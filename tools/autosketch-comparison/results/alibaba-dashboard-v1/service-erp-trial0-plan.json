@@ -1,0 +1,23 @@
+{
+  "configs": [
+    "Exact"
+  ],
+  "shared": true,
+  "planning_seconds": 0.056584864,
+  "searches": [
+    {
+      "fallback": "exact",
+      "panels": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "predicted_retained_bytes": 3187200,
+      "reason": "no applicable ERP configuration satisfies the empirical accuracy requirement"
+    }
+  ],
+  "reason": "real ASAPPlanner ERP selector; custom calibration profile; memory objective"
+}

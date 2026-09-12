@@ -1,0 +1,78 @@
+{
+  "configs": [
+    "Exact",
+    {
+      "Cms": {
+        "depth": 7,
+        "width": 128,
+        "heap": 16
+      }
+    },
+    "Exact",
+    {
+      "Cms": {
+        "depth": 5,
+        "width": 128,
+        "heap": 16
+      }
+    },
+    "Exact",
+    {
+      "Cms": {
+        "depth": 3,
+        "width": 128,
+        "heap": 16
+      }
+    }
+  ],
+  "shared": false,
+  "planning_seconds": 0.060506845,
+  "searches": [
+    {
+      "fallback": "exact",
+      "panels": [
+        0
+      ],
+      "predicted_retained_bytes": 53120,
+      "reason": "no applicable ERP configuration satisfies the empirical accuracy requirement"
+    },
+    {
+      "panels": [
+        1
+      ],
+      "predicted_retained_bytes": 8048.0,
+      "record_id": "Cms { depth: 7, width: 128, heap: 16 }"
+    },
+    {
+      "fallback": "exact",
+      "panels": [
+        2
+      ],
+      "predicted_retained_bytes": 531200,
+      "reason": "no applicable ERP configuration satisfies the empirical accuracy requirement"
+    },
+    {
+      "panels": [
+        3
+      ],
+      "predicted_retained_bytes": 60000.0,
+      "record_id": "Cms { depth: 5, width: 128, heap: 16 }"
+    },
+    {
+      "fallback": "exact",
+      "panels": [
+        4
+      ],
+      "predicted_retained_bytes": 3187200,
+      "reason": "no applicable ERP configuration satisfies the empirical accuracy requirement"
+    },
+    {
+      "panels": [
+        5
+      ],
+      "predicted_retained_bytes": 237120.0,
+      "record_id": "Cms { depth: 3, width: 128, heap: 16 }"
+    }
+  ],
+  "reason": "real ASAPPlanner ERP selector; custom calibration profile; memory objective"
+}

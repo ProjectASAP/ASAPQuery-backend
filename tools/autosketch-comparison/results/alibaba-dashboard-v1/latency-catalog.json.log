@@ -1,0 +1,11 @@
+ERP Latency candidate 0: Kll { capacity: 128 }, max loss 1000000000000
+ERP Latency candidate 1: Kll { capacity: 256 }, max loss 1000000000000
+ERP Latency candidate 2: Kll { capacity: 512 }, max loss 1000000000000
+ERP Latency candidate 3: Kll { capacity: 1024 }, max loss 26.080000000016298
+ERP Latency candidate 4: Kll { capacity: 2048 }, max loss 12.388059701490105
+ERP Latency candidate 5: Dd { milli_alpha: 5 }, max loss 0.049999999999998934
+ERP Latency candidate 6: Dd { milli_alpha: 10 }, max loss 0.10000000000000009
+ERP Latency candidate 7: Dd { milli_alpha: 20 }, max loss 0.20000000000000018
+ERP Latency candidate 8: Dd { milli_alpha: 50 }, max loss 0.5207839418365736
+ERP Latency candidate 9: Dd { milli_alpha: 100 }, max loss 1.0367883811127412
+ERP Latency candidate 10: Exact, max loss 0

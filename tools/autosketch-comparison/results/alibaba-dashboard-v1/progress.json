@@ -1,0 +1,10 @@
+{
+  "stage": "stopped_by_user",
+  "time_utc": "2026-09-11T14:27:12Z",
+  "pid": 180865,
+  "artifact": "service-auto-trial2-run.json",
+  "artifact_status": "interrupted_without_completed_result",
+  "completed_runs": 15,
+  "planned_runs": 54,
+  "automatic_execution_and_publication": "stopped; partial evidence published manually at user request"
+}

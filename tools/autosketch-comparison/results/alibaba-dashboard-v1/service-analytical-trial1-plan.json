@@ -1,0 +1,15 @@
+{
+  "configs": [
+    {
+      "Cms": {
+        "depth": 5,
+        "width": 512,
+        "heap": 16
+      }
+    }
+  ],
+  "shared": true,
+  "planning_seconds": 0.000046394,
+  "searches": [],
+  "reason": "ASAPPlanner analytical sizing; native bounds do not certify final query loss"
+}

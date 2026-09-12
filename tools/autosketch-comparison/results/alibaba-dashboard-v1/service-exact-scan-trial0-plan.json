@@ -1,0 +1,9 @@
+{
+  "configs": [
+    "Exact"
+  ],
+  "shared": true,
+  "planning_seconds": 8.72e-7,
+  "searches": [],
+  "reason": "exact-scan"
+}

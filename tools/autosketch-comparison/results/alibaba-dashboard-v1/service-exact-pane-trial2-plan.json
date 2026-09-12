@@ -1,0 +1,9 @@
+{
+  "configs": [
+    "Exact"
+  ],
+  "shared": true,
+  "planning_seconds": 9.44e-7,
+  "searches": [],
+  "reason": "exact-pane"
+}

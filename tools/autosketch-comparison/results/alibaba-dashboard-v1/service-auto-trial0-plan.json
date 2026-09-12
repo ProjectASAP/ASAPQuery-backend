@@ -1,0 +1,6267 @@
+{
+  "configs": [
+    "Exact",
+    {
+      "Cms": {
+        "depth": 7,
+        "width": 128,
+        "heap": 16
+      }
+    },
+    "Exact",
+    {
+      "Cms": {
+        "depth": 5,
+        "width": 128,
+        "heap": 16
+      }
+    },
+    "Exact",
+    {
+      "Cms": {
+        "depth": 3,
+        "width": 128,
+        "heap": 16
+      }
+    }
+  ],
+  "shared": false,
+  "planning_seconds": 1383.901148486,
+  "searches": [
+    {
+      "allocated_memory_budget_bytes": 112676056,
+      "calibration_feasible": false,
+      "candidates": 39,
+      "evidence": [
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            305.39307004470936,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005482799996059384,
+          "merge_seconds": 0.000054727999999999995,
+          "pane_bytes": 34936,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.004971769999983167,
+          "query_operations": 5,
+          "query_seconds": 0.004970857,
+          "update_cpu_seconds": 7.4450923610000075,
+          "update_seconds": 7.445431815
+        },
+        {
+          "composition_operations": 5,
+          "config": "Exact",
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000044378000012557095,
+          "merge_seconds": 0.000044211,
+          "pane_bytes": 53120,
+          "pane_bytes_without_enumeration": 53120,
+          "query_cpu_seconds": 0.00035085499996512226,
+          "query_operations": 5,
+          "query_seconds": 0.000350505,
+          "update_cpu_seconds": 0.4155956190000154,
+          "update_seconds": 0.415618217
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            102.95933574622097,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005043299999840656,
+          "merge_seconds": 0.000050404,
+          "pane_bytes": 41592,
+          "pane_bytes_without_enumeration": 15216,
+          "query_cpu_seconds": 0.004976656000010848,
+          "query_operations": 5,
+          "query_seconds": 0.0049761910000000005,
+          "update_cpu_seconds": 7.379002900000003,
+          "update_seconds": 7.379355458
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            305.39307004470936,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000047174999995291955,
+          "merge_seconds": 0.000047207,
+          "pane_bytes": 34424,
+          "pane_bytes_without_enumeration": 8048,
+          "query_cpu_seconds": 0.004974660000002018,
+          "query_operations": 5,
+          "query_seconds": 0.004974056,
+          "update_cpu_seconds": 7.371508542000001,
+          "update_seconds": 7.371862145
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            35.236587183308494,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000060642999983429036,
+          "merge_seconds": 0.000060587999999999997,
+          "pane_bytes": 48248,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.006436025999960293,
+          "query_operations": 5,
+          "query_seconds": 0.006435371999999999,
+          "update_cpu_seconds": 8.360525798999987,
+          "update_seconds": 8.360908414
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            168.73935490738768,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0000765570000282878,
+          "merge_seconds": 0.000076551,
+          "pane_bytes": 34936,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.0036602149999964695,
+          "query_operations": 5,
+          "query_seconds": 0.0036598639999999997,
+          "update_cpu_seconds": 5.199993613999993,
+          "update_seconds": 5.200248863
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            302.2328081754311,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000030688999999028965,
+          "merge_seconds": 0.000030666999999999996,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 33912,
+          "query_cpu_seconds": 0.003101969000006477,
+          "query_operations": 5,
+          "query_seconds": 0.0031015920000000002,
+          "update_cpu_seconds": 2.6945240429999977,
+          "update_seconds": 2.69465554
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            7.3091867149244205,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00007309899996243985,
+          "merge_seconds": 0.00007307200000000001,
+          "pane_bytes": 84600,
+          "pane_bytes_without_enumeration": 58224,
+          "query_cpu_seconds": 0.004970577999984016,
+          "query_operations": 5,
+          "query_seconds": 0.004970031000000001,
+          "update_cpu_seconds": 7.370395771000005,
+          "update_seconds": 7.3705176980000005
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            10.368320204385778,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0001286939999971537,
+          "merge_seconds": 0.00012865499999999998,
+          "pane_bytes": 84600,
+          "pane_bytes_without_enumeration": 58224,
+          "query_cpu_seconds": 0.00775406500000031,
+          "query_operations": 5,
+          "query_seconds": 0.0077534249999999996,
+          "update_cpu_seconds": 9.957588505000004,
+          "update_seconds": 9.95797254
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            30.63657653821588,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00004246700001431236,
+          "merge_seconds": 0.000042441,
+          "pane_bytes": 55416,
+          "pane_bytes_without_enumeration": 55416,
+          "query_cpu_seconds": 0.003163962999991554,
+          "query_operations": 5,
+          "query_seconds": 0.003163561,
+          "update_cpu_seconds": 2.7723860849999937,
+          "update_seconds": 2.772519791
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            10.368320204385778,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0001357060000373167,
+          "merge_seconds": 0.00013559599999999998,
+          "pane_bytes": 85112,
+          "pane_bytes_without_enumeration": 58736,
+          "query_cpu_seconds": 0.007759938999981841,
+          "query_operations": 5,
+          "query_seconds": 0.00775944,
+          "update_cpu_seconds": 10.033827795999997,
+          "update_seconds": 10.034384447
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 1024
+            }
+          },
+          "losses": [
+            28.579412390887796,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00008421700002259058,
+          "merge_seconds": 0.000084113,
+          "pane_bytes": 53368,
+          "pane_bytes_without_enumeration": 26992,
+          "query_cpu_seconds": 0.005272819999987632,
+          "query_operations": 5,
+          "query_seconds": 0.005272361999999999,
+          "update_cpu_seconds": 6.819419006000004,
+          "update_seconds": 6.819579092
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            311.01500958058335,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00007373600001159275,
+          "merge_seconds": 0.000073703,
+          "pane_bytes": 31864,
+          "pane_bytes_without_enumeration": 5488,
+          "query_cpu_seconds": 0.005260482000004174,
+          "query_operations": 5,
+          "query_seconds": 0.005259985,
+          "update_cpu_seconds": 6.803558929000001,
+          "update_seconds": 6.803877941
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            57.42628273365978,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005795599997782119,
+          "merge_seconds": 0.000058205,
+          "pane_bytes": 40056,
+          "pane_bytes_without_enumeration": 13680,
+          "query_cpu_seconds": 0.00366378300000747,
+          "query_operations": 5,
+          "query_seconds": 0.0036631879999999995,
+          "update_cpu_seconds": 5.149171123000002,
+          "update_seconds": 5.149340772
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 1024
+            }
+          },
+          "losses": [
+            10.325739833936554,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0000941949999884173,
+          "merge_seconds": 0.000094037,
+          "pane_bytes": 69752,
+          "pane_bytes_without_enumeration": 43376,
+          "query_cpu_seconds": 0.004319802999987132,
+          "query_operations": 5,
+          "query_seconds": 0.004318997,
+          "update_cpu_seconds": 6.3490509959999955,
+          "update_seconds": 6.349429117
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            19.209069618905684,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003921799998352071,
+          "merge_seconds": 0.000039159,
+          "pane_bytes": 51320,
+          "pane_bytes_without_enumeration": 51320,
+          "query_cpu_seconds": 0.003048055000022032,
+          "query_operations": 5,
+          "query_seconds": 0.0030478400000000004,
+          "update_cpu_seconds": 2.648028057999994,
+          "update_seconds": 2.648268211
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            18.54774324036619,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00006729799997629016,
+          "merge_seconds": 0.00006727399999999999,
+          "pane_bytes": 52344,
+          "pane_bytes_without_enumeration": 25968,
+          "query_cpu_seconds": 0.003664433999972516,
+          "query_operations": 5,
+          "query_seconds": 0.003664049,
+          "update_cpu_seconds": 5.155902706000006,
+          "update_seconds": 5.156315749
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            30.53810943155205,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00008796699999180646,
+          "merge_seconds": 0.000088008,
+          "pane_bytes": 57464,
+          "pane_bytes_without_enumeration": 31088,
+          "query_cpu_seconds": 0.0049798410000008175,
+          "query_operations": 5,
+          "query_seconds": 0.004979204,
+          "update_cpu_seconds": 7.487284643000002,
+          "update_seconds": 7.487715197
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            102.32196082605917,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003278699999498258,
+          "merge_seconds": 0.000032734,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 41080,
+          "query_cpu_seconds": 0.003115874000016561,
+          "query_operations": 5,
+          "query_seconds": 0.0031152519999999998,
+          "update_cpu_seconds": 2.6985416100000066,
+          "update_seconds": 2.698671333
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            14.3349478390462,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00007552800002486038,
+          "merge_seconds": 0.000075522,
+          "pane_bytes": 68728,
+          "pane_bytes_without_enumeration": 42352,
+          "query_cpu_seconds": 0.006439467000006971,
+          "query_operations": 5,
+          "query_seconds": 0.006438715,
+          "update_cpu_seconds": 8.353206830000005,
+          "update_seconds": 8.353584584
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            168.73935490738768,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005439799999606976,
+          "merge_seconds": 0.000054377,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.0036635079999989273,
+          "query_operations": 5,
+          "query_seconds": 0.003663107,
+          "update_cpu_seconds": 5.146706174,
+          "update_seconds": 5.146924236
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            144.15318288269108,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0000765760000120963,
+          "merge_seconds": 0.000076527,
+          "pane_bytes": 34936,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.005277203000019881,
+          "query_operations": 5,
+          "query_seconds": 0.005276728999999999,
+          "update_cpu_seconds": 6.814252619000001,
+          "update_seconds": 6.814637116
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            58.037044922290825,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003373000001261062,
+          "merge_seconds": 0.000033667,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 39032,
+          "query_cpu_seconds": 0.0030499080000083723,
+          "query_operations": 5,
+          "query_seconds": 0.003049472,
+          "update_cpu_seconds": 2.64952653200001,
+          "update_seconds": 2.649612773
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            10.578560783478816,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00008943399999594703,
+          "merge_seconds": 0.00008930599999999999,
+          "pane_bytes": 67704,
+          "pane_bytes_without_enumeration": 67704,
+          "query_cpu_seconds": 0.0031290049999981306,
+          "query_operations": 5,
+          "query_seconds": 0.0031286189999999996,
+          "update_cpu_seconds": 2.6792777979999975,
+          "update_seconds": 2.679349856
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 1024
+            }
+          },
+          "losses": [
+            10.368320204385778,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00015190500002404406,
+          "merge_seconds": 0.00015179199999999999,
+          "pane_bytes": 86136,
+          "pane_bytes_without_enumeration": 59760,
+          "query_cpu_seconds": 0.007769198000033839,
+          "query_operations": 5,
+          "query_seconds": 0.007768271,
+          "update_cpu_seconds": 10.121597948000016,
+          "update_seconds": 10.122102765
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            30.53810943155205,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005797099998972044,
+          "merge_seconds": 0.000057955,
+          "pane_bytes": 55928,
+          "pane_bytes_without_enumeration": 29552,
+          "query_cpu_seconds": 0.0049749049999832096,
+          "query_operations": 5,
+          "query_seconds": 0.004974293,
+          "update_cpu_seconds": 7.365985260999992,
+          "update_seconds": 7.366554271
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            86.64972322759208,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005528900000228987,
+          "merge_seconds": 0.000055298999999999994,
+          "pane_bytes": 38008,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.006437050000002387,
+          "query_operations": 5,
+          "query_seconds": 0.0064365640000000005,
+          "update_cpu_seconds": 8.359488266,
+          "update_seconds": 8.360038103
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            7.463540557802853,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00010914700000341782,
+          "merge_seconds": 0.000108965,
+          "pane_bytes": 84088,
+          "pane_bytes_without_enumeration": 84088,
+          "query_cpu_seconds": 0.0032229320000283224,
+          "query_operations": 5,
+          "query_seconds": 0.003222608,
+          "update_cpu_seconds": 2.772777922000003,
+          "update_seconds": 2.772889809
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            65.59239940387481,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000060644999933856525,
+          "merge_seconds": 0.000060648,
+          "pane_bytes": 42104,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.007725150000055692,
+          "query_operations": 5,
+          "query_seconds": 0.007724733,
+          "update_cpu_seconds": 10.05519617500002,
+          "update_seconds": 10.056017253
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            210.99771130508836,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00007502599999043014,
+          "merge_seconds": 0.000075011,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.0064357470000118155,
+          "query_operations": 5,
+          "query_seconds": 0.006435053999999999,
+          "update_cpu_seconds": 8.440539526999999,
+          "update_seconds": 8.440979501
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            86.64972322759208,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00007926399996449618,
+          "merge_seconds": 0.000079167,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.0064281900000082715,
+          "query_operations": 5,
+          "query_seconds": 0.006427877,
+          "update_cpu_seconds": 8.433092334000008,
+          "update_seconds": 8.43355402
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            102.95933574622097,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005908599999315811,
+          "merge_seconds": 0.000059031000000000005,
+          "pane_bytes": 42104,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.004976083000002518,
+          "query_operations": 5,
+          "query_seconds": 0.004975475000000001,
+          "update_cpu_seconds": 7.4350944570000195,
+          "update_seconds": 7.435649685
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            65.52852884820098,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00009548300002393262,
+          "merge_seconds": 0.000095702,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 14704,
+          "query_cpu_seconds": 0.005354599000014559,
+          "query_operations": 5,
+          "query_seconds": 0.005354185,
+          "update_cpu_seconds": 6.833072166999983,
+          "update_seconds": 6.833429245
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            121.97945497125826,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0000324240000111331,
+          "merge_seconds": 0.000032383999999999994,
+          "pane_bytes": 36984,
+          "pane_bytes_without_enumeration": 36984,
+          "query_cpu_seconds": 0.003090648999986456,
+          "query_operations": 5,
+          "query_seconds": 0.0030903659999999998,
+          "update_cpu_seconds": 2.674434570999992,
+          "update_seconds": 2.6744899
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            161.51932084309132,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00007932200003324397,
+          "merge_seconds": 0.00007929,
+          "pane_bytes": 35960,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.007724472000006699,
+          "query_operations": 5,
+          "query_seconds": 0.00772404,
+          "update_cpu_seconds": 10.125063334000004,
+          "update_seconds": 10.125946261
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            305.39307004470936,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0000772299999596271,
+          "merge_seconds": 0.000077253,
+          "pane_bytes": 35960,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.004987856999946416,
+          "query_operations": 5,
+          "query_seconds": 0.004987195999999999,
+          "update_cpu_seconds": 7.502279020000003,
+          "update_seconds": 7.502785942
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            122.89626357249308,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000060193999999569314,
+          "merge_seconds": 0.000060184000000000005,
+          "pane_bytes": 38008,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.004310954999965588,
+          "query_operations": 5,
+          "query_seconds": 0.004310555,
+          "update_cpu_seconds": 6.286254737999997,
+          "update_seconds": 6.286540364
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            38.18394720034065,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00012458799999937042,
+          "merge_seconds": 0.00012451200000000002,
+          "pane_bytes": 49272,
+          "pane_bytes_without_enumeration": 22896,
+          "query_cpu_seconds": 0.004358725000000341,
+          "query_operations": 5,
+          "query_seconds": 0.004358394,
+          "update_cpu_seconds": 6.355104035,
+          "update_seconds": 6.355284858
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            171.49643389397488,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003077400000250918,
+          "merge_seconds": 0.000030726,
+          "pane_bytes": 32888,
+          "pane_bytes_without_enumeration": 32888,
+          "query_cpu_seconds": 0.003028166999996529,
+          "query_operations": 5,
+          "query_seconds": 0.0030278299999999996,
+          "update_cpu_seconds": 2.6482369509999977,
+          "update_seconds": 2.648304001
+        }
+      ],
+      "panel": {
+        "query": "Count",
+        "window": 1
+      },
+      "seconds": 243.417303869,
+      "selected": "Exact"
+    },
+    {
+      "allocated_memory_budget_bytes": 112676056,
+      "calibration_feasible": true,
+      "candidates": 38,
+      "evidence": [
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003135600002224237,
+          "merge_seconds": 0.000031419,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 33912,
+          "query_cpu_seconds": 0.003679968999904304,
+          "query_operations": 5,
+          "query_seconds": 0.0036794179999999994,
+          "update_cpu_seconds": 2.7049659730000144,
+          "update_seconds": 2.70517078
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000042097999994439306,
+          "merge_seconds": 0.000042065,
+          "pane_bytes": 15728,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.00004489799999873867,
+          "query_operations": 5,
+          "query_seconds": 0.000044718,
+          "update_cpu_seconds": 9.784378846000038,
+          "update_seconds": 9.784821903
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005506499991270175,
+          "merge_seconds": 0.000055064,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.00007708000015327343,
+          "query_operations": 5,
+          "query_seconds": 0.000076857,
+          "update_cpu_seconds": 6.52605533000002,
+          "update_seconds": 6.526375092
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005909700001893725,
+          "merge_seconds": 0.000059087,
+          "pane_bytes": 9584,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.00007660800002895485,
+          "query_operations": 5,
+          "query_seconds": 0.000076418,
+          "update_cpu_seconds": 9.854469280999979,
+          "update_seconds": 9.854751564
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003988299999946321,
+          "merge_seconds": 0.000039862000000000006,
+          "pane_bytes": 13680,
+          "pane_bytes_without_enumeration": 13680,
+          "query_cpu_seconds": 0.000044843000068794936,
+          "query_operations": 5,
+          "query_seconds": 0.000044605,
+          "update_cpu_seconds": 4.857722290999959,
+          "update_seconds": 4.858418914
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00004526800006487974,
+          "merge_seconds": 0.000045452000000000005,
+          "pane_bytes": 21872,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.00004437000001189517,
+          "query_operations": 5,
+          "query_seconds": 0.000044214999999999996,
+          "update_cpu_seconds": 8.05789082299998,
+          "update_seconds": 8.058293432
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000048446000050716975,
+          "merge_seconds": 0.000048489,
+          "pane_bytes": 41840,
+          "pane_bytes_without_enumeration": 41840,
+          "query_cpu_seconds": 0.000024501999973836064,
+          "query_operations": 5,
+          "query_seconds": 0.000024350999999999998,
+          "update_cpu_seconds": 7.980614583000033,
+          "update_seconds": 7.98095075
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            3.3333333333333335,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003046599999834143,
+          "merge_seconds": 0.000030450999999999997,
+          "pane_bytes": 29816,
+          "pane_bytes_without_enumeration": 29816,
+          "query_cpu_seconds": 0.0036018149999677007,
+          "query_operations": 5,
+          "query_seconds": 0.0036014,
+          "update_cpu_seconds": 2.6453141079999796,
+          "update_seconds": 2.645435333
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005819600011136572,
+          "merge_seconds": 0.000058193,
+          "pane_bytes": 9584,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.0000775119999616436,
+          "query_operations": 5,
+          "query_seconds": 0.00007720899999999999,
+          "update_cpu_seconds": 7.195068056000025,
+          "update_seconds": 7.195535906
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00002758100004029984,
+          "merge_seconds": 0.000027667,
+          "pane_bytes": 11120,
+          "pane_bytes_without_enumeration": 11120,
+          "query_cpu_seconds": 0.00002563399999644389,
+          "query_operations": 5,
+          "query_seconds": 0.000025375,
+          "update_cpu_seconds": 5.92691486800004,
+          "update_seconds": 5.927161675
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003317800002378135,
+          "merge_seconds": 0.000033267000000000005,
+          "pane_bytes": 36984,
+          "pane_bytes_without_enumeration": 36984,
+          "query_cpu_seconds": 0.0036355420000404592,
+          "query_operations": 5,
+          "query_seconds": 0.003635122,
+          "update_cpu_seconds": 2.6807202640000014,
+          "update_seconds": 2.680883809
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005754099998966922,
+          "merge_seconds": 0.000057568,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00007785099995771816,
+          "query_operations": 5,
+          "query_seconds": 0.000077636,
+          "update_cpu_seconds": 8.118363000999977,
+          "update_seconds": 8.119095416
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000037195999993855366,
+          "merge_seconds": 0.000037210000000000005,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 41080,
+          "query_cpu_seconds": 0.003665860000126031,
+          "query_operations": 5,
+          "query_seconds": 0.003665355,
+          "update_cpu_seconds": 2.6940738019999912,
+          "update_seconds": 2.694296154
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000044585999944501964,
+          "merge_seconds": 0.000044566999999999995,
+          "pane_bytes": 21872,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.00004478100004234875,
+          "query_operations": 5,
+          "query_seconds": 0.000044485000000000005,
+          "update_cpu_seconds": 6.003859298999998,
+          "update_seconds": 6.004206018
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003710099997533689,
+          "merge_seconds": 0.000037149,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00004507500005956899,
+          "query_operations": 5,
+          "query_seconds": 0.000044877,
+          "update_cpu_seconds": 4.863211688999968,
+          "update_seconds": 4.863243898
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000036375000149746484,
+          "merge_seconds": 0.000036277,
+          "pane_bytes": 11632,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.00004443900007800039,
+          "query_operations": 5,
+          "query_seconds": 0.00004425,
+          "update_cpu_seconds": 6.00094849300001,
+          "update_seconds": 6.00100435
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005927199998723154,
+          "merge_seconds": 0.000059297999999999994,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00007871900004374766,
+          "query_operations": 5,
+          "query_seconds": 0.000078499,
+          "update_cpu_seconds": 6.053003117999992,
+          "update_seconds": 6.053165744
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0000630239999850346,
+          "merge_seconds": 0.000063023,
+          "pane_bytes": 16752,
+          "pane_bytes_without_enumeration": 16752,
+          "query_cpu_seconds": 0.00007635999992317011,
+          "query_operations": 5,
+          "query_seconds": 0.000076139,
+          "update_cpu_seconds": 9.845463085000006,
+          "update_seconds": 9.845999135
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00006258899998101697,
+          "merge_seconds": 0.000062646,
+          "pane_bytes": 14704,
+          "pane_bytes_without_enumeration": 14704,
+          "query_cpu_seconds": 0.00007825599999478072,
+          "query_operations": 5,
+          "query_seconds": 0.000078046,
+          "update_cpu_seconds": 6.515144507999992,
+          "update_seconds": 6.51525573
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000049164999950335186,
+          "merge_seconds": 0.00004919600000000001,
+          "pane_bytes": 25968,
+          "pane_bytes_without_enumeration": 25968,
+          "query_cpu_seconds": 0.00004510399998025605,
+          "query_operations": 5,
+          "query_seconds": 0.00004493,
+          "update_cpu_seconds": 6.453634351000005,
+          "update_seconds": 6.45400443
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003940000010516087,
+          "merge_seconds": 0.000039557,
+          "pane_bytes": 29552,
+          "pane_bytes_without_enumeration": 29552,
+          "query_cpu_seconds": 0.000025458000095568423,
+          "query_operations": 5,
+          "query_seconds": 0.000025193999999999996,
+          "update_cpu_seconds": 9.68391029999998,
+          "update_seconds": 9.685251248
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003885600006015011,
+          "merge_seconds": 0.000038935,
+          "pane_bytes": 11632,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.00004500999995116217,
+          "query_operations": 5,
+          "query_seconds": 0.000044842,
+          "update_cpu_seconds": 8.060692254999992,
+          "update_seconds": 8.062145575
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003700600001366183,
+          "merge_seconds": 0.000037039,
+          "pane_bytes": 21360,
+          "pane_bytes_without_enumeration": 21360,
+          "query_cpu_seconds": 0.000026902999991307297,
+          "query_operations": 5,
+          "query_seconds": 0.000026868,
+          "update_cpu_seconds": 5.925524737999979,
+          "update_seconds": 5.9258966730000004
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000024739999958001135,
+          "merge_seconds": 0.000024774,
+          "pane_bytes": 8048,
+          "pane_bytes_without_enumeration": 8048,
+          "query_cpu_seconds": 0.000025945999993837177,
+          "query_operations": 5,
+          "query_seconds": 0.000025784,
+          "update_cpu_seconds": 7.061204766000003,
+          "update_seconds": 7.061571995
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003165799989801599,
+          "merge_seconds": 0.000031593,
+          "pane_bytes": 31864,
+          "pane_bytes_without_enumeration": 31864,
+          "query_cpu_seconds": 0.003630907000001571,
+          "query_operations": 5,
+          "query_seconds": 0.003630449,
+          "update_cpu_seconds": 2.676170487000036,
+          "update_seconds": 2.676560914
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000034847000051740906,
+          "merge_seconds": 0.000034862999999999995,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 39032,
+          "query_cpu_seconds": 0.003595693000022493,
+          "query_operations": 5,
+          "query_seconds": 0.003595313,
+          "update_cpu_seconds": 2.6604201310000235,
+          "update_seconds": 2.66060594
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005790099999103404,
+          "merge_seconds": 0.000057888000000000005,
+          "pane_bytes": 5488,
+          "pane_bytes_without_enumeration": 5488,
+          "query_cpu_seconds": 0.00007731599998805905,
+          "query_operations": 5,
+          "query_seconds": 0.00007709899999999999,
+          "update_cpu_seconds": 6.505015222000054,
+          "update_seconds": 6.505519309
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000031352999940281734,
+          "merge_seconds": 0.00003142,
+          "pane_bytes": 32888,
+          "pane_bytes_without_enumeration": 32888,
+          "query_cpu_seconds": 0.0036138419999929283,
+          "query_operations": 5,
+          "query_seconds": 0.0036130669999999998,
+          "update_cpu_seconds": 2.65480326200003,
+          "update_seconds": 2.655000876
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000031122999985200295,
+          "merge_seconds": 0.000031297,
+          "pane_bytes": 15216,
+          "pane_bytes_without_enumeration": 15216,
+          "query_cpu_seconds": 0.000024706999909085425,
+          "query_operations": 5,
+          "query_seconds": 0.000024498,
+          "update_cpu_seconds": 7.082567996000023,
+          "update_seconds": 7.082783942
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0000763690001122086,
+          "merge_seconds": 0.00007645099999999999,
+          "pane_bytes": 55416,
+          "pane_bytes_without_enumeration": 55416,
+          "query_cpu_seconds": 0.003804615000035483,
+          "query_operations": 5,
+          "query_seconds": 0.0038040599999999997,
+          "update_cpu_seconds": 2.777781234000031,
+          "update_seconds": 2.777916083
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000030197999990377866,
+          "merge_seconds": 0.000030231999999999998,
+          "pane_bytes": 13168,
+          "pane_bytes_without_enumeration": 13168,
+          "query_cpu_seconds": 0.000024839999980486027,
+          "query_operations": 5,
+          "query_seconds": 0.000024653000000000003,
+          "update_cpu_seconds": 4.780579051000018,
+          "update_seconds": 4.780778547
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000050638999937291373,
+          "merge_seconds": 0.00005074499999999999,
+          "pane_bytes": 15216,
+          "pane_bytes_without_enumeration": 15216,
+          "query_cpu_seconds": 0.00002913399998760724,
+          "query_operations": 5,
+          "query_seconds": 0.000028983000000000004,
+          "update_cpu_seconds": 10.230510432000017,
+          "update_seconds": 10.230818769
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00002412899999626461,
+          "merge_seconds": 0.000024204,
+          "pane_bytes": 7024,
+          "pane_bytes_without_enumeration": 7024,
+          "query_cpu_seconds": 0.00002490500003204943,
+          "query_operations": 5,
+          "query_seconds": 0.00002472,
+          "update_cpu_seconds": 4.784729562000024,
+          "update_seconds": 4.784830866
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003833800008123944,
+          "merge_seconds": 0.000038461,
+          "pane_bytes": 47224,
+          "pane_bytes_without_enumeration": 47224,
+          "query_cpu_seconds": 0.0036249179999572334,
+          "query_operations": 5,
+          "query_seconds": 0.00362438,
+          "update_cpu_seconds": 2.673512775000006,
+          "update_seconds": 2.673626174
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00007591999997202947,
+          "merge_seconds": 0.00007593299999999999,
+          "pane_bytes": 42352,
+          "pane_bytes_without_enumeration": 42352,
+          "query_cpu_seconds": 0.000043525999956273154,
+          "query_operations": 5,
+          "query_seconds": 0.000043389,
+          "update_cpu_seconds": 8.126393999999948,
+          "update_seconds": 8.12728274
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00005793299999368173,
+          "merge_seconds": 0.000057950999999999995,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.00007401900001013928,
+          "query_operations": 5,
+          "query_seconds": 0.000073763,
+          "update_cpu_seconds": 4.903210597999987,
+          "update_seconds": 4.903799733
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00003696699997135511,
+          "merge_seconds": 0.000036976999999999995,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.00004237900003545292,
+          "query_operations": 5,
+          "query_seconds": 0.000042151000000000004,
+          "update_cpu_seconds": 7.138958176000017,
+          "update_seconds": 7.13935934
+        },
+        {
+          "composition_operations": 5,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00011427099997263213,
+          "merge_seconds": 0.000114163,
+          "pane_bytes": 84088,
+          "pane_bytes_without_enumeration": 84088,
+          "query_cpu_seconds": 0.0038655269999594566,
+          "query_operations": 5,
+          "query_seconds": 0.0038647329999999995,
+          "update_cpu_seconds": 2.7814723760000106,
+          "update_seconds": 2.781594686
+        }
+      ],
+      "panel": {
+        "query": "Top3",
+        "window": 1
+      },
+      "seconds": 225.366992682,
+      "selected": {
+        "Cms": {
+          "depth": 7,
+          "heap": 16,
+          "width": 128
+        }
+      }
+    },
+    {
+      "allocated_memory_budget_bytes": 1126760560,
+      "calibration_feasible": false,
+      "candidates": 40,
+      "evidence": [
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            1163.1054549978935,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006347891000018535,
+          "merge_seconds": 0.006346009,
+          "pane_bytes": 31864,
+          "pane_bytes_without_enumeration": 5488,
+          "query_cpu_seconds": 0.010136480000028314,
+          "query_operations": 5,
+          "query_seconds": 0.010135639,
+          "update_cpu_seconds": 5.191284660999997,
+          "update_seconds": 5.191488938
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            69.64602320445425,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004787504999967496,
+          "merge_seconds": 0.004786105000000001,
+          "pane_bytes": 51832,
+          "pane_bytes_without_enumeration": 25456,
+          "query_cpu_seconds": 0.014685503000009703,
+          "query_operations": 5,
+          "query_seconds": 0.014684678999999999,
+          "update_cpu_seconds": 6.659653505000051,
+          "update_seconds": 6.659955935
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            49.89410104654747,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006442919999926744,
+          "merge_seconds": 0.006441869999999999,
+          "pane_bytes": 53368,
+          "pane_bytes_without_enumeration": 26992,
+          "query_cpu_seconds": 0.010160268999925393,
+          "query_operations": 5,
+          "query_seconds": 0.010159509,
+          "update_cpu_seconds": 5.187448012000004,
+          "update_seconds": 5.187643127
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            99.79399896504627,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004698619000123472,
+          "merge_seconds": 0.004697372,
+          "pane_bytes": 47736,
+          "pane_bytes_without_enumeration": 21360,
+          "query_cpu_seconds": 0.011965446000090196,
+          "query_operations": 5,
+          "query_seconds": 0.011964847,
+          "update_cpu_seconds": 6.217949000999965,
+          "update_seconds": 6.218464825
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            213.25179066788448,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005777787999988959,
+          "merge_seconds": 0.005776308,
+          "pane_bytes": 38008,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.017848266000044077,
+          "query_operations": 5,
+          "query_seconds": 0.017847527,
+          "update_cpu_seconds": 8.344937838000021,
+          "update_seconds": 8.345400487
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            140.75243397928395,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004458089999957338,
+          "merge_seconds": 0.004456888,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 39032,
+          "query_cpu_seconds": 0.008446876000107295,
+          "query_operations": 5,
+          "query_seconds": 0.008446038999999999,
+          "update_cpu_seconds": 2.644937946999903,
+          "update_seconds": 2.645170343
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            48.56477933712062,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004414141999973253,
+          "merge_seconds": 0.004412695,
+          "pane_bytes": 51320,
+          "pane_bytes_without_enumeration": 51320,
+          "query_cpu_seconds": 0.008445472000062182,
+          "query_operations": 5,
+          "query_seconds": 0.008444753,
+          "update_cpu_seconds": 2.6414561660000118,
+          "update_seconds": 2.641670796
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            771.9333840441807,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004657222999981059,
+          "merge_seconds": 0.00465634,
+          "pane_bytes": 30328,
+          "pane_bytes_without_enumeration": 3952,
+          "query_cpu_seconds": 0.014579148000052555,
+          "query_operations": 5,
+          "query_seconds": 0.014578575,
+          "update_cpu_seconds": 6.647121167000023,
+          "update_seconds": 6.6473991
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            745.11691301016,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0072029310002790226,
+          "merge_seconds": 0.007202082,
+          "pane_bytes": 35960,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.013800747999880514,
+          "query_operations": 5,
+          "query_seconds": 0.013799777000000001,
+          "update_cpu_seconds": 7.468072745999962,
+          "update_seconds": 7.468393927
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            306.7324305294382,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005397721000235833,
+          "merge_seconds": 0.005396522000000001,
+          "pane_bytes": 38008,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.012036779000027309,
+          "query_operations": 5,
+          "query_seconds": 0.012035965,
+          "update_cpu_seconds": 6.269540688999996,
+          "update_seconds": 6.269941948
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            148.03288098880495,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006384155000091596,
+          "merge_seconds": 0.006382755999999999,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 14704,
+          "query_cpu_seconds": 0.010166209999965758,
+          "query_operations": 5,
+          "query_seconds": 0.010165547,
+          "update_cpu_seconds": 5.1888089049999735,
+          "update_seconds": 5.189162622
+        },
+        {
+          "composition_operations": 50,
+          "config": "Exact",
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0035099700000955636,
+          "merge_seconds": 0.003509209,
+          "pane_bytes": 53120,
+          "pane_bytes_without_enumeration": 53120,
+          "query_cpu_seconds": 0.0011145050001459822,
+          "query_operations": 5,
+          "query_seconds": 0.00111407,
+          "update_cpu_seconds": 0.4146424240000215,
+          "update_seconds": 0.414660833
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            157.66077836437725,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006045609000011609,
+          "merge_seconds": 0.006044416,
+          "pane_bytes": 42104,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.02152191599998332,
+          "query_operations": 5,
+          "query_seconds": 0.021521049,
+          "update_cpu_seconds": 10.089447434000022,
+          "update_seconds": 10.090005316
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            509.9532291404511,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004795027999875856,
+          "merge_seconds": 0.004794069,
+          "pane_bytes": 32376,
+          "pane_bytes_without_enumeration": 6000,
+          "query_cpu_seconds": 0.017864972000097623,
+          "query_operations": 5,
+          "query_seconds": 0.017864110000000002,
+          "update_cpu_seconds": 8.271457489,
+          "update_seconds": 8.271948312
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            420.3391028704413,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004411747999995441,
+          "merge_seconds": 0.004410707999999999,
+          "pane_bytes": 32888,
+          "pane_bytes_without_enumeration": 32888,
+          "query_cpu_seconds": 0.008461779000015213,
+          "query_operations": 5,
+          "query_seconds": 0.008461287000000001,
+          "update_cpu_seconds": 2.639510656000027,
+          "update_seconds": 2.63966058
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            260.98790009020496,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004794085000071391,
+          "merge_seconds": 0.004792888,
+          "pane_bytes": 41592,
+          "pane_bytes_without_enumeration": 15216,
+          "query_cpu_seconds": 0.013889443000039137,
+          "query_operations": 5,
+          "query_seconds": 0.013906983000000001,
+          "update_cpu_seconds": 7.336994598000047,
+          "update_seconds": 7.337174921
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            771.9333840441807,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005479587999957403,
+          "merge_seconds": 0.005478311,
+          "pane_bytes": 30840,
+          "pane_bytes_without_enumeration": 4464,
+          "query_cpu_seconds": 0.014598275000025751,
+          "query_operations": 5,
+          "query_seconds": 0.014597604,
+          "update_cpu_seconds": 6.776804850999952,
+          "update_seconds": 6.777213421
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            29.37331572592389,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0047985479999397285,
+          "merge_seconds": 0.004796764,
+          "pane_bytes": 68216,
+          "pane_bytes_without_enumeration": 41840,
+          "query_cpu_seconds": 0.01201383500006159,
+          "query_operations": 5,
+          "query_seconds": 0.0120132,
+          "update_cpu_seconds": 6.1997626859999855,
+          "update_seconds": 6.200115311
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            29.219769312773764,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0044822759999192385,
+          "merge_seconds": 0.004480724,
+          "pane_bytes": 67704,
+          "pane_bytes_without_enumeration": 67704,
+          "query_cpu_seconds": 0.008599726000113606,
+          "query_operations": 5,
+          "query_seconds": 0.008599063,
+          "update_cpu_seconds": 2.667876894000017,
+          "update_seconds": 2.667901652
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            24.654944731774492,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.008621397999945657,
+          "merge_seconds": 0.008620039,
+          "pane_bytes": 86136,
+          "pane_bytes_without_enumeration": 59760,
+          "query_cpu_seconds": 0.021930389000090145,
+          "query_operations": 5,
+          "query_seconds": 0.021929309999999997,
+          "update_cpu_seconds": 10.098460847999945,
+          "update_seconds": 10.098986889
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            298.15235310585086,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0041367659999878015,
+          "merge_seconds": 0.004135728,
+          "pane_bytes": 36984,
+          "pane_bytes_without_enumeration": 36984,
+          "query_cpu_seconds": 0.008602494000115257,
+          "query_operations": 5,
+          "query_seconds": 0.008601899,
+          "update_cpu_seconds": 2.6743759780000573,
+          "update_seconds": 2.67455085
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            22.326298852784902,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006171023000092646,
+          "merge_seconds": 0.006169666000000001,
+          "pane_bytes": 85112,
+          "pane_bytes_without_enumeration": 58736,
+          "query_cpu_seconds": 0.014109559999837984,
+          "query_operations": 5,
+          "query_seconds": 0.014108654,
+          "update_cpu_seconds": 7.42049249899992,
+          "update_seconds": 7.420809457
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            82.10194576955595,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005698965999954453,
+          "merge_seconds": 0.005697642,
+          "pane_bytes": 56440,
+          "pane_bytes_without_enumeration": 30064,
+          "query_cpu_seconds": 0.013784882000095422,
+          "query_operations": 5,
+          "query_seconds": 0.013784206000000002,
+          "update_cpu_seconds": 7.417584333999969,
+          "update_seconds": 7.417837287
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            738.6255475216251,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004105012000024999,
+          "merge_seconds": 0.004104076,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 33912,
+          "query_cpu_seconds": 0.00865574299984928,
+          "query_operations": 5,
+          "query_seconds": 0.008654852,
+          "update_cpu_seconds": 2.6849649620000378,
+          "update_seconds": 2.685112144
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            34.89193782359977,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005927045000134967,
+          "merge_seconds": 0.005924751,
+          "pane_bytes": 68728,
+          "pane_bytes_without_enumeration": 42352,
+          "query_cpu_seconds": 0.017887307000137298,
+          "query_operations": 5,
+          "query_seconds": 0.017908325,
+          "update_cpu_seconds": 8.331352825000067,
+          "update_seconds": 8.331667728
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            378.74555690973,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004935032000048523,
+          "merge_seconds": 0.004933961,
+          "pane_bytes": 34424,
+          "pane_bytes_without_enumeration": 8048,
+          "query_cpu_seconds": 0.021531944999992447,
+          "query_operations": 5,
+          "query_seconds": 0.021530974,
+          "update_cpu_seconds": 9.963004204999947,
+          "update_seconds": 9.963688817
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            213.25179066788448,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.007562521000068045,
+          "merge_seconds": 0.007561232,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.017864132999875437,
+          "query_operations": 5,
+          "query_seconds": 0.017863467,
+          "update_cpu_seconds": 8.411030385000004,
+          "update_seconds": 8.41145196
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            82.10194576955595,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.007333871000128056,
+          "merge_seconds": 0.007332168,
+          "pane_bytes": 57464,
+          "pane_bytes_without_enumeration": 31088,
+          "query_cpu_seconds": 0.013784525999881225,
+          "query_operations": 5,
+          "query_seconds": 0.013783808,
+          "update_cpu_seconds": 7.489195777999953,
+          "update_seconds": 7.489519362
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            422.6892395917871,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006357473999969443,
+          "merge_seconds": 0.006356103,
+          "pane_bytes": 34936,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.010167790999958015,
+          "query_operations": 5,
+          "query_seconds": 0.010167217000000001,
+          "update_cpu_seconds": 5.185986699000068,
+          "update_seconds": 5.186124287
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            22.68782572057946,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004567207000036433,
+          "merge_seconds": 0.0045656690000000005,
+          "pane_bytes": 84088,
+          "pane_bytes_without_enumeration": 84088,
+          "query_cpu_seconds": 0.008860796999783815,
+          "query_operations": 5,
+          "query_seconds": 0.008860124,
+          "update_cpu_seconds": 2.771817231,
+          "update_seconds": 2.771939567
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            163.16596868558048,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004716518999998698,
+          "merge_seconds": 0.004715397,
+          "pane_bytes": 39544,
+          "pane_bytes_without_enumeration": 13168,
+          "query_cpu_seconds": 0.014611185999910958,
+          "query_operations": 5,
+          "query_seconds": 0.014610411,
+          "update_cpu_seconds": 6.67223637799998,
+          "update_seconds": 6.672503543
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            771.9333840441807,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006987669000068308,
+          "merge_seconds": 0.0069862399999999995,
+          "pane_bytes": 31864,
+          "pane_bytes_without_enumeration": 5488,
+          "query_cpu_seconds": 0.014568072999850301,
+          "query_operations": 5,
+          "query_seconds": 0.014567189000000001,
+          "update_cpu_seconds": 6.787235325999973,
+          "update_seconds": 6.78765741
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            863.4675474141709,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006771279999838953,
+          "merge_seconds": 0.006770338999999999,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.012087891999840394,
+          "query_operations": 5,
+          "query_seconds": 0.012087180999999999,
+          "update_cpu_seconds": 6.327268379000088,
+          "update_seconds": 6.327483294
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            355.07395960287187,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004680416999917725,
+          "merge_seconds": 0.00467915,
+          "pane_bytes": 33400,
+          "pane_bytes_without_enumeration": 7024,
+          "query_cpu_seconds": 0.014613272000133293,
+          "query_operations": 5,
+          "query_seconds": 0.014612478,
+          "update_cpu_seconds": 6.657409033000022,
+          "update_seconds": 6.657782461
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            253.71650185641286,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0043723860002273796,
+          "merge_seconds": 0.004371442,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 41080,
+          "query_cpu_seconds": 0.008667109999805689,
+          "query_operations": 5,
+          "query_seconds": 0.008666488,
+          "update_cpu_seconds": 2.6941004530000328,
+          "update_seconds": 2.6942177259999998
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            306.7324305294382,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.006780821000006654,
+          "merge_seconds": 0.006779766,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.011983127999997123,
+          "query_operations": 5,
+          "query_seconds": 0.011982392,
+          "update_cpu_seconds": 6.329442016999906,
+          "update_seconds": 6.329722626
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            63.10404112668568,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00819013900002119,
+          "merge_seconds": 0.008188638,
+          "pane_bytes": 57464,
+          "pane_bytes_without_enumeration": 31088,
+          "query_cpu_seconds": 0.021598993000111477,
+          "query_operations": 5,
+          "query_seconds": 0.021597979000000003,
+          "update_cpu_seconds": 10.121145085000023,
+          "update_seconds": 10.121703255
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            81.17981896793057,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004442139000047973,
+          "merge_seconds": 0.004440632,
+          "pane_bytes": 55416,
+          "pane_bytes_without_enumeration": 55416,
+          "query_cpu_seconds": 0.008846671000014794,
+          "query_operations": 5,
+          "query_seconds": 0.008846028,
+          "update_cpu_seconds": 2.7670507459999953,
+          "update_seconds": 2.767233209
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            87.82529641809869,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005827909000004183,
+          "merge_seconds": 0.005825694,
+          "pane_bytes": 48248,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.01783969299981436,
+          "query_operations": 5,
+          "query_seconds": 0.017838974,
+          "update_cpu_seconds": 8.335617522999996,
+          "update_seconds": 8.336400459
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            306.7324305294382,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004662528000039856,
+          "merge_seconds": 0.004661129,
+          "pane_bytes": 37496,
+          "pane_bytes_without_enumeration": 11120,
+          "query_cpu_seconds": 0.011956926000038948,
+          "query_operations": 5,
+          "query_seconds": 0.011956111,
+          "update_cpu_seconds": 6.199825611999984,
+          "update_seconds": 6.200129418
+        }
+      ],
+      "panel": {
+        "query": "Count",
+        "window": 10
+      },
+      "seconds": 243.027671524,
+      "selected": "Exact"
+    },
+    {
+      "allocated_memory_budget_bytes": 1126760560,
+      "calibration_feasible": true,
+      "candidates": 41,
+      "evidence": [
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0011382299999240786,
+          "merge_seconds": 0.0011381759999999999,
+          "pane_bytes": 29552,
+          "pane_bytes_without_enumeration": 29552,
+          "query_cpu_seconds": 0.000023049999981594738,
+          "query_operations": 5,
+          "query_seconds": 0.000022906,
+          "update_cpu_seconds": 9.671183794000058,
+          "update_seconds": 9.672128208
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0015724220002084621,
+          "merge_seconds": 0.0015721210000000001,
+          "pane_bytes": 21872,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.000042507000102887105,
+          "query_operations": 5,
+          "query_seconds": 0.000042231,
+          "update_cpu_seconds": 6.027270124000097,
+          "update_seconds": 6.027456638
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004407545000162827,
+          "merge_seconds": 0.004406381,
+          "pane_bytes": 67704,
+          "pane_bytes_without_enumeration": 67704,
+          "query_cpu_seconds": 0.01020975299991278,
+          "query_operations": 5,
+          "query_seconds": 0.010208790999999998,
+          "update_cpu_seconds": 2.6717741720000276,
+          "update_seconds": 2.672010875
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004240456000047743,
+          "merge_seconds": 0.004239665,
+          "pane_bytes": 36984,
+          "pane_bytes_without_enumeration": 36984,
+          "query_cpu_seconds": 0.010198140999932548,
+          "query_operations": 5,
+          "query_seconds": 0.010197279,
+          "update_cpu_seconds": 2.6694653849999668,
+          "update_seconds": 2.6696156330000003
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0024392759999045666,
+          "merge_seconds": 0.002439164,
+          "pane_bytes": 5488,
+          "pane_bytes_without_enumeration": 5488,
+          "query_cpu_seconds": 0.00008574299999963841,
+          "query_operations": 5,
+          "query_seconds": 0.000085459,
+          "update_cpu_seconds": 4.903153390000057,
+          "update_seconds": 4.9035751130000005
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0007784719999790468,
+          "merge_seconds": 0.000778342,
+          "pane_bytes": 7024,
+          "pane_bytes_without_enumeration": 7024,
+          "query_cpu_seconds": 0.000022327999886329053,
+          "query_operations": 5,
+          "query_seconds": 0.000022168,
+          "update_cpu_seconds": 6.36280355100007,
+          "update_seconds": 6.363259218
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.002901458999986062,
+          "merge_seconds": 0.002901314,
+          "pane_bytes": 12656,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.00008474000003388937,
+          "query_operations": 5,
+          "query_seconds": 0.000084456,
+          "update_cpu_seconds": 6.0667484049999985,
+          "update_seconds": 6.0669003870000004
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0012593879999940327,
+          "merge_seconds": 0.001259423,
+          "pane_bytes": 4464,
+          "pane_bytes_without_enumeration": 4464,
+          "query_cpu_seconds": 0.00004120399989915313,
+          "query_operations": 5,
+          "query_seconds": 0.000040979,
+          "update_cpu_seconds": 4.863046907000012,
+          "update_seconds": 4.8631142050000005
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0015913680000494423,
+          "merge_seconds": 0.001591328,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00004128799992031418,
+          "query_operations": 5,
+          "query_seconds": 0.000041103,
+          "update_cpu_seconds": 6.439556811999978,
+          "update_seconds": 6.440276197
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004293950000146651,
+          "merge_seconds": 0.004293567,
+          "pane_bytes": 32888,
+          "pane_bytes_without_enumeration": 32888,
+          "query_cpu_seconds": 0.01012674900005095,
+          "query_operations": 5,
+          "query_seconds": 0.010125907,
+          "update_cpu_seconds": 2.6439454669999805,
+          "update_seconds": 2.644096309
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0009248379999462486,
+          "merge_seconds": 0.000924796,
+          "pane_bytes": 11120,
+          "pane_bytes_without_enumeration": 11120,
+          "query_cpu_seconds": 0.000022482000076706754,
+          "query_operations": 5,
+          "query_seconds": 0.000022338000000000002,
+          "update_cpu_seconds": 7.977161558000034,
+          "update_seconds": 7.978046586
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0019159490000220103,
+          "merge_seconds": 0.00191575,
+          "pane_bytes": 21872,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.00004115700005513645,
+          "query_operations": 5,
+          "query_seconds": 0.000040968,
+          "update_cpu_seconds": 8.05364710699996,
+          "update_seconds": 8.054283569
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0017317510001930714,
+          "merge_seconds": 0.001731466,
+          "pane_bytes": 15728,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.000041504000137138064,
+          "query_operations": 5,
+          "query_seconds": 0.000041272999999999996,
+          "update_cpu_seconds": 7.123668135000003,
+          "update_seconds": 7.124154903
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0024815169999783393,
+          "merge_seconds": 0.002481358,
+          "pane_bytes": 14704,
+          "pane_bytes_without_enumeration": 14704,
+          "query_cpu_seconds": 0.00008513500017670594,
+          "query_operations": 5,
+          "query_seconds": 0.00008486100000000001,
+          "update_cpu_seconds": 4.915096823999988,
+          "update_seconds": 4.915293446
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.000608679000038137,
+          "merge_seconds": 0.000608769,
+          "pane_bytes": 3952,
+          "pane_bytes_without_enumeration": 3952,
+          "query_cpu_seconds": 0.00002300099993135518,
+          "query_operations": 5,
+          "query_seconds": 0.000022822,
+          "update_cpu_seconds": 4.763224046999994,
+          "update_seconds": 4.7635515139999995
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.002127478000033989,
+          "merge_seconds": 0.002127116,
+          "pane_bytes": 15728,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.00004145100001551327,
+          "query_operations": 5,
+          "query_seconds": 0.000041212,
+          "update_cpu_seconds": 9.756573731000003,
+          "update_seconds": 9.757202734
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004248330999871541,
+          "merge_seconds": 0.00424766,
+          "pane_bytes": 55416,
+          "pane_bytes_without_enumeration": 55416,
+          "query_cpu_seconds": 0.010513516000173695,
+          "query_operations": 5,
+          "query_seconds": 0.010512512,
+          "update_cpu_seconds": 2.766890596000053,
+          "update_seconds": 2.767212599
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.002871001000016804,
+          "merge_seconds": 0.0028710169999999996,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00008624800000234245,
+          "query_operations": 5,
+          "query_seconds": 0.000085969,
+          "update_cpu_seconds": 6.042970121000053,
+          "update_seconds": 6.043434118
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0039311269997597265,
+          "merge_seconds": 0.003930709,
+          "pane_bytes": 31864,
+          "pane_bytes_without_enumeration": 31864,
+          "query_cpu_seconds": 0.010180945000115571,
+          "query_operations": 5,
+          "query_seconds": 0.010180117,
+          "update_cpu_seconds": 2.671186854000098,
+          "update_seconds": 2.6714165210000003
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0030939450000460056,
+          "merge_seconds": 0.0030938680000000005,
+          "pane_bytes": 5488,
+          "pane_bytes_without_enumeration": 5488,
+          "query_cpu_seconds": 0.00008546100013973046,
+          "query_operations": 5,
+          "query_seconds": 0.00008521599999999999,
+          "update_cpu_seconds": 6.491598300000078,
+          "update_seconds": 6.492038192
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0008059059999823148,
+          "merge_seconds": 0.000805757,
+          "pane_bytes": 21360,
+          "pane_bytes_without_enumeration": 21360,
+          "query_cpu_seconds": 0.00002342300001600961,
+          "query_operations": 5,
+          "query_seconds": 0.000023244,
+          "update_cpu_seconds": 5.917149311999992,
+          "update_seconds": 5.917778985
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0008939450000298166,
+          "merge_seconds": 0.0008939149999999999,
+          "pane_bytes": 6000,
+          "pane_bytes_without_enumeration": 6000,
+          "query_cpu_seconds": 0.000022893999926054676,
+          "query_operations": 5,
+          "query_seconds": 0.000022743999999999998,
+          "update_cpu_seconds": 7.976336526999944,
+          "update_seconds": 7.977115039
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.003621381000129986,
+          "merge_seconds": 0.0036212659999999997,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00008579899997585017,
+          "query_operations": 5,
+          "query_seconds": 0.00008556199999999999,
+          "update_cpu_seconds": 8.117375347999996,
+          "update_seconds": 8.117861855
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0007190439998794318,
+          "merge_seconds": 0.000718882,
+          "pane_bytes": 6000,
+          "pane_bytes_without_enumeration": 6000,
+          "query_cpu_seconds": 0.000022878999970998848,
+          "query_operations": 5,
+          "query_seconds": 0.000022763000000000002,
+          "update_cpu_seconds": 5.939416531000006,
+          "update_seconds": 5.939646381
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0029309889998785366,
+          "merge_seconds": 0.002930771,
+          "pane_bytes": 22896,
+          "pane_bytes_without_enumeration": 22896,
+          "query_cpu_seconds": 0.00008553300006042264,
+          "query_operations": 5,
+          "query_seconds": 0.00008526700000000001,
+          "update_cpu_seconds": 6.0353573880000795,
+          "update_seconds": 6.035721626
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0040989679998801876,
+          "merge_seconds": 0.00409852,
+          "pane_bytes": 29816,
+          "pane_bytes_without_enumeration": 29816,
+          "query_cpu_seconds": 0.01011583099989366,
+          "query_operations": 5,
+          "query_seconds": 0.010114801999999999,
+          "update_cpu_seconds": 2.6383932109999932,
+          "update_seconds": 2.638688394
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0022016259999873,
+          "merge_seconds": 0.0022243280000000002,
+          "pane_bytes": 30064,
+          "pane_bytes_without_enumeration": 30064,
+          "query_cpu_seconds": 0.000042149999785578984,
+          "query_operations": 5,
+          "query_seconds": 0.000041953,
+          "update_cpu_seconds": 9.765237379999917,
+          "update_seconds": 9.766645157
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0008816370000204188,
+          "merge_seconds": 0.0008816049999999999,
+          "pane_bytes": 15216,
+          "pane_bytes_without_enumeration": 15216,
+          "query_cpu_seconds": 0.000022821000129624736,
+          "query_operations": 5,
+          "query_seconds": 0.000022666,
+          "update_cpu_seconds": 7.053129646000002,
+          "update_seconds": 7.053781403
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0008083639997948922,
+          "merge_seconds": 0.000808348,
+          "pane_bytes": 13168,
+          "pane_bytes_without_enumeration": 13168,
+          "query_cpu_seconds": 0.000022426999976232764,
+          "query_operations": 5,
+          "query_seconds": 0.000022282,
+          "update_cpu_seconds": 6.370565868999961,
+          "update_seconds": 6.371173482
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004432459999861749,
+          "merge_seconds": 0.004431283,
+          "pane_bytes": 51320,
+          "pane_bytes_without_enumeration": 51320,
+          "query_cpu_seconds": 0.010125023999876248,
+          "query_operations": 5,
+          "query_seconds": 0.010124082999999999,
+          "update_cpu_seconds": 2.6453486469999916,
+          "update_seconds": 2.64535453
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0016333380000332909,
+          "merge_seconds": 0.00163328,
+          "pane_bytes": 13680,
+          "pane_bytes_without_enumeration": 13680,
+          "query_cpu_seconds": 0.00004097400005775853,
+          "query_operations": 5,
+          "query_seconds": 0.00004078,
+          "update_cpu_seconds": 6.443825953999976,
+          "update_seconds": 6.444321737
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0014864500000157932,
+          "merge_seconds": 0.001486252,
+          "pane_bytes": 11632,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.00004185500006315124,
+          "query_operations": 5,
+          "query_seconds": 0.000041638000000000004,
+          "update_cpu_seconds": 6.013620444000026,
+          "update_seconds": 6.013920891
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.001254170000152044,
+          "merge_seconds": 0.001254166,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00004151999996793165,
+          "query_operations": 5,
+          "query_seconds": 0.000041283,
+          "update_cpu_seconds": 4.847055090000026,
+          "update_seconds": 4.84746645
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0031130760002042734,
+          "merge_seconds": 0.003113012,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.00008606900030372344,
+          "query_operations": 5,
+          "query_seconds": 0.000085846,
+          "update_cpu_seconds": 6.5025347740000825,
+          "update_seconds": 6.502687152
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004088532999958261,
+          "merge_seconds": 0.004087748,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 41080,
+          "query_cpu_seconds": 0.01030494099995849,
+          "query_operations": 5,
+          "query_seconds": 0.010303917,
+          "update_cpu_seconds": 2.689742066000008,
+          "update_seconds": 2.689772086
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0041368810001358725,
+          "merge_seconds": 0.004136331,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 33912,
+          "query_cpu_seconds": 0.010297419999915292,
+          "query_operations": 5,
+          "query_seconds": 0.010296596,
+          "update_cpu_seconds": 2.6898918079999703,
+          "update_seconds": 2.690188541
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0006178269999281838,
+          "merge_seconds": 0.000617782,
+          "pane_bytes": 7024,
+          "pane_bytes_without_enumeration": 7024,
+          "query_cpu_seconds": 0.00002288899997893168,
+          "query_operations": 5,
+          "query_seconds": 0.00002272,
+          "update_cpu_seconds": 4.7795284150000725,
+          "update_seconds": 4.77978217
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0020819749997826875,
+          "merge_seconds": 0.002081909,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.00004060999992816505,
+          "query_operations": 5,
+          "query_seconds": 0.000040409,
+          "update_cpu_seconds": 9.750142826000001,
+          "update_seconds": 9.750494648
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.004749581000169201,
+          "merge_seconds": 0.004748909,
+          "pane_bytes": 84088,
+          "pane_bytes_without_enumeration": 84088,
+          "query_cpu_seconds": 0.011274593999928584,
+          "query_operations": 5,
+          "query_seconds": 0.011273253,
+          "update_cpu_seconds": 2.7699918250000337,
+          "update_seconds": 2.770151716
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0016955679998318374,
+          "merge_seconds": 0.0016955719999999998,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.0000483490000533493,
+          "query_operations": 5,
+          "query_seconds": 0.000048134,
+          "update_cpu_seconds": 7.151332243999946,
+          "update_seconds": 7.156734732
+        },
+        {
+          "composition_operations": 50,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.001848018999908163,
+          "merge_seconds": 0.0018479209999999998,
+          "pane_bytes": 6512,
+          "pane_bytes_without_enumeration": 6512,
+          "query_cpu_seconds": 0.00004049799997574155,
+          "query_operations": 5,
+          "query_seconds": 0.000040307,
+          "update_cpu_seconds": 8.052420039000026,
+          "update_seconds": 8.053117183
+        }
+      ],
+      "panel": {
+        "query": "Top3",
+        "window": 10
+      },
+      "seconds": 237.31773132,
+      "selected": {
+        "Cms": {
+          "depth": 5,
+          "heap": 16,
+          "width": 128
+        }
+      }
+    },
+    {
+      "allocated_memory_budget_bytes": 6760563360,
+      "calibration_feasible": false,
+      "candidates": 40,
+      "evidence": [
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            267.2130982179011,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.025233210000124018,
+          "merge_seconds": 0.025231299999999998,
+          "pane_bytes": 39544,
+          "pane_bytes_without_enumeration": 13168,
+          "query_cpu_seconds": 0.0254898079999748,
+          "query_operations": 5,
+          "query_seconds": 0.025488794999999998,
+          "update_cpu_seconds": 6.673476298999958,
+          "update_seconds": 6.6738117070000005
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            146.07809513653825,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.03235915599998407,
+          "merge_seconds": 0.032356808,
+          "pane_bytes": 48248,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.03114622899988717,
+          "query_operations": 5,
+          "query_seconds": 0.031145166000000002,
+          "update_cpu_seconds": 8.385573039000064,
+          "update_seconds": 8.386247384
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            111.91975871703865,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.025624910000033196,
+          "merge_seconds": 0.025622935000000003,
+          "pane_bytes": 51832,
+          "pane_bytes_without_enumeration": 25456,
+          "query_cpu_seconds": 0.025549182999839104,
+          "query_operations": 5,
+          "query_seconds": 0.025569187000000004,
+          "update_cpu_seconds": 6.687621096000157,
+          "update_seconds": 6.68847212
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            705.0342696545559,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.024039076000008208,
+          "merge_seconds": 0.024037166999999998,
+          "pane_bytes": 33400,
+          "pane_bytes_without_enumeration": 7024,
+          "query_cpu_seconds": 0.017931235999981254,
+          "query_operations": 5,
+          "query_seconds": 0.017929725,
+          "update_cpu_seconds": 5.062363398999992,
+          "update_seconds": 5.062369559
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            492.70564794840794,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.020779713999900196,
+          "merge_seconds": 0.020777378,
+          "pane_bytes": 36984,
+          "pane_bytes_without_enumeration": 36984,
+          "query_cpu_seconds": 0.014980178000314481,
+          "query_operations": 5,
+          "query_seconds": 0.014979445000000001,
+          "update_cpu_seconds": 2.6726785180001116,
+          "update_seconds": 2.6728328120000002
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1217.467100507188,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02047870999990664,
+          "merge_seconds": 0.020477091,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 33912,
+          "query_cpu_seconds": 0.015091762999986713,
+          "query_operations": 5,
+          "query_seconds": 0.01509094,
+          "update_cpu_seconds": 2.6940655020000577,
+          "update_seconds": 2.694240654
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            165.53854681678163,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.029987145999939457,
+          "merge_seconds": 0.029984458999999998,
+          "pane_bytes": 48248,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.02091018900000563,
+          "query_operations": 5,
+          "query_seconds": 0.020928795,
+          "update_cpu_seconds": 6.276740502999928,
+          "update_seconds": 6.276886995
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            133.2568156240228,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.021304850000205988,
+          "merge_seconds": 0.021302901,
+          "pane_bytes": 55416,
+          "pane_bytes_without_enumeration": 55416,
+          "query_cpu_seconds": 0.015443359000073542,
+          "query_operations": 5,
+          "query_seconds": 0.015442545,
+          "update_cpu_seconds": 2.767013016999954,
+          "update_seconds": 2.767283372
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1928.4426124385227,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02389423199997509,
+          "merge_seconds": 0.023891875,
+          "pane_bytes": 30328,
+          "pane_bytes_without_enumeration": 3952,
+          "query_cpu_seconds": 0.017741617999945447,
+          "query_operations": 5,
+          "query_seconds": 0.017740451,
+          "update_cpu_seconds": 5.052557371000034,
+          "update_seconds": 5.052816373
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            427.80215488855936,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.03129464500011636,
+          "merge_seconds": 0.031292079,
+          "pane_bytes": 42104,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.02408804600008807,
+          "query_operations": 5,
+          "query_seconds": 0.024086781,
+          "update_cpu_seconds": 7.4413132940001105,
+          "update_seconds": 7.441407109
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            37.575695131927,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.04374926299999515,
+          "merge_seconds": 0.043747827,
+          "pane_bytes": 86136,
+          "pane_bytes_without_enumeration": 59760,
+          "query_cpu_seconds": 0.02450043299995741,
+          "query_operations": 5,
+          "query_seconds": 0.024498873,
+          "update_cpu_seconds": 7.477774188000012,
+          "update_seconds": 7.478594516
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            267.2130982179011,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.03050741399965773,
+          "merge_seconds": 0.030505561999999996,
+          "pane_bytes": 40056,
+          "pane_bytes_without_enumeration": 13680,
+          "query_cpu_seconds": 0.025554322000061802,
+          "query_operations": 5,
+          "query_seconds": 0.025553534,
+          "update_cpu_seconds": 6.742682332999948,
+          "update_seconds": 6.74364099
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            505.50785807574056,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02973370499989869,
+          "merge_seconds": 0.029731235,
+          "pane_bytes": 38008,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.020910643000092932,
+          "query_operations": 5,
+          "query_seconds": 0.020909723999999998,
+          "update_cpu_seconds": 6.271116068000083,
+          "update_seconds": 6.271547483
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            103.75220174544917,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.027355861999922126,
+          "merge_seconds": 0.027374433,
+          "pane_bytes": 55928,
+          "pane_bytes_without_enumeration": 29552,
+          "query_cpu_seconds": 0.037599099000090064,
+          "query_operations": 5,
+          "query_seconds": 0.037597865,
+          "update_cpu_seconds": 9.990385385999843,
+          "update_seconds": 9.991436685
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            264.1998951904321,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.046927705000371134,
+          "merge_seconds": 0.046925528,
+          "pane_bytes": 43128,
+          "pane_bytes_without_enumeration": 16752,
+          "query_cpu_seconds": 0.037633799999866824,
+          "query_operations": 5,
+          "query_seconds": 0.037632371,
+          "update_cpu_seconds": 10.139190431000088,
+          "update_seconds": 10.14026676
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1928.4426124385227,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02799337400006152,
+          "merge_seconds": 0.027991283,
+          "pane_bytes": 30840,
+          "pane_bytes_without_enumeration": 4464,
+          "query_cpu_seconds": 0.017805249000048207,
+          "query_operations": 5,
+          "query_seconds": 0.017804265,
+          "update_cpu_seconds": 5.139547105000133,
+          "update_seconds": 5.139780467
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            48.83237241884824,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0217215729999225,
+          "merge_seconds": 0.021718796,
+          "pane_bytes": 67704,
+          "pane_bytes_without_enumeration": 67704,
+          "query_cpu_seconds": 0.014980261999880895,
+          "query_operations": 5,
+          "query_seconds": 0.014979145,
+          "update_cpu_seconds": 2.6703697130000137,
+          "update_seconds": 2.670430089
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            56.030849173651966,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.033077418999937436,
+          "merge_seconds": 0.033074542,
+          "pane_bytes": 68728,
+          "pane_bytes_without_enumeration": 42352,
+          "query_cpu_seconds": 0.031192653000289283,
+          "query_operations": 5,
+          "query_seconds": 0.031191734,
+          "update_cpu_seconds": 8.335815894999996,
+          "update_seconds": 8.33650065
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            701.7389165803261,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.020608550999781983,
+          "merge_seconds": 0.020606555999999998,
+          "pane_bytes": 32888,
+          "pane_bytes_without_enumeration": 32888,
+          "query_cpu_seconds": 0.014794500999983029,
+          "query_operations": 5,
+          "query_seconds": 0.014793591,
+          "update_cpu_seconds": 2.647078398999952,
+          "update_seconds": 2.647403567
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            234.94753037051765,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.020790415000192297,
+          "merge_seconds": 0.020809624999999998,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 39032,
+          "query_cpu_seconds": 0.014801859999806766,
+          "query_operations": 5,
+          "query_seconds": 0.014801037,
+          "update_cpu_seconds": 2.650330457999871,
+          "update_seconds": 2.650700929
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            264.1998951904321,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.03374373399992692,
+          "merge_seconds": 0.033741834,
+          "pane_bytes": 42104,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.037590854000200125,
+          "query_operations": 5,
+          "query_seconds": 0.037589732,
+          "update_cpu_seconds": 10.084815216000152,
+          "update_seconds": 10.085837931
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            267.2130982179011,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.04030958400016971,
+          "merge_seconds": 0.040306773000000004,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 14704,
+          "query_cpu_seconds": 0.025517339000089123,
+          "query_operations": 5,
+          "query_seconds": 0.025516630999999998,
+          "update_cpu_seconds": 6.80950513699986,
+          "update_seconds": 6.809693509
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1928.4426124385227,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.03558070099984434,
+          "merge_seconds": 0.035597133,
+          "pane_bytes": 31864,
+          "pane_bytes_without_enumeration": 5488,
+          "query_cpu_seconds": 0.01774389000024712,
+          "query_operations": 5,
+          "query_seconds": 0.017742693,
+          "update_cpu_seconds": 5.1924339509998845,
+          "update_seconds": 5.192992766
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            103.75220174544917,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.04743228199981786,
+          "merge_seconds": 0.047430057,
+          "pane_bytes": 57464,
+          "pane_bytes_without_enumeration": 31088,
+          "query_cpu_seconds": 0.03769046200022785,
+          "query_operations": 5,
+          "query_seconds": 0.037689201,
+          "update_cpu_seconds": 10.12207546500008,
+          "update_seconds": 10.122877945
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            362.1332445670265,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.032061170000019956,
+          "merge_seconds": 0.032059524000000006,
+          "pane_bytes": 38008,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.031112501999814413,
+          "query_operations": 5,
+          "query_seconds": 0.031111304,
+          "update_cpu_seconds": 8.33652723199998,
+          "update_seconds": 8.337219472
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1425.0644252213513,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.024758166000083293,
+          "merge_seconds": 0.024755928,
+          "pane_bytes": 32376,
+          "pane_bytes_without_enumeration": 6000,
+          "query_cpu_seconds": 0.02089526600013869,
+          "query_operations": 5,
+          "query_seconds": 0.020893982,
+          "update_cpu_seconds": 6.192618957000036,
+          "update_seconds": 6.193129025
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            362.1332445670265,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.043594474000201444,
+          "merge_seconds": 0.043592282,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.031207746000063707,
+          "query_operations": 5,
+          "query_seconds": 0.031206483,
+          "update_cpu_seconds": 8.414957464000054,
+          "update_seconds": 8.415445326
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            39.64659673918317,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.048952066000083505,
+          "merge_seconds": 0.048950239,
+          "pane_bytes": 86136,
+          "pane_bytes_without_enumeration": 59760,
+          "query_cpu_seconds": 0.038283067999827836,
+          "query_operations": 5,
+          "query_seconds": 0.038303573,
+          "update_cpu_seconds": 10.123354899000105,
+          "update_seconds": 10.124385934
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            642.5661580376498,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.04668804100003854,
+          "merge_seconds": 0.046686241,
+          "pane_bytes": 35960,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.03761874200017701,
+          "query_operations": 5,
+          "query_seconds": 0.037617702,
+          "update_cpu_seconds": 10.11793160000002,
+          "update_seconds": 10.118745106
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            37.85047200330856,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02215083600003709,
+          "merge_seconds": 0.022148318,
+          "pane_bytes": 84088,
+          "pane_bytes_without_enumeration": 84088,
+          "query_cpu_seconds": 0.01547946999994565,
+          "query_operations": 5,
+          "query_seconds": 0.015478519999999999,
+          "update_cpu_seconds": 2.772361508000131,
+          "update_seconds": 2.772628051
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            49.39297391625129,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.030729725000128383,
+          "merge_seconds": 0.030726475000000003,
+          "pane_bytes": 68728,
+          "pane_bytes_without_enumeration": 42352,
+          "query_cpu_seconds": 0.020888573999854998,
+          "query_operations": 5,
+          "query_seconds": 0.020887482,
+          "update_cpu_seconds": 6.280099624000059,
+          "update_seconds": 6.280540745
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            135.78932124036504,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.042176646999791956,
+          "merge_seconds": 0.042174823,
+          "pane_bytes": 57464,
+          "pane_bytes_without_enumeration": 31088,
+          "query_cpu_seconds": 0.024095982999938315,
+          "query_operations": 5,
+          "query_seconds": 0.024094903,
+          "update_cpu_seconds": 7.474320581000029,
+          "update_seconds": 7.474646327
+        },
+        {
+          "composition_operations": 300,
+          "config": "Exact",
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.018154792999894198,
+          "merge_seconds": 0.018152964,
+          "pane_bytes": 53120,
+          "pane_bytes_without_enumeration": 53120,
+          "query_cpu_seconds": 0.0021322799998415576,
+          "query_operations": 5,
+          "query_seconds": 0.0021317819999999996,
+          "update_cpu_seconds": 0.4137238339999385,
+          "update_seconds": 0.413733175
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            505.50785807574056,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.03875976100016487,
+          "merge_seconds": 0.03875752700000001,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.020956741999725637,
+          "query_operations": 5,
+          "query_seconds": 0.020955551,
+          "update_cpu_seconds": 6.325347989999955,
+          "update_seconds": 6.325461282
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            419.2574131634477,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.020956035999915912,
+          "merge_seconds": 0.020954238,
+          "pane_bytes": 41080,
+          "pane_bytes_without_enumeration": 41080,
+          "query_cpu_seconds": 0.015106824999747914,
+          "query_operations": 5,
+          "query_seconds": 0.015105847,
+          "update_cpu_seconds": 2.6952132860001257,
+          "update_seconds": 2.695497354
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            146.07809513653825,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.026297957000224415,
+          "merge_seconds": 0.026295369,
+          "pane_bytes": 47736,
+          "pane_bytes_without_enumeration": 21360,
+          "query_cpu_seconds": 0.03119557000036366,
+          "query_operations": 5,
+          "query_seconds": 0.031194737,
+          "update_cpu_seconds": 8.264208783999948,
+          "update_seconds": 8.264970264
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            79.78438625640109,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.021424537000029886,
+          "merge_seconds": 0.021422696999999997,
+          "pane_bytes": 51320,
+          "pane_bytes_without_enumeration": 51320,
+          "query_cpu_seconds": 0.014799358999880496,
+          "query_operations": 5,
+          "query_seconds": 0.014798601000000002,
+          "update_cpu_seconds": 2.6454016449999926,
+          "update_seconds": 2.645577083
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            82.18107654124583,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.024636474999852,
+          "merge_seconds": 0.024635077999999998,
+          "pane_bytes": 51832,
+          "pane_bytes_without_enumeration": 25456,
+          "query_cpu_seconds": 0.017716012999926534,
+          "query_operations": 5,
+          "query_seconds": 0.017715097,
+          "update_cpu_seconds": 5.061309015999996,
+          "update_seconds": 5.061864309
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            246.4138027764448,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02422314499995082,
+          "merge_seconds": 0.024220991999999997,
+          "pane_bytes": 39544,
+          "pane_bytes_without_enumeration": 13168,
+          "query_cpu_seconds": 0.0177356129997861,
+          "query_operations": 5,
+          "query_seconds": 0.017734539,
+          "update_cpu_seconds": 5.059810913000092,
+          "update_seconds": 5.060239381
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1224.6107707922345,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.025474771999824952,
+          "merge_seconds": 0.025472539000000002,
+          "pane_bytes": 34424,
+          "pane_bytes_without_enumeration": 8048,
+          "query_cpu_seconds": 0.024045092000051227,
+          "query_operations": 5,
+          "query_seconds": 0.024043959,
+          "update_cpu_seconds": 7.33615805400018,
+          "update_seconds": 7.336800199
+        }
+      ],
+      "panel": {
+        "query": "Count",
+        "window": 60
+      },
+      "seconds": 247.748164662,
+      "selected": "Exact"
+    },
+    {
+      "allocated_memory_budget_bytes": 6760563360,
+      "calibration_feasible": true,
+      "candidates": 30,
+      "evidence": [
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02078936300017631,
+          "merge_seconds": 0.020787793000000002,
+          "pane_bytes": 36984,
+          "pane_bytes_without_enumeration": 36984,
+          "query_cpu_seconds": 0.017934282999931384,
+          "query_operations": 5,
+          "query_seconds": 0.017932662,
+          "update_cpu_seconds": 2.668823125000017,
+          "update_seconds": 2.669049805
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.015473025000119378,
+          "merge_seconds": 0.015472318,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.00008852600012687617,
+          "query_operations": 5,
+          "query_seconds": 0.00008819800000000001,
+          "update_cpu_seconds": 4.900957015999893,
+          "update_seconds": 4.901286756
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005037653000044884,
+          "merge_seconds": 0.005037179,
+          "pane_bytes": 13168,
+          "pane_bytes_without_enumeration": 13168,
+          "query_cpu_seconds": 0.000024535999955332954,
+          "query_operations": 5,
+          "query_seconds": 0.000024403,
+          "update_cpu_seconds": 6.370993366999983,
+          "update_seconds": 6.371605647
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02085307000015746,
+          "merge_seconds": 0.020851348999999998,
+          "pane_bytes": 39032,
+          "pane_bytes_without_enumeration": 39032,
+          "query_cpu_seconds": 0.017716628999551176,
+          "query_operations": 5,
+          "query_seconds": 0.017714732,
+          "update_cpu_seconds": 2.6381284419999247,
+          "update_seconds": 2.638345838
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.013455709000254501,
+          "merge_seconds": 0.013454305,
+          "pane_bytes": 15728,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.00004416600017975725,
+          "query_operations": 5,
+          "query_seconds": 0.000043984000000000004,
+          "update_cpu_seconds": 9.753545961999862,
+          "update_seconds": 9.753902768
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.008555031999776475,
+          "merge_seconds": 0.008553781,
+          "pane_bytes": 25968,
+          "pane_bytes_without_enumeration": 25968,
+          "query_cpu_seconds": 0.000043289999666740187,
+          "query_operations": 5,
+          "query_seconds": 0.000043047,
+          "update_cpu_seconds": 4.864774958999988,
+          "update_seconds": 4.864825027
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.009282885999937207,
+          "merge_seconds": 0.009281989000000001,
+          "pane_bytes": 6512,
+          "pane_bytes_without_enumeration": 6512,
+          "query_cpu_seconds": 0.00004314299985708203,
+          "query_operations": 5,
+          "query_seconds": 0.000042916999999999996,
+          "update_cpu_seconds": 5.992686002000028,
+          "update_seconds": 5.9931377569999995
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.011062570000149208,
+          "merge_seconds": 0.011061734,
+          "pane_bytes": 15728,
+          "pane_bytes_without_enumeration": 15728,
+          "query_cpu_seconds": 0.00004393500034893805,
+          "query_operations": 5,
+          "query_seconds": 0.000043669,
+          "update_cpu_seconds": 7.126116787000001,
+          "update_seconds": 7.126824319
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.011661894000098982,
+          "merge_seconds": 0.011661138000000001,
+          "pane_bytes": 11632,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.00004220200025883969,
+          "query_operations": 5,
+          "query_seconds": 0.000041995,
+          "update_cpu_seconds": 8.03766009900005,
+          "update_seconds": 8.03817417
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667
+          ],
+          "merge_cpu_seconds": 0.022868860000016866,
+          "merge_seconds": 0.0228681,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.00008832599996821955,
+          "query_operations": 5,
+          "query_seconds": 0.000088053,
+          "update_cpu_seconds": 8.10552004200008,
+          "update_seconds": 8.106005766
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02146402899984423,
+          "merge_seconds": 0.021462929,
+          "pane_bytes": 16752,
+          "pane_bytes_without_enumeration": 16752,
+          "query_cpu_seconds": 0.00008726099986233748,
+          "query_operations": 5,
+          "query_seconds": 0.000086967,
+          "update_cpu_seconds": 7.178678833999811,
+          "update_seconds": 7.180247445
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 32,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667
+          ],
+          "merge_cpu_seconds": 0.013155143000176395,
+          "merge_seconds": 0.013154477000000001,
+          "pane_bytes": 8560,
+          "pane_bytes_without_enumeration": 8560,
+          "query_cpu_seconds": 0.00004279099971427058,
+          "query_operations": 5,
+          "query_seconds": 0.000042598,
+          "update_cpu_seconds": 9.747248070000069,
+          "update_seconds": 9.748218269
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667
+          ],
+          "merge_cpu_seconds": 0.02627897600018514,
+          "merge_seconds": 0.026277981,
+          "pane_bytes": 9584,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.00008574799994676141,
+          "query_operations": 5,
+          "query_seconds": 0.000085514,
+          "update_cpu_seconds": 9.816475460999982,
+          "update_seconds": 9.817324158
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.00558889100034321,
+          "merge_seconds": 0.005587958,
+          "pane_bytes": 15216,
+          "pane_bytes_without_enumeration": 15216,
+          "query_cpu_seconds": 0.000023837000071580405,
+          "query_operations": 5,
+          "query_seconds": 0.000023648,
+          "update_cpu_seconds": 7.051612227000078,
+          "update_seconds": 7.052162471
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.020414479999999458,
+          "merge_seconds": 0.020413396,
+          "pane_bytes": 31864,
+          "pane_bytes_without_enumeration": 31864,
+          "query_cpu_seconds": 0.0179447920002076,
+          "query_operations": 5,
+          "query_seconds": 0.017943272000000003,
+          "update_cpu_seconds": 2.6611007830001654,
+          "update_seconds": 2.661248956
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.005722736999587141,
+          "merge_seconds": 0.005721573,
+          "pane_bytes": 41840,
+          "pane_bytes_without_enumeration": 41840,
+          "query_cpu_seconds": 0.000025286999516538344,
+          "query_operations": 5,
+          "query_seconds": 0.000025121999999999998,
+          "update_cpu_seconds": 5.918184753000105,
+          "update_seconds": 5.918495004
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 16,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.003709961000140538,
+          "merge_seconds": 0.0037097330000000006,
+          "pane_bytes": 3952,
+          "pane_bytes_without_enumeration": 3952,
+          "query_cpu_seconds": 0.00002312099968548864,
+          "query_operations": 5,
+          "query_seconds": 0.000022951,
+          "update_cpu_seconds": 4.76037674600002,
+          "update_seconds": 4.760886731
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0054838219998600835,
+          "merge_seconds": 0.005482664999999999,
+          "pane_bytes": 25456,
+          "pane_bytes_without_enumeration": 25456,
+          "query_cpu_seconds": 0.000025585000003047753,
+          "query_operations": 5,
+          "query_seconds": 0.000025393,
+          "update_cpu_seconds": 6.390017946999933,
+          "update_seconds": 6.390530171
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667
+          ],
+          "merge_cpu_seconds": 0.009902608999937001,
+          "merge_seconds": 0.009901987,
+          "pane_bytes": 7536,
+          "pane_bytes_without_enumeration": 7536,
+          "query_cpu_seconds": 0.000043604999973467784,
+          "query_operations": 5,
+          "query_seconds": 0.000043403000000000004,
+          "update_cpu_seconds": 6.434792503999915,
+          "update_seconds": 6.435022986
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.02045355399991422,
+          "merge_seconds": 0.020452612999999998,
+          "pane_bytes": 33912,
+          "pane_bytes_without_enumeration": 33912,
+          "query_cpu_seconds": 0.018084357999896383,
+          "query_operations": 5,
+          "query_seconds": 0.018082881999999998,
+          "update_cpu_seconds": 2.68841274600004,
+          "update_seconds": 2.688471483
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0184817069998644,
+          "merge_seconds": 0.018481016,
+          "pane_bytes": 12656,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.00008844600006341352,
+          "query_operations": 5,
+          "query_seconds": 0.000088057,
+          "update_cpu_seconds": 6.035842314000092,
+          "update_seconds": 6.036199316
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 3,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667
+          ],
+          "merge_cpu_seconds": 0.0048089210001762694,
+          "merge_seconds": 0.004808465,
+          "pane_bytes": 7024,
+          "pane_bytes_without_enumeration": 7024,
+          "query_cpu_seconds": 0.000024737000103414175,
+          "query_operations": 5,
+          "query_seconds": 0.000024567,
+          "update_cpu_seconds": 6.365434160999939,
+          "update_seconds": 6.365895087
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 1024
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.010492501999806336,
+          "merge_seconds": 0.010491288,
+          "pane_bytes": 42352,
+          "pane_bytes_without_enumeration": 42352,
+          "query_cpu_seconds": 0.000044930999820280704,
+          "query_operations": 5,
+          "query_seconds": 0.00004461,
+          "update_cpu_seconds": 5.995132485000113,
+          "update_seconds": 5.995595015
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 512
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.009808662000295953,
+          "merge_seconds": 0.009807459999999999,
+          "pane_bytes": 21872,
+          "pane_bytes_without_enumeration": 21872,
+          "query_cpu_seconds": 0.00004410300016388646,
+          "query_operations": 5,
+          "query_seconds": 0.000043948999999999995,
+          "update_cpu_seconds": 5.9893803610000305,
+          "update_seconds": 5.989475755
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 5,
+              "heap": 64,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.023184790000186695,
+          "merge_seconds": 0.023183827999999997,
+          "pane_bytes": 12656,
+          "pane_bytes_without_enumeration": 12656,
+          "query_cpu_seconds": 0.00008984800001599069,
+          "query_operations": 5,
+          "query_seconds": 0.00008958499999999999,
+          "update_cpu_seconds": 8.127516359999845,
+          "update_seconds": 8.127939067
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cs": {
+              "depth": 7,
+              "heap": 16,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.0067007420000209095,
+          "merge_seconds": 0.006700167000000001,
+          "pane_bytes": 15216,
+          "pane_bytes_without_enumeration": 15216,
+          "query_cpu_seconds": 0.000024845999860190204,
+          "query_operations": 5,
+          "query_seconds": 0.0000247,
+          "update_cpu_seconds": 9.674004997000111,
+          "update_seconds": 9.674920877
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.6666666666666667
+          ],
+          "merge_cpu_seconds": 0.020226662999903056,
+          "merge_seconds": 0.020225434,
+          "pane_bytes": 29816,
+          "pane_bytes_without_enumeration": 29816,
+          "query_cpu_seconds": 0.017686094000282537,
+          "query_operations": 5,
+          "query_seconds": 0.017684459,
+          "update_cpu_seconds": 2.6400146940000013,
+          "update_seconds": 2.640015402
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 3,
+              "heap": 0,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.020506742999941707,
+          "merge_seconds": 0.020505723,
+          "pane_bytes": 32888,
+          "pane_bytes_without_enumeration": 32888,
+          "query_cpu_seconds": 0.017765117999715585,
+          "query_operations": 5,
+          "query_seconds": 0.017763609,
+          "update_cpu_seconds": 2.643839541999796,
+          "update_seconds": 2.644068204
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 5,
+              "heap": 32,
+              "width": 256
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.009401023000009445,
+          "merge_seconds": 0.009400044,
+          "pane_bytes": 11632,
+          "pane_bytes_without_enumeration": 11632,
+          "query_cpu_seconds": 0.00004262800007381884,
+          "query_operations": 5,
+          "query_seconds": 0.000042419,
+          "update_cpu_seconds": 5.989623420999806,
+          "update_seconds": 5.990097183
+        },
+        {
+          "composition_operations": 300,
+          "config": {
+            "Cms": {
+              "depth": 7,
+              "heap": 64,
+              "width": 128
+            }
+          },
+          "losses": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "merge_cpu_seconds": 0.021188254000207962,
+          "merge_seconds": 0.021187659,
+          "pane_bytes": 9584,
+          "pane_bytes_without_enumeration": 9584,
+          "query_cpu_seconds": 0.00008456599994133285,
+          "query_operations": 5,
+          "query_seconds": 0.00008428400000000001,
+          "update_cpu_seconds": 7.178384471000072,
+          "update_seconds": 7.17881359
+        }
+      ],
+      "panel": {
+        "query": "Top3",
+        "window": 60
+      },
+      "seconds": 184.346880742,
+      "selected": {
+        "Cms": {
+          "depth": 3,
+          "heap": 16,
+          "width": 128
+        }
+      }
+    }
+  ],
+  "reason": "AutoSketch CPU extension: independent query-local searches; explicit exact fallback"
+}
