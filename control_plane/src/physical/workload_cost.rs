@@ -1144,9 +1144,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_snapshot_requires_quotes_and_roundtrips_selection() {
+    fn snapshot_requires_quotes_and_roundtrips_selection() {
         let mut snapshot = fixture();
-        snapshot.snapshot_version = 2;
         assert!(snapshot.clone().compile().is_err());
         let (_, _, evidence) = quoted();
         snapshot.workload_cost_evidence = Some(evidence);
