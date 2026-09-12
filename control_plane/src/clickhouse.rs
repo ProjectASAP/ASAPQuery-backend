@@ -39,37 +39,85 @@ pub async fn plan_clickhouse_sql(
     catalog: &SqlCatalog,
     accuracy: AccuracyTarget,
 ) -> Result<ClickHousePlannedQuery, ClickHousePlanningError> {
-    let canonical = lower_sql_dialect(sql, catalog, SqlDialect::ClickhouseSQL, accuracy.clone())
-        .await
-        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
-    // SQL keeps relational parents such as Project and Filter above a
-    // summary-capable Aggregate. Use ASAPPlanner's recursive selector here;
-    // the PromQL deployment lowering retains its existing conservative rules.
+    plan_sql_cohort(&[(0, sql)], catalog, accuracy)
+        .await?
+        .pop()
+        .map(|(_, plan)| plan)
+        .ok_or_else(|| ClickHousePlanningError::Lower("SQL selection returned no root".into()))
+}
+
+async fn plan_sql_cohort(
+    queries: &[(usize, &str)],
+    catalog: &SqlCatalog,
+    accuracy: AccuracyTarget,
+) -> Result<Vec<(usize, ClickHousePlannedQuery)>, ClickHousePlanningError> {
+    let mut canonical = std::collections::BTreeMap::new();
+    for &(index, sql) in queries {
+        let root = lower_sql_dialect(sql, catalog, SqlDialect::ClickhouseSQL, accuracy.clone())
+            .await
+            .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+        canonical.insert(index, root);
+    }
     let cost_model = ControlPlaneCostModel::new(accuracy.clone());
     let (selected, selection_trace) =
         crate::planner_selection::select_workload_with_accuracy_model_and_trace(
-            vec![(0, Rc::new(canonical.clone()))],
+            canonical
+                .iter()
+                .map(|(&index, root)| (index, Rc::new(root.clone())))
+                .collect(),
             accuracy,
             &cost_model,
             &asap_aware_mapping::NoAccuracyEvidence,
             &asap_aware_mapping::DefaultAccuracyModel,
         )?;
-    let selected = selected
+    if selected.len() != canonical.len() {
+        return Err(ClickHousePlanningError::Lower(
+            "SQL selection lost workload roots".into(),
+        ));
+    }
+    selected
         .into_iter()
-        .next()
-        .map(|(_, node)| node)
-        .ok_or_else(|| {
-            crate::planner_selection::SelectionError::Workload(
-                "SQL workload search returned no root".into(),
-            )
-        })?;
-    let physical = PhysicalExpr::committed(selected);
-    Ok(ClickHousePlannedQuery {
-        canonical_sql: canonical_sql_identity(&canonical),
-        canonical,
-        physical,
-        selection_trace,
-    })
+        .map(|(index, selected)| {
+            let canonical = canonical.remove(&index).ok_or_else(|| {
+                ClickHousePlanningError::Lower(
+                    "SQL selection returned an unknown or duplicate root".into(),
+                )
+            })?;
+            Ok((
+                index,
+                ClickHousePlannedQuery {
+                    canonical_sql: canonical_sql_identity(&canonical),
+                    canonical,
+                    physical: PhysicalExpr::committed(selected),
+                    selection_trace: selection_trace.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+async fn plan_sql_workload(
+    queries: &[ClickHouseSqlWorkloadEntry],
+    catalog: &SqlCatalog,
+    accuracy: AccuracyTarget,
+) -> Result<Vec<(usize, ClickHousePlannedQuery)>, ClickHousePlanningError> {
+    // Physical bindings carry pane origins and cumulative evaluation semantics.
+    // Share only within the same runtime range; canonical SQL keeps source
+    // predicates, table identity, and aggregation semantics distinct inside it.
+    let mut cohorts = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (index, query) in queries.iter().enumerate() {
+        validate_sql_evaluation(query)?;
+        cohorts
+            .entry((query.start_ms, query.end_ms, query.cumulative))
+            .or_default()
+            .push((index, query.sql.as_str()));
+    }
+    let mut planned = Vec::with_capacity(queries.len());
+    for cohort in cohorts.into_values() {
+        planned.extend(plan_sql_cohort(&cohort, catalog, accuracy.clone()).await?);
+    }
+    planned.sort_by_key(|(index, _)| *index);
+    Ok(planned)
 }
 
 pub async fn canonicalize_clickhouse_sql(
@@ -247,12 +295,10 @@ pub async fn compile_automatic_clickhouse_workload(
     let mut installed_dags = std::collections::BTreeMap::new();
     let mut materializations = std::collections::BTreeMap::new();
     let mut selection_traces = std::collections::BTreeMap::new();
-    for query in &request.queries {
-        validate_sql_evaluation(query)?;
-        // Selection runs once. Compilation installs only SummaryAgg nodes
-        // actually visited in this selected DAG, never a scripted family.
-        let mut planned =
-            plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+    for (index, mut planned) in
+        plan_sql_workload(&request.queries, &catalog, request.accuracy.clone()).await?
+    {
+        let query = &request.queries[index];
         let selection_trace = std::mem::take(&mut planned.selection_trace);
         let template = planned.canonical_sql.clone();
         let (entry, installed) = compile_selected_sql(query, planned, |node, family| {
@@ -408,8 +454,10 @@ pub async fn compile_clickhouse_workload(
     let mut entries = std::collections::BTreeMap::new();
     let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
-    for query in &request.queries {
-        let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+    for (index, planned) in
+        plan_sql_workload(&request.queries, &catalog, request.accuracy.clone()).await?
+    {
+        let query = &request.queries[index];
         let template = planned.canonical_sql.clone();
         let (executable, installed) = compile_selected_sql(query, planned, |node, family| {
             bind_selected_node(node, family, query, request)
@@ -879,6 +927,98 @@ mod tests {
     use super::*;
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
     use planner_types::pre_asap::{Column, DataType, Schema};
+
+    // SQL publications must expose one selection over all compatible roots.
+    #[tokio::test]
+    async fn automatic_sql_selects_a_workload_cohort() {
+        let request = ClickHouseSqlAutomaticWorkload {
+            envelope: crate::physical::compiler::PlanEnvelope {
+                plan_id: 73, plan_version: 1, generated_at_unix_ms: 0,
+                activation_unix_ms: 0, expiry_unix_ms: None,
+                backend_compat: crate::physical::compiler::BACKEND_COMPAT.into(),
+                planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
+                capability_snapshot_id: "sql-cohort-test".into(),
+            },
+            tables: HashMap::from([("telemetry".into(), Schema::with_time_index(
+                vec![Column::new("timestamp_ms", DataType::Int64, false),
+                     Column::new("value", DataType::Float64, false)], 0, vec![]))]),
+            accuracy: AccuracyTarget::Exact,
+            queries: ["sum(value)", "sum(value) + 1 AS total"].into_iter().map(|expression| ClickHouseSqlWorkloadEntry {
+                sql: format!("SELECT {expression} FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000"),
+                start_ms: 0, end_ms: 2000, cumulative: false,
+            }).collect(),
+        };
+        let (publication, traces) = compile_automatic_clickhouse_workload(&request)
+            .await
+            .unwrap();
+        assert_eq!(publication.query_plan.entries.len(), 2);
+        assert_eq!(publication.summary_catalog.materializations.len(), 1);
+        for trace in traces.values() {
+            assert_eq!(trace["roots"].as_array().unwrap().len(), 2);
+            assert_eq!(trace["roots"][0]["query_index"], 0);
+            assert_eq!(trace["roots"][1]["query_index"], 1);
+            assert_eq!(trace, traces.values().next().unwrap());
+        }
+        // Equal source ASTs cannot override incompatible runtime bindings.
+        let mut queries = request.queries;
+        queries[1].cumulative = true;
+        let separated = plan_sql_workload(
+            &queries,
+            &SqlCatalog {
+                tables: request.tables,
+            },
+            AccuracyTarget::Exact,
+        )
+        .await
+        .unwrap();
+        assert_eq!(separated.len(), 2);
+        for (index, plan) in separated {
+            assert_eq!(plan.selection_trace["roots"].as_array().unwrap().len(), 1);
+            assert_eq!(plan.selection_trace["roots"][0]["query_index"], index);
+        }
+    }
+
+    // Workload search can offer cross-query rollup without forcing its selection.
+    #[tokio::test]
+    async fn sql_cohort_exposes_rollup_candidates() {
+        let catalog = SqlCatalog {
+            tables: HashMap::from([(
+                "telemetry".into(),
+                Schema::with_time_index(
+                    vec![
+                        Column::new("timestamp_ms", DataType::Int64, false),
+                        Column::new("value", DataType::Float64, false),
+                        Column::new("job", DataType::Utf8, false),
+                    ],
+                    0,
+                    vec![],
+                ),
+            )]),
+        };
+        let grouped = "SELECT job, sum(value) AS total FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000 GROUP BY job";
+        let total = "SELECT sum(value) AS total FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000";
+        let has_rollup = |trace: &serde_json::Value| {
+            trace["groups"].as_array().unwrap().iter().any(|group| {
+                group["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|candidate| candidate["strategy"] == "RollupStrategy")
+            })
+        };
+        for sql in [grouped, total] {
+            let single = plan_clickhouse_sql(sql, &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap();
+            assert!(!has_rollup(&single.selection_trace));
+        }
+        let combined =
+            plan_sql_cohort(&[(0, grouped), (1, total)], &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap();
+        assert_eq!(combined.len(), 2);
+        assert!(has_rollup(&combined[0].1.selection_trace));
+    }
 
     // A dashboard refresh must reuse the installed identity without treating
     // value thresholds or window length as runtime parameters.
