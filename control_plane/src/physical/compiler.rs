@@ -139,8 +139,6 @@ pub struct LifecyclePlanningInput {
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanningRequest {
-    /// Exact current-value state is a separately priced physical alternative.
-    pub current_series: bool,
     /// Diagnostic projections of the original Planner search; never consumed by selection.
     pub logical_selection: Vec<serde_json::Value>,
     /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
@@ -683,7 +681,6 @@ impl BackendLocalPlanningSnapshot {
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
-                current_series: false,
                 logical_selection,
                 hybrid_execution: true,
                 materialization_policy: None,
@@ -918,7 +915,7 @@ impl PhysicalCompiler {
         environment: DeploymentEnvironment,
         metricsql: bool,
     ) -> Result<PhysicalPlan, CompileError> {
-        if request.current_series
+        if super::current_series::supported(&request)
             && (metricsql
                 || environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite)
         {
@@ -1075,7 +1072,7 @@ impl PhysicalCompiler {
                 .collect::<Vec<_>>();
             // An exact native fallback has no maintained state and must not
             // depend on evidence for unused window/state implementations.
-            if selected.is_empty() {
+            if selected.is_empty() && super::current_series::operator(&request, query)?.is_none() {
                 continue;
             }
             let executable =
@@ -1085,6 +1082,9 @@ impl PhysicalCompiler {
                         reason: format!("invalid executable subDAG: {error}"),
                     })?;
             executable_dags[query_index] = Some(executable);
+            if selected.is_empty() {
+                continue;
+            }
             validate_lifecycle_input(&query.query_id, &query.lifecycle)?;
             if environment.target == PhysicalDeploymentTarget::DistributedCollectors
                 && selected.iter().any(|state| {
@@ -1432,12 +1432,12 @@ impl PhysicalCompiler {
             }
         }
 
-        let plan_id = if request.hybrid_execution || request.current_series {
+        let plan_id = if request.hybrid_execution || super::current_series::supported(&request) {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
             "typed-local-residual-v3-counter-index".hash(&mut hash);
-            request.current_series.hash(&mut hash);
+            super::current_series::supported(&request).hash(&mut hash);
             request.materialization_policy.hash(&mut hash);
             for query in &request.queries {
                 format!("{:?}", query.post_asap).hash(&mut hash);
@@ -1565,7 +1565,31 @@ impl PhysicalCompiler {
                 full_history: false,
                 cumulative_readout: true,
             };
-            let mut entry = if request.hybrid_execution {
+            let mut entry = if let Some(operator) =
+                super::current_series::operator(&request, query)?
+            {
+                let root = crate::query_plan::QueryNodeId(0);
+                let compiled = executable_dags[query_index]
+                    .as_ref()
+                    .expect("compiled Planner DAG");
+                query_node_bindings.insert((query_index, compiled.dag.root), root);
+                Ok(crate::query_plan::QueryPlanEntry {
+                    language: crate::query_plan::QueryLanguage::PromQl,
+                    query_id: query.query_id.clone(),
+                    canonical_query: canonical.clone(),
+                    fixed_evaluation: None,
+                    root,
+                    nodes: BTreeMap::from([(
+                        root,
+                        crate::query_plan::QueryPlanNode::Logical {
+                            operator,
+                            inputs: vec![],
+                        },
+                    )]),
+                    instant,
+                    fallback: FallbackPolicy::ExactBackend,
+                })
+            } else if request.hybrid_execution {
                 crate::query_plan::compile_bound_composable_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
@@ -1608,18 +1632,6 @@ impl PhysicalCompiler {
             }
             if metricsql {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
-            }
-            if request.current_series && !metricsql {
-                if let Some(operator) = super::current_series::operator(&request, query)? {
-                    entry.root = crate::query_plan::QueryNodeId(0);
-                    entry.nodes = BTreeMap::from([(
-                        entry.root,
-                        crate::query_plan::QueryPlanNode::Logical {
-                            operator,
-                            inputs: vec![],
-                        },
-                    )]);
-                }
             }
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
@@ -3319,6 +3331,42 @@ mod tests {
             }
         }
         assert_eq!(populations.len(), 1);
+        let installed = serde_json::to_string(&plan.precompute_plan.executable_dags).unwrap();
+        assert!(
+            installed.contains("MaintainCurrentSeries"),
+            "shared state must originate in the installed Planner DAG"
+        );
+    }
+
+    // Physical lowering follows selected Planner IR, independent of catalog text.
+    #[test]
+    fn current_series_lowering_uses_selected_ir_not_query_text() {
+        let mut request = request("ir", "quantile(0.5, a)");
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                "quantile(0.5, a)",
+                AccuracyTarget::Exact,
+            )
+            .unwrap(),
+        );
+        let strategy = asap_aware_mapping::current_series::CurrentSeriesStrategy::new(
+            std::slice::from_ref(&root),
+        );
+        request.queries[0].post_asap = strategy.candidate(&root).unwrap();
+        let before = super::super::current_series::operator(&request, &request.queries[0])
+            .unwrap()
+            .unwrap();
+        request.queries[0].query_string = "quantile(0.99, b)".into();
+        let after = super::super::current_series::operator(&request, &request.queries[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after);
+        request.queries[0].post_asap = crate::planner_selection::keep_pre_asap(&root).unwrap();
+        assert!(
+            super::super::current_series::operator(&request, &request.queries[0])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3808,7 +3856,6 @@ mod tests {
             evidence_by_query.insert(query_id.to_string(), evidence);
         }
         Ok(PlanningRequest {
-            current_series: false,
             logical_selection: Vec::new(),
             hybrid_execution: false,
             materialization_policy: None,

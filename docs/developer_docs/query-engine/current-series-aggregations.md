@@ -6,6 +6,15 @@ alternative for `quantile(q, metric)` and `topk(k, metric)`, including `by` and
 literals. Selector offsets, `@`, nested input expressions and MetricsQL use the
 existing alternatives; they are not admitted by this implementation.
 
+ASAPPlanner owns this transformation through the opt-in `CurrentSeriesStrategy`
+over canonical IR. It emits `MaintainCurrentSeries` at maintenance time and
+`ReadCurrentSeries` at read time, with source/filter/group identity, quantile
+consumers and the maximum requested k in its typed contract. Compatible producers
+are shared by Planner CSE. The backend consumes these nodes, binds resource and
+input-lag limits, and retains the Planner DAG in the installed plan. It does not
+recognize this optimization by reparsing the query text. Other deployments must
+opt in only when they can implement and price this maintenance contract.
+
 For example, put p50, p90, p95, p99 and Top1/Top5 in one workload. Matching source,
 selector and grouping contracts produce one `CurrentSeries` population with
 `quantiles: true` and `max_k: 5`. Each registered query keeps its own readout.

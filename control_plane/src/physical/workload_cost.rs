@@ -680,11 +680,29 @@ fn select_with_frontend(
 pub fn with_exact_alternative(
     request: PlanningRequest,
 ) -> Result<Vec<PlanningRequest>, CompileError> {
-    let current = !request.current_series && super::current_series::supported(&request);
+    let already_selected = super::current_series::supported(&request);
     let mut alternatives = materialization_alternatives(request)?;
-    if current {
-        let mut maintained = alternatives.last().expect("exact alternative").clone();
-        maintained.current_series = true;
+    if already_selected {
+        return Ok(alternatives);
+    }
+    let mut maintained = alternatives.last().expect("exact alternative").clone();
+    let roots: Vec<_> = maintained
+        .queries
+        .iter()
+        .map(|q| match &q.post_asap.expr {
+            planner_types::post_asap::SummaryExpr::KeepPreAsap(root) => std::rc::Rc::clone(root),
+            _ => unreachable!("native alternative retains canonical roots"),
+        })
+        .collect();
+    let strategy = asap_aware_mapping::current_series::CurrentSeriesStrategy::new(&roots);
+    let mut changed = false;
+    for (query, root) in maintained.queries.iter_mut().zip(&roots) {
+        if let Some(candidate) = strategy.candidate(root) {
+            query.post_asap = candidate;
+            changed = true;
+        }
+    }
+    if changed {
         maintained.hybrid_execution = false;
         maintained.materialization_policy = None;
         alternatives.push(maintained);
