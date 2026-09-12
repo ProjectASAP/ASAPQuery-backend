@@ -31,6 +31,10 @@ pub struct QueryPlan {
 pub struct ClickHousePlanningContext {
     pub tables: std::collections::HashMap<String, planner_types::pre_asap::Schema>,
     pub accuracy: planner_types::types::AccuracyTarget,
+    /// A time template can have several concrete plans with different pane
+    /// origins or materializations. Keep their physical bindings independent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub window_templates: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +165,29 @@ impl QueryPlan {
             return Err(QueryPlanError::Invalid(
                 "non-bootstrap QueryPlan has zero plan_version".into(),
             ));
+        }
+        if let Some(context) = &self.clickhouse_context {
+            for (template, identities) in &context.window_templates {
+                if !template.starts_with("moving-window-v1:") || identities.is_empty() {
+                    return Err(QueryPlanError::Invalid(
+                        "invalid SQL window template index".into(),
+                    ));
+                }
+                let mut seen = BTreeSet::new();
+                for identity in identities {
+                    let entry = self.lookup_clickhouse(identity)?;
+                    if !seen.insert(identity)
+                        || entry
+                            .nodes
+                            .values()
+                            .any(|node| matches!(node, QueryPlanNode::ExternalExact { .. }))
+                    {
+                        return Err(QueryPlanError::Invalid(
+                            "SQL window template has duplicate or external bindings".into(),
+                        ));
+                    }
+                }
+            }
         }
         for (identity, entry) in &self.entries {
             let expected = Self::catalog_key(entry.language, &entry.canonical_query);

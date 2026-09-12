@@ -243,6 +243,7 @@ pub async fn compile_automatic_clickhouse_workload(
         tables: request.tables.clone(),
     };
     let mut entries = std::collections::BTreeMap::new();
+    let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
     let mut materializations = std::collections::BTreeMap::new();
     let mut selection_traces = std::collections::BTreeMap::new();
@@ -253,6 +254,7 @@ pub async fn compile_automatic_clickhouse_workload(
         let mut planned =
             plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
         let selection_trace = std::mem::take(&mut planned.selection_trace);
+        let template = planned.canonical_sql.clone();
         let (entry, installed) = compile_selected_sql(query, planned, |node, family| {
             let config = materialize_selected_sql(node, family, query)
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
@@ -269,6 +271,7 @@ pub async fn compile_automatic_clickhouse_workload(
                 .or_insert(config);
             Ok(binding)
         })?;
+        index_sql_template(&mut window_templates, template, &entry);
         selection_traces.insert(entry.canonical_query.clone(), selection_trace);
         let key = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &entry.canonical_query);
         if entries.insert(key, entry).is_some() {
@@ -308,6 +311,7 @@ pub async fn compile_automatic_clickhouse_workload(
             plan_id: request.envelope.plan_id,
             plan_version: request.envelope.plan_version,
             clickhouse_context: Some(ClickHousePlanningContext {
+                window_templates,
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
@@ -402,12 +406,15 @@ pub async fn compile_clickhouse_workload(
         tables: request.tables.clone(),
     };
     let mut entries = std::collections::BTreeMap::new();
+    let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
     for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+        let template = planned.canonical_sql.clone();
         let (executable, installed) = compile_selected_sql(query, planned, |node, family| {
             bind_selected_node(node, family, query, request)
         })?;
+        index_sql_template(&mut window_templates, template, &executable);
         installed_dags.insert(query.sql.clone(), installed);
         let identity =
             QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &executable.canonical_query);
@@ -428,6 +435,7 @@ pub async fn compile_clickhouse_workload(
             plan_id: request.sds.plan_id,
             plan_version: request.sds.plan_version,
             clickhouse_context: Some(ClickHousePlanningContext {
+                window_templates,
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
@@ -438,6 +446,25 @@ pub async fn compile_clickhouse_workload(
         .validate()
         .map_err(ClickHousePlanningError::Lower)?;
     Ok(publication)
+}
+
+fn index_sql_template(
+    templates: &mut std::collections::BTreeMap<String, Vec<String>>,
+    template: String,
+    entry: &QueryPlanEntry,
+) {
+    // External subqueries still contain fixed SQL literals.
+    if template.starts_with("moving-window-v1:")
+        && !entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExternalExact { .. }))
+    {
+        templates
+            .entry(template)
+            .or_default()
+            .push(entry.canonical_query.clone());
+    }
 }
 
 fn compile_selected_sql<F>(
@@ -469,9 +496,9 @@ where
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut materialization_nodes = std::collections::BTreeMap::new();
     let mut query_nodes = std::collections::BTreeMap::new();
-    let mut executable = crate::query_plan::compile_bound_relational_mapped(
+    let executable = crate::query_plan::compile_bound_relational_mapped(
         query.sql.clone(),
-        planned.canonical_sql.clone(),
+        format!("{:?}", planned.canonical),
         &root,
         FixedEvaluationRange {
             start_ms: query.start_ms,
@@ -501,13 +528,6 @@ where
         },
     )
     .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
-    if executable
-        .nodes
-        .values()
-        .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExternalExact { .. }))
-    {
-        executable.canonical_query = format!("{:?}", planned.canonical);
-    }
     let installed = crate::physical::executable_binding::install_selected_dag(
         query.sql.clone(),
         &semantic.dag,
@@ -1281,8 +1301,82 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(simple.query_plan.lookup_clickhouse(&shifted).is_ok());
+        assert_eq!(
+            simple
+                .query_plan
+                .clickhouse_context
+                .as_ref()
+                .unwrap()
+                .window_templates[&shifted]
+                .len(),
+            1
+        );
         assert!(shifted.starts_with("moving-window-v1:"));
+        // Different windows remain distinct publications even with one template.
+        let windows = || {
+            vec![
+            ClickHouseSqlWorkloadEntry { sql: simple_sql.into(), start_ms: 0, end_ms: 2000, cumulative: true },
+            ClickHouseSqlWorkloadEntry {
+                sql: "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 2000 AND timestamp_ms < 4000".into(),
+                start_ms: 2000, end_ms: 4000, cumulative: true,
+            },
+        ]
+        };
+        let multiple = compile_clickhouse_workload(&ClickHouseSqlWorkload {
+            sds: request.sds.clone(),
+            precompute_plan: request.precompute_plan.clone(),
+            transmission_plan: request.transmission_plan.clone(),
+            tables: request.tables.clone(),
+            accuracy: request.accuracy.clone(),
+            queries: windows(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(multiple.query_plan.entries.len(), 2);
+        let (multiple_auto, multiple_traces) =
+            compile_automatic_clickhouse_workload(&ClickHouseSqlAutomaticWorkload {
+                envelope: request.precompute_plan.envelope.clone(),
+                tables: request.tables.clone(),
+                accuracy: request.accuracy.clone(),
+                queries: windows(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(multiple_auto.query_plan.entries.len(), 2);
+        for plan in [&multiple.query_plan, &multiple_auto.query_plan] {
+            let identities = &plan.clickhouse_context.as_ref().unwrap().window_templates[&shifted];
+            assert_eq!(identities.len(), 2);
+            assert_ne!(identities[0], identities[1]);
+            for identity in identities {
+                assert!(plan.lookup_clickhouse(identity).is_ok());
+            }
+        }
+        assert_eq!(multiple_traces.len(), 2);
+        assert_eq!(multiple_auto.precompute_plan.executable_dags.len(), 2);
+        multiple_auto.validate().unwrap();
+        let bindings = multiple_auto
+            .query_plan
+            .entries
+            .values()
+            .map(|entry| entry.materialization_bindings()[0].materialization)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            bindings.len(),
+            2,
+            "different pane origins must retain distinct materializations"
+        );
+        let mut invalid = multiple_auto.clone();
+        invalid
+            .query_plan
+            .clickhouse_context
+            .as_mut()
+            .unwrap()
+            .window_templates
+            .values_mut()
+            .next()
+            .unwrap()
+            .push("missing concrete query".into());
+        assert!(invalid.validate().is_err());
         let (automatic, traces) =
             compile_automatic_clickhouse_workload(&ClickHouseSqlAutomaticWorkload {
                 envelope: request.precompute_plan.envelope.clone(),

@@ -85,6 +85,7 @@ async fn main() {
         plan_id: 27,
         plan_version: 1,
         clickhouse_context: Some(ClickHousePlanningContext {
+            window_templates: Default::default(),
             tables: HashMap::from([("raw_samples".into(), schema)]),
             accuracy: AccuracyTarget::Epsilon(0.01),
         }),
