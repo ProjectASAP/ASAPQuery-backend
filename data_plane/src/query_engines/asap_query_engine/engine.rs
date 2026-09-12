@@ -3622,7 +3622,9 @@ mod range_stitch_tests {
                 "../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let mut plan = snapshot.compile().unwrap();
+        let mut plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let identity = asap_types::query_plan::canonical_promql("1 + 2").unwrap();
         plan.query_plan.entries.insert(
             asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),

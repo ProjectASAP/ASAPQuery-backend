@@ -3792,7 +3792,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let store = SketchStore::new();
         store
@@ -3865,7 +3867,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let store = SketchStore::new();
         store
@@ -5023,7 +5027,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let metadata = meta_with_policy(507, fingerprint);
         let record = SidMetaRecord::new(
@@ -5064,7 +5070,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let definition = fingerprint.into();
         let mut next_catalog = plan.summary_catalog.clone();
@@ -5163,7 +5171,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
         let store = SketchStore::new();
@@ -5249,7 +5259,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
         {
@@ -5357,7 +5369,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
         let disk = directory.path().to_path_buf();
@@ -5439,7 +5453,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let definition_id = SummaryDefinitionId::from(fingerprint);
         let producers = BTreeMap::from([(definition_id, "producer-a".to_string())]);

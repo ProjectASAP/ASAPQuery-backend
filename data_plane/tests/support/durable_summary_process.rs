@@ -15,7 +15,7 @@ async fn persisted_summary_restarts_without_live_reregistration() {
         serde_json::json!([fixture["query_workload"]["repeating_queries"][2].clone()]);
     let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
         serde_json::from_value(fixture).unwrap();
-    let plan = snapshot.compile().unwrap();
+    let plan = quote_snapshot_for_test(snapshot).compile().unwrap();
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
         collector_plans: plan.collector_plans,

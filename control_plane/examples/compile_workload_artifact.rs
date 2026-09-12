@@ -3,17 +3,21 @@ use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
         .ok_or("usage: compile_workload_artifact SNAPSHOT.json [--metricsql]")?;
-    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
-    if snapshot.snapshot_version != 2 {
-        return Err(
-            "execution evaluation requires version 2 complete workload cost evidence".into(),
-        );
+    let metricsql = match args.next().as_deref() {
+        None => false,
+        Some("--metricsql") => true,
+        Some(_) => return Err("expected optional --metricsql".into()),
+    };
+    if args.next().is_some() {
+        return Err("unexpected arguments".into());
     }
+    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
     let start = std::time::Instant::now();
-    let plan = if std::env::args().skip(2).any(|arg| arg == "--metricsql") {
+    let plan = if metricsql {
         snapshot.compile_metricsql()?
     } else {
         snapshot.compile()?
@@ -29,6 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "planning_elapsed_ns": elapsed,
             "envelope": plan.envelope,
             "cost_comparison": comparison,
+            "logical_selection": plan.logical_selection,
+            "backend_revision": control_plane::physical::compiler::BACKEND_REVISION,
+            "planner_revision": control_plane::physical::compiler::PLANNER_REVISION,
             "lifecycle_estimates": plan.lifecycle_estimates,
             "install_request": {
                 "summary_catalog": plan.summary_catalog,

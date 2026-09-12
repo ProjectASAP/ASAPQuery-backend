@@ -641,7 +641,10 @@ mod tests {
         wire["query_workload"]["repeating_queries"] = serde_json::json!([query]);
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(wire).unwrap();
-        let mut plan = snapshot.compile().unwrap().precompute_plan;
+        let mut plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap()
+            .precompute_plan;
         let target = plan
             .materializations
             .iter()

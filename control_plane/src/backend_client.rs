@@ -601,7 +601,11 @@ mod tests {
                 "../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let publication = snapshot.compile().unwrap().publication().unwrap();
+        let publication = crate::physical::compiler::tests::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap()
+            .publication()
+            .unwrap();
         let hits: StdArc<Mutex<Vec<serde_json::Value>>> = StdArc::new(Mutex::new(Vec::new()));
         let route_hits = hits.clone();
         let app = Router::new().route(

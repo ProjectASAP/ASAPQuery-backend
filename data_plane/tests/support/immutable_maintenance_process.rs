@@ -35,7 +35,7 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
     let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
         serde_json::from_value(fixture.clone()).unwrap();
-    let plan = snapshot.compile().unwrap();
+    let plan = quote_snapshot_for_test(snapshot).compile().unwrap();
     assert_eq!(
         plan.precompute_plan.materializations.len(),
         if multi_source { 3 } else { 2 }
@@ -303,12 +303,15 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
         // singleton-derived output while new source populations can arrive.
         let mut next_fixture = fixture.clone();
         next_fixture["environment"]["plan_version"] = 2.into();
-        let next = serde_json::from_value::<
-            control_plane::physical::compiler::BackendLocalPlanningSnapshot,
-        >(next_fixture)
-        .unwrap()
-        .compile()
-        .unwrap();
+        let next =
+            quote_snapshot_for_test(
+                serde_json::from_value::<
+                    control_plane::physical::compiler::BackendLocalPlanningSnapshot,
+                >(next_fixture)
+                .unwrap(),
+            )
+            .compile()
+            .unwrap();
         let next_install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
             summary_catalog: next.summary_catalog,
             collector_plans: next.collector_plans,
