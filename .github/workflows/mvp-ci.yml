@@ -16,7 +16,7 @@ jobs:
   backend:
     name: MVP backend
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout ASAPQuery-backend
         uses: actions/checkout@v4
@@ -78,3 +78,18 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
         run: cargo test -p control_plane
+
+      # Compiling the data plane is not evidence that it runs: plan
+      # installation, maintenance execution, persistence recovery and query
+      # routing all live in these library tests, and none of them were gated
+      # before. `--lib` deliberately excludes `data_plane/tests/`, which needs
+      # live ClickHouse / Prometheus / VictoriaMetrics endpoints.
+      - name: Test shared types and data plane
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # Several storage tests wait on background flusher / sealer threads.
+          # Hosted runners are small and noisy, so give those waits headroom;
+          # a passing wait still returns as soon as its condition holds.
+          ASAP_TEST_TIMEOUT_SCALE: "4"
+        working-directory: ASAPQuery-backend
+        run: cargo test -p asap_types -p data_plane --lib

@@ -2587,7 +2587,8 @@ mod tests {
                 &BTreeMap::new()
             )
             .is_err());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3023,7 +3024,8 @@ mod tests {
         assert!(store
             .series_ids_for_policy(configs[2].policy_fingerprint())
             .is_empty());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));

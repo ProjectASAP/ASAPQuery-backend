@@ -50,6 +50,9 @@ pub struct ClickHouseReader {
     http: reqwest::Client,
     population: Option<asap_types::table_population::TablePopulation>,
     value_projection: Option<asap_types::sds::ValueProjectionIdentity>,
+    /// Producer typing for the projected column, when the materialization
+    /// carries it. Drives [`ClickHouseReader::value_column_guards`].
+    value_source_column: Option<planner_types::pre_asap::Column>,
     output_metric: Option<String>,
     grouping_projection: Option<asap_types::GroupingProjection>,
 }
@@ -77,6 +80,7 @@ impl ClickHouseReader {
             http: reqwest::Client::new(),
             population: None,
             value_projection: None,
+            value_source_column: None,
             output_metric: None,
             grouping_projection: None,
         })
@@ -139,23 +143,64 @@ impl ClickHouseReader {
         let value = match &self.value_projection {
             Some(asap_types::sds::ValueProjectionIdentity::Constant {
                 value: planner_types::pre_asap::ScalarValue::Int64(_),
-            }) => "{projected_value:Int64}",
+            }) => "{projected_value:Int64}".to_string(),
             Some(asap_types::sds::ValueProjectionIdentity::Constant {
                 value: planner_types::pre_asap::ScalarValue::Float64(_),
-            }) => "{projected_value:Float64}",
-            _ => c.value_column.as_str(),
+            }) => "{projected_value:Float64}".to_string(),
+            // A typed column projection is read through its declared type:
+            // integers via an explicit widening, everything else as-is.
+            _ => match self
+                .value_source_column
+                .as_ref()
+                .map(|column| &column.dtype)
+            {
+                Some(planner_types::pre_asap::DataType::Int64) => {
+                    format!("toFloat64({})", c.value_column)
+                }
+                _ => c.value_column.clone(),
+            },
         };
         format!(
             "SELECT {labels} AS labels, {timestamp} AS timestamp_ms, {value} AS value \
-             FROM {database}.{table} WHERE {population} \
+             FROM {database}.{table} WHERE {population}{value_guards} \
              AND {timestamp} >= {{start_ms:Int64}} AND {timestamp} < {{end_ms:Int64}} \
              ORDER BY labels, timestamp_ms FORMAT JSONEachRow",
             labels = labels,
             timestamp = c.timestamp_ms_column,
             value = value,
+            value_guards = self.value_column_guards(),
             database = c.database,
             table = c.table,
         )
+    }
+
+    /// Predicates the typed value column needs before its rows may enter
+    /// summary state.
+    ///
+    /// * **NULL**: a SQL aggregate skips NULL inputs, so the summary that
+    ///   stands in for `sum(col)` / `count(col)` / `quantile(col)` has to skip
+    ///   them too. (Without this the JSON decode fails on the first NULL row,
+    ///   which is why nullable columns used to be refused at planning time.)
+    /// * **Integer exactness**: summary state is f64. Beyond 2^53 an integer
+    ///   no longer round-trips, so instead of silently summarising a rounded
+    ///   value the read fails loudly on the offending row. The guard evaluates
+    ///   to NULL for NULL rows, which the NULL predicate has already excluded.
+    fn value_column_guards(&self) -> String {
+        let Some(column) = self.value_source_column.as_ref() else {
+            return String::new();
+        };
+        let name = &self.config.value_column;
+        let mut guards = String::new();
+        if column.nullable {
+            guards.push_str(&format!(" AND {name} IS NOT NULL"));
+        }
+        if column.dtype == planner_types::pre_asap::DataType::Int64 {
+            guards.push_str(&format!(
+                " AND throwIf(abs({name}) > 9007199254740992, \
+                 'ASAP ClickHouse ingest: integer value exceeds the exact Float64 range') = 0"
+            ));
+        }
+        guards
     }
 }
 
@@ -199,6 +244,7 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
             let mut reader = ClickHouseReader::new(source_config)?;
             reader.population = Some(materialization.table_population.clone().unwrap_or_default());
             reader.value_projection = Some(materialization.effective_value_projection().clone());
+            reader.value_source_column = materialization.value_source_column.clone();
             reader.output_metric = Some(materialization.metric.clone());
             reader.grouping_projection = Some(materialization.grouping_labels.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
@@ -408,6 +454,81 @@ mod tests {
         let sql = reader.sql();
         assert!(sql.contains("WHERE 1 AND"));
         assert!(!sql.contains("{metric:String}"));
+    }
+
+    /// SQL aggregates skip NULL inputs, so the summary standing in for one has
+    /// to skip them too — and a NULL row would otherwise fail the row decode,
+    /// which is why nullable columns used to be refused at planning time.
+    #[test]
+    fn nullable_value_columns_skip_null_rows_the_way_sql_aggregates_do() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
+        reader.value_source_column = Some(planner_types::pre_asap::Column::new(
+            "value",
+            planner_types::pre_asap::DataType::Float64,
+            true,
+        ));
+        let sql = reader.sql();
+        assert!(sql.contains("AND value IS NOT NULL"), "{sql}");
+        // A float column is read as it comes; only integers are widened.
+        assert!(sql.contains(" value AS value"), "{sql}");
+        assert!(!sql.contains("toFloat64"), "{sql}");
+    }
+
+    /// A non-null column needs no NULL predicate: the guard tracks the declared
+    /// nullability, it is not applied blindly.
+    #[test]
+    fn non_null_value_columns_are_read_without_extra_predicates() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
+        reader.value_source_column = Some(planner_types::pre_asap::Column::new(
+            "value",
+            planner_types::pre_asap::DataType::Float64,
+            false,
+        ));
+        let sql = reader.sql();
+        assert!(!sql.contains("IS NOT NULL"), "{sql}");
+        assert!(!sql.contains("throwIf"), "{sql}");
+    }
+
+    /// Summary state is f64. An integer column is widened explicitly, and a
+    /// value that no longer round-trips fails the read instead of entering the
+    /// summary rounded.
+    #[test]
+    fn integer_value_columns_are_widened_under_an_exactness_guard() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
+        reader.value_source_column = Some(planner_types::pre_asap::Column::new(
+            "value",
+            planner_types::pre_asap::DataType::Int64,
+            false,
+        ));
+        let sql = reader.sql();
+        assert!(sql.contains("toFloat64(value) AS value"), "{sql}");
+        assert!(
+            sql.contains("throwIf(abs(value) > 9007199254740992"),
+            "{sql}"
+        );
+        assert!(!sql.contains("IS NOT NULL"), "{sql}");
+    }
+
+    /// A legacy definition without producer typing keeps its previous read.
+    #[test]
+    fn untyped_column_projection_reads_exactly_as_before() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
+        let sql = reader.sql();
+        assert!(sql.contains(" value AS value"), "{sql}");
+        assert!(!sql.contains("IS NOT NULL"), "{sql}");
+        assert!(!sql.contains("throwIf"), "{sql}");
     }
 
     #[test]

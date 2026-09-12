@@ -909,38 +909,11 @@ mod runtime_tests {
     /// Mimics the pre-population loop in `main()` — turns each
     /// `WorkloadEntry` into a `QueryWorkload` via the shared `Analyzer`.
     fn populate_store_from_registry(registry: &WorkloadRegistry, store: &WorkloadStore) {
-        use crate::pipeline::{Analyzer, QuerySpec};
+        use crate::pipeline::Analyzer;
         use crate::types;
-        use crate::types_v2;
         let analyzer = Analyzer::new();
         for entry in registry.entries() {
-            // Mirrors main.rs's QuerySpec construction post-B3/B4:
-            // thread grouping_labels into group_by_labels; let the
-            // parser drive time_window when query_string is present.
-            let spec = QuerySpec {
-                query_string: entry.query_string.clone(),
-                metric_name: entry.metric_name.clone(),
-                label_filters: Default::default(),
-                group_by_labels: entry.grouping_labels.clone(),
-                aggregations: vec!["quantile".into()],
-                time_window: if entry.query_string.is_some() {
-                    String::new()
-                } else {
-                    "5m".into()
-                },
-                repeat_every: None,
-                accuracy_sla: entry.accuracy_sla,
-                latency_sla: None,
-                sketch_type: entry.sketch_family_override.clone(),
-                workload: types::WorkloadCharacteristics::default(),
-                id: None,
-                language: None,
-                accuracy: None,
-                dollars: None,
-                deployment_model: None,
-                shape: types_v2::QueryShape::default(),
-                data: types_v2::DataShape::default(),
-            };
+            let spec = crate::workload::query_spec_for_entry(entry);
             if let Ok(wl) = analyzer.analyze(spec) {
                 let role = crate::workload::derive_agg_role(entry);
                 store.set(

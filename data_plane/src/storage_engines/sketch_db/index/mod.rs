@@ -4791,7 +4791,10 @@ mod tests {
     }
 
     fn wait_until<F: Fn() -> bool>(f: F, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+        // Scaled: these waits are on background flusher / sealer threads that
+        // compete with the test harness for cores. See
+        // `crate::tests::test_utilities::timing`.
+        let deadline = crate::tests::test_utilities::timing::deadline(timeout);
         while std::time::Instant::now() < deadline {
             if f() {
                 return true;

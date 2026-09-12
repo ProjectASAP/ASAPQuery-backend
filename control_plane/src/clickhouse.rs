@@ -358,8 +358,15 @@ fn materialize_selected_sql(
     }
     let grouping = asap_types::GroupingProjection::new(columns);
     grouping.validate_table_group_codec()?;
-    let (table, value, window, population, timestamp) =
-        clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)?;
+    let leaf = clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)?;
+    let ClickHouseMaterializationLeaf {
+        table,
+        value,
+        value_source_column,
+        window_secs: window,
+        population,
+        timestamp_column: timestamp,
+    } = leaf;
     let window_secs = window.ok_or("SQL materialization requires a bounded window")?;
     let aggregation = BackendAggregation {
         aggregation_id: String::new(),
@@ -382,6 +389,7 @@ fn materialize_selected_sql(
     config.value_projection = Some(value);
     config.table_timestamp_column = Some(timestamp);
     config.table_population = Some(population);
+    config.value_source_column = value_source_column;
     config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
     config.pane_origin_ms = Some(
         i64::try_from(query.start_ms)
@@ -567,9 +575,15 @@ fn bind_selected_node(
     query: &ClickHouseSqlWorkloadEntry,
     request: &ClickHouseSqlWorkload,
 ) -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
-    let (table_ref, value_column, source_window, spatial_filter, timestamp_column) =
-        clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)
-            .map_err(crate::query_plan::QueryPlanError::Invalid)?;
+    let ClickHouseMaterializationLeaf {
+        table: table_ref,
+        value: value_column,
+        window_secs: source_window,
+        population: spatial_filter,
+        timestamp_column,
+        ..
+    } = clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)
+        .map_err(crate::query_plan::QueryPlanError::Invalid)?;
     let expected = crate::physical::compiler::physical_materialization_family(family);
     let selected = select_materialization(
         &request.precompute_plan.materializations,
@@ -614,20 +628,25 @@ fn constant_int64(expr: &QueryExpr) -> Option<i64> {
     }
 }
 
+/// The table leaf a SQL summary materialization is admitted against.
+#[derive(Debug)]
+struct ClickHouseMaterializationLeaf {
+    table: String,
+    value: asap_types::sds::ValueProjectionIdentity,
+    /// Producer typing for a column projection: what the ingest path must know
+    /// to read the column safely (integer exactness, NULL skipping). `None`
+    /// for constant projections, which carry their own literal.
+    value_source_column: Option<planner_types::pre_asap::Column>,
+    window_secs: Option<u64>,
+    population: asap_types::table_population::TablePopulation,
+    timestamp_column: String,
+}
+
 fn clickhouse_materialization_leaf_contract(
     node: &planner_types::post_asap::SummaryNode,
     evaluation_start_ms: u64,
     evaluation_end_ms: u64,
-) -> Result<
-    (
-        String,
-        asap_types::sds::ValueProjectionIdentity,
-        Option<u64>,
-        asap_types::table_population::TablePopulation,
-        String,
-    ),
-    String,
-> {
+) -> Result<ClickHouseMaterializationLeaf, String> {
     use planner_types::{
         post_asap::SummaryExpr,
         pre_asap::{CompareOpKind, QueryExpr, ScalarValue, Source},
@@ -676,6 +695,7 @@ fn clickhouse_materialization_leaf_contract(
     };
     use asap_types::sds::ValueProjectionIdentity;
     use planner_types::post_asap::SummaryInputExpr;
+    let mut value_source_column = None;
     let value_projection = match &input.weight {
         SummaryInputExpr::Column(
             planner_types::pre_asap::ColumnRef::Wildcard
@@ -701,9 +721,24 @@ fn clickhouse_materialization_leaf_contract(
                 .iter()
                 .find(|column| column.name == *name)
                 .ok_or("SQL summary value projection is not a source column")?;
-            if column.nullable || column.dtype != planner_types::pre_asap::DataType::Float64 {
-                return Err("SQL value readout requires a non-null Float64 source until typed/null-aware ingest is available".into());
+            // Numeric source columns are admitted with their declared type and
+            // nullability, which the ingest reader honours: integers get an
+            // exactness guard on the way into f64 summary state, and NULL rows
+            // are skipped the way a SQL aggregate skips them. Non-numeric
+            // columns have no value semantics to summarise and stay refused.
+            if !matches!(
+                column.dtype,
+                planner_types::pre_asap::DataType::Float64
+                    | planner_types::pre_asap::DataType::Int64
+            ) {
+                return Err(format!(
+                    "SQL value readout requires a numeric source column; `{name}` is {:?}",
+                    column.dtype
+                ));
             }
+            let mut source_column = column.clone();
+            source_column.table = None;
+            value_source_column = Some(source_column);
             ValueProjectionIdentity::Column { name: name.clone() }
         }
         SummaryInputExpr::Constant(value) if value.is_finite() => {
@@ -827,18 +862,19 @@ fn clickhouse_materialization_leaf_contract(
     let window_secs = explicit_window.or(inferred_window).ok_or_else(|| {
         "SQL table summary requires a positive whole-second timestamp range".to_string()
     })?;
-    Ok((
-        table_ref.to_owned(),
-        value_projection,
-        Some(window_secs),
+    Ok(ClickHouseMaterializationLeaf {
+        table: table_ref.to_owned(),
+        value: value_projection,
+        value_source_column,
+        window_secs: Some(window_secs),
         population,
-        schema
+        timestamp_column: schema
             .time_index
             .and_then(|index| schema.columns.get(index))
             .ok_or("SQL summary source has no timestamp projection")?
             .name
             .clone(),
-    ))
+    })
 }
 
 fn select_materialization<'a>(
@@ -991,6 +1027,133 @@ mod tests {
         value.pane_origin_ms = Some(0);
         value.table_timestamp_column = Some("timestamp_ms".into());
         value
+    }
+
+    /// A table leaf whose value column has the given producer typing.
+    fn typed_value_leaf(
+        dtype: planner_types::pre_asap::DataType,
+        nullable: bool,
+    ) -> planner_types::post_asap::SummaryNode {
+        use planner_types::post_asap::{
+            SummaryExpr, SummaryInputExpr, SummaryNode, SummarySchema, SummaryUpdate,
+        };
+        use planner_types::pre_asap::{
+            Column, ColumnRef, CompareOpKind, DataType, Predicate, QueryExpr, Reduction,
+            ScalarValue, Schema, Source,
+        };
+        let schema = Schema::with_time_index(
+            vec![
+                Column::new("timestamp_ms", DataType::Timestamp, false),
+                Column::new("value", dtype, nullable),
+            ],
+            0,
+            Vec::new(),
+        );
+        let bound = |op: CompareOpKind, at: i64| {
+            Predicate(std::rc::Rc::new(QueryExpr::Compare {
+                left: std::rc::Rc::new(QueryExpr::Column(0)),
+                op,
+                right: std::rc::Rc::new(QueryExpr::Literal(ScalarValue::Int64(at))),
+            }))
+        };
+        let scan = QueryExpr::Scan {
+            source: Source::Table {
+                table_ref: "telemetry".into(),
+            },
+            predicates: vec![
+                bound(CompareOpKind::Ge, 0),
+                bound(CompareOpKind::Lt, 60_000),
+            ],
+            schema,
+        };
+        let family = materialization(
+            AggregationType::Sum,
+            "value",
+            60,
+            60,
+            ("variant", serde_json::json!(1)),
+        )
+        .accumulator_spec()
+        .unwrap()
+        .family;
+        let summary_schema = SummarySchema {
+            fields: vec![],
+            time_index: None,
+        };
+        SummaryNode {
+            expr: SummaryExpr::SummaryAgg {
+                child: std::rc::Rc::new(SummaryNode {
+                    expr: SummaryExpr::KeepPreAsap(std::rc::Rc::new(scan)),
+                    schema: summary_schema.clone(),
+                    guarantee: Default::default(),
+                }),
+                family,
+                input: SummaryUpdate {
+                    item: None,
+                    weight: SummaryInputExpr::Column(ColumnRef::Named("value".into())),
+                    weight_domain: Default::default(),
+                },
+                reduction: Reduction::Reduce(vec![].into()),
+                grouping: Default::default(),
+            },
+            schema: summary_schema,
+            guarantee: Default::default(),
+        }
+    }
+
+    /// Numeric source columns are admitted with their producer typing, which
+    /// the ingest reader needs to read them safely. Before this the contract
+    /// took non-null `Float64` only, so an ordinary nullable or integer
+    /// ClickHouse column could not be automatically materialized at all.
+    #[test]
+    fn numeric_value_columns_are_admitted_with_their_producer_typing() {
+        use planner_types::pre_asap::DataType;
+        for (dtype, nullable) in [
+            (DataType::Float64, false),
+            (DataType::Float64, true),
+            (DataType::Int64, false),
+            (DataType::Int64, true),
+        ] {
+            let leaf = clickhouse_materialization_leaf_contract(
+                &typed_value_leaf(dtype.clone(), nullable),
+                0,
+                60_000,
+            )
+            .unwrap_or_else(|error| panic!("{dtype:?}/{nullable}: {error}"));
+            assert_eq!(
+                leaf.value,
+                asap_types::sds::ValueProjectionIdentity::Column {
+                    name: "value".into()
+                }
+            );
+            let column = leaf
+                .value_source_column
+                .expect("a column projection carries its producer typing");
+            assert_eq!(column.dtype, dtype);
+            assert_eq!(column.nullable, nullable);
+            // Typing is a read concern, not an identity one: the same column
+            // is the same policy however it is declared.
+            assert_eq!(column.table, None);
+        }
+    }
+
+    /// Non-numeric columns have no value semantics to summarise. Refusing them
+    /// protects the result; it is not a gap to be widened.
+    #[test]
+    fn non_numeric_value_columns_stay_refused() {
+        use planner_types::pre_asap::DataType;
+        for dtype in [DataType::Utf8, DataType::Bool, DataType::Timestamp] {
+            let error = clickhouse_materialization_leaf_contract(
+                &typed_value_leaf(dtype.clone(), false),
+                0,
+                60_000,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("numeric source column"),
+                "{dtype:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1427,12 +1590,21 @@ mod tests {
                 })
                 .collect(),
         };
+        // An Int64 source is admitted and carries its declared type into the
+        // materialization, which is what lets the ingest reader widen the
+        // column explicitly and fail loudly on a value beyond the exact
+        // Float64 range instead of silently summarising a rounded one.
         integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Int64;
-        assert!(
-            compile_automatic_clickhouse_workload(&integer_source)
-                .await
-                .is_err(),
-            "an Int64 source may contain values beyond exact Float64 ingest range"
+        let (integer_plan, _) = compile_automatic_clickhouse_workload(&integer_source)
+            .await
+            .expect("an Int64 source is admitted with its producer typing");
+        assert_eq!(
+            integer_plan.precompute_plan.materializations[0]
+                .value_source_column
+                .as_ref()
+                .expect("column projections carry their producer typing")
+                .dtype,
+            DataType::Int64
         );
         integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Float64;
         integer_source.queries[0].sql = integer_source.queries[0].sql.replace(

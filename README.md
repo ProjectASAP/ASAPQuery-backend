@@ -139,17 +139,20 @@ text and deployment hints:
   accuracy_sla: 0.99
   assign_to_role: agent
   grouping_labels: [region]
+  repeat_every: 30s
 ```
 
 `query_string` is the preferred source for metric, aggregation, filters,
 grouping and range-window semantics. Optional registry fields include
-`sketch_family_override`, `sample_p`, `distinct_keys_per_window`, `item_label`
-and `monitor`. `accuracy_sla` is the legacy success fraction: `1.0` requests
-exact results and `0.99` permits epsilon `0.01`.
+`sketch_family_override`, `sample_p`, `distinct_keys_per_window`, `item_label`,
+`monitor` and `repeat_every`. `accuracy_sla` is the legacy success fraction:
+`1.0` requests exact results and `0.99` permits epsilon `0.01`. An unknown key
+is rejected rather than ignored, and a registry file that exists but does not
+parse fails startup instead of degrading to an empty registry.
 
-The startup registry does not currently carry dashboard recurrence. The legacy
-planning API accepts an evaluation cadence at `POST /api/v1/plan`
-(`CONTROLLER_ADDR`, default port `8080`):
+The startup registry and the legacy planning API carry the same evaluation
+cadence, so a declaration is costed identically through either entry point.
+`POST /api/v1/plan` (`CONTROLLER_ADDR`, default port `8080`):
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/plan \
