@@ -270,6 +270,7 @@ mod tests {
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor: None,
+                repeat_every: None,
             },
             WorkloadEntry {
                 metric_name: "http_requests_total".into(),
@@ -283,6 +284,7 @@ mod tests {
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor: None,
+                repeat_every: None,
             },
             WorkloadEntry {
                 metric_name: "http_requests_total".into(),
@@ -296,6 +298,7 @@ mod tests {
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor: None,
+                repeat_every: None,
             },
         ];
 
