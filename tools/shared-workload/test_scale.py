@@ -71,7 +71,7 @@ class ScaleTests(unittest.TestCase):
                                       start_ms=None, end_ms=None, query_name=["temporal_sum"], components=None,
                                       prometheus=url + "/prom", victoriametrics=url + "/vm", clickhouse=url + "/ch",
                                       asap_prometheus=url + "/asap", asap_clickhouse=url + "/asap-sql",
-                                      rtol=1e-9, atol=1e-12, require_warm=True)
+                                      rtol=1e-9, atol=1e-12, require_warm=True, required_pairs=["promql", "sql"])
             self.assertEqual(accuracy_suite.run(args), 0)
             rows = [json.loads(line) for line in args.output.read_text().splitlines()]
             self.assertEqual(len(calls), 20)

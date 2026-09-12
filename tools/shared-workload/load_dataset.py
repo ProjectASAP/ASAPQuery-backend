@@ -31,7 +31,7 @@ def main():
     if digest.hexdigest() != manifest["sha256"]["samples.jsonl"]:
         raise ValueError("data hash does not match manifest")
     def post(url, body, headers=None):
-        with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers or {}), timeout=60) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers or {}), timeout=None) as response:
             response.read()
     def batch(rows):
         encoded = encode_write([({**r["labels"], "__name__": r["metric"]}, r["value"], r["ts_ms"]) for r in rows])

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 import urllib.parse
 import urllib.request
+import urllib.error
 
 from generate import WINDOWS, queries
 import resources
@@ -63,7 +64,7 @@ def corpus(dataset, filter_value=None):
             "coverage": "requested ten families plus representative count, increase and nested compositions; not exhaustive AnyAgg/binary operators"}
 
 
-def request(url, query, timestamp, sql=False, timeout=60):
+def request(url, query, timestamp, sql=False, timeout=None):
     if sql:
         req = urllib.request.Request(url, data=(query + " FORMAT JSONEachRow").encode())
     else:
@@ -85,6 +86,36 @@ def evaluate(actual, expected, rtol, atol):
     _, _, samples = comparison.result_samples(expected)
     if not samples:
         result.update(equal=False, reason="empty oracle cannot establish accuracy")
+    return result
+
+
+def execution(body, headers):
+    h = {k.lower(): v for k, v in headers.items()}
+    if h.get("x-asap-execution"):
+        return h["x-asap-execution"]
+    return "warm" if "data_source: asap_query" in body.get("infos", []) else "unknown"
+
+
+def compare_pair(endpoints, backend, baseline, rtol, atol):
+    actual, exact = endpoints.get(backend, {}), endpoints.get(baseline, {})
+    result = {"backend": backend, "baseline": baseline,
+              "execution": actual.get("execution", "unavailable"),
+              "eligible_for_query_comparison": False,
+              "eligible_for_benefit_conclusion": False,
+              "full_cost": None,
+              "cost_reason": "replay has no isolated complete-lifecycle cost evidence"}
+    if not actual.get("success") or not exact.get("success"):
+        result["correctness"] = {"equal": False, "comparable": False,
+                                 "reason": "paired endpoint missing or failed"}
+        return result
+    try:
+        result["correctness"] = evaluate(actual["response"], exact["response"], rtol, atol)
+    except (ValueError, KeyError, TypeError) as error:
+        result["correctness"] = {"equal": False, "comparable": False, "reason": str(error)}
+    result["eligible_for_query_comparison"] = (result["correctness"]["equal"] and result["execution"] == "warm")
+    result["latency_ns"] = {"backend": actual["latency_ns"], "baseline": exact["latency_ns"]}
+    result["query_latency_ratio"] = (exact["latency_ns"] / actual["latency_ns"]
+                                      if result["eligible_for_query_comparison"] and actual["latency_ns"] else None)
     return result
 
 
@@ -115,13 +146,25 @@ def run(args):
         components = component_sets.get(engine, {})
         before = resources.snapshot(components)
         start = time.perf_counter_ns()
+        record = {"success": False}
         try:
-            body, headers = request(url, expression, timestamp, sql, getattr(args, "timeout_seconds", 60))
-            return body, headers
+            # No client deadline: wait for the service to return, including slow natives.
+            body, headers = request(url, expression, timestamp, sql, timeout=None)
+            record.update(success=body.get("status") == "success", response=body, headers=headers,
+                          execution=execution(body, headers) if engine.startswith("asap_") else "native")
+            if not record["success"]:
+                record["error"] = {"kind": "api_error", "message": str(body.get("error", body))}
+        except Exception as error:
+            record["error"] = {"kind": "timeout" if isinstance(error, TimeoutError) else type(error).__name__,
+                               "message": str(error)}
+            if isinstance(error, urllib.error.HTTPError):
+                record["error"].update(http_status=error.code, body=error.read().decode(errors="replace"))
+                record["headers"] = dict(error.headers.items())
         finally:
-            timing[engine] = {"latency_ns": time.perf_counter_ns() - start,
-                              "resources": resources.delta(before, resources.snapshot(components))}
-    with args.output.open("x") as output:
+            record["latency_ns"] = time.perf_counter_ns() - start
+            record["resources"] = resources.delta(before, resources.snapshot(components))
+        return record
+    with args.output.open("x") as output, args.output.with_name(args.output.name + ".endpoints.jsonl").open("x") as journal:
         for query in manifest["queries"]:
             if args.query_name and query["name"] not in args.query_name:
                 continue
@@ -132,37 +175,52 @@ def run(args):
                        "scale": scale,
                        "dataset_sha256": loaded["sha256"], "interval_ms": query["interval_ms"],
                        "schedule": "sequential historical replay, not wall-clock load"}
-                timing = {}
+                row["endpoints"] = {}
                 try:
                     if query["interval_ms"] != 1000 and timestamp - query["window_ms"] < loaded["start_ms"]:
                         raise ValueError("full temporal window not present in loaded history")
                     sql = query["clickhouse_sql"].replace("{eval_ms}", str(timestamp)).replace("{lookback_ms}", "300000")
-                    prom, _ = measured("prometheus", args.prometheus, query["promql"], timestamp)
-                    exact_sql, _ = measured("clickhouse", args.clickhouse, sql, timestamp, sql=True)
-                    vm, _ = measured("victoriametrics", args.victoriametrics, query["metricsql"], timestamp)
-                    actual_prom, ph = measured("asap_promql", args.asap_prometheus, query["promql"], timestamp)
-                    actual_sql, sh = measured("asap_sql", args.asap_clickhouse, sql, timestamp, sql=True)
-                    row.update(oracle_parity=evaluate(exact_sql, prom, 1e-9, 1e-12),
-                               victoriametrics=evaluate(vm, prom, 1e-9, 1e-12),
-                               promql=evaluate(actual_prom, prom, args.rtol, args.atol),
-                               sql=evaluate(actual_sql, exact_sql, args.rtol, args.atol),
-                               responses={"prometheus": prom, "clickhouse": exact_sql,
-                                          "victoriametrics": vm, "asap_promql": actual_prom, "asap_sql": actual_sql},
-                               headers={"promql": ph, "sql": sh})
-                    # Preserve evidence; never infer warm execution from numerical equality.
-                    def route(body, headers):
-                        h = {k.lower(): v for k, v in headers.items()}
-                        if h.get("x-asap-execution"):
-                            return h["x-asap-execution"]
-                        return "warm" if "data_source: asap_query" in body.get("infos", []) else "unknown"
-                    routes = [route(actual_prom, ph), route(actual_sql, sh)]
-                    row["execution"] = routes
-                    row["passed"] = all(row[k]["equal"] for k in ("oracle_parity", "promql", "sql"))
-                    if args.require_warm:
-                        row["passed"] &= all(route == "warm" for route in routes)
+                    jobs = [("asap_promql", args.asap_prometheus, query["promql"], False),
+                            ("asap_sql", args.asap_clickhouse, sql, True)]
+                    if getattr(args, "asap_metricsql", None):
+                        jobs.append(("asap_metricsql", args.asap_metricsql, query["metricsql"], False))
+                    jobs += [("prometheus", args.prometheus, query["promql"], False),
+                             ("clickhouse", args.clickhouse, sql, True),
+                             ("victoriametrics", args.victoriametrics, query["metricsql"], False)]
+                    row["request_order"] = [job[0] for job in jobs]
+                    for engine, url, expression, is_sql in jobs:
+                        record = measured(engine, url, expression, timestamp, is_sql)
+                        row["endpoints"][engine] = record
+                        # Persist each completed request even if the next service never returns.
+                        journal.write(json.dumps({"query_id": query["id"], "evaluation_ms": timestamp,
+                                                  "engine": engine, **record}, allow_nan=False) + "\n")
+                        journal.flush()
+                    ep = row["endpoints"]
+                    row["pairs"] = {name: compare_pair(ep, backend, baseline, args.rtol, args.atol)
+                                    for name, backend, baseline in (
+                                        ("promql", "asap_promql", "prometheus"),
+                                        ("sql", "asap_sql", "clickhouse"),
+                                        ("metricsql", "asap_metricsql", "victoriametrics"))}
+                    row["oracle_parity"] = compare_pair(ep, "clickhouse", "prometheus", 1e-9, 1e-12)["correctness"]
+                    row["victoriametrics"] = compare_pair(ep, "victoriametrics", "prometheus", 1e-9, 1e-12)["correctness"]
+                    row["sql"], row["promql"] = [row["pairs"][name]["correctness"] for name in ("sql", "promql")]
+                    if not row["oracle_parity"]["equal"]:
+                        row["pairs"]["sql"].update(eligible_for_query_comparison=False, query_latency_ratio=None,
+                                                    oracle_reason="ClickHouse/Prometheus translation parity unavailable or failed")
+                    row["execution"] = [ep[name].get("execution", "failed") for name in ("asap_promql", "asap_sql")]
+                    required = getattr(args, "required_pairs", None) or ["promql", "sql", "metricsql"]
+                    row["acceptance_scope"] = {"required_pairs": required, "full_benefit_acceptance": False}
+                    row["passed"] = all(row["pairs"][name]["correctness"]["equal"] and
+                                        (not args.require_warm or row["pairs"][name]["eligible_for_query_comparison"])
+                                        for name in required)
+                    if "sql" in required:
+                        row["passed"] &= row["oracle_parity"]["equal"]
                 except Exception as error:
                     row.update(passed=False, error=str(error))
-                row["measurements"] = timing
+                row["responses"] = {k: v["response"] for k, v in row["endpoints"].items() if "response" in v}
+                row["headers"] = {k: v.get("headers", {}) for k, v in row["endpoints"].items()}
+                row["measurements"] = {k: {"latency_ns": v["latency_ns"], "resources": v["resources"]}
+                                       for k, v in row["endpoints"].items()}
                 results.append(row["passed"])
                 output.write(json.dumps(row, allow_nan=False) + "\n")
                 output.flush()
@@ -182,6 +240,9 @@ def main():
     check.add_argument("--output", type=Path, required=True)
     for endpoint in ("prometheus", "victoriametrics", "clickhouse", "asap-prometheus", "asap-clickhouse"):
         check.add_argument("--" + endpoint, required=True)
+    check.add_argument("--asap-metricsql", help="ASAP MetricsQL service paired with native VM; absent means unvalidated VM pair")
+    check.add_argument("--required-pair", dest="required_pairs", choices=("promql", "sql", "metricsql"), action="append",
+                       help="explicit partial acceptance scope; default requires all three pairs")
     check.add_argument("--start-ms", type=int)
     check.add_argument("--end-ms", type=int)
     check.add_argument("--query-name", action="append", default=[])
@@ -189,8 +250,6 @@ def main():
     check.add_argument("--atol", type=float, default=1e-12)
     check.add_argument("--require-warm", action="store_true")
     check.add_argument("--components", type=Path)
-    check.add_argument("--timeout-seconds", type=float, default=60,
-                       help="same HTTP timeout for all five engines; configure server limits separately")
     args = parser.parse_args()
     if args.command == "manifest":
         with args.output.open("x") as out:
@@ -198,8 +257,6 @@ def main():
         return 0
     if any(not math.isfinite(v) or v < 0 for v in (args.rtol, args.atol)):
         parser.error("tolerances must be finite and nonnegative")
-    if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
-        parser.error("timeout must be finite and positive")
     return run(args)
 
 

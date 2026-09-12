@@ -124,7 +124,7 @@ class AccuracyTests(unittest.TestCase):
                                   prometheus=url + "/prom", victoriametrics=url + "/vm", clickhouse=url + "/ch",
                                   asap_prometheus=url + "/asap", asap_clickhouse=url + "/asap-sql",
                                   start_ms=1000000, end_ms=1002000, query_name=[], rtol=1e-9, atol=1e-12,
-                                  require_warm=True, components=None)
+                                  require_warm=True, components=None, required_pairs=["promql", "sql"])
         for key, value in changes.items():
             setattr(args, key, value)
         code = suite.run(args)
@@ -152,6 +152,61 @@ class AccuracyTests(unittest.TestCase):
                 code, rows = self.run_fixture(Path(tmp), url)
                 self.assertEqual(code, 1)
                 self.assertFalse(any(row["passed"] for row in rows))
+
+    def test_native_timeout_does_not_skip_other_endpoints(self):
+        """A failed VM call cannot erase successful responses or skip ASAP calls."""
+        original = suite.request
+        for failed in ("/prom", "/ch", "/vm"):
+            with tempfile.TemporaryDirectory() as tmp, endpoints() as (url, calls):
+                def probe(endpoint, *args, **kwargs):
+                    if endpoint == url + failed:
+                        raise TimeoutError("native timed out")
+                    return original(endpoint, *args, **kwargs)
+                with patch.object(suite, "request", side_effect=probe):
+                    _, rows = self.run_fixture(Path(tmp), url)
+                self.assertEqual(sum(path.startswith("/asap") for path, _ in calls), 6)
+                self.assertTrue(all("asap_promql" in row["responses"] for row in rows))
+                engine = {"/prom": "prometheus", "/ch": "clickhouse", "/vm": "victoriametrics"}[failed]
+                self.assertTrue(all(row["endpoints"][engine]["error"]["kind"] == "timeout" for row in rows))
+
+    def test_vm_mismatch_cannot_establish_vm_benefit(self):
+        """Native VM semantics and a missing ASAP MetricsQL pair are explicit."""
+        original = suite.request
+        with tempfile.TemporaryDirectory() as tmp, endpoints() as (url, _):
+            def probe(endpoint, *args, **kwargs):
+                body, headers = original(endpoint, *args, **kwargs)
+                if endpoint == url + "/vm":
+                    body["data"]["result"][0]["value"][1] = "999"
+                return body, headers
+            with patch.object(suite, "request", side_effect=probe):
+                code, rows = self.run_fixture(Path(tmp), url, asap_metricsql=url + "/asap-vm",
+                                              required_pairs=["promql", "sql", "metricsql"])
+            self.assertEqual(code, 1)
+            self.assertTrue(all(not row["pairs"]["metricsql"]["eligible_for_query_comparison"] for row in rows))
+
+    def test_missing_metricsql_pair_is_not_full_acceptance(self):
+        """Without an ASAP VM endpoint the default three-pair acceptance fails."""
+        with tempfile.TemporaryDirectory() as tmp, endpoints() as (url, _):
+            code, rows = self.run_fixture(Path(tmp), url, required_pairs=None)
+            self.assertEqual(code, 1)
+            self.assertTrue(all(not row["pairs"]["metricsql"]["correctness"]["comparable"] for row in rows))
+
+    def test_asap_first_without_client_deadline_and_vm_pair(self):
+        """ASAP runs first without a deadline; MetricsQL has its own exact pair."""
+        original = suite.request
+        with tempfile.TemporaryDirectory() as tmp, endpoints() as (url, calls):
+            def probe(endpoint, *args, **kwargs):
+                self.assertIsNone(kwargs["timeout"])
+                return original(endpoint, *args, **kwargs)
+            with patch.object(suite, "request", side_effect=probe):
+                code, rows = self.run_fixture(Path(tmp), url, asap_metricsql=url + "/asap-vm",
+                                              required_pairs=["promql", "sql", "metricsql"])
+            self.assertEqual(code, 0)
+            self.assertTrue(all(row["pairs"]["metricsql"]["eligible_for_query_comparison"] for row in rows))
+            self.assertTrue(all(not row["pairs"]["metricsql"]["eligible_for_benefit_conclusion"] for row in rows))
+            self.assertEqual(rows[0]["request_order"], ["asap_promql", "asap_sql", "asap_metricsql", "prometheus", "clickhouse", "victoriametrics"])
+            journal = Path(tmp) / "results.jsonl.endpoints.jsonl"
+            self.assertEqual(len(journal.read_text().splitlines()), 18)
 
     def test_empty_oracle_fails(self):
         """An empty result pair is not positive accuracy evidence."""

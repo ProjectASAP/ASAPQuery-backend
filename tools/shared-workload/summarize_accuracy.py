@@ -21,8 +21,25 @@ def summarize(rows):
             "latency": {engine: comparison.distribution([r["measurements"][engine]["latency_ns"]
                         for r in records if engine in r["measurements"]]) for engine in sorted(engines)},
             "victoriametrics_equal": sum(r.get("victoriametrics", {}).get("equal", False) for r in records),
+            "endpoint_failures": {engine: sum(not r.get("endpoints", {}).get(engine, {}).get("success", False)
+                                               for r in records) for engine in sorted(engines)},
+            "pairs": {},
         }
-    return {"queries": result, "scope": "sequential HTTP latency including failures; no throughput or total-system speedup claim"}
+        for name in ("promql", "sql", "metricsql"):
+            pairs = [r.get("pairs", {}).get(name, {}) for r in records]
+            eligible = bool(pairs) and all(p.get("eligible_for_query_comparison", False) for p in pairs)
+            result[query]["pairs"][name] = {
+                "correct_occurrences": sum(p.get("correctness", {}).get("equal", False) for p in pairs),
+                "query_comparison_eligible_occurrences": sum(p.get("eligible_for_query_comparison", False) for p in pairs),
+                "execution_counts": {route: sum(p.get("execution", "unavailable") == route for p in pairs)
+                                     for route in ("warm", "hybrid", "exact_fallback", "unknown", "unavailable", "failed")},
+                "paired_query_latency_ratio": (sum(p["latency_ns"]["baseline"] for p in pairs) /
+                                                sum(p["latency_ns"]["backend"] for p in pairs)) if eligible else None,
+                "eligible_for_benefit_conclusion": False,
+                "full_cost": None,
+                "reason": "complete isolated lifecycle costs are not supplied by endpoint replay",
+            }
+    return {"queries": result, "scope": "ASAP-first sequential HTTP latency including failures; no throughput or total-system speedup claim"}
 
 
 if __name__ == "__main__":
