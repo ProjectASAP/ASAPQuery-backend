@@ -233,6 +233,24 @@ pub fn manifest(
         // Typed local scans require retained input and ingest/update work even
         // when no precomputed summary is installed. Deduplicate by source.
         for node in entry.nodes.values() {
+            if let crate::query_plan::QueryPlanNode::Logical {
+                operator:
+                    crate::query_plan::logical::LogicalOperator::CurrentSeries { population, .. },
+                ..
+            } = node
+            {
+                let key = population.key();
+                for phase in ["build", "update", "residency", "retire"] {
+                    add(
+                        format!("current-series:{key}:{phase}"),
+                        json!({"population": population, "phase": phase}),
+                        "horizon",
+                        1.0,
+                    );
+                }
+                let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: population.metric.clone() }, "location": "backend", "ingest": plan.precompute_plan.ingest});
+                add(format!("source:{source}"), source, "horizon", 1.0);
+            }
             if matches!(
                 node,
                 crate::query_plan::QueryPlanNode::Logical {
@@ -660,6 +678,21 @@ fn select_with_frontend(
 /// The current executor exposes continuously maintained state and the native
 /// exact backend. Additional Planner-produced forests can use `select` directly.
 pub fn with_exact_alternative(
+    request: PlanningRequest,
+) -> Result<Vec<PlanningRequest>, CompileError> {
+    let current = !request.current_series && super::current_series::supported(&request);
+    let mut alternatives = materialization_alternatives(request)?;
+    if current {
+        let mut maintained = alternatives.last().expect("exact alternative").clone();
+        maintained.current_series = true;
+        maintained.hybrid_execution = false;
+        maintained.materialization_policy = None;
+        alternatives.push(maintained);
+    }
+    Ok(alternatives)
+}
+
+fn materialization_alternatives(
     request: PlanningRequest,
 ) -> Result<Vec<PlanningRequest>, CompileError> {
     let mut exact = request.clone();

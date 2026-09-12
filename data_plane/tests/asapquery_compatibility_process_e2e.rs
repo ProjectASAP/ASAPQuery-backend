@@ -28,6 +28,9 @@ mod durable_summary_process;
 #[path = "support/immutable_maintenance_process.rs"]
 mod immutable_maintenance_process;
 
+#[path = "support/current_series_process.rs"]
+mod current_series_process;
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {

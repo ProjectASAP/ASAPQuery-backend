@@ -48,3 +48,5 @@ pub use allocator::SketchAllocator;
 pub use plan::{CostEstimate, ExecutionMode, PipelineStage, PlanNode, PlanSummary};
 
 pub mod publication;
+
+pub(crate) mod current_series;

@@ -631,6 +631,7 @@ impl Drop for StateMutation<'_> {
 
 #[derive(Default)]
 pub struct SketchStore {
+    pub current_series: std::sync::Mutex<super::current_series::CurrentSeriesStore>,
     /// Held through each state append; completion takes the exclusive guard.
     completed_windows: RwLock<HashMap<u64, u64>>,
     completion_flush_before: std::sync::atomic::AtomicU64,

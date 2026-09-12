@@ -138,3 +138,6 @@ remote failures remain errors and are not successful empty vectors.
 - Partial/stale/gapped summary state must not return a successful complete
   `QueryResponse`.
 - A plan swap during execution must not mix identities in one response.
+
+For maintained instant-vector quantiles and shared maximum-k TopK state, see
+[current-series aggregations](current-series-aggregations.md).

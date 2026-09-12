@@ -463,6 +463,14 @@ impl PrometheusRemoteWriteReceiver {
                 )))
             })?;
 
+        self.inner
+            .ingest
+            .sketch_index
+            .current_series
+            .lock()
+            .expect("current-series state poisoned")
+            .ingest(&physical_plan.query_plan, &new_samples);
+
         // Commit dedup mutation only after the entire routed batch was
         // reserved successfully. A rejected/backpressured request must not
         // advance event time or erase retry history.
@@ -541,7 +549,7 @@ impl DedupState {
     }
 }
 
-fn canonicalize_request(
+pub(crate) fn canonicalize_request(
     request: &WriteRequest,
     config: &PrometheusRemoteWriteConfig,
 ) -> Result<Vec<CanonicalSample>, RemoteWriteError> {

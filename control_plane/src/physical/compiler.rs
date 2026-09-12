@@ -139,6 +139,8 @@ pub struct LifecyclePlanningInput {
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanningRequest {
+    /// Exact current-value state is a separately priced physical alternative.
+    pub current_series: bool,
     /// Diagnostic projections of the original Planner search; never consumed by selection.
     pub logical_selection: Vec<serde_json::Value>,
     /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
@@ -681,6 +683,7 @@ impl BackendLocalPlanningSnapshot {
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
+                current_series: false,
                 logical_selection,
                 hybrid_execution: true,
                 materialization_policy: None,
@@ -915,6 +918,14 @@ impl PhysicalCompiler {
         environment: DeploymentEnvironment,
         metricsql: bool,
     ) -> Result<PhysicalPlan, CompileError> {
+        if request.current_series
+            && (metricsql
+                || environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite)
+        {
+            return Err(CompileError::Snapshot(
+                "current-series maintenance requires backend-local PromQL deployment".into(),
+            ));
+        }
         if request.hybrid_execution
             && environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
         {
@@ -1421,11 +1432,12 @@ impl PhysicalCompiler {
             }
         }
 
-        let plan_id = if request.hybrid_execution {
+        let plan_id = if request.hybrid_execution || request.current_series {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
             "typed-local-residual-v3-counter-index".hash(&mut hash);
+            request.current_series.hash(&mut hash);
             request.materialization_policy.hash(&mut hash);
             for query in &request.queries {
                 format!("{:?}", query.post_asap).hash(&mut hash);
@@ -1596,6 +1608,18 @@ impl PhysicalCompiler {
             }
             if metricsql {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
+            }
+            if request.current_series && !metricsql {
+                if let Some(operator) = super::current_series::operator(&request, query)? {
+                    entry.root = crate::query_plan::QueryNodeId(0);
+                    entry.nodes = BTreeMap::from([(
+                        entry.root,
+                        crate::query_plan::QueryPlanNode::Logical {
+                            operator,
+                            inputs: vec![],
+                        },
+                    )]);
+                }
             }
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
@@ -3240,6 +3264,63 @@ fn stable_workload_plan_id(
 mod tests {
     use super::*;
 
+    /// Multiple current-value quantiles and TopK limits share one maintained population.
+    #[test]
+    fn current_series_quantiles_and_topk_have_a_shared_executable_candidate() {
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        snapshot.snapshot_version = 2;
+        let template = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0].clone();
+        let queries = [
+            "quantile by (job) (0.5, a)",
+            "quantile by (job) (0.9, a)",
+            "quantile by (job) (0.95, a)",
+            "quantile by (job) (0.99, a)",
+            "topk by (job) (1, a)",
+            "topk by (job) (5, a)",
+        ];
+        snapshot.query_workload.repeating_queries = Some(
+            queries
+                .iter()
+                .map(|q| {
+                    let mut entry = template.clone();
+                    entry.query = planner_types::workload::Query((*q).into());
+                    entry
+                })
+                .collect(),
+        );
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let plans: Vec<_> = super::super::workload_cost::with_exact_alternative(request)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| PhysicalCompiler.compile(r, environment.clone()).ok())
+            .collect();
+        let plan = plans.iter().find(|plan| plan.query_plan.entries.values().all(|entry|
+            entry.nodes.values().any(|node| matches!(node, crate::query_plan::QueryPlanNode::Logical {
+                operator: crate::query_plan::logical::LogicalOperator::CurrentSeries { .. }, ..
+            })))).expect("no shared current-series candidate");
+        let mut populations = BTreeSet::new();
+        for entry in plan.query_plan.entries.values() {
+            for node in entry.nodes.values() {
+                if let crate::query_plan::QueryPlanNode::Logical {
+                    operator:
+                        crate::query_plan::logical::LogicalOperator::CurrentSeries {
+                            population, ..
+                        },
+                    ..
+                } = node
+                {
+                    assert_eq!(population.max_k, 5);
+                    assert!(population.quantiles);
+                    populations.insert(population.key());
+                }
+            }
+        }
+        assert_eq!(populations.len(), 1);
+    }
+
     #[test]
     fn installed_partition_must_match_the_bound_dag_reduction() {
         let mut env = environment(10_000);
@@ -3727,6 +3808,7 @@ mod tests {
             evidence_by_query.insert(query_id.to_string(), evidence);
         }
         Ok(PlanningRequest {
+            current_series: false,
             logical_selection: Vec::new(),
             hybrid_execution: false,
             materialization_policy: None,

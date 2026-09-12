@@ -182,6 +182,16 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .clone();
         let value = match node {
             QueryPlanNode::Scalar { value } => Value::Scalar(value),
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::CurrentSeries { .. },
+                ..
+            } => {
+                self.stats.summary_readout_evaluations += 1;
+                from_result((self.callback)(
+                    id,
+                    u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
+                )?)?
+            }
             QueryPlanNode::Logical { operator, inputs } => {
                 if matches!(
                     operator,
@@ -239,6 +249,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             | LogicalOperator::CandidateExactSubquery { .. } => {
                 Err(miss("Prometheus exact leaf was not prepared"))
             }
+            LogicalOperator::CurrentSeries { .. } => Err(miss(
+                "current-series leaf must use its installed node identity",
+            )),
             LogicalOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }

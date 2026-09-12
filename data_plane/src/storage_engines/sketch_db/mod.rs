@@ -56,3 +56,5 @@ pub use sds::{
     DataDescriptor, DataDescriptorId, SdsBinding, SummaryDescriptor, SummaryDescriptorId,
     SummaryDescriptorRegistry, SummaryOperator,
 };
+
+pub mod current_series;

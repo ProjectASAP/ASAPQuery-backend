@@ -9,6 +9,10 @@ fn invalid(message: impl Into<String>) -> QueryPlanError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LogicalOperator {
+    CurrentSeries {
+        population: super::current_series::SeriesPopulation,
+        readout: super::current_series::SeriesReadout,
+    },
     /// A maximal exact scalar/vector subtree evaluated by Prometheus.
     ExactSubquery {
         query: String,
@@ -116,8 +120,28 @@ pub enum TemporalOperation {
 
 impl LogicalOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
+        if let Self::CurrentSeries {
+            population,
+            readout,
+        } = self
+        {
+            population.validate()?;
+            match readout {
+                super::current_series::SeriesReadout::Quantile { q }
+                    if !q.is_finite() || !population.quantiles =>
+                {
+                    return Err(invalid(
+                        "quantile readout requires finite q and a quantile population",
+                    ))
+                }
+                super::current_series::SeriesReadout::TopK { k } if *k > population.max_k => {
+                    return Err(invalid("TopK readout exceeds shared population capacity"))
+                }
+                _ => {}
+            }
+        }
         let expected = match self {
-            Self::Scan { .. } | Self::ExactSubquery { .. } => 0,
+            Self::Scan { .. } | Self::ExactSubquery { .. } | Self::CurrentSeries { .. } => 0,
             Self::CandidateExactSubquery { .. } => 1,
             Self::Binary { .. } | Self::HistogramQuantile => 2,
             _ => 1,

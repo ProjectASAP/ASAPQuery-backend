@@ -2160,6 +2160,15 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let mut buffer = Vec::new();
     prometheus::Encoder::encode(&encoder, &metric_families, &mut buffer)
         .unwrap_or_else(|e| tracing::error!("Failed to encode metrics: {}", e));
+    let (populations, builds) = state
+        .sketch_index
+        .current_series
+        .lock()
+        .expect("current-series state poisoned")
+        .stats();
+    buffer.extend_from_slice(format!(
+        "# TYPE asap_current_series_populations gauge\nasap_current_series_populations {populations}\n# TYPE asap_current_series_cache_builds_total counter\nasap_current_series_cache_builds_total {builds}\n"
+    ).as_bytes());
     if let Some(receiver) = state.remote_write.as_ref() {
         use std::sync::atomic::Ordering;
         let stats = receiver.stats();

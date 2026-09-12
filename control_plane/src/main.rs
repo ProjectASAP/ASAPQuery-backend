@@ -973,6 +973,7 @@ fn compile_physical_plan_request(
     };
 
     let planning_request = physical::compiler::PlanningRequest {
+        current_series: false,
         logical_selection,
         query_workload: None,
         queries,

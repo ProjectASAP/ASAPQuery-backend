@@ -275,8 +275,43 @@ impl ASAPQueryEngine {
             .sketch_index
             .as_ref()
             .map(|index| index.summary_update_revision());
-        let result =
-            super::logical_dag::execute_installed(entry, leaves, at, |root, evaluation_ms| {
+        let result = super::logical_dag::execute_installed(
+            entry,
+            leaves,
+            at,
+            |root, evaluation_ms| {
+                if let Some(asap_types::query_plan::QueryPlanNode::Logical {
+                    operator:
+                        asap_types::query_plan::logical::LogicalOperator::CurrentSeries {
+                            population,
+                            readout,
+                        },
+                    ..
+                }) = entry.nodes.get(&root)
+                {
+                    let index = self.sketch_index.as_ref().ok_or_else(|| {
+                        EngineError::capability_miss("current_series", "summary store unavailable")
+                    })?;
+                    let values = index
+                        .current_series
+                        .lock()
+                        .expect("current-series state poisoned")
+                        .read(
+                            (
+                                physical.query_plan.plan_id,
+                                physical.query_plan.plan_version,
+                            ),
+                            population,
+                            readout,
+                            evaluation_ms,
+                        )
+                        .map_err(|error| EngineError::capability_miss("current_series", error))?;
+                    use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
+                    return Ok(QueryResult::vector(values.into_iter().map(|(labels,value)| {
+                        InstantVectorElement::new(crate::storage_engines::types::KeyByLabelValues::new_with_labels(labels.values().cloned().collect()), value)
+                            .with_label_keys_override(labels.into_keys().collect())
+                    }).collect(), evaluation_ms));
+                }
                 let mut subtree = entry.clone();
                 subtree.root = root;
                 let reachable = subtree.topological_order().map_err(|e| {
@@ -383,7 +418,8 @@ impl ASAPQueryEngine {
                     evaluation_ms,
                     false,
                 ))
-            });
+            },
+        );
         let current = self
             .sketch_index
             .as_ref()
