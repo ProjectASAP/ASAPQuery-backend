@@ -57,6 +57,10 @@ jobs:
           # post-step can package `target`; registry/git inputs are sufficient.
           cache-targets: false
 
+      - name: Test shared-workload comparison accounting
+        working-directory: ASAPQuery-backend
+        run: python3 -m unittest discover -s tools/shared-workload -p 'test*.py'
+
       - name: Check formatting
         working-directory: ASAPQuery-backend
         run: cargo fmt -p control_plane -p data_plane -- --check
