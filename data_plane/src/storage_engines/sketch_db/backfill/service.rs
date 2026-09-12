@@ -389,7 +389,9 @@ mod tests {
         target: BackfillStatus,
         timeout_ms: u64,
     ) -> BackfillStatus {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let deadline = crate::tests::test_utilities::timing::deadline(
+            std::time::Duration::from_millis(timeout_ms),
+        );
         loop {
             if let Some(j) = registry.get(job_id) {
                 if j.status == target || j.status.is_terminal() {

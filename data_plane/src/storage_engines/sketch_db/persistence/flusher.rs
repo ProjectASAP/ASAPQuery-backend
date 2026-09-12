@@ -721,7 +721,7 @@ mod tests {
         let mut handle = FlusherHandle::start(cfg, manifest.clone(), source.clone()).unwrap();
 
         // Wait until memory is below the low-water mark.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::tests::test_utilities::timing::deadline(Duration::from_secs(2));
         while source.approx_memory_bytes() > 600 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
@@ -755,7 +755,7 @@ mod tests {
         cfg.hot_window_ms = Some(1_000); // 1 second hot window
         let mut handle = FlusherHandle::start(cfg, manifest.clone(), source.clone()).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::tests::test_utilities::timing::deadline(Duration::from_secs(2));
         while source.approx_memory_bytes() > 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
@@ -788,7 +788,7 @@ mod tests {
         cfg.hot_window_ms = Some(120_000); // 120s hot window, like live
         let mut handle = FlusherHandle::start(cfg, manifest.clone(), source.clone()).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = crate::tests::test_utilities::timing::deadline(Duration::from_secs(3));
         while manifest.live_parts().is_empty() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
@@ -809,7 +809,7 @@ mod tests {
         cfg.delete_older_than_ms = Some(0); // then immediately expire it
         let mut handle = FlusherHandle::start(cfg, manifest.clone(), source.clone()).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::tests::test_utilities::timing::deadline(Duration::from_secs(2));
         while !manifest.live_parts().is_empty() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
