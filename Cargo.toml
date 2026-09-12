@@ -28,6 +28,13 @@ version = "0.1.0"
 asap_sketchlib = { path = "../asap_sketchlib" }
 
 [workspace.dependencies]
+# Keep Planner frontends, selection, and IR on the same immutable main revision.
+# Alias upstream asap-types because this workspace also defines asap_types.
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
+asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
+
 # Shared external deps (used by 2+ crates)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
