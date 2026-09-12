@@ -1067,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn one_sid_with_two_populations_cannot_publish_a_partial_global_summary() {
+    fn complete_populations_publish_once_and_reject_foreign_generation() {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
         ))
@@ -1106,7 +1106,7 @@ mod tests {
         config.delete_older_than_ms = None;
         config.hot_window_ms = None;
         let mut persistence = store.start_persistence(config).unwrap();
-        for instance in ["a", "b"] {
+        for (instance, value) in [("a", 5.0), ("b", 15.0)] {
             let population = BTreeMap::from([("instance".to_string(), instance.to_string())]);
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
                 summary_definition_id: source.policy_fingerprint().into(),
@@ -1123,7 +1123,7 @@ mod tests {
             output.population_labels = Some(population);
             output.catalog_generation = Some(Arc::clone(&generation));
             let mut sum = SumAccumulator::new();
-            sum.update(5.0);
+            sum.update(value);
             store
                 .publish_admitted_summary_update(
                     &generation,
@@ -1167,8 +1167,7 @@ mod tests {
             )
             .unwrap();
         assert!(!frozen.singleton_population_complete);
-        // The read set is deterministic and all-or-nothing, independently of
-        // the later routing decision (which still rejects this global reduce).
+        // The global reduction must consume both populations in one read set.
         let request = |name: &str| {
             (
                 700,
@@ -1210,32 +1209,74 @@ mod tests {
             .is_err());
         let parts_before = persistence.manifest.live_parts().len();
         let resolver = crate::drivers::ingest::series_resolver::SeriesIdResolver::new();
-        for _ in 0..2 {
-            assert!(
-                crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
-                    &store,
-                    &resolver,
-                    &plan.precompute_plan
-                )
-                .is_err()
-            );
-        }
-        assert!(store
-            .series_ids_for_policy(target.policy_fingerprint())
-            .is_empty());
-        assert_eq!(persistence.manifest.live_parts().len(), parts_before);
-        let records = store
-            .persistence_metadata
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .load_strict()
-            .unwrap();
-        assert!(records.iter().all(|record| record.summary_definition_id
-            != Some(target.policy_fingerprint().into())
-            && record.pending_immutable.is_none()));
+        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+            &store,
+            &resolver,
+            &plan.precompute_plan,
+        )
+        .unwrap();
+        let targets = store.series_ids_for_policy(target.policy_fingerprint());
+        assert_eq!(targets.len(), 1);
+        let target_sid = targets[0];
+        let assert_complete_output = |store: &SketchStore| {
+            use crate::precompute_engine::operators::DDSketchAccumulator;
+            use crate::storage_engines::sketch_db::data::SketchEncoding;
+            let rows = store.query_range(target_sid, 0, 60_000);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].series_label_values.is_empty());
+            assert_eq!(rows[0].samples.len(), 1);
+            let frames = &rows[0].samples[&60_000];
+            assert_eq!(frames.len(), 1);
+            let sketch = match frames[0].encoding {
+                SketchEncoding::MsgpackFull => {
+                    DDSketchAccumulator::from_msgpack_bytes(&frames[0].bytes).unwrap()
+                }
+                SketchEncoding::ProtoFull => {
+                    DDSketchAccumulator::from_sketchlib_proto_bytes(&frames[0].bytes).unwrap()
+                }
+                other => panic!("unexpected derived encoding: {other:?}"),
+            };
+            assert_eq!(sketch.inner.total_count(), 2);
+            for (q, expected) in [(0.0, 5.0), (1.0, 15.0)] {
+                let actual = sketch.inner.quantile(q).unwrap();
+                assert!((actual - expected).abs() <= expected * sketch.inner.wire_alpha());
+            }
+            frames[0].bytes.clone()
+        };
+        let bytes = assert_complete_output(&store);
+        assert_eq!(persistence.manifest.live_parts().len(), parts_before + 1);
+        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+            &store,
+            &resolver,
+            &plan.precompute_plan,
+        )
+        .unwrap();
+        assert_eq!(assert_complete_output(&store), bytes);
+        assert_eq!(persistence.manifest.live_parts().len(), parts_before + 1);
         persistence.shutdown();
+
+        // Replaying the same generation after recovery must reuse the output.
+        let recovered = Arc::new(SketchStore::new());
+        recovered
+            .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
+        let mut recovery_config =
+            persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+                1 << 24,
+                directory.path().to_path_buf(),
+            );
+        recovery_config.delete_older_than_ms = None;
+        recovery_config.hot_window_ms = None;
+        let mut recovery = recovered.start_persistence(recovery_config).unwrap();
+        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+            &recovered,
+            &resolver,
+            &plan.precompute_plan,
+        )
+        .unwrap();
+        assert_eq!(assert_complete_output(&recovered), bytes);
+        assert_eq!(recovery.manifest.live_parts().len(), parts_before + 1);
+        recovery.shutdown();
 
         // A catalog transition deliberately leaves old-generation payload
         // unbound on restart. It must still count against singleton proof.
@@ -1310,6 +1351,17 @@ mod tests {
         let mut next_plan = plan.precompute_plan.clone();
         next_plan.summary_catalog = Some(next_generation.as_ref().clone());
         let parts_before = restored.manifest.live_parts().len();
+        let durable_records = || {
+            restored
+                .flusher
+                .metadata_store()
+                .load_strict()
+                .unwrap()
+                .into_iter()
+                .map(|record| (record.sid, serde_json::to_value(record).unwrap()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let records_before = durable_records();
         assert!(
             crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
                 &restarted, &resolver, &next_plan
@@ -1320,18 +1372,7 @@ mod tests {
             .series_ids_for_policy(target.policy_fingerprint())
             .is_empty());
         assert_eq!(restored.manifest.live_parts().len(), parts_before);
-        assert!(restarted
-            .persistence_metadata
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .load_strict()
-            .unwrap()
-            .iter()
-            .all(|record| record.summary_definition_id
-                != Some(target.policy_fingerprint().into())
-                && record.pending_immutable.is_none()));
+        assert_eq!(durable_records(), records_before);
         restored.shutdown();
     }
 
