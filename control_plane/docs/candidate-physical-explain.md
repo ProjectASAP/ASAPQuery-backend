@@ -21,3 +21,9 @@ The read-only `/api/v1/physical-plan/cost-manifests` and MetricsQL equivalent re
 Snapshot compilation exposes the same logical trace on `PhysicalPlan`; `inspect_physical_dag` prints it outside the install request. Compile-and-publish returns the trace without adding it to executable wire DTOs. SQL's existing selection trace gains the same semantic candidate/root identities.
 
 These are bounded explanations: they cover the actual Planner search and the existing physical materialization/exact inventory, not every possible placement or resource-constrained cluster assignment. Missing numeric measurements remain missing. The next provider integration must occur before logical commitment and reuse Planner's provider/resource contracts.
+
+## Realization providers
+
+The internal `RealizationProvider` boundary reuses the existing window implementation, physical plan, manifest and quote contracts. The current provider delegates to the established compiler and ThreeStage allocator/emitter. It preserves supplied implementation IDs and validates their evidence; it does not create algorithms from display names, change selected families, or infer panes from slides.
+
+Complete alternatives continue to report `AlternativeCost` identities, capability-bound quote availability, costs and rejection reasons. Missing or stale evidence is unavailable, not a zero-cost alternative. `try_split_typed` retains allocation and emission errors; the legacy ThreeStage compatibility wrapper logs the concrete error before its existing fallback. SingleStage/ZeroStage allocator support and continuous/sliding derived maintenance remain gated. Backend-local compilation remains available through its existing independent compiler path.
