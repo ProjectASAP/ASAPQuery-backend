@@ -579,7 +579,10 @@ external-only DAG; only actual summary reads establish ASAP/hybrid execution.
 The fixture's mixed-DAG assertions are stronger than a successful `SELECT 1`.
 
 For recorded datasets, see the [replay guide](docs/user_guide/o11y-replay.md) and
-[execution calibration](tools/o11y-execution/CALIBRATION.md). Report correctness,
+[execution calibration](tools/o11y-execution/CALIBRATION.md). For synthetic fake
+metrics, Google and Alibaba query expressions and cross-engine measurements, see
+the [dataset-specific accuracy evaluation](tools/shared-workload/ACCURACY_E2E.md).
+Report correctness,
 fallbacks, build/update cost and whole-deployment resources separately from
 query latency. Manual examples leave evidence directories intact; remove them
 only when no longer needed. PID-file cleanup commands apply only to the

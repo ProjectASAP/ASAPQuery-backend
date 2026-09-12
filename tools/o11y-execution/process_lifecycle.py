@@ -13,7 +13,7 @@ def stop(child, timeout=30):
     # cannot subsequently be recovered with wait4, and is not a measured zero.
     if child.returncode is None:
         child.terminate()
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             try:
                 pid, status, collected = os.wait4(child.pid, os.WNOHANG)
@@ -23,7 +23,7 @@ def stop(child, timeout=30):
                 child.returncode = os.waitstatus_to_exitcode(status)
                 usage = collected
                 break
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 forced = True
                 child.kill()
                 try:

@@ -1,5 +1,9 @@
 # Shared aggregation sensitivity workload
 
+For dataset-specific fake-client, Google and Alibaba expressions, matched HTTP
+accuracy/latency replay and component/system resource accounting, see
+[Accuracy E2E](ACCURACY_E2E.md).
+
 This developer evaluation tool emits identical timestamped samples for Prometheus,
 VictoriaMetrics, and ClickHouse, with a query manifest. This synthetic sensitivity
 study supplements the original o11y workload; it does not replace its coverage or
