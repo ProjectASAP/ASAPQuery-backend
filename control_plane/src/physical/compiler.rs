@@ -148,6 +148,8 @@ pub struct PlanningRequest {
     /// Original dashboard demand, in the same order as queries. None is legacy input.
     pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<PlanningQuery>,
+    /// Compiler-owned quotes eligible for joint pane repricing; never inferred from model labels.
+    pub synthesized_window_queries: BTreeSet<String>,
     pub evidence: HashMap<String, TopKMembershipEvidence>,
     /// Fresh measured costs for Planner exact/summary composition sites,
     /// scoped to query IDs just like accuracy evidence.
@@ -678,6 +680,67 @@ impl BackendLocalPlanningSnapshot {
             &exact_costs_by_id,
             self.implementation.erp.as_ref(),
         )?;
+        // Derived maintenance currently consumes full, non-overlapping source cohorts.
+        // Restrict only synthesized candidates; deployment-supplied evidence is authoritative.
+        for query in &mut queries {
+            if self
+                .implementation
+                .window_candidates
+                .contains_key(&query.query_string)
+            {
+                continue;
+            }
+            let states =
+                collect_selected_materializations(&query.post_asap, true).map_err(|reason| {
+                    CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason,
+                    }
+                })?;
+            let mut full_windows = BTreeSet::new();
+            for state in &states {
+                if let Some(sources) = immutable_materialization_sources(&state.node) {
+                    full_windows.insert(state.window_secs.unwrap_or(query.window_secs));
+                    for source in sources {
+                        let (_, window, _) =
+                            selected_input_contract(&source).map_err(|reason| {
+                                CompileError::Query {
+                                    query_id: query.query_id.clone(),
+                                    reason,
+                                }
+                            })?;
+                        full_windows.insert(window.unwrap_or(query.window_secs));
+                    }
+                }
+            }
+            let mut seen = BTreeSet::new();
+            query.window_implementations.retain_mut(|candidate| {
+                if !full_windows.contains(&candidate.window_secs) {
+                    return true;
+                }
+                if !seen.insert(candidate.window_secs) {
+                    return false;
+                }
+                candidate.slide_secs = candidate.window_secs;
+                candidate.framework = SummaryWindowFramework::Tumbling;
+                candidate.layout = asap_types::WindowMaterializationLayout::Pane {
+                    pane_secs: candidate.window_secs,
+                };
+                candidate.implementation_id = format!(
+                    "{}-{}s-derived-cohort",
+                    self.implementation.window_implementation_id, candidate.window_secs
+                );
+                candidate.cost = derived_window_cost(
+                    &candidate.cost,
+                    &query.lifecycle,
+                    candidate.window_secs,
+                    candidate.slide_secs,
+                    &candidate.layout,
+                    self.implementation.query_staleness_margin_ms,
+                );
+                true
+            });
+        }
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
@@ -685,6 +748,16 @@ impl BackendLocalPlanningSnapshot {
                 hybrid_execution: true,
                 materialization_policy: None,
                 query_workload: Some(workload),
+                synthesized_window_queries: queries
+                    .iter()
+                    .filter(|q| {
+                        !self
+                            .implementation
+                            .window_candidates
+                            .contains_key(&q.query_string)
+                    })
+                    .map(|q| q.query_id.clone())
+                    .collect(),
                 queries,
                 evidence: topk_evidence_by_id,
                 exact_composition_costs: exact_costs_by_id,
@@ -1419,6 +1492,18 @@ impl PhysicalCompiler {
                     }
                 }
             }
+        }
+
+        if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+            super::pane_reuse::share_additive_panes(
+                &request,
+                &mut compiled_materializations,
+                &mut collector_materializations,
+                &mut plan_materializations,
+                &mut node_bindings,
+                &mut runtime_policies,
+                &mut lifecycle_estimates,
+            );
         }
 
         let plan_id = if request.hybrid_execution {
@@ -2214,8 +2299,8 @@ fn validate_lifecycle_input(
 ///   query's own evaluation cadence.
 /// - **retention**: `retained_state_count`, the same function that fills
 ///   `num_aggregates_to_retain`, so the quote and the plan cannot disagree.
-///   Concurrent in-flight full windows are not double-charged here — the
-///   fanout term already prices that write amplification.
+///   Open worker accumulators are charged separately from published states;
+///   updating a state and keeping it resident are different resources.
 ///
 /// The byte fields are left exactly as the snapshot supplied them: state size
 /// needs sketch parameters that do not exist yet at this point, and guessing
@@ -2223,7 +2308,7 @@ fn validate_lifecycle_input(
 /// `cpu_cost` and `weighted_cost` are derived, and only those two are read —
 /// by `validate_window_implementations` and by the `min_by` that ranks
 /// candidates. `model_version` records that the quote is derived.
-fn derived_window_cost(
+pub(super) fn derived_window_cost(
     template: &ImplementationCostEvidence,
     lifecycle: &LifecyclePlanningInput,
     window_secs: u64,
@@ -2258,23 +2343,29 @@ fn derived_window_cost(
         slide_secs.saturating_mul(1_000),
         layout,
     ) as f64;
+    // Store retention does not include worker accumulators that are still open.
+    let active = match layout {
+        asap_types::WindowMaterializationLayout::FullWindow => (window / slide).ceil(),
+        _ => 1.0,
+    };
 
     let build = costs.build * states_created;
     let maintenance = costs.maintenance_per_update * updates;
     let read = costs.read * reads * finalizations_per_read;
-    let retention = costs.retention_per_second * horizon * retained;
+    let retention = costs.retention_per_second * horizon * (retained + active);
     let retirement = costs.retirement * states_created;
     let cpu_cost = build + maintenance;
     let weighted_cost = cpu_cost + read + retention + retirement;
 
     ImplementationCostEvidence {
-        model_version: format!("{}+derived-window-layout-v1", template.model_version),
-        cpu_cost: if cpu_cost.is_finite() { cpu_cost } else { 0.0 },
-        weighted_cost: if weighted_cost.is_finite() {
-            weighted_cost
-        } else {
-            0.0
-        },
+        model_version: format!(
+            "{}+derived-window-layout-v1",
+            template
+                .model_version
+                .trim_end_matches("+derived-window-layout-v1")
+        ),
+        cpu_cost,
+        weighted_cost,
         ..template.clone()
     }
 }
@@ -2326,42 +2417,10 @@ fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
     windows
 }
 
-/// The window implementations to plan with when the snapshot priced none for
-/// this query.
-///
-/// These are *shapes*, not cost quotes. `ImplementationCostEvidence` is
-/// measured evidence: its `weighted_cost` doc puts pricing update CPU,
-/// query-time merges, retained memory, storage, scans and network on the
-/// evidence producer. So this never synthesizes competing candidates for one
-/// window to rank against each other — one shape per window, selected by a
-/// `min_by` over a one-element list where the cost cannot change the outcome.
-/// Ranking `Pane` against `FullWindow` requires a snapshot supplying both with
-/// their own priced evidence in `window_candidates`.
-///
-/// **One candidate per range-selector window, not one per query.** A state
-/// whose window has no candidate is dropped from selection outright
-/// (`hybrid_execution`'s filter), and the surviving candidates are narrowed to
-/// the selected window before validation. Deriving a single candidate from
-/// `time_selection.lookback` therefore silently costs every operand whose own
-/// range differs from it its summary: `sum(sum_over_time(a[1m])) /
-/// sum(sum_over_time(b[5m]))` under a 1m lookback kept `a` and dropped `b` to
-/// exact execution, with nothing reported.
-///
-/// Within one window, the shape follows the query's evaluation cadence. A
-/// workload evaluated every 30s over a 5m window needs its state to advance
-/// every 30s; one 5m tumbling window answers with results that only change
-/// once every five minutes. `evaluation_interval_ms` already reaches this
-/// function — it was read for lifecycle costing and then dropped here.
-///
-/// The guards are the validator's own rules, so a bad shape is a compile error
-/// rather than a silent plan: `WindowMaterializationLayout::validate` requires
-/// the pane to divide both window and slide (45s into 300s has no such pane),
-/// and the framework/layout table admits `Tumbling + Pane` and `Sliding + Pane`.
-/// `pane_secs == slide_secs` is the coarsest legal pane for a cadence, so it
-/// is the one with the fewest query-time merges. `FullWindow` is the other
-/// legal `Sliding` layout and is deliberately not emitted alongside it:
-/// preferring it is a write-amplification-versus-read-amplification tradeoff,
-/// which is a cost comparison, and there is no second quote to compare.
+/// Derive and price one implementation per supported layout for each range.
+/// Explicit snapshot candidates bypass this path. After logical selection,
+/// derived maintenance cohorts are restricted to their supported full windows;
+/// raw additive pane producers may subsequently be shared by Planner.
 fn derived_window_candidates(
     implementation_id: &str,
     expr: &QueryExpr,
@@ -2524,7 +2583,7 @@ pub(super) fn validate_window_implementations(
     Ok(candidates)
 }
 
-fn retained_state_count(
+pub(super) fn retained_state_count(
     lookback_ms: u64,
     staleness_margin_ms: u64,
     slide_ms: u64,
@@ -3987,6 +4046,7 @@ mod tests {
         }
         Ok(PlanningRequest {
             logical_selection: Vec::new(),
+            synthesized_window_queries: BTreeSet::new(),
             hybrid_execution: false,
             materialization_policy: None,
             query_workload: None,
@@ -5151,6 +5211,164 @@ mod tests {
             actual,
             BTreeSet::from([("a", 10_000, Some(60_000)), ("b", 10_000, Some(300_000)),])
         );
+        assert_eq!(plan.precompute_plan.materializations.len(), 2);
+    }
+
+    // Derived programs and their raw inputs must keep a runtime-supported cohort.
+    #[test]
+    fn derived_window_regression_nested_snapshot() {
+        for rate in [0.0, 100.0] {
+            let mut value: Value = serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+            value["query_workload"]["repeating_queries"][0]["query"] =
+                json!("quantile(0.9, sum_over_time(m[1m]))");
+            value["data_workload"]["ingestion_rate"]["value"] = json!(rate);
+            value["query_workload"]["data_workload"]["ingestion_rate"]["value"] = json!(rate);
+            let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(value).unwrap();
+            let (request, env) = snapshot.planning_request().unwrap();
+            let plan = PhysicalCompiler.compile(request, env).unwrap();
+            assert!(plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .any(|m| m.derived_input.is_some()));
+            assert!(plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .all(|m| m.window_size == m.slide_interval));
+        }
+    }
+
+    // A full-window producer keeps overlapping accumulators alive even before publication.
+    #[test]
+    fn derived_window_regression_resident_cost() {
+        let template = planning_snapshot().implementation.implementation_cost;
+        let mut lifecycle = planning_lifecycle();
+        lifecycle.costs = LifecycleCostEvidence {
+            build: 0.0,
+            maintenance_per_update: 0.0,
+            read: 0.0,
+            retention_per_second: 1.0,
+            retirement: 0.0,
+        };
+        let full = derived_window_cost(
+            &template,
+            &lifecycle,
+            300,
+            30,
+            &asap_types::WindowMaterializationLayout::FullWindow,
+            0,
+        );
+        assert!(full.weighted_cost >= lifecycle.horizon_seconds * 11.0);
+    }
+
+    // Temporal SUM readouts share raw state only for identical source populations.
+    #[test]
+    fn derived_window_regression_shared_sum_panes() {
+        for interval in [10_000, 60_000] {
+            for (rhs, expected_states) in [("a", 1), ("b", 2), ("a{job=\"x\"}", 2)] {
+                let mut snapshot = planning_snapshot();
+                let query = format!("sum_over_time(a[1m]) / sum_over_time({rhs}[10m])");
+                let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+                entry.query = Query(query);
+                entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+                entry.demand = RepeatedDemand::FixedIntervalAt {
+                    interval: RepetitionInterval(interval),
+                    evaluation_phase: planner_types::workload::TimestampMs(0),
+                };
+                let (request, env) = snapshot.planning_request().unwrap();
+                let plan = PhysicalCompiler.compile(request, env).unwrap();
+                assert_eq!(plan.precompute_plan.materializations.len(), expected_states);
+                let entry = plan.query_plan.entries.values().next().unwrap();
+                let bindings = entry.materialization_bindings();
+                assert_eq!(
+                    bindings
+                        .iter()
+                        .filter_map(|b| b.readout_lookback_ms)
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([60_000, 600_000])
+                );
+                if rhs == "a" {
+                    assert_eq!(bindings[0].materialization, bindings[1].materialization);
+                    assert_eq!(
+                        plan.precompute_plan.materializations[0].num_aggregates_to_retain,
+                        Some(600_000 / u64::from(interval) + 1)
+                    );
+                }
+            }
+        }
+    }
+
+    // Distinct workload entries share one producer and retain both lifecycle consumers.
+    #[test]
+    fn shared_panes_preserve_workload_consumers_and_phase() {
+        for phase in [0, 5_000] {
+            let mut snapshot = planning_snapshot();
+            let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+            entries[0].query = Query("sum_over_time(a[1m])".into());
+            entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            let mut second = entries[0].clone();
+            second.query = Query("sum_over_time(a[10m])".into());
+            second.demand = RepeatedDemand::FixedIntervalAt {
+                interval: RepetitionInterval(10_000),
+                evaluation_phase: planner_types::workload::TimestampMs(phase),
+            };
+            entries.push(second);
+            let (request, env) = snapshot.planning_request().unwrap();
+            let plan = PhysicalCompiler.compile(request, env).unwrap();
+            assert_eq!(
+                plan.precompute_plan.materializations.len(),
+                if phase == 0 { 1 } else { 2 }
+            );
+            if phase == 0 {
+                assert_eq!(plan.lifecycle_estimates.len(), 1);
+                let estimate = &plan.lifecycle_estimates[0];
+                assert_eq!(estimate.consumer_query_ids.len(), 2);
+                assert_eq!(estimate.expected_reads, 60.0);
+                assert_eq!(estimate.expected_updates, 30_000.0);
+            }
+        }
+    }
+
+    // Overflow must fail candidate validation, never turn an expensive layout into a free one.
+    #[test]
+    fn derived_cost_overflow_is_rejected() {
+        let snapshot = planning_snapshot();
+        let (mut request, env) = snapshot.planning_request().unwrap();
+        let query = &mut request.queries[0];
+        let mut lifecycle = query.lifecycle.clone();
+        lifecycle.costs.build = f64::MAX;
+        let candidate = &mut query.window_implementations[0];
+        candidate.cost = derived_window_cost(
+            &candidate.cost,
+            &lifecycle,
+            candidate.window_secs,
+            candidate.slide_secs,
+            &candidate.layout,
+            0,
+        );
+        assert!(validate_window_implementations(query, &env).is_err());
+    }
+
+    // Serialized derived quotes become authoritative when a deployment supplies them explicitly.
+    #[test]
+    fn explicit_window_quotes_are_not_repriced_for_sharing() {
+        let mut snapshot = planning_snapshot();
+        let query = "sum_over_time(a[1m]) / sum_over_time(a[10m])";
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query(query.into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let (derived, _) = snapshot.clone().planning_request().unwrap();
+        snapshot.implementation.window_candidates.insert(
+            query.into(),
+            derived.queries[0].window_implementations.clone(),
+        );
+        let (request, env) = snapshot.planning_request().unwrap();
+        assert!(request.synthesized_window_queries.is_empty());
+        let plan = PhysicalCompiler.compile(request, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
 

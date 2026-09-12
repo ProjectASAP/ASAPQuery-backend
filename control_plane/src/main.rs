@@ -1006,6 +1006,7 @@ fn compile_physical_plan_request(
     };
 
     let planning_request = physical::compiler::PlanningRequest {
+        synthesized_window_queries: Default::default(),
         logical_selection,
         query_workload: None,
         queries,
