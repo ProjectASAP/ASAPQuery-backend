@@ -27,6 +27,7 @@ pub mod deployment;
 pub mod deployment_cost;
 pub mod erp;
 pub mod executable_binding;
+mod pane_reuse;
 pub mod plan;
 pub mod plan_cache;
 pub mod planner;

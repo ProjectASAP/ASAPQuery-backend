@@ -264,7 +264,7 @@ docker version
 cargo +1.98.0 fetch --locked
 cargo +1.98.0 build --locked -p control_plane -p data_plane
 cargo +1.98.0 build --locked -p control_plane \
-  --example calibration_candidates --example inspect_physical_dag \
+  --example calibration_candidates --example compile_workload_artifact \
   --example compile_clickhouse_workload
 target/debug/data_plane --help
 mkdir -p target/readme-evidence
@@ -278,7 +278,7 @@ mkdir -p target/readme-evidence
 The executable is `target/debug/data_plane`, or `target/release/data_plane` if
 you build with `--release`. Access to the pinned Git dependencies is required.
 
-### 3. Export candidates and inspect the ordinary selected plan
+### 3. Export candidates and select a deployable plan by complete cost
 
 ```bash
 target/debug/examples/calibration_candidates \
@@ -287,10 +287,10 @@ target/debug/examples/calibration_candidates \
 jq '.candidates[] | {candidate_index, unavailable_reason}' \
   target/readme-evidence/candidates.json
 
-target/debug/examples/inspect_physical_dag \
-  docs/examples/asapquery-compatibility-demo-snapshot.json \
+target/debug/examples/compile_workload_artifact \
+  "$ASAPQUERY_PLANNING_SNAPSHOT" \
   > target/readme-evidence/selected.json
-jq '.purpose' target/readme-evidence/selected.json
+jq '.cost_comparison' target/readme-evidence/selected.json
 jq '.install_request.summary_catalog' target/readme-evidence/selected.json
 jq '.install_request.precompute_plan | {materializations, executable_dags}' \
   target/readme-evidence/selected.json
@@ -299,13 +299,13 @@ jq '.install_request.precompute_plan.schemas[] | {materialization, schema_id}' \
   target/readme-evidence/selected.json
 ```
 
-Expect `inspection_only`, catalog/plan objects and explicit candidate rejection
-reasons where unsupported. One verified demo export contained five candidate
-entries (one installable), five selected materializations and six query entries;
-these are inspection evidence, not a permanent optimizer-count contract.
-Materialization IDs are definitions, not physical SIDs. Demo costs are not
-measurements. The [E2E walkthrough](docs/evaluation/e2e-physical-dag.md) explains
-ERP evidence and the version-2 measured-cost workflow.
+Candidate discovery accepts the checked-in unquoted templates. Deployment and
+selected-plan inspection require `ASAPQUERY_PLANNING_SNAPSHOT` to point to a
+snapshot with complete, valid workload cost evidence. Prepare that input using
+the [cost evidence workflow](docs/examples/workload-cost-evidence.md).
+There is one snapshot compiler: it compares complete executable alternatives,
+including exact fallback. Materialization IDs are definitions, not physical SIDs.
+For `--metricsql`, collect quotes for the MetricsQL frontend.
 
 ## Prometheus runbook
 
@@ -342,7 +342,7 @@ done
 curl -fsS http://127.0.0.1:19090/-/healthy
 
 target/debug/data_plane --profile asapquery \
-  --planning-snapshot docs/examples/asapquery-compatibility-demo-snapshot.json \
+  --planning-snapshot "$ASAPQUERY_PLANNING_SNAPSHOT" \
   --prometheus-server http://127.0.0.1:19090 \
   --forward-unsupported-queries --http-port 19091 \
   --output-dir target/readme-evidence/prometheus/runtime \
@@ -409,6 +409,7 @@ kill "$(cat target/readme-evidence/prometheus/backend.pid)"
 docker rm -f asap-readme-prometheus asap-readme-pushgateway
 cargo +1.98.0 test --locked -p data_plane --test asapquery_compatibility_process_e2e \
   collector_free_profile_serves_complete_matrix_and_falls_back_exactly -- --exact
+export ASAPQUERY_PLANNING_SNAPSHOT=/absolute/path/priced-snapshot.json
 ./scripts/e2e.sh asapquery-demo
 ```
 
@@ -467,8 +468,8 @@ kill "$(cat target/readme-evidence/victoriametrics/backend.pid)"
 To inspect supported MetricsQL planning independently:
 
 ```bash
-target/debug/examples/inspect_physical_dag \
-  docs/examples/asapquery-compatibility-demo-snapshot.json --metricsql \
+target/debug/examples/compile_workload_artifact \
+  "$ASAPQUERY_PLANNING_SNAPSHOT" --metricsql \
   > target/readme-evidence/victoriametrics/selected.json
 jq '.install_request.query_plan.entries' \
   target/readme-evidence/victoriametrics/selected.json

@@ -2,6 +2,8 @@
 
 Scope: ASAPQuery-backend main `877ea128`, plus PR #700 (`1dcf299f`) and its current correction. Reviewed implementation and callers, not documentation claims. Findings below are code-level boundary violations or coupling; no untested claim of production wrong answers.
 
+Rechecked after merging main `674b9573` (#699): the four implementation files containing these five findings are unchanged; the legacy callers remain.
+
 ## Findings
 
 1. **[P1] Legacy binding rewrites Rate into Increase before Planner selection.** `control_plane/src/physical/post_asap/lower.rs:171-214` calls `rewrite_rate_to_increase` before `select_summary`. This erases Rate from the selected logical IR and relies on downstream knowledge to recover division by the window. The caller in `control_plane/src/main.rs:1135-1162` remains reachable through the legacy algebra/typed-stage path. Share a physical counter implementation while preserving the logical Rate node/readout; if a logical rate-to-increase/divide transformation is needed, Planner must emit both operations. This is distinct from the main physical compiler's `physical_materialization_family`, which only maps the stored family and retains the selected readout.

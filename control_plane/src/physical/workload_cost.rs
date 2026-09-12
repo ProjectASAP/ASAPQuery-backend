@@ -1042,7 +1042,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(manifest
+        // Both ranges are summarized now, so nothing in this workload is
+        // priced as exact backend execution. The 5m operand used to land there
+        // only because its window had no implementation candidate.
+        assert!(!manifest
             .components
             .values()
             .any(|demand| demand.implementation.get("location")
@@ -1195,9 +1198,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_snapshot_requires_quotes_and_roundtrips_selection() {
+    fn snapshot_requires_quotes_and_roundtrips_selection() {
         let mut snapshot = fixture();
-        snapshot.snapshot_version = 2;
         assert!(snapshot.clone().compile().is_err());
         let (_, _, evidence) = quoted();
         snapshot.workload_cost_evidence = Some(evidence);

@@ -11,6 +11,7 @@ PROM_CONTAINER="${RUN_ID}-prometheus"
 PUSH_CONTAINER="${RUN_ID}-pushgateway"
 EVIDENCE_DIR="${ASAPQUERY_DEMO_EVIDENCE_DIR:-${REPO_DIR}/target/asapquery-demo-evidence}"
 BACKEND_PID=""
+: "${ASAPQUERY_PLANNING_SNAPSHOT:?Set ASAPQUERY_PLANNING_SNAPSHOT to a snapshot with complete workload cost evidence}"
 
 cleanup() {
     if [[ -n "${BACKEND_PID}" ]]; then
@@ -52,7 +53,7 @@ curl -fsS http://127.0.0.1:19090/-/healthy >/dev/null
 
 "${REPO_DIR}/target/debug/data_plane" \
     --profile asapquery \
-    --planning-snapshot "${REPO_DIR}/docs/examples/asapquery-compatibility-demo-snapshot.json" \
+    --planning-snapshot "${ASAPQUERY_PLANNING_SNAPSHOT}" \
     --prometheus-server http://127.0.0.1:19090 \
     --forward-unsupported-queries \
     --http-port 19091 \

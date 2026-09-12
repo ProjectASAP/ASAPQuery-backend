@@ -1160,6 +1160,95 @@ mod tests {
         assert_eq!(outcome.coverage, Some((2_000, 2_000)));
     }
 
+    // Compile the two readouts, store one pane series, and execute the actual ratio.
+    #[test]
+    fn compiled_shared_sum_panes_preserve_each_lookback() {
+        use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+        let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entry = &mut snapshot["query_workload"]["repeating_queries"][0];
+        entry["query"] = serde_json::json!("sum_over_time(a[1m]) / sum_over_time(a[10m])");
+        entry["requirements"]["accuracy"]["explicit"] = serde_json::json!("Exact");
+        entry["demand"]["fixed_interval_at"]["interval"] = serde_json::json!(60_000);
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(snapshot).unwrap();
+        let (request, env) = snapshot.planning_request().unwrap();
+        let plan = PhysicalCompiler.compile(request, env).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        let config = &plan.precompute_plan.materializations[0];
+        let policy = config.policy_fingerprint();
+        let idx = SketchStore::new();
+        idx.register(SketchInstanceMetadata {
+            sid: 7,
+            metric_name: "a".into(),
+            group_by_keys: Default::default(),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: asap_types::AggregationType::Sum,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: policy,
+        });
+        for pane in 0..11 {
+            idx.append_precompute(
+                7,
+                BTreeMap::new(),
+                (pane * 60_000, (pane + 1) * 60_000),
+                Box::new(
+                    crate::precompute_engine::operators::SumAccumulator::with_sum(
+                        (pane + 1) as f64,
+                    ),
+                ),
+            );
+        }
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        for (now, expected) in [(600_000, 10.0 / 55.0), (660_000, 11.0 / 65.0)] {
+            let (outcome, stats) = super::super::logical_dag::execute_installed(
+                entry,
+                &BTreeMap::new(),
+                now,
+                |root, at| {
+                    let mut subtree = entry.clone();
+                    subtree.root = root;
+                    let reachable = subtree.topological_order().unwrap();
+                    subtree.nodes.retain(|id, _| reachable.contains(id));
+                    subtree.instant.lookback_ms = subtree.materialization_bindings()[0]
+                        .readout_lookback_ms
+                        .unwrap();
+                    super::super::live_serve::serve_instant_from_query_plan(&idx, &subtree, at)
+                        .map(|(result, _)| {
+                            use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
+                            let values = result.series.into_iter().map(|(labels, samples)| {
+                                let (keys, values) = labels.into_iter().unzip();
+                                InstantVectorElement::new(crate::storage_engines::types::KeyByLabelValues::new_with_labels(values), samples.last().unwrap().1)
+                                    .with_label_keys_override(keys)
+                            }).collect();
+                            QueryResult::vector(values, at)
+                        })
+                        .map_err(|error| {
+                            crate::query_engines::EngineError::capability_miss(
+                                "test",
+                                format!("{error:?}"),
+                            )
+                        })
+                },
+            )
+            .unwrap();
+            let crate::query_engines::query_result::QueryResult::Vector(outcome) = outcome else {
+                panic!("expected vector");
+            };
+            assert_eq!(stats.summary_readout_evaluations, 2);
+            assert_eq!(outcome.values.len(), 1);
+            assert!((outcome.values[0].value - expected).abs() < 1e-12);
+        }
+    }
+
     #[test]
     fn repeated_multi_pane_reads_exclude_expired_state_and_reject_gaps() {
         let idx = SketchStore::new();
