@@ -7,6 +7,11 @@ at repeated evaluation timestamps. It records accuracy, HTTP latency and optiona
 Linux component accounting. It does **not** claim that the backend already
 accelerates every expression in the corpus.
 
+This is an **offline, manually invoked evaluation**. Neither the evaluation nor
+its harness tests are registered as a push/PR CI job. Run the commands below
+explicitly when preparing an experiment or validating changes to this tooling.
+The repository's existing backend CI is unchanged.
+
 ## Query matrix
 
 `accuracy_suite.py manifest` emits **concrete PromQL and ClickHouse SQL** for each
