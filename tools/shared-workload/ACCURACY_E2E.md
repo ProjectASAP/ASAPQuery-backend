@@ -12,6 +12,11 @@ its harness tests are registered as a push/PR CI job. Run the commands below
 explicitly when preparing an experiment or validating changes to this tooling.
 The repository's existing backend CI is unchanged.
 
+Runtime scope is **backend-local precompute**. No ASAPCollector service is
+started or called: the generator sends Remote Write directly to the backend.
+The `asap-precompute-rs` build dependency and offline Google mapper source happen
+to live in the ASAPCollector repository; they are not an extra running collector.
+
 ## Query matrix
 
 `accuracy_suite.py manifest` emits **concrete PromQL and ClickHouse SQL** for each
@@ -181,8 +186,10 @@ receipt, the five endpoints, `--require-warm`, and component accounting. Omit
 `--start-ms`/`--end-ms`: the scale-bound manifest supplies the complete planned
 repetition interval. The runner rejects undersized/mismatched receipts and
 shortened intervals. `--query-name` can select a bounded family experiment.
-Use a common explicit `--timeout-seconds` across engines and match server-side
-timeout/sample/memory limits; report failures instead of counting them as speedup.
+Queries have **no client deadline** and are never killed for taking too long.
+Wait for natural completion. Inspect and record each service's own limits
+(query timeout, samples, memory); a service-enforced failure is retained as a
+failure, never converted into a speedup or a fabricated completion time.
 
 The planner also emits the requested six group cardinalities × five windows,
 including full repeated-history sizes. It does not automatically execute that
@@ -272,6 +279,7 @@ python3 tools/shared-workload/accuracy_suite.py run \
   --clickhouse 'http://127.0.0.1:18123/?database=accuracy_fixture' \
   --asap-prometheus http://127.0.0.1:18089 \
   --asap-clickhouse http://127.0.0.1:18090 \
+  --required-pair promql --required-pair sql \
   --require-warm --output /tmp/accuracy-results.jsonl
 python3 tools/shared-workload/summarize_accuracy.py /tmp/accuracy-results.jsonl \
   --output /tmp/accuracy-summary.json
@@ -290,16 +298,76 @@ ClickHouse-vs-Prometheus oracle parity must pass before claiming SQL correctness
 VM's **native** MetricsQL result is compared separately: semantic differences are
 reported, not relabeled as sketch error or silently normalized. The manifest also
 preserves the separately named VM Prometheus variant for follow-up experiments.
-VM mismatch is not part of the ASAP pass gate; failed HTTP requests are failures.
+Each comparison pair has its own correctness, execution route and eligibility:
+PromQL/Prometheus, SQL/ClickHouse and MetricsQL/VM. Supply `--asap-metricsql` for
+the third pair. By default all three pairs are required; a missing MetricsQL
+endpoint cannot pass full acceptance. The example explicitly selects only two
+pairs using `--required-pair`; its scope does **not** certify VM. Native VM vs
+Prometheus is a semantic diagnostic, not a replacement for ASAP MetricsQL vs VM.
+VM disagreement with Prometheus can coexist with a valid native-semantics VM pair;
+VM disagreement with its paired ASAP endpoint makes that pair ineligible.
 Empty oracles, warnings and malformed/duplicate results cannot establish accuracy.
 `--require-warm` rejects hybrid, fallback and unknown provenance even when values
-match. Without it, a pass means accuracy only, not acceleration.
+match. Without it, a pass means accuracy only, not acceleration. A pair's
+`eligible_for_query_comparison` concerns matching warm query service only;
+`eligible_for_benefit_conclusion` remains false without full lifecycle evidence.
 
 This runner is **sequential historical replay**: 1s/1m control evaluation timestamp
 spacing, not wall-clock dashboard concurrency. Latency is client-observed HTTP
-service time (including failures and connection overhead). Engine order is fixed;
-use repeated fresh trials and control cache/order effects before performance
-claims. It is not a scheduled live-load or throughput benchmark.
+service time (including failures and connection overhead). **All configured ASAP
+endpoints run before native endpoints at each timestamp**. Each request executes
+independently; one failure cannot skip the next engine. Completed responses/errors
+are immediately flushed to `OUTPUT.endpoints.jsonl`, so an indefinitely slow
+later query does not erase earlier evidence. The final output retains all endpoints,
+including failures, and summary distributions must not discard unsuccessful cases.
+Use independent baseline/fallback stores to prevent ASAP-first fallback traffic
+from warming the baseline. Fixed order alone does not isolate caches. This is not
+a scheduled live-load or throughput benchmark.
+
+## Production-planned PromQL chain acceptance
+
+`planned_run.py` connects one selected corpus query to the existing production
+planning/replay workflow. It owns fresh, separate Prometheus baseline/fallback
+stores, invokes the normal compiler on measured version-2 cost evidence, installs
+its selected artifact, loads data, drains finite-input materialization and probes
+**every evaluation window** before timed replay. A readiness probe requires a
+nonempty warm response, positive summary-readout count and zero exact-subquery RPCs;
+an HTTP-success/warm label alone is insufficient. Probes warm ASAP caches and their
+cost is retained separately from query service timing.
+
+```sh
+python3 tools/shared-workload/planned_run.py \
+  --data /tmp/accuracy-data --manifest /tmp/accuracy-queries.json \
+  --query-id synthetic/1m/False/temporal_sum \
+  --snapshot /path/measured-costed-snapshot.json \
+  --compiler target/debug/examples/compile_workload_artifact \
+  --data-plane target/debug/data_plane --prometheus /path/to/prometheus \
+  --cpu-affinity 0,1 --repetitions 2 --output /tmp/planned-sum-acceptance
+```
+
+Obtain the snapshot via [candidate calibration](../o11y-execution/CALIBRATION.md),
+registering exactly the selected query. Use `calibrate_runtime.py
+--wait-for-completion` for deadline-free calibration. Candidate calibration does
+not manually select the evaluation winner. The driver rejects discovery/demo
+snapshots without deployment cost quotes, invalid data hashes and partial windows.
+Its owned replay uses `--backend-first --wait-for-completion
+--require-summary-ready`; no client query timeout, subprocess deadline or
+timeout-based forced shutdown is used. Owned servers receive normal termination
+only after replay returns; the driver waits for shutdown without forced kill.
+
+`acceptance.json` reports chain correctness, warm/readout evidence, query latency,
+planning CPU, observed phase resources, retained storage and artifact locations.
+This is **PromQL-only** acceptance, not complete three-engine benefits evaluation.
+SQL's moving `{eval_ms}` fixed-plan limitation is not solved by this driver, nor
+does it provision a MetricsQL plan. Baseline/fallback stores are distinct, but
+their processes overlap in wall time. Independently matched complete lifecycle
+runs (including native ingestion and ASAP planning/build/upkeep/retained exact DB)
+remain required before a system-benefit claim. No full-cost total is invented.
+
+The [recorded small sum run](planned-sum-evidence.md) passed this real chain but
+ASAP was slower than direct Prometheus in that debug-build fixture. Keep that
+negative performance result; do not conflate compiler plan selection with beating
+an independently queried native DB.
 
 ## Component and whole-system resources
 
@@ -311,20 +379,22 @@ and optional dedicated-network-namespace counters. Example configuration:
 {
   "asap_promql": {
     "data_plane": {"cgroup": "/sys/fs/cgroup/eval/asap", "data_directory": "/srv/eval/asap"},
-    "collector": {"cgroup": "/sys/fs/cgroup/eval/collector"},
     "control_plane": {"cgroup": "/sys/fs/cgroup/eval/control"},
     "fallback": {"cgroup": "/sys/fs/cgroup/eval/fallback", "data_directory": "/srv/eval/fallback"}
   },
   "asap_sql": {},
+  "asap_metricsql": {},
   "prometheus": {"server": {"cgroup": "/sys/fs/cgroup/eval/prom", "data_directory": "/srv/eval/prom"}},
   "clickhouse": {"server": {"cgroup": "/sys/fs/cgroup/eval/ch", "data_directory": "/srv/eval/ch"}},
   "victoriametrics": {"server": {"cgroup": "/sys/fs/cgroup/eval/vm", "data_directory": "/srv/eval/vm"}}
 }
 ```
 
-Populate `asap_sql` with its real components; an empty set intentionally reports
-unavailable totals. Include collector, control/data plane, exact fallback, broker
-and any other component actually used. Shared dependencies count once **within**
+Populate `asap_sql`/`asap_metricsql` with their real components; an empty set
+intentionally reports unavailable totals. Include the backend-local data plane,
+the planning process during planning, and retained exact fallback services.
+Do not include a collector or broker: this profile does not deploy either.
+Shared dependencies count once **within**
 each system. Reject parent/child cgroup overlap; never sum all five alternative
 systems together and call it ASAP cost. `network_namespace_pid` optionally
 identifies a distinct non-host namespace per component. Host `/proc/net/dev` is
@@ -360,7 +430,8 @@ matched loading/hash guards and whole-phase resource/exit-status boundaries.
 A local Prometheus 3.5.0 `promtool tsdb create-blocks-from openmetrics` smoke test
 imported 32 samples / 16 series spanning 100ms successfully; this verifies import
 format only, not the newer query-boundary semantics targeted by the SQL.
-HTTP fixtures validate the harness, **not** live engine
-or planner support. Large trace runs, complete planned backend/SQL integration,
+HTTP fixtures validate the harness, **not** live engine or planner support; the
+separate small PromQL run above establishes one real planned summary-readout chain.
+Large trace runs, complete three-engine planned integration and SQL moving-time plans,
 all-family warm coverage, production resource measurements, live dashboard load,
 quantile rank error and tie-aware TopK accuracy remain separate acceptance work.
