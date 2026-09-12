@@ -35,59 +35,11 @@ tonic          = { version = "0.12", features = ["gzip"] }
 tokio-stream   = { version = "0.1", features = ["net"] }
 asap_types.workspace = true
 
-# Locked to a specific commit on ASAPPlanner's main (see
-# control_plane/docs/design-asapplanner-pin-migration.md):
-# not a tag -- ASAPPlanner has no tagged releases yet. Re-pin as
-# ASAPPlanner's IR evolves; move to a tag once one exists.
-#
-# ASAPPlanner consolidated its crates (ASAPPlanner#198): `asap-ir` and
-# `asap-sketch` merged into one crate -- Cargo package `asap-types`, with
-# `pre_asap`/`post_asap` modules replacing the old L3/L4 split -- and
-# `asap-l2` was deleted outright (folded into `asap-frontend-promql` +
-# `asap-types::pre_asap`). Depended on here under the `planner-types` key
-# (via `package = "asap-types"`), not `asap-types` directly, because this
-# repo already has its own crate literally named `asap_types`
-# (crates/asap_types) -- Cargo canonicalizes `-`/`_` for the extern-crate
-# identifier, so the two would collide on the same Rust path under the
-# upstream package's own name. `package =` renames the *local* identifier
-# only; nothing upstream changes.
-#
-# asap-plan owns the single authoritative AggIntent -> sketch-vs-exact
-# implementation decision (`boundary::implementation_for`, Cascades
-# "implementation rule" terminology -- see that crate's doc); capability_for
-# delegates to it instead of maintaining its own parallel judgment. It is
-# now its own crate, `asap-aware-mapping` (same role, same public API
-# shape -- `implement_tree`/`implement_tree_with`,
-# `CostModel::{rank_candidates, size_params, realize_extension,
-# readout_extension}`, `boundary::Matcher` -- just relocated and renamed
-# alongside the rest of the restructure). It still depends only on
-# `asap-types` (per its own crate doc's layering invariant), so this
-# doesn't pull in datafusion or any front-end weight.
-#
-# `CostModel::{realize_extension, readout_extension}` -- the pluggable
-# `AggIntent::Extension` hook this repo's `Extension{"frequency"}` intent
-# needs (ASAPPlanner#150) -- kept the same shape across the restructure
-# (verified by reading `asap-aware-mapping/src/cost_model.rs` on `main`).
-#
-# `asap_sketch::exec` (`SummaryExecutor`/`execute`) -- the serving-time
-# counterpart to `asap-aware-mapping`'s planning-time `SummaryNode`
-# construction, needed for data_plane/docs/l4node-plan-executor-design.md
-# (Step C) -- was deleted upstream (ASAPPlanner#190/#197): upstream's own
-# repo search found no implementor and concluded the module was dead
-# scaffolding, unaware that `data_plane`'s `summary_executor.rs` in *this*
-# repo is a real one. Vendored locally instead of chased upstream -- see
-# `data_plane/src/query_engines/asap_query_engine/summary_exec.rs`.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
-
-# L1 adoption (design-target-architecture.md Part B): the PromQL front
-# end itself, replacing control_plane's own query_parser/promql.rs.
-# Pinned via `rev`, not a floating branch reference. Same rev as
-# `planner-types`/`asap-aware-mapping` above -- these three MUST move
-# together (two revs of the same upstream repo's types in one workspace
-# resolve to distinct Rust types that won't unify).
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
-asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
+# Planner's IR, replacement search, and frontends share the workspace pin.
+planner-types.workspace = true
+asap-aware-mapping.workspace = true
+asap-frontend-promql.workspace = true
+asap-frontend-sql.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
