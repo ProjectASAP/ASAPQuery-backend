@@ -64,7 +64,7 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
         # Preserve the existing warning policy while expanding runtime coverage.
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build process-test control plane
         env:
