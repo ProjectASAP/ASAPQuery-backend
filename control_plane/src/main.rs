@@ -284,7 +284,18 @@ async fn main() {
     // ── Declarative workload registry ────────────────────────────────────────
     let workloads_path =
         std::env::var("CONTROLLER_WORKLOADS").unwrap_or_else(|_| "workloads.yaml".into());
-    let workload_registry = Arc::new(WorkloadRegistry::load(&workloads_path));
+    // A registry file that exists but does not parse is a startup failure, not
+    // an empty registry: every later step (plan pre-population, agent config
+    // push, cost accounting) would otherwise look exactly like a deployment
+    // that declared no workloads at all.
+    let workload_registry = match WorkloadRegistry::try_load(&workloads_path) {
+        Ok(registry) => Arc::new(registry),
+        Err(error) => {
+            tracing::error!(path = %workloads_path, %error, "unusable workload registry");
+            eprintln!("unusable workload registry at {workloads_path}: {error}");
+            std::process::exit(1);
+        }
+    };
 
     // Pre-populate PlanStore from the registry so agents get a config immediately.
     //
@@ -302,56 +313,10 @@ async fn main() {
     {
         let analyzer = Analyzer::new();
         for entry in workload_registry.entries() {
-            // MVP blocker B4 — let the analyzer parse `time_window` from
-            // `query_string` (matrix-selector `[range]`) instead of
-            // forcing a hardcoded "5m" default that overrides whatever
-            // the user wrote. The analyzer falls back to its own 5m
-            // default when the PromQL has no matrix selector (e.g.
-            // `count(unique_users_per_min)`), so this is strictly an
-            // improvement for queries that DO carry an explicit range.
-            // Empty string here means "no override; trust the parsed
-            // value or the analyzer's fallback".
-            //
-            // MVP blocker B3 — thread the WorkloadEntry's declarative
-            // `grouping_labels` into `QuerySpec.group_by_labels`. The
-            // analyzer merges these with any `by (...)` keys the
-            // PromQL parser surfaces, populating `QueryWorkload.
-            // group_by_labels`, which `collect_metric_to_grouping_labels`
-            // then drops into `EdgeStageConfig.metric_to_grouping_labels`
-            // so the agent's `keep_keys(datapoint.attributes, [...])`
-            // OTTL processor strips wire attrs down to this list
-            // BEFORE sketching.
-            let spec = pipeline::QuerySpec {
-                query_string: entry.query_string.clone(),
-                metric_name: entry.metric_name.clone(),
-                label_filters: Default::default(),
-                group_by_labels: entry.grouping_labels.clone(),
-                aggregations: vec!["quantile".into()],
-                // Empty when the entry HAS a `query_string` (the parser
-                // surfaces the matrix-selector range or its own 5m
-                // fallback). For entries without a query_string we
-                // can't trust the parser, so fall back to the
-                // historical 5m default so the analyzer doesn't error
-                // out at Step 4.
-                time_window: if entry.query_string.is_some() {
-                    String::new()
-                } else {
-                    "5m".into()
-                },
-                repeat_every: None,
-                accuracy_sla: entry.accuracy_sla,
-                latency_sla: None,
-                sketch_type: entry.sketch_family_override.clone(),
-                workload: types::WorkloadCharacteristics::default(),
-                // design.md alignment: defaults preserve legacy behaviour.
-                id: None,
-                language: None,
-                accuracy: None,
-                dollars: None,
-                deployment_model: None,
-                shape: types_v2::QueryShape::default(),
-                data: types_v2::DataShape::default(),
-            };
+            // One conversion, shared with every other caller: see
+            // `control_plane::workload::query_spec_for_entry` for the B3/B4
+            // field notes and for why the cadence must come from the entry.
+            let spec = control_plane::workload::query_spec_for_entry(entry);
             // B2 full restructure — derive the AggRole for this entry
             // BEFORE store insertion so collisions on metric name don't
             // overwrite a prior role's entry. The pre-B2 loop wrote
@@ -1223,6 +1188,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             item_label: None,
             // Role derivation does not depend on monitoring.
             monitor: None,
+            repeat_every: None,
         };
         control_plane::workload::derive_agg_role(&entry)
     };
@@ -1562,6 +1528,7 @@ async fn handle_plan_auto(
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor,
+                repeat_every: None,
             };
             let role = derive_agg_role(&entry);
             // (1) Inject the monitor unconditionally — only needs the metric name;
@@ -3720,26 +3687,7 @@ mod api_tests {
 
         let analyzer = Analyzer::new();
         for entry in registry.entries() {
-            let spec = pipeline::QuerySpec {
-                query_string: entry.query_string.clone(),
-                metric_name: entry.metric_name.clone(),
-                label_filters: Default::default(),
-                group_by_labels: vec![],
-                aggregations: vec!["quantile".into()],
-                time_window: "5m".into(),
-                repeat_every: None,
-                accuracy_sla: entry.accuracy_sla,
-                latency_sla: None,
-                sketch_type: entry.sketch_family_override.clone(),
-                workload: types::WorkloadCharacteristics::default(),
-                id: None,
-                language: None,
-                accuracy: None,
-                dollars: None,
-                deployment_model: None,
-                shape: types_v2::QueryShape::default(),
-                data: types_v2::DataShape::default(),
-            };
+            let spec = control_plane::workload::query_spec_for_entry(entry);
             if let Ok(wl) = analyzer.analyze(spec) {
                 let wc = types::WorkloadCharacteristics::default();
                 let plan = state.planner.plan(&wl, Some(&wc));

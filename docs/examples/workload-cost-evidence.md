@@ -1,8 +1,10 @@
 # Complete workload cost evidence
 
-The migrated, evidence-required startup profile uses `snapshot_version: 2`.
-Version 1 and live requests without `workload_cost_evidence` remain compatibility
-paths: their lifecycle estimates are not complete workload costs.
+Planning snapshots use one schema, `snapshot_version: 2`. Version 1 is rejected.
+Candidate discovery may omit `workload_cost_evidence`; compiling a deployable
+snapshot requires complete, valid quotes and selects by complete workload cost.
+There is no unquoted snapshot deployment path. The checked-in JSON examples are
+discovery templates, not ready-to-deploy plans.
 
 ## Workflow
 

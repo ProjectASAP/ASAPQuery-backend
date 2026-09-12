@@ -125,7 +125,7 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         "runtime": {"allowed_algorithms": ["Hll", "Kll", "UnivMon"], "max_memory_bytes": null}
     });
     let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture.clone()).unwrap();
-    let plan = snapshot.compile().unwrap();
+    let plan = quote_snapshot_for_test(snapshot).compile().unwrap();
     eprintln!(
         "UNIVMON_PLANNED {}",
         serde_json::json!({"query_plan": plan.query_plan, "materializations": plan.precompute_plan.materializations, "lifecycle_estimates": plan.lifecycle_estimates, "executable_dags": plan.precompute_plan.executable_dags, "observation": observation})
@@ -148,10 +148,11 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             .unwrap()
             .remove("max_frequency_entropy_absolute_bits_error");
     }
-    let missing = serde_json::from_value::<BackendLocalPlanningSnapshot>(missing_entropy)
-        .unwrap()
-        .compile()
-        .unwrap();
+    let missing = quote_snapshot_for_test(
+        serde_json::from_value::<BackendLocalPlanningSnapshot>(missing_entropy).unwrap(),
+    )
+    .compile()
+    .unwrap();
     use control_plane::query_plan::{QueryPlanNode, QueryReadout};
     assert!(missing
         .query_plan
@@ -210,7 +211,8 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
     });
     let output = tempfile::tempdir().unwrap();
     let path = output.path().join("planning.json");
-    std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    let priced = quote_snapshot_for_test(serde_json::from_value(fixture.clone()).unwrap());
+    std::fs::write(&path, serde_json::to_vec(&priced).unwrap()).unwrap();
     let port = unused_port();
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_data_plane"))
@@ -326,7 +328,7 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
                 .unwrap()
                 .invalid_reason
                 .is_none());
-            let replanned = live_snapshot.compile().unwrap();
+            let replanned = quote_snapshot_for_test(live_snapshot).compile().unwrap();
             assert!(
                 replanned
                     .precompute_plan

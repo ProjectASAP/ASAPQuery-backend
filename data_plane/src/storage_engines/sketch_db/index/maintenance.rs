@@ -742,7 +742,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
         first.aggregation_type = asap_types::AggregationType::Sum;
         first.aggregation_sub_type = "sum".into();
@@ -800,7 +802,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -850,7 +853,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
         first.aggregation_type = asap_types::AggregationType::Sum;
         first.aggregation_sub_type = "sum".into();
@@ -953,7 +958,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1067,7 +1073,16 @@ mod tests {
     }
 
     #[test]
-    fn one_sid_with_two_populations_cannot_publish_a_partial_global_summary() {
+    fn one_sid_with_two_populations_publishes_one_complete_global_summary() {
+        // Two logical populations share a physical sid. A global reduce over
+        // them is publishable exactly when EVERY population contributes the
+        // window — `read_complete_raw_maintenance_cohort` enumerates the whole
+        // durable population set and fails on the first one that is missing,
+        // so the reduce sees both or it sees nothing. The partial publication
+        // this test used to assert against is therefore unreachable here; what
+        // still has to hold is that the complete reduce publishes ONCE, with
+        // both populations' state in it, and that a later lifetime which
+        // repeats a logical population is still refused (second half).
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
         ))
@@ -1080,7 +1095,9 @@ mod tests {
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(fixture).unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let source = plan
             .precompute_plan
             .materializations
@@ -1123,7 +1140,9 @@ mod tests {
             output.population_labels = Some(population);
             output.catalog_generation = Some(Arc::clone(&generation));
             let mut sum = SumAccumulator::new();
-            sum.update(5.0);
+            // Distinct per-population values: a summary built from only one of
+            // them reads back as 5 or 7, never as the pair.
+            sum.update(if instance == "a" { 5.0 } else { 7.0 });
             store
                 .publish_admitted_summary_update(
                     &generation,
@@ -1138,7 +1157,8 @@ mod tests {
         assert!(store
             .complete_raw_maintenance_population(source.policy_fingerprint().into(), &generation)
             .is_err());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1168,7 +1188,7 @@ mod tests {
             .unwrap();
         assert!(!frozen.singleton_population_complete);
         // The read set is deterministic and all-or-nothing, independently of
-        // the later routing decision (which still rejects this global reduce).
+        // the routing decision that consumes it.
         let request = |name: &str| {
             (
                 700,
@@ -1208,22 +1228,86 @@ mod tests {
                 &[request("a"), request("absent")]
             )
             .is_err());
-        let parts_before = persistence.manifest.live_parts().len();
         let resolver = crate::drivers::ingest::series_resolver::SeriesIdResolver::new();
-        for _ in 0..2 {
-            assert!(
-                crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
-                    &store,
-                    &resolver,
-                    &plan.precompute_plan
+        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+            &store,
+            &resolver,
+            &plan.precompute_plan,
+        )
+        .unwrap();
+
+        // One target series, one output population (the global reduce erases
+        // the source grouping), one window.
+        let target_id = target.policy_fingerprint().into();
+        let target_sids = store.series_ids_for_policy(target.policy_fingerprint());
+        assert_eq!(target_sids.len(), 1, "one global output series");
+        let published = store
+            .completed_maintenance_coordinates(target_id, &generation)
+            .unwrap();
+        assert_eq!(published.len(), 1);
+        let groups = &published[&target_sids[0]];
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[&BTreeMap::new()], BTreeSet::from([(0, 60_000)]));
+
+        // The reduce consumed BOTH populations: the cohort the publication
+        // path reads is the whole durable population set for this window, and
+        // it carries the two distinct per-population sums. (Published summary
+        // state is sketch-encoded, and the immutable read-back path decodes
+        // exact accumulators only — the reduced VALUE is asserted against this
+        // same cohort contract by
+        // `precompute_engine::maintenance_runtime::tests`.)
+        let cohort = store
+            .read_complete_raw_maintenance_cohort(
+                &generation,
+                &BTreeSet::from([source_id]),
+                (0, 60_000),
+            )
+            .unwrap();
+        assert_eq!(cohort.inputs().len(), 2);
+        let contributions: Vec<(String, f64)> = cohort
+            .inputs()
+            .iter()
+            .map(|input| {
+                (
+                    input.group["instance"].clone(),
+                    input.windows[&(0, 60_000)]
+                        .query_statistic(
+                            asap_types::Statistic::Sum,
+                            &None,
+                            &std::collections::HashMap::new(),
+                        )
+                        .unwrap(),
                 )
-                .is_err()
-            );
-        }
-        assert!(store
-            .series_ids_for_policy(target.policy_fingerprint())
-            .is_empty());
-        assert_eq!(persistence.manifest.live_parts().len(), parts_before);
+            })
+            .collect();
+        assert_eq!(
+            contributions,
+            vec![("a".to_string(), 5.0), ("b".to_string(), 7.0)]
+        );
+
+        // Idempotent: a re-run republishes nothing and writes no new part.
+        let parts_after_publication = persistence.manifest.live_parts().len();
+        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+            &store,
+            &resolver,
+            &plan.precompute_plan,
+        )
+        .unwrap();
+        assert_eq!(
+            persistence.manifest.live_parts().len(),
+            parts_after_publication
+        );
+        assert_eq!(
+            store
+                .completed_maintenance_coordinates(target_id, &generation)
+                .unwrap(),
+            published
+        );
+        assert_eq!(
+            store.series_ids_for_policy(target.policy_fingerprint()),
+            target_sids
+        );
+        // The published output is durable and committed, not left pending.
         let records = store
             .persistence_metadata
             .read()
@@ -1232,9 +1316,15 @@ mod tests {
             .unwrap()
             .load_strict()
             .unwrap();
-        assert!(records.iter().all(|record| record.summary_definition_id
-            != Some(target.policy_fingerprint().into())
-            && record.pending_immutable.is_none()));
+        let published_target_sids: BTreeSet<u64> = records
+            .iter()
+            .filter(|record| !record.removed && record.summary_definition_id == Some(target_id))
+            .map(|record| record.sid)
+            .collect();
+        assert_eq!(published_target_sids.len(), 1);
+        assert!(records
+            .iter()
+            .all(|record| record.pending_immutable.is_none()));
         persistence.shutdown();
 
         // A catalog transition deliberately leaves old-generation payload
@@ -1281,7 +1371,8 @@ mod tests {
                 |writer| writer.ingest_precompute_with_series_id(702, source, &output, &sum),
             )
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !restarted
             .seal_finite_summary_input(&next_generation)
             .unwrap()
@@ -1320,18 +1411,27 @@ mod tests {
             .series_ids_for_policy(target.policy_fingerprint())
             .is_empty());
         assert_eq!(restored.manifest.live_parts().len(), parts_before);
-        assert!(restarted
+        let after_restart = restarted
             .persistence_metadata
             .read()
             .unwrap()
             .as_ref()
             .unwrap()
             .load_strict()
-            .unwrap()
+            .unwrap();
+        // The refused lifetime publishes nothing NEW: the durable target state
+        // is exactly what the earlier complete reduce committed.
+        assert_eq!(
+            after_restart
+                .iter()
+                .filter(|record| !record.removed && record.summary_definition_id == Some(target_id))
+                .map(|record| record.sid)
+                .collect::<BTreeSet<u64>>(),
+            published_target_sids
+        );
+        assert!(after_restart
             .iter()
-            .all(|record| record.summary_definition_id
-                != Some(target.policy_fingerprint().into())
-                && record.pending_immutable.is_none()));
+            .all(|record| record.pending_immutable.is_none()));
         restored.shutdown();
     }
 
@@ -1344,7 +1444,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let mut source_config = plan.precompute_plan.materializations[0].clone();
         source_config.aggregation_type = asap_types::AggregationType::Sum;
         source_config.aggregation_sub_type = "sum".into();

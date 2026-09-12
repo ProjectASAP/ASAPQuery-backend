@@ -95,7 +95,7 @@ _SAMPLE = re.compile(r'([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)\s+(\d+(?:
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\[\\"n])*)"')
 
 
-def iter_samples(lines):
+def iter_samples(lines, require_global_order=True):
     """Strict OpenMetrics subset: seconds converted losslessly to Remote Write milliseconds."""
     seen, latest, yielded = {}, -1, False
     for number, line in enumerate(lines, 1):
@@ -123,7 +123,7 @@ def iter_samples(lines):
             raise ValueError(f"submillisecond timestamp at line {number}")
         value, timestamp = float(value), int(millis)
         key = tuple(sorted(labels.items()))
-        if not math.isfinite(value) or timestamp > 2**63 - 1 or timestamp < latest or timestamp <= seen.get(key, -1):
+        if not math.isfinite(value) or timestamp > 2**63 - 1 or (require_global_order and timestamp < latest) or timestamp <= seen.get(key, -1):
             raise ValueError(f"nonfinite, duplicate, or out-of-order sample at line {number}")
         latest, seen[key] = timestamp, timestamp
         yielded = True
@@ -183,10 +183,13 @@ def encode_write(rows):
     return varint(length) + literal + wire
 
 
+HTTP_TIMEOUT = 60
+
+
 def _http_request(url, data=None, headers=None):
     start = time.perf_counter_ns()
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}), timeout=60) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}), timeout=HTTP_TIMEOUT) as response:
             body, status, received = response.read(), response.status, dict(response.headers.items())
         try:
             body = json.loads(body)
@@ -256,7 +259,7 @@ def ingest(rows, endpoints, output):
     write_json(output / "ingestion.json", batches)
 
 
-def replay(queries, backend, output, repetitions, exact_url=None, relative_tolerance=0.0, absolute_tolerance=0.0, evaluation_step_ms=0, batch_resources=False):
+def replay(queries, backend, output, repetitions, exact_url=None, relative_tolerance=0.0, absolute_tolerance=0.0, evaluation_step_ms=0, batch_resources=False, backend_first=False):
     rows = []
     if evaluation_step_ms < 0:
         raise ValueError("evaluation step must be nonnegative")
@@ -265,18 +268,30 @@ def replay(queries, backend, output, repetitions, exact_url=None, relative_toler
     batch_started = time.perf_counter_ns()
     for repeat in range(repetitions):
         for query_index, query in enumerate(queries):
-            exact_first = (repeat + query_index) % 2 == 0
+            exact_first = not backend_first and (repeat + query_index) % 2 == 0
             evaluation_ms = query["eval_timestamp_ms"] - (repetitions - 1 - repeat) * evaluation_step_ms
             if evaluation_ms < 0:
                 raise ValueError("advancing evaluation grid predates epoch")
             params = urllib.parse.urlencode({"query": query["query"], "time": f'{evaluation_ms / 1000:.3f}'})
-            # Alternate paired order to expose, rather than always favor, cache/order effects.
+            # Offline acceptance can require ASAP-first; preserve legacy alternating mode.
+            def recorded_request(endpoint, engine):
+                started = time.perf_counter_ns()
+                try:
+                    answer = query_request(endpoint.rstrip("/") + "/api/v1/query?" + params)
+                except Exception as error:
+                    answer = {"http_status": None, "response": {"status": "error", "error": str(error)},
+                              "headers": {}, "elapsed_ns": time.perf_counter_ns() - started}
+                with (output / "endpoint-requests.jsonl").open("a") as journal:
+                    journal.write(json.dumps({"id": query["id"], "evaluation_ms": evaluation_ms,
+                                              "repetition": repeat, "engine": engine, **answer}, allow_nan=False) + "\n")
+                    journal.flush()
+                return answer
             exact = None
             if exact_url and exact_first:
-                exact = query_request(exact_url.rstrip("/") + "/api/v1/query?" + params)
-            answer = query_request(backend.rstrip("/") + "/api/v1/query?" + params)
+                exact = recorded_request(exact_url, "native")
+            answer = recorded_request(backend, "asap")
             if exact_url and exact is None:
-                exact = query_request(exact_url.rstrip("/") + "/api/v1/query?" + params)
+                exact = recorded_request(exact_url, "native")
             route = classify(answer["response"], answer["headers"])
             if answer["http_status"] != 200:
                 route = "failed"
@@ -308,7 +323,29 @@ def replay(queries, backend, output, repetitions, exact_url=None, relative_toler
     return rows
 
 
+def verify_summary_ready(queries, backend, output, repetitions, evaluation_step_ms):
+    """Exercise every admitted window after drain; a warmup is not a timed trial."""
+    probes = []
+    for repeat in range(repetitions):
+        for query in queries:
+            timestamp = query["eval_timestamp_ms"] - (repetitions - 1 - repeat) * evaluation_step_ms
+            params = urllib.parse.urlencode({"query": query["query"], "time": timestamp / 1000})
+            answer = request(backend + "/api/v1/query?" + params)
+            provenance = execution_provenance(answer["response"], answer["headers"])
+            ready = (answer["http_status"] == 200 and classify(answer["response"], answer["headers"]) == "warm"
+                     and (provenance.get("summary_readout_evaluations") or 0) > 0
+                     and provenance.get("exact_subquery_rpcs") == 0
+                     and bool(answer["response"].get("data", {}).get("result")))
+            probes.append({"id": query["id"], "evaluation_ms": timestamp, "ready": ready,
+                           "provenance": provenance, **answer})
+            write_json(output / "summary-readiness.json", {"complete": all(p["ready"] for p in probes),
+                       "scope": "post-drain warm probes at every evaluation window, before measured queries; warms ASAP caches", "probes": probes})
+            if not ready:
+                raise RuntimeError("summary window is not ready; see summary-readiness.json")
+
+
 def main():
+    global HTTP_TIMEOUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--queries", type=Path, required=True)
@@ -332,7 +369,11 @@ def main():
     parser.add_argument("--relative-tolerance", type=float, default=0.0)
     parser.add_argument("--absolute-tolerance", type=float, default=0.0)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--backend-first", action="store_true")
+    parser.add_argument("--wait-for-completion", action="store_true", help="no HTTP deadline or forced shutdown kill")
+    parser.add_argument("--require-summary-ready", action="store_true")
     args = parser.parse_args()
+    HTTP_TIMEOUT = None if args.wait_for_completion else 60
     if args.repetitions < 1 or not 0 <= args.settle_seconds <= 60:
         parser.error("positive repetitions and settle-seconds in [0, 60] required")
     cpus = {int(x) for x in args.cpu_affinity.split(",")} if args.cpu_affinity else None
@@ -438,9 +479,12 @@ def main():
             phases["after_ingest_and_drain"] = process_snapshots()
             write_json(args.output / "store-after-build.json", request(backend + "/api/v1/store/metrics"))
             write_json(args.output / "process-phases.json", phases)
+            if args.require_summary_ready:
+                verify_summary_ready(queries, backend, args.output, args.repetitions, args.evaluation_step_ms)
+                phases["after_readiness_probes"] = process_snapshots()
             results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None,
                              args.relative_tolerance, args.absolute_tolerance,
-                             args.evaluation_step_ms, args.batch_resources)
+                             args.evaluation_step_ms, args.batch_resources, args.backend_first)
             phases["after_queries"] = process_snapshots()
             write_json(args.output / "process-phases.json", phases)
             store = request(backend + "/api/v1/store/metrics")
@@ -484,7 +528,9 @@ def main():
                                               for name, before, after in [
                                                   ("startup", "startup", "before_ingest"),
                                                   ("ingest_and_build", "before_ingest", "after_ingest_and_drain"),
-                                                  ("queries", "after_ingest_and_drain", "after_queries")]},
+                                                  *([("readiness_probes", "after_ingest_and_drain", "after_readiness_probes")]
+                                                    if args.require_summary_ready else []),
+                                                  ("queries", "after_readiness_probes" if args.require_summary_ready else "after_ingest_and_drain", "after_queries")]},
                           "estimated_vs_measured_cost_ratio": None,
                           "acceptance_complete": False,
                           "limitations": ["No common conversion from provider cost units to measured resource units",
@@ -502,7 +548,7 @@ def main():
                 write_json(args.output / "comparison.json", report)
         finally:
             from process_lifecycle import stop
-            write_json(args.output / "backend-lifecycle.json", stop(child, timeout=10))
+            write_json(args.output / "backend-lifecycle.json", stop(child, timeout=None if args.wait_for_completion else 10))
 
 
 if __name__ == "__main__":

@@ -195,7 +195,9 @@ mod tests {
         value["query_workload"]["repeating_queries"][0]["query"] =
             "sum(sum_over_time(m[1m]))".into();
         let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(value).unwrap();
-        snapshot.compile().unwrap()
+        crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap()
     }
 
     fn catalog_fixture() -> SummaryCatalog {

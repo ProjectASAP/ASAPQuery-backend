@@ -7,5 +7,8 @@
 //! `StoreQueryPlan` legacy types.
 
 pub mod engine_factories;
+pub mod timing;
 
 pub use engine_factories::*;
+
+pub mod planning;

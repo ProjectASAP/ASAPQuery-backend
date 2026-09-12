@@ -104,7 +104,7 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
         ));
         let snapshot: BackendLocalPlanningSnapshot =
             serde_json::from_value(fixture.clone()).unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = quote_snapshot_for_test(snapshot).compile().unwrap();
         assert_eq!(
             plan.precompute_plan.materializations.len(),
             1,
@@ -131,7 +131,8 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
         );
         let output = tempfile::tempdir().unwrap();
         let path = output.path().join("planning.json");
-        std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let priced = quote_snapshot_for_test(serde_json::from_value(fixture.clone()).unwrap());
+        std::fs::write(&path, serde_json::to_vec(&priced).unwrap()).unwrap();
         let port = unused_port();
         let mut child = ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_data_plane"))

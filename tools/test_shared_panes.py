@@ -18,7 +18,16 @@ def main():
     args = parser.parse_args()
     backend = Path(__file__).resolve().parents[1]
     manifest = (backend / "control_plane/Cargo.toml").read_text()
-    revision = re.search(r'planner-types = .*rev = "([0-9a-f]+)"', manifest).group(1)
+    declaration = re.search(r"^planner-types(?:\.workspace)?\s*=\s*(.+)$", manifest, re.MULTILINE)
+    if declaration is None:
+        raise RuntimeError("planner-types dependency is missing")
+    if re.search(r"workspace\s*=\s*true", declaration.group(0)):
+        manifest = (backend / "Cargo.toml").read_text()
+        declaration = re.search(r"^planner-types\s*=\s*(.+)$", manifest, re.MULTILINE)
+    revision_match = re.search(r'rev\s*=\s*"([0-9a-f]+)"', declaration.group(1)) if declaration else None
+    if revision_match is None:
+        raise RuntimeError("planner-types must declare a pinned Git revision")
+    revision = revision_match.group(1)
     lock = backend / "Cargo.lock"
     original_lock = lock.read_bytes()
     with tempfile.TemporaryDirectory(prefix="asap-pane-reuse-") as temporary:

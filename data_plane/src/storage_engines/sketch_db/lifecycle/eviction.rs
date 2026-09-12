@@ -280,6 +280,7 @@ mod tests {
             derived_input: None,
             table_timestamp_column: None,
             partitioning: None,
+            value_source_column: None,
         }
     }
 

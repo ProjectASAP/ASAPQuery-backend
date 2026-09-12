@@ -1459,7 +1459,9 @@ mod tests {
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([query]);
         let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(fixture).unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::physical::compiler::tests::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let (mut policy, mut observed) = online_population_fixture();
         observed.catalog_generation = plan.summary_catalog.reference().unwrap();
         observed.summary_definition_id =

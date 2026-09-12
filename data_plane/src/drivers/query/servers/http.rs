@@ -3727,6 +3727,7 @@ aggregations:
                 derived_input: None,
                 table_timestamp_column: None,
                 partitioning: None,
+                value_source_column: None,
             };
             // PR 5: streaming-config is keyed on the policy
             // fingerprint. Build a marker→fingerprint map so the test
@@ -7229,7 +7230,9 @@ mod catalog_install_tests {
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         PhysicalPlanInstallRequest {
             summary_catalog: plan.summary_catalog,
             collector_plans: plan.collector_plans,

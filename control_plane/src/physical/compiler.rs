@@ -200,7 +200,8 @@ pub enum PhysicalDeploymentTarget {
     BackendLocalRemoteWrite,
 }
 
-/// Versioned startup input for the Collector-free compatibility profile.
+/// Startup and candidate-discovery input for backend-local planning.
+/// Version 2 is the sole supported schema; deployment always requires quotes.
 /// Query/data semantics use ASAPPlanner's canonical workload types directly;
 /// this wrapper adds only backend-owned implementation evidence and lifecycle
 /// identity required to choose a concrete physical realization.
@@ -208,6 +209,7 @@ pub enum PhysicalDeploymentTarget {
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPlanningSnapshot {
     pub snapshot_version: u32,
+    /// May be absent during candidate discovery, never during deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     pub query_workload: QueryWorkload,
@@ -482,34 +484,17 @@ impl BackendLocalPlanningSnapshot {
     }
 
     fn compile_frontend(self, metricsql: bool) -> Result<PhysicalPlan, CompileError> {
-        let evidence = self.workload_cost_evidence.clone();
-        if self.snapshot_version == 2 && evidence.is_none() {
-            return Err(CompileError::Snapshot(
-                "version 2 requires complete workload cost evidence".into(),
-            ));
-        }
+        let evidence = self.workload_cost_evidence.clone().ok_or_else(|| {
+            CompileError::Snapshot(
+                "deployment requires complete workload cost evidence; export candidates and price them before compiling".into(),
+            )
+        })?;
         let (request, environment) = self.planning_request()?;
-        match evidence {
-            Some(evidence) => {
-                let candidates = super::workload_cost::with_exact_alternative(request)?;
-                if metricsql {
-                    super::workload_cost::select_metricsql(candidates, environment, &evidence)
-                } else {
-                    super::workload_cost::select(candidates, environment, &evidence)
-                }
-            }
-            None => {
-                // Unquoted v1 startup snapshots keep the established summary/native
-                // compatibility policy. Local residual candidates are enumerated by
-                // planning_request and admitted through measured workload selection.
-                let mut request = request;
-                request.hybrid_execution = false;
-                if metricsql {
-                    PhysicalCompiler.compile_metricsql(request, environment)
-                } else {
-                    PhysicalCompiler.compile(request, environment)
-                }
-            }
+        let candidates = super::workload_cost::with_exact_alternative(request)?;
+        if metricsql {
+            super::workload_cost::select_metricsql(candidates, environment, &evidence)
+        } else {
+            super::workload_cost::select(candidates, environment, &evidence)
         }
     }
 
@@ -517,9 +502,9 @@ impl BackendLocalPlanningSnapshot {
     pub fn planning_request(
         self,
     ) -> Result<(PlanningRequest, DeploymentEnvironment), CompileError> {
-        if self.snapshot_version != 1 && self.snapshot_version != 2 {
+        if self.snapshot_version != 2 {
             return Err(CompileError::Snapshot(format!(
-                "unsupported workload snapshot version {}",
+                "unsupported workload snapshot version {}; only version 2 is supported",
                 self.snapshot_version
             )));
         }
@@ -1131,7 +1116,9 @@ impl PhysicalCompiler {
                                 .ok()
                                 .flatten()
                             });
-                            key.is_some_and(|key| policy.contains(&key))
+                            // Masks enumerate counter/max choices only. Other selected
+                            // summaries remain required by this physical alternative.
+                            key.is_none_or(|key| policy.contains(&key))
                         })
                 })
                 .collect::<Vec<_>>();
@@ -1638,7 +1625,31 @@ impl PhysicalCompiler {
                 full_history: false,
                 cumulative_readout: true,
             };
-            let mut entry = if request.hybrid_execution {
+            // A whole-query native fallback need not be expressible in the local
+            // residual algebra (for example an ERP-rejected entropy readout).
+            // Retain its native boundary without discarding other workload roots.
+            let native_root = request.hybrid_execution
+                && if let SummaryExpr::KeepPreAsap(expr) = &query.post_asap.expr {
+                    let original = crate::query_parser::parse_query_expr_canonical(
+                        &query.query_string,
+                        query.accuracy.clone(),
+                    )
+                    .map_err(|error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: error.to_string(),
+                    })?;
+                    expr.as_ref() == &original
+                        && crate::query_plan::logical::compile_logical(
+                            query.query_id.clone(),
+                            canonical.clone(),
+                            instant,
+                            FallbackPolicy::ExactBackend,
+                        )
+                        .is_err()
+                } else {
+                    false
+                };
+            let mut entry = if request.hybrid_execution && !native_root {
                 crate::query_plan::compile_bound_composable_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
@@ -3555,8 +3566,114 @@ fn stable_workload_plan_id(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // Complete deployment quotes must preserve one producer with two window readouts.
+    #[test]
+    fn complete_cost_selection_preserves_shared_sum_panes() {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("sum_over_time(a[1m]) / sum_over_time(a[10m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let plan = quoted_snapshot(snapshot, false).compile().unwrap();
+        assert!(plan.cost_comparison.is_some());
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        let bindings = plan
+            .query_plan
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .materialization_bindings();
+        assert_eq!(bindings[0].materialization, bindings[1].materialization);
+        assert_eq!(
+            bindings
+                .iter()
+                .filter_map(|b| b.readout_lookback_ms)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([60_000, 600_000])
+        );
+    }
+
+    // Synthetic quotes exercise deployment selection in tests, never production defaults.
+    pub(crate) fn quoted_snapshot(
+        mut snapshot: BackendLocalPlanningSnapshot,
+        metricsql: bool,
+    ) -> BackendLocalPlanningSnapshot {
+        use super::super::workload_cost::{
+            manifest, with_exact_alternative, WorkloadCostEvidence, WorkloadQuote,
+        };
+        let (request, environment) = snapshot.clone().planning_request().unwrap();
+        let quotes = with_exact_alternative(request)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let plan = if metricsql {
+                    PhysicalCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                } else {
+                    PhysicalCompiler.compile(candidate.clone(), environment.clone())
+                }
+                .ok()?;
+                let manifest = manifest(&plan, &candidate.queries).unwrap();
+                Some(WorkloadQuote {
+                    unit_costs: manifest
+                        .components
+                        .keys()
+                        .map(|key| (key.clone(), if index == 0 { 1.0 } else { 1e12 }))
+                        .collect(),
+                    manifest,
+                    executable: true,
+                })
+            })
+            .collect();
+        snapshot.workload_cost_evidence = Some(WorkloadCostEvidence {
+            backend_revision: BACKEND_REVISION.into(),
+            planner_revision: PLANNER_REVISION.into(),
+            data_snapshot_id: "compiler-unit-fixture".into(),
+            model_version: "test-only-unit-costs".into(),
+            observed_at_unix_ms: environment.observed_at_unix_ms,
+            valid_for_ms: environment.max_evidence_age_ms,
+            quotes,
+        });
+        snapshot
+    }
+
+    /// Optional counter masks must retain the workload's mandatory sketch bindings.
+    #[test]
+    fn costed_mixed_workload_retains_sketches_and_counter_readouts() {
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let plan = quoted_snapshot(snapshot, false).compile().unwrap();
+        assert!(!plan.precompute_plan.materializations.is_empty());
+        for entry in plan.query_plan.entries.values() {
+            assert!(!entry.materialization_bindings().is_empty(), "{entry:#?}");
+        }
+    }
+
+    /// A schema marker cannot opt into a legacy deployment policy.
+    #[test]
+    fn only_current_snapshot_schema_is_accepted() {
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        for version in [0, 1, 3] {
+            let mut old = snapshot.clone();
+            old.snapshot_version = version;
+            assert!(old
+                .clone()
+                .planning_request()
+                .unwrap_err()
+                .to_string()
+                .contains("only version 2"));
+            assert!(old.compile().is_err());
+        }
+        assert!(snapshot.planning_request().is_ok());
+    }
 
     #[test]
     fn installed_partition_must_match_the_bound_dag_reduction() {
@@ -4276,7 +4393,7 @@ mod tests {
             "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
         ))
         .unwrap();
-        let plan = snapshot.compile_metricsql().unwrap();
+        let plan = quoted_snapshot(snapshot, true).compile_metricsql().unwrap();
         assert!(!plan.query_plan.entries.is_empty());
         assert!(plan
             .query_plan
@@ -5773,7 +5890,7 @@ mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap();
-        let bundle = snapshot.compile().unwrap();
+        let bundle = quoted_snapshot(snapshot, false).compile().unwrap();
         let catalog = &bundle.summary_catalog;
         let mut transmission = bundle.transmission_plan.clone();
         transmission.validate_against_catalog(catalog).unwrap();
@@ -5841,7 +5958,7 @@ mod tests {
         let mut second = entries[0].clone();
         second.query = Query("sum(sum_over_time(m[1m])) * 2".into());
         entries.push(second);
-        let bundle = snapshot.compile().unwrap();
+        let bundle = quoted_snapshot(snapshot, false).compile().unwrap();
         assert_eq!(bundle.query_plan.entries.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         let query_plan: QueryPlan =
@@ -6183,7 +6300,7 @@ mod tests {
             .queries
             .remove(0);
         let snapshot = BackendLocalPlanningSnapshot {
-            snapshot_version: 1,
+            snapshot_version: 2,
             workload_cost_evidence: None,
             query_workload,
             data_workload,
@@ -6214,12 +6331,10 @@ mod tests {
                 .as_ref(),
             Some(&snapshot.query_workload)
         );
-        let first = snapshot
-            .clone()
+        let first = quoted_snapshot(snapshot.clone(), false)
             .compile()
             .expect("first deterministic plan");
-        let second = snapshot
-            .clone()
+        let second = quoted_snapshot(snapshot.clone(), false)
             .compile()
             .expect("second deterministic plan");
         assert_eq!(first.envelope, second.envelope);
@@ -6234,7 +6349,9 @@ mod tests {
         let encoded = serde_json::to_vec(&snapshot).expect("serialize startup snapshot");
         let decoded: BackendLocalPlanningSnapshot =
             serde_json::from_slice(&encoded).expect("deserialize startup snapshot");
-        let bundle = decoded.compile().expect("canonical startup planning");
+        let bundle = quoted_snapshot(decoded, false)
+            .compile()
+            .expect("canonical startup planning");
 
         assert!(bundle.collector_plans.is_empty());
         assert!(bundle.transmission_plan.rules.is_empty());
@@ -6322,10 +6439,10 @@ mod tests {
         let fixture: serde_json::Value = serde_json::from_str(source).expect("fixture JSON");
         assert_eq!(encoded, fixture);
 
-        snapshot
-            .clone()
-            .compile()
-            .expect("unquoted v1 compatibility startup remains available");
+        assert!(
+            snapshot.clone().compile().is_err(),
+            "discovery fixtures must be priced before deployment"
+        );
         let (local, env) = snapshot.clone().planning_request().unwrap();
         let isolated = PhysicalCompiler.compile(local, env).unwrap();
         assert!(!isolated.precompute_plan.materializations.is_empty());
@@ -6358,10 +6475,10 @@ mod tests {
             include_str!("../../../docs/examples/asapquery-compatibility-demo-snapshot.json");
         let snapshot: BackendLocalPlanningSnapshot =
             serde_json::from_str(source).expect("strict compatibility demo fixture");
-        snapshot
-            .clone()
-            .compile()
-            .expect("unquoted v1 compatibility startup remains available");
+        assert!(
+            snapshot.clone().compile().is_err(),
+            "discovery fixtures must be priced before deployment"
+        );
         let (local, env) = snapshot.clone().planning_request().unwrap();
         let isolated = PhysicalCompiler.compile(local, env).unwrap();
         assert!(!isolated.precompute_plan.materializations.is_empty());
