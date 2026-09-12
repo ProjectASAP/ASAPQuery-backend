@@ -147,7 +147,72 @@ is a gauge, so counter families are N/A here too. The trace's roughly 4,000
 machines do **not** establish natural million-group coverage; synthetic scale
 results must be reported separately from real-trace results.
 
-## Generate, load and compare
+## Benefit-scale experiments (offline, opt-in)
+
+The 10-group, two-minute example below is **only a correctness smoke test**, not
+the input size for reporting ASAP benefits. The default `scale_plan.py` profile
+is `benefit`; it produces a plan and a window-matched query manifest, not data.
+
+| Profile | Groups × members per metric | Query T + evaluation span | Samples, both metrics | Unfiltered temporal input samples/query |
+|---|---|---|---:|---:|
+| smoke | 10 × 4 | 1m + 1m | 96,080 | 24,000 |
+| benefit (default) | 1,000 × 16 | 1h + 30m | 1,728,032,000 | 576,000,000 |
+| scale | 10,000 × 16 | 6h + 1h | 80,640,320,000 | 34,560,000,000 |
+| cardinality | 1,000,000 × 4 | 1m + 1m | 9,608,000,000 | 2,400,000,000 |
+
+Input counts are logical samples, not measured disk reads: engines may prune,
+cache, compress or use indexes. The benefit cell has 32,000 total series,
+31 temporal evaluation timestamps at 1m spacing, and 1,801 spatial timestamps at
+1s spacing. Full history precedes the **first** query. This tests repeated reuse
+of summaries; it does not claim that repetition necessarily amortizes build cost.
+
+```sh
+# Planning is cheap. This writes scale.json, queries.json and a 30-cell matrix.json.
+python3 tools/shared-workload/scale_plan.py --profile benefit --output /tmp/benefit-plan
+# Only after inspecting scale.json and provisioning storage, explicitly generate:
+python3 tools/shared-workload/dataset.py --dataset synthetic \
+  --scale-plan /tmp/benefit-plan/scale.json --max-samples 1728032000 \
+  --output /srv/eval/benefit-data
+```
+
+Load the resulting data with `load_dataset.py` as below. Run `accuracy_suite.py run`
+with `--manifest /tmp/benefit-plan/queries.json`, its matching `--loaded-data`
+receipt, the five endpoints, `--require-warm`, and component accounting. Omit
+`--start-ms`/`--end-ms`: the scale-bound manifest supplies the complete planned
+repetition interval. The runner rejects undersized/mismatched receipts and
+shortened intervals. `--query-name` can select a bounded family experiment.
+Use a common explicit `--timeout-seconds` across engines and match server-side
+timeout/sample/memory limits; report failures instead of counting them as speedup.
+
+The planner also emits the requested six group cardinalities × five windows,
+including full repeated-history sizes. It does not automatically execute that
+matrix. Use `--groups`, `--members`, `--window` and `--evaluation-minutes` to select
+one cell. Sweep members **4, 16, 64 at fixed group count** as a separate axis:
+increasing groups alone also increases output size, whereas more members increases
+the spatial reduction opportunity at fixed grouped-sum output cardinality. Keep
+single-group filtered controls separate: their input does not grow with the number
+of unselected groups. Do not describe every query as scanning the full dataset.
+
+Measure storage in a bounded pilot before generating these datasets. `scale.json`
+reports `16 * samples` uncompressed timestamp/value payload (27.65 GB for benefit),
+**not** physical disk size: labels, JSONL/OpenMetrics artifacts, indexes, compression,
+replicas, WAL and summaries change the actual requirement. Supply
+`--measured-bytes-per-sample` from a pilot to estimate **one** store; budget every
+baseline/fallback copy plus generated files and temporary storage separately.
+No measured bytes/sample means no invented disk estimate. Billion-sample Python
+client generation and import can themselves take substantial time; these profiles
+are explicit resource commitments, not a promise that the current host can run them.
+
+Report the crossover curve from smoke through benefit and larger feasible cells,
+including cases where ASAP loses. Charge ingestion, materialization, updates and
+fallback to ASAP; assess savings over the declared repeated-query horizon, not just
+one warm request. Large data is necessary to test scalability, not proof of benefit.
+For Google/Alibaba expand contiguous time coverage and complete selected job/machine
+populations, report their actual series/sample counts, and preserve native cadence.
+Do not replicate trace identities or invent 100ms observations to meet synthetic
+targets. A trace subset too small to stress the baseline remains an accuracy control.
+
+## Generate, load and compare (smoke example)
 
 ```sh
 python3 -m pip install -r tools/shared-workload/requirements.txt

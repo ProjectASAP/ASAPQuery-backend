@@ -63,13 +63,13 @@ def corpus(dataset, filter_value=None):
             "coverage": "requested ten families plus representative count, increase and nested compositions; not exhaustive AnyAgg/binary operators"}
 
 
-def request(url, query, timestamp, sql=False):
+def request(url, query, timestamp, sql=False, timeout=60):
     if sql:
         req = urllib.request.Request(url, data=(query + " FORMAT JSONEachRow").encode())
     else:
         req = urllib.request.Request(url.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode(
             {"query": query, "time": timestamp / 1000}))
-    with urllib.request.urlopen(req, timeout=60) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         headers = dict(response.headers.items())
         if sql:
             rows = [json.loads(line) for line in response if line.strip()]
@@ -91,6 +91,18 @@ def evaluate(actual, expected, rtol, atol):
 def run(args):
     manifest = json.loads(args.manifest.read_text())
     loaded = json.loads(args.loaded_data.read_text())["data"]
+    scale = manifest.get("scale")
+    if scale:
+        if (loaded.get("provenance", {}).get("scale_plan") != scale
+                or loaded["samples"] != scale["total_samples"]
+                or loaded["series"] != scale["total_series"]):
+            raise ValueError("loaded data does not match the requested scale plan")
+        args.start_ms = scale["evaluation_start_ms"] if args.start_ms is None else args.start_ms
+        args.end_ms = scale["evaluation_end_ms"] if args.end_ms is None else args.end_ms
+        if (args.start_ms, args.end_ms) != (scale["evaluation_start_ms"], scale["evaluation_end_ms"]):
+            raise ValueError("evaluation must cover the planned repetition interval")
+    if args.start_ms is None or args.end_ms is None or args.end_ms < args.start_ms:
+        raise ValueError("provide valid start/end timestamps or a scale-bound query manifest")
     if loaded.get("provenance", {}).get("dataset") != manifest["dataset"]:
         raise ValueError("query and loaded dataset profiles differ")
     if args.end_ms > loaded["end_ms"] or args.start_ms < loaded["start_ms"]:
@@ -104,7 +116,7 @@ def run(args):
         before = resources.snapshot(components)
         start = time.perf_counter_ns()
         try:
-            body, headers = request(url, expression, timestamp, sql)
+            body, headers = request(url, expression, timestamp, sql, getattr(args, "timeout_seconds", 60))
             return body, headers
         finally:
             timing[engine] = {"latency_ns": time.perf_counter_ns() - start,
@@ -117,6 +129,7 @@ def run(args):
                 continue
             for timestamp in range(args.start_ms, args.end_ms + 1, query["interval_ms"]):
                 row = {"query_id": query["id"], "evaluation_ms": timestamp,
+                       "scale": scale,
                        "dataset_sha256": loaded["sha256"], "interval_ms": query["interval_ms"],
                        "schedule": "sequential historical replay, not wall-clock load"}
                 timing = {}
@@ -169,22 +182,24 @@ def main():
     check.add_argument("--output", type=Path, required=True)
     for endpoint in ("prometheus", "victoriametrics", "clickhouse", "asap-prometheus", "asap-clickhouse"):
         check.add_argument("--" + endpoint, required=True)
-    check.add_argument("--start-ms", type=int, required=True)
-    check.add_argument("--end-ms", type=int, required=True)
+    check.add_argument("--start-ms", type=int)
+    check.add_argument("--end-ms", type=int)
     check.add_argument("--query-name", action="append", default=[])
     check.add_argument("--rtol", type=float, default=1e-9)
     check.add_argument("--atol", type=float, default=1e-12)
     check.add_argument("--require-warm", action="store_true")
     check.add_argument("--components", type=Path)
+    check.add_argument("--timeout-seconds", type=float, default=60,
+                       help="same HTTP timeout for all five engines; configure server limits separately")
     args = parser.parse_args()
     if args.command == "manifest":
         with args.output.open("x") as out:
             json.dump(corpus(args.dataset, args.filter_value), out, indent=2)
         return 0
-    if args.end_ms < args.start_ms:
-        parser.error("end must be >= start")
     if any(not math.isfinite(v) or v < 0 for v in (args.rtol, args.atol)):
         parser.error("tolerances must be finite and nonnegative")
+    if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
+        parser.error("timeout must be finite and positive")
     return run(args)
 
 

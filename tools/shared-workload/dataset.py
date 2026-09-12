@@ -106,7 +106,14 @@ def main():
     parser.add_argument("--start-ms", type=int, default=1700000000000)
     parser.add_argument("--duration-ms", type=int, default=120000)
     parser.add_argument("--max-samples", type=int, default=1000000)
+    parser.add_argument("--scale-plan", type=Path, help="synthetic scale.json; overrides group/member/time settings, not sample budget")
     args = parser.parse_args()
+    if args.scale_plan:
+        if args.dataset != "synthetic":
+            parser.error("synthetic scale plans cannot rescale real traces")
+        scale = json.loads(args.scale_plan.read_text())
+        for name in ("groups", "members", "start_ms", "duration_ms"):
+            setattr(args, name, scale[name])
     if min(args.groups, args.members, args.max_samples) < 1 or args.duration_ms < 0 or args.duration_ms % 100:
         parser.error("counts must be positive and duration nonnegative")
     if args.dataset != "synthetic" and not args.input:
@@ -117,6 +124,8 @@ def main():
     provenance = {"dataset": args.dataset, "generator": "prometheus_client", "groups": args.groups if args.dataset == "synthetic" else None,
                   "members": args.members if args.dataset == "synthetic" else None,
                   "scrape_ms": 100 if args.dataset == "synthetic" else None}
+    if args.scale_plan:
+        provenance["scale_plan"] = scale
     if args.input:
         digest = hashlib.sha256()
         with args.input.open("rb") as source:
