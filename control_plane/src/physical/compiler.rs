@@ -608,6 +608,7 @@ impl BackendLocalPlanningSnapshot {
                 horizon_seconds: self.implementation.horizon_seconds,
                 costs: self.implementation.lifecycle_costs.clone(),
             };
+            let derived_lifecycle = lifecycle.clone();
             let post_asap = crate::planner_selection::keep_pre_asap(&parsed)
                 .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             canonical_roots.push(Rc::new(parsed));
@@ -642,6 +643,8 @@ impl BackendLocalPlanningSnapshot {
                             lookback_ms,
                             evaluation_interval_ms,
                             cost,
+                            &derived_lifecycle,
+                            self.implementation.query_staleness_margin_ms,
                         )
                     }),
                 runtime_policy: RuntimeRulePolicy::default(),
@@ -2185,6 +2188,97 @@ fn validate_lifecycle_input(
     Ok(())
 }
 
+/// Price one derived layout from the snapshot's own lifecycle unit costs.
+///
+/// `ImplementationCostEvidence` is normally measured evidence, and its
+/// `weighted_cost` doc puts pricing update CPU, query-time merges, retained
+/// memory, storage, scans and network on the evidence producer. When a
+/// snapshot prices no candidate, the control plane becomes that producer for
+/// the derived shapes — and it does so without inventing a single magnitude.
+/// Every unit cost below is supplied evidence (`LifecycleCostEvidence`, from
+/// `implementation.lifecycle_costs`); every multiplier is a structural count
+/// that follows from the layout's definition. Nothing here is a measurement.
+///
+/// Over `horizon_seconds`, for window `W`, slide `S` and the layout's own
+/// shape:
+///
+/// - **states created**: a `Pane { P }` seals a state every `P`, a
+///   `FullWindow` every `S`. Each one is built once and retired once, so
+///   `build` and `retirement` are charged per created state.
+/// - **update fanout**: this is the layout's whole point (`worker.rs`'s
+///   `stores_full_windows` branch). A pane takes each sample exactly once; a
+///   full window takes it into every overlapping window that contains it,
+///   `ceil(W / S)` of them. Charged at the supplied ingestion rate.
+/// - **finalizations per read**: the mirror image. A full window is read
+///   whole; `W / P` panes are composed into one answer. Charged at the
+///   query's own evaluation cadence.
+/// - **retention**: `retained_state_count`, the same function that fills
+///   `num_aggregates_to_retain`, so the quote and the plan cannot disagree.
+///   Concurrent in-flight full windows are not double-charged here — the
+///   fanout term already prices that write amplification.
+///
+/// The byte fields are left exactly as the snapshot supplied them: state size
+/// needs sketch parameters that do not exist yet at this point, and guessing
+/// them would be the fabrication this function otherwise avoids. Only
+/// `cpu_cost` and `weighted_cost` are derived, and only those two are read —
+/// by `validate_window_implementations` and by the `min_by` that ranks
+/// candidates. `model_version` records that the quote is derived.
+fn derived_window_cost(
+    template: &ImplementationCostEvidence,
+    lifecycle: &LifecyclePlanningInput,
+    window_secs: u64,
+    slide_secs: u64,
+    layout: &asap_types::WindowMaterializationLayout,
+    staleness_margin_ms: u64,
+) -> ImplementationCostEvidence {
+    let costs = &lifecycle.costs;
+    let horizon = lifecycle.horizon_seconds.max(0.0);
+    let window = window_secs.max(1) as f64;
+    let slide = slide_secs.max(1) as f64;
+    let (seal_interval, update_fanout, finalizations_per_read) = match layout {
+        asap_types::WindowMaterializationLayout::FullWindow => {
+            (slide, (window / slide).ceil(), 1.0)
+        }
+        asap_types::WindowMaterializationLayout::Pane { pane_secs } => {
+            let pane = (*pane_secs).max(1) as f64;
+            (pane, 1.0, (window / pane).ceil())
+        }
+        asap_types::WindowMaterializationLayout::HierarchicalRollup { base_pane_secs, .. } => {
+            let pane = (*base_pane_secs).max(1) as f64;
+            (pane, 1.0, (window / pane).ceil())
+        }
+    };
+    let states_created = horizon / seal_interval;
+    let updates = lifecycle.ingestion_rate_per_second.max(0.0) * horizon * update_fanout;
+    let evaluation_secs = (f64::from(lifecycle.evaluation_interval_ms) / 1_000.0).max(1.0);
+    let reads = horizon / evaluation_secs;
+    let retained = retained_state_count(
+        window_secs.saturating_mul(1_000),
+        staleness_margin_ms,
+        slide_secs.saturating_mul(1_000),
+        layout,
+    ) as f64;
+
+    let build = costs.build * states_created;
+    let maintenance = costs.maintenance_per_update * updates;
+    let read = costs.read * reads * finalizations_per_read;
+    let retention = costs.retention_per_second * horizon * retained;
+    let retirement = costs.retirement * states_created;
+    let cpu_cost = build + maintenance;
+    let weighted_cost = cpu_cost + read + retention + retirement;
+
+    ImplementationCostEvidence {
+        model_version: format!("{}+derived-window-layout-v1", template.model_version),
+        cpu_cost: if cpu_cost.is_finite() { cpu_cost } else { 0.0 },
+        weighted_cost: if weighted_cost.is_finite() {
+            weighted_cost
+        } else {
+            0.0
+        },
+        ..template.clone()
+    }
+}
+
 /// Every distinct range-selector window in `expr`, as seconds.
 ///
 /// A single query can carry several. `sum(sum_over_time(a[1m])) / sum(sum_over_time(b[5m]))`
@@ -2274,6 +2368,8 @@ fn derived_window_candidates(
     lookback_ms: u64,
     evaluation_interval_ms: u32,
     cost: ImplementationCostEvidence,
+    lifecycle: &LifecyclePlanningInput,
+    staleness_margin_ms: u64,
 ) -> Vec<WindowImplementationCandidate> {
     let mut windows = range_selector_windows_secs(expr);
     if windows.is_empty() {
@@ -2285,7 +2381,7 @@ fn derived_window_candidates(
     let distinct = windows.len() > 1;
     windows
         .into_iter()
-        .map(|window_secs| {
+        .flat_map(|window_secs| {
             let evaluation_secs = u64::from(evaluation_interval_ms) / 1_000;
             let advances_within_window = evaluation_secs != 0
                 && evaluation_secs < window_secs
@@ -2295,24 +2391,58 @@ fn derived_window_candidates(
             } else {
                 window_secs
             };
-            WindowImplementationCandidate {
-                implementation_id: if distinct {
-                    format!("{implementation_id}-{window_secs}s")
+            let window_label = if distinct {
+                format!("{implementation_id}-{window_secs}s")
+            } else {
+                implementation_id.to_string()
+            };
+            // `Tumbling` pairs only with `Pane` in the validator's
+            // framework/layout table, so a non-sliding shape has no
+            // alternative to rank against and keeps its label unchanged.
+            let layouts: Vec<(String, asap_types::WindowMaterializationLayout)> =
+                if advances_within_window {
+                    vec![
+                        (
+                            format!("{window_label}-pane-{slide_secs}s"),
+                            asap_types::WindowMaterializationLayout::Pane {
+                                pane_secs: slide_secs,
+                            },
+                        ),
+                        (
+                            format!("{window_label}-full-window"),
+                            asap_types::WindowMaterializationLayout::FullWindow,
+                        ),
+                    ]
                 } else {
-                    implementation_id.to_string()
-                },
-                framework: if advances_within_window {
-                    SummaryWindowFramework::Sliding
-                } else {
-                    SummaryWindowFramework::Tumbling
-                },
-                window_secs,
-                slide_secs,
-                layout: asap_types::WindowMaterializationLayout::Pane {
-                    pane_secs: slide_secs,
-                },
-                cost: cost.clone(),
-            }
+                    vec![(
+                        window_label,
+                        asap_types::WindowMaterializationLayout::Pane {
+                            pane_secs: slide_secs,
+                        },
+                    )]
+                };
+            layouts
+                .into_iter()
+                .map(|(id, layout)| WindowImplementationCandidate {
+                    implementation_id: id,
+                    framework: if advances_within_window {
+                        SummaryWindowFramework::Sliding
+                    } else {
+                        SummaryWindowFramework::Tumbling
+                    },
+                    window_secs,
+                    slide_secs,
+                    cost: derived_window_cost(
+                        &cost,
+                        lifecycle,
+                        window_secs,
+                        slide_secs,
+                        &layout,
+                        staleness_margin_ms,
+                    ),
+                    layout,
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -5024,6 +5154,12 @@ mod tests {
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
 
+    fn planning_lifecycle() -> LifecyclePlanningInput {
+        planning_snapshot().planning_request().unwrap().0.queries[0]
+            .lifecycle
+            .clone()
+    }
+
     fn planning_snapshot() -> BackendLocalPlanningSnapshot {
         serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
@@ -5042,8 +5178,26 @@ mod tests {
             AccuracyTarget::Exact,
         )
         .unwrap();
-        let derived = derived_window_candidates("id", &expr, 300_000, 30_000, cost);
-        assert_eq!(derived.len(), 1);
+        let derived =
+            derived_window_candidates("id", &expr, 300_000, 30_000, cost, &planning_lifecycle(), 0);
+        // A sliding shape has two legal layouts, so both are offered and the
+        // cost model picks between them.
+        assert_eq!(
+            derived
+                .iter()
+                .map(|c| (c.implementation_id.as_str(), c.layout.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "id-pane-30s",
+                    asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 }
+                ),
+                (
+                    "id-full-window",
+                    asap_types::WindowMaterializationLayout::FullWindow
+                ),
+            ]
+        );
         let candidate = &derived[0];
         assert_eq!(candidate.framework, SummaryWindowFramework::Sliding);
         assert_eq!((candidate.window_secs, candidate.slide_secs), (300, 30));
@@ -5051,6 +5205,82 @@ mod tests {
             candidate.layout,
             asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 }
         );
+    }
+
+    // The layout choice is a write-amplification-versus-read-amplification
+    // trade, and the derived quote has to price it in the right direction: a
+    // full window takes every sample into all ten overlapping windows but is
+    // read whole, panes take each sample once but compose ten per read. Which
+    // wins depends on how hard the source is pushing, so pin the crossover,
+    // not the magnitudes.
+    #[test]
+    fn derived_window_layout_prices_write_against_read_amplification() {
+        let cost = planning_snapshot().implementation.implementation_cost;
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let quote = |rate: f64| {
+            let mut lifecycle = planning_lifecycle();
+            lifecycle.ingestion_rate_per_second = rate;
+            let derived = derived_window_candidates(
+                "id",
+                &expr,
+                300_000,
+                30_000,
+                cost.clone(),
+                &lifecycle,
+                0,
+            );
+            let weighted = |layout: &asap_types::WindowMaterializationLayout| {
+                derived
+                    .iter()
+                    .find(|c| c.layout == *layout)
+                    .expect("both layouts offered")
+                    .cost
+                    .weighted_cost
+            };
+            (
+                weighted(&asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 }),
+                weighted(&asap_types::WindowMaterializationLayout::FullWindow),
+            )
+        };
+        let (idle_pane, idle_full) = quote(0.0);
+        assert!(
+            idle_full < idle_pane,
+            "with no arriving data the fanout is free and the merges are not: \
+             pane {idle_pane} full {idle_full}"
+        );
+        let (busy_pane, busy_full) = quote(100.0);
+        assert!(
+            busy_pane < busy_full,
+            "under load the tenfold update fanout dominates: pane {busy_pane} full {busy_full}"
+        );
+    }
+
+    // A tumbling shape pairs only with `Pane` in the validator's
+    // framework/layout table, so there is no alternative to price against it.
+    #[test]
+    fn tumbling_shapes_have_no_layout_alternative_to_rank() {
+        let cost = planning_snapshot().implementation.implementation_cost;
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let derived = derived_window_candidates(
+            "id",
+            &expr,
+            300_000,
+            300_000,
+            cost,
+            &planning_lifecycle(),
+            0,
+        );
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].implementation_id, "id");
+        assert_eq!(derived[0].framework, SummaryWindowFramework::Tumbling);
     }
 
     // Every shape this function can emit must survive the validator, or a bad
@@ -5079,6 +5309,8 @@ mod tests {
                 lookback_ms,
                 evaluation_ms,
                 cost.clone(),
+                &planning_lifecycle(),
+                0,
             );
             validate_window_implementations(&query, &environment).unwrap_or_else(|error| {
                 panic!("lookback {lookback_ms} cadence {evaluation_ms}: {error:?}")
@@ -5098,8 +5330,15 @@ mod tests {
         )
         .unwrap();
         for evaluation_ms in [300_000, 450_000, 45_000, 0] {
-            let derived =
-                derived_window_candidates("id", &expr, 300_000, evaluation_ms, cost.clone());
+            let derived = derived_window_candidates(
+                "id",
+                &expr,
+                300_000,
+                evaluation_ms,
+                cost.clone(),
+                &planning_lifecycle(),
+                0,
+            );
             let candidate = &derived[0];
             assert_eq!(
                 (
@@ -5137,6 +5376,8 @@ mod tests {
             60_000,
             60_000,
             snapshot.implementation.implementation_cost.clone(),
+            &planning_lifecycle(),
+            0,
         )
         .remove(0);
         supplied.framework = SummaryWindowFramework::Sliding;
