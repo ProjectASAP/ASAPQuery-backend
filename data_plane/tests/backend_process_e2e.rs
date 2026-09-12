@@ -395,6 +395,7 @@ async fn quote_workload(
 }
 
 #[tokio::test]
+#[ignore = "requires ASAPCollector CollectorPlan schema compatibility; run explicitly after Collector is updated"]
 async fn production_control_plane_to_data_plane_otlp_to_promql() {
     let control_binary = std::env::var("ASAP_E2E_CONTROL_PLANE_BIN")
         .expect("ASAP_E2E_CONTROL_PLANE_BIN is set by scripts/e2e.sh whole");
