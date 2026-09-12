@@ -57,24 +57,26 @@ jobs:
           # post-step can package `target`; registry/git inputs are sufficient.
           cache-targets: false
 
-      - name: Check formatting
+      - name: Check workspace formatting
         working-directory: ASAPQuery-backend
-        run: cargo fmt -p control_plane -p data_plane -- --check
+        # `--all` also follows this workspace's sibling path dependencies.
+        # Keep the gate scoped to every backend-owned workspace member.
+        run: cargo fmt -p control_plane -p data_plane -p asap_types -p asap_otel_proto -- --check
 
-      - name: Check control plane and data plane
+      - name: Check workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo check -p control_plane -p data_plane
+        run: cargo check --workspace
 
-      - name: Lint control plane and data plane
+      - name: Lint workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo clippy -p control_plane -p data_plane --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test MVP control plane
+      - name: Test workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo test -p control_plane
+        run: cargo test --workspace
