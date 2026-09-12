@@ -6,6 +6,9 @@
 
 mod materialization_candidates;
 
+#[cfg(test)]
+use super::compiler::PhysicalCompiler;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use asap_aware_mapping::cost_model::Cost;
@@ -13,8 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::compiler::{
-    CompileError, DeploymentEnvironment, PhysicalCompiler, PhysicalPlan, PlanningQuery,
-    PlanningRequest,
+    CompileError, DeploymentEnvironment, PhysicalPlan, PlanningQuery, PlanningRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -350,7 +352,7 @@ pub(crate) fn exact_source_metrics(
     Ok(metrics)
 }
 
-type PricedComponents = (Cost, BTreeMap<String, f64>);
+pub(super) type PricedComponents = (Cost, BTreeMap<String, f64>);
 
 impl WorkloadCostEvidence {
     fn validate(&self, env: &DeploymentEnvironment) -> Result<(), CompileError> {
@@ -377,7 +379,7 @@ impl WorkloadCostEvidence {
         Ok(())
     }
 
-    fn price(
+    pub(super) fn price(
         &self,
         manifest: &WorkloadCostManifest,
     ) -> Result<PricedComponents, (&'static str, String)> {
@@ -462,11 +464,12 @@ fn bind_alternative(
 ) -> Result<(PhysicalPlan, WorkloadCostManifest, AlternativeCost), Box<AlternativeCost>> {
     let mut description = alternative_description(&candidate);
     let queries = candidate.queries.clone();
-    let compiled = if metricsql {
-        PhysicalCompiler.compile_metricsql(candidate, env)
-    } else {
-        PhysicalCompiler.compile(candidate, env)
-    };
+    let compiled = super::realization::RealizationProvider::compile(
+        &super::realization::ExistingRealizations,
+        candidate,
+        env,
+        metricsql,
+    );
     let plan = match compiled {
         Ok(plan) => plan,
         Err(error) => {
@@ -612,7 +615,11 @@ fn select_with_frontend(
             ));
         }
         comparison_workload = Some(scope);
-        match evidence.price(&manifest) {
+        match super::realization::RealizationProvider::price(
+            &super::realization::ExistingRealizations,
+            evidence,
+            &manifest,
+        ) {
             Ok((cost, components)) => {
                 description.status = "unselected".into();
                 description.total_cost = Some(cost.0);

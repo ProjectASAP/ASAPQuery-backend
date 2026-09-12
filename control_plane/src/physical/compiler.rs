@@ -1139,7 +1139,11 @@ impl PhysicalCompiler {
                     retention_cost_rate: Some(CostRate(query.lifecycle.costs.retention_per_second)),
                     retirement_cost: Some(Cost(query.lifecycle.costs.retirement)),
                 };
-                let window_costs = validate_window_implementations(query, &environment)?;
+                let window_costs = super::realization::RealizationProvider::windows(
+                    &super::realization::ExistingRealizations,
+                    query,
+                    &environment,
+                )?;
                 let model = ControlPlaneCostModel::new(query.accuracy.clone())
                     .with_summary_maintenance(
                         lifecycle_costs,
@@ -2184,7 +2188,7 @@ fn validate_lifecycle_input(
     Ok(())
 }
 
-fn validate_window_implementations(
+pub(super) fn validate_window_implementations(
     query: &PlanningQuery,
     environment: &DeploymentEnvironment,
 ) -> Result<Vec<(String, SummaryWindowFramework, Cost)>, CompileError> {

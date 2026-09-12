@@ -35,8 +35,8 @@ pub fn typed_stage_split_enabled() -> bool {
 /// per-stage [`crate::physical::colored_dag::StageConfig`] map for the DC
 /// lifecycle three-stage topology.
 ///
-/// Returns `None` when stage allocation errors out (unsupported topology
-/// shape, unresolved `Ref`, empty backend). Each per-stage config the
+/// Compatibility wrapper: failures retain their concrete reason in diagnostics.
+/// Call [`try_split_typed`] when the caller can return the error. Each per-stage config the
 /// returned map carries is materialised into wire bytes by the emitters
 /// in [`crate::emit::stage_config`] — `emit_edge_yaml` for `Edge`,
 /// `emit_gateway_yaml` for `Gateway`, `emit_backend_streaming_config_json`
@@ -49,9 +49,28 @@ pub fn split_typed_three_stage(
         crate::physical::colored_dag::StageConfig,
     >,
 > {
-    use crate::physical::colored_dag::{Emitter, StageAllocator, ThreeStageEmitter, Topology};
-    let dag = StageAllocator.allocate(expr, Topology::ThreeStage).ok()?;
-    ThreeStageEmitter.emit_per_stage(&dag).ok()
+    match try_split_typed(expr, crate::physical::colored_dag::Topology::ThreeStage) {
+        Ok(configs) => Some(configs),
+        Err(error) => {
+            tracing::warn!(error = %error, "three-stage realization unavailable");
+            None
+        }
+    }
+}
+
+/// Allocate and emit without erasing capability or emission failures.
+/// Unsupported topology remains an error; this does not enable SingleStage.
+pub fn try_split_typed(
+    expr: &crate::physical::post_asap::PhysicalExpr,
+    topology: crate::physical::colored_dag::Topology,
+) -> anyhow::Result<
+    std::collections::HashMap<
+        crate::physical::colored_dag::StageId,
+        crate::physical::colored_dag::StageConfig,
+    >,
+> {
+    use super::realization::{ExistingRealizations, RealizationProvider};
+    ExistingRealizations.stages(expr, topology)
 }
 
 #[cfg(test)]
@@ -184,5 +203,29 @@ mod l5_walk_propagation_tests {
              patch in handle_plan — got {:?}",
             agg.grouping
         );
+    }
+}
+
+#[cfg(test)]
+mod realization_failures {
+    use super::*;
+    use crate::physical::colored_dag::{AllocateError, Topology};
+    use crate::physical::post_asap::PhysicalExpr;
+
+    // Unsupported topology retains the allocator's typed rejection.
+    #[test]
+    fn unsupported_realization_retains_reason() {
+        let expr = PhysicalExpr::RawAtEdgePrometheusArchive {
+            metric: "m".into(),
+            window: None,
+            label_proj: vec![],
+        };
+        for topology in [Topology::SingleStage, Topology::ZeroStage] {
+            let error = try_split_typed(&expr, topology).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<AllocateError>(),
+                Some(&AllocateError::UnsupportedTopology(topology))
+            );
+        }
     }
 }
