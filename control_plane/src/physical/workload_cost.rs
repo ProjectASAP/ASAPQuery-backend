@@ -991,7 +991,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(manifest
+        // Both ranges are summarized now, so nothing in this workload is
+        // priced as exact backend execution. The 5m operand used to land there
+        // only because its window had no implementation candidate.
+        assert!(!manifest
             .components
             .values()
             .any(|demand| demand.implementation.get("location")

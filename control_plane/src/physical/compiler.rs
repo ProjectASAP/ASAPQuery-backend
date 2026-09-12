@@ -636,12 +636,13 @@ impl BackendLocalPlanningSnapshot {
                     .get(&query_string)
                     .cloned()
                     .unwrap_or_else(|| {
-                        vec![derived_window_candidate(
-                            self.implementation.window_implementation_id.clone(),
+                        derived_window_candidates(
+                            &self.implementation.window_implementation_id,
+                            canonical_roots.last().expect("root pushed above"),
                             lookback_ms,
                             evaluation_interval_ms,
                             cost,
-                        )]
+                        )
                     }),
                 runtime_policy: RuntimeRulePolicy::default(),
             });
@@ -2184,76 +2185,136 @@ fn validate_lifecycle_input(
     Ok(())
 }
 
-/// The one window implementation to plan with when the snapshot priced none
-/// for this query.
+/// Every distinct range-selector window in `expr`, as seconds.
 ///
-/// This is a *shape*, not a cost quote. `ImplementationCostEvidence` is
-/// measured evidence an evidence producer supplies — its `weighted_cost` doc
-/// is explicit that the producer, not this compiler, prices update CPU,
-/// query-time merges, retained memory, storage, scans and network. So this
-/// function never synthesizes a second candidate to rank: a single candidate
-/// is selected by `complete_summary_candidate_estimate`'s `min_by` over a
-/// one-element list, where the cost value cannot change the outcome. Ranking
-/// Pane against FullWindow requires the snapshot to supply both in
-/// `window_candidates`, each with its own priced evidence.
+/// A single query can carry several. `sum(sum_over_time(a[1m])) / sum(sum_over_time(b[5m]))`
+/// has two, and each one becomes its own materialization with its own window.
+/// `time_selection.lookback` is the workload's declared range and is not
+/// required to equal any of them.
+fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
+    fn visit(expr: &QueryExpr, windows: &mut BTreeSet<u64>) {
+        if let QueryExpr::TimeRange { range, .. } = expr {
+            let secs = range.as_secs();
+            if secs != 0 {
+                windows.insert(secs);
+            }
+        }
+        match expr {
+            QueryExpr::PromqlScalarBridge(child)
+            | QueryExpr::PromqlVectorFromScalar(child)
+            | QueryExpr::PromqlScalarFromVector(child)
+            | QueryExpr::PromqlRelabel { child, .. }
+            | QueryExpr::PromqlSeriesSample { child, .. }
+            | QueryExpr::Filter { child, .. }
+            | QueryExpr::Project { child, .. }
+            | QueryExpr::Aggregate { child, .. }
+            | QueryExpr::Dedup { child, .. }
+            | QueryExpr::Sort { child, .. }
+            | QueryExpr::Limit { child, .. }
+            | QueryExpr::PromqlSubquery { child, .. }
+            | QueryExpr::TimeRange { child, .. }
+            | QueryExpr::TimeShift { child, .. } => visit(child, windows),
+            QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            }
+            | QueryExpr::Join { left, right, .. }
+            | QueryExpr::SetOp { left, right, .. } => {
+                visit(left, windows);
+                visit(right, windows);
+            }
+            _ => {}
+        }
+    }
+    let mut windows = BTreeSet::new();
+    visit(expr, &mut windows);
+    windows
+}
+
+/// The window implementations to plan with when the snapshot priced none for
+/// this query.
 ///
-/// What the shape must respect is the query's own demand. A workload that
-/// evaluates every 30s over a 5m lookback needs its state to advance every
-/// 30s; planning it as one 5m tumbling window answers with results that only
-/// change every 5 minutes. `evaluation_interval_ms` already reaches this
-/// function — it was previously read for lifecycle costing and then dropped
-/// on the floor here.
+/// These are *shapes*, not cost quotes. `ImplementationCostEvidence` is
+/// measured evidence: its `weighted_cost` doc puts pricing update CPU,
+/// query-time merges, retained memory, storage, scans and network on the
+/// evidence producer. So this never synthesizes competing candidates for one
+/// window to rank against each other — one shape per window, selected by a
+/// `min_by` over a one-element list where the cost cannot change the outcome.
+/// Ranking `Pane` against `FullWindow` requires a snapshot supplying both with
+/// their own priced evidence in `window_candidates`.
 ///
-/// The derivation, and why each guard exists
-/// (`validate_window_implementations` rejects a candidate that breaks any of
-/// them, so a bad shape would surface as a compile error, never a silent
-/// plan):
+/// **One candidate per range-selector window, not one per query.** A state
+/// whose window has no candidate is dropped from selection outright
+/// (`hybrid_execution`'s filter), and the surviving candidates are narrowed to
+/// the selected window before validation. Deriving a single candidate from
+/// `time_selection.lookback` therefore silently costs every operand whose own
+/// range differs from it its summary: `sum(sum_over_time(a[1m])) /
+/// sum(sum_over_time(b[5m]))` under a 1m lookback kept `a` and dropped `b` to
+/// exact execution, with nothing reported.
 ///
-/// - `window_secs` is the semantic lookback, which `PlanningQuery::window_secs`
-///   also uses; the validator requires the two to be equal.
-/// - The slide advances one evaluation interval, so consecutive evaluations
-///   share state, but only when that interval is shorter than the window and
-///   divides it. A non-dividing interval (45s into 300s) has no pane width
-///   that divides both, and `WindowMaterializationLayout::validate` would
-///   reject it, so keep the tumbling shape.
-/// - `Pane { pane_secs: slide_secs }` divides the slide trivially and divides
-///   the window by the same guard. Each sample then updates exactly one pane
-///   (`worker.rs`'s `stores_full_windows` branch), and a read composes
-///   `window / slide` of them. `FullWindow` is the other legal Sliding
-///   layout and is deliberately not chosen here: preferring it over panes is
-///   a cost comparison, and this function has no second quote to compare.
-/// - Tumbling pairs only with `Pane` in the validator's framework/layout
-///   table, so the degenerate `pane_secs == window_secs` case stays as it was.
-fn derived_window_candidate(
-    implementation_id: String,
+/// Within one window, the shape follows the query's evaluation cadence. A
+/// workload evaluated every 30s over a 5m window needs its state to advance
+/// every 30s; one 5m tumbling window answers with results that only change
+/// once every five minutes. `evaluation_interval_ms` already reaches this
+/// function — it was read for lifecycle costing and then dropped here.
+///
+/// The guards are the validator's own rules, so a bad shape is a compile error
+/// rather than a silent plan: `WindowMaterializationLayout::validate` requires
+/// the pane to divide both window and slide (45s into 300s has no such pane),
+/// and the framework/layout table admits `Tumbling + Pane` and `Sliding + Pane`.
+/// `pane_secs == slide_secs` is the coarsest legal pane for a cadence, so it
+/// is the one with the fewest query-time merges. `FullWindow` is the other
+/// legal `Sliding` layout and is deliberately not emitted alongside it:
+/// preferring it is a write-amplification-versus-read-amplification tradeoff,
+/// which is a cost comparison, and there is no second quote to compare.
+fn derived_window_candidates(
+    implementation_id: &str,
+    expr: &QueryExpr,
     lookback_ms: u64,
     evaluation_interval_ms: u32,
     cost: ImplementationCostEvidence,
-) -> WindowImplementationCandidate {
-    let window_secs = lookback_ms / 1_000;
-    let evaluation_secs = u64::from(evaluation_interval_ms) / 1_000;
-    let advances_within_window = evaluation_secs != 0
-        && evaluation_secs < window_secs
-        && window_secs.is_multiple_of(evaluation_secs);
-    let slide_secs = if advances_within_window {
-        evaluation_secs
-    } else {
-        window_secs
-    };
-    WindowImplementationCandidate {
-        implementation_id,
-        framework: if advances_within_window {
-            SummaryWindowFramework::Sliding
-        } else {
-            SummaryWindowFramework::Tumbling
-        },
-        window_secs,
-        slide_secs,
-        layout: asap_types::WindowMaterializationLayout::Pane {
-            pane_secs: slide_secs,
-        },
-        cost,
+) -> Vec<WindowImplementationCandidate> {
+    let mut windows = range_selector_windows_secs(expr);
+    if windows.is_empty() {
+        windows.insert(lookback_ms / 1_000);
     }
+    // `window_implementation_id` reaches lifecycle estimates and cost
+    // manifests, so one label must not describe several shapes. A query with a
+    // single window keeps the snapshot's identity untouched.
+    let distinct = windows.len() > 1;
+    windows
+        .into_iter()
+        .map(|window_secs| {
+            let evaluation_secs = u64::from(evaluation_interval_ms) / 1_000;
+            let advances_within_window = evaluation_secs != 0
+                && evaluation_secs < window_secs
+                && window_secs.is_multiple_of(evaluation_secs);
+            let slide_secs = if advances_within_window {
+                evaluation_secs
+            } else {
+                window_secs
+            };
+            WindowImplementationCandidate {
+                implementation_id: if distinct {
+                    format!("{implementation_id}-{window_secs}s")
+                } else {
+                    implementation_id.to_string()
+                },
+                framework: if advances_within_window {
+                    SummaryWindowFramework::Sliding
+                } else {
+                    SummaryWindowFramework::Tumbling
+                },
+                window_secs,
+                slide_secs,
+                layout: asap_types::WindowMaterializationLayout::Pane {
+                    pane_secs: slide_secs,
+                },
+                cost: cost.clone(),
+            }
+        })
+        .collect()
 }
 
 pub(super) fn validate_window_implementations(
@@ -4929,15 +4990,9 @@ mod tests {
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         entry.query = Query("sum(sum_over_time(a[1m])) / sum(sum_over_time(b[5m]))".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
-        let (mut request, env) = snapshot.planning_request().unwrap();
-        let query = &mut request.queries[0];
-        let mut five_minutes = query.window_implementations[0].clone();
-        five_minutes.implementation_id = "five-minute-evidence".into();
-        five_minutes.window_secs = 300;
-        five_minutes.framework = SummaryWindowFramework::Sliding;
-        five_minutes.slide_secs = 60;
-        five_minutes.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 };
-        query.window_implementations.push(five_minutes);
+        // The derivation now covers both range selectors, so this no longer
+        // needs a hand-supplied 5m candidate to keep `b` from falling back.
+        let (request, env) = snapshot.planning_request().unwrap();
         let plan = PhysicalCompiler.compile(request, env).unwrap();
         let bindings = plan
             .query_plan
@@ -4959,13 +5014,12 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         // `window_ms` is the stored pane width, `readout_lookback_ms` the
-        // semantic range. The snapshot evaluates every 10s, so `a`'s derived
-        // candidate stores 10s panes and composes six of them for its 1m
-        // readout; `b` keeps the 60s pane its explicitly supplied candidate
-        // priced. Both readouts are unchanged.
+        // semantic range. Each operand keeps its own range -- 1m for `a`, 5m
+        // for `b` -- while both store 10s panes, because the snapshot
+        // evaluates every 10s and the derivation now covers both selectors.
         assert_eq!(
             actual,
-            BTreeSet::from([("a", 10_000, Some(60_000)), ("b", 60_000, Some(300_000)),])
+            BTreeSet::from([("a", 10_000, Some(60_000)), ("b", 10_000, Some(300_000)),])
         );
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
@@ -4983,7 +5037,14 @@ mod tests {
     #[test]
     fn derived_window_candidate_follows_the_evaluation_cadence() {
         let cost = planning_snapshot().implementation.implementation_cost;
-        let candidate = derived_window_candidate("id".into(), 300_000, 30_000, cost);
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let derived = derived_window_candidates("id", &expr, 300_000, 30_000, cost);
+        assert_eq!(derived.len(), 1);
+        let candidate = &derived[0];
         assert_eq!(candidate.framework, SummaryWindowFramework::Sliding);
         assert_eq!((candidate.window_secs, candidate.slide_secs), (300, 30));
         assert_eq!(
@@ -5007,12 +5068,18 @@ mod tests {
         ] {
             let mut query = request.queries[0].clone();
             query.window_secs = lookback_ms / 1_000;
-            query.window_implementations = vec![derived_window_candidate(
-                "derived".into(),
+            let expr = crate::query_parser::parse_query_expr_canonical(
+                &format!("quantile_over_time(0.5, data[{}s])", lookback_ms / 1_000),
+                AccuracyTarget::Exact,
+            )
+            .unwrap();
+            query.window_implementations = derived_window_candidates(
+                "derived",
+                &expr,
                 lookback_ms,
                 evaluation_ms,
                 cost.clone(),
-            )];
+            );
             validate_window_implementations(&query, &environment).unwrap_or_else(|error| {
                 panic!("lookback {lookback_ms} cadence {evaluation_ms}: {error:?}")
             });
@@ -5025,9 +5092,15 @@ mod tests {
     #[test]
     fn derived_window_candidate_stays_tumbling_without_a_dividing_cadence() {
         let cost = planning_snapshot().implementation.implementation_cost;
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
         for evaluation_ms in [300_000, 450_000, 45_000, 0] {
-            let candidate =
-                derived_window_candidate("id".into(), 300_000, evaluation_ms, cost.clone());
+            let derived =
+                derived_window_candidates("id", &expr, 300_000, evaluation_ms, cost.clone());
+            let candidate = &derived[0];
             assert_eq!(
                 (
                     candidate.framework.clone(),
@@ -5053,12 +5126,19 @@ mod tests {
             .query
             .0
             .clone();
-        let mut supplied = derived_window_candidate(
-            "supplied".into(),
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.99, m[1m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let mut supplied = derived_window_candidates(
+            "supplied",
+            &expr,
             60_000,
             60_000,
             snapshot.implementation.implementation_cost.clone(),
-        );
+        )
+        .remove(0);
         supplied.framework = SummaryWindowFramework::Sliding;
         supplied.slide_secs = 20;
         supplied.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 20 };
@@ -5122,9 +5202,10 @@ mod tests {
         );
     }
 
-    // A filtered denominator is a typed residual while its summary sibling remains installed.
+    // A filtered operand gets a summary over its own filtered population,
+    // with each operand keeping its own range.
     #[test]
-    fn composable_binary_retains_summary_sibling_of_prometheus_filtered_subtree() {
+    fn composable_binary_summarizes_each_prometheus_filtered_operand() {
         use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
         let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
@@ -5138,22 +5219,35 @@ mod tests {
         let plan = PhysicalCompiler.compile(request, env).unwrap();
         let query = plan.query_plan.entries.values().next().unwrap();
         let bindings = query.materialization_bindings();
-        assert_eq!(bindings.len(), 1);
-        let identity = &plan.summary_catalog.materializations[&bindings[0].materialization];
-        let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
-        // 10s panes for a 10s evaluation cadence; the 1m readout range is
-        // carried by `readout_lookback_ms`, not by the stored pane width.
+        // Both operands now hold a summary. The filtered denominator is no
+        // longer a typed residual: its 5m range has a candidate, so it gets
+        // its own summary over the filtered population rather than exact
+        // execution. Nothing about the filter forced the residual -- the
+        // missing 5m window candidate did, and this test previously pinned
+        // that artifact as intended behavior.
+        let bound = bindings
+            .iter()
+            .map(|binding| {
+                let identity = &plan.summary_catalog.materializations[&binding.materialization];
+                let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
+                (
+                    data.time_series_metric().unwrap(),
+                    data.population_filter_canonical.clone(),
+                    binding.readout_lookback_ms,
+                )
+            })
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            (data.time_series_metric().unwrap(), bindings[0].window_ms),
-            ("a", 10_000)
+            bound,
+            BTreeSet::from([
+                ("a", String::new(), Some(60_000)),
+                ("b", "{job!=\"x\"}".to_string(), Some(300_000)),
+            ])
         );
         assert!(!query
             .nodes
             .values()
             .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })));
-        assert!(query.nodes.values().any(|node| matches!(node,
-            QueryPlanNode::Logical { operator: LogicalOperator::ExactSubquery { query }, .. }
-            if query == "sum_over_time(b{job!=\"x\"}[5m])" || query == "sum(sum_over_time(b{job!=\"x\"}[5m]))")));
         assert!(!query.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
@@ -5161,7 +5255,7 @@ mod tests {
                 ..
             }
         )));
-        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
 
     #[test]
