@@ -321,6 +321,59 @@ pub fn select_workload_with_accuracy_model_and_trace(
     Ok((selected, trace))
 }
 
+/// The [`ReplacementStrategy`] set this deployment registers, carrying its own
+/// cost and accuracy models. This is deliberately not Planner's
+/// `default_strategies_with`: two of the strategies that list would give us are
+/// excluded below, for two unrelated reasons.
+///
+/// The three workload-dependent strategies — `RollupStrategy`,
+/// `AccuracyReconciliationStrategy` and `TopKLimitReuseStrategy` — are
+/// deliberately absent and must stay absent: they are constructed from the
+/// post-CSE sibling set, which only `search_cse_workload_with` owns, so
+/// `search_workload_with_targets` registers them itself against every
+/// discovered target. Adding them here would ask each target with an empty
+/// sibling list and report nothing.
+///
+/// `SharedSubtreeStrategy` is withheld for a reason the pinned Planner has to
+/// fix first, not as a cost policy this deployment could express. Both of its
+/// arms are `Replacement::Rewrite`s of the target itself, and `rank_group`
+/// ranks that pair (its "Shape 1") ahead of every `Replacement::Summary` in
+/// the same group and returns before the sketch-family ranking runs. The
+/// winning rewrite then materializes as `KeepPreAsap`, so registering the
+/// strategy silently downgrades every shared aggregate from its selected
+/// sketch to raw execution — `shared_aggregates_keep_their_summary` pins
+/// exactly that. Sharing must decide how many copies of the summary state
+/// exist, never whether the state is a summary at all; until Planner can
+/// carry the selected summary through the share rewrite, canonical CSE
+/// inside `search_workload_with_targets` already shares these subtrees
+/// structurally and correctly.
+fn replacement_strategies<'a>(
+    cost_model: &'a dyn CostModel,
+    evidence: &'a dyn AccuracyEvidenceProvider,
+    accuracy_model: &'a dyn AccuracyModel,
+) -> Vec<Box<dyn ReplacementStrategy + 'a>> {
+    vec![
+        Box::new(SketchAlgorithmStrategy::with_models_and_evidence(
+            cost_model,
+            accuracy_model,
+            &asap_aware_mapping::EqualSplitAllocator,
+            evidence,
+        )),
+        Box::new(
+            asap_aware_mapping::HydraGroupingStrategy::with_models_and_evidence(
+                cost_model,
+                accuracy_model,
+                &asap_aware_mapping::EqualSplitAllocator,
+                evidence,
+            ),
+        ),
+        Box::new(asap_aware_mapping::ExactCompositionStrategy::new(
+            cost_model,
+        )),
+        Box::new(asap_aware_mapping::SemanticEquivalentRewriteStrategy),
+    ]
+}
+
 fn select_workload_impl(
     roots: Vec<(usize, Rc<QueryExpr>)>,
     accuracy: AccuracyTarget,
@@ -329,21 +382,7 @@ fn select_workload_impl(
     accuracy_model: &dyn AccuracyModel,
     mut trace: Option<&mut serde_json::Value>,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
-    // Canonical CSE still runs inside search_workload_with_targets. Do not
-    // offer CSE's per-invocation recompute alternative: this runtime currently
-    // provisions continuously maintained, content-addressed state only.
-    let strategies: Vec<Box<dyn ReplacementStrategy + '_>> = vec![
-        Box::new(SketchAlgorithmStrategy::with_models_and_evidence(
-            cost_model,
-            accuracy_model,
-            &asap_aware_mapping::EqualSplitAllocator,
-            evidence,
-        )),
-        Box::new(asap_aware_mapping::ExactCompositionStrategy::new(
-            cost_model,
-        )),
-        Box::new(asap_aware_mapping::SemanticEquivalentRewriteStrategy),
-    ];
+    let strategies = replacement_strategies(cost_model, evidence, accuracy_model);
     let space = asap_aware_mapping::search_workload_with_targets(
         roots
             .into_iter()
@@ -626,5 +665,169 @@ mod workload_tests {
             _ => lhs,
         };
         assert!(Rc::ptr_eq(&roots[0].1, shared));
+    }
+
+    // The registered set is exactly the four strategies this deployment
+    // supports, in discovery order — which is also the tie-break order
+    // `rank_group` falls back to. Both exclusions are load-bearing:
+    // `SharedSubtreeStrategy` would downgrade shared aggregates to raw
+    // execution (see `shared_aggregates_keep_their_summary`), and the
+    // workload-dependent three are already registered by
+    // `search_cse_workload_with`, which alone owns their sibling set.
+    #[test]
+    fn registered_strategies_are_exactly_the_supported_set() {
+        let accuracy = AccuracyTarget::Epsilon(0.01);
+        let cost_model = ControlPlaneCostModel::new(accuracy);
+        let names: Vec<&str> = replacement_strategies(
+            &cost_model,
+            &asap_aware_mapping::NoAccuracyEvidence,
+            &asap_aware_mapping::DefaultAccuracyModel,
+        )
+        .iter()
+        .map(|strategy| strategy.name())
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "SketchAlgorithmStrategy",
+                "HydraGroupingStrategy",
+                "ExactCompositionStrategy",
+                "SemanticEquivalentRewriteStrategy",
+            ]
+        );
+    }
+
+    // HydraGroupingStrategy is registered, but a shared grid is only legal
+    // with a collision bound to compose: `QueryEvidence` (compiler.rs) reports
+    // none today, so the strategy correctly offers nothing rather than an
+    // unbounded guarantee. Pin both halves — the wiring and the missing input.
+    #[test]
+    fn hydra_candidates_wait_for_shared_grid_evidence() {
+        use asap_aware_mapping::{AccuracyEvidenceProvider, PropagationStats};
+        use planner_types::post_asap::{CompositionOperator, SketchQuery};
+        use planner_types::pre_asap::query_expr::Source;
+        use planner_types::pre_asap::{Column, DataType, GroupKeys, Reduction, Schema};
+
+        struct MeasuredSharedGrid;
+        impl AccuracyEvidenceProvider for MeasuredSharedGrid {
+            fn propagation_stats(
+                &self,
+                _op: &CompositionOperator,
+                _family: &SummaryFamilyType,
+                _query: Option<&SketchQuery>,
+            ) -> PropagationStats {
+                PropagationStats {
+                    hydra_shared_grid_collision_bound: Some(0.0),
+                    hydra_shared_grid_failure_probability: Some(0.0),
+                    ..Default::default()
+                }
+            }
+        }
+
+        let accuracy = AccuracyTarget::EpsilonDelta {
+            epsilon: 0.01,
+            delta: 0.01,
+        };
+        let grouped_count = Rc::new(QueryExpr::Aggregate {
+            reduction: Reduction::Reduce(GroupKeys::by(vec![2])),
+            measures: vec![AggIntent::Count {
+                accuracy: accuracy.clone(),
+            }],
+            output_names: vec![],
+            having: None,
+            child: Rc::new(QueryExpr::Scan {
+                source: Source::TimeSeries { metric: "m".into() },
+                predicates: vec![],
+                schema: Schema::with_time_index(
+                    vec![
+                        Column::new("ts", DataType::Timestamp, false),
+                        Column::new("value", DataType::Float64, false),
+                        Column::new("job", DataType::Utf8, true),
+                    ],
+                    0,
+                    vec![],
+                ),
+            }),
+        });
+        let cost_model = ControlPlaneCostModel::new(accuracy);
+        let target = TargetSubDAG::new(&grouped_count);
+        let hydra = |evidence: &dyn AccuracyEvidenceProvider| {
+            asap_aware_mapping::HydraGroupingStrategy::with_models_and_evidence(
+                &cost_model,
+                &asap_aware_mapping::DefaultAccuracyModel,
+                &asap_aware_mapping::EqualSplitAllocator,
+                evidence,
+            )
+            .replacements(&target)
+            .len()
+        };
+        assert_eq!(hydra(&asap_aware_mapping::NoAccuracyEvidence), 0);
+        // HydraCms over Cms and HydraCountSketch over CountSketch.
+        assert_eq!(hydra(&MeasuredSharedGrid), 2);
+    }
+
+    // A shared aggregate must keep the sketch plan an unshared one gets:
+    // sharing decides how many copies of the state exist, never whether the
+    // state is a summary at all.
+    #[test]
+    fn shared_aggregates_keep_their_summary() {
+        use planner_types::pre_asap::query_expr::Source;
+        use planner_types::pre_asap::{Column, DataType, GroupKeys, Reduction, Schema};
+
+        let accuracy = AccuracyTarget::EpsilonDelta {
+            epsilon: 0.01,
+            delta: 0.01,
+        };
+        let grouped_count = || {
+            Rc::new(QueryExpr::Aggregate {
+                reduction: Reduction::Reduce(GroupKeys::by(vec![2])),
+                measures: vec![AggIntent::Count {
+                    accuracy: accuracy.clone(),
+                }],
+                output_names: vec![],
+                having: None,
+                child: Rc::new(QueryExpr::Scan {
+                    source: Source::TimeSeries { metric: "m".into() },
+                    predicates: vec![],
+                    schema: Schema::with_time_index(
+                        vec![
+                            Column::new("ts", DataType::Timestamp, false),
+                            Column::new("value", DataType::Float64, false),
+                            Column::new("job", DataType::Utf8, true),
+                        ],
+                        0,
+                        vec![vec![2]],
+                    ),
+                }),
+            })
+        };
+        let summarized = |roots: Vec<(usize, Rc<QueryExpr>)>| -> Vec<bool> {
+            select_workload(
+                roots,
+                accuracy.clone(),
+                &ControlPlaneCostModel::new(accuracy.clone()),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, node)| {
+                fn is_summary(node: &SummaryNode) -> bool {
+                    match &node.expr {
+                        SummaryExpr::SummaryAgg { .. } => true,
+                        SummaryExpr::SummaryEstimate { summary_input, .. } => {
+                            is_summary(summary_input)
+                        }
+                        _ => false,
+                    }
+                }
+                is_summary(&node)
+            })
+            .collect()
+        };
+        assert_eq!(summarized(vec![(0, grouped_count())]), [true]);
+        assert_eq!(
+            summarized(vec![(0, grouped_count()), (1, grouped_count())]),
+            [true, true],
+            "sharing must not downgrade a summarized aggregate to raw execution"
+        );
     }
 }

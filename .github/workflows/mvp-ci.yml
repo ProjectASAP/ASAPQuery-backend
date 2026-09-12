@@ -16,7 +16,7 @@ jobs:
   backend:
     name: MVP backend
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       # The full workspace links multiple DataFusion-heavy process test binaries.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -75,6 +75,8 @@ jobs:
       - name: Test workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # Give background flusher/sealer waits headroom on hosted runners.
+          ASAP_TEST_TIMEOUT_SCALE: "4"
         working-directory: ASAPQuery-backend
         # Persistence tests wait on background flushers with bounded deadlines.
         # Match scripts/e2e.sh to avoid competing flushers exhausting those waits.

@@ -189,9 +189,6 @@ def measure(args, artifact, corpus, snapshot, folder):
             if not occurrences:
                 raise RuntimeError(f"no original corpus occurrences for {qid}")
             exact = {}
-            for occurrence in occurrences:
-                params = query_parameters(occurrence, args.disable_result_cache)
-                exact[occurrence["id"]] = runner._http_request(args.reference_url.rstrip("/") + "/api/v1/query?" + params)
             records, before, start = [], snapshots(children), time.perf_counter_ns()
             repeat = 0
             measured_cpu = 0
@@ -199,6 +196,8 @@ def measure(args, artifact, corpus, snapshot, folder):
                 for occurrence in occurrences:
                     params = query_parameters(occurrence, args.disable_result_cache)
                     answer = runner._http_request(query_backend + "/api/v1/query?" + params)
+                    if occurrence["id"] not in exact:
+                        exact[occurrence["id"]] = runner._http_request(args.reference_url.rstrip("/") + "/api/v1/query?" + params)
                     reference = exact[occurrence["id"]]
                     route = runner.classify(answer["response"], answer["headers"]) if answer["http_status"] == 200 else "failed"
                     comparison = compare_results(answer["response"], reference["response"], *comparison_tolerances(occurrence, args))
@@ -232,7 +231,7 @@ def measure(args, artifact, corpus, snapshot, folder):
         for child in children.values():
             child.terminate()
         for child in children.values():
-            child.wait(timeout=30)
+            child.wait(timeout=None if args.wait_for_completion else 30)
         row["resources"]["storage_before_shutdown_bytes"] = row["resources"]["storage_bytes"]
         row["resources"]["storage_after_shutdown"] = {
             "exact_bytes": file_bytes(folder / "exact-data"),
@@ -255,7 +254,10 @@ def measure(args, artifact, corpus, snapshot, folder):
     finally:
         for child in children.values():
             if child.poll() is None:
-                child.kill()
+                if args.wait_for_completion:
+                    child.terminate()
+                else:
+                    child.kill()
                 child.wait()
         for log in logs:
             log.close()
@@ -390,7 +392,9 @@ def main():
     parser.add_argument("--residency-seconds", type=float, default=1)
     parser.add_argument("--relative-tolerance", type=float, default=0.0)
     parser.add_argument("--absolute-tolerance", type=float, default=0.0)
+    parser.add_argument("--wait-for-completion", action="store_true", help="wait without client deadlines or forced shutdown kills")
     args = parser.parse_args()
+    runner.HTTP_TIMEOUT = None if args.wait_for_completion else 60
     if args.repetitions < 1 or args.max_repetitions < args.repetitions or args.minimum_query_cpu_ns <= 0 or args.residency_seconds < 0:
         parser.error("positive repetitions and nonnegative residency required")
     if len({args.backend_port, args.fallback_port, args.metricsql_port}) != 3 or args.exact_cache_bytes <= 0:

@@ -1051,6 +1051,7 @@ mod tests {
             derived_input: None,
             table_timestamp_column: None,
             partitioning: None,
+            value_source_column: None,
         };
         let policy_fp = aggregation.policy_fp_u64();
         let streaming = StreamingConfig::new(HashMap::from([(policy_fp, aggregation)]));
@@ -1187,6 +1188,7 @@ mod tests {
                 derived_input: None,
                 table_timestamp_column: None,
                 partitioning: None,
+                value_source_column: None,
             };
         let cms = config(
             AggregationType::CountMinSketchWithHeap,

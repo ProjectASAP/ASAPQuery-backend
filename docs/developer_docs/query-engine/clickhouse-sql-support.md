@@ -65,8 +65,15 @@ publishes the shared catalog and both execution plans through the normal atomic
 install/activate path.
 
 The initial automatic binder supports bounded, whole-second scalar reductions
-over a non-null Float64 value column or a finite numeric literal, plus typed
-table predicates. Row counts use the shared typed constant `1` projection. It uses the query's fixed
+over a numeric value column — `Float64` or `Int64`, nullable or not — or a
+finite numeric literal, plus typed table predicates. The column's declared type
+and nullability travel with the materialization (`value_source_column`) because
+the ingest reader needs them: a nullable column is read with `IS NOT NULL`, so
+the summary skips NULL inputs exactly as the SQL aggregate it stands in for
+does, and an `Int64` column is widened explicitly with a guard that fails the
+read on a value beyond the exact `Float64` range rather than summarising a
+rounded one. Typing is a read concern, not an identity one, so it stays out of
+the policy fingerprint. Row counts use the shared typed constant `1` projection. It uses the query's fixed
 window as the materialization duration; this is not a cost-optimized pane/layout
 search. The initial fixed-window policy retains two windows (a completed window
 and the next active window); it does not certify arbitrary historical or moving
@@ -79,9 +86,9 @@ SQL `count(*)` now installs an exact row-count materialization through the same
 catalog and readout DAG as other summaries. The selected Count intent uses the
 existing physical SUM accumulator over typed constant `1`. It includes rows with a NULL value column.
 Planner rejects nullable `count(value)` until per-aggregate null exclusion is
-represented; it must not silently become row count. Non-Float64 named sources
-are rejected because the current Float64 ingest path cannot preserve arbitrary
-Int64 values exactly. Producer `Project` subtrees are also rejected until their
+represented; it must not silently become row count. Non-numeric named sources
+are rejected: a string, boolean or timestamp column has no value semantics to
+summarise. Producer `Project` subtrees are also rejected until their
 computation is executed, rather than skipped while binding the original table.
 The real process test covers SUM and row count mixed with a ClickHouse exact
 branch, and deletes a source row after materialization to prove summary readout.

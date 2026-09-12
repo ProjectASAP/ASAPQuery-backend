@@ -3727,6 +3727,7 @@ aggregations:
                 derived_input: None,
                 table_timestamp_column: None,
                 partitioning: None,
+                value_source_column: None,
             };
             // PR 5: streaming-config is keyed on the policy
             // fingerprint. Build a marker→fingerprint map so the test
@@ -7257,6 +7258,7 @@ mod catalog_install_tests {
         let mut candidate = request();
         candidate.query_plan.clickhouse_context =
             Some(asap_types::query_plan::ClickHousePlanningContext {
+                window_templates: Default::default(),
                 tables: Default::default(),
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             });

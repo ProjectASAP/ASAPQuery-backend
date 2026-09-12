@@ -29,6 +29,9 @@ def main():
     parser.add_argument("--batch-resources", action="store_true")
     parser.add_argument("--cpu-affinity", required=True)
     parser.add_argument("--base-port", type=int, default=19410)
+    parser.add_argument("--backend-first", action="store_true")
+    parser.add_argument("--wait-for-completion", action="store_true")
+    parser.add_argument("--require-summary-ready", action="store_true")
     args = parser.parse_args()
     if args.trials < 1 or args.repetitions < 1:
         parser.error("trials and repetitions must be positive")
@@ -94,20 +97,30 @@ def main():
             command += ["--evaluation-step-ms", str(args.evaluation_step_ms)]
             if args.batch_resources:
                 command.append("--batch-resources")
+            if args.backend_first:
+                command.append("--backend-first")
+            if args.wait_for_completion:
+                command.append("--wait-for-completion")
+            if args.require_summary_ready:
+                command.append("--require-summary-ready")
             save(folder / "command.json", command)
             subprocess.run(command, check=True)
         finally:
             cleanup_errors = []
             for name, child in children.items():
                 try:
-                    evidence.setdefault(name, {})["termination"] = stop(child)
+                    evidence.setdefault(name, {})["termination"] = stop(child, timeout=None if args.wait_for_completion else 30)
                 except Exception as error:
                     # An error collecting one service must not orphan the other.
                     evidence.setdefault(name, {})["termination_error"] = repr(error)
                     cleanup_errors.append(f"{name}: {error}")
                     try:
-                        child.kill()
-                        child.wait(timeout=10)
+                        if args.wait_for_completion:
+                            child.terminate()
+                            child.wait()
+                        else:
+                            child.kill()
+                            child.wait(timeout=10)
                     except Exception as kill_error:
                         evidence[name]["cleanup_error"] = repr(kill_error)
             try:

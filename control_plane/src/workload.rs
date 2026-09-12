@@ -214,7 +214,14 @@ fn collect_agg_intents(expr: &planner_types::pre_asap::QueryExpr, out: &mut Vec<
 }
 
 /// A single workload entry from the workloads YAML file.
+///
+/// `deny_unknown_fields`: a misspelled or unsupported key is a planning input
+/// the controller cannot honour. Accepting it silently would let the operator
+/// believe a declared cadence / hint reached the planner when it never left the
+/// YAML, so the registry rejects the file instead (see
+/// [`WorkloadRegistry::try_load`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadEntry {
     /// Metric name this workload targets (e.g. `http_request_duration_seconds`).
     pub metric_name: String,
@@ -344,6 +351,80 @@ pub struct WorkloadEntry {
     /// future, the edge `threshold:` block. `None` / missing ⇒ no monitor.
     #[serde(default)]
     pub monitor: Option<MonitorDecl>,
+
+    /// Optional evaluation cadence for this declared query class, in the same
+    /// `1h5m30s` spelling [`crate::pipeline::parse_duration`] accepts.
+    ///
+    /// Why this exists: the cadence is a **cost input**, not a scheduler knob.
+    /// [`crate::physical::deployment_cost::delta`] uses it as the batch-mode
+    /// flush-period proxy, so the same declaration costed through the HTTP
+    /// `POST /api/v1/plan` path (whose [`crate::pipeline::QuerySpec`] has
+    /// carried `repeat_every` all along) and through this YAML registry used
+    /// to reach the planner with *different* flush periods — the startup path
+    /// hardcoded `None`. Threaded into `QuerySpec::repeat_every` by the
+    /// registry pre-pop loop in `main`, which the analyzer parses into
+    /// [`crate::types::QueryWorkload::repeat_every`].
+    ///
+    /// `None` / missing ⇒ unchanged behaviour (the cost model falls back to
+    /// its window-derived flush rate).
+    #[serde(default)]
+    pub repeat_every: Option<String>,
+}
+
+/// Build the planning [`crate::pipeline::QuerySpec`] a declarative registry
+/// entry describes.
+///
+/// **Why this exists**: the YAML → planner conversion used to be an inline
+/// struct literal, hand-copied into the controller's startup pre-population
+/// loop and into the test helpers that claim to mimic it. Every field added to
+/// [`WorkloadEntry`] then had to be re-threaded in each copy, and
+/// `repeat_every` is the field that proves the cost: the HTTP
+/// `POST /api/v1/plan` path carried the declared cadence into
+/// [`crate::types::QueryWorkload::repeat_every`] while the startup path pinned
+/// `None`, so the same declaration was costed with two different batch-mode
+/// flush periods depending on which entry point registered it.
+///
+/// Field notes preserved from the original loop:
+/// * MVP blocker B4 — `time_window` is left EMPTY when the entry carries a
+///   `query_string` so the analyzer parses the matrix-selector `[range]`
+///   instead of a hardcoded `5m` overriding what the operator wrote. Entries
+///   without a query string keep the historical `5m` default, because the
+///   parser has nothing to read and the analyzer errors out without one.
+/// * MVP blocker B3 — `grouping_labels` is threaded into `group_by_labels`.
+///   The analyzer merges it with any `by (...)` keys the PromQL parser
+///   surfaces, which `collect_metric_to_grouping_labels` drops into
+///   `EdgeStageConfig::metric_to_grouping_labels` so the agent's
+///   `keep_keys(datapoint.attributes, [...])` OTTL processor strips wire attrs
+///   down to this list BEFORE sketching.
+/// * `sketch_family_override` is threaded into `QuerySpec::sketch_type`, which
+///   populates `QueryWorkload::sketch_type_override` — what `bind_workload_typed`
+///   reads to honour the MVP §46 HLL / CountSketch / CountMinSketch pins.
+pub fn query_spec_for_entry(entry: &WorkloadEntry) -> crate::pipeline::QuerySpec {
+    crate::pipeline::QuerySpec {
+        query_string: entry.query_string.clone(),
+        metric_name: entry.metric_name.clone(),
+        label_filters: Default::default(),
+        group_by_labels: entry.grouping_labels.clone(),
+        aggregations: vec!["quantile".into()],
+        time_window: if entry.query_string.is_some() {
+            String::new()
+        } else {
+            "5m".into()
+        },
+        repeat_every: entry.repeat_every.clone(),
+        accuracy_sla: entry.accuracy_sla,
+        latency_sla: None,
+        sketch_type: entry.sketch_family_override.clone(),
+        workload: crate::types::WorkloadCharacteristics::default(),
+        // design.md alignment: defaults preserve legacy behaviour.
+        id: None,
+        language: None,
+        accuracy: None,
+        dollars: None,
+        deployment_model: None,
+        shape: crate::types_v2::QueryShape::default(),
+        data: crate::types_v2::DataShape::default(),
+    }
 }
 
 /// User-facing continuous-monitoring declaration on a [`WorkloadEntry`]. τ/ε and
@@ -471,32 +552,45 @@ impl WorkloadRegistry {
     }
 
     /// Load from a YAML file. Returns an empty registry on any error.
+    ///
+    /// Prefer [`Self::try_load`] on the startup path: a registry that parses
+    /// into nothing is indistinguishable, at every later step, from an
+    /// operator who declared no workloads at all.
     pub fn load(path: &str) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => match serde_yaml::from_str::<Vec<WorkloadEntry>>(&contents) {
-                Ok(entries) => {
-                    info!(path, count = entries.len(), "loaded workload registry");
-                    Self {
-                        entries,
-                        runtime: Default::default(),
-                    }
-                }
-                Err(e) => {
-                    warn!(path, error = %e, "invalid workloads YAML; using empty registry");
-                    Self {
-                        entries: vec![],
-                        runtime: Default::default(),
-                    }
-                }
-            },
-            Err(_) => {
-                info!(path, "workloads file not found; using empty registry");
-                Self {
-                    entries: vec![],
-                    runtime: Default::default(),
-                }
+        match Self::try_load(path) {
+            Ok(registry) => registry,
+            Err(error) => {
+                warn!(path, error = %error, "invalid workloads YAML; using empty registry");
+                Self::empty()
             }
         }
+    }
+
+    /// Load from a YAML file, reporting an unusable file instead of degrading
+    /// to an empty registry.
+    ///
+    /// A **missing** file stays non-fatal — the controller is expected to run
+    /// without a declarative registry (the process e2e tests boot it with
+    /// `CONTROLLER_WORKLOADS` pointing at a path that does not exist). A file
+    /// that exists but does not parse is fatal: it carries planning input the
+    /// operator wrote down, and silently planning *nothing* from it has the
+    /// same observable shape as a controller that planned everything.
+    pub fn try_load(path: &str) -> Result<Self, String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                info!(path, "workloads file not found; using empty registry");
+                return Ok(Self::empty());
+            }
+            Err(error) => return Err(format!("cannot read workload registry: {error}")),
+        };
+        let entries = serde_yaml::from_str::<Vec<WorkloadEntry>>(&contents)
+            .map_err(|error| format!("cannot parse workload registry: {error}"))?;
+        info!(path, count = entries.len(), "loaded workload registry");
+        Ok(Self {
+            entries,
+            runtime: Default::default(),
+        })
     }
 
     /// Create an empty registry (no file).
@@ -542,6 +636,97 @@ impl WorkloadRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The declared cadence is a planning cost input, so it has to survive the
+    /// YAML entry point exactly as it survives `POST /api/v1/plan`.
+    #[test]
+    fn yaml_cadence_reaches_the_planning_workload() {
+        let yaml = r#"
+- metric_name: http_requests_total
+  query_string: "sum by (zone) (rate(http_requests_total[5m]))"
+  accuracy_sla: 0.99
+  repeat_every: 30s
+- metric_name: http_errors_total
+  query_string: "sum by (zone) (rate(http_errors_total[5m]))"
+  accuracy_sla: 0.99
+"#;
+        let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entries[0].repeat_every.as_deref(), Some("30s"));
+        assert_eq!(entries[1].repeat_every, None);
+
+        let analyzer = crate::pipeline::Analyzer::new();
+        let declared = analyzer.analyze(query_spec_for_entry(&entries[0])).unwrap();
+        assert_eq!(
+            declared.repeat_every,
+            Some(std::time::Duration::from_secs(30))
+        );
+        // An entry that declares no cadence keeps the historical `None`, so the
+        // cost model falls back to its window-derived flush rate.
+        let undeclared = analyzer.analyze(query_spec_for_entry(&entries[1])).unwrap();
+        assert_eq!(undeclared.repeat_every, None);
+    }
+
+    /// A cadence the duration parser cannot read is a declaration error, not a
+    /// silently dropped field.
+    #[test]
+    fn unparsable_cadence_fails_the_entry() {
+        let entry = WorkloadEntry {
+            metric_name: "http_requests_total".into(),
+            query_string: Some("sum(http_requests_total)".into()),
+            accuracy_sla: 0.99,
+            assign_to_role: "agent".into(),
+            sketch_family_override: None,
+            target_path: None,
+            grouping_labels: vec![],
+            sample_p: 1.0,
+            distinct_keys_per_window: None,
+            item_label: None,
+            monitor: None,
+            repeat_every: Some("every 30 seconds".into()),
+        };
+        let error = crate::pipeline::Analyzer::new()
+            .analyze(query_spec_for_entry(&entry))
+            .expect_err("unparsable cadence must not plan");
+        assert!(
+            format!("{error:#}").contains("repeat_every"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// An unsupported key is planning input the controller cannot honour;
+    /// accepting the file would report a cadence / hint that never left the YAML.
+    #[test]
+    fn unknown_registry_key_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "asap_workload_unknown_key_{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "- metric_name: http_requests_total
+  accuracy_sla: 0.99
+  repeat_evry: 30s
+",
+        )
+        .unwrap();
+        let error = WorkloadRegistry::try_load(path.to_str().unwrap())
+            .expect_err("unknown key must not load");
+        assert!(error.contains("repeat_evry"), "unexpected error: {error}");
+        // The lenient wrapper still degrades, which is why startup uses `try_load`.
+        assert!(WorkloadRegistry::load(path.to_str().unwrap())
+            .entries()
+            .is_empty());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Running without a declarative registry stays supported: the process e2e
+    /// tests boot the controller with `CONTROLLER_WORKLOADS` pointing nowhere.
+    #[test]
+    fn missing_registry_file_is_not_a_startup_failure() {
+        let registry = WorkloadRegistry::try_load("/definitely/missing/workloads.yaml")
+            .expect("a missing registry is not an error");
+        assert!(registry.entries().is_empty());
+    }
 
     #[test]
     fn load_empty_on_missing_file() {
@@ -617,6 +802,7 @@ mod tests {
                 epsilon: 0.05,
                 window_secs: 30,
             }),
+            repeat_every: None,
         });
         let intents = reg.monitor_intents("dp:4319");
         assert_eq!(intents.len(), 1);
@@ -644,6 +830,7 @@ mod tests {
                 epsilon: 0.05,
                 window_secs: 30,
             }),
+            repeat_every: None,
         });
         let intents = reg.monitor_intents("dp:4319");
         assert_eq!(intents.len(), 1, "replaced, not duplicated");
@@ -685,6 +872,7 @@ mod tests {
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor: None,
+                repeat_every: None,
             },
             WorkloadEntry {
                 metric_name: "b".into(),
@@ -698,6 +886,7 @@ mod tests {
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor: None,
+                repeat_every: None,
             },
             WorkloadEntry {
                 metric_name: "c".into(),
@@ -711,6 +900,7 @@ mod tests {
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor: None,
+                repeat_every: None,
             },
         ]);
         assert_eq!(reg.for_role("agent").len(), 2);
@@ -821,6 +1011,7 @@ mod tests {
             distinct_keys_per_window: None,
             item_label: None,
             monitor: None,
+            repeat_every: None,
         }
     }
 

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Summarize recorded service latency without claiming unmeasured system speedup."""
+import argparse
+from collections import defaultdict
+import json
+from pathlib import Path
+
+from accuracy_suite import comparison
+
+
+def summarize(rows):
+    groups = defaultdict(list)
+    for row in rows:
+        groups[row["query_id"]].append(row)
+    result = {}
+    for query, records in groups.items():
+        engines = {engine for row in records for engine in row["measurements"]}
+        result[query] = {
+            "occurrences": len(records), "passed": sum(r["passed"] for r in records),
+            "warm_occurrences": sum(r.get("execution") == ["warm", "warm"] for r in records),
+            "latency": {engine: comparison.distribution([r["measurements"][engine]["latency_ns"]
+                        for r in records if engine in r["measurements"]]) for engine in sorted(engines)},
+            "victoriametrics_equal": sum(r.get("victoriametrics", {}).get("equal", False) for r in records),
+            "endpoint_failures": {engine: sum(not r.get("endpoints", {}).get(engine, {}).get("success", False)
+                                               for r in records) for engine in sorted(engines)},
+            "pairs": {},
+        }
+        for name in ("promql", "sql", "metricsql"):
+            pairs = [r.get("pairs", {}).get(name, {}) for r in records]
+            eligible = bool(pairs) and all(p.get("eligible_for_query_comparison", False) for p in pairs)
+            result[query]["pairs"][name] = {
+                "correct_occurrences": sum(p.get("correctness", {}).get("equal", False) for p in pairs),
+                "query_comparison_eligible_occurrences": sum(p.get("eligible_for_query_comparison", False) for p in pairs),
+                "execution_counts": {route: sum(p.get("execution", "unavailable") == route for p in pairs)
+                                     for route in ("warm", "hybrid", "exact_fallback", "unknown", "unavailable", "failed")},
+                "paired_query_latency_ratio": (sum(p["latency_ns"]["baseline"] for p in pairs) /
+                                                sum(p["latency_ns"]["backend"] for p in pairs)) if eligible else None,
+                "eligible_for_benefit_conclusion": False,
+                "full_cost": None,
+                "reason": "complete isolated lifecycle costs are not supplied by endpoint replay",
+            }
+    return {"queries": result, "scope": "ASAP-first sequential HTTP latency including failures; no throughput or total-system speedup claim"}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    with args.input.open() as source:
+        result = summarize(json.loads(line) for line in source)
+    with args.output.open("x") as output:
+        json.dump(result, output, indent=2)

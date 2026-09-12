@@ -14,33 +14,9 @@ asap_types.workspace = true
 control_plane = { path = "../control_plane" }
 sha2 = "0.10"
 
-# Step C (data_plane/docs/l4node-plan-executor-design.md): data_plane
-# vendors its own `SummaryExecutor`/`execute` (see
-# `query_engines/asap_query_engine/summary_exec.rs` -- upstream deleted
-# `asap_sketch::exec` in ASAPPlanner#190/#197; see
-# control_plane/docs/design-asapplanner-pin-migration.md), which means
-# naming `planner_types::post_asap::{SummaryNode, SketchQuery, ...}`
-# types directly -- not reachable through
-# `control_plane::asap_tier_implement`'s public `Vec<Rc<SummaryNode>>`
-# return type alone (Rust requires importing a type's defining crate to
-# implement traits on it or match its variants, even when a dependency's
-# function already returns that type). Pin MUST match control_plane's
-# `planner-types` pin exactly -- same rule as
-# `crates/asap_types/Cargo.toml`'s existing pin comment: two revs of the
-# same git dependency in one workspace resolve to two distinct Rust
-# types that won't unify.
-#
-# Bumped to cb70086 (main tip, 2026-08-22) from cc18c987 -- ASAPPlanner's
-# crate consolidation (ASAPPlanner#198) merged `asap-ir` and `asap-sketch`
-# into one crate (Cargo package `asap-types`, depended on here under the
-# `planner-types` key -- see control_plane/Cargo.toml's comment for why).
-# `L4Node` renamed to `SummaryNode` (ASAPPlanner#217); its fields
-# (`SummaryExpr::Logical(Box<QueryExpr>)`, `SummaryAgg { col: ColumnRef,
-# reduction: Reduction, .. }`) are `pre_asap` types, in the same crate now
-# (not a separate `asap-ir` import). Query serving consumes the compiled
-# QueryPlan; these types are used at physical-plan compilation boundaries.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
+# Use the same Planner IR as the control plane at compilation boundaries.
+planner-types.workspace = true
+asap-frontend-promql.workspace = true
 
 # Shared external (workspace)
 serde.workspace = true
@@ -116,7 +92,7 @@ fs2 = "0.4"
 # none of them.
 
 [dev-dependencies]
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3be523fa0f06a905188e42cbe482d06aa843ba5d" }
+asap-aware-mapping.workspace = true
 tempfile = "3.20.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-tungstenite = "0.21"

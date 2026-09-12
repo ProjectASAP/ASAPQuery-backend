@@ -37,7 +37,7 @@ def main():
     report["reproduction"] = {
         "command": command,
         "backend_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=backend, text=True).strip(),
-        "planner_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=planner, text=True).strip() if planner else re.search(r'asap-aware-mapping = .*rev = "([a-f0-9]+)"', (backend / "control_plane/Cargo.toml").read_text()).group(1),
+        "planner_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=planner, text=True).strip() if planner else re.search(r'asap-aware-mapping = .*rev = "([a-f0-9]+)"', (backend / "Cargo.toml").read_text()).group(1),
         "backend_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=backend, text=True)),
         "planner_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=planner, text=True)) if planner else False,
         "planner_source": "local_override" if planner else "pinned_git_dependency",

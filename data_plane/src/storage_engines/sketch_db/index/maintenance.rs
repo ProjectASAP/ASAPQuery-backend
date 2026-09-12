@@ -800,7 +800,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -953,7 +954,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1138,7 +1140,8 @@ mod tests {
         assert!(store
             .complete_raw_maintenance_population(source.policy_fingerprint().into(), &generation)
             .is_err());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1218,6 +1221,16 @@ mod tests {
         let targets = store.series_ids_for_policy(target.policy_fingerprint());
         assert_eq!(targets.len(), 1);
         let target_sid = targets[0];
+        let published = store
+            .completed_maintenance_coordinates(target.policy_fingerprint().into(), &generation)
+            .unwrap();
+        assert_eq!(
+            published,
+            BTreeMap::from([(
+                target_sid,
+                BTreeMap::from([(BTreeMap::new(), BTreeSet::from([(0, 60_000)]))]),
+            )])
+        );
         let assert_complete_output = |store: &SketchStore| {
             use crate::precompute_engine::operators::DDSketchAccumulator;
             use crate::storage_engines::sketch_db::data::SketchEncoding;
@@ -1322,7 +1335,8 @@ mod tests {
                 |writer| writer.ingest_precompute_with_series_id(702, source, &output, &sum),
             )
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::tests::test_utilities::timing::deadline(std::time::Duration::from_secs(5));
         while !restarted
             .seal_finite_summary_input(&next_generation)
             .unwrap()

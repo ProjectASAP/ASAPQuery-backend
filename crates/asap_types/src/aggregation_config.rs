@@ -162,6 +162,27 @@ pub struct PrecomputeMaterialization {
         skip_serializing_if = "Option::is_none"
     )]
     pub table_population: Option<crate::table_population::TablePopulation>,
+    /// Producer typing for a SQL table value projection: the source column's
+    /// declared type and nullability.
+    ///
+    /// **Why this is separate from [`Self::value_projection`]**: the
+    /// projection is the materialization's *identity* — which column or
+    /// constant is summarised, and part of the policy fingerprint. This is how
+    /// the ingest path must *read* that column, which the identity does not
+    /// determine: an integer column needs an exactness guard on its way into
+    /// f64 summary state, and a nullable column needs SQL's "aggregates skip
+    /// NULL" rule reproduced at the reader rather than a decode failure on the
+    /// first NULL row. Two materializations over the same column are the same
+    /// policy either way, so this deliberately stays out of the fingerprint.
+    ///
+    /// `None` ⇒ PromQL-mode materializations and legacy SQL definitions, which
+    /// keep the pre-typed behaviour (read the column as it comes).
+    #[serde(
+        default,
+        alias = "valueSourceColumn",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub value_source_column: Option<planner_types::pre_asap::Column>,
 }
 
 /// Policy-match handles for both the key and value dimensions of a
@@ -323,6 +344,7 @@ impl PrecomputeMaterialization {
                 .map(|name| crate::sds::ValueProjectionIdentity::Column { name }),
             table_population: None,
             table_timestamp_column: None,
+            value_source_column: None,
         }
     }
 
