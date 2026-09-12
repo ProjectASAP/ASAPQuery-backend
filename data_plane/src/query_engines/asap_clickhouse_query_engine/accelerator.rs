@@ -178,23 +178,28 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
         };
-        let canonical_sql = match control_plane::clickhouse::canonicalize_clickhouse_sql(
-            &request.sql,
-            &control_plane::clickhouse::ClickHouseSqlCatalog {
-                tables: context.tables.clone(),
-            },
-            context.accuracy.clone(),
-        )
-        .await
-        {
-            Ok(canonical) => canonical,
-            Err(error) => {
-                return ClickHouseAccelerationOutcome::Fallback(
-                    ClickHouseAccelerationFallback::Planning(error.to_string()),
-                )
-            }
-        };
-        let Ok(entry) = physical.query_plan.lookup_clickhouse(&canonical_sql) else {
+        let (fixed_sql, canonical_sql, runtime_range) =
+            match control_plane::clickhouse::bind_clickhouse_sql(
+                &request.sql,
+                &control_plane::clickhouse::ClickHouseSqlCatalog {
+                    tables: context.tables.clone(),
+                },
+                context.accuracy.clone(),
+            )
+            .await
+            {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    return ClickHouseAccelerationOutcome::Fallback(
+                        ClickHouseAccelerationFallback::Planning(error.to_string()),
+                    )
+                }
+            };
+        let Ok(entry) = physical
+            .query_plan
+            .lookup_clickhouse(&fixed_sql)
+            .or_else(|_| physical.query_plan.lookup_clickhouse(&canonical_sql))
+        else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
@@ -212,13 +217,34 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
         };
-        let Some(range) = entry.fixed_evaluation else {
+        let Some(mut range) = entry.fixed_evaluation else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::Execution(
                     "ClickHouse plan is missing its fixed evaluation range".into(),
                 ),
             );
         };
+        if entry.canonical_query.starts_with("moving-window-v1:") {
+            let Some((start_ms, end_ms)) = runtime_range else {
+                return ClickHouseAccelerationOutcome::Fallback(
+                    ClickHouseAccelerationFallback::CatalogMiss,
+                );
+            };
+            if end_ms - start_ms != range.end_ms - range.start_ms
+                || entry.nodes.values().any(|node| {
+                    matches!(
+                        node,
+                        asap_types::query_plan::QueryPlanNode::ExternalExact { .. }
+                    )
+                })
+            {
+                return ClickHouseAccelerationOutcome::Fallback(
+                    ClickHouseAccelerationFallback::CatalogMiss,
+                );
+            }
+            range.start_ms = start_ms;
+            range.end_ms = end_ms;
+        }
         let prepared = match self
             .prepare_external_exact(entry, range.start_ms, range.end_ms, request)
             .await
@@ -471,6 +497,20 @@ mod tests {
         store: Arc<SketchStore>,
         seed: bool,
     ) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
+        fixture_with_sql(end_ms, store, seed, false).await
+    }
+
+    async fn fixture_with_sql(
+        end_ms: u64,
+        store: Arc<SketchStore>,
+        seed: bool,
+        moving: bool,
+    ) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
+        let sql = if moving {
+            format!("SELECT sum(value) FROM requests WHERE timestamp >= 0 AND timestamp < {end_ms}")
+        } else {
+            "SELECT sum(value) FROM requests".into()
+        };
         let mut config = PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
@@ -617,7 +657,7 @@ mod tests {
         };
         let table_schema = Schema::with_time_index(
             vec![
-                Column::new("timestamp", DataType::Timestamp, false),
+                Column::new("timestamp", DataType::Int64, false),
                 Column::new("value", DataType::Float64, false),
             ],
             0,
@@ -625,7 +665,7 @@ mod tests {
         );
         let tables = HashMap::from([("requests".into(), table_schema)]);
         let canonical_sql = control_plane::clickhouse::canonicalize_clickhouse_sql(
-            "SELECT sum(value) FROM requests",
+            &sql,
             &control_plane::clickhouse::ClickHouseSqlCatalog {
                 tables: tables.clone(),
             },
@@ -634,7 +674,7 @@ mod tests {
         .await
         .unwrap();
         let entry = QueryPlanEntry {
-            query_id: "SELECT sum(value) FROM requests".into(),
+            query_id: sql.clone(),
             canonical_query: canonical_sql.clone(),
             language: QueryLanguage::ClickHouseSql,
             fixed_evaluation: Some(FixedEvaluationRange {
@@ -735,7 +775,7 @@ mod tests {
         );
         let request = ClickHouseQueryRequest {
             method: Method::GET,
-            sql: "SELECT sum(value) FROM requests".into(),
+            sql,
             body: Bytes::new(),
             parameters: Default::default(),
             headers: HeaderMap::new(),
@@ -752,6 +792,98 @@ mod tests {
             panic!("expected accelerated response")
         };
         assert_eq!(response.body, "1970-01-01T00:00:02\t50.0\n");
+    }
+
+    // A shifted request reads only its bound panes and falls back on a gap.
+    #[tokio::test]
+    async fn moving_window_binds_request_coverage() {
+        let (accelerator, mut request) =
+            fixture_with_sql(1_000, Arc::new(SketchStore::new()), true, true).await;
+        request.sql =
+            "SELECT sum(value) FROM requests WHERE timestamp >= 1000 AND timestamp < 2000".into();
+        let ClickHouseAccelerationOutcome::Accelerated(response) =
+            accelerator.execute(&request).await
+        else {
+            panic!("shifted covered window must accelerate");
+        };
+        assert_eq!(response.body, "1970-01-01T00:00:02\t30.0\n");
+        // Equivalent inclusive/arithmetic bounds must select the same panes.
+        request.sql =
+            "SELECT sum(value) FROM requests WHERE timestamp > 1999 - 1000 AND timestamp <= 1999"
+                .into();
+        let ClickHouseAccelerationOutcome::Accelerated(response) =
+            accelerator.execute(&request).await
+        else {
+            panic!("equivalent inclusive window must accelerate");
+        };
+        assert_eq!(response.body, "1970-01-01T00:00:02\t30.0\n");
+        request.sql =
+            "SELECT sum(value) FROM requests WHERE timestamp >= 2000 AND timestamp < 3000".into();
+        let uncovered = accelerator.execute(&request).await;
+        assert!(
+            matches!(&uncovered, ClickHouseAccelerationOutcome::Fallback(ClickHouseAccelerationFallback::Execution(detail)) if detail.contains("NoCandidates")),
+            "{uncovered:?}"
+        );
+        request.sql =
+            "SELECT sum(value) FROM requests WHERE timestamp >= 0 AND timestamp < 2000".into();
+        assert!(matches!(
+            accelerator.execute(&request).await,
+            ClickHouseAccelerationOutcome::Fallback(ClickHouseAccelerationFallback::CatalogMiss)
+        ));
+    }
+
+    // A partially covered refresh must not return the available subset.
+    #[tokio::test]
+    async fn moving_window_partial_coverage_falls_back() {
+        let (accelerator, mut request) =
+            fixture_with_sql(2_000, Arc::new(SketchStore::new()), true, true).await;
+        request.sql =
+            "SELECT sum(value) FROM requests WHERE timestamp >= 1000 AND timestamp < 3000".into();
+        assert!(matches!(
+            accelerator.execute(&request).await,
+            ClickHouseAccelerationOutcome::Fallback(
+                ClickHouseAccelerationFallback::IncompleteCoverage
+            )
+        ));
+    }
+
+    // A publication made before time templates keeps its fixed lookup semantics.
+    #[tokio::test]
+    async fn legacy_bounded_sql_plan_still_executes() {
+        let (accelerator, mut request) =
+            fixture_with_sql(1_000, Arc::new(SketchStore::new()), true, true).await;
+        let active = accelerator.active_physical_plan.as_ref().unwrap();
+        let mut snapshot = active.snapshot().as_ref().clone();
+        let context = snapshot.query_plan.clickhouse_context.as_ref().unwrap();
+        let (fixed, _, _) = control_plane::clickhouse::bind_clickhouse_sql(
+            &request.sql,
+            &control_plane::clickhouse::ClickHouseSqlCatalog {
+                tables: context.tables.clone(),
+            },
+            context.accuracy.clone(),
+        )
+        .await
+        .unwrap();
+        let plan = Arc::make_mut(&mut snapshot.query_plan);
+        let mut entry = plan.entries.pop_first().unwrap().1;
+        entry.canonical_query = fixed.clone();
+        plan.entries.insert(
+            QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &fixed),
+            entry,
+        );
+        active.swap(snapshot);
+        let ClickHouseAccelerationOutcome::Accelerated(response) =
+            accelerator.execute(&request).await
+        else {
+            panic!("old fixed identity must remain executable");
+        };
+        assert_eq!(response.body, "1970-01-01T00:00:01\t20.0\n");
+        request.sql =
+            "SELECT sum(value) FROM requests WHERE timestamp >= 1000 AND timestamp < 2000".into();
+        assert!(matches!(
+            accelerator.execute(&request).await,
+            ClickHouseAccelerationOutcome::Fallback(ClickHouseAccelerationFallback::CatalogMiss)
+        ));
     }
 
     #[tokio::test]
