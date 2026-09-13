@@ -1,0 +1,24 @@
+services:
+  cluster-data-exporter:
+    build: .
+    volumes:
+      - ${CDE_DATA_DIR:?set CDE_DATA_DIR to the preprocessed Google task-usage directory}:/data:ro
+    ports:
+      - "40000:40000"
+    command:
+      - --input-directory
+      - /data
+      - --port
+      - "40000"
+      - google
+      - --metrics=${CDE_GOOGLE_METRICS:-mean-cpu-usage-rate}
+      - --part-index=${CDE_PART_INDEX:-0}
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - cluster-data-exporter
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
