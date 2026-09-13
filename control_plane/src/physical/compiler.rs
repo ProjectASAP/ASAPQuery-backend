@@ -406,6 +406,11 @@ pub struct PhysicalPlan {
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
     pub query_plan: QueryPlan,
+    /// Backend storage-routing table for the metrics this plan materializes.
+    /// Published alongside the plan so the query-shape → engine split always
+    /// describes the generation that is actually installed; without it the
+    /// backend falls back to its default engine and archive-shape queries miss.
+    pub storage_routing: serde_json::Value,
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
     pub cost_comparison: Option<super::workload_cost::WorkloadCostComparison>,
@@ -1058,6 +1063,12 @@ impl PhysicalCompiler {
         )?;
         let mut lifecycle_estimates =
             BTreeMap::<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>::new();
+        // Per-metric sketch families this cycle materializes. The storage-routing
+        // classifier turns them into the warm/archive shape split, so routing is
+        // derived from the same decisions that produced the materializations
+        // rather than from a separately maintained table.
+        let mut routed_algorithms =
+            BTreeMap::<String, Vec<planner_types::post_asap::SketchAlgorithm>>::new();
 
         for (query_index, query) in request.queries.iter().enumerate() {
             let evidence = request.evidence.get(&query.query_id);
@@ -1233,6 +1244,12 @@ impl PhysicalCompiler {
                     aggregation_id.clone(),
                     environment.target,
                 );
+                if let SummaryFamilyType::Sketch(kind, _) = &aggregation.family {
+                    routed_algorithms
+                        .entry(aggregation.metric_name.clone())
+                        .or_default()
+                        .push(kind.algorithm().clone());
+                }
                 let precompute_materialization =
                     scoped_materialization(&aggregation, &selected.node)?;
                 let materialization = precompute_materialization.policy_fingerprint();
@@ -1865,6 +1882,10 @@ impl PhysicalCompiler {
                 })?;
         }
         query_plan.validate_against_catalog(&summary_catalog)?;
+        let storage_routing = crate::emit::stage_config::storage_routing_document(
+            crate::emit::stage_config::DEFAULT_TENANT,
+            &routed_algorithms.into_iter().collect::<Vec<_>>(),
+        );
         Ok(PhysicalPlan {
             envelope,
             summary_catalog,
@@ -1872,6 +1893,7 @@ impl PhysicalCompiler {
             precompute_plan,
             transmission_plan,
             query_plan,
+            storage_routing,
             lifecycle_estimates: lifecycle_estimates.into_values().collect(),
             cost_comparison: None,
             logical_selection: request.logical_selection,
@@ -3568,6 +3590,41 @@ fn stable_workload_plan_id(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // Every metric the plan materializes must carry a routing entry, or the
+    // backend falls through to its default engine and archive-shape queries
+    // miss. Publication passes this document straight to the data plane.
+    #[test]
+    fn compiled_plan_routes_every_materialized_metric() {
+        let plan = quoted_snapshot(planning_snapshot(), false).compile().unwrap();
+        let routing = &plan.storage_routing;
+        assert_eq!(routing["default_engine"], "asap_query");
+        let routed: std::collections::BTreeSet<String> = routing["metrics"]
+            .as_array()
+            .expect("routing document carries a metrics array")
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !routed.is_empty(),
+            "a plan with materializations emitted an empty routing table: {routing}"
+        );
+        // Archive-shape claims are what the default engine cannot serve; a
+        // routing entry without them would silently widen the warm tier.
+        for entry in routing["metrics"].as_array().unwrap() {
+            let engines: Vec<&str> = entry["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["engine"].as_str().unwrap())
+                .collect();
+            assert!(
+                engines.contains(&"asap_query"),
+                "metric {} lost its warm target: {entry}",
+                entry["name"]
+            );
+        }
+    }
 
     // Complete deployment quotes must preserve one producer with two window readouts.
     #[test]

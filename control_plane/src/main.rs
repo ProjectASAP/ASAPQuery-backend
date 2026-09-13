@@ -687,7 +687,11 @@ async fn compile_and_publish_physical_plan(
         }
     };
     if let Err(error) = backend
-        .post_catalog_plan_typed(&publication, None, &adaptation_evidence)
+        .post_catalog_plan_typed(
+            &publication,
+            Some(bundle.storage_routing.clone()),
+            &adaptation_evidence,
+        )
         .await
     {
         return (

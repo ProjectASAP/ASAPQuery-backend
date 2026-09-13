@@ -715,15 +715,43 @@ pub fn emit_backend_storage_routing_for_tenant(
     tenant: &str,
     metric_plans: &[(String, &BackendStageConfig)],
 ) -> Result<JsonValue> {
-    let mut metrics_json: Vec<JsonValue> = Vec::with_capacity(metric_plans.len());
-    for (metric_name, backend_cfg) in metric_plans {
-        metrics_json.push(build_routing_entry(metric_name, backend_cfg));
-    }
-    Ok(json!({
+    let by_metric: Vec<(String, Vec<SketchAlgorithm>)> = metric_plans
+        .iter()
+        .map(|(metric_name, cfg)| (metric_name.clone(), routed_algorithms(cfg)))
+        .collect();
+    Ok(storage_routing_document(tenant, &by_metric))
+}
+
+/// Build the storage-routing document from the per-metric sketch algorithms a
+/// planning cycle decided to materialize. This is the shared entry point: the
+/// `BackendStageConfig` emitters above project onto it, and the physical
+/// compiler calls it directly from its own compiled aggregations, so both
+/// publication paths derive routing from one classifier.
+pub fn storage_routing_document(
+    tenant: &str,
+    metric_algorithms: &[(String, Vec<SketchAlgorithm>)],
+) -> JsonValue {
+    let metrics_json: Vec<JsonValue> = metric_algorithms
+        .iter()
+        .map(|(metric_name, algorithms)| build_routing_entry(metric_name, algorithms))
+        .collect();
+    json!({
         "tenant": tenant,
         "default_engine": "asap_query",
         "metrics": metrics_json,
-    }))
+    })
+}
+
+/// Sketch algorithms a `BackendStageConfig` materializes, in aggregation order.
+/// Non-sketch families contribute no routing capability.
+fn routed_algorithms(cfg: &BackendStageConfig) -> Vec<SketchAlgorithm> {
+    cfg.aggregations
+        .iter()
+        .filter_map(|a| match &a.family {
+            SummaryFamilyType::Sketch(kind, _) => Some(kind.algorithm().clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// same as [`emit_backend_storage_routing`] but also
@@ -766,7 +794,10 @@ pub fn emit_backend_storage_routing_with_prometheus_for_tenant(
     let mut metrics_json: Vec<JsonValue> =
         Vec::with_capacity(metric_plans.len() + mode3_metrics.len());
     for (metric_name, backend_cfg) in metric_plans {
-        metrics_json.push(build_routing_entry(metric_name, backend_cfg));
+        metrics_json.push(build_routing_entry(
+            metric_name,
+            &routed_algorithms(backend_cfg),
+        ));
     }
     for metric_name in mode3_metrics {
         // Mode 3 — Prometheus owns the storage. Single target,
@@ -799,16 +830,7 @@ pub fn emit_backend_storage_routing_with_prometheus_for_tenant(
 /// ```
 /// where each `<target>` is either `{ "engine": <engine>, "applies_to_query_shape": [...] }`
 /// or `{ "engine": <engine> }` for the default slot.
-fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue {
-    let algorithms: Vec<&SketchAlgorithm> = cfg
-        .aggregations
-        .iter()
-        .filter_map(|a| match &a.family {
-            SummaryFamilyType::Sketch(kind, _) => Some(kind.algorithm()),
-            _ => None,
-        })
-        .collect();
-
+fn build_routing_entry(metric_name: &str, algorithms: &[SketchAlgorithm]) -> JsonValue {
     // Sketch-eligible shapes — the ASAP tier serves these natively
     // because we planned a sketch for them.
     let mut warm_shapes: Vec<&'static str> = Vec::new();
