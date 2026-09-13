@@ -3596,7 +3596,9 @@ pub(crate) mod tests {
     // miss. Publication passes this document straight to the data plane.
     #[test]
     fn compiled_plan_routes_every_materialized_metric() {
-        let plan = quoted_snapshot(planning_snapshot(), false).compile().unwrap();
+        let plan = quoted_snapshot(planning_snapshot(), false)
+            .compile()
+            .unwrap();
         let routing = &plan.storage_routing;
         assert_eq!(routing["default_engine"], "asap_query");
         let routed: std::collections::BTreeSet<String> = routing["metrics"]
