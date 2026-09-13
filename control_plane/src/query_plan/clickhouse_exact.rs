@@ -419,7 +419,7 @@ mod original_tests {
                 let PhysicalExpr::Committed(PostAsapPlan::Summary(root)) = planned.physical else {
                     panic!("missing selected SQL DAG")
                 };
-                let entry = crate::query_plan::compile_bound_relational(
+                let entry = crate::query_plan::compile_bound_relational_mapped(
                     "test".into(),
                     planned.canonical_sql,
                     &root,
@@ -435,6 +435,7 @@ mod original_tests {
                     },
                     FallbackPolicy::ExactBackend,
                     |_, _| Err(QueryPlanError::Invalid("unexpected summary binding".into())),
+                    |_, _| {},
                 )
                 .unwrap();
                 assert!(

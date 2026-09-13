@@ -228,6 +228,7 @@ impl SummaryCoordinationCheckpointStore {
         })
     }
 
+    #[cfg(test)]
     pub fn publish_if_absent(&self, key: AtomicPublicationKey) -> io::Result<bool> {
         key.validate()?;
         self.mutate(|document| {

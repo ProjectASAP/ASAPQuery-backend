@@ -632,7 +632,7 @@ mod hybrid_tests {
         .unwrap();
         let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
         let entry =
-            crate::query_plan::compile_bound_composable(
+            crate::query_plan::compile_bound_composable_mapped(
                 "hybrid".into(),
                 query.into(),
                 &selected,
@@ -659,6 +659,7 @@ mod hybrid_tests {
                         readout_lookback_ms: Some(300_000),
                     })
                 },
+                |_, _| {},
             )
             .unwrap();
         assert_eq!(entry.materialization_bindings().len(), 2);

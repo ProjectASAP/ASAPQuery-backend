@@ -19,7 +19,7 @@ use crate::physical::colored_dag::allocator::StageAllocator;
 use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
-use crate::types_v2::{AccuracyTarget, BindingName};
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::{Column, DataType};
 use planner_types::pre_asap::{ColumnRef, QueryExpr, Reduction, Schema, Source};
 
@@ -276,10 +276,10 @@ fn allocator_let_binding_color_propagates() {
         logical_l4(windowed_scan()),
     );
     let bind = PhysicalExpr::Committed(PostAsapPlan::LetBinding {
-        name: BindingName::new("kll_state"),
+        name: String::from("kll_state"),
         expr: Rc::new(PostAsapPlan::Summary(inner_agg)),
         child: Rc::new(PostAsapPlan::Ref {
-            name: BindingName::new("kll_state"),
+            name: String::from("kll_state"),
         }),
     });
     let dag = StageAllocator
@@ -306,10 +306,10 @@ fn allocator_ref_resolves_to_binding_stage() {
         logical_l4(windowed_scan()),
     );
     let bind = PhysicalExpr::Committed(PostAsapPlan::LetBinding {
-        name: BindingName::new("shared"),
+        name: String::from("shared"),
         expr: Rc::new(PostAsapPlan::Summary(inner_agg)),
         child: Rc::new(PostAsapPlan::Ref {
-            name: BindingName::new("shared"),
+            name: String::from("shared"),
         }),
     });
     let dag = StageAllocator

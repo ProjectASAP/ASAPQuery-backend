@@ -94,6 +94,7 @@ pub fn execute_from<R: QueryNodeRuntime>(
     })
 }
 
+#[cfg(test)]
 pub async fn execute_async<R: AsyncQueryNodeRuntime + Sync>(
     entry: &QueryPlanEntry,
     runtime: &R,

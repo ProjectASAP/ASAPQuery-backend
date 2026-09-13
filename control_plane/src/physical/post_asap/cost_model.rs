@@ -27,7 +27,7 @@ use planner_types::pre_asap::expr_ir::ColumnRef;
 use crate::physical::deployment_cost::wire::WireCostTable;
 use crate::physical::erp::{ErpParameterDecision, ErpPlanningInput};
 use crate::planner_selection::FREQUENCY_EXT_KIND;
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
 use serde::{Deserialize, Serialize};
 
@@ -299,17 +299,6 @@ impl ControlPlaneCostModel {
         self.window_framework_costs = costs
             .into_iter()
             .map(|(id, framework, cost)| (Some(id), framework, cost))
-            .collect();
-        self
-    }
-
-    pub fn with_window_framework_costs(
-        mut self,
-        costs: Vec<(SummaryWindowFramework, Cost)>,
-    ) -> Self {
-        self.window_framework_costs = costs
-            .into_iter()
-            .map(|(framework, cost)| (None, framework, cost))
             .collect();
         self
     }
@@ -821,99 +810,6 @@ impl CostModel for ForcedFamilyCostModel {
     // `ForcedFamilyCostModel`, already knowing its family pick from the
     // capability matrix) would still decline pending #150 even after
     // `ControlPlaneCostModel` itself learned to realize it.
-    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
-        self.inner.realize_extension(ext_kind, payload)
-    }
-
-    fn readout_extension(
-        &self,
-        ext_kind: &str,
-        payload: &serde_json::Value,
-        col: &ColumnRef,
-    ) -> SketchQuery {
-        self.inner.readout_extension(ext_kind, payload, col)
-    }
-}
-
-/// A `CostModel` that forces both the family AND the exact parameters
-/// for whichever intent it's asked to rank/size, falling back to an
-/// inner accuracy-driven [`ControlPlaneCostModel`] when nothing was
-/// observed for the candidates on offer.
-///
-/// This is the seam `data_plane`'s live-serving re-binding path
-/// (`post_asap_planner.rs`) needs: planning already decided a family + params
-/// for a metric (that decision is what's actually registered in the
-/// `SketchStore`), so serving-time re-parsing the same query must
-/// reproduce EXACTLY that plan, not size a fresh one from a guessed
-/// accuracy target (`ForcedFamilyCostModel` above forces the family but
-/// still re-derives params from `eps`/`delta` — the wrong tool here,
-/// since re-deriving is exactly what caused the mismatch this type
-/// exists to avoid; see `control_plane/docs/design-target-architecture.md`'s
-/// "planning vs serving" split). `observed` is `None` whenever this
-/// query's metric has no registered sid at all — `rank_candidates`/
-/// `size_params` then fall back to the accuracy-driven default, which
-/// won't match anything registered either way, so the outcome
-/// (`find_candidates` finds nothing) is unchanged.
-///
-/// **Legacy metadata fallback:**
-/// `post_asap_planner.rs` prefers reading planning's decision directly off an
-/// installed SummaryCatalog materializations (no reconstruction needed
-/// there — `Materialization.kind`/`.params` already ARE the pair
-/// `observed` needs). This type's caller
-/// (`observed_family_for_metric`, the `SketchStore`-metadata
-/// reconstruction) is the fallback for deployments without a catalog snapshot
-/// installed yet, or for metrics a partial/stale plan doesn't cover.
-pub struct ObservedFamilyCostModel {
-    inner: ControlPlaneCostModel,
-    observed: Option<(SketchAlgorithm, SketchParams)>,
-}
-
-impl ObservedFamilyCostModel {
-    pub fn new(
-        workload_accuracy: AccuracyTarget,
-        observed: Option<(SketchAlgorithm, SketchParams)>,
-    ) -> Self {
-        Self {
-            inner: ControlPlaneCostModel::new(workload_accuracy),
-            observed,
-        }
-    }
-}
-
-impl CostModel for ObservedFamilyCostModel {
-    fn rank_candidates(
-        &self,
-        intent: &AggIntent,
-        candidates: &[SketchAlgorithm],
-    ) -> Vec<SketchAlgorithm> {
-        match &self.observed {
-            Some((kind, _)) if candidates.contains(kind) => {
-                let mut ranked = self.inner.rank_candidates(intent, candidates);
-                let pos = ranked
-                    .iter()
-                    .position(|candidate| candidate == kind)
-                    .expect("observed candidate was present before ranking");
-                let observed = ranked.remove(pos);
-                ranked.insert(0, observed);
-                ranked
-            }
-            _ => self.inner.rank_candidates(intent, candidates),
-        }
-    }
-
-    fn size_params(
-        &self,
-        kind: SketchAlgorithm,
-        intent: &AggIntent,
-        eps: f64,
-        delta: f64,
-    ) -> SketchParams {
-        match &self.observed {
-            Some((okind, oparams)) if *okind == kind => oparams.clone(),
-            _ => self.inner.size_params(kind, intent, eps, delta),
-        }
-    }
-
     fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
         self.inner.realize_extension(ext_kind, payload)
     }

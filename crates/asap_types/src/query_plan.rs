@@ -310,46 +310,6 @@ pub struct InstantExecution {
 }
 
 impl QueryPlanEntry {
-    /// Replace an explicit planner fallback cut with a typed external-exact leaf.
-    /// The control plane chooses the cut; serving only executes the published DAG.
-    pub fn bind_external_exact_leaf(
-        &mut self,
-        node_id: QueryNodeId,
-        request: ExternalExactRequest,
-    ) -> Result<(), QueryPlanError> {
-        if request.language != self.language {
-            return Err(QueryPlanError::Invalid(
-                "external exact language differs from its query plan".into(),
-            ));
-        }
-        if !request.input_contracts.is_empty() {
-            return Err(QueryPlanError::Invalid(
-                "leaf binding cannot declare DAG input contracts".into(),
-            ));
-        }
-        match self.nodes.get(&node_id) {
-            Some(QueryPlanNode::ExactFallback { .. }) => {}
-            Some(_) => {
-                return Err(QueryPlanError::Invalid(
-                    "external exact binding must replace a planner fallback cut".into(),
-                ))
-            }
-            None => {
-                return Err(QueryPlanError::Invalid(
-                    "external exact cut node is absent".into(),
-                ))
-            }
-        }
-        self.nodes.insert(
-            node_id,
-            QueryPlanNode::ExternalExact {
-                request,
-                inputs: Vec::new(),
-            },
-        );
-        Ok(())
-    }
-
     /// Materializations this executable DAG reads, in stable node order.
     /// Serving uses this set for readiness accounting; it never performs a
     /// catalog candidate search to reconstruct dependencies.

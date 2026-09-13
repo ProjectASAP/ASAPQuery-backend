@@ -116,6 +116,7 @@ impl Monitor {
     pub fn round(&self) -> u64 {
         self.round
     }
+    #[cfg(test)]
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }

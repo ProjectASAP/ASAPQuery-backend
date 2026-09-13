@@ -101,7 +101,7 @@ mod l5_walk_propagation_tests {
             time_window: window,
             repeat_every: None,
             accuracy_sla: 0.01,
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,

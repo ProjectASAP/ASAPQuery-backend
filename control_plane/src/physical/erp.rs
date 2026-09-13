@@ -298,7 +298,7 @@ impl asap_aware_mapping::AccuracyModel for ErpAccuracyModel<'_> {
     fn satisfies(
         &self,
         guarantee: &planner_types::post_asap::ResultGuarantee,
-        target: &crate::types_v2::AccuracyTarget,
+        target: &crate::types::AccuracyTarget,
     ) -> bool {
         asap_aware_mapping::DefaultAccuracyModel.satisfies(guarantee, target)
     }
@@ -1181,7 +1181,7 @@ mod tests {
             ));
             assert!(!model.satisfies(
                 &guarantee,
-                &crate::types_v2::AccuracyTarget::EpsilonDelta {
+                &crate::types::AccuracyTarget::EpsilonDelta {
                     epsilon: 0.2,
                     delta: 0.01
                 }

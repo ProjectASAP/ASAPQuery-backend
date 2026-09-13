@@ -9,10 +9,12 @@ use std::rc::Rc;
 
 use asap_aware_mapping::cost_model::Cost;
 use asap_aware_mapping::{
-    plan_summary_maintenance_lifecycles, AccuracyEvidenceProvider, CostRate, DefaultAccuracyModel,
-    EqualSplitAllocator, Horizon, PropagationStats, SummaryMaintenanceCapabilities,
-    SummaryMaintenanceLifecycleCapabilities, SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
+    plan_summary_maintenance_lifecycles, AccuracyEvidenceProvider, CostRate, Horizon,
+    PropagationStats, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCapabilities,
+    SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
 };
+#[cfg(test)]
+use asap_aware_mapping::{DefaultAccuracyModel, EqualSplitAllocator};
 use planner_types::post_asap::{
     CompositionOperator, EvaluationSchedule, ExecutableDagCompilation, OutputRepresentation,
     PostAsapNodeId, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
@@ -34,7 +36,7 @@ use crate::query_plan::{
     canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
     QueryPlan, QueryPlanEntry,
 };
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
 mod windows;
@@ -278,6 +280,7 @@ pub use asap_types::producer_plan::{
     TransmissionPlan, TransmissionPlanError, TransmissionRule,
 };
 
+#[cfg(test)]
 /// Build the fixed physical knob from the controller's canonical
 /// epsilon-floor allocator. Degenerate budgets/rates disable sampling.
 pub fn sampling_policy_from_accuracy_budget(
@@ -303,6 +306,7 @@ pub fn sampling_policy_from_accuracy_budget(
     }
 }
 
+#[cfg(test)]
 /// Allocate the deterministic staleness share with the same linear-peel
 /// composition used by `epsilon_alloc`. `None` means the selected sketch
 /// already consumes the budget or communication has no allocated weight.
@@ -2167,6 +2171,7 @@ fn requires_exact_erp_fallback(
     })
 }
 
+#[cfg(test)]
 /// Planner-adapter selection step used before physical compilation. Keeping
 /// this separate makes the ownership boundary explicit: callers supply the
 /// selected post-ASAP DAG to [`PhysicalCompiler::compile`].

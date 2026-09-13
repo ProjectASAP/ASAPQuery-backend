@@ -514,18 +514,6 @@ impl SummaryState {
         }
     }
 
-    /// Borrow the inner HLL sketch when this rolling state is HLL-backed.
-    /// Used by the GLOBAL cardinality rollup (`count(hll_metric)` with no
-    /// `by`), which must MERGE the per-series HLL registers (register-wise
-    /// max) across all matched series and estimate ONCE — summing per-series
-    /// distinct estimates would double-count items present in multiple series.
-    pub fn as_hll(&self) -> Option<&HllSketch> {
-        match self {
-            SummaryState::Hll(sk) => Some(sk),
-            _ => None,
-        }
-    }
-
     /// Merge `other` into `self` in place — both must be the same sketch
     /// family. Used to combine several sids' reconstructed states
     /// (`cumulative_summary_state`/`per_window_summary_states`) into one
@@ -619,6 +607,7 @@ pub fn cumulative_summary_state(
     Ok(rolling)
 }
 
+#[cfg(test)]
 /// Walk a sorted-by-window-end slice of samples in time order and
 /// produce ONE per-window scalar `(window_end_ms, scalar)`.
 ///
@@ -734,79 +723,6 @@ pub fn per_window_summary_states(
         out.push((prev_end, rs));
     }
 
-    Ok((out, skipped))
-}
-
-/// Cumulative-mode rollup: fold every window in `[t0, t1]` into a
-/// single rolling state and emit one scalar at the latest
-/// `window_end_ms` seen (or the largest if all were Deltas that got
-/// skipped). Used by `quantile_over_time` / `count_distinct_over_time`.
-///
-/// Returns `Ok((window_end, scalar), skipped_leading_deltas)`. Returns
-/// `Ok(None, _)` if every sample was a leading delta (no Full ever
-/// landed in the range).
-pub fn cumulative_evaluate<E>(
-    samples: &[(i64, &SketchSampleState)],
-    kind: DeltaSketchKind,
-    eval: E,
-) -> Result<(Option<(i64, f64)>, usize), String>
-where
-    E: Fn(&SummaryState) -> f64,
-{
-    let mut rolling: Option<SummaryState> = None;
-    let mut latest_end = i64::MIN;
-    let mut skipped = 0usize;
-
-    for (window_end, state) in samples {
-        if *window_end > latest_end {
-            latest_end = *window_end;
-        }
-        match state.encoding {
-            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull => {
-                let new_state = decode_full(&kind, &state.bytes, state.encoding)?;
-                // Merge new_state into any existing rolling state — a
-                // mid-range Full effectively "restarts" the window in
-                // the cumulative roll-up if the agent flushed a new
-                // snapshot. Merging keeps the answer monotonic in
-                // sample inclusion.
-                rolling = Some(match (rolling.take(), new_state) {
-                    (None, n) => n,
-                    (Some(SummaryState::Dd(mut a)), SummaryState::Dd(b)) => {
-                        a.merge(&b).map_err(|e| format!("cum merge DD: {e}"))?;
-                        SummaryState::Dd(a)
-                    }
-                    (Some(SummaryState::Hll(mut a)), SummaryState::Hll(b)) => {
-                        a.merge(&b).map_err(|e| format!("cum merge HLL: {e}"))?;
-                        SummaryState::Hll(a)
-                    }
-                    (Some(SummaryState::Kll(mut a)), SummaryState::Kll(b)) => {
-                        a.merge(&b).map_err(|e| format!("cum merge KLL: {e}"))?;
-                        SummaryState::Kll(a)
-                    }
-                    (Some(_), _) => {
-                        return Err("cumulative merge across sketch family mismatch".to_string())
-                    }
-                });
-            }
-            SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-                // PWR: the range may have NO carry-in Full (it starts
-                // mid-stream), so the first frame is a delta-from-empty.
-                // Bootstrap an empty base and apply onto it. Under PWR
-                // each window's frames are increments-since-its-own-base;
-                // folding them all (Full-fragment merge for DD/KLL,
-                // register-max for HLL) yields the union over the range,
-                // which is the cumulative (`*_over_time`) answer.
-                if rolling.is_none() {
-                    rolling = Some(kind.bootstrap_empty());
-                }
-                match rolling.as_mut() {
-                    Some(rs) => rs.apply_delta_bytes(&state.bytes, state.encoding)?,
-                    None => skipped += 1,
-                }
-            }
-        }
-    }
-    let out = rolling.map(|rs| (latest_end, eval(&rs)));
     Ok((out, skipped))
 }
 

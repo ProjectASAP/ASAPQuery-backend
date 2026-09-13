@@ -150,6 +150,7 @@ impl MockRawSampleReader {
         Self { samples }
     }
 
+    #[cfg(test)]
     /// Total number of samples the reader was seeded with —
     /// independent of any range / filter. Exposed so tests can
     /// assert reader setup without round-tripping through

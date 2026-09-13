@@ -61,14 +61,6 @@ impl SchemaEvictionService {
         }
     }
 
-    /// Override the retirement-retention duration. Tests use this to
-    /// drive lifecycle transitions deterministically without waiting
-    /// out the 24-hour default.
-    pub fn with_retirement_retention(mut self, retention: Duration) -> Self {
-        self.retirement_retention = retention;
-        self
-    }
-
     /// Spawn as a tokio task. Returns a handle whose `shutdown`
     /// oneshot stops the loop cleanly on ctrl-c.
     pub fn spawn(self) -> SchemaEvictionHandle {

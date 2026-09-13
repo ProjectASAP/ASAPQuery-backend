@@ -79,11 +79,6 @@ impl ColoredDag {
         self.nodes.first()
     }
 
-    /// All nodes painted with `stage`.
-    pub fn nodes_in_stage(&self, stage: StageId) -> impl Iterator<Item = &ColoredNode> {
-        self.nodes.iter().filter(move |n| n.stage == stage)
-    }
-
     /// Set of `StageId`s actually present in this colouring (subset of
     /// `topology.stages()`).
     pub fn occupied_stages(&self) -> Vec<StageId> {
@@ -96,6 +91,7 @@ impl ColoredDag {
         seen
     }
 
+    #[cfg(test)]
     /// Edges crossing stage boundaries. They describe the required transport hops.
     pub fn cut_edges(&self) -> Vec<(NodeId, NodeId)> {
         self.edges
@@ -175,7 +171,7 @@ mod tests {
             measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
-                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+                accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             }],
             output_names: Vec::new(),
             having: None,

@@ -1353,7 +1353,7 @@ fn find_metric(node: &SummaryNode) -> Option<String> {
 
 /// Walk a canonical `QueryExpr` down to its first `Scan {
 /// source: Source::TimeSeries { metric }, .. }` to recover the target
-/// metric name. Shared with `post_asap_planner.rs`'s observed-family lookup
+/// metric name.
 /// (serving time must know which metric to check the `SketchStore`
 /// against BEFORE binding — see that module's docs).
 pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {

@@ -184,6 +184,7 @@ impl Replanner {
         }
     }
 
+    #[cfg(test)]
     /// Remove every `(metric, role)` mapping for a disconnected agent.
     pub async fn unregister_agent(&self, agent_id: &str) {
         self.agent_to_metrics.write().await.remove(agent_id);
@@ -894,7 +895,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,

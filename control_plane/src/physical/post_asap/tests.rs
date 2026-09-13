@@ -14,7 +14,7 @@ use planner_types::pre_asap::expr_ir::ColumnRef;
 use crate::physical::post_asap::cost_model::ForcedFamilyCostModel;
 use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
 use crate::physical::post_asap::lower::bind_query_expr;
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::{AggIntent, QueryExpr, Reduction, Schema, Source};
 use planner_types::pre_asap::{Column, DataType};
 

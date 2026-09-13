@@ -3,7 +3,6 @@
 //! Two cooperating submodules — bidirectional plumbing between the
 //! data plane and the control plane (`control_plane` crate):
 //!
-//! * [`config_fetcher`] — outbound `GET /api/v1/plan/:metric` polling.
 //!   Fetches plan config from the control plane. Optional; today's
 //!   binary path does not consume it.
 //! * [`miss_notifier`] — outbound capability-miss notifications. The
@@ -12,7 +11,6 @@
 //!   generate a new sketch plan and push it back via the streaming
 //!   config endpoint.
 
-pub mod config_fetcher;
 pub mod miss_notifier;
 
 pub use miss_notifier::{spawn_capability_miss_notify, ControlPlaneClient, HttpControlPlaneClient};

@@ -20,9 +20,10 @@
 #![allow(dead_code)]
 
 use crate::physical::post_asap::matcher::sketch_family_satisfied;
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use asap_types::AggregationType;
 pub use planner_types::post_asap::SketchAlgorithm;
+#[cfg(test)]
 use planner_types::pre_asap::AggIntent;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
@@ -365,6 +366,7 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
 
 // ── AggIntent → Capability bridge ────────────────────────────────────────────
 
+#[cfg(test)]
 /// Map a semantic [`AggIntent`] to the ASAP-tier [`Capability`] that can
 /// answer it. Returns `None` for intents that have no ASAP-tier sketch
 /// (Sum / Min / Max / Avg / Rate / Increase / every archive-only intent

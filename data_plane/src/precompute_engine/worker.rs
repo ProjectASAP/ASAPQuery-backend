@@ -1335,6 +1335,7 @@ fn precomputed_output_for_group(
     output
 }
 
+#[cfg(test)]
 /// Extract the metric name from a series key like `"metric_name{key1=\"val1\"}"`.
 pub fn extract_metric_name(series_key: &str) -> &str {
     match series_key.find('{') {
@@ -1343,6 +1344,7 @@ pub fn extract_metric_name(series_key: &str) -> &str {
     }
 }
 
+#[cfg(test)]
 /// Extract grouping label values from a series key string based on the
 /// aggregation config's `grouping_labels`.
 ///
