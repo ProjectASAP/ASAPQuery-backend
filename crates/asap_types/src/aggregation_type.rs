@@ -73,29 +73,6 @@ impl AggregationType {
                 | AggregationType::HydraKLL
         )
     }
-
-    /// Returns `true` if this type needs a paired key aggregation (SetAggregator / DeltaSetAggregator).
-    pub fn is_multi_population_value_type(self) -> bool {
-        matches!(
-            self,
-            AggregationType::MultipleSum
-                | AggregationType::MultipleMinMax
-                | AggregationType::MultipleIncrease
-                | AggregationType::CountMinSketch
-                | AggregationType::CountMinSketchWithHeap
-                | AggregationType::CountSketch
-                | AggregationType::CountSketchWithHeap
-        )
-    }
-
-    /// Returns `true` if this is a key-tracking aggregation type.
-    /// Retained as a stable predicate for downstream callers; the
-    /// historical `SetAggregator` / `DeltaSetAggregator` set-tracking
-    /// family has been retired (no `AggregationType` is key-tracking
-    /// today).
-    pub fn is_key_agg_type(self) -> bool {
-        false
-    }
 }
 
 impl fmt::Display for AggregationType {

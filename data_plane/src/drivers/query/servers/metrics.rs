@@ -79,21 +79,3 @@ pub fn record_query_outcome(query_type: &str, status: &str) {
         .with_label_values(&[query_type, status])
         .inc();
 }
-
-pub fn start_ingest_timer(protocol: &str) -> HistogramTimer {
-    INGEST_BATCH_DURATION_SECONDS
-        .with_label_values(&[protocol])
-        .start_timer()
-}
-
-pub fn record_ingest_samples(protocol: &str, count: u64) {
-    INGEST_SAMPLES_TOTAL
-        .with_label_values(&[protocol])
-        .inc_by(count as f64);
-}
-
-pub fn record_ingest_decode_error(protocol: &str) {
-    INGEST_DECODE_ERRORS_TOTAL
-        .with_label_values(&[protocol])
-        .inc();
-}

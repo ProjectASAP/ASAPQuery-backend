@@ -167,7 +167,7 @@ fn build_workload_with_override(
         aggregations,
         time_window,
         repeat_every: None,
-        accuracy: control_plane::types_v2::AccuracyTarget::Epsilon(accuracy_sla),
+        accuracy: control_plane::types::AccuracyTarget::Epsilon(accuracy_sla),
         accuracy_sla,
         latency_sla: None,
         sketch_type_override,
@@ -2346,20 +2346,7 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
 // merges them itself. The gate is gone; this SHOULD exercise the new
 // path serving the shape directly, not a fallback.
 //
-// Correction (sketch_reducer.rs retirement): that claim above wasn't
-// actually true until now. This shape was ALSO hitting a real
-// family/params mismatch on `SummaryExecutor` (serving time picked
-// precision from a hardcoded default accuracy, not what this workload
-// was actually planned/registered with) -- the legacy reducer's
-// `evaluate_cardinality_global` fallback silently masked that miss, so
-// the test passed via the fallback, not the new path. With the reducer
-// gone, the params mismatch is fixed (see `ObservedFamilyCostModel`),
-// but that unmasked a SECOND, independent bug: `effective_is_cumulative`
-// classifies a bare `count(...)` as non-cumulative, so `readout`
-// evaluates per-window instead of merging the whole range -- this test's
-// later "watermark" sample (a distinct, more recent window) then wins
-// over the real data instead of being merged with it. Tracked as
-// https://github.com/ProjectASAP/ASAPQuery-backend/issues/431.
+// The installed cardinality readout merges all bound series and windows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_serve_hll_global_count_merges_across_sids() {
     let _live = LiveServeEnvGuard::enable();

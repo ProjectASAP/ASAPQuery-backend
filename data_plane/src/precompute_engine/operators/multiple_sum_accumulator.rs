@@ -22,10 +22,6 @@ impl MultipleSumAccumulator {
         }
     }
 
-    pub fn new_with_sums(sums: HashMap<KeyByLabelValues, f64>) -> Self {
-        Self { sums }
-    }
-
     pub fn update(&mut self, key: KeyByLabelValues, value: f64) {
         *self.sums.entry(key).or_insert(0.0) += value;
     }

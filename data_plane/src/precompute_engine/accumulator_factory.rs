@@ -899,6 +899,7 @@ impl AccumulatorUpdater for HydraKllAccumulatorUpdater {
 // Config helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// Return `true` if `config` produces a keyed (MultipleSubpopulation) updater,
 /// without allocating an updater object.
 ///

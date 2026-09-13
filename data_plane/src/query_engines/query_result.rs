@@ -48,6 +48,7 @@ impl QueryResult {
         })
     }
 
+    #[cfg(test)]
     /// Construct an instant vector with a non-empty warnings list.
     /// Used by the schema-timeline dispatcher when the query spans
     /// a reconfigure boundary and one or more segments could not
@@ -123,16 +124,6 @@ impl QueryResult {
             QueryResult::Vector(iv) => iv.window_used,
             QueryResult::Matrix(m) => m.window_used,
         }
-    }
-
-    /// Attach the actual window range that produced this answer.
-    /// Chainable, mirroring `with_accuracy`.
-    pub fn with_window_used(mut self, window: (u64, u64)) -> Self {
-        match &mut self {
-            QueryResult::Vector(iv) => iv.window_used = Some(window),
-            QueryResult::Matrix(m) => m.window_used = Some(window),
-        }
-        self
     }
 }
 

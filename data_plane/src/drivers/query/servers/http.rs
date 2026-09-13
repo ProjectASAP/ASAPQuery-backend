@@ -275,6 +275,7 @@ impl HttpServer {
         self
     }
 
+    #[cfg(test)]
     /// Plug an additional [`QueryEngine`] into the capability router.
     /// Used by the binary to register `GorillaQueryEngine` (cold
     /// archive) alongside the `ASAPQueryEngine` registered by `new`.

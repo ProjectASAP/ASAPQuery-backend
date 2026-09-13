@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
 use planner_types::post_asap::SketchAlgorithm;
@@ -29,7 +30,7 @@ use planner_types::post_asap::SketchAlgorithm;
 /// Used by the optimizer to compare candidates and by the physical
 /// planner to check whether a sketch fits within a stage's budget.
 /// Populated from compiled-in defaults via [`default_capability_table`]
-/// or overridden at runtime via [`load_capability_overrides`].
+/// with YAML override loading available to unit tests.
 #[derive(Debug, Clone)]
 pub struct SketchCapability {
     /// Insertion throughput (samples/sec at 1 core).
@@ -53,6 +54,7 @@ pub struct SketchCapability {
 // ── YAML override loader ─────────────────────────────────────────────────────
 
 /// YAML-serialisable capability profile (matches `sketch_capabilities.yml`).
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct SketchCapabilityYaml {
     insert_throughput: f64,
@@ -65,6 +67,7 @@ struct SketchCapabilityYaml {
     supports_sliding_window: bool,
 }
 
+#[cfg(test)]
 impl SketchCapabilityYaml {
     fn to_capability(&self) -> SketchCapability {
         SketchCapability {
@@ -82,6 +85,7 @@ impl SketchCapabilityYaml {
 
 /// YAML file structure for all sketch capabilities. Mirrors
 /// `control_plane/sketch_capabilities.yml` 1:1.
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct SketchCapabilitiesFile {
     ddsketch: SketchCapabilityYaml,
@@ -162,6 +166,7 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
     map
 }
 
+#[cfg(test)]
 /// Load overrides from `CONTROLLER_SKETCH_CAPABILITIES`. Missing or malformed
 /// files fall back to [`default_capability_table`].
 pub fn load_capability_overrides(path: &str) -> HashMap<SketchAlgorithm, SketchCapability> {

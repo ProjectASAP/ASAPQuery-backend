@@ -200,27 +200,6 @@ fn complete_pane_coverage(
     pane_ms > 0 && first_end.saturating_sub(pane_ms) <= requested.0 && last_end >= requested.1
 }
 
-/// Executes only the published physical DAG; serving performs no parsing,
-/// summary selection, or materialization candidate search.
-pub fn execute_sql_dag(
-    index: &SketchStore,
-    entry: &QueryPlanEntry,
-    sds: &SummaryCatalog,
-    t0_ms: u64,
-    t1_ms: u64,
-    is_cumulative: bool,
-) -> ClickHouseDagOutcome {
-    execute_sql_dag_with_external(
-        index,
-        entry,
-        sds,
-        &PreparedExternalLeaves::new(),
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-    )
-}
-
 pub fn execute_sql_dag_with_external(
     index: &SketchStore,
     entry: &QueryPlanEntry,

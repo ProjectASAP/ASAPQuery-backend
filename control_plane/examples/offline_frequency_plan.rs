@@ -8,7 +8,7 @@ use asap_aware_mapping::empirical_comparison::{
 use control_plane::{
     physical::post_asap::{bind_query_expr_with_cost_model, cost_model::ControlPlaneCostModel},
     planner_selection::frequency,
-    types_v2::AccuracyTarget,
+    types::AccuracyTarget,
 };
 use planner_types::pre_asap::{AggIntent, Column, DataType, QueryExpr, Reduction, Schema, Source};
 use serde_json::json;

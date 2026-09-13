@@ -56,11 +56,6 @@ impl SketchEnvelopeAccumulator {
             sketch_type,
         })
     }
-
-    /// Return the decoded envelope (re-decodes from bytes each time).
-    pub fn decode_envelope(&self) -> Result<SketchEnvelope, prost::DecodeError> {
-        SketchEnvelope::decode(self.payload.as_slice())
-    }
 }
 
 // ---------------------------------------------------------------------------

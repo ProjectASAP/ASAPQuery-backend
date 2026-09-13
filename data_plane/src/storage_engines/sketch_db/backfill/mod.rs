@@ -794,6 +794,7 @@ impl BackfillRegistry {
         Coverage::Missing
     }
 
+    #[cfg(test)]
     /// Remove any terminal job older than `older_than_ms`. Used by
     /// the eventual retention sweep; returns the number of jobs
     /// evicted. Non-terminal jobs are never evicted.

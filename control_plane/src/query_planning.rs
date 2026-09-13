@@ -50,6 +50,7 @@ pub struct QuerySetPlan {
 }
 
 impl QuerySetPlan {
+    #[cfg(test)]
     /// All sketch families this plan allocates, across every metric
     /// (de-duplicated, order-stable). Convenience for capacity sizing.
     pub fn all_sketches(&self) -> Vec<SketchType> {

@@ -80,24 +80,6 @@ impl PrometheusReader {
         }
     }
 
-    /// Override the evaluation step. Prometheus returns one
-    /// `(ts, value)` point every `step` within the query window,
-    /// so setting `step` below the scrape interval wastes
-    /// bandwidth and setting it above drops samples.
-    pub fn with_step(mut self, step: Duration) -> Self {
-        self.step = step;
-        self
-    }
-
-    /// Override the HTTP client timeout. Defaults to none.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        self
-    }
-
     fn url(&self) -> String {
         format!("{}/api/v1/query_range", self.base_url.trim_end_matches('/'))
     }

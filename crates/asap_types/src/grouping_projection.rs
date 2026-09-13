@@ -372,6 +372,7 @@ pub fn encode_label_population_key(
     ))
 }
 
+#[cfg(test)]
 /// Reject legacy, unknown-version, duplicate-name and noncanonical encodings.
 /// In particular, decoding must never silently collapse duplicate populations.
 pub fn decode_label_population_key(

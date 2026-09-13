@@ -196,14 +196,7 @@ pub struct AggregationIdInfo {
     pub aggregation_type_for_value: AggregationType,
 }
 
-impl AggregationIdInfo {
-    pub fn policy_fp_for_key(&self) -> PolicyFingerprint {
-        PolicyFingerprint(self.aggregation_id_for_key)
-    }
-    pub fn policy_fp_for_value(&self) -> PolicyFingerprint {
-        PolicyFingerprint(self.aggregation_id_for_value)
-    }
-}
+impl AggregationIdInfo {}
 
 /// Compatibility name for legacy streaming-config and precompute call sites.
 /// New PhysicalPlan code should use [`PrecomputeMaterialization`].
@@ -352,11 +345,6 @@ impl PrecomputeMaterialization {
     /// addressed identity, NOT a controller-allocated counter id.
     pub fn policy_fp_u64(&self) -> u64 {
         self.policy_fingerprint().as_u64()
-    }
-
-    pub fn with_original_yaml(mut self, yaml: String) -> Self {
-        self.original_yaml = yaml;
-        self
     }
 
     pub fn deserialize_from_json(
