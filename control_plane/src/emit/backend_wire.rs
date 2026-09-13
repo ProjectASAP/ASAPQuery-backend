@@ -12,14 +12,10 @@
 //! rather than re-deriving the field mapping, so `BackendPlan` materializations
 //! and the JSON wire format share one `PolicyFingerprint` identity space.
 
-use planner_types::post_asap::{
-    ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType,
-};
+use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
 use serde_json::{json, Value as JsonValue};
 
-use crate::physical::backend_stage::{
-    AggregationInput, BackendAggregation,
-};
+use crate::physical::backend_stage::{AggregationInput, BackendAggregation};
 
 // ── Window-size clamping (MVP blocker B4) ─────────────────────────────────────
 //
@@ -81,7 +77,6 @@ pub fn clamp_window_secs(w: Option<u64>) -> Option<u64> {
     w.map(|s| s.clamp(MIN_WINDOW_SECS, MAX_WINDOW_SECS))
 }
 
-
 pub const DEFAULT_TENANT: &str = "default";
 
 pub fn storage_routing_document(
@@ -98,7 +93,6 @@ pub fn storage_routing_document(
         "metrics": metrics_json,
     })
 }
-
 
 /// same as [`emit_backend_storage_routing`] but also
 /// emits `thanos_query` engine entries for Mode 3 metrics.
@@ -330,9 +324,6 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
     })
 }
 
-
-
-
 /// Map a `SketchAlgorithm` to the backend's `AggregationType::Display`
 /// string — the same mapping
 /// [`crate::config::asapquery_backend::map_sketch_type_to_agg_type`] uses
@@ -362,7 +353,6 @@ fn sketch_algorithm_to_backend_type(kind: &SketchAlgorithm) -> &'static str {
         ),
     }
 }
-
 
 /// Serialize a `SketchParams` payload to a flat JSON object the backend
 /// can read directly without round-tripping through the controller's

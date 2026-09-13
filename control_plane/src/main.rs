@@ -63,10 +63,10 @@ async fn main() {
     // ── SP-5: Online EMA cost store ───────────────────────────────────────────
     let online_store = init_online_store();
 
-        // ── OpAMP server with connect/disconnect hooks ────────────────────────────
+    // ── OpAMP server with connect/disconnect hooks ────────────────────────────
     let opamp_srv: Arc<OpampServer> = Arc::new(OpampServer::new());
 
-        // Share one client between HTTP planning and replanning. An unset
+    // Share one client between HTTP planning and replanning. An unset
     // `CONTROLLER_BACKEND_ENDPOINT` disables backend pushes.
     let backend_client_shared: Option<Arc<backend_client::BackendClient>> =
         backend_endpoint.as_ref().map(|endpoint| {
@@ -747,19 +747,6 @@ fn workload_cost_manifests(
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// Returns the current EMA cost model state — blended benchmark + observed costs
 /// per sketch type.  Useful for diagnosing whether the online cost model has
 /// received sufficient observations to meaningfully influence plan selection.
@@ -1045,12 +1032,6 @@ mod api_tests {
 
     // ── Integration: control plane ↔ collector wiring ─────────────────────────
 
-
-
-
-
-
-
     #[tokio::test]
     async fn tco_with_custom_pricing() {
         let (_, app) = test_app();
@@ -1089,14 +1070,6 @@ mod api_tests {
         assert!(body["monthly_savings_dollars"].as_f64().unwrap() > 0.0);
     }
 
-
-
-
-
-
-
-
-
     // ── MVP §46: planner ↔ 5-sketch emitter stitch (PR #339 ↔ PR #340) ─────────
     //
     // The acceptance contract: register the six contract metrics in the
@@ -1110,10 +1083,4 @@ mod api_tests {
     // EdgeStageConfig.metric_to_family HashMap stays empty and the
     // emitter falls back to single-pipeline DDSketch — none of the
     // assertions below pass.
-
-
-
-
-
-
 }

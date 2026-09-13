@@ -94,7 +94,6 @@ fn benchmark_table() -> HashMap<SketchType, SketchCosts> {
     .into()
 }
 
-
 // ── Tuning constants ──────────────────────────────────────────────────────────
 
 /// EMA smoothing factor α.  Smaller → slower adaptation, more stable.

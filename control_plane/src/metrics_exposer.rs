@@ -40,8 +40,6 @@
 //! | `asap_runtime_samples_records_evicted_total` | Counter |
 //! | `asap_runtime_samples_decode_errors_total` | Counter |
 
-
-
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -167,7 +165,6 @@ impl MetricsRegistry {
             decode_errors,
         })
     }
-
 
     /// Walk the store and push the latest sample per key into
     /// the gauge vecs. Called at scrape time, not per-record —

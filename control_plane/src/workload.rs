@@ -371,7 +371,6 @@ pub struct WorkloadEntry {
     pub repeat_every: Option<String>,
 }
 
-
 /// User-facing continuous-monitoring declaration on a [`WorkloadEntry`]. τ/ε and
 /// the window are authoritative at the coordinator; this is the controller's
 /// source for emitting them. See `crate::emit::monitor`.
@@ -582,8 +581,6 @@ impl WorkloadRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-
 
     /// An unsupported key is planning input the controller cannot honour;
     /// accepting the file would report a cadence / hint that never left the YAML.
