@@ -30,8 +30,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use emit::{emit_for_runtime, AgentRuntime};
 use emit::generate_agent_collector_config;
+use emit::{emit_for_runtime, AgentRuntime};
 use monitor::{Endpoint, ScrapedData, Scraper, Thresholds, Violation};
 use opamp::OpampServer;
 use physical::colored_dag::emitter::BackendStageConfig;
@@ -1055,14 +1055,6 @@ fn workload_cost_manifests(
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-
-
-
-
-
-
-
-
 /// Bootstrap YAML config for agent collectors.
 ///
 /// Collectors start with:
@@ -1425,7 +1417,6 @@ async fn handle_tco(Json(req): Json<TcoRequest>) -> impl IntoResponse {
     (StatusCode::OK, Json(estimate))
 }
 
-
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 /// Builds a minimal `AppState` + `Router` for integration tests.
@@ -1613,7 +1604,6 @@ mod api_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-
     // ── AppState.backend_client wiring ───────────────────────────────
 
     /// Default-constructed AppState (no `CONTROLLER_BACKEND_ENDPOINT`)
@@ -1642,13 +1632,7 @@ mod api_tests {
 
     // ── POST /api/v1/plan ─────────────────────────────────────────────────────
 
-
-
-
-
     // ── GET /api/v1/plan/:metric ──────────────────────────────────────────────
-
-
 
     // ── GET /api/v1/cost-model ────────────────────────────────────────────────
 
@@ -2689,6 +2673,4 @@ mod api_tests {
         }
         assert!(!yaml.contains("name == \"top_endpoint_qps\""));
     }
-
-
 }

@@ -151,7 +151,6 @@ struct Args {
     #[arg(long, default_value = "http://localhost:9090")]
     prometheus_server: String,
 
-
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
     forward_unsupported_queries: bool,

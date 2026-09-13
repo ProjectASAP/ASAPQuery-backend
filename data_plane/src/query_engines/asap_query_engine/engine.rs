@@ -508,7 +508,6 @@ impl ASAPQueryEngine {
         self
     }
 
-
     /// Build a minimal `QueryRequirements` from a bare PromQL string —
     /// used by the no-sketch-index miss branch in modern `execute()`,
     /// where we don't have a parsed candidate (analysis was skipped)
@@ -1065,8 +1064,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
 
         // Without a sketch index, notify the control plane directly on a capability
         // miss so the feedback loop also works for this configuration.
-        if let Some(req) = Self::requirements_from_query_str(query) {
-        }
+        if let Some(req) = Self::requirements_from_query_str(query) {}
         Err(crate::query_engines::EngineError::capability_miss(
             crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
             format!("ASAPQueryEngine: no sketch index for `{query}` — failing over to archive"),
