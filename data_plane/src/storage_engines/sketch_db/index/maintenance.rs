@@ -1082,7 +1082,6 @@ mod tests {
         entry["query"] = "quantile(0.9, sum_over_time(immutable_value[1m]))".into();
         entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
         entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
-        entry["time_selection"]["lookback"] = 60_000.into();
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(fixture).unwrap();

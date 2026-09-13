@@ -615,7 +615,6 @@ mod tests {
         query["query"] = "quantile(0.9, sum_over_time(m[1m]) + sum_over_time(n[1m]))".into();
         query["demand"]["fixed_interval_at"]["interval"] = 60000.into();
         query["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
-        query["time_selection"]["lookback"] = 60000.into();
         wire["query_workload"]["repeating_queries"] = serde_json::json!([query]);
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(wire).unwrap();

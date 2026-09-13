@@ -787,9 +787,6 @@ async fn run_shared_dashboard(multi_pane: bool) {
         serde_json::from_value(snapshot.clone()).unwrap();
     if multi_pane {
         for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
-            entry.time_selection.lookback = Some(planner_types::workload::DurationMs(10_000));
-        }
-        for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
             entry.demand = planner_types::workload::RepeatedDemand::FixedIntervalAt {
                 interval: planner_types::workload::RepetitionInterval(5_000),
                 evaluation_phase: planner_types::workload::TimestampMs(0),

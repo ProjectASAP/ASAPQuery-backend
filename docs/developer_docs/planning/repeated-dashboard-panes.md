@@ -25,6 +25,14 @@ Unquoted layouts use supplied lifecycle unit costs multiplied by structural
 counts. Layout changes never inherit another layout's measured scalar cost.
 Workload-versus-exact deployment evidence is still required by snapshot version 2.
 
+Temporal requirements are derived from PromQL. A range selector supplies its
+own readout window; a rangeless instant-vector expression uses required
+`implementation.scrape_interval_ms`. Snapshot `time_selection.lookback` is
+rejected because it duplicates and can conflict with query semantics. A
+subquery or positive offset extends only the furthest lookback: evaluated at
+`t`, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`, not a continuous
+61-minute interval.
+
 ## Cases
 
 All ranges below use PromQL's `(start,end]` convention. W is the lookback and E

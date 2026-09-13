@@ -822,7 +822,6 @@ mod tests {
         entries[0].requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
             planner_types::types::AccuracyTarget::Exact,
         );
-        entries[0].time_selection.lookback = Some(planner_types::workload::DurationMs(21_600_000));
         let mut second = entries[0].clone();
         second.query = planner_types::workload::Query(
             "max_over_time(service_retry_queue_depth{job=\"order-service\"}[6h])".into(),

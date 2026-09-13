@@ -26,7 +26,7 @@ use planner_types::workload::{
     Predictability, Query, QueryLanguage, QueryRecurrence, QueryRequirements, QueryTimeScope,
     QueryWorkload, Rate, RepeatedDemand, RepeatingEntry, RepetitionInterval, TimeSelection,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -170,9 +170,6 @@ pub struct PlanningRequest {
     /// mode falls back to theoretical sizing and then exact execution.
     pub erp: Option<super::erp::ErpPlanningInput>,
     pub planner_revision: String,
-    /// Observed cadence of source samples. Exact temporal panes must divide
-    /// both this cadence and the repeated-query evaluation interval.
-    pub source_sample_interval_ms: Option<u64>,
     /// How far behind the newest ingested sample an admitted query may be
     /// evaluated. This extends physical retention only; it never changes the
     /// PromQL range selector used for readout.
@@ -224,6 +221,7 @@ pub struct BackendLocalPlanningSnapshot {
     /// May be absent during candidate discovery, never during deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
+    #[serde(deserialize_with = "deserialize_snapshot_query_workload")]
     pub query_workload: QueryWorkload,
     pub data_workload: DataWorkload,
     pub implementation: BackendLocalImplementation,
@@ -238,8 +236,9 @@ pub struct BackendLocalImplementation {
     pub evidence_valid_for_ms: u64,
     pub horizon_seconds: f64,
     pub window_cost_model: WindowCostModel,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_sample_interval_ms: Option<u64>,
+    /// Prometheus source scrape cadence. Rangeless instant-vector expressions
+    /// use this as their derived readout window.
+    pub scrape_interval_ms: u64,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub query_staleness_margin_ms: u64,
     /// Admission budget for all retained panes and estimated partitions.
@@ -260,6 +259,33 @@ pub struct BackendLocalImplementation {
     pub exact_composition_costs: HashMap<String, Vec<ExactCompositionCostEvidence>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub erp: Option<super::erp::ErpPlanningInput>,
+}
+
+/// Snapshot lookback is derived from PromQL and the declared scrape interval;
+/// accepting it here would silently restore the competing legacy input.
+fn deserialize_snapshot_query_workload<'de, D>(deserializer: D) -> Result<QueryWorkload, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let has_legacy_lookback = value
+        .get("repeating_queries")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("time_selection")
+                    .and_then(Value::as_object)
+                    .and_then(|selection| selection.get("lookback"))
+                    .is_some_and(|lookback| !lookback.is_null())
+            })
+        });
+    if has_legacy_lookback {
+        return Err(D::Error::custom(
+            "query_workload.repeating_queries[].time_selection.lookback is not supported; it is derived from PromQL",
+        ));
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -573,16 +599,11 @@ impl BackendLocalPlanningSnapshot {
                     )))
                 }
             };
-            let lookback_ms = entry
-                .time_selection
-                .lookback
-                .ok_or_else(|| {
-                    CompileError::Snapshot(format!("query {index} requires an explicit lookback"))
-                })?
-                .0;
-            if lookback_ms == 0 || lookback_ms % 1_000 != 0 {
+            if self.implementation.scrape_interval_ms == 0
+                || self.implementation.scrape_interval_ms % 1_000 != 0
+            {
                 return Err(CompileError::Snapshot(format!(
-                    "query {index} lookback must be a positive whole number of seconds"
+                    "scrape_interval_ms must be a positive whole number of seconds"
                 )));
             }
             let accuracy = entry.requirements.accuracy.target();
@@ -590,6 +611,8 @@ impl BackendLocalPlanningSnapshot {
             let parsed =
                 crate::query_parser::parse_query_expr_canonical(&query_string, accuracy.clone())
                     .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
+            let lookback_ms =
+                query_history_window_ms(&parsed).unwrap_or(self.implementation.scrape_interval_ms);
             let metadata = crate::query_parser::qe_to_parsed_query(&parsed);
             let source_metrics = super::workload_cost::exact_source_metrics(&parsed)?;
             let source_hint = source_metrics.iter().next().cloned().ok_or_else(|| {
@@ -673,7 +696,6 @@ impl BackendLocalPlanningSnapshot {
                 exact_composition_costs: exact_costs_by_id,
                 erp: self.implementation.erp,
                 planner_revision: PLANNER_REVISION.into(),
-                source_sample_interval_ms: self.implementation.source_sample_interval_ms,
                 query_staleness_margin_ms: self.implementation.query_staleness_margin_ms,
                 retained_summary_memory_budget_bytes: Some(
                     self.implementation.max_retained_summary_bytes,
@@ -2374,12 +2396,62 @@ pub(super) fn derived_window_cost(
     }
 }
 
+/// The furthest point in the past that evaluating `expr` can read, in ms.
+///
+/// A range selector and a subquery each evaluate their child over prior
+/// history; a positive offset moves that history further back. The result is a
+/// lower-bound horizon, not a claim that the entire interval is read. For
+/// example, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
+fn query_history_window_ms(expr: &QueryExpr) -> Option<u64> {
+    fn duration_ms(duration: std::time::Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn visit(expr: &QueryExpr, preceding_history_ms: u64) -> u64 {
+        match expr {
+            QueryExpr::PromqlSubquery { range, child, .. }
+            | QueryExpr::TimeRange { range, child } => visit(
+                child,
+                preceding_history_ms.saturating_add(duration_ms(*range)),
+            ),
+            QueryExpr::TimeShift { shift, child } => visit(
+                child,
+                preceding_history_ms.saturating_add(shift.offset_ms.max(0) as u64),
+            ),
+            QueryExpr::PromqlScalarBridge(child)
+            | QueryExpr::PromqlVectorFromScalar(child)
+            | QueryExpr::PromqlScalarFromVector(child)
+            | QueryExpr::PromqlRelabel { child, .. }
+            | QueryExpr::PromqlSeriesSample { child, .. }
+            | QueryExpr::Filter { child, .. }
+            | QueryExpr::Project { child, .. }
+            | QueryExpr::Aggregate { child, .. }
+            | QueryExpr::Dedup { child, .. }
+            | QueryExpr::Sort { child, .. }
+            | QueryExpr::Limit { child, .. } => visit(child, preceding_history_ms),
+            QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            }
+            | QueryExpr::Join { left, right, .. }
+            | QueryExpr::SetOp { left, right, .. } => {
+                visit(left, preceding_history_ms).max(visit(right, preceding_history_ms))
+            }
+            _ => preceding_history_ms,
+        }
+    }
+
+    let history_ms = visit(expr, 0);
+    (history_ms != 0).then_some(history_ms)
+}
+
 /// Every distinct range-selector window in `expr`, as seconds.
 ///
 /// A single query can carry several. `sum(sum_over_time(a[1m])) / sum(sum_over_time(b[5m]))`
 /// has two, and each one becomes its own materialization with its own window.
-/// `time_selection.lookback` is the workload's declared range and is not
-/// required to equal any of them.
+/// These are materialization contracts. Enclosing subquery ranges and offsets
+/// affect a query's furthest lookback but do not change a leaf contract.
 #[cfg(test)]
 fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
     fn visit(expr: &QueryExpr, windows: &mut BTreeSet<u64>) {
@@ -2423,8 +2495,7 @@ fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
 }
 
 /// Derive and price one implementation per supported layout for each range.
-/// Explicit snapshot candidates bypass this path. After logical selection,
-/// derived maintenance cohorts are restricted to their supported full windows;
+/// Derived maintenance cohorts are restricted to their supported full windows;
 /// raw additive pane producers may subsequently be shared by Planner.
 #[cfg(test)]
 fn derived_window_candidates(
@@ -4171,7 +4242,6 @@ pub(crate) mod tests {
             erp: None,
             exact_composition_costs: HashMap::new(),
             planner_revision: PLANNER_REVISION.into(),
-            source_sample_interval_ms: None,
             query_staleness_margin_ms: 0,
             retained_summary_memory_budget_bytes: None,
         })
@@ -5549,6 +5619,42 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    fn derived_query_window_secs(query: &str) -> u64 {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query(query.into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        snapshot.planning_request().unwrap().0.queries[0].window_secs
+    }
+
+    #[test]
+    fn snapshot_rejects_manual_lookback() {
+        let mut wire = serde_json::to_value(planning_snapshot()).unwrap();
+        wire["query_workload"]["repeating_queries"][0]["time_selection"]["lookback"] =
+            60_000.into();
+        let error = serde_json::from_value::<BackendLocalPlanningSnapshot>(wire)
+            .expect_err("manual lookback must not be accepted")
+            .to_string();
+        assert!(error.contains("lookback is not supported"), "{error}");
+    }
+
+    #[test]
+    fn subquery_range_derives_the_query_window() {
+        assert_eq!(
+            derived_query_window_secs("avg_over_time((sum(a))[6h:])"),
+            6 * 60 * 60
+        );
+    }
+
+    #[test]
+    fn offset_extends_the_query_furthest_lookback() {
+        // Evaluated at t, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
+        assert_eq!(
+            derived_query_window_secs("sum_over_time(a[1m] offset 1h)"),
+            61 * 60
+        );
+    }
+
     // A workload evaluated more often than its window is wide must advance its
     // state at that cadence. Planning it as one lookback-wide tumbling window
     // answers with results that only change once per window.
@@ -5944,7 +6050,6 @@ pub(crate) mod tests {
         {
             let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
             entry.query = Query("quantile_over_time(0.5, data[5m])".into());
-            entry.time_selection.lookback = Some(DurationMs(300_000));
             entry.demand = RepeatedDemand::FixedIntervalAt {
                 interval: RepetitionInterval(30_000),
                 evaluation_phase: planner_types::workload::TimestampMs(0),
@@ -6481,7 +6586,7 @@ pub(crate) mod tests {
                 predictability: Predictability::Predictable { known_at: None },
                 time_selection: TimeSelection {
                     scope: QueryTimeScope::RealTime,
-                    lookback: Some(DurationMs(60_000)),
+                    lookback: None,
                     as_of: None,
                 },
             }]),
@@ -6508,7 +6613,7 @@ pub(crate) mod tests {
                     cost: template.window_implementations[0].cost.clone(),
                     quotes: Vec::new(),
                 },
-                source_sample_interval_ms: None,
+                scrape_interval_ms: 1_000,
                 query_staleness_margin_ms: 0,
                 max_retained_summary_bytes: DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
                 topk_evidence: HashMap::new(),

@@ -137,7 +137,8 @@ coverage is a capability miss, never a partial warm success. Inspect the
 per-materialization state and observed coverage through
 `GET /api/v1/physical-plan/status`.
 
-Snapshot schema version `1` currently accepts fixed-interval repeating PromQL
-queries with explicit whole-second lookbacks and fresh ingestion-rate
-evidence. Unsupported snapshot semantics fail startup rather than silently
-inventing cost or placement evidence.
+Snapshot schema version `2` accepts fixed-interval repeating PromQL queries
+with `implementation.scrape_interval_ms` and fresh ingestion-rate evidence.
+Range selectors derive their own lookback; rangeless instant-vector queries use
+the scrape interval. Unsupported snapshot semantics fail startup rather than
+silently inventing cost or placement evidence.

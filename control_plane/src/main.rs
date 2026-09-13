@@ -960,7 +960,6 @@ fn compile_physical_plan_request(
         exact_composition_costs: request.exact_composition_costs,
         erp: request.erp,
         planner_revision: request.planner_revision,
-        source_sample_interval_ms: None,
         query_staleness_margin_ms: 0,
         retained_summary_memory_budget_bytes: None,
     };

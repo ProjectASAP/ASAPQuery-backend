@@ -716,19 +716,6 @@ mod planner_workload_tests {
     use super::*;
     use crate::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
 
-    fn lookback(expr: &Expr) -> u64 {
-        match expr {
-            Expr::MatrixSelector(e) => e.range.as_millis() as u64,
-            Expr::Subquery(e) => (e.range.as_millis() as u64).max(lookback(&e.expr)),
-            Expr::Aggregate(e) => lookback(&e.expr),
-            Expr::Paren(e) => lookback(&e.expr),
-            Expr::Unary(e) => lookback(&e.expr),
-            Expr::Binary(e) => lookback(&e.lhs).max(lookback(&e.rhs)),
-            Expr::Call(e) => e.args.args.iter().map(|e| lookback(e)).max().unwrap_or(0),
-            _ => 0,
-        }
-    }
-
     fn compile_one(query: &str) -> crate::physical::compiler::PhysicalPlan {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
@@ -737,8 +724,6 @@ mod planner_workload_tests {
         let mut entry = fixture["query_workload"]["repeating_queries"][0].clone();
         entry["query"] = query.into();
         entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
-        let window = lookback(&parser::parse(query).unwrap());
-        entry["time_selection"]["lookback"] = (if window == 0 { 300_000 } else { window }).into();
         fixture["query_workload"]["repeating_queries"] = vec![entry].into();
         let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
         let (request, environment) = snapshot
@@ -824,9 +809,6 @@ mod planner_workload_tests {
             let mut entry = template.clone();
             entry["query"] = query.into();
             entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
-            let window = lookback(&parser::parse(query).unwrap());
-            entry["time_selection"]["lookback"] =
-                (if window == 0 { 300_000 } else { window }).into();
             entries.push(entry);
         }
         fixture["query_workload"]["repeating_queries"] = entries.into();
