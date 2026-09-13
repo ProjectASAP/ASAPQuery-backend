@@ -36,7 +36,6 @@ use emit::{emit_for_runtime, AgentRuntime};
 use emit::{generate_agent_collector_config, post_typed_backend_for_role};
 use monitor::{Endpoint, ScrapedData, Scraper, Thresholds, Violation};
 use opamp::{AgentRole, OpampServer, RemoteConfig};
-use physical::allocator::SketchAllocator;
 use physical::colored_dag::emitter::BackendStageConfig;
 use physical::deployment_cost::online as online_cost_model;
 use physical::deployment_cost::online::{init_store as init_online_store, OnlineMetricsStore};
@@ -49,7 +48,6 @@ use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
 use store::{PlanStore, WorkloadStore};
 use types::AgentCollectorConfig;
-use types::StageResourceBudgets;
 use workload::AggRole;
 use workload::WorkloadRegistry;
 
@@ -1110,28 +1108,10 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
 
     let plan = st.planner.plan(&workload, Some(&wc));
 
-    // ── L1→L5: parse → optimise → bind → stage. One algebra pipeline. ───────
-    // When the spec carries a `query_string`, this is the single place the
-    // algebra runs: parse to canonical L3, optimise, bind to the L4
-    // `PhysicalExpr`, and derive the L5 artifacts from that one tree —
-    //   * `bound_physical` → the typed L5 stage-split (below) — the L5;
-    //   * `plan_summary`   → the cost summary in the JSON response.
-    // The SP-3 flat assignment in `plan` remains the fallback when there
-    // is no `query_string`.
-    let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
-    let budgets = StageResourceBudgets::from_workload_chars(&wc);
-    // Everything that touches `physical::post_asap::PhysicalExpr` (which
-    // carries `Rc<planner_types::post_asap::SummaryNode>` since Step B of the
-    // plan-shaped-serving migration adopted ASAPController's own
-    // `Rc`-based DAG sharing) is scoped to this block and resolved down
-    // to Send-safe outputs (`Option<PlanSummary>`,
-    // `Option<HashMap<StageId, StageConfig>>`) *before* any `.await`
-    // below — an `Rc` alive in this `async fn`'s generator state at a
-    // yield point would make its `Future` `!Send`, breaking
-    // `axum::Handler`.
-    let (plan_summary, stage_configs) = {
+    // Derive deployment configs from the bound query. Keep its Rc-backed DAG
+    // scoped before any await so the handler future remains Send.
+    let stage_configs = {
         let mut bound_physical: Option<control_plane::physical::post_asap::PhysicalExpr> = None;
-        let mut plan_summary = None;
         if let Some(ref qs) = query_string {
             match parse_query_expr_canonical(qs, workload.accuracy.clone()) {
                 Err(e) => {
@@ -1145,9 +1125,6 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                         workload.accuracy.clone(),
                     )
                     .ok();
-                    // Cost summary for the JSON response.
-                    let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(qe);
-                    plan_summary = Some(plan_node.summarise(raw_bps));
                 }
             }
         }
@@ -1165,7 +1142,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             None
         };
 
-        (plan_summary, stage_configs)
+        stage_configs
     };
 
     // B2 (metric, role): derive the role from the request's
@@ -1379,8 +1356,6 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             .await;
     }
 
-    // `plan_summary` was computed in the single algebra pipeline above.
-
     let agents = st.opamp.connected_agents().await;
     let cost = &plan.transmission_cost_summary;
     (
@@ -1402,7 +1377,6 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                 "estimated_fill_rate":                  cost.estimated_fill_rate,
                 "flush_rate_hz":                        cost.flush_rate_hz,
             },
-            "plan_summary": plan_summary,
         })),
     )
         .into_response()
@@ -2469,6 +2443,8 @@ mod api_tests {
         assert_eq!(body["metric"], "latency");
         assert!(body["sketch_type"].as_str().is_some());
         assert!(body["valid_until"].as_str().is_some());
+        assert!(body.get("plan_summary").is_none());
+        assert!(body["transmission_costs"].is_object());
     }
 
     /// HTTP and stored replan inputs share the resolved typed target, including delta.
