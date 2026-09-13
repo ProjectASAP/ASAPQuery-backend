@@ -27,6 +27,8 @@ cross-repository interfaces live in
 ## Control plane
 
 - [Physical compiler](control-plane/physical-compiler.md)
+- [Planning terminology and architecture](control-plane/planning-terminology.md)
+- [Architecture naming review (中文)](control-plane/architecture-naming-review.zh.md)
 - [Plan publication](control-plane/plan-publication.md)
 - [Workload inputs](control-plane/workload-inputs.md)
 - [Runtime accuracy feedback](control-plane/runtime-accuracy-feedback.md)
