@@ -757,19 +757,15 @@ async fn main() -> Result<()> {
 
     // Query execution reads generation-consistent runtime configuration from
     // the ActivePhysicalPlan installed below.
-    let engine = {
-        let engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
-            // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
-            // SketchStore to the query engine so SeriesLookup classification
-            // drives the Phase 6 archive failover via
-            // EngineError::CapabilityMiss when the ASAP tier is empty
-            // / ghost / unknown.
-            .with_sketch_index(sketch_index.clone())
-            .with_active_physical_plan(active_physical_plan.clone())
-            .with_exact_subquery_endpoint(args.prometheus_server.clone())
-            .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
-        engine
-    };
+    // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier SketchStore to the
+    // query engine so SeriesLookup classification drives the Phase 6 archive
+    // failover via EngineError::CapabilityMiss when the ASAP tier is empty /
+    // ghost / unknown.
+    let engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
+        .with_sketch_index(sketch_index.clone())
+        .with_active_physical_plan(active_physical_plan.clone())
+        .with_exact_subquery_endpoint(args.prometheus_server.clone())
+        .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
 
     // Setup precompute engine. Backend ingest is OTLP-only — the
     // precompute engine no longer hosts an HTTP listener of its own; the
