@@ -356,6 +356,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
             rhs: child.clone(),
             operator: BinaryOperator {
                 checked_relative_division: false,
+                checked_finite_division: false,
                 kind: BinaryOpKind::Arithmetic(planner_types::pre_asap::ArithmeticOpKind::Div),
                 vector_match: None,
             },

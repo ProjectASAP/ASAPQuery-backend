@@ -621,7 +621,10 @@ where
                 rhs,
                 operator,
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
-            } if self.logical_source.is_some() || operator.checked_relative_division => {
+            } if self.logical_source.is_some()
+                || operator.checked_relative_division
+                || operator.checked_finite_division =>
+            {
                 let operator = logical::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,

@@ -3757,6 +3757,33 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("row-update executor"), "{error}");
     }
 
+    // Compiler preserves the Planner's conditional-average execution guard.
+    #[test]
+    fn temporal_average_lowers_with_finite_division_guard() {
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.collector_ids.clear();
+        let request = request("average", "avg_over_time(a[1m])");
+        let plan = PhysicalCompiler.compile(request, environment).unwrap();
+        assert!(
+            plan.query_plan
+                .entries
+                .values()
+                .flat_map(|e| e.nodes.values())
+                .any(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::Logical {
+                        operator: asap_types::query_plan::logical::LogicalOperator::Binary {
+                            operation: asap_types::query_plan::logical::BinaryOperation::FiniteDiv,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+            "{plan:#?}"
+        );
+    }
+
     // The Planner's minimum state lowers without reconstructing direction from text.
     #[test]
     fn minimum_retains_its_typed_direction() {
@@ -5448,6 +5475,7 @@ pub(crate) mod tests {
                 rhs: selected.clone(),
                 operator: planner_types::post_asap::BinaryOperator {
                     checked_relative_division: false,
+                    checked_finite_division: false,
                     kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
                         planner_types::pre_asap::ArithmeticOpKind::Add,
                     ),

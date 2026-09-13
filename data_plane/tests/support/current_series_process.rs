@@ -343,5 +343,32 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
             "{body}"
         );
     }
+    // Keep one series fresh while all members last seen at `end` hit the exact
+    // left lookback boundary. Native Prometheus 3.5 must agree for every readout.
+    let updates: Vec<_> = (60_000..=300_000)
+        .step_by(60_000)
+        .map(|offset| (end + offset, 9.0))
+        .collect();
+    let wire = WriteRequest {
+        timeseries: vec![series_with_labels(
+            "a",
+            &[("pod", "y"), ("job", "api")],
+            &updates,
+        )],
+    };
+    if let Some(url) = &native {
+        assert_eq!(remote_write(&client, url, &wire).await, 204);
+    }
+    assert_eq!(remote_write(&client, &base, &wire).await, 204);
+    for text in &queries {
+        let body = query(&client, &base, text, end + 300_000).await;
+        assert!(is_warm(&body), "{text}: {body}");
+        assert_eq!(
+            body["data"]["result"].as_array().unwrap().len(),
+            1,
+            "{text}: {body}"
+        );
+        compare_native(&client, &native, text, end + 300_000, &body).await;
+    }
     task.abort();
 }

@@ -99,6 +99,8 @@ pub enum BinaryOperation {
     Div,
     /// Division with the Planner relative-value certificate domain checks.
     CheckedDiv,
+    /// Division for conditional exact rewrites: finite inputs and finite output.
+    FiniteDiv,
     Mod,
     Pow,
     Equal,

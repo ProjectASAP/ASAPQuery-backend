@@ -549,6 +549,7 @@ mod tests {
                 rhs: child.clone(),
                 operator: planner_types::post_asap::BinaryOperator {
                     checked_relative_division: false,
+                    checked_finite_division: false,
                     kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
                         planner_types::pre_asap::ArithmeticOpKind::Div,
                     ),

@@ -85,3 +85,8 @@ The UnivMon process test also installs one shared materialization for distinct,
 frequency L2 and entropy with identical input/window/parameters, checks all three
 readouts against held-out raw values, and checks readout-specific missing-evidence
 fallback. This establishes sharing and correctness, not a measured speedup.
+
+Current-series lookback follows Prometheus 3.5: `(evaluation - 5m, evaluation]`.
+Expiration removes members at the lower boundary, and admission does not reinsert
+samples at that boundary. The process regression compares every shared readout
+with native Prometheus when only one series remains fresh.

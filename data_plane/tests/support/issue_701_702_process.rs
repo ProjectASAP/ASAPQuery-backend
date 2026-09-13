@@ -341,3 +341,143 @@ async fn issue_workloads_execute_warm_at_successive_evaluations() {
         }
     }
 }
+
+// Finite input can overflow sum; the installed average must fall back while zero stays warm.
+#[tokio::test]
+async fn temporal_average_overflow_falls_back_after_state_is_warm() {
+    let native = std::env::var("ASAP_CURRENT_SERIES_PROMETHEUS_URL").ok();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", listener.local_addr().unwrap());
+    let mock = tokio::spawn(async move {
+        axum::serve(listener, Router::new()
+            .route("/-/healthy", get(|| async { "healthy" }))
+            .route("/api/v1/query", get(|| async { Json(serde_json::json!({"status":"success", "data":{"resultType":"vector", "result":[{"metric":{},"value":[0,"1e308"]}]}})) })))
+            .await.unwrap();
+    });
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "../../../docs/examples/asapquery-planning-snapshot.json"
+    ))
+    .unwrap();
+    fixture["implementation"]["source_sample_interval_ms"] = 1000.into();
+    let template = fixture["query_workload"]["repeating_queries"][0].clone();
+    fixture["query_workload"]["repeating_queries"] = ["avg", "sum", "count"]
+        .map(|op| {
+            let mut entry = template.clone();
+            entry["query"] = format!("{op}_over_time(average_overflow[5s])").into();
+            entry["time_selection"]["lookback"] = 5000.into();
+            entry["demand"]["fixed_interval_at"]["interval"] = 1000.into();
+            entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
+            entry
+        })
+        .to_vec()
+        .into();
+    let snapshot = quote_snapshot_for_test(serde_json::from_value(fixture).unwrap());
+    let plan = snapshot.clone().compile().unwrap();
+    assert!(plan
+        .query_plan
+        .entries
+        .values()
+        .flat_map(|entry| entry.nodes.values())
+        .any(|node| matches!(
+            node,
+            control_plane::query_plan::QueryPlanNode::Logical {
+                operator: control_plane::query_plan::logical::LogicalOperator::Binary {
+                    operation: control_plane::query_plan::logical::BinaryOperation::FiniteDiv,
+                    ..
+                },
+                ..
+            }
+        )));
+    let output = tempfile::tempdir().unwrap();
+    let path = output.path().join("snapshot.json");
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let port = unused_port();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
+    command
+        .args(["--profile", "asapquery", "--planning-snapshot"])
+        .arg(&path)
+        .args(["--http-port", &port.to_string(), "--output-dir"])
+        .arg(output.path())
+        .args([
+            "--precompute-allowed-lateness-ms",
+            "0",
+            "--precompute-flush-interval-ms",
+            "25",
+            "--prometheus-server",
+            native.as_deref().unwrap_or(&mock_url),
+            "--forward-unsupported-queries",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let mut child = ChildGuard(command.spawn().unwrap());
+    let client = reqwest::Client::new();
+    let backend = format!("http://127.0.0.1:{port}");
+    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let origin = now - now.rem_euclid(1000) - 60_000;
+    for (start, end, value) in [(1, 6, 0.0), (7, 12, 1e308)] {
+        let samples: Vec<_> = (start..=end).map(|i| (origin + i * 1000, value)).collect();
+        let wire = WriteRequest {
+            timeseries: vec![series_with_labels("average_overflow", &[], &samples)],
+        };
+        if let Some(url) = &native {
+            assert_eq!(remote_write(&client, url, &wire).await, 204);
+        }
+        assert_eq!(remote_write(&client, &backend, &wire).await, 204);
+        let at = (origin + (end - 1) * 1000) as f64 / 1000.0;
+        for op in ["sum", "count"] {
+            wait_for_issue_warm_instant(
+                &client,
+                &backend,
+                &format!("{op}_over_time(average_overflow[5s])"),
+                at,
+                &output.path().join("query_engine.log"),
+            )
+            .await;
+        }
+        let query = "avg_over_time(average_overflow[5s])";
+        if value == 0.0 {
+            let result = wait_for_issue_warm_instant(
+                &client,
+                &backend,
+                query,
+                at,
+                &output.path().join("query_engine.log"),
+            )
+            .await;
+            assert_eq!(first_value(&result, "value"), Some(0.0));
+        } else {
+            let params = [("query", query.to_string()), ("time", at.to_string())];
+            let actual: Value = client
+                .get(format!("{backend}/api/v1/query"))
+                .query(&params)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                !is_warm(&actual),
+                "overflowed average must fall back: {actual}"
+            );
+            assert_eq!(first_value(&actual, "value"), Some(1e308), "{actual}");
+            if let Some(url) = &native {
+                let expected: Value = client
+                    .get(format!("{url}/api/v1/query"))
+                    .query(&params)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(actual["data"], expected["data"]);
+            }
+        }
+    }
+    mock.abort();
+}

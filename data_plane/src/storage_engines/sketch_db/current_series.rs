@@ -104,7 +104,7 @@ impl Population {
     }
     fn expire(&mut self, cutoff: i64) {
         while let Some((timestamp, labels)) = self.expiry.first().cloned() {
-            if timestamp >= cutoff {
+            if timestamp > cutoff {
                 break;
             }
             self.remove(&labels);
@@ -113,7 +113,7 @@ impl Population {
     fn update(&mut self, sample: &CanonicalSample, cutoff: i64) {
         if self.unavailable
             || sample.metric.as_ref() != self.definition.metric
-            || sample.timestamp_ms < cutoff
+            || sample.timestamp_ms <= cutoff
         {
             return;
         }
@@ -569,8 +569,8 @@ mod tests {
                 .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 600_000)
                 .unwrap()
                 .len(),
-            2
-        ); // inclusive lookback boundary
+            1
+        ); // Prometheus 3.5 lookback is left-open
         assert_eq!(
             store
                 .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 600_001)
@@ -599,5 +599,34 @@ mod tests {
             )
             .unwrap_err()
             .contains("budget"));
+    }
+
+    // Prometheus 3.5 selectors exclude samples exactly at evaluation - lookback.
+    #[test]
+    fn lookback_left_boundary_expires_members_for_all_shared_readouts() {
+        let p = definition();
+        let plan = plan(&p);
+        let mut store = CurrentSeriesStore::default();
+        warm(&mut store, &plan);
+        for t in (360_000..=600_000).step_by(60_000) {
+            store.ingest(&plan, &[sample("y", "api", t, Some(9.))]);
+        }
+        for (readout, expected) in [
+            (SeriesReadout::Count, 1.0),
+            (SeriesReadout::Sum, 9.0),
+            (SeriesReadout::Average, 9.0),
+            (SeriesReadout::Quantile { q: 0.5 }, 9.0),
+        ] {
+            let rows = store.read((7, 1), &p, &readout, 600_000).unwrap();
+            assert_eq!(
+                rows,
+                vec![(BTreeMap::from([("job".into(), "api".into())]), expected)]
+            );
+        }
+        let rows = store
+            .read((7, 1), &p, &SeriesReadout::TopK { k: 3 }, 600_000)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0["pod"], "y");
     }
 }

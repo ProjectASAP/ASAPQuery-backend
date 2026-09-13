@@ -95,3 +95,23 @@ Validation on 2026-09-12:
 
 These are correctness results. No measured performance win is claimed. The
 separately ignored Collector schema integration remains outside these fixes.
+
+## Review follow-up: lookback boundary and average overflow
+
+The exact lower lookback boundary now expires current-series members, matching
+Prometheus 3.5. A regression covers count, sum, average, quantile and TopK when
+all but one series reach that boundary.
+
+Temporal average no longer exports an unconditional sum/count logical rewrite.
+Planner marks the physical division with `checked_finite_division`; the compiler
+retains it as `FiniteDiv`. Nonfinite operands/results or a zero divisor trigger
+the original-query fallback. A zero or subnormal finite average remains eligible.
+The production HTTP test first waits for both sum and count state to become warm,
+then verifies that overflowing `1e308` samples return the native finite average.
+
+Validation on 2026-09-13: backend workspace library tests passed (2,102); the
+Prometheus 3.5 compatibility process suite passed 15 tests with the existing
+Collector-schema test ignored; workspace/all-targets clippy passed with warnings
+denied. Planner workspace unit/integration tests passed, and the workspace
+doctests passed on a separate run after a transient cached-crate lookup failure.
+The Planner's GitHub test and format/lint checks also passed.

@@ -329,6 +329,7 @@ mod tests {
             timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
             operator: BinaryOperator {
                 checked_relative_division: false,
+                checked_finite_division: false,
                 kind: BinaryOpKind::Arithmetic(ArithmeticOpKind::Sub),
                 vector_match: None,
             },

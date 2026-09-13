@@ -552,7 +552,10 @@ fn binary(
     left: Value,
     right: Value,
 ) -> Result<Value, EngineError> {
-    if operation == BinaryOperation::CheckedDiv {
+    if matches!(
+        operation,
+        BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv
+    ) {
         let valid = |value: &Value, denominator: bool| match value {
             Value::Scalar(v) => v.is_finite() && (!denominator || *v != 0.0),
             Value::Vector(rows) => rows
@@ -562,19 +565,28 @@ fn binary(
         };
         if boolean || !valid(&left, false) || !valid(&right, true) {
             return Err(miss(
-                "relative division domain requires finite operands and a nonzero divisor",
+                "checked division requires finite operands and a nonzero divisor",
             ));
         }
         let result = binary(BinaryOperation::Div, false, left, right)?;
+        let valid_result = |v: &f64| {
+            if operation == BinaryOperation::FiniteDiv {
+                v.is_finite()
+            } else {
+                v.is_normal()
+            }
+        };
         let normal = match &result {
-            Value::Scalar(v) => v.is_normal(),
-            Value::Vector(rows) => rows.iter().all(|(_, v)| v.is_normal()),
+            Value::Scalar(v) => valid_result(v),
+            Value::Vector(rows) => rows.iter().all(|(_, v)| valid_result(v)),
             Value::Matrix(..) => false,
         };
         return if normal {
             Ok(result)
         } else {
-            Err(miss("relative division result requires exact evaluation outside normal floating-point range"))
+            Err(miss(
+                "checked division result is outside the declared floating-point domain",
+            ))
         };
     }
     let arithmetic = matches!(
@@ -773,6 +785,44 @@ mod topk_tests {
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect()
+    }
+
+    // An overflowing sum cannot implement average, but zero/subnormal averages remain valid.
+    #[test]
+    fn finite_division_guards_temporal_average_without_rejecting_zero() {
+        let mut sum = crate::precompute_engine::operators::sum_accumulator::SumAccumulator::new();
+        sum.update(1e308);
+        sum.update(1e308);
+        assert!(binary(
+            BinaryOperation::FiniteDiv,
+            false,
+            Value::Scalar(sum.sum),
+            Value::Scalar(2.0)
+        )
+        .is_err());
+        for (a, b, expected) in [
+            (0.0, 2.0, 0.0),
+            (10.0, 2.0, 5.0),
+            (f64::MIN_POSITIVE, 2.0, f64::MIN_POSITIVE / 2.0),
+        ] {
+            let Value::Scalar(value) = binary(
+                BinaryOperation::FiniteDiv,
+                false,
+                Value::Scalar(a),
+                Value::Scalar(b),
+            )
+            .unwrap() else {
+                panic!("scalar")
+            };
+            assert_eq!(value, expected);
+        }
+        assert!(binary(
+            BinaryOperation::FiniteDiv,
+            false,
+            Value::Scalar(1.0),
+            Value::Scalar(0.0)
+        )
+        .is_err());
     }
 
     // A conditional accuracy certificate must fall back rather than return an unbounded ratio.
