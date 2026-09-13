@@ -13,7 +13,6 @@ pub mod runtime_capability;
 pub mod sketch_catalog;
 pub mod stage_split;
 pub mod summary_catalog;
-pub mod summary_reconcile;
 pub mod topology;
 pub mod workload_cost;
 pub mod workload_planner;
