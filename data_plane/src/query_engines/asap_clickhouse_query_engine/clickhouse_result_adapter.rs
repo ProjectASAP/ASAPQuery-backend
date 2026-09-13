@@ -308,113 +308,6 @@ pub fn raw_response(response: ClickHouseRawResponse) -> Response {
     output
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::{
-        array::{Int64Array, StringArray},
-        datatypes::{DataType, Field, Schema},
-    };
-    use std::sync::Arc;
-
-    #[test]
-    fn nullable_fields_remain_explicit_in_json_and_tsv() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("value", DataType::Float64, true),
-                Field::new("label", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(Float64Array::from(vec![Some(1.25), None, Some(2.5)])),
-                Arc::new(StringArray::from(vec![Some(""), None, Some("\\N")])),
-            ],
-        )
-        .unwrap();
-        let result = ClickHouseQueryResult {
-            batches: vec![batch],
-        };
-        let json: serde_json::Value =
-            serde_json::from_slice(&result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
-        assert_eq!(
-            json["data"],
-            serde_json::json!([{ "value":1.25,"label":"" }, { "value":null,"label":null }, {"value":2.5,"label":"\\N"}])
-        );
-        let lines = result.encode(ClickHouseFormat::JsonEachRow).unwrap();
-        let null_row: serde_json::Value =
-            serde_json::from_slice(lines.split(|byte| *byte == b'\n').nth(1).unwrap()).unwrap();
-        assert_eq!(null_row, serde_json::json!({"value":null,"label":null}));
-        assert_eq!(
-            result.encode(ClickHouseFormat::TabSeparated).unwrap(),
-            b"1.25\t\n\\N\t\\N\n2.5\t\\\\N\n"
-        );
-    }
-
-    #[test]
-    fn empty_map_bottom_type_uses_clickhouse_nothing() {
-        let entries = DataType::Struct(
-            vec![
-                Field::new("key", DataType::Null, false),
-                Field::new("value", DataType::Null, false),
-            ]
-            .into(),
-        );
-        let dtype = DataType::Map(Arc::new(Field::new("entries", entries, false)), false);
-        assert_eq!(clickhouse_type(&dtype, false), "Map(Nothing, Nothing)");
-        assert_eq!(clickhouse_type(&DataType::Null, true), "Nullable(Nothing)");
-    }
-
-    #[test]
-    fn map_timestamp_transport_is_not_assumed_to_match_native_formatting() {
-        let entries = DataType::Struct(
-            vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new(
-                    "value",
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-                    false,
-                ),
-            ]
-            .into(),
-        );
-        let dtype = DataType::Map(Arc::new(Field::new("entries", entries, false)), false);
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("m", dtype.clone(), false)])),
-            vec![arrow::array::new_empty_array(&dtype)],
-        )
-        .unwrap();
-        let result = ClickHouseQueryResult {
-            batches: vec![batch],
-        };
-        assert!(result.encode(ClickHouseFormat::Json).is_err());
-        assert!(result.encode(ClickHouseFormat::TabSeparated).is_err());
-    }
-
-    #[test]
-    fn encodes_table_without_using_promql_query_result() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("zone", DataType::Utf8, false),
-            Field::new("count", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a\tb"])),
-                Arc::new(Int64Array::from(vec![7])),
-            ],
-        )
-        .unwrap();
-        let result = ClickHouseQueryResult {
-            batches: vec![batch],
-        };
-        assert_eq!(
-            result.encode(ClickHouseFormat::TabSeparated).unwrap(),
-            b"a\\tb\t7\n"
-        );
-        assert!(result.encode(ClickHouseFormat::JsonEachRow).is_err());
-        assert!(result.encode(ClickHouseFormat::Json).is_err());
-    }
-}
-
 struct JsonArrowRows<'a>(&'a [RecordBatch]);
 impl Serialize for JsonArrowRows<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -584,5 +477,112 @@ fn map_literal(array: &dyn Array, row: usize) -> Result<String, ClickHouseResult
         )),
         _ => array_value_to_string(array, row)
             .map_err(|error| ClickHouseResultError::Arrow(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn nullable_fields_remain_explicit_in_json_and_tsv() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Float64, true),
+                Field::new("label", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(1.25), None, Some(2.5)])),
+                Arc::new(StringArray::from(vec![Some(""), None, Some("\\N")])),
+            ],
+        )
+        .unwrap();
+        let result = ClickHouseQueryResult {
+            batches: vec![batch],
+        };
+        let json: serde_json::Value =
+            serde_json::from_slice(&result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
+        assert_eq!(
+            json["data"],
+            serde_json::json!([{ "value":1.25,"label":"" }, { "value":null,"label":null }, {"value":2.5,"label":"\\N"}])
+        );
+        let lines = result.encode(ClickHouseFormat::JsonEachRow).unwrap();
+        let null_row: serde_json::Value =
+            serde_json::from_slice(lines.split(|byte| *byte == b'\n').nth(1).unwrap()).unwrap();
+        assert_eq!(null_row, serde_json::json!({"value":null,"label":null}));
+        assert_eq!(
+            result.encode(ClickHouseFormat::TabSeparated).unwrap(),
+            b"1.25\t\n\\N\t\\N\n2.5\t\\\\N\n"
+        );
+    }
+
+    #[test]
+    fn empty_map_bottom_type_uses_clickhouse_nothing() {
+        let entries = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Null, false),
+                Field::new("value", DataType::Null, false),
+            ]
+            .into(),
+        );
+        let dtype = DataType::Map(Arc::new(Field::new("entries", entries, false)), false);
+        assert_eq!(clickhouse_type(&dtype, false), "Map(Nothing, Nothing)");
+        assert_eq!(clickhouse_type(&DataType::Null, true), "Nullable(Nothing)");
+    }
+
+    #[test]
+    fn map_timestamp_transport_is_not_assumed_to_match_native_formatting() {
+        let entries = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new(
+                    "value",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                    false,
+                ),
+            ]
+            .into(),
+        );
+        let dtype = DataType::Map(Arc::new(Field::new("entries", entries, false)), false);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", dtype.clone(), false)])),
+            vec![arrow::array::new_empty_array(&dtype)],
+        )
+        .unwrap();
+        let result = ClickHouseQueryResult {
+            batches: vec![batch],
+        };
+        assert!(result.encode(ClickHouseFormat::Json).is_err());
+        assert!(result.encode(ClickHouseFormat::TabSeparated).is_err());
+    }
+
+    #[test]
+    fn encodes_table_without_using_promql_query_result() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("zone", DataType::Utf8, false),
+            Field::new("count", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a\tb"])),
+                Arc::new(Int64Array::from(vec![7])),
+            ],
+        )
+        .unwrap();
+        let result = ClickHouseQueryResult {
+            batches: vec![batch],
+        };
+        assert_eq!(
+            result.encode(ClickHouseFormat::TabSeparated).unwrap(),
+            b"a\\tb\t7\n"
+        );
+        assert!(result.encode(ClickHouseFormat::JsonEachRow).is_err());
+        assert!(result.encode(ClickHouseFormat::Json).is_err());
     }
 }

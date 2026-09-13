@@ -25,7 +25,7 @@ pub enum DataDistribution {
 
 /// Observable characteristics of the incoming data stream.
 ///
-/// Callers supply these alongside a [`QueryWorkload`] so the planner can
+/// Callers supply these alongside a [`LegacyMetricWorkload`] so the planner can
 /// compare raw vs. sketch-full vs. sketch-delta transmission costs and
 /// estimate the CPU / memory overhead at the SDK or agent collector.
 ///
@@ -263,7 +263,7 @@ impl std::fmt::Display for ProcessorMode {
 // ── Core types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub struct QueryWorkload {
+pub struct LegacyMetricWorkload {
     pub metric_name: String,
     pub label_filters: HashMap<String, String>,
     pub group_by_labels: Vec<String>,
@@ -287,7 +287,7 @@ pub struct QueryWorkload {
     pub quantiles: Vec<f64>,
 }
 
-impl QueryWorkload {
+impl LegacyMetricWorkload {
     /// Scalar sizing input for legacy cost formulas, not a confidence guarantee.
     pub fn error_bound(&self) -> f64 {
         match self.accuracy {
@@ -656,3 +656,6 @@ pub struct CollectionPlan {
     /// Bandwidth and overhead estimates for all three transmission strategies.
     pub transmission_cost_summary: TransmissionCostSummary,
 }
+
+#[deprecated(note = "Use LegacyMetricWorkload; canonical workloads are Planner-owned")]
+pub use LegacyMetricWorkload as QueryWorkload;

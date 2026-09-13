@@ -1026,7 +1026,7 @@ mod tests {
                 window_secs: 60,
                 abstract_window_framework:
                     planner_types::post_asap::SummaryWindowFramework::Tumbling,
-                window_implementation_id: "collector-tumbling-v1".into(),
+                window_realization_id: "collector-tumbling-v1".into(),
                 slide_secs: 60,
                 pane_origin_ms: Some(0),
                 window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },

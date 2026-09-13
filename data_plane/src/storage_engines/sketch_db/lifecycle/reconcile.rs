@@ -27,7 +27,7 @@
 //! equal so they're never retired by this path. That matches the
 //! pre-retirement behavior: `SchemaRegistry::reconcile` only retired
 //! agg_ids in its own registry, which mirrored the
-//! `StreamingConfig.aggregation_configs` map (also precompute-only).
+//! `StreamingConfig.materializations_by_policy_fingerprint` map (also precompute-only).
 //! Sketch lifecycle stays driven by the control plane's eviction RPC
 //! until M3 unifies the two.
 
@@ -96,7 +96,7 @@ pub fn reconcile_from_streaming_config(
     // First pass: find orphaned Active sids without cloning the
     // catalog. `reconcile_from_streaming_config` runs on every ingest
     // batch, and the old `snapshot_instances()` here deep-cloned every
-    // `SketchInstanceMetadata` (String + BTreeSet<String> + AggKind)
+    // `SummarySeriesMetadata` (String + BTreeSet<String> + AggKind)
     // on each call — the dominant ingest-path CPU cost in profiling
     // (BTreeMap/String clone + malloc churn). We only need to read each
     // instance's signature under the read lock; collect just the cheap
@@ -203,7 +203,7 @@ fn signature_from_agg_config(cfg: &AggregationConfig) -> Vec<u8> {
 
 fn build_live_signature_set(config: &StreamingConfig) -> HashSet<Vec<u8>> {
     config
-        .get_all_aggregation_configs()
+        .materializations()
         .values()
         .map(signature_from_agg_config)
         .collect()
@@ -295,7 +295,7 @@ mod tests {
     use asap_types::KeyByLabelNames;
 
     use crate::storage_engines::sketch_db::data::AggKind;
-    use crate::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
+    use crate::storage_engines::sketch_db::index::{SketchStore, SummarySeriesMetadata};
 
     fn agg_config(
         metric: &str,
@@ -326,9 +326,9 @@ mod tests {
         metric: &str,
         agg_type: AggregationType,
         group_by: Vec<&str>,
-    ) -> SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys,
@@ -432,9 +432,9 @@ mod tests {
         kind: crate::storage_engines::sketch_db::data::SketchAlgorithm,
         config: crate::storage_engines::sketch_db::data::SketchConfig,
         group_by: Vec<&str>,
-    ) -> SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys,

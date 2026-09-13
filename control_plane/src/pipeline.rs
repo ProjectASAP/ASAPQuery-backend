@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::query_parser;
-use crate::types::{AggType, QueryWorkload, SketchType, WorkloadCharacteristics};
+use crate::types::{AggType, LegacyMetricWorkload, SketchType, WorkloadCharacteristics};
 use crate::types_v2::{AccuracyTarget, DataShape, QueryId, QueryLanguage, QueryShape};
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -122,7 +122,7 @@ impl Analyzer {
         Self
     }
 
-    pub fn analyze(&self, spec: QuerySpec) -> anyhow::Result<QueryWorkload> {
+    pub fn analyze(&self, spec: QuerySpec) -> anyhow::Result<LegacyMetricWorkload> {
         let accuracy =
             crate::types_v2::resolve_accuracy_target(spec.accuracy.as_ref(), spec.accuracy_sla)
                 .map_err(|error| anyhow!(error))?;
@@ -266,7 +266,7 @@ impl Analyzer {
             &spec.deployment_model,
         );
 
-        Ok(QueryWorkload {
+        Ok(LegacyMetricWorkload {
             metric_name,
             label_filters: merged_filters,
             group_by_labels: all_group_by,
@@ -628,14 +628,14 @@ mod tests {
 
     /// Typed `accuracy: Some(Epsilon(0.05))` overrides the legacy
     /// `accuracy_sla: 0.99` (which would translate to `Epsilon(0.01)`),
-    /// and the resolved value flows through to `QueryWorkload.accuracy_sla`.
+    /// and the resolved value flows through to `LegacyMetricWorkload.accuracy_sla`.
     #[test]
     fn typed_accuracy_overrides_legacy_accuracy_sla() {
         let mut spec = basic_spec();
         spec.accuracy_sla = 0.99; // legacy: ε = 0.01
         spec.accuracy = Some(AccuracyTarget::Epsilon(0.05));
         let w = Analyzer::new().analyze(spec).unwrap();
-        // The resolved 1.0 - 0.05 = 0.95 must reach the QueryWorkload, not
+        // The resolved 1.0 - 0.05 = 0.95 must reach the LegacyMetricWorkload, not
         // the legacy 0.99.
         assert!(
             (w.accuracy_sla - 0.95).abs() < 1e-9,

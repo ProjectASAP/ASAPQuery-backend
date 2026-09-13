@@ -281,7 +281,7 @@ mod tests {
     use super::*;
 
     // Shared installation metadata must be safe to retain in cross-thread
-    // ActivePhysicalPlan snapshots without importing the compiler crate.
+    // RuntimePhysicalPlan snapshots without importing the compiler crate.
     #[test]
     fn installed_contract_is_send_sync_and_preserves_wire_identity() {
         fn send_sync<T: Send + Sync>() {}

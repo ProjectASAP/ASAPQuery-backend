@@ -95,7 +95,7 @@ pub struct ParetoPoint {
 /// If `online_store` is `Some` the scoring uses EMA-blended costs; otherwise
 /// it falls back to the static benchmark table.
 pub fn pareto_frontier(
-    workload: &QueryWorkload,
+    workload: &LegacyMetricWorkload,
     wc: &WorkloadCharacteristics,
     weights: ObjectiveWeights,
     online_store: Option<&online::OnlineMetricsStore>,
@@ -182,7 +182,7 @@ fn all_sketch_types() -> Vec<SketchType> {
 fn apply_delta(
     st: SketchType,
     plan: &mut CollectionPlan,
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
     wc: &WorkloadCharacteristics,
     table: &HashMap<SketchType, SketchCosts>,
 ) {
@@ -241,8 +241,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn quantile_workload() -> QueryWorkload {
-        QueryWorkload {
+    fn quantile_workload() -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: "latency".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn tight_sla_excludes_inaccurate_sketches() {
-        let w = QueryWorkload {
+        let w = LegacyMetricWorkload {
             accuracy_sla: 0.001, // very tight — only DDSketch at 0.1% accuracy can meet this
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.001),
             ..quantile_workload()

@@ -40,9 +40,6 @@ pub mod dag;
 pub mod emitter;
 pub mod stage_id;
 
-#[cfg(test)]
-mod tests;
-
 // Re-exports — `crate::physical::colored_dag::*` for downstream callers.
 // The historical `crate::physical::colored_dag::*` path is preserved via a
 // re-export in `lib.rs` so existing callers see no source-level break.
@@ -54,3 +51,6 @@ pub use emitter::{
     PrometheusArchiveMetric, StageConfig, ThreeStageEmitter,
 };
 pub use stage_id::{StageId, Topology};
+
+#[cfg(test)]
+mod tests;

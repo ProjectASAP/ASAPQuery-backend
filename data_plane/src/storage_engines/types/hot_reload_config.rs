@@ -7,7 +7,7 @@
 //!
 //! ## How the pieces see the swap
 //!
-//! Runtime bootstrap readers share clones of the same `HotReloadStreamingConfig`
+//! Runtime bootstrap readers share clones of the same `StreamingConfigHandle`
 //! handle (internally `Arc<ArcSwap<StreamingConfig>>`), so they
 //! observe the swap at the same instant:
 //!
@@ -23,7 +23,7 @@
 //!   `GroupState` for them.
 //!
 //! Query execution obtains its generation-consistent runtime configuration,
-//! query plan, and catalog from `ActivePhysicalPlan` instead of this handle.
+//! query plan, and catalog from `RuntimePhysicalPlan` instead of this handle.
 //!
 //! ## Config-upgrade contract for the control plane
 //!
@@ -83,9 +83,9 @@ use arc_swap::ArcSwap;
 use crate::storage_engines::types::StreamingConfig;
 
 /// One immutable, generation-consistent runtime snapshot. Every execution
-/// subsystem must project its view from the same `Arc<ActivePhysicalPlan>`.
+/// subsystem must project its view from the same `Arc<RuntimePhysicalPlan>`.
 #[derive(Debug, Clone)]
-pub struct ActivePhysicalPlan {
+pub struct RuntimePhysicalPlan {
     /// Authoritative generation and lifecycle identity shared by every plan
     /// projection in this immutable snapshot.
     pub envelope: asap_types::precompute_plan::PlanEnvelope,
@@ -93,12 +93,12 @@ pub struct ActivePhysicalPlan {
     pub summary_catalog: Option<Arc<control_plane::physical::summary_catalog::SummaryCatalog>>,
     pub precompute_plan: asap_types::precompute_plan::PrecomputePlan,
     pub transmission_plan: asap_types::producer_plan::TransmissionPlan,
-    pub runtime_config: Arc<StreamingConfig>,
+    pub streaming_config: Arc<StreamingConfig>,
     pub query_plan: Arc<asap_types::query_plan::QueryPlan>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 }
 
-impl ActivePhysicalPlan {
+impl RuntimePhysicalPlan {
     pub fn plan_id(&self) -> u64 {
         self.envelope.plan_id
     }
@@ -123,8 +123,8 @@ impl ActivePhysicalPlan {
 }
 
 #[derive(Clone)]
-pub struct HotReloadActivePhysicalPlan {
-    inner: Arc<ArcSwap<ActivePhysicalPlan>>,
+pub struct ActivePhysicalPlanHandle {
+    inner: Arc<ArcSwap<RuntimePhysicalPlan>>,
     readiness: Arc<std::sync::Mutex<MaterializationReadinessState>>,
 }
 
@@ -153,7 +153,7 @@ struct MaterializationReadinessState {
 }
 
 impl MaterializationReadinessState {
-    fn for_plan(plan: &ActivePhysicalPlan) -> Self {
+    fn for_plan(plan: &RuntimePhysicalPlan) -> Self {
         let plan_id = plan.plan_id();
         let plan_version = plan.plan_version();
         let statuses = plan
@@ -265,18 +265,18 @@ pub enum PhysicalPlanLifecycleError {
 
 #[derive(Clone)]
 pub struct PhysicalPlanLifecycle {
-    active: HotReloadActivePhysicalPlan,
+    active: ActivePhysicalPlanHandle,
     state: Arc<std::sync::Mutex<PhysicalPlanLifecycleState>>,
 }
 
 struct PhysicalPlanLifecycleState {
-    staged: BTreeMap<(u64, u64), ActivePhysicalPlan>,
+    staged: BTreeMap<(u64, u64), RuntimePhysicalPlan>,
     statuses: BTreeMap<(u64, u64), PhysicalPlanStatus>,
 }
 
 impl PhysicalPlanLifecycle {
-    pub fn new(active: HotReloadActivePhysicalPlan) -> Self {
-        let snapshot = active.snapshot();
+    pub fn new(active: ActivePhysicalPlanHandle) -> Self {
+        let snapshot = active.active_snapshot();
         let mut statuses = BTreeMap::new();
         if snapshot.plan_id() != 0 {
             statuses.insert(
@@ -295,7 +295,7 @@ impl PhysicalPlanLifecycle {
 
     pub fn stage(
         &self,
-        plan: ActivePhysicalPlan,
+        plan: RuntimePhysicalPlan,
         now: u64,
     ) -> Result<(), PhysicalPlanLifecycleError> {
         let key = (plan.plan_id(), plan.plan_version());
@@ -304,7 +304,7 @@ impl PhysicalPlanLifecycle {
                 return Err(PhysicalPlanLifecycleError::Expired { expiry, now });
             }
         }
-        let active = self.active.snapshot();
+        let active = self.active.active_snapshot();
         if active.plan_id() != 0 && key.1 <= active.plan_version() {
             return Err(PhysicalPlanLifecycleError::StaleVersion {
                 plan_id: key.0,
@@ -359,7 +359,7 @@ impl PhysicalPlanLifecycle {
         plan_id: u64,
         plan_version: u64,
         now: u64,
-    ) -> Result<Arc<ActivePhysicalPlan>, PhysicalPlanLifecycleError> {
+    ) -> Result<Arc<RuntimePhysicalPlan>, PhysicalPlanLifecycleError> {
         self.activate_with_prepare(plan_id, plan_version, now, |_| Ok::<(), String>(()))
     }
 
@@ -371,8 +371,8 @@ impl PhysicalPlanLifecycle {
         plan_id: u64,
         plan_version: u64,
         now: u64,
-        prepare: impl FnOnce(&ActivePhysicalPlan) -> Result<(), E>,
-    ) -> Result<Arc<ActivePhysicalPlan>, PhysicalPlanLifecycleError>
+        prepare: impl FnOnce(&RuntimePhysicalPlan) -> Result<(), E>,
+    ) -> Result<Arc<RuntimePhysicalPlan>, PhysicalPlanLifecycleError>
     where
         E: std::fmt::Display,
     {
@@ -399,7 +399,7 @@ impl PhysicalPlanLifecycle {
                 return Err(PhysicalPlanLifecycleError::Expired { expiry, now });
             }
         }
-        let current = self.active.snapshot();
+        let current = self.active.active_snapshot();
         if current.plan_id() != 0 && plan.plan_version() <= current.plan_version() {
             return Err(PhysicalPlanLifecycleError::StaleVersion {
                 plan_id,
@@ -433,7 +433,7 @@ impl PhysicalPlanLifecycle {
 
     /// Mark a superseded generation retired after all readers of the old
     /// immutable snapshot have drained.
-    pub fn retire_drained(&self, plan_id: u64, plan_version: u64) {
+    pub fn mark_drained_plan_retired(&self, plan_id: u64, plan_version: u64) {
         if let Some(status) = self
             .state
             .lock()
@@ -448,7 +448,7 @@ impl PhysicalPlanLifecycle {
     }
 }
 
-fn status_for(plan: &ActivePhysicalPlan, phase: PhysicalPlanPhase) -> PhysicalPlanStatus {
+fn status_for(plan: &RuntimePhysicalPlan, phase: PhysicalPlanPhase) -> PhysicalPlanStatus {
     PhysicalPlanStatus {
         plan_id: plan.plan_id(),
         plan_version: plan.plan_version(),
@@ -458,8 +458,8 @@ fn status_for(plan: &ActivePhysicalPlan, phase: PhysicalPlanPhase) -> PhysicalPl
     }
 }
 
-impl HotReloadActivePhysicalPlan {
-    pub fn new(initial: ActivePhysicalPlan) -> Self {
+impl ActivePhysicalPlanHandle {
+    pub fn new(initial: RuntimePhysicalPlan) -> Self {
         let readiness = MaterializationReadinessState::for_plan(&initial);
         Self {
             inner: Arc::new(ArcSwap::new(Arc::new(initial))),
@@ -467,11 +467,11 @@ impl HotReloadActivePhysicalPlan {
         }
     }
 
-    pub fn snapshot(&self) -> Arc<ActivePhysicalPlan> {
+    pub fn active_snapshot(&self) -> Arc<RuntimePhysicalPlan> {
         self.inner.load_full()
     }
 
-    pub fn swap(&self, next: ActivePhysicalPlan) -> Arc<ActivePhysicalPlan> {
+    pub fn swap(&self, next: RuntimePhysicalPlan) -> Arc<RuntimePhysicalPlan> {
         let next_readiness = MaterializationReadinessState::for_plan(&next);
         let old = self.inner.swap(Arc::new(next));
         *self
@@ -554,10 +554,10 @@ impl HotReloadActivePhysicalPlan {
     }
 }
 
-impl std::fmt::Debug for HotReloadActivePhysicalPlan {
+impl std::fmt::Debug for ActivePhysicalPlanHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let snapshot = self.snapshot();
-        f.debug_struct("HotReloadActivePhysicalPlan")
+        let snapshot = self.active_snapshot();
+        f.debug_struct("ActivePhysicalPlanHandle")
             .field("plan_id", &snapshot.plan_id())
             .field("query_count", &snapshot.query_plan.entries.len())
             .field(
@@ -568,16 +568,18 @@ impl std::fmt::Debug for HotReloadActivePhysicalPlan {
     }
 }
 
-/// Thin wrapper around `ArcSwap<StreamingConfig>` with ergonomic
-/// snapshot + swap helpers. Cloneable; clones share the same
-/// underlying `ArcSwap` so all holders see the same swaps.
+/// Streaming materialization view with two compatibility modes. Legacy mode
+/// owns a swappable config; active-plan mode reads the config from the current
+/// immutable runtime plan. In active-plan mode, `swap` only updates the legacy
+/// backing slot and does not publish a new plan. Use plan activation to change
+/// the authoritative configuration.
 #[derive(Clone)]
-pub struct HotReloadStreamingConfig {
+pub struct StreamingConfigHandle {
     inner: Arc<ArcSwap<StreamingConfig>>,
-    active: Option<HotReloadActivePhysicalPlan>,
+    active: Option<ActivePhysicalPlanHandle>,
 }
 
-impl HotReloadStreamingConfig {
+impl StreamingConfigHandle {
     /// Construct with an initial `StreamingConfig`. Takes ownership —
     /// callers who need to keep their own handle should `.clone()` the
     /// `StreamingConfig` before calling `new`.
@@ -598,8 +600,8 @@ impl HotReloadStreamingConfig {
         }
     }
 
-    pub fn from_active(active: HotReloadActivePhysicalPlan) -> Self {
-        let initial = active.snapshot().runtime_config.clone();
+    pub fn from_active_physical_plan(active: ActivePhysicalPlanHandle) -> Self {
+        let initial = active.active_snapshot().streaming_config.clone();
         Self {
             inner: Arc::new(ArcSwap::new(initial)),
             active: Some(active),
@@ -612,12 +614,12 @@ impl HotReloadStreamingConfig {
     pub fn snapshot(&self) -> Arc<StreamingConfig> {
         self.active
             .as_ref()
-            .map(|a| a.snapshot().runtime_config.clone())
+            .map(|a| a.active_snapshot().streaming_config.clone())
             .unwrap_or_else(|| self.inner.load_full())
     }
 
-    pub fn physical_plan_snapshot(&self) -> Option<Arc<ActivePhysicalPlan>> {
-        self.active.as_ref().map(|active| active.snapshot())
+    pub fn active_physical_plan_snapshot(&self) -> Option<Arc<RuntimePhysicalPlan>> {
+        self.active.as_ref().map(|active| active.active_snapshot())
     }
 
     /// Atomically replace the current config. The previous `Arc` is
@@ -630,12 +632,48 @@ impl HotReloadStreamingConfig {
     }
 }
 
-impl std::fmt::Debug for HotReloadStreamingConfig {
+impl std::fmt::Debug for StreamingConfigHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snap = self.snapshot();
-        f.debug_struct("HotReloadStreamingConfig")
-            .field("num_agg_configs", &snap.aggregation_configs.len())
+        f.debug_struct("StreamingConfigHandle")
+            .field(
+                "num_agg_configs",
+                &snap.materializations_by_policy_fingerprint.len(),
+            )
             .finish()
+    }
+}
+
+// Compatibility imports; new callers use the domain names above.
+#[deprecated(note = "Use ActivePhysicalPlanHandle")]
+pub use ActivePhysicalPlanHandle as HotReloadActivePhysicalPlan;
+#[deprecated(note = "Use RuntimePhysicalPlan")]
+pub use RuntimePhysicalPlan as ActivePhysicalPlan;
+
+#[deprecated(note = "Use StreamingConfigHandle")]
+pub use StreamingConfigHandle as HotReloadStreamingConfig;
+
+impl StreamingConfigHandle {
+    #[deprecated(note = "Use from_active_physical_plan")]
+    pub fn from_active(active: ActivePhysicalPlanHandle) -> Self {
+        Self::from_active_physical_plan(active)
+    }
+    #[deprecated(note = "Use active_physical_plan_snapshot")]
+    pub fn physical_plan_snapshot(&self) -> Option<Arc<RuntimePhysicalPlan>> {
+        self.active_physical_plan_snapshot()
+    }
+}
+impl PhysicalPlanLifecycle {
+    #[deprecated(note = "Use mark_drained_plan_retired")]
+    pub fn retire_drained(&self, plan_id: u64, plan_version: u64) {
+        self.mark_drained_plan_retired(plan_id, plan_version)
+    }
+}
+
+impl ActivePhysicalPlanHandle {
+    #[deprecated(note = "Use active_snapshot")]
+    pub fn snapshot(&self) -> Arc<RuntimePhysicalPlan> {
+        self.active_snapshot()
     }
 }
 
@@ -654,7 +692,7 @@ mod tests {
         plan_version: u64,
         activation_unix_ms: u64,
         expiry_unix_ms: Option<u64>,
-    ) -> ActivePhysicalPlan {
+    ) -> RuntimePhysicalPlan {
         let envelope = asap_types::precompute_plan::PlanEnvelope {
             plan_id,
             plan_version,
@@ -665,7 +703,7 @@ mod tests {
             planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
-        ActivePhysicalPlan {
+        RuntimePhysicalPlan {
             envelope: envelope.clone(),
             summary_catalog: None,
             precompute_plan: asap_types::precompute_plan::PrecomputePlan {
@@ -705,7 +743,7 @@ mod tests {
                 },
                 rules: Vec::new(),
             },
-            runtime_config: Arc::new(StreamingConfig::new(HashMap::new())),
+            streaming_config: Arc::new(StreamingConfig::new(HashMap::new())),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan {
                 plan_id,
                 plan_version,
@@ -756,46 +794,56 @@ mod tests {
     #[test]
     fn snapshot_reflects_initial_config() {
         let (cfg, id_to_fp) = cfg_with_ids(&[1, 2, 3]);
-        let hr = HotReloadStreamingConfig::new(cfg);
+        let hr = StreamingConfigHandle::new(cfg);
         let snap = hr.snapshot();
-        assert_eq!(snap.aggregation_configs.len(), 3);
-        assert!(snap.aggregation_configs.contains_key(&id_to_fp[&2]));
+        assert_eq!(snap.materializations_by_policy_fingerprint.len(), 3);
+        assert!(snap
+            .materializations_by_policy_fingerprint
+            .contains_key(&id_to_fp[&2]));
     }
 
     #[test]
     fn swap_replaces_config_atomically() {
         let (cfg1, id_to_fp1) = cfg_with_ids(&[1, 2]);
         let (cfg2, id_to_fp2) = cfg_with_ids(&[3, 4, 5]);
-        let hr = HotReloadStreamingConfig::new(cfg1);
+        let hr = StreamingConfigHandle::new(cfg1);
         let old = hr.swap(cfg2);
         // Old snapshot still reflects pre-swap contents.
-        assert_eq!(old.aggregation_configs.len(), 2);
-        assert!(old.aggregation_configs.contains_key(&id_to_fp1[&1]));
+        assert_eq!(old.materializations_by_policy_fingerprint.len(), 2);
+        assert!(old
+            .materializations_by_policy_fingerprint
+            .contains_key(&id_to_fp1[&1]));
         // New snapshot reflects post-swap contents.
         let new_snap = hr.snapshot();
-        assert_eq!(new_snap.aggregation_configs.len(), 3);
-        assert!(new_snap.aggregation_configs.contains_key(&id_to_fp2[&5]));
-        assert!(!new_snap.aggregation_configs.contains_key(&id_to_fp1[&1]));
+        assert_eq!(new_snap.materializations_by_policy_fingerprint.len(), 3);
+        assert!(new_snap
+            .materializations_by_policy_fingerprint
+            .contains_key(&id_to_fp2[&5]));
+        assert!(!new_snap
+            .materializations_by_policy_fingerprint
+            .contains_key(&id_to_fp1[&1]));
     }
 
     #[test]
     fn clones_share_underlying_swap() {
         let (cfg1, _) = cfg_with_ids(&[1]);
         let (cfg2, id_to_fp2) = cfg_with_ids(&[2, 3]);
-        let hr = HotReloadStreamingConfig::new(cfg1);
+        let hr = StreamingConfigHandle::new(cfg1);
         let hr_clone = hr.clone();
         hr.swap(cfg2);
         // The clone sees the swap because both handles share the
         // same ArcSwap inside.
         let snap = hr_clone.snapshot();
-        assert_eq!(snap.aggregation_configs.len(), 2);
-        assert!(snap.aggregation_configs.contains_key(&id_to_fp2[&3]));
+        assert_eq!(snap.materializations_by_policy_fingerprint.len(), 2);
+        assert!(snap
+            .materializations_by_policy_fingerprint
+            .contains_key(&id_to_fp2[&3]));
     }
 
     #[test]
     fn concurrent_readers_see_consistent_snapshot() {
         let (cfg1, _) = cfg_with_ids(&[1, 2]);
-        let hr = HotReloadStreamingConfig::new(cfg1);
+        let hr = StreamingConfigHandle::new(cfg1);
         let hr_writer = hr.clone();
         let writer = thread::spawn(move || {
             for i in 0..50 {
@@ -810,7 +858,7 @@ mod tests {
                 // Under race, the snapshot must be internally
                 // consistent — either 2 entries (original) or 3
                 // (post-swap). Never a torn state.
-                let n = snap.aggregation_configs.len();
+                let n = snap.materializations_by_policy_fingerprint.len();
                 assert!(n == 2 || n == 3, "torn snapshot: {n} entries");
             }
         });
@@ -820,33 +868,33 @@ mod tests {
 
     #[test]
     fn physical_plan_stages_activates_drains_and_retires() {
-        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let active = ActivePhysicalPlanHandle::new(physical_plan(7, 1, 100, None));
         let lifecycle = PhysicalPlanLifecycle::new(active.clone());
         lifecycle
             .stage(physical_plan(7, 2, 200, Some(500)), 150)
             .unwrap();
 
-        assert_eq!(active.snapshot().plan_version(), 1);
+        assert_eq!(active.active_snapshot().plan_version(), 1);
         assert!(matches!(
             lifecycle.activate(7, 2, 199),
             Err(PhysicalPlanLifecycleError::ActivationNotReached { .. })
         ));
         let old = lifecycle.activate(7, 2, 200).unwrap();
         assert_eq!(old.plan_version(), 1);
-        assert_eq!(active.snapshot().plan_version(), 2);
+        assert_eq!(active.active_snapshot().plan_version(), 2);
 
         let statuses = lifecycle.statuses();
         assert_eq!(statuses.len(), 2);
         assert_eq!(statuses[0].phase, PhysicalPlanPhase::Draining);
         assert_eq!(statuses[1].phase, PhysicalPlanPhase::Active);
-        lifecycle.retire_drained(7, 1);
+        lifecycle.mark_drained_plan_retired(7, 1);
         assert_eq!(lifecycle.statuses()[0].phase, PhysicalPlanPhase::Retired);
     }
 
     #[test]
     fn failed_activation_preparation_keeps_active_and_staged_generations() {
-        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
-        let held_reader = active.snapshot();
+        let active = ActivePhysicalPlanHandle::new(physical_plan(7, 1, 100, None));
+        let held_reader = active.active_snapshot();
         let lifecycle = PhysicalPlanLifecycle::new(active.clone());
         lifecycle
             .stage(physical_plan(7, 2, 200, None), 150)
@@ -859,7 +907,7 @@ mod tests {
             error,
             PhysicalPlanLifecycleError::Prepare("catalog rejected".into())
         );
-        assert_eq!(active.snapshot().plan_version(), 1);
+        assert_eq!(active.active_snapshot().plan_version(), 1);
         assert_eq!(held_reader.plan_version(), 1);
         assert!(lifecycle.statuses().iter().any(|status| {
             status.plan_version == 2 && status.phase == PhysicalPlanPhase::Staged
@@ -868,14 +916,14 @@ mod tests {
         lifecycle
             .activate_with_prepare(7, 2, 200, |_| Ok::<(), String>(()))
             .unwrap();
-        assert_eq!(active.snapshot().plan_version(), 2);
+        assert_eq!(active.active_snapshot().plan_version(), 2);
     }
 
     // Failed publication releases only its staging slot; active readers remain valid.
     #[test]
     fn discard_staged_allows_retry_and_never_discards_active() {
-        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
-        let held_reader = active.snapshot();
+        let active = ActivePhysicalPlanHandle::new(physical_plan(7, 1, 100, None));
+        let held_reader = active.active_snapshot();
         let lifecycle = PhysicalPlanLifecycle::new(active.clone());
         lifecycle
             .stage(physical_plan(7, 2, 200, None), 150)
@@ -886,13 +934,13 @@ mod tests {
             .unwrap();
         lifecycle.activate(7, 2, 300).unwrap();
         assert!(lifecycle.discard_staged(7, 2).is_err());
-        assert_eq!(active.snapshot().plan_version(), 2);
+        assert_eq!(active.active_snapshot().plan_version(), 2);
         assert_eq!(held_reader.plan_version(), 1);
     }
 
     #[test]
     fn materialization_readiness_is_generation_scoped_and_monotonic() {
-        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let active = ActivePhysicalPlanHandle::new(physical_plan(7, 1, 100, None));
         let fingerprint = asap_types::PolicyFingerprint(41);
         active.readiness.lock().unwrap().statuses.insert(
             fingerprint,
@@ -923,7 +971,7 @@ mod tests {
 
     #[test]
     fn physical_plan_rejects_stale_and_expired_generations() {
-        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 2, 100, None));
+        let active = ActivePhysicalPlanHandle::new(physical_plan(7, 2, 100, None));
         let lifecycle = PhysicalPlanLifecycle::new(active);
         assert!(matches!(
             lifecycle.stage(physical_plan(7, 1, 100, None), 150),
@@ -937,7 +985,7 @@ mod tests {
 
     #[test]
     fn activation_rechecks_version_and_cannot_downgrade_across_plan_ids() {
-        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let active = ActivePhysicalPlanHandle::new(physical_plan(7, 1, 100, None));
         let lifecycle = PhysicalPlanLifecycle::new(active.clone());
         lifecycle
             .stage(physical_plan(8, 3, 100, None), 100)
@@ -955,6 +1003,6 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(active.snapshot().plan_version(), 3);
+        assert_eq!(active.active_snapshot().plan_version(), 3);
     }
 }

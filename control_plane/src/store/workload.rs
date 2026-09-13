@@ -1,4 +1,4 @@
-//! Persists the `QueryWorkload` + `WorkloadCharacteristics` associated with
+//! Persists the `LegacyMetricWorkload` + `WorkloadCharacteristics` associated with
 //! each planned `(metric, AggRole)` pair so that the re-planner can re-run
 //! `plan()` without needing the original `QuerySpec` HTTP payload.
 //!
@@ -11,14 +11,14 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::types::{QueryWorkload, WorkloadCharacteristics};
+use crate::types::{LegacyMetricWorkload, WorkloadCharacteristics};
 use crate::workload::AggRole;
 
 /// Composite key `(metric_name, role)` for the store.
 pub type WorkloadKey = (String, AggRole);
 
 pub struct WorkloadStore {
-    inner: RwLock<HashMap<WorkloadKey, (QueryWorkload, WorkloadCharacteristics)>>,
+    inner: RwLock<HashMap<WorkloadKey, (LegacyMetricWorkload, WorkloadCharacteristics)>>,
 }
 
 impl Default for WorkloadStore {
@@ -45,7 +45,7 @@ impl WorkloadStore {
         &self,
         metric: impl Into<String>,
         role: AggRole,
-        wl: QueryWorkload,
+        wl: LegacyMetricWorkload,
         wc: WorkloadCharacteristics,
     ) {
         self.inner
@@ -60,7 +60,7 @@ impl WorkloadStore {
         &self,
         metric: &str,
         role: AggRole,
-    ) -> Option<(QueryWorkload, WorkloadCharacteristics)> {
+    ) -> Option<(LegacyMetricWorkload, WorkloadCharacteristics)> {
         self.inner
             .read()
             .unwrap()
@@ -74,7 +74,7 @@ impl WorkloadStore {
     pub fn get_all_for_metric(
         &self,
         metric: &str,
-    ) -> Vec<(AggRole, QueryWorkload, WorkloadCharacteristics)> {
+    ) -> Vec<(AggRole, LegacyMetricWorkload, WorkloadCharacteristics)> {
         self.inner
             .read()
             .unwrap()
@@ -106,8 +106,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn wl(name: &str) -> QueryWorkload {
-        QueryWorkload {
+    fn wl(name: &str) -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: name.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],

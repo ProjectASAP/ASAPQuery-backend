@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::physical::deployment_cost::DeploymentCostPlanner;
-use crate::types::{CollectionPlan, QueryWorkload, WorkloadCharacteristics};
+use crate::types::{CollectionPlan, LegacyMetricWorkload, WorkloadCharacteristics};
 
 pub struct CachedDeploymentPlanner {
     inner: DeploymentCostPlanner,
@@ -36,7 +36,7 @@ impl CachedDeploymentPlanner {
     /// establish a new baseline if this is the first request for the metric.
     pub fn plan(
         &self,
-        workload: &QueryWorkload,
+        workload: &LegacyMetricWorkload,
         wc: Option<&WorkloadCharacteristics>,
     ) -> CollectionPlan {
         let key = &workload.metric_name;
@@ -80,8 +80,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn workload(metric: &str) -> QueryWorkload {
-        QueryWorkload {
+    fn workload(metric: &str) -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: metric.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],

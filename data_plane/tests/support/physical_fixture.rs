@@ -4,7 +4,7 @@
 use control_plane::{physical::compiler::*, query_plan::*};
 use data_plane::{
     drivers::query::servers::http::PhysicalPlanInstallRequest,
-    storage_engines::types::{ActivePhysicalPlan, BackendStorageRouting, StreamingConfig},
+    storage_engines::types::{BackendStorageRouting, RuntimePhysicalPlan, StreamingConfig},
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -20,7 +20,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
         capability_snapshot_id: "transport-fixture".into(),
     };
     let mut configs = config
-        .aggregation_configs
+        .materializations_by_policy_fingerprint
         .values()
         .cloned()
         .collect::<Vec<_>>();
@@ -37,7 +37,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), configs, &["fixture".into()]).unwrap();
     precompute.summary_catalog = Some(catalog.reference().unwrap());
-    let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
+    let mut transmission = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute,
         &BTreeMap::new(),
@@ -157,8 +157,8 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
 }
 
 #[allow(dead_code)]
-pub fn bootstrap() -> ActivePhysicalPlan {
-    let mut plan = data_plane::drivers::query::servers::http::build_active_physical_plan(
+pub fn bootstrap() -> RuntimePhysicalPlan {
+    let mut plan = data_plane::drivers::query::servers::http::validate_and_build_runtime_plan(
         artifact(&StreamingConfig::default()),
         Arc::new(BackendStorageRouting::empty()),
     )

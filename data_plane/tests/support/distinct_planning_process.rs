@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
+use control_plane::physical::compiler::BackendLocalPlanningInput;
 
 /// The production compiler, ingest engine and query DAG preserve distinct populations.
 #[tokio::test]
@@ -24,9 +24,9 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.05}});
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
     let plan = quote_snapshot_for_test(
-        serde_json::from_value::<BackendLocalPlanningSnapshot>(fixture.clone()).unwrap(),
+        serde_json::from_value::<BackendLocalPlanningInput>(fixture.clone()).unwrap(),
     )
-    .compile()
+    .compile_promql()
     .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(
@@ -81,7 +81,7 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
     // Source syntax uses the shared parser fork; serving semantics and exact
     // routing belong to the MetricsQL adapter and its installed query entries.
-    let snapshot = serde_json::from_value::<BackendLocalPlanningSnapshot>(fixture).unwrap();
+    let snapshot = serde_json::from_value::<BackendLocalPlanningInput>(fixture).unwrap();
     let mut snapshot = snapshot;
     snapshot.environment.plan_version = 2;
     let compiled = quote_snapshot_for_frontend_test(snapshot, true)

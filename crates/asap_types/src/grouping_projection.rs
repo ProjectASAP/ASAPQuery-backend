@@ -144,57 +144,6 @@ impl<'de> Deserialize<'de> for GroupingProjection {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    /// Legacy label lists become one non-null string column per name.
-    #[test]
-    fn legacy_and_typed_groups_share_one_projection() {
-        let legacy: GroupingProjection =
-            serde_json::from_value(serde_json::json!({"labels":["job"]})).unwrap();
-        assert_eq!(
-            legacy.columns(),
-            &[Column::new("job", DataType::Utf8, false)]
-        );
-        let typed: GroupingProjection = serde_json::from_value(
-            serde_json::json!([{"name":"job","dtype":"utf8","nullable":false}]),
-        )
-        .unwrap();
-        assert_eq!(typed, legacy);
-        assert_eq!(typed.serialize_to_json(), serde_json::json!(["job"]));
-        assert_eq!(
-            serde_json::to_value(&typed).unwrap(),
-            serde_json::json!(["job"])
-        );
-        #[derive(Serialize)]
-        struct LegacyConfig {
-            #[serde(serialize_with = "serialize_config_grouping")]
-            grouping_labels: GroupingProjection,
-        }
-        assert_eq!(
-            serde_json::to_value(LegacyConfig {
-                grouping_labels: typed
-            })
-            .unwrap(),
-            serde_json::json!({"grouping_labels":{"labels":["job"]}})
-        );
-    }
-    /// Numeric grouping types must survive wire transport rather than become labels.
-    #[test]
-    fn typed_group_retains_type_and_rejects_duplicate_columns() {
-        let typed = GroupingProjection::new(vec![Column::new("tenant", DataType::Int64, true)]);
-        let decoded: GroupingProjection =
-            serde_json::from_value(typed.serialize_to_json()).unwrap();
-        assert_eq!(decoded, typed);
-        assert!(!decoded.is_legacy_labels());
-        let duplicate = GroupingProjection::new(vec![
-            Column::new("tenant", DataType::Int64, true),
-            Column::new("tenant", DataType::Utf8, false),
-        ]);
-        assert!(duplicate.validate().is_err());
-    }
-}
-
-#[cfg(test)]
 mod identity_tests {
     use super::*;
     /// A type or nullability change cannot reuse an incompatible summary population.
@@ -450,5 +399,56 @@ mod population_key_tests {
         ] {
             assert!(decode_label_population_key(key).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Legacy label lists become one non-null string column per name.
+    #[test]
+    fn legacy_and_typed_groups_share_one_projection() {
+        let legacy: GroupingProjection =
+            serde_json::from_value(serde_json::json!({"labels":["job"]})).unwrap();
+        assert_eq!(
+            legacy.columns(),
+            &[Column::new("job", DataType::Utf8, false)]
+        );
+        let typed: GroupingProjection = serde_json::from_value(
+            serde_json::json!([{"name":"job","dtype":"utf8","nullable":false}]),
+        )
+        .unwrap();
+        assert_eq!(typed, legacy);
+        assert_eq!(typed.serialize_to_json(), serde_json::json!(["job"]));
+        assert_eq!(
+            serde_json::to_value(&typed).unwrap(),
+            serde_json::json!(["job"])
+        );
+        #[derive(Serialize)]
+        struct LegacyConfig {
+            #[serde(serialize_with = "serialize_config_grouping")]
+            grouping_labels: GroupingProjection,
+        }
+        assert_eq!(
+            serde_json::to_value(LegacyConfig {
+                grouping_labels: typed
+            })
+            .unwrap(),
+            serde_json::json!({"grouping_labels":{"labels":["job"]}})
+        );
+    }
+    /// Numeric grouping types must survive wire transport rather than become labels.
+    #[test]
+    fn typed_group_retains_type_and_rejects_duplicate_columns() {
+        let typed = GroupingProjection::new(vec![Column::new("tenant", DataType::Int64, true)]);
+        let decoded: GroupingProjection =
+            serde_json::from_value(typed.serialize_to_json()).unwrap();
+        assert_eq!(decoded, typed);
+        assert!(!decoded.is_legacy_labels());
+        let duplicate = GroupingProjection::new(vec![
+            Column::new("tenant", DataType::Int64, true),
+            Column::new("tenant", DataType::Utf8, false),
+        ]);
+        assert!(duplicate.validate().is_err());
     }
 }

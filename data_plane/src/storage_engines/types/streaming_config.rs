@@ -26,7 +26,11 @@ use super::storage_backend::StorageBackend;
 /// from_configs` primitive this method now calls directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
-    pub aggregation_configs: HashMap<u64, AggregationConfig>,
+    #[serde(
+        rename = "aggregation_configs",
+        alias = "materializations_by_policy_fingerprint"
+    )]
+    pub materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig>,
     /// Phase-5 capability-routing axis: which storage tier serves this
     /// per-metric runtime config. The controller pushes this when planning
     /// (see `docs/design-gorilla-s3-cold-engine.md` §8); pre-Phase-5
@@ -42,9 +46,9 @@ pub struct StreamingConfig {
 }
 
 impl StreamingConfig {
-    pub fn new(aggregation_configs: HashMap<u64, AggregationConfig>) -> Self {
+    pub fn new(materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig>) -> Self {
         Self {
-            aggregation_configs,
+            materializations_by_policy_fingerprint,
             storage_backend: StorageBackend::default(),
             monitors: Vec::new(),
         }
@@ -59,11 +63,11 @@ impl StreamingConfig {
     /// Used by the controller-driven plan-push path; tests typically
     /// stay on `Self::new(...)` and let the default land.
     pub fn with_storage_backend(
-        aggregation_configs: HashMap<u64, AggregationConfig>,
+        materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig>,
         storage_backend: StorageBackend,
     ) -> Self {
         Self {
-            aggregation_configs,
+            materializations_by_policy_fingerprint,
             storage_backend,
             monitors: Vec::new(),
         }
@@ -77,21 +81,23 @@ impl StreamingConfig {
     }
 
     pub fn get_aggregation_config(&self, aggregation_id: u64) -> Option<&AggregationConfig> {
-        self.aggregation_configs.get(&aggregation_id)
+        self.materializations_by_policy_fingerprint
+            .get(&aggregation_id)
     }
 
-    pub fn get_all_aggregation_configs(&self) -> &HashMap<u64, AggregationConfig> {
-        &self.aggregation_configs
+    pub fn materializations(&self) -> &HashMap<u64, AggregationConfig> {
+        &self.materializations_by_policy_fingerprint
     }
 
     pub fn contains(&self, aggregation_id: u64) -> bool {
-        self.aggregation_configs.contains_key(&aggregation_id)
+        self.materializations_by_policy_fingerprint
+            .contains_key(&aggregation_id)
     }
 
     /// Derived content-addressed view. Builds a [`PolicyRegistry`] keyed
     /// on [`asap_types::PolicyFingerprint`] — the merged-sid-identity-chain
     /// replacement for the `aggregation_id`-keyed lookup. Cheap (O(N)
-    /// over `aggregation_configs.len()`); call at swap time, not per
+    /// over `materializations_by_policy_fingerprint.len()`); call at swap time, not per
     /// query, if it shows up in hot-path profiles.
     ///
     /// Dual-keyed transition: this method exists alongside the legacy
@@ -99,7 +105,11 @@ impl StreamingConfig {
     /// one at a time. The two views are derived from the same source —
     /// they can never disagree.
     pub fn policy_registry(&self) -> PolicyRegistry {
-        PolicyRegistry::from_configs(self.aggregation_configs.values().cloned())
+        PolicyRegistry::from_configs(
+            self.materializations_by_policy_fingerprint
+                .values()
+                .cloned(),
+        )
     }
 
     pub fn from_yaml_file(yaml_file: &str) -> Result<Self> {
@@ -116,7 +126,8 @@ impl StreamingConfig {
     /// (operator-authored query→agg_ids YAML feeding a retention_map)
     /// is gone — the controller drives capability matching dynamically.
     pub fn from_yaml_data(data: &Value) -> Result<Self> {
-        let mut aggregation_configs: HashMap<u64, AggregationConfig> = HashMap::new();
+        let mut materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig> =
+            HashMap::new();
 
         if let Some(aggregations) = data.get("aggregations").and_then(|v| v.as_sequence()) {
             for aggregation_data in aggregations {
@@ -146,11 +157,11 @@ impl StreamingConfig {
                 // PR 5: the map key IS the policy-fingerprint u64.
                 // `AggregationConfig::policy_fp_u64()` is the canonical
                 // accessor for this value.
-                aggregation_configs.insert(config.policy_fp_u64(), config);
+                materializations_by_policy_fingerprint.insert(config.policy_fp_u64(), config);
             }
         }
 
-        let mut config = Self::new(aggregation_configs);
+        let mut config = Self::new(materializations_by_policy_fingerprint);
         // Continuous-monitoring (CDM) specs: a top-level `monitors:` array, each
         // entry deserializing into a MonitorSpec. Absent → empty (the common
         // case). The data-plane monitor coordinator reads these.
@@ -170,13 +181,20 @@ impl Index<u64> for StreamingConfig {
     type Output = AggregationConfig;
 
     fn index(&self, aggregation_id: u64) -> &Self::Output {
-        &self.aggregation_configs[&aggregation_id]
+        &self.materializations_by_policy_fingerprint[&aggregation_id]
     }
 }
 
 impl Default for StreamingConfig {
     fn default() -> Self {
         Self::new(HashMap::new())
+    }
+}
+
+impl StreamingConfig {
+    #[deprecated(note = "Use materializations")]
+    pub fn get_all_aggregation_configs(&self) -> &HashMap<u64, AggregationConfig> {
+        self.materializations()
     }
 }
 
@@ -250,8 +268,12 @@ aggregations:\n\
 - aggregationType: DDSketch\n  aggregationSubType: ''\n  metric: cpu_seconds\n  labels:\n    grouping: [host]\n    rollup: []\n    aggregated: []\n  parameters:\n    relative_accuracy: 0.01\n  windowSize: 30\n  windowType: tumbling\n  spatialFilter: ''\n";
         let data: Value = serde_yaml::from_str(yaml).expect("yaml ok");
         let cfg = StreamingConfig::from_yaml_data(&data).expect("decode without id");
-        assert_eq!(cfg.aggregation_configs.len(), 1);
-        let (k, v) = cfg.aggregation_configs.iter().next().unwrap();
+        assert_eq!(cfg.materializations_by_policy_fingerprint.len(), 1);
+        let (k, v) = cfg
+            .materializations_by_policy_fingerprint
+            .iter()
+            .next()
+            .unwrap();
         assert_ne!(*k, 0, "derived id is not the 0 sentinel");
         assert_eq!(*k, v.policy_fp_u64(), "map key equals fingerprint u64");
         assert_eq!(v.metric, "cpu_seconds");
@@ -272,8 +294,16 @@ aggregations:\n\
         let wo: Value = serde_yaml::from_str(without).expect("without yaml ok");
         let cw = StreamingConfig::from_yaml_data(&w).expect("with");
         let cwo = StreamingConfig::from_yaml_data(&wo).expect("without");
-        let (kw, _) = cw.aggregation_configs.iter().next().unwrap();
-        let (kwo, _) = cwo.aggregation_configs.iter().next().unwrap();
+        let (kw, _) = cw
+            .materializations_by_policy_fingerprint
+            .iter()
+            .next()
+            .unwrap();
+        let (kwo, _) = cwo
+            .materializations_by_policy_fingerprint
+            .iter()
+            .next()
+            .unwrap();
         assert_eq!(
             kw, kwo,
             "explicit aggregationId in YAML must not change identity"

@@ -36,7 +36,7 @@ fn mvp_deployment_policy(
     })
 }
 
-/// Bind a `QueryWorkload` into the typed L4 [`crate::physical::post_asap::PhysicalExpr`]
+/// Bind a `LegacyMetricWorkload` into the typed L4 [`crate::physical::post_asap::PhysicalExpr`]
 /// IR, when callers want to inspect the typed binding alongside the
 /// legacy `CollectionPlan` output.
 ///
@@ -69,7 +69,9 @@ fn mvp_deployment_policy(
 /// the parallel `USE_TYPED_STAGE_SPLIT` gate is enabled — the bound
 /// `PhysicalExpr` is then fed into `planner::stage_split::split_typed_three_stage`
 /// + the per-stage emitters in `config::stage_config`.
-pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::physical::post_asap::PhysicalExpr> {
+pub fn bind_workload_typed(
+    w: &LegacyMetricWorkload,
+) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_evidence(w, None, None)
 }
 
@@ -78,7 +80,7 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::physical::post_as
 /// evidence is absent; callers that have validated a fresh certificate use
 /// this entry point instead.
 pub fn bind_workload_typed_with_topk_evidence(
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
     evidence: &crate::physical::compiler::TopKMembershipEvidence,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_evidence(w, None, Some(evidence))
@@ -89,21 +91,21 @@ pub fn bind_workload_typed_with_topk_evidence(
 /// query's actual per-item filter value through to the bound
 /// `SketchQuery::PointCount` -- `None` (what `bind_workload_typed` itself
 /// passes) gives the bare bucket total, same as before this parameter
-/// existed. `QueryWorkload` itself carries no `item_label` field (adding
+/// existed. `LegacyMetricWorkload` itself carries no `item_label` field (adding
 /// one would break its 30+ struct-literal construction sites across the
 /// crate), so callers that know a metric's item_label -- e.g.
 /// `emit::collect_metric_to_family`'s loop, which already has `entry:
 /// &WorkloadEntry` and `workload.label_filters` in scope -- pass it in
 /// directly instead.
 pub fn bind_workload_typed_with_item_filter(
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
     item_filter: Option<(&str, &str)>,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_evidence(w, item_filter, None)
 }
 
 fn bind_workload_typed_with_evidence(
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
     item_filter: Option<(&str, &str)>,
     topk_evidence: Option<&crate::physical::compiler::TopKMembershipEvidence>,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
@@ -382,7 +384,7 @@ impl DeploymentPlanCompiler {
         }
     }
 
-    pub fn plan(&self, w: &QueryWorkload) -> CollectionPlan {
+    pub fn plan(&self, w: &LegacyMetricWorkload) -> CollectionPlan {
         // This legacy scalar cost path cannot certify a failure probability.
         // Exact/zero-error and EpsilonDelta use raw; the typed binder independently
         // checks the full requirement against Planner's family guarantees.
@@ -444,7 +446,7 @@ impl DeploymentPlanCompiler {
 
     /// Returns a raw-passthrough plan for queries that require exact per-sample
     /// computation (RSI, MACD, stochastic oscillator, etc.).
-    fn raw_passthrough_plan(&self, w: &QueryWorkload) -> CollectionPlan {
+    fn raw_passthrough_plan(&self, w: &LegacyMetricWorkload) -> CollectionPlan {
         let valid_until = Utc::now() + chrono::Duration::seconds(self.valid_for.as_secs() as i64);
 
         let mut label_matchers: Vec<String> = w
@@ -492,7 +494,7 @@ pub use crate::physical::sketch_catalog::{build_sketch_params, default_sketch_pa
 ///
 /// Rule: if `latency_sla >= time_window` (or unset) → window mode.
 ///       otherwise → batch mode (gateway/backend merges on query).
-pub fn select_window_strategy(w: &QueryWorkload) -> (ProcessorMode, Option<Duration>) {
+pub fn select_window_strategy(w: &LegacyMetricWorkload) -> (ProcessorMode, Option<Duration>) {
     match w.latency_sla {
         None => (ProcessorMode::Window, Some(w.time_window)),
         Some(ls) if ls >= w.time_window => (ProcessorMode::Window, Some(w.time_window)),
@@ -507,8 +509,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn workload(aggs: Vec<AggType>) -> QueryWorkload {
-        QueryWorkload {
+    fn workload(aggs: Vec<AggType>) -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: "test".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
@@ -723,8 +725,8 @@ mod tests {
     /// contract rows; the AggType still has to be a valid one (the enum
     /// has no `TopK` variant, so for `top_endpoint_qps` we pass
     /// `Frequency` and rely on the metric-name reclassification).
-    fn workload_for(metric: &str, agg: AggType) -> QueryWorkload {
-        QueryWorkload {
+    fn workload_for(metric: &str, agg: AggType) -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: metric.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],

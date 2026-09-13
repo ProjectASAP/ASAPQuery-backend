@@ -1,6 +1,6 @@
 use super::compiler::{
     derived_window_cost, retained_state_count, CollectorMaterialization,
-    MaterializationLifecycleEstimate, PlanningRequest, RuntimeRulePolicy,
+    MaterializationLifecycleEstimate, PhysicalCompilationRequest, RuntimeRulePolicy,
 };
 use planner_types::post_asap::{PostAsapNodeId, SummaryWindowFramework};
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Only raw additive states are eligible; derived cohorts retain their full-window identity.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn share_additive_panes(
-    request: &PlanningRequest,
+    request: &PhysicalCompilationRequest,
     materializations: &mut [asap_types::PrecomputeMaterialization],
     producers: &mut Vec<CollectorMaterialization>,
     plan_producers: &mut [CollectorMaterialization],
@@ -57,9 +57,11 @@ pub(super) fn share_additive_panes(
         // Explicitly priced implementations are not repriced or replaced.
         if consumers.iter().any(|index| {
             let q = &request.queries[*index];
-            q.lifecycle != query.lifecycle
-                || q.accuracy != query.accuracy
-                || !request.synthesized_window_queries.contains(&q.query_id)
+            q.summary_lifecycle_inputs != query.summary_lifecycle_inputs
+                || q.accuracy_target != query.accuracy_target
+                || !request
+                    .compiler_priced_window_query_ids
+                    .contains(&q.query_id)
         }) {
             continue;
         }
@@ -72,12 +74,12 @@ pub(super) fn share_additive_panes(
         };
         let key = (
             canonical.policy_fingerprint(),
-            serde_json::to_string(&query.lifecycle).unwrap(),
+            serde_json::to_string(&query.summary_lifecycle_inputs).unwrap(),
             serde_json::to_string(policy).unwrap(),
         );
-        let mut maintenance = query.lifecycle.clone();
+        let mut maintenance = query.summary_lifecycle_inputs.clone();
         maintenance.costs.read = 0.0;
-        let Some(template) = query.window_implementations.first() else {
+        let Some(template) = query.window_realization_candidates.first() else {
             continue;
         };
         let producer_cost = derived_window_cost(
@@ -86,11 +88,12 @@ pub(super) fn share_additive_panes(
             m.window_size,
             m.slide_interval,
             &m.window_layout,
-            request.query_staleness_margin_ms,
+            request.query_retention_margin_ms,
         )
         .weighted_cost;
-        let read_cost = query.lifecycle.costs.read * query.lifecycle.horizon_seconds
-            / (f64::from(query.lifecycle.evaluation_interval_ms) / 1000.0)
+        let read_cost = query.summary_lifecycle_inputs.costs.read
+            * query.summary_lifecycle_inputs.horizon_seconds
+            / (f64::from(query.summary_lifecycle_inputs.evaluation_interval_ms) / 1000.0)
             * (m.window_size / pane_secs) as f64
             * consumers.len() as f64;
         offers.push(PaneReuseCandidate {
@@ -113,7 +116,7 @@ pub(super) fn share_additive_panes(
         let mut canonical = physical[group.members[0]].1.clone();
         canonical.num_aggregates_to_retain = Some(retained_state_count(
             group.lookback_ms,
-            request.query_staleness_margin_ms,
+            request.query_retention_margin_ms,
             canonical.slide_interval * 1000,
             &canonical.window_layout,
         ));
@@ -139,7 +142,7 @@ pub(super) fn share_additive_panes(
         combined.expected_reads = 0.0;
         combined.expected_updates = 0.0;
         combined.lifecycle_cost = group.cost;
-        combined.window_implementation_id = format!("shared-pane-{}", new.0);
+        combined.window_realization_id = format!("shared-pane-{}", new.0);
         for index in group.members {
             let old = physical[index].0;
             if let Some(estimate) = estimates.remove(&old) {
@@ -179,7 +182,7 @@ pub(super) fn share_additive_panes(
             producer.window_secs = canonical.window_size;
             producer.slide_secs = canonical.slide_interval;
             producer.abstract_window_framework = SummaryWindowFramework::Tumbling;
-            producer.window_implementation_id = estimates[&new].window_implementation_id.clone();
+            producer.window_realization_id = estimates[&new].window_realization_id.clone();
         }
     }
     let mut seen = BTreeSet::new();

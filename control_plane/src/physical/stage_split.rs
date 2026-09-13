@@ -98,12 +98,12 @@ mod l5_walk_propagation_tests {
     //! TODO in `intent_algebra::column_resolution`).
 
     use crate::physical::colored_dag::StageConfig;
-    use crate::types::{AggType, QueryWorkload};
+    use crate::types::{AggType, LegacyMetricWorkload};
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn workload(metric: &str, group_by: Vec<String>, window: Duration) -> QueryWorkload {
-        QueryWorkload {
+    fn workload(metric: &str, group_by: Vec<String>, window: Duration) -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: metric.to_string(),
             label_filters: HashMap::new(),
             group_by_labels: group_by,

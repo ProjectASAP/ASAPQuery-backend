@@ -69,7 +69,7 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
     .unwrap();
     let mut artifact = physical_fixture::artifact(&runtime);
     if runtime
-        .aggregation_configs
+        .materializations_by_policy_fingerprint
         .values()
         .any(|c| c.metric == "http_requests_total_latency_ms")
     {
@@ -128,7 +128,7 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
 }
 
 use control_plane::types::{AggType, QueryWorkload, WorkloadCharacteristics};
-use data_plane::storage_engines::types::HotReloadStreamingConfig;
+use data_plane::storage_engines::types::StreamingConfigHandle;
 use serde_json::Value as JsonValue;
 
 use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -263,21 +263,21 @@ fn plan_streaming_config_json(workload: &QueryWorkload) -> JsonValue {
         .expect("emit_backend_streaming_config_json must succeed")
 }
 
-/// Spin up an in-process backend HTTP server with `HotReloadStreamingConfig`
+/// Spin up an in-process backend HTTP server with `StreamingConfigHandle`
 /// wired through both the query engine and the POST `/api/v1/streaming-config`
 /// handler. Returns `(port, hot_reload_handle)` — the latter so tests can
 /// also inspect the current config from the controller's side.
-async fn start_backend_http_server() -> (u16, HotReloadStreamingConfig) {
+async fn start_backend_http_server() -> (u16, StreamingConfigHandle) {
     use data_plane::drivers::query::adapters::config::AdapterConfig;
     use data_plane::drivers::query::servers::{HttpServer, HttpServerConfig};
     use data_plane::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     use data_plane::storage_engines::sketch_db::index::SketchStore;
     use data_plane::storage_engines::types::StreamingConfig;
 
-    let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-    let sketch_index = Arc::new(SketchStore::new());
+    let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+    let summary_store = Arc::new(SketchStore::new());
     let query_engine =
-        Arc::new(ASAPQueryEngine::new(15_000).with_sketch_index(sketch_index.clone()));
+        Arc::new(ASAPQueryEngine::new(15_000).with_sketch_index(summary_store.clone()));
 
     let adapter_config = AdapterConfig::prometheus_promql(
         "http://127.0.0.1:9999".to_string(), // unused — no forwarding in this test
@@ -289,7 +289,7 @@ async fn start_backend_http_server() -> (u16, HotReloadStreamingConfig) {
         adapter_config,
     };
 
-    let server = HttpServer::new(http_config, query_engine, sketch_index)
+    let server = HttpServer::new(http_config, query_engine, summary_store)
         .with_hot_reload_config(hot_reload.clone());
 
     let port = server
@@ -345,7 +345,7 @@ fn _wc_anchor() -> WorkloadCharacteristics {
 
 /// Full test stack: PrecomputeEngine + SketchStoreSink + OtlpReceiver +
 /// HttpServer, all sharing the same `SketchStore` and
-/// `HotReloadStreamingConfig` so a controller-posted streaming-config
+/// `StreamingConfigHandle` so a controller-posted streaming-config
 /// is visible to the engine's accumulator routing, the engine's window
 /// outputs land in `SketchStore`, and the query engine reads from the
 /// same store.
@@ -373,17 +373,17 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     use data_plane::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     use data_plane::storage_engines::sketch_db::index::SketchStore;
 
-    let sketch_index = Arc::new(SketchStore::new());
-    let active = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
+    let summary_store = Arc::new(SketchStore::new());
+    let active = data_plane::storage_engines::types::ActivePhysicalPlanHandle::new(
         physical_fixture::bootstrap(),
     );
-    let hot_reload = HotReloadStreamingConfig::from_active(active.clone());
+    let hot_reload = StreamingConfigHandle::from_active_physical_plan(active.clone());
     let series_resolver = Arc::new(SeriesIdResolver::new());
 
     // SketchStoreSink writes precompute output back into SketchStore so
     // the query engine can find it.
     let sink = Arc::new(SketchStoreSink::new(
-        sketch_index.clone(),
+        summary_store.clone(),
         hot_reload.clone(),
         series_resolver.clone(),
     ));
@@ -406,7 +406,7 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
         hot_reload.clone(),
         sink,
         series_resolver.clone(),
-        sketch_index.clone(),
+        summary_store.clone(),
     );
     let ingest_state = engine.ingest_state();
     tokio::spawn(async move {
@@ -441,10 +441,10 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
             // `sketch_index` via OTLP ingest (the engine's
             // `precompute_engine` shares the Arc), but the query
             // path can't see them without this binding.
-            .with_sketch_index(sketch_index.clone())
+            .with_sketch_index(summary_store.clone())
             .with_active_physical_plan(active.clone()),
     );
-    let server = HttpServer::new(http_config, query_engine, sketch_index)
+    let server = HttpServer::new(http_config, query_engine, summary_store)
         .with_hot_reload_config(hot_reload.clone())
         .with_active_physical_plan(active);
     let backend_port = server
@@ -958,7 +958,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
     assert_eq!(active["aggregation_count"], 1);
 
     // Walk the streaming_config object to find the registered grouping
-    // labels. The snapshot path is `streaming_config.aggregation_configs.
+    // labels. The snapshot path is `streaming_config.materializations_by_policy_fingerprint.
     // <fp_u64_string>.grouping_labels.<inner-shape>`.
     let cfgs = active["streaming_config"]["aggregation_configs"]
         .as_object()
@@ -1008,7 +1008,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
 //   * Modified-OTLP `DdSketchDataPoint` wire encoding + the backend's
 //     OTLP HTTP receiver accept the payload (no 4xx/5xx).
 //   * The full stack (PrecomputeEngine + SketchStoreSink + OtlpReceiver
-//     + HttpServer all sharing SketchStore + HotReloadStreamingConfig)
+//     + HttpServer all sharing SketchStore + StreamingConfigHandle)
 //     comes up and stays up under POST + query traffic.
 //   * The OTLP-ingested sketch lands in `SketchStore` keyed by the
 //     right `PolicyFingerprint` (or via the `instances_matching`

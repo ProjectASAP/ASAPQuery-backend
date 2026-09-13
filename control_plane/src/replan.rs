@@ -33,7 +33,7 @@ use crate::physical::plan_cache::CachedDeploymentPlanner;
 use crate::physical::stage_split;
 use crate::physical::workload_planner as rules;
 use crate::store::{PlanStore, WorkloadStore};
-use crate::types::QueryWorkload;
+use crate::types::LegacyMetricWorkload;
 use crate::workload::AggRole;
 
 fn short_hash(s: &str) -> String {
@@ -231,7 +231,7 @@ impl Replanner {
     }
 
     /// Same as [`try_emit_typed_edge_yaml`] but takes the
-    /// `QueryWorkload` directly. Used by `replan_metric` which already
+    /// `LegacyMetricWorkload` directly. Used by `replan_metric` which already
     /// has the workload in scope.
     ///
     /// `agent_id` is threaded into the emitted opamp `X-Agent-ID` header
@@ -239,7 +239,7 @@ impl Replanner {
     /// pass `"$AGENT_ID"` and rely on the agent container's env.
     fn try_emit_typed_edge_yaml_for_workload(
         &self,
-        workload: &QueryWorkload,
+        workload: &LegacyMetricWorkload,
         agent_id: &str,
     ) -> Option<String> {
         let deployment_expr = rules::bind_workload_typed(workload)?;
@@ -595,7 +595,7 @@ impl Replanner {
     /// return `No result for query`.
     fn build_backend_stage_config(
         &self,
-        workload: &QueryWorkload,
+        workload: &LegacyMetricWorkload,
         role: AggRole,
     ) -> Option<BackendStageConfig> {
         // ── Typed sketch path (Quantile / Cardinality / TopK / Frequency) ──
@@ -610,7 +610,7 @@ impl Replanner {
                     // through `extract_edge_facts` fails, and always leaves
                     // `grouping` empty (`QueryExpr::Aggregate.by` is positional
                     // `ColumnId`s with no label-name resolution today). The
-                    // `QueryWorkload` carries both unambiguously, and every
+                    // `LegacyMetricWorkload` carries both unambiguously, and every
                     // aggregation under one workload shares them.
                     // Per-metric item_label (the high-card dimension a CMS/CountSketch
                     // hashes): threaded into the policy params so the data-plane ingest
@@ -899,8 +899,8 @@ mod tests {
         ))
     }
 
-    fn test_workload(metric: &str) -> (QueryWorkload, WorkloadCharacteristics) {
-        let wl = QueryWorkload {
+    fn test_workload(metric: &str) -> (LegacyMetricWorkload, WorkloadCharacteristics) {
+        let wl = LegacyMetricWorkload {
             metric_name: metric.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],

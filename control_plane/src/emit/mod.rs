@@ -637,7 +637,7 @@ pub fn collect_cumulative_counter_metrics(
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entry in registry.entries() {
         // `derive_agg_role` reads the WorkloadEntry directly (query
-        // string + family override), not the lowered QueryWorkload, so
+        // string + family override), not the lowered LegacyMetricWorkload, so
         // we classify the registry entry. We still consult the
         // workload_store to confirm the metric was successfully
         // pre-populated (matching the contract of the sibling
@@ -900,10 +900,10 @@ mod runtime_tests {
     // Reproduces the live demo gap: 3 of 6 (HLL, CountSketch, CMS) silently
     // drop because the analyzer pre-population path doesn't propagate
     // `sketch_family_override` from the workload YAML into
-    // `QueryWorkload::sketch_type_override`.
+    // `LegacyMetricWorkload::sketch_type_override`.
 
     /// Mimics the pre-population loop in `main()` — turns each
-    /// `WorkloadEntry` into a `QueryWorkload` via the shared `Analyzer`.
+    /// `WorkloadEntry` into a `LegacyMetricWorkload` via the shared `Analyzer`.
     fn populate_store_from_registry(registry: &WorkloadRegistry, store: &WorkloadStore) {
         use crate::pipeline::Analyzer;
         use crate::types;
@@ -1124,12 +1124,12 @@ mod runtime_tests {
     /// fan into three pipelines.
     ///
     /// We populate the store directly with three `(metric, role)`
-    /// `QueryWorkload`s — one per capability — so the test pins
+    /// `LegacyMetricWorkload`s — one per capability — so the test pins
     /// `collect_metric_to_family`'s union semantics independently of the
     /// analyzer's query-string → AggType parsing.
     #[test]
     fn collect_metric_to_family_unions_multiple_capabilities_per_metric() {
-        use crate::types::{AggType, QueryWorkload, SketchType, WorkloadCharacteristics};
+        use crate::types::{AggType, LegacyMetricWorkload, SketchType, WorkloadCharacteristics};
         use crate::workload::AggRole;
         use planner_types::post_asap::SketchAlgorithm;
         use std::collections::BTreeSet;
@@ -1156,8 +1156,8 @@ mod runtime_tests {
         let mk = |agg: AggType,
                   override_family: Option<SketchType>,
                   quantiles: Vec<f64>|
-         -> QueryWorkload {
-            QueryWorkload {
+         -> LegacyMetricWorkload {
+            LegacyMetricWorkload {
                 metric_name: METRIC.to_string(),
                 label_filters: Default::default(),
                 group_by_labels: Vec::new(),
@@ -1221,7 +1221,7 @@ mod runtime_tests {
     // Pre-B3 the WorkloadEntry YAML had no way to declare grouping
     // labels — the analyzer pulled them only from PromQL `by (...)`
     // clauses. Bare `quantile_over_time(0.99, metric[30s])` carries no
-    // `by`, so `QueryWorkload.group_by_labels` ended up empty, so
+    // `by`, so `LegacyMetricWorkload.group_by_labels` ended up empty, so
     // `collect_metric_to_grouping_labels` returned `{metric: vec![]}`,
     // so the 5-sketch routing emitter wrote
     // `keep_keys(datapoint.attributes, [])` — stripping ALL attrs
@@ -1230,7 +1230,7 @@ mod runtime_tests {
     //
     // Post-B3 a declarative `grouping_labels: [zone]` on WorkloadEntry
     // is threaded through the pre-pop QuerySpec → analyzer →
-    // QueryWorkload.group_by_labels → collect_metric_to_grouping_labels
+    // LegacyMetricWorkload.group_by_labels → collect_metric_to_grouping_labels
     // → the emitter's keep_keys list. Without this round-trip the
     // end-to-end test's sid catalog stays empty-per-zone.
     #[test]
@@ -1256,7 +1256,7 @@ mod runtime_tests {
         populate_store_from_registry(&registry, &store);
 
         // The analyzer must have threaded grouping_labels into
-        // QueryWorkload.group_by_labels.
+        // LegacyMetricWorkload.group_by_labels.
         let map = collect_metric_to_grouping_labels(&registry, &store);
         assert_eq!(
             map.get("http_requests_total_latency_ms"),

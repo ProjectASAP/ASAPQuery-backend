@@ -4,7 +4,7 @@
 //! Criterion's `iter_batched` consumes the input by value and the input's
 //! `Drop` runs *inside* the timed region (see criterion-0.5.1
 //! `src/bencher.rs:264-272`). Our `setup` builds a `SketchStore` with N
-//! `SketchInstanceMetadata` entries registered; dropping that store at N=10_000
+//! `SummarySeriesMetadata` entries registered; dropping that store at N=10_000
 //! pays for 10k Drops of `metric_name: String`, `BTreeSet`, `SketchConfig`,
 //! `AccuracyBound`, etc. That drop, not `append_sample`, is what makes the
 //! 10k case look ~90× slower than the 100-sid case.
@@ -27,7 +27,7 @@ use data_plane::storage_engines::sketch_db::data::{
     AccuracyBound, AggKind, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
     SketchSampleState,
 };
-use data_plane::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
+use data_plane::storage_engines::sketch_db::index::{SketchStore, SummarySeriesMetadata};
 
 fn ddsketch_payload() -> Vec<u8> {
     let mut sk = DdSketch::new(0.01);
@@ -46,11 +46,11 @@ fn ddsketch_payload() -> Vec<u8> {
     .encode_to_vec()
 }
 
-fn dd_meta(sid: u64) -> SketchInstanceMetadata {
+fn dd_meta(sid: u64) -> SummarySeriesMetadata {
     let cfg = SketchConfig::DDSketch {
         relative_accuracy: 0.01,
     };
-    SketchInstanceMetadata {
+    SummarySeriesMetadata {
         sid,
         metric_name: "bench_metric".into(),
         group_by_keys: BTreeSet::new(),

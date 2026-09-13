@@ -286,7 +286,7 @@ mod tests {
 
     use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata, SketchSampleState,
+        AccuracyBound, Capability, SketchAlgorithm, SketchSampleState, SummarySeriesMetadata,
     };
 
     fn ddsketch_fixture() -> SketchStore {
@@ -294,7 +294,7 @@ mod tests {
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
@@ -331,7 +331,7 @@ mod tests {
         let cfg = SketchConfig::Hll { precision: 14 };
         let mut group_by_keys = std::collections::BTreeSet::new();
         group_by_keys.insert("service".to_string());
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid,
             metric_name: "unique_users".to_string(),
             group_by_keys,
@@ -423,7 +423,7 @@ mod tests {
     fn formal_range_plan_returns_exact_requested_steps() {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(901);
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 9,
             metric_name: "bytes".into(),
             group_by_keys: std::collections::BTreeSet::new(),

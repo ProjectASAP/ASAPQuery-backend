@@ -129,7 +129,7 @@ pub fn delta_benchmark_table() -> HashMap<SketchType, DeltaCosts> {
 /// A shorter flush period means:
 ///   • fewer inserts accumulate per period  → lower fill rate → better delta
 ///   • more flushes per second              → higher total CPU overhead
-pub fn flush_period_secs(plan: &CollectionPlan, w: &QueryWorkload) -> f64 {
+pub fn flush_period_secs(plan: &CollectionPlan, w: &LegacyMetricWorkload) -> f64 {
     if let Some(wd) = plan.agent_config.window_duration {
         return wd.as_secs_f64();
     }
@@ -196,7 +196,7 @@ fn estimate_distinct_keys(inserts_per_flush: f64, wc: &WorkloadCharacteristics) 
 pub fn estimate_fill_rate(
     wc: &WorkloadCharacteristics,
     plan: &CollectionPlan,
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
 ) -> f64 {
     let flush_secs = flush_period_secs(plan, w);
     let inserts_per_flush = wc.samples_per_sec_per_series * wc.series_count as f64 * flush_secs;
@@ -313,7 +313,7 @@ pub const RAW_PASSTHROUGH_SAMPLE_RATE_THRESHOLD: f64 = 10.0;
 ///   7. Otherwise → UseDelta.
 pub fn decide_delta(
     plan: &CollectionPlan,
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
     wc: &WorkloadCharacteristics,
     bytes_per_series_per_sec: f64,
 ) -> (DeltaDecision, TransmissionCostSummary) {
@@ -474,8 +474,8 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
 
-    fn workload_for(agg: AggType) -> QueryWorkload {
-        QueryWorkload {
+    fn workload_for(agg: AggType) -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: "m".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],

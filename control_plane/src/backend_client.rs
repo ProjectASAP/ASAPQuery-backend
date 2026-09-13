@@ -596,16 +596,18 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_publication_posts_canonical_document_without_legacy_bytes() {
-        let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
-            serde_json::from_str(include_str!(
-                "../../docs/examples/asapquery-planning-snapshot.json"
-            ))
-            .unwrap();
-        let publication = crate::physical::compiler::tests::quoted_snapshot(snapshot, false)
-            .compile()
-            .unwrap()
-            .publication()
-            .unwrap();
+        let snapshot: crate::physical::compiler::BackendLocalPlanningInput = serde_json::from_str(
+            include_str!("../../docs/examples/asapquery-planning-snapshot.json"),
+        )
+        .unwrap();
+        let publication = crate::physical::compiler::tests::quoted_snapshot(
+            snapshot,
+            crate::physical::compiler::QueryFrontend::PromQl,
+        )
+        .compile_promql()
+        .unwrap()
+        .to_publication_artifact()
+        .unwrap();
         let hits: StdArc<Mutex<Vec<serde_json::Value>>> = StdArc::new(Mutex::new(Vec::new()));
         let route_hits = hits.clone();
         let app = Router::new().route(

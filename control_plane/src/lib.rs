@@ -1,7 +1,14 @@
-//! Control-plane planning, configuration emission, and deployment services.
+//! Backend control-plane library and standalone service.
 //!
-//! These modules support in-process integration and the standalone control-plane
-//! binary. Internal module paths are not a wire-protocol compatibility contract.
+//! ASAPPlanner owns canonical semantic IR and legal logical selection. This
+//! crate adapts workload/evidence inputs, compiles physical candidates, checks
+//! provider quotes, and publishes one consistent catalog-backed generation.
+//! Shared execution and installation contracts live in `asap_types`.
+//!
+//! `physical::compiler`, `physical::workload_cost`, and `clickhouse` are the
+//! current compilation paths. Flat metric workloads and stage emission remain
+//! compatibility paths. Their public modules are workspace integration APIs,
+//! not an independent wire schema or a second semantic planner.
 
 #![allow(
     clippy::collapsible_match,

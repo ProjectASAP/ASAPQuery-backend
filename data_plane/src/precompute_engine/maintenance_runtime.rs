@@ -5,7 +5,7 @@ use super::subdag_scheduler::{
     execute_precompute_sink, IdempotentCommitSink, MaterializationCommitKey,
     PrecomputeOperatorRegistry, ScheduleError,
 };
-use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, PrecomputedOutput};
+use crate::storage_engines::types::{AggregateCore, PrecomputedOutput, StreamingConfigHandle};
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
 use planner_types::post_asap::{ExecutableDagNode, ExecutableOperatorPayload, PostAsapNodeId};
 use sha2::{Digest, Sha256};
@@ -1610,12 +1610,12 @@ struct CommitRegistry(Mutex<CommitRegistryState>);
 impl CommitRegistry {
     fn plan_snapshot(
         &self,
-        plans: &HotReloadStreamingConfig,
-    ) -> Result<Option<Arc<crate::storage_engines::types::ActivePhysicalPlan>>, String> {
+        plans: &StreamingConfigHandle,
+    ) -> Result<Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>>, String> {
         let mut state = self.0.lock().map_err(|_| "commit registry poisoned")?;
         // Read the authoritative generation while holding the registry lock,
         // so an old in-flight batch cannot restore an obsolete generation.
-        let plan = plans.physical_plan_snapshot();
+        let plan = plans.active_physical_plan_snapshot();
         let generation = plan
             .as_ref()
             .map(|plan| (plan.plan_id(), plan.plan_version()));
@@ -1778,13 +1778,13 @@ impl IdempotentCommitSink<MaintenanceValue> for CommitRegistry {
 /// With no matching DAG, the source output is forwarded unchanged.
 pub struct MaintenanceDagSink {
     inner: Arc<dyn OutputSink>,
-    plans: HotReloadStreamingConfig,
+    plans: StreamingConfigHandle,
     commits: CommitRegistry,
     batch_guard: Mutex<()>,
 }
 
 impl MaintenanceDagSink {
-    pub fn new(inner: Arc<dyn OutputSink>, plans: HotReloadStreamingConfig) -> Self {
+    pub fn new(inner: Arc<dyn OutputSink>, plans: StreamingConfigHandle) -> Self {
         Self {
             inner,
             plans,
@@ -1795,7 +1795,7 @@ impl MaintenanceDagSink {
 
     fn execute_one(
         &self,
-        plan: &crate::storage_engines::types::ActivePhysicalPlan,
+        plan: &crate::storage_engines::types::RuntimePhysicalPlan,
         output: PrecomputedOutput,
         state: Box<dyn AggregateCore>,
     ) -> Result<Vec<PendingOutput>, String> {
@@ -2105,6 +2105,44 @@ impl OutputSink for MaintenanceDagSink {
     }
 }
 
+/// Materializations affected by an admitted source update, following installed
+/// semantic dependencies rather than assuming source and output identities match.
+pub(crate) fn affected_materializations(
+    plan: &asap_types::precompute_plan::PrecomputePlan,
+    source: asap_types::sds::SummaryDefinitionId,
+) -> BTreeSet<asap_types::sds::SummaryDefinitionId> {
+    use asap_types::executable_plan::BackendNodeBinding;
+    let mut affected = BTreeSet::from([source]);
+    for installed in plan.executable_dags.values() {
+        let mut reachable = installed.binding.nodes.iter().filter_map(|(node, binding)| {
+            matches!(binding, BackendNodeBinding::Materialization { summary_definition } if *summary_definition == source).then_some(*node)
+        }).collect::<BTreeSet<_>>();
+        let mut frontier = reachable.iter().copied().collect::<Vec<_>>();
+        while let Some(producer) = frontier.pop() {
+            for edge in &installed.document.edges {
+                let immutable = matches!(installed.binding.node(edge.consumer),
+                    Some(BackendNodeBinding::Materialization { summary_definition })
+                        if plan.materializations.iter().any(|config|
+                            config.policy_fingerprint() == summary_definition.fingerprint()
+                                && config.derived_input.is_some()));
+                if edge.producer == producer && !immutable && reachable.insert(edge.consumer) {
+                    frontier.push(edge.consumer);
+                }
+            }
+        }
+        for sink in &installed.binding.precompute_sinks {
+            if reachable.contains(sink) {
+                if let Some(BackendNodeBinding::Materialization { summary_definition }) =
+                    installed.binding.nodes.get(sink)
+                {
+                    affected.insert(*summary_definition);
+                }
+            }
+        }
+    }
+    affected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2309,10 +2347,10 @@ mod tests {
         .unwrap();
         snapshot["query_workload"]["repeating_queries"][0]["query"] =
             "sum(sum_over_time(m[1m]))".into();
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_value(snapshot).unwrap();
         let bundle = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let mut source_config = bundle.precompute_plan.materializations[0].clone();
         // This operator fixture supplies global raw populations; its config
@@ -3533,13 +3571,13 @@ mod tests {
     fn summary_update_rejects_multiple_output_populations_before_updating() {
         use planner_types::post_asap::{GroupingStrategy, SummaryUpdate};
         use planner_types::pre_asap::{ColumnRef, Reduction};
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
         let mut config = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap()
             .precompute_plan
             .materializations[0]
@@ -3594,13 +3632,13 @@ mod tests {
     fn dds_maintenance_rejects_nonpositive_population_before_returning_summary() {
         use planner_types::post_asap::{GroupingStrategy, SummaryUpdate};
         use planner_types::pre_asap::{ColumnRef, Reduction};
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
         let mut config = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap()
             .precompute_plan
             .materializations[0]
@@ -3757,7 +3795,7 @@ mod tests {
     #[test]
     fn downstream_failure_does_not_acknowledge_maintenance_publication() {
         use crate::storage_engines::types::{
-            ActivePhysicalPlan, HotReloadActivePhysicalPlan, StreamingConfig,
+            ActivePhysicalPlanHandle, RuntimePhysicalPlan, StreamingConfig,
         };
         use asap_types::executable_plan::{InstalledPostAsapDag, OwnedPostAsapDag};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3790,10 +3828,10 @@ mod tests {
         .unwrap();
         snapshot["query_workload"]["repeating_queries"][0]["query"] =
             "sum(sum_over_time(m[1m]))".into();
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_value(snapshot).unwrap();
         let mut bundle = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let target_config = &bundle.precompute_plan.materializations[0];
         let long_step = target_config.window_size.max(
@@ -3841,12 +3879,12 @@ mod tests {
                 binding,
             },
         )]);
-        let active = ActivePhysicalPlan {
+        let active = RuntimePhysicalPlan {
             envelope: bundle.precompute_plan.envelope.clone(),
             summary_catalog: Some(Arc::new(bundle.summary_catalog)),
             precompute_plan: bundle.precompute_plan,
             transmission_plan: bundle.transmission_plan,
-            runtime_config: Arc::new(StreamingConfig::new(Default::default())),
+            streaming_config: Arc::new(StreamingConfig::new(Default::default())),
             query_plan: Arc::new(bundle.query_plan),
             storage_routing: Arc::new(Default::default()),
         };
@@ -3861,7 +3899,7 @@ mod tests {
             });
             let sink = MaintenanceDagSink::new(
                 downstream.clone(),
-                HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(
+                StreamingConfigHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(
                     active.clone(),
                 )),
             );
@@ -4069,42 +4107,4 @@ mod tests {
         ));
         assert!(commits.get(&key).unwrap().is_none());
     }
-}
-
-/// Materializations affected by an admitted source update, following installed
-/// semantic dependencies rather than assuming source and output identities match.
-pub(crate) fn affected_materializations(
-    plan: &asap_types::precompute_plan::PrecomputePlan,
-    source: asap_types::sds::SummaryDefinitionId,
-) -> BTreeSet<asap_types::sds::SummaryDefinitionId> {
-    use asap_types::executable_plan::BackendNodeBinding;
-    let mut affected = BTreeSet::from([source]);
-    for installed in plan.executable_dags.values() {
-        let mut reachable = installed.binding.nodes.iter().filter_map(|(node, binding)| {
-            matches!(binding, BackendNodeBinding::Materialization { summary_definition } if *summary_definition == source).then_some(*node)
-        }).collect::<BTreeSet<_>>();
-        let mut frontier = reachable.iter().copied().collect::<Vec<_>>();
-        while let Some(producer) = frontier.pop() {
-            for edge in &installed.document.edges {
-                let immutable = matches!(installed.binding.node(edge.consumer),
-                    Some(BackendNodeBinding::Materialization { summary_definition })
-                        if plan.materializations.iter().any(|config|
-                            config.policy_fingerprint() == summary_definition.fingerprint()
-                                && config.derived_input.is_some()));
-                if edge.producer == producer && !immutable && reachable.insert(edge.consumer) {
-                    frontier.push(edge.consumer);
-                }
-            }
-        }
-        for sink in &installed.binding.precompute_sinks {
-            if reachable.contains(sink) {
-                if let Some(BackendNodeBinding::Materialization { summary_definition }) =
-                    installed.binding.nodes.get(sink)
-                {
-                    affected.insert(*summary_definition);
-                }
-            }
-        }
-    }
-    affected
 }

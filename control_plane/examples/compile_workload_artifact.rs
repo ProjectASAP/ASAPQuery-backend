@@ -1,5 +1,5 @@
 //! Control-plane entry point: cost-select a workload and emit its atomic install request.
-use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
+use control_plane::physical::compiler::BackendLocalPlanningInput;
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,12 +15,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         return Err("unexpected arguments".into());
     }
-    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
+    let snapshot: BackendLocalPlanningInput = serde_json::from_slice(&std::fs::read(path)?)?;
     let start = std::time::Instant::now();
     let plan = if metricsql {
         snapshot.compile_metricsql()?
     } else {
-        snapshot.compile()?
+        snapshot.compile_promql()?
     };
     let elapsed = start.elapsed().as_nanos();
     let comparison = plan
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "planning_elapsed_ns": elapsed,
             "envelope": plan.envelope,
             "cost_comparison": comparison,
-            "logical_selection": plan.logical_selection,
+            "logical_selection": plan.planner_selection_trace,
             "backend_revision": control_plane::physical::compiler::BACKEND_REVISION,
             "planner_revision": control_plane::physical::compiler::PLANNER_REVISION,
             "lifecycle_estimates": plan.lifecycle_estimates,

@@ -3,7 +3,7 @@ use crate::precompute_engine::ingest_handler::IngestState;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
 use crate::precompute_engine::worker::{Worker, WorkerRuntimeConfig};
-use crate::storage_engines::types::HotReloadStreamingConfig;
+use crate::storage_engines::types::StreamingConfigHandle;
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -20,15 +20,14 @@ pub struct PrecomputeWorkerDiagnostics {
 /// Creates worker threads and the series router. The ingest state
 /// (router + hot-reload handle) is built eagerly in `new()` so that
 /// ingest sources (currently OTLP) can hold a handle and push data
-/// into the same worker pool. The legacy Prometheus / VictoriaMetrics
-/// remote-write HTTP listener was deleted alongside the rest of the
-/// remote-write ingest path — backend ingest is OTLP-only now.
+/// into the same worker pool. OTLP ingestion and the backend-local Remote Write
+/// profile both use the installed materialization view.
 pub struct PrecomputeEngine {
     config: PrecomputeEngineConfig,
     output_sink: Arc<dyn OutputSink>,
     diagnostics: Arc<PrecomputeWorkerDiagnostics>,
     ingest_state: Arc<IngestState>,
-    hot_reload_config: HotReloadStreamingConfig,
+    hot_reload_config: StreamingConfigHandle,
     /// Worker receivers, one per worker. Taken by `run()` when spawning workers.
     receivers: Vec<mpsc::Receiver<WorkerMessage>>,
 }
@@ -36,10 +35,10 @@ pub struct PrecomputeEngine {
 impl PrecomputeEngine {
     pub fn new(
         config: PrecomputeEngineConfig,
-        hot_reload_config: HotReloadStreamingConfig,
+        hot_reload_config: StreamingConfigHandle,
         output_sink: Arc<dyn OutputSink>,
         series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
-        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
         let worker_group_counts = (0..config.num_workers)
             .map(|_| Arc::new(AtomicUsize::new(0)))
@@ -81,7 +80,7 @@ impl PrecomputeEngine {
             pass_raw_samples: config.pass_raw_samples,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver,
-            sketch_index,
+            summary_store,
             observability: crate::precompute_engine::ingest_handler::IngestObservability::new(),
         });
 
@@ -108,10 +107,8 @@ impl PrecomputeEngine {
     }
 
     /// Start the precompute engine. This spawns worker tasks and the
-    /// periodic flush timer, then blocks until shutdown. The legacy
-    /// Prometheus / VictoriaMetrics HTTP ingest listener has been
-    /// removed; ingest now flows in via the OTLP receiver, which holds
-    /// the same `IngestState` handle returned by `ingest_state()`.
+    /// periodic flush timer, then blocks until shutdown. Protocol receivers
+    /// submit through the shared `IngestState` returned by `ingest_state()`.
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let num_workers = self.config.num_workers;
         let output_sink: Arc<dyn crate::precompute_engine::output_sink::OutputSink> = Arc::new(

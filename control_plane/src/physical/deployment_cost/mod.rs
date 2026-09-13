@@ -101,7 +101,7 @@ pub struct PlanScore {
 /// Estimates resource costs for a given plan + workload using the provided cost table.
 pub fn score_with(
     plan: &CollectionPlan,
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
     table: &HashMap<SketchType, SketchCosts>,
 ) -> PlanScore {
     let st = &plan.agent_config.sketch_type;
@@ -136,7 +136,7 @@ pub fn score_with(
 }
 
 /// Estimates resource costs for a given plan + workload.
-pub fn score(plan: &CollectionPlan, w: &QueryWorkload) -> PlanScore {
+pub fn score(plan: &CollectionPlan, w: &LegacyMetricWorkload) -> PlanScore {
     let table = benchmark_table();
     let st = &plan.agent_config.sketch_type;
 
@@ -239,7 +239,11 @@ impl DeploymentCostPlanner {
     /// CPU / memory overhead, and raw vs. sketch bandwidth comparison.
     /// Pass `None` to use conservative defaults (1 000 series, 100 Hz,
     /// 100 B/sample, Zipf distribution, no memory budget).
-    pub fn plan(&self, w: &QueryWorkload, wc: Option<&WorkloadCharacteristics>) -> CollectionPlan {
+    pub fn plan(
+        &self,
+        w: &LegacyMetricWorkload,
+        wc: Option<&WorkloadCharacteristics>,
+    ) -> CollectionPlan {
         if !matches!(w.accuracy, crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
         {
             return self.inner.plan(w);
@@ -306,7 +310,7 @@ impl DeploymentCostPlanner {
 /// Runs the delta cost model and writes the decision into the plan using a provided cost table.
 fn apply_delta_decision_with(
     plan: &mut CollectionPlan,
-    w: &QueryWorkload,
+    w: &LegacyMetricWorkload,
     wc: &WorkloadCharacteristics,
     table: &HashMap<SketchType, SketchCosts>,
 ) {
@@ -350,8 +354,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn workload(aggs: Vec<AggType>) -> QueryWorkload {
-        QueryWorkload {
+    fn workload(aggs: Vec<AggType>) -> LegacyMetricWorkload {
+        LegacyMetricWorkload {
             metric_name: "test".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
@@ -408,7 +412,7 @@ mod tests {
 
     #[test]
     fn ddsketch_fails_tight_sla() {
-        let w = QueryWorkload {
+        let w = LegacyMetricWorkload {
             accuracy_sla: 0.001,
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.001),
             ..workload(vec![AggType::Quantile])
@@ -433,11 +437,11 @@ mod tests {
 
     #[test]
     fn dim_multiplier_increases_bandwidth() {
-        let w_few = QueryWorkload {
+        let w_few = LegacyMetricWorkload {
             group_by_labels: vec!["host".into()],
             ..workload(vec![AggType::Quantile])
         };
-        let w_many = QueryWorkload {
+        let w_many = LegacyMetricWorkload {
             group_by_labels: vec![
                 "host".into(),
                 "service".into(),
@@ -454,7 +458,7 @@ mod tests {
 
     #[test]
     fn kll_error_formula() {
-        let w = QueryWorkload {
+        let w = LegacyMetricWorkload {
             accuracy_sla: 0.02,
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.02),
             ..workload(vec![AggType::Quantile])
@@ -476,7 +480,7 @@ mod tests {
             (AggType::Cardinality, 0.01),
             (AggType::Frequency, 0.02),
         ] {
-            let w = QueryWorkload {
+            let w = LegacyMetricWorkload {
                 accuracy_sla: sla,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(sla),
                 ..workload(vec![agg])
@@ -493,7 +497,7 @@ mod tests {
 
     #[test]
     fn cost_model_prefers_lower_bandwidth_for_cardinality() {
-        let w = QueryWorkload {
+        let w = LegacyMetricWorkload {
             accuracy_sla: 0.02,
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.02),
             ..workload(vec![AggType::Cardinality])

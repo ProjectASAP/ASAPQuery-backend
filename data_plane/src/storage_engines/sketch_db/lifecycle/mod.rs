@@ -3,7 +3,7 @@
 //!
 //! Post-M2.3 reorg #5. The sid-level lifecycle state itself (the
 //! `retired_at_ms` / `expires_at_ms` fields on
-//! [`crate::storage_engines::sketch_db::index::SketchInstanceMetadata`],
+//! [`crate::storage_engines::sketch_db::index::SummarySeriesMetadata`],
 //! plus `force_retire` / `force_expire` / `is_writable` / `list_by_status`
 //! / `remove_instance` / `remove_instances_for_agg_config` methods on
 //! `SketchStore`) lives in `index/` next to the data it gates. This

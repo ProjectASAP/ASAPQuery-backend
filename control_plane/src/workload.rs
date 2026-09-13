@@ -237,7 +237,7 @@ pub struct WorkloadEntry {
     /// Optional explicit sketch family override. When set, the planner pins
     /// this family for the metric (modulo `(sketch, statistic)` validity
     /// by ASAPPlanner's legal candidate enumeration). Threaded
-    /// into `QueryWorkload::sketch_type_override` by the registry pre-pop
+    /// into `LegacyMetricWorkload::sketch_type_override` by the registry pre-pop
     /// path so the typed L4 binding (`bind_workload_typed`) honours it.
     ///
     /// MVP-§46 contract entries 5–8 in `deploy/configs/mvp-workload.yaml`
@@ -264,12 +264,12 @@ pub struct WorkloadEntry {
     /// http_requests_total_latency_ms[30s])` carries no `by (...)`
     /// clause, so the PromQL parser surfaces an EMPTY group_by_labels.
     /// Without a declarative field the analyzer ends up with an empty
-    /// `QueryWorkload.group_by_labels` → an empty `keep_keys` list →
+    /// `LegacyMetricWorkload.group_by_labels` → an empty `keep_keys` list →
     /// the agent strips ALL attrs and mints a single sid per metric
     /// (instead of one per `(metric, zone)`), defeating the streaming-
     /// config contract.
     ///
-    /// Threaded into `QueryWorkload::group_by_labels` by the registry
+    /// Threaded into `LegacyMetricWorkload::group_by_labels` by the registry
     /// pre-pop loop in `main`, so it merges with any `by (...)` keys
     /// the PromQL parser surfaces. Empty / missing ⇒ same behaviour as
     /// pre-B3 (no allowlist injected).
@@ -363,7 +363,7 @@ pub struct WorkloadEntry {
     /// to reach the planner with *different* flush periods — the startup path
     /// hardcoded `None`. Threaded into `QuerySpec::repeat_every` by the
     /// registry pre-pop loop in `main`, which the analyzer parses into
-    /// [`crate::types::QueryWorkload::repeat_every`].
+    /// [`crate::types::LegacyMetricWorkload::repeat_every`].
     ///
     /// `None` / missing ⇒ unchanged behaviour (the cost model falls back to
     /// its window-derived flush rate).
@@ -380,7 +380,7 @@ pub struct WorkloadEntry {
 /// [`WorkloadEntry`] then had to be re-threaded in each copy, and
 /// `repeat_every` is the field that proves the cost: the HTTP
 /// `POST /api/v1/plan` path carried the declared cadence into
-/// [`crate::types::QueryWorkload::repeat_every`] while the startup path pinned
+/// [`crate::types::LegacyMetricWorkload::repeat_every`] while the startup path pinned
 /// `None`, so the same declaration was costed with two different batch-mode
 /// flush periods depending on which entry point registered it.
 ///
@@ -397,7 +397,7 @@ pub struct WorkloadEntry {
 ///   `keep_keys(datapoint.attributes, [...])` OTTL processor strips wire attrs
 ///   down to this list BEFORE sketching.
 /// * `sketch_family_override` is threaded into `QuerySpec::sketch_type`, which
-///   populates `QueryWorkload::sketch_type_override` — what `bind_workload_typed`
+///   populates `LegacyMetricWorkload::sketch_type_override` — what `bind_workload_typed`
 ///   reads to honour the MVP §46 HLL / CountSketch / CountMinSketch pins.
 pub fn query_spec_for_entry(entry: &WorkloadEntry) -> crate::pipeline::QuerySpec {
     crate::pipeline::QuerySpec {

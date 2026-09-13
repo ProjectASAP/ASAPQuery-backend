@@ -63,7 +63,7 @@ struct Args {
 
     /// Versioned canonical QueryWorkload + DataWorkload and backend-local
     /// implementation evidence. The ASAPQuery profile invokes the pinned
-    /// Planner and PhysicalCompiler at startup when this is supplied.
+    /// Planner and PhysicalPlanCompiler at startup when this is supplied.
     #[arg(long)]
     planning_snapshot: Option<std::path::PathBuf>,
 
@@ -539,7 +539,7 @@ async fn main() -> Result<()> {
 
     let startup_artifact = if let Some(path) = args.planning_snapshot.as_ref() {
         let bytes = fs::read(path)?;
-        let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_slice(&bytes).map_err(|error| {
                 format!(
                     "failed to decode planning snapshot {}: {error}",
@@ -549,12 +549,14 @@ async fn main() -> Result<()> {
         let runtime_memory_budget = u64::try_from(args.persistence_memory_limit_mb)
             .unwrap_or(u64::MAX)
             .saturating_mul(1024 * 1024);
-        snapshot.implementation.max_retained_summary_bytes = snapshot
-            .implementation
-            .max_retained_summary_bytes
+        snapshot
+            .physical_inputs
+            .retained_summary_memory_budget_bytes = snapshot
+            .physical_inputs
+            .retained_summary_memory_budget_bytes
             .min(runtime_memory_budget);
         let plan = snapshot
-            .compile()
+            .compile_promql()
             .map_err(|error| format!("startup planning failed for {}: {error}", path.display()))?;
         if let Some(comparison) = &plan.cost_comparison {
             info!(
@@ -585,7 +587,7 @@ async fn main() -> Result<()> {
         None
     };
     let startup_physical_plan = if let Some(artifact) = startup_artifact {
-        let active = data_plane::drivers::query::servers::http::build_active_physical_plan(
+        let active = data_plane::drivers::query::servers::http::validate_and_build_runtime_plan(
             artifact,
             Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
         )
@@ -616,7 +618,7 @@ async fn main() -> Result<()> {
         None
     };
     let streaming_config = match startup_physical_plan.as_ref() {
-        Some(active) => active.runtime_config.clone(),
+        Some(active) => active.streaming_config.clone(),
         None => Arc::new(read_streaming_config(
             args.streaming_config
                 .as_deref()
@@ -625,7 +627,7 @@ async fn main() -> Result<()> {
     };
     info!(
         "Loaded streaming config with {} entries",
-        streaming_config.get_all_aggregation_configs().len()
+        streaming_config.materializations().len()
     );
     info!("Streaming config: {:?}", streaming_config);
 
@@ -674,12 +676,12 @@ async fn main() -> Result<()> {
     } else {
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new())
     };
-    let sketch_index = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
+    let summary_store = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
     if let Some(catalog) = startup_physical_plan
         .as_ref()
         .and_then(|plan| plan.summary_catalog.as_ref())
     {
-        sketch_index
+        summary_store
             .install_summary_catalog(Arc::clone(catalog))
             .map_err(std::io::Error::other)?;
     }
@@ -733,7 +735,7 @@ async fn main() -> Result<()> {
             index_persistence_dir
         );
         Some(
-            sketch_index
+            summary_store
                 .start_persistence(cfg)
                 .expect("SketchStore::start_persistence failed"),
         )
@@ -765,7 +767,7 @@ async fn main() -> Result<()> {
         schemas: Vec::new(),
         producers: Vec::new(),
         materializations: streaming_config
-            .aggregation_configs
+            .materializations_by_policy_fingerprint
             .values()
             .cloned()
             .collect(),
@@ -784,12 +786,12 @@ async fn main() -> Result<()> {
         rules: Vec::new(),
     };
     let initial_active_plan = startup_physical_plan.unwrap_or_else(|| {
-        data_plane::storage_engines::types::ActivePhysicalPlan {
+        data_plane::storage_engines::types::RuntimePhysicalPlan {
             envelope: initial_precompute_plan.envelope.clone(),
             summary_catalog: None,
             precompute_plan: initial_precompute_plan,
             transmission_plan: initial_transmission_plan,
-            runtime_config: streaming_config.clone(),
+            streaming_config: streaming_config.clone(),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
@@ -797,14 +799,14 @@ async fn main() -> Result<()> {
         }
     });
     let active_physical_plan =
-        data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(initial_active_plan);
+        data_plane::storage_engines::types::ActivePhysicalPlanHandle::new(initial_active_plan);
     let hot_reload_config =
-        data_plane::storage_engines::types::HotReloadStreamingConfig::from_active(
+        data_plane::storage_engines::types::StreamingConfigHandle::from_active_physical_plan(
             active_physical_plan.clone(),
         );
 
     // Query execution reads generation-consistent runtime configuration from
-    // the ActivePhysicalPlan installed below.
+    // the RuntimePhysicalPlan installed below.
     let engine = {
         let mut engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
             // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
@@ -812,7 +814,7 @@ async fn main() -> Result<()> {
             // drives the Phase 6 archive failover via
             // EngineError::CapabilityMiss when the ASAP tier is empty
             // / ghost / unknown.
-            .with_sketch_index(sketch_index.clone())
+            .with_sketch_index(summary_store.clone())
             .with_active_physical_plan(active_physical_plan.clone())
             .with_exact_subquery_endpoint(args.prometheus_server.clone())
             .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
@@ -866,7 +868,7 @@ async fn main() -> Result<()> {
         // below is for the eviction service + diagnostic plumbing
         // until subsequent M2.3.6 sub-PRs delete those too.
         let output_sink = Arc::new(SketchStoreSink::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             hot_reload_config.clone(),
             series_resolver.clone(),
         ));
@@ -875,12 +877,12 @@ async fn main() -> Result<()> {
             hot_reload_config.clone(),
             output_sink,
             series_resolver.clone(),
-            sketch_index.clone(),
+            summary_store.clone(),
         );
         if let Some(endpoint) = args.erp_runtime_samples_endpoint.clone() {
             let generation = engine
                 .ingest_state()
-                .physical_plan_snapshot()
+                .active_physical_plan_snapshot()
                 .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
                 .ok_or_else(|| {
                     std::io::Error::other("ERP observation requires an installed catalog")
@@ -898,7 +900,7 @@ async fn main() -> Result<()> {
         // Spawn periodic memory diagnostics logger — M2.3.6g routes
         // through SketchStore now that SketchStore no longer holds
         // production data.
-        let diag_index = sketch_index.clone();
+        let diag_index = summary_store.clone();
         tokio::spawn(async move {
             spawn_memory_diagnostics(diag_index, Some(worker_diagnostics)).await;
         });
@@ -921,7 +923,7 @@ async fn main() -> Result<()> {
     // write-idle, fully-flushed sketch sids while keeping their queryable
     // metadata, bounding resident registry memory under series churn.
     if args.idle_sid_evict_secs > 0 {
-        let evict_index = sketch_index.clone();
+        let evict_index = summary_store.clone();
         let idle_ms = args.idle_sid_evict_secs.saturating_mul(1000);
         // Sweep a few times per idle horizon, clamped to a sane cadence.
         let sweep = std::time::Duration::from_secs(args.idle_sid_evict_secs.clamp(10, 60));
@@ -995,7 +997,7 @@ async fn main() -> Result<()> {
     // sample_p grant. Global-threshold alerting is retired (see
     // data_plane::monitor module docs) — this coordinator never fires one.
     let monitor_handle = if args.enable_monitor_coordinator {
-        use data_plane::monitor::{
+        use data_plane::update_sampling::{
             Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl,
         };
         let specs: Vec<MonitorConfig> = streaming_config
@@ -1110,13 +1112,13 @@ async fn main() -> Result<()> {
     // `SchemaRegistry`. `POST /api/v1/streaming-config` drives
     // lifecycle transitions at the sid level via the shared
     // `SketchStore` (already passed in below).
-    let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
+    let mut server = HttpServer::new(http_config, engine, summary_store.clone())
         .with_active_physical_plan(active_physical_plan.clone())
         .with_probe_cache(probe_cache.clone());
     if args.profile == RuntimeProfile::Distributed {
         // Legacy partial-document endpoints remain available to distributed
         // deployments. The compatibility profile deliberately exposes only
-        // the atomic PhysicalPlan stage/activate lifecycle.
+        // the atomic CompiledPhysicalPlan stage/activate lifecycle.
         server = server.with_hot_reload_config(hot_reload_config.clone());
     }
 
@@ -1178,14 +1180,14 @@ async fn main() -> Result<()> {
         );
         data_plane::storage_engines::types::BackendStorageRouting::empty()
     };
-    if active_physical_plan.snapshot().plan_id() == 0 {
-        let current = active_physical_plan.snapshot();
-        active_physical_plan.swap(data_plane::storage_engines::types::ActivePhysicalPlan {
+    if active_physical_plan.active_snapshot().plan_id() == 0 {
+        let current = active_physical_plan.active_snapshot();
+        active_physical_plan.swap(data_plane::storage_engines::types::RuntimePhysicalPlan {
             envelope: current.envelope.clone(),
             summary_catalog: current.summary_catalog.clone(),
             precompute_plan: current.precompute_plan.clone(),
             transmission_plan: current.transmission_plan.clone(),
-            runtime_config: current.runtime_config.clone(),
+            streaming_config: current.streaming_config.clone(),
             query_plan: current.query_plan.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });
@@ -1326,7 +1328,7 @@ async fn main() -> Result<()> {
         // destination after the M2.3.6g store retirement). Resolver
         // is the same shared mint authority as live ingest, so
         // backfilled precompute sids share the OTel namespace.
-        .with_sketch_index(sketch_index.clone())
+        .with_sketch_index(summary_store.clone())
         .with_series_resolver(series_resolver.clone());
         info!(
             "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/OtherSketch fail fast)"
@@ -1366,7 +1368,7 @@ async fn main() -> Result<()> {
             data_plane::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
         );
         let svc = data_plane::storage_engines::sketch_db::SchemaEvictionService::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             backfill_registry.clone(),
             data_plane::storage_engines::sketch_db::SchemaEvictionConfig {
                 poll_interval: std::time::Duration::from_secs(args.schema_eviction_poll_secs),
@@ -1411,7 +1413,7 @@ async fn main() -> Result<()> {
         );
         let accelerator = Arc::new(
             data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan_and_exact_backend(
-                sketch_index.clone(),
+                summary_store.clone(),
                 active_physical_plan.clone(),
                 fallback.clone(),
             ),
@@ -1501,7 +1503,7 @@ fn process_resident_bytes() -> usize {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    sketch_index: Arc<data_plane::storage_engines::sketch_db::index::SketchStore>,
+    summary_store: Arc<data_plane::storage_engines::sketch_db::index::SketchStore>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
     use data_plane::storage_engines::sketch_db::index::persistence::EpochSource;
@@ -1513,8 +1515,8 @@ async fn spawn_memory_diagnostics(
 
         // 1. SketchStore diagnostics (M2.3.6g — replaces the
         //    pre-M2.3 per-agg_id SketchStore::diagnostic_info).
-        let instance_count = sketch_index.instance_count();
-        let series_count = sketch_index.series_len();
+        let instance_count = summary_store.instance_count();
+        let series_count = summary_store.series_len();
         // `approx_memory_bytes` is the flusher's EVICTABLE-payload gauge:
         // it counts only live sketch payloads (current_epoch + sealed), so
         // it correctly reads ~0 once everything has been flushed to disk.
@@ -1522,8 +1524,8 @@ async fn spawn_memory_diagnostics(
         // per-sid registry + intern caches stay resident and are not
         // flushable. Report evictable payload, structural overhead, their
         // total store estimate, and process RSS ground truth separately.
-        let payload_bytes = sketch_index.approx_memory_bytes();
-        let resident_bytes = sketch_index.approx_resident_bytes();
+        let payload_bytes = summary_store.approx_memory_bytes();
+        let resident_bytes = summary_store.approx_resident_bytes();
         let structural_bytes = resident_bytes.saturating_sub(payload_bytes);
         let rss_bytes = process_resident_bytes();
         info!(

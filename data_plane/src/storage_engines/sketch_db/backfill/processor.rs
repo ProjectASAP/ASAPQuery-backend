@@ -72,7 +72,7 @@ use tracing::debug;
 use crate::drivers::ingest::population_attrs_fingerprint;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
+use crate::storage_engines::types::{AggregateCore, KeyByLabelValues, StreamingConfigHandle};
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
 
@@ -177,13 +177,13 @@ pub struct BackfillWindowProcessor {
     /// `StreamingConfig` at each window to find the
     /// `AggregationConfig` for `agg_id`. The snapshot is cheap
     /// (Arc refcount bump) so we don't optimise further.
-    config: HotReloadStreamingConfig,
+    config: StreamingConfigHandle,
     /// Phase 5 M2.3.6g — replayed batches land here. The legacy
     /// `Arc<dyn Store>` field is gone; SketchStore is the only
     /// destination. Optional so tests that don't observe write
     /// effects can skip attaching one (the processor becomes a
     /// registry-only logger in that case).
-    sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
+    summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Shared sid mint authority. Same `SeriesIdResolver` the OTel
     /// ingest path uses, so backfilled precompute sids land in the
     /// same unified namespace as live precompute / sketch sids. Only
@@ -202,13 +202,13 @@ pub struct BackfillWindowProcessor {
 
 impl BackfillWindowProcessor {
     pub fn new(
-        config: HotReloadStreamingConfig,
+        config: StreamingConfigHandle,
         registry: Arc<BackfillRegistry>,
         job_id: u64,
     ) -> Self {
         Self {
             config,
-            sketch_index: None,
+            summary_store: None,
             series_resolver: None,
             registry,
             job_id,
@@ -220,10 +220,10 @@ impl BackfillWindowProcessor {
     /// so existing call sites opt in with one chained call.
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
-        self.catalog_generation = sketch_index.active_catalog_generation();
-        self.sketch_index = Some(sketch_index);
+        self.catalog_generation = summary_store.active_catalog_generation();
+        self.summary_store = Some(summary_store);
         self
     }
 
@@ -303,7 +303,7 @@ impl WindowProcessor for BackfillWindowProcessor {
                     r.as_ref(),
                     &config,
                     &sample.labels,
-                    self.sketch_index.as_deref(),
+                    self.summary_store.as_deref(),
                     self.catalog_generation.as_deref(),
                 )?,
                 None => fallback_bucket_id(&group_key),
@@ -373,7 +373,7 @@ impl WindowProcessor for BackfillWindowProcessor {
         // provenance below. When sketch_index is attached but no
         // resolver was provided, the precompute write is skipped
         // with a warn — sid minting requires the shared resolver.
-        if let Some(idx) = self.sketch_index.as_ref() {
+        if let Some(idx) = self.summary_store.as_ref() {
             match self.series_resolver.as_ref() {
                 Some(_resolver) => {
                     // B7.7 — sid is pre-resolved per bucket above; hand
@@ -471,7 +471,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -515,7 +515,7 @@ mod tests {
     async fn unknown_agg_id_fails_cleanly() {
         let cfg = sum_config(1, "m", vec![]);
         let streaming = streaming_config_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             999,
@@ -538,7 +538,7 @@ mod tests {
         let cfg = sum_config(1, "m", vec![]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -559,7 +559,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -851,7 +851,7 @@ mod tests {
     ///
     /// Drives `process_window` end-to-end with samples spanning two
     /// distinct `svc` values × two samples each. Asserts:
-    ///   - exactly two `SketchInstanceMetadata` entries land in the
+    ///   - exactly two `SummarySeriesMetadata` entries land in the
     ///     `SketchStore` (one per distinct sid bucket)
     ///   - their sids equal what the shared `SeriesIdResolver` would
     ///     mint for the same `(metric, grouping-values, agg_kind)`
@@ -868,16 +868,16 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
-        let sketch_index = Arc::new(SketchStore::new());
+        let summary_store = Arc::new(SketchStore::new());
         let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
             1,
             1,
             &[cfg.clone()],
         )
         .unwrap();
-        sketch_index
+        summary_store
             .install_summary_catalog(Arc::new(catalog))
             .unwrap();
         let resolver = Arc::new(SeriesIdResolver::new());
@@ -890,7 +890,7 @@ mod tests {
         );
 
         let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id)
-            .with_sketch_index(sketch_index.clone())
+            .with_sketch_index(summary_store.clone())
             .with_series_resolver(resolver.clone());
 
         // Two distinct svc values × two samples each. Same window
@@ -925,7 +925,7 @@ mod tests {
 
         // Two distinct sids landed in the index.
         assert_eq!(
-            sketch_index.instance_count(),
+            summary_store.instance_count(),
             2,
             "one sid per distinct svc bucket"
         );
@@ -939,8 +939,8 @@ mod tests {
         let sid_b =
             resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}", None, None).unwrap();
         assert_ne!(sid_a, sid_b, "distinct svc values mint distinct sids");
-        assert_eq!(sketch_index.classify(sid_a), SeriesLookup::Hit);
-        assert_eq!(sketch_index.classify(sid_b), SeriesLookup::Hit);
+        assert_eq!(summary_store.classify(sid_a), SeriesLookup::Hit);
+        assert_eq!(summary_store.classify(sid_b), SeriesLookup::Hit);
 
         // Provenance was recorded once per window (not once per
         // bucket) — same shape as the pre-rekey path.

@@ -24,7 +24,7 @@ pub mod summary_executor;
 // engine still consumes it via that canonical path.
 pub use crate::storage_engines::sketch_db::query as asap_tier;
 
+pub use engine::ASAPQueryEngine;
+
 #[cfg(test)]
 pub mod tests;
-
-pub use engine::ASAPQueryEngine;

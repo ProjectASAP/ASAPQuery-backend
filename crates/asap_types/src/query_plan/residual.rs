@@ -8,7 +8,7 @@ fn invalid(message: impl Into<String>) -> QueryPlanError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LogicalOperator {
+pub enum ResidualQueryOperator {
     /// A maximal exact scalar/vector subtree evaluated by Prometheus.
     ExactSubquery {
         query: String,
@@ -114,7 +114,7 @@ pub enum TemporalOperation {
     Count,
 }
 
-impl LogicalOperator {
+impl ResidualQueryOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
         let expected = match self {
             Self::Scan { .. } | Self::ExactSubquery { .. } => 0,
@@ -153,3 +153,7 @@ impl LogicalOperator {
         Ok(())
     }
 }
+
+// Compatibility imports; new callers use the domain names above.
+#[deprecated(note = "Use ResidualQueryOperator")]
+pub use ResidualQueryOperator as LogicalOperator;
