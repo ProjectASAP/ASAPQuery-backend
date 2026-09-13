@@ -35,9 +35,6 @@ pub mod store;
 pub mod types;
 pub mod workload;
 
-/// PromQL → ASAPPlanner's canonical post-ASAP plan via
-/// `asap_aware_mapping::bind::implement_tree`.
-
 /// Crate-wide test-only utilities for serialising access to process-global
 /// state (environment variables).
 ///
