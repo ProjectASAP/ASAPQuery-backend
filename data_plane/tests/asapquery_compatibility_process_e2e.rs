@@ -28,6 +28,60 @@ mod durable_summary_process;
 #[path = "support/immutable_maintenance_process.rs"]
 mod immutable_maintenance_process;
 
+// Test-only quotes preserve the fixture's local candidate without a production bypass.
+fn quote_snapshot_for_test(
+    snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot,
+) -> control_plane::physical::compiler::BackendLocalPlanningSnapshot {
+    quote_snapshot_for_frontend_test(snapshot, false)
+}
+
+fn quote_snapshot_for_frontend_test(
+    mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot,
+    metricsql: bool,
+) -> control_plane::physical::compiler::BackendLocalPlanningSnapshot {
+    use control_plane::physical::{
+        compiler::{PhysicalCompiler, BACKEND_REVISION, PLANNER_REVISION},
+        workload_cost::{self, WorkloadCostEvidence, WorkloadQuote},
+    };
+    let (request, environment) = snapshot.clone().planning_request().unwrap();
+    let mut preferred = true;
+    let quotes = workload_cost::with_exact_alternative(request)
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(_index, candidate)| {
+            let plan = if metricsql {
+                PhysicalCompiler.compile_metricsql(candidate.clone(), environment.clone())
+            } else {
+                PhysicalCompiler.compile(candidate.clone(), environment.clone())
+            }
+            .ok()?;
+            let unit_cost = if preferred { 1.0 } else { 1e12 };
+            preferred = false;
+            let manifest = workload_cost::manifest(&plan, &candidate.queries).unwrap();
+            Some(WorkloadQuote {
+                unit_costs: manifest
+                    .components
+                    .keys()
+                    .map(|key| (key.clone(), unit_cost))
+                    .collect(),
+                manifest,
+                executable: true,
+            })
+        })
+        .collect();
+    snapshot.workload_cost_evidence = Some(WorkloadCostEvidence {
+        backend_revision: BACKEND_REVISION.into(),
+        planner_revision: PLANNER_REVISION.into(),
+        data_snapshot_id: "process-fixture".into(),
+        model_version: "test-only-unit-costs".into(),
+        observed_at_unix_ms: environment.observed_at_unix_ms,
+        valid_for_ms: environment.max_evidence_age_ms,
+        quotes,
+    });
+    snapshot
+}
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -1144,15 +1198,18 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
 
     let backend_port = unused_port();
     let output_dir = tempfile::tempdir().expect("backend output directory");
-    let snapshot = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../docs/examples/asapquery-compatibility-demo-snapshot.json"
-    );
+    let fixture = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+    ))
+    .unwrap();
+    let priced = quote_snapshot_for_test(fixture);
+    let snapshot = output_dir.path().join("snapshot.json");
+    std::fs::write(&snapshot, serde_json::to_vec(&priced).unwrap()).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--profile")
         .arg("asapquery")
         .arg("--planning-snapshot")
-        .arg(snapshot)
+        .arg(&snapshot)
         .arg("--prometheus-server")
         .arg(format!("http://{fallback_address}"))
         .arg("--forward-unsupported-queries")
@@ -1589,7 +1646,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .as_array()
         .expect("materialization statuses");
     let planned_snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
-        serde_json::from_str(&std::fs::read_to_string(snapshot).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(&snapshot).unwrap()).unwrap();
     let planned = planned_snapshot.compile().unwrap();
     // Every selected state must be serving; the Planner may share or separate
     // physical populations, so compare identities rather than a frozen count.

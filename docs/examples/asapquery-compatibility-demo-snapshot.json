@@ -1,5 +1,5 @@
 {
-  "snapshot_version": 1,
+  "snapshot_version": 2,
   "query_workload": {
     "language": "promql",
     "query_batch": null,

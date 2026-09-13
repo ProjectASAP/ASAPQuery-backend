@@ -2311,7 +2311,9 @@ mod tests {
             "sum(sum_over_time(m[1m]))".into();
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(snapshot).unwrap();
-        let bundle = snapshot.compile().unwrap();
+        let bundle = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let mut source_config = bundle.precompute_plan.materializations[0].clone();
         // This operator fixture supplies global raw populations; its config
         // must agree with the explicit Reduce([]) below.
@@ -2319,6 +2321,7 @@ mod tests {
         source_config.grouping_labels = std::iter::empty::<String>().collect();
         source_config.window_size = 2;
         source_config.slide_interval = 2;
+        source_config.window_type = asap_types::WindowKind::Tumbling;
         source_config.window_layout =
             asap_types::aggregation_config::WindowMaterializationLayout::Pane { pane_secs: 1 };
         let source_definition = source_config.policy_fingerprint().into();
@@ -3535,7 +3538,12 @@ mod tests {
                 "../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let mut config = snapshot.compile().unwrap().precompute_plan.materializations[0].clone();
+        let mut config = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap()
+            .precompute_plan
+            .materializations[0]
+            .clone();
         config.aggregation_type = asap_types::AggregationType::Sum;
         config.aggregation_sub_type = "sum".into();
         config.grouping_labels = ["instance".to_string()].into_iter().collect();
@@ -3591,7 +3599,12 @@ mod tests {
                 "../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let mut config = snapshot.compile().unwrap().precompute_plan.materializations[0].clone();
+        let mut config = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap()
+            .precompute_plan
+            .materializations[0]
+            .clone();
         config.aggregation_type = asap_types::AggregationType::DDSketch;
         config.parameters.clear();
         config
@@ -3779,7 +3792,9 @@ mod tests {
             "sum(sum_over_time(m[1m]))".into();
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(snapshot).unwrap();
-        let mut bundle = snapshot.compile().unwrap();
+        let mut bundle = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let target_config = &bundle.precompute_plan.materializations[0];
         let long_step = target_config.window_size.max(
             target_config.slide_interval * target_config.num_aggregates_to_retain.unwrap_or(1),

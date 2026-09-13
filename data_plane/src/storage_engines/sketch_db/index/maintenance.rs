@@ -742,7 +742,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
         first.aggregation_type = asap_types::AggregationType::Sum;
         first.aggregation_sub_type = "sum".into();
@@ -851,7 +853,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
         first.aggregation_type = asap_types::AggregationType::Sum;
         first.aggregation_sub_type = "sum".into();
@@ -1082,7 +1086,9 @@ mod tests {
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(fixture).unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let source = plan
             .precompute_plan
             .materializations
@@ -1399,7 +1405,9 @@ mod tests {
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
-        let plan = snapshot.compile().unwrap();
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile()
+            .unwrap();
         let mut source_config = plan.precompute_plan.materializations[0].clone();
         source_config.aggregation_type = asap_types::AggregationType::Sum;
         source_config.aggregation_sub_type = "sum".into();

@@ -23,10 +23,11 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     entry["query"] = QUERY.into();
     entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.05}});
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
-    let plan = serde_json::from_value::<BackendLocalPlanningSnapshot>(fixture.clone())
-        .unwrap()
-        .compile()
-        .unwrap();
+    let plan = quote_snapshot_for_test(
+        serde_json::from_value::<BackendLocalPlanningSnapshot>(fixture.clone()).unwrap(),
+    )
+    .compile()
+    .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(
         plan.precompute_plan.materializations[0].aggregation_type,
@@ -38,7 +39,8 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     );
     let output = tempfile::tempdir().unwrap();
     let path = output.path().join("planning.json");
-    std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    let priced = quote_snapshot_for_test(serde_json::from_value(fixture.clone()).unwrap());
+    std::fs::write(&path, serde_json::to_vec(&priced).unwrap()).unwrap();
     let port = unused_port();
     let mut vm_port = unused_port();
     while vm_port == port {
@@ -80,11 +82,10 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     // Source syntax uses the shared parser fork; serving semantics and exact
     // routing belong to the MetricsQL adapter and its installed query entries.
     let snapshot = serde_json::from_value::<BackendLocalPlanningSnapshot>(fixture).unwrap();
-    let (mut request, mut environment) = snapshot.planning_request().unwrap();
-    request.hybrid_execution = false;
-    environment.plan_version = 2;
-    let compiled = control_plane::physical::compiler::PhysicalCompiler
-        .compile_metricsql(request, environment)
+    let mut snapshot = snapshot;
+    snapshot.environment.plan_version = 2;
+    let compiled = quote_snapshot_for_frontend_test(snapshot, true)
+        .compile_metricsql()
         .unwrap();
     let identity = serde_json::json!({"plan_id": compiled.envelope.plan_id, "plan_version": compiled.envelope.plan_version});
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {

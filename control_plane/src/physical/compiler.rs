@@ -148,6 +148,8 @@ pub struct PlanningRequest {
     /// Original dashboard demand, in the same order as queries. None is legacy input.
     pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<PlanningQuery>,
+    /// Compiler-owned quotes eligible for joint pane repricing; never inferred from model labels.
+    pub synthesized_window_queries: BTreeSet<String>,
     pub evidence: HashMap<String, TopKMembershipEvidence>,
     /// Fresh measured costs for Planner exact/summary composition sites,
     /// scoped to query IDs just like accuracy evidence.
@@ -198,7 +200,8 @@ pub enum PhysicalDeploymentTarget {
     BackendLocalRemoteWrite,
 }
 
-/// Versioned startup input for the Collector-free compatibility profile.
+/// Startup and candidate-discovery input for backend-local planning.
+/// Version 2 is the sole supported schema; deployment always requires quotes.
 /// Query/data semantics use ASAPPlanner's canonical workload types directly;
 /// this wrapper adds only backend-owned implementation evidence and lifecycle
 /// identity required to choose a concrete physical realization.
@@ -206,6 +209,7 @@ pub enum PhysicalDeploymentTarget {
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPlanningSnapshot {
     pub snapshot_version: u32,
+    /// May be absent during candidate discovery, never during deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     pub query_workload: QueryWorkload,
@@ -480,34 +484,17 @@ impl BackendLocalPlanningSnapshot {
     }
 
     fn compile_frontend(self, metricsql: bool) -> Result<PhysicalPlan, CompileError> {
-        let evidence = self.workload_cost_evidence.clone();
-        if self.snapshot_version == 2 && evidence.is_none() {
-            return Err(CompileError::Snapshot(
-                "version 2 requires complete workload cost evidence".into(),
-            ));
-        }
+        let evidence = self.workload_cost_evidence.clone().ok_or_else(|| {
+            CompileError::Snapshot(
+                "deployment requires complete workload cost evidence; export candidates and price them before compiling".into(),
+            )
+        })?;
         let (request, environment) = self.planning_request()?;
-        match evidence {
-            Some(evidence) => {
-                let candidates = super::workload_cost::with_exact_alternative(request)?;
-                if metricsql {
-                    super::workload_cost::select_metricsql(candidates, environment, &evidence)
-                } else {
-                    super::workload_cost::select(candidates, environment, &evidence)
-                }
-            }
-            None => {
-                // Unquoted v1 startup snapshots keep the established summary/native
-                // compatibility policy. Local residual candidates are enumerated by
-                // planning_request and admitted through measured workload selection.
-                let mut request = request;
-                request.hybrid_execution = false;
-                if metricsql {
-                    PhysicalCompiler.compile_metricsql(request, environment)
-                } else {
-                    PhysicalCompiler.compile(request, environment)
-                }
-            }
+        let candidates = super::workload_cost::with_exact_alternative(request)?;
+        if metricsql {
+            super::workload_cost::select_metricsql(candidates, environment, &evidence)
+        } else {
+            super::workload_cost::select(candidates, environment, &evidence)
         }
     }
 
@@ -515,9 +502,9 @@ impl BackendLocalPlanningSnapshot {
     pub fn planning_request(
         self,
     ) -> Result<(PlanningRequest, DeploymentEnvironment), CompileError> {
-        if self.snapshot_version != 1 && self.snapshot_version != 2 {
+        if self.snapshot_version != 2 {
             return Err(CompileError::Snapshot(format!(
-                "unsupported workload snapshot version {}",
+                "unsupported workload snapshot version {}; only version 2 is supported",
                 self.snapshot_version
             )));
         }
@@ -608,6 +595,7 @@ impl BackendLocalPlanningSnapshot {
                 horizon_seconds: self.implementation.horizon_seconds,
                 costs: self.implementation.lifecycle_costs.clone(),
             };
+            let derived_lifecycle = lifecycle.clone();
             let post_asap = crate::planner_selection::keep_pre_asap(&parsed)
                 .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             canonical_roots.push(Rc::new(parsed));
@@ -636,16 +624,15 @@ impl BackendLocalPlanningSnapshot {
                     .get(&query_string)
                     .cloned()
                     .unwrap_or_else(|| {
-                        vec![WindowImplementationCandidate {
-                            implementation_id: self.implementation.window_implementation_id.clone(),
-                            framework: SummaryWindowFramework::Tumbling,
-                            window_secs: lookback_ms / 1_000,
-                            slide_secs: lookback_ms / 1_000,
-                            layout: asap_types::WindowMaterializationLayout::Pane {
-                                pane_secs: lookback_ms / 1_000,
-                            },
+                        derived_window_candidates(
+                            &self.implementation.window_implementation_id,
+                            canonical_roots.last().expect("root pushed above"),
+                            lookback_ms,
+                            evaluation_interval_ms,
                             cost,
-                        }]
+                            &derived_lifecycle,
+                            self.implementation.query_staleness_margin_ms,
+                        )
                     }),
                 runtime_policy: RuntimeRulePolicy::default(),
             });
@@ -678,6 +665,67 @@ impl BackendLocalPlanningSnapshot {
             &exact_costs_by_id,
             self.implementation.erp.as_ref(),
         )?;
+        // Derived maintenance currently consumes full, non-overlapping source cohorts.
+        // Restrict only synthesized candidates; deployment-supplied evidence is authoritative.
+        for query in &mut queries {
+            if self
+                .implementation
+                .window_candidates
+                .contains_key(&query.query_string)
+            {
+                continue;
+            }
+            let states =
+                collect_selected_materializations(&query.post_asap, true).map_err(|reason| {
+                    CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason,
+                    }
+                })?;
+            let mut full_windows = BTreeSet::new();
+            for state in &states {
+                if let Some(sources) = immutable_materialization_sources(&state.node) {
+                    full_windows.insert(state.window_secs.unwrap_or(query.window_secs));
+                    for source in sources {
+                        let (_, window, _) =
+                            selected_input_contract(&source).map_err(|reason| {
+                                CompileError::Query {
+                                    query_id: query.query_id.clone(),
+                                    reason,
+                                }
+                            })?;
+                        full_windows.insert(window.unwrap_or(query.window_secs));
+                    }
+                }
+            }
+            let mut seen = BTreeSet::new();
+            query.window_implementations.retain_mut(|candidate| {
+                if !full_windows.contains(&candidate.window_secs) {
+                    return true;
+                }
+                if !seen.insert(candidate.window_secs) {
+                    return false;
+                }
+                candidate.slide_secs = candidate.window_secs;
+                candidate.framework = SummaryWindowFramework::Tumbling;
+                candidate.layout = asap_types::WindowMaterializationLayout::Pane {
+                    pane_secs: candidate.window_secs,
+                };
+                candidate.implementation_id = format!(
+                    "{}-{}s-derived-cohort",
+                    self.implementation.window_implementation_id, candidate.window_secs
+                );
+                candidate.cost = derived_window_cost(
+                    &candidate.cost,
+                    &query.lifecycle,
+                    candidate.window_secs,
+                    candidate.slide_secs,
+                    &candidate.layout,
+                    self.implementation.query_staleness_margin_ms,
+                );
+                true
+            });
+        }
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
@@ -685,6 +733,16 @@ impl BackendLocalPlanningSnapshot {
                 hybrid_execution: true,
                 materialization_policy: None,
                 query_workload: Some(workload),
+                synthesized_window_queries: queries
+                    .iter()
+                    .filter(|q| {
+                        !self
+                            .implementation
+                            .window_candidates
+                            .contains_key(&q.query_string)
+                    })
+                    .map(|q| q.query_id.clone())
+                    .collect(),
                 queries,
                 evidence: topk_evidence_by_id,
                 exact_composition_costs: exact_costs_by_id,
@@ -1058,7 +1116,9 @@ impl PhysicalCompiler {
                                 .ok()
                                 .flatten()
                             });
-                            key.is_some_and(|key| policy.contains(&key))
+                            // Masks enumerate counter/max choices only. Other selected
+                            // summaries remain required by this physical alternative.
+                            key.is_none_or(|key| policy.contains(&key))
                         })
                 })
                 .collect::<Vec<_>>();
@@ -1421,6 +1481,18 @@ impl PhysicalCompiler {
             }
         }
 
+        if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+            super::pane_reuse::share_additive_panes(
+                &request,
+                &mut compiled_materializations,
+                &mut collector_materializations,
+                &mut plan_materializations,
+                &mut node_bindings,
+                &mut runtime_policies,
+                &mut lifecycle_estimates,
+            );
+        }
+
         let plan_id = if request.hybrid_execution {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -1553,7 +1625,31 @@ impl PhysicalCompiler {
                 full_history: false,
                 cumulative_readout: true,
             };
-            let mut entry = if request.hybrid_execution {
+            // A whole-query native fallback need not be expressible in the local
+            // residual algebra (for example an ERP-rejected entropy readout).
+            // Retain its native boundary without discarding other workload roots.
+            let native_root = request.hybrid_execution
+                && if let SummaryExpr::KeepPreAsap(expr) = &query.post_asap.expr {
+                    let original = crate::query_parser::parse_query_expr_canonical(
+                        &query.query_string,
+                        query.accuracy.clone(),
+                    )
+                    .map_err(|error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: error.to_string(),
+                    })?;
+                    expr.as_ref() == &original
+                        && crate::query_plan::logical::compile_logical(
+                            query.query_id.clone(),
+                            canonical.clone(),
+                            instant,
+                            FallbackPolicy::ExactBackend,
+                        )
+                        .is_err()
+                } else {
+                    false
+                };
+            let mut entry = if request.hybrid_execution && !native_root {
                 crate::query_plan::compile_bound_composable_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
@@ -2188,6 +2284,239 @@ fn validate_lifecycle_input(
     Ok(())
 }
 
+/// Price one derived layout from the snapshot's own lifecycle unit costs.
+///
+/// `ImplementationCostEvidence` is normally measured evidence, and its
+/// `weighted_cost` doc puts pricing update CPU, query-time merges, retained
+/// memory, storage, scans and network on the evidence producer. When a
+/// snapshot prices no candidate, the control plane becomes that producer for
+/// the derived shapes — and it does so without inventing a single magnitude.
+/// Every unit cost below is supplied evidence (`LifecycleCostEvidence`, from
+/// `implementation.lifecycle_costs`); every multiplier is a structural count
+/// that follows from the layout's definition. Nothing here is a measurement.
+///
+/// Over `horizon_seconds`, for window `W`, slide `S` and the layout's own
+/// shape:
+///
+/// - **states created**: a `Pane { P }` seals a state every `P`, a
+///   `FullWindow` every `S`. Each one is built once and retired once, so
+///   `build` and `retirement` are charged per created state.
+/// - **update fanout**: this is the layout's whole point (`worker.rs`'s
+///   `stores_full_windows` branch). A pane takes each sample exactly once; a
+///   full window takes it into every overlapping window that contains it,
+///   `ceil(W / S)` of them. Charged at the supplied ingestion rate.
+/// - **finalizations per read**: the mirror image. A full window is read
+///   whole; `W / P` panes are composed into one answer. Charged at the
+///   query's own evaluation cadence.
+/// - **retention**: `retained_state_count`, the same function that fills
+///   `num_aggregates_to_retain`, so the quote and the plan cannot disagree.
+///   Open worker accumulators are charged separately from published states;
+///   updating a state and keeping it resident are different resources.
+///
+/// The byte fields are left exactly as the snapshot supplied them: state size
+/// needs sketch parameters that do not exist yet at this point, and guessing
+/// them would be the fabrication this function otherwise avoids. Only
+/// `cpu_cost` and `weighted_cost` are derived, and only those two are read —
+/// by `validate_window_implementations` and by the `min_by` that ranks
+/// candidates. `model_version` records that the quote is derived.
+pub(super) fn derived_window_cost(
+    template: &ImplementationCostEvidence,
+    lifecycle: &LifecyclePlanningInput,
+    window_secs: u64,
+    slide_secs: u64,
+    layout: &asap_types::WindowMaterializationLayout,
+    staleness_margin_ms: u64,
+) -> ImplementationCostEvidence {
+    let costs = &lifecycle.costs;
+    let horizon = lifecycle.horizon_seconds.max(0.0);
+    let window = window_secs.max(1) as f64;
+    let slide = slide_secs.max(1) as f64;
+    let (seal_interval, update_fanout, finalizations_per_read) = match layout {
+        asap_types::WindowMaterializationLayout::FullWindow => {
+            (slide, (window / slide).ceil(), 1.0)
+        }
+        asap_types::WindowMaterializationLayout::Pane { pane_secs } => {
+            let pane = (*pane_secs).max(1) as f64;
+            (pane, 1.0, (window / pane).ceil())
+        }
+        asap_types::WindowMaterializationLayout::HierarchicalRollup { base_pane_secs, .. } => {
+            let pane = (*base_pane_secs).max(1) as f64;
+            (pane, 1.0, (window / pane).ceil())
+        }
+    };
+    let states_created = horizon / seal_interval;
+    let updates = lifecycle.ingestion_rate_per_second.max(0.0) * horizon * update_fanout;
+    let evaluation_secs = (f64::from(lifecycle.evaluation_interval_ms) / 1_000.0).max(1.0);
+    let reads = horizon / evaluation_secs;
+    let retained = retained_state_count(
+        window_secs.saturating_mul(1_000),
+        staleness_margin_ms,
+        slide_secs.saturating_mul(1_000),
+        layout,
+    ) as f64;
+    // Store retention does not include worker accumulators that are still open.
+    let active = match layout {
+        asap_types::WindowMaterializationLayout::FullWindow => (window / slide).ceil(),
+        _ => 1.0,
+    };
+
+    let build = costs.build * states_created;
+    let maintenance = costs.maintenance_per_update * updates;
+    let read = costs.read * reads * finalizations_per_read;
+    let retention = costs.retention_per_second * horizon * (retained + active);
+    let retirement = costs.retirement * states_created;
+    let cpu_cost = build + maintenance;
+    let weighted_cost = cpu_cost + read + retention + retirement;
+
+    ImplementationCostEvidence {
+        model_version: format!(
+            "{}+derived-window-layout-v1",
+            template
+                .model_version
+                .trim_end_matches("+derived-window-layout-v1")
+        ),
+        cpu_cost,
+        weighted_cost,
+        ..template.clone()
+    }
+}
+
+/// Every distinct range-selector window in `expr`, as seconds.
+///
+/// A single query can carry several. `sum(sum_over_time(a[1m])) / sum(sum_over_time(b[5m]))`
+/// has two, and each one becomes its own materialization with its own window.
+/// `time_selection.lookback` is the workload's declared range and is not
+/// required to equal any of them.
+fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
+    fn visit(expr: &QueryExpr, windows: &mut BTreeSet<u64>) {
+        if let QueryExpr::TimeRange { range, .. } = expr {
+            let secs = range.as_secs();
+            if secs != 0 {
+                windows.insert(secs);
+            }
+        }
+        match expr {
+            QueryExpr::PromqlScalarBridge(child)
+            | QueryExpr::PromqlVectorFromScalar(child)
+            | QueryExpr::PromqlScalarFromVector(child)
+            | QueryExpr::PromqlRelabel { child, .. }
+            | QueryExpr::PromqlSeriesSample { child, .. }
+            | QueryExpr::Filter { child, .. }
+            | QueryExpr::Project { child, .. }
+            | QueryExpr::Aggregate { child, .. }
+            | QueryExpr::Dedup { child, .. }
+            | QueryExpr::Sort { child, .. }
+            | QueryExpr::Limit { child, .. }
+            | QueryExpr::PromqlSubquery { child, .. }
+            | QueryExpr::TimeRange { child, .. }
+            | QueryExpr::TimeShift { child, .. } => visit(child, windows),
+            QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            }
+            | QueryExpr::Join { left, right, .. }
+            | QueryExpr::SetOp { left, right, .. } => {
+                visit(left, windows);
+                visit(right, windows);
+            }
+            _ => {}
+        }
+    }
+    let mut windows = BTreeSet::new();
+    visit(expr, &mut windows);
+    windows
+}
+
+/// Derive and price one implementation per supported layout for each range.
+/// Explicit snapshot candidates bypass this path. After logical selection,
+/// derived maintenance cohorts are restricted to their supported full windows;
+/// raw additive pane producers may subsequently be shared by Planner.
+fn derived_window_candidates(
+    implementation_id: &str,
+    expr: &QueryExpr,
+    lookback_ms: u64,
+    evaluation_interval_ms: u32,
+    cost: ImplementationCostEvidence,
+    lifecycle: &LifecyclePlanningInput,
+    staleness_margin_ms: u64,
+) -> Vec<WindowImplementationCandidate> {
+    let mut windows = range_selector_windows_secs(expr);
+    if windows.is_empty() {
+        windows.insert(lookback_ms / 1_000);
+    }
+    // `window_implementation_id` reaches lifecycle estimates and cost
+    // manifests, so one label must not describe several shapes. A query with a
+    // single window keeps the snapshot's identity untouched.
+    let distinct = windows.len() > 1;
+    windows
+        .into_iter()
+        .flat_map(|window_secs| {
+            let evaluation_secs = u64::from(evaluation_interval_ms) / 1_000;
+            let advances_within_window = evaluation_secs != 0
+                && evaluation_secs < window_secs
+                && window_secs.is_multiple_of(evaluation_secs);
+            let slide_secs = if advances_within_window {
+                evaluation_secs
+            } else {
+                window_secs
+            };
+            let window_label = if distinct {
+                format!("{implementation_id}-{window_secs}s")
+            } else {
+                implementation_id.to_string()
+            };
+            // `Tumbling` pairs only with `Pane` in the validator's
+            // framework/layout table, so a non-sliding shape has no
+            // alternative to rank against and keeps its label unchanged.
+            let layouts: Vec<(String, asap_types::WindowMaterializationLayout)> =
+                if advances_within_window {
+                    vec![
+                        (
+                            format!("{window_label}-pane-{slide_secs}s"),
+                            asap_types::WindowMaterializationLayout::Pane {
+                                pane_secs: slide_secs,
+                            },
+                        ),
+                        (
+                            format!("{window_label}-full-window"),
+                            asap_types::WindowMaterializationLayout::FullWindow,
+                        ),
+                    ]
+                } else {
+                    vec![(
+                        window_label,
+                        asap_types::WindowMaterializationLayout::Pane {
+                            pane_secs: slide_secs,
+                        },
+                    )]
+                };
+            layouts
+                .into_iter()
+                .map(|(id, layout)| WindowImplementationCandidate {
+                    implementation_id: id,
+                    framework: if advances_within_window {
+                        SummaryWindowFramework::Sliding
+                    } else {
+                        SummaryWindowFramework::Tumbling
+                    },
+                    window_secs,
+                    slide_secs,
+                    cost: derived_window_cost(
+                        &cost,
+                        lifecycle,
+                        window_secs,
+                        slide_secs,
+                        &layout,
+                        staleness_margin_ms,
+                    ),
+                    layout,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 pub(super) fn validate_window_implementations(
     query: &PlanningQuery,
     environment: &DeploymentEnvironment,
@@ -2265,7 +2594,7 @@ pub(super) fn validate_window_implementations(
     Ok(candidates)
 }
 
-fn retained_state_count(
+pub(super) fn retained_state_count(
     lookback_ms: u64,
     staleness_margin_ms: u64,
     slide_ms: u64,
@@ -3237,8 +3566,114 @@ fn stable_workload_plan_id(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // Complete deployment quotes must preserve one producer with two window readouts.
+    #[test]
+    fn complete_cost_selection_preserves_shared_sum_panes() {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("sum_over_time(a[1m]) / sum_over_time(a[10m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let plan = quoted_snapshot(snapshot, false).compile().unwrap();
+        assert!(plan.cost_comparison.is_some());
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        let bindings = plan
+            .query_plan
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .materialization_bindings();
+        assert_eq!(bindings[0].materialization, bindings[1].materialization);
+        assert_eq!(
+            bindings
+                .iter()
+                .filter_map(|b| b.readout_lookback_ms)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([60_000, 600_000])
+        );
+    }
+
+    // Synthetic quotes exercise deployment selection in tests, never production defaults.
+    pub(crate) fn quoted_snapshot(
+        mut snapshot: BackendLocalPlanningSnapshot,
+        metricsql: bool,
+    ) -> BackendLocalPlanningSnapshot {
+        use super::super::workload_cost::{
+            manifest, with_exact_alternative, WorkloadCostEvidence, WorkloadQuote,
+        };
+        let (request, environment) = snapshot.clone().planning_request().unwrap();
+        let quotes = with_exact_alternative(request)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let plan = if metricsql {
+                    PhysicalCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                } else {
+                    PhysicalCompiler.compile(candidate.clone(), environment.clone())
+                }
+                .ok()?;
+                let manifest = manifest(&plan, &candidate.queries).unwrap();
+                Some(WorkloadQuote {
+                    unit_costs: manifest
+                        .components
+                        .keys()
+                        .map(|key| (key.clone(), if index == 0 { 1.0 } else { 1e12 }))
+                        .collect(),
+                    manifest,
+                    executable: true,
+                })
+            })
+            .collect();
+        snapshot.workload_cost_evidence = Some(WorkloadCostEvidence {
+            backend_revision: BACKEND_REVISION.into(),
+            planner_revision: PLANNER_REVISION.into(),
+            data_snapshot_id: "compiler-unit-fixture".into(),
+            model_version: "test-only-unit-costs".into(),
+            observed_at_unix_ms: environment.observed_at_unix_ms,
+            valid_for_ms: environment.max_evidence_age_ms,
+            quotes,
+        });
+        snapshot
+    }
+
+    /// Optional counter masks must retain the workload's mandatory sketch bindings.
+    #[test]
+    fn costed_mixed_workload_retains_sketches_and_counter_readouts() {
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let plan = quoted_snapshot(snapshot, false).compile().unwrap();
+        assert!(!plan.precompute_plan.materializations.is_empty());
+        for entry in plan.query_plan.entries.values() {
+            assert!(!entry.materialization_bindings().is_empty(), "{entry:#?}");
+        }
+    }
+
+    /// A schema marker cannot opt into a legacy deployment policy.
+    #[test]
+    fn only_current_snapshot_schema_is_accepted() {
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        for version in [0, 1, 3] {
+            let mut old = snapshot.clone();
+            old.snapshot_version = version;
+            assert!(old
+                .clone()
+                .planning_request()
+                .unwrap_err()
+                .to_string()
+                .contains("only version 2"));
+            assert!(old.compile().is_err());
+        }
+        assert!(snapshot.planning_request().is_ok());
+    }
 
     #[test]
     fn installed_partition_must_match_the_bound_dag_reduction() {
@@ -3728,6 +4163,7 @@ mod tests {
         }
         Ok(PlanningRequest {
             logical_selection: Vec::new(),
+            synthesized_window_queries: BTreeSet::new(),
             hybrid_execution: false,
             materialization_policy: None,
             query_workload: None,
@@ -3957,7 +4393,7 @@ mod tests {
             "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
         ))
         .unwrap();
-        let plan = snapshot.compile_metricsql().unwrap();
+        let plan = quoted_snapshot(snapshot, true).compile_metricsql().unwrap();
         assert!(!plan.query_plan.entries.is_empty());
         assert!(plan
             .query_plan
@@ -4861,15 +5297,9 @@ mod tests {
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         entry.query = Query("sum(sum_over_time(a[1m])) / sum(sum_over_time(b[5m]))".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
-        let (mut request, env) = snapshot.planning_request().unwrap();
-        let query = &mut request.queries[0];
-        let mut five_minutes = query.window_implementations[0].clone();
-        five_minutes.implementation_id = "five-minute-evidence".into();
-        five_minutes.window_secs = 300;
-        five_minutes.framework = SummaryWindowFramework::Sliding;
-        five_minutes.slide_secs = 60;
-        five_minutes.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 };
-        query.window_implementations.push(five_minutes);
+        // The derivation now covers both range selectors, so this no longer
+        // needs a hand-supplied 5m candidate to keep `b` from falling back.
+        let (request, env) = snapshot.planning_request().unwrap();
         let plan = PhysicalCompiler.compile(request, env).unwrap();
         let bindings = plan
             .query_plan
@@ -4890,16 +5320,468 @@ mod tests {
                 )
             })
             .collect::<BTreeSet<_>>();
+        // `window_ms` is the stored pane width, `readout_lookback_ms` the
+        // semantic range. Each operand keeps its own range -- 1m for `a`, 5m
+        // for `b` -- while both store 10s panes, because the snapshot
+        // evaluates every 10s and the derivation now covers both selectors.
         assert_eq!(
             actual,
-            BTreeSet::from([("a", 60_000, Some(60_000)), ("b", 60_000, Some(300_000)),])
+            BTreeSet::from([("a", 10_000, Some(60_000)), ("b", 10_000, Some(300_000)),])
         );
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
 
-    // A filtered denominator is a typed residual while its summary sibling remains installed.
+    // Derived programs and their raw inputs must keep a runtime-supported cohort.
     #[test]
-    fn composable_binary_retains_summary_sibling_of_prometheus_filtered_subtree() {
+    fn derived_window_regression_nested_snapshot() {
+        for rate in [0.0, 100.0] {
+            let mut value: Value = serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+            value["query_workload"]["repeating_queries"][0]["query"] =
+                json!("quantile(0.9, sum_over_time(m[1m]))");
+            value["data_workload"]["ingestion_rate"]["value"] = json!(rate);
+            value["query_workload"]["data_workload"]["ingestion_rate"]["value"] = json!(rate);
+            let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(value).unwrap();
+            let (request, env) = snapshot.planning_request().unwrap();
+            let plan = PhysicalCompiler.compile(request, env).unwrap();
+            assert!(plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .any(|m| m.derived_input.is_some()));
+            assert!(plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .all(|m| m.window_size == m.slide_interval));
+        }
+    }
+
+    // A full-window producer keeps overlapping accumulators alive even before publication.
+    #[test]
+    fn derived_window_regression_resident_cost() {
+        let template = planning_snapshot().implementation.implementation_cost;
+        let mut lifecycle = planning_lifecycle();
+        lifecycle.costs = LifecycleCostEvidence {
+            build: 0.0,
+            maintenance_per_update: 0.0,
+            read: 0.0,
+            retention_per_second: 1.0,
+            retirement: 0.0,
+        };
+        let full = derived_window_cost(
+            &template,
+            &lifecycle,
+            300,
+            30,
+            &asap_types::WindowMaterializationLayout::FullWindow,
+            0,
+        );
+        assert!(full.weighted_cost >= lifecycle.horizon_seconds * 11.0);
+    }
+
+    // Temporal SUM readouts share raw state only for identical source populations.
+    #[test]
+    fn derived_window_regression_shared_sum_panes() {
+        for interval in [10_000, 60_000] {
+            for (rhs, expected_states) in [("a", 1), ("b", 2), ("a{job=\"x\"}", 2)] {
+                let mut snapshot = planning_snapshot();
+                let query = format!("sum_over_time(a[1m]) / sum_over_time({rhs}[10m])");
+                let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+                entry.query = Query(query);
+                entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+                entry.demand = RepeatedDemand::FixedIntervalAt {
+                    interval: RepetitionInterval(interval),
+                    evaluation_phase: planner_types::workload::TimestampMs(0),
+                };
+                let (request, env) = snapshot.planning_request().unwrap();
+                let plan = PhysicalCompiler.compile(request, env).unwrap();
+                assert_eq!(plan.precompute_plan.materializations.len(), expected_states);
+                let entry = plan.query_plan.entries.values().next().unwrap();
+                let bindings = entry.materialization_bindings();
+                assert_eq!(
+                    bindings
+                        .iter()
+                        .filter_map(|b| b.readout_lookback_ms)
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([60_000, 600_000])
+                );
+                if rhs == "a" {
+                    assert_eq!(bindings[0].materialization, bindings[1].materialization);
+                    assert_eq!(
+                        plan.precompute_plan.materializations[0].num_aggregates_to_retain,
+                        Some(600_000 / u64::from(interval) + 1)
+                    );
+                }
+            }
+        }
+    }
+
+    // Distinct workload entries share one producer and retain both lifecycle consumers.
+    #[test]
+    fn shared_panes_preserve_workload_consumers_and_phase() {
+        for phase in [0, 5_000] {
+            let mut snapshot = planning_snapshot();
+            let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+            entries[0].query = Query("sum_over_time(a[1m])".into());
+            entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            let mut second = entries[0].clone();
+            second.query = Query("sum_over_time(a[10m])".into());
+            second.demand = RepeatedDemand::FixedIntervalAt {
+                interval: RepetitionInterval(10_000),
+                evaluation_phase: planner_types::workload::TimestampMs(phase),
+            };
+            entries.push(second);
+            let (request, env) = snapshot.planning_request().unwrap();
+            let plan = PhysicalCompiler.compile(request, env).unwrap();
+            assert_eq!(
+                plan.precompute_plan.materializations.len(),
+                if phase == 0 { 1 } else { 2 }
+            );
+            if phase == 0 {
+                assert_eq!(plan.lifecycle_estimates.len(), 1);
+                let estimate = &plan.lifecycle_estimates[0];
+                assert_eq!(estimate.consumer_query_ids.len(), 2);
+                assert_eq!(estimate.expected_reads, 60.0);
+                assert_eq!(estimate.expected_updates, 30_000.0);
+            }
+        }
+    }
+
+    // Overflow must fail candidate validation, never turn an expensive layout into a free one.
+    #[test]
+    fn derived_cost_overflow_is_rejected() {
+        let snapshot = planning_snapshot();
+        let (mut request, env) = snapshot.planning_request().unwrap();
+        let query = &mut request.queries[0];
+        let mut lifecycle = query.lifecycle.clone();
+        lifecycle.costs.build = f64::MAX;
+        let candidate = &mut query.window_implementations[0];
+        candidate.cost = derived_window_cost(
+            &candidate.cost,
+            &lifecycle,
+            candidate.window_secs,
+            candidate.slide_secs,
+            &candidate.layout,
+            0,
+        );
+        assert!(validate_window_implementations(query, &env).is_err());
+    }
+
+    // Serialized derived quotes become authoritative when a deployment supplies them explicitly.
+    #[test]
+    fn explicit_window_quotes_are_not_repriced_for_sharing() {
+        let mut snapshot = planning_snapshot();
+        let query = "sum_over_time(a[1m]) / sum_over_time(a[10m])";
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query(query.into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let (derived, _) = snapshot.clone().planning_request().unwrap();
+        snapshot.implementation.window_candidates.insert(
+            query.into(),
+            derived.queries[0].window_implementations.clone(),
+        );
+        let (request, env) = snapshot.planning_request().unwrap();
+        assert!(request.synthesized_window_queries.is_empty());
+        let plan = PhysicalCompiler.compile(request, env).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 2);
+    }
+
+    fn planning_lifecycle() -> LifecyclePlanningInput {
+        planning_snapshot().planning_request().unwrap().0.queries[0]
+            .lifecycle
+            .clone()
+    }
+
+    fn planning_snapshot() -> BackendLocalPlanningSnapshot {
+        serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap()
+    }
+
+    // A workload evaluated more often than its window is wide must advance its
+    // state at that cadence. Planning it as one lookback-wide tumbling window
+    // answers with results that only change once per window.
+    #[test]
+    fn derived_window_candidate_follows_the_evaluation_cadence() {
+        let cost = planning_snapshot().implementation.implementation_cost;
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let derived =
+            derived_window_candidates("id", &expr, 300_000, 30_000, cost, &planning_lifecycle(), 0);
+        // A sliding shape has two legal layouts, so both are offered and the
+        // cost model picks between them.
+        assert_eq!(
+            derived
+                .iter()
+                .map(|c| (c.implementation_id.as_str(), c.layout.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "id-pane-30s",
+                    asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 }
+                ),
+                (
+                    "id-full-window",
+                    asap_types::WindowMaterializationLayout::FullWindow
+                ),
+            ]
+        );
+        let candidate = &derived[0];
+        assert_eq!(candidate.framework, SummaryWindowFramework::Sliding);
+        assert_eq!((candidate.window_secs, candidate.slide_secs), (300, 30));
+        assert_eq!(
+            candidate.layout,
+            asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 }
+        );
+    }
+
+    // The layout choice is a write-amplification-versus-read-amplification
+    // trade, and the derived quote has to price it in the right direction: a
+    // full window takes every sample into all ten overlapping windows but is
+    // read whole, panes take each sample once but compose ten per read. Which
+    // wins depends on how hard the source is pushing, so pin the crossover,
+    // not the magnitudes.
+    #[test]
+    fn derived_window_layout_prices_write_against_read_amplification() {
+        let cost = planning_snapshot().implementation.implementation_cost;
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let quote = |rate: f64| {
+            let mut lifecycle = planning_lifecycle();
+            lifecycle.ingestion_rate_per_second = rate;
+            let derived = derived_window_candidates(
+                "id",
+                &expr,
+                300_000,
+                30_000,
+                cost.clone(),
+                &lifecycle,
+                0,
+            );
+            let weighted = |layout: &asap_types::WindowMaterializationLayout| {
+                derived
+                    .iter()
+                    .find(|c| c.layout == *layout)
+                    .expect("both layouts offered")
+                    .cost
+                    .weighted_cost
+            };
+            (
+                weighted(&asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 }),
+                weighted(&asap_types::WindowMaterializationLayout::FullWindow),
+            )
+        };
+        let (idle_pane, idle_full) = quote(0.0);
+        assert!(
+            idle_full < idle_pane,
+            "with no arriving data the fanout is free and the merges are not: \
+             pane {idle_pane} full {idle_full}"
+        );
+        let (busy_pane, busy_full) = quote(100.0);
+        assert!(
+            busy_pane < busy_full,
+            "under load the tenfold update fanout dominates: pane {busy_pane} full {busy_full}"
+        );
+    }
+
+    // A tumbling shape pairs only with `Pane` in the validator's
+    // framework/layout table, so there is no alternative to price against it.
+    #[test]
+    fn tumbling_shapes_have_no_layout_alternative_to_rank() {
+        let cost = planning_snapshot().implementation.implementation_cost;
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let derived = derived_window_candidates(
+            "id",
+            &expr,
+            300_000,
+            300_000,
+            cost,
+            &planning_lifecycle(),
+            0,
+        );
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].implementation_id, "id");
+        assert_eq!(derived[0].framework, SummaryWindowFramework::Tumbling);
+    }
+
+    // Every shape this function can emit must survive the validator, or a bad
+    // derivation would reach a plan instead of a compile error.
+    #[test]
+    fn derived_window_candidate_shapes_are_accepted_by_validation() {
+        let snapshot = planning_snapshot();
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let cost = planning_snapshot().implementation.implementation_cost;
+        for (lookback_ms, evaluation_ms) in [
+            (300_000, 30_000),
+            (300_000, 300_000),
+            (300_000, 45_000),
+            (60_000, 90_000),
+        ] {
+            let mut query = request.queries[0].clone();
+            query.window_secs = lookback_ms / 1_000;
+            let expr = crate::query_parser::parse_query_expr_canonical(
+                &format!("quantile_over_time(0.5, data[{}s])", lookback_ms / 1_000),
+                AccuracyTarget::Exact,
+            )
+            .unwrap();
+            query.window_implementations = derived_window_candidates(
+                "derived",
+                &expr,
+                lookback_ms,
+                evaluation_ms,
+                cost.clone(),
+                &planning_lifecycle(),
+                0,
+            );
+            validate_window_implementations(&query, &environment).unwrap_or_else(|error| {
+                panic!("lookback {lookback_ms} cadence {evaluation_ms}: {error:?}")
+            });
+        }
+    }
+
+    // A cadence that cannot divide the window has no pane width dividing both,
+    // and one at or above the window has nothing to slide within. Both keep the
+    // previous tumbling shape rather than emitting something unschedulable.
+    #[test]
+    fn derived_window_candidate_stays_tumbling_without_a_dividing_cadence() {
+        let cost = planning_snapshot().implementation.implementation_cost;
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.5, data[5m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        for evaluation_ms in [300_000, 450_000, 45_000, 0] {
+            let derived = derived_window_candidates(
+                "id",
+                &expr,
+                300_000,
+                evaluation_ms,
+                cost.clone(),
+                &planning_lifecycle(),
+                0,
+            );
+            let candidate = &derived[0];
+            assert_eq!(
+                (
+                    candidate.framework.clone(),
+                    candidate.slide_secs,
+                    candidate.layout.clone()
+                ),
+                (
+                    SummaryWindowFramework::Tumbling,
+                    300,
+                    asap_types::WindowMaterializationLayout::Pane { pane_secs: 300 }
+                ),
+                "cadence {evaluation_ms}"
+            );
+        }
+    }
+
+    // Priced evidence is the evidence producer's to supply. A snapshot that
+    // carries its own candidates keeps them verbatim.
+    #[test]
+    fn supplied_window_candidates_are_not_replaced_by_the_derivation() {
+        let mut snapshot = planning_snapshot();
+        let query_string = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0]
+            .query
+            .0
+            .clone();
+        let expr = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.99, m[1m])",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let mut supplied = derived_window_candidates(
+            "supplied",
+            &expr,
+            60_000,
+            60_000,
+            snapshot.implementation.implementation_cost.clone(),
+            &planning_lifecycle(),
+            0,
+        )
+        .remove(0);
+        supplied.framework = SummaryWindowFramework::Sliding;
+        supplied.slide_secs = 20;
+        supplied.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 20 };
+        snapshot
+            .implementation
+            .window_candidates
+            .insert(query_string, vec![supplied.clone()]);
+        let (request, _) = snapshot.planning_request().unwrap();
+        assert_eq!(request.queries[0].window_implementations, vec![supplied]);
+    }
+
+    // End to end: the retained-state count is derived from the pane width, so
+    // fixing the shape fixes it too. Six 10s panes cover the 1m lookback, plus
+    // the one still being filled.
+    #[test]
+    fn retained_state_count_follows_the_derived_pane_width() {
+        let snapshot = planning_snapshot();
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let plan = PhysicalCompiler.compile(request, environment).unwrap();
+        assert_eq!(
+            plan.precompute_plan.materializations[0].num_aggregates_to_retain,
+            Some(7)
+        );
+    }
+
+    // The reported case: two 5m-lookback quantiles evaluated every 30s. The
+    // whole chain has to land — sliding framework, 30s panes, and the retained
+    // count that falls out of the pane width — or the answer only changes once
+    // every five minutes.
+    #[test]
+    fn five_minute_lookback_evaluated_every_thirty_seconds_slides_by_thirty() {
+        let mut snapshot = planning_snapshot();
+        {
+            let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+            entry.query = Query("quantile_over_time(0.5, data[5m])".into());
+            entry.time_selection.lookback = Some(DurationMs(300_000));
+            entry.demand = RepeatedDemand::FixedIntervalAt {
+                interval: RepetitionInterval(30_000),
+                evaluation_phase: planner_types::workload::TimestampMs(0),
+            };
+        }
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let plan = PhysicalCompiler.compile(request, environment).unwrap();
+        let materialization = &plan.precompute_plan.materializations[0];
+        assert_eq!(
+            (
+                materialization.window_size,
+                materialization.slide_interval,
+                materialization.window_type,
+                materialization.window_layout.clone(),
+                materialization.num_aggregates_to_retain,
+            ),
+            (
+                300,
+                30,
+                asap_types::WindowKind::Sliding,
+                asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 },
+                // Ten 30s panes cover the 5m lookback, plus the one still filling.
+                Some(11),
+            )
+        );
+    }
+
+    // A filtered operand gets a summary over its own filtered population,
+    // with each operand keeping its own range.
+    #[test]
+    fn composable_binary_summarizes_each_prometheus_filtered_operand() {
         use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
         let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
@@ -4913,20 +5795,35 @@ mod tests {
         let plan = PhysicalCompiler.compile(request, env).unwrap();
         let query = plan.query_plan.entries.values().next().unwrap();
         let bindings = query.materialization_bindings();
-        assert_eq!(bindings.len(), 1);
-        let identity = &plan.summary_catalog.materializations[&bindings[0].materialization];
-        let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
+        // Both operands now hold a summary. The filtered denominator is no
+        // longer a typed residual: its 5m range has a candidate, so it gets
+        // its own summary over the filtered population rather than exact
+        // execution. Nothing about the filter forced the residual -- the
+        // missing 5m window candidate did, and this test previously pinned
+        // that artifact as intended behavior.
+        let bound = bindings
+            .iter()
+            .map(|binding| {
+                let identity = &plan.summary_catalog.materializations[&binding.materialization];
+                let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
+                (
+                    data.time_series_metric().unwrap(),
+                    data.population_filter_canonical.clone(),
+                    binding.readout_lookback_ms,
+                )
+            })
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            (data.time_series_metric().unwrap(), bindings[0].window_ms),
-            ("a", 60_000)
+            bound,
+            BTreeSet::from([
+                ("a", String::new(), Some(60_000)),
+                ("b", "{job!=\"x\"}".to_string(), Some(300_000)),
+            ])
         );
         assert!(!query
             .nodes
             .values()
             .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })));
-        assert!(query.nodes.values().any(|node| matches!(node,
-            QueryPlanNode::Logical { operator: LogicalOperator::ExactSubquery { query }, .. }
-            if query == "sum_over_time(b{job!=\"x\"}[5m])" || query == "sum(sum_over_time(b{job!=\"x\"}[5m]))")));
         assert!(!query.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
@@ -4934,7 +5831,7 @@ mod tests {
                 ..
             }
         )));
-        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
 
     #[test]
@@ -4993,7 +5890,7 @@ mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap();
-        let bundle = snapshot.compile().unwrap();
+        let bundle = quoted_snapshot(snapshot, false).compile().unwrap();
         let catalog = &bundle.summary_catalog;
         let mut transmission = bundle.transmission_plan.clone();
         transmission.validate_against_catalog(catalog).unwrap();
@@ -5061,7 +5958,7 @@ mod tests {
         let mut second = entries[0].clone();
         second.query = Query("sum(sum_over_time(m[1m])) * 2".into());
         entries.push(second);
-        let bundle = snapshot.compile().unwrap();
+        let bundle = quoted_snapshot(snapshot, false).compile().unwrap();
         assert_eq!(bundle.query_plan.entries.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         let query_plan: QueryPlan =
@@ -5403,7 +6300,7 @@ mod tests {
             .queries
             .remove(0);
         let snapshot = BackendLocalPlanningSnapshot {
-            snapshot_version: 1,
+            snapshot_version: 2,
             workload_cost_evidence: None,
             query_workload,
             data_workload,
@@ -5434,12 +6331,10 @@ mod tests {
                 .as_ref(),
             Some(&snapshot.query_workload)
         );
-        let first = snapshot
-            .clone()
+        let first = quoted_snapshot(snapshot.clone(), false)
             .compile()
             .expect("first deterministic plan");
-        let second = snapshot
-            .clone()
+        let second = quoted_snapshot(snapshot.clone(), false)
             .compile()
             .expect("second deterministic plan");
         assert_eq!(first.envelope, second.envelope);
@@ -5454,7 +6349,9 @@ mod tests {
         let encoded = serde_json::to_vec(&snapshot).expect("serialize startup snapshot");
         let decoded: BackendLocalPlanningSnapshot =
             serde_json::from_slice(&encoded).expect("deserialize startup snapshot");
-        let bundle = decoded.compile().expect("canonical startup planning");
+        let bundle = quoted_snapshot(decoded, false)
+            .compile()
+            .expect("canonical startup planning");
 
         assert!(bundle.collector_plans.is_empty());
         assert!(bundle.transmission_plan.rules.is_empty());
@@ -5542,10 +6439,10 @@ mod tests {
         let fixture: serde_json::Value = serde_json::from_str(source).expect("fixture JSON");
         assert_eq!(encoded, fixture);
 
-        snapshot
-            .clone()
-            .compile()
-            .expect("unquoted v1 compatibility startup remains available");
+        assert!(
+            snapshot.clone().compile().is_err(),
+            "discovery fixtures must be priced before deployment"
+        );
         let (local, env) = snapshot.clone().planning_request().unwrap();
         let isolated = PhysicalCompiler.compile(local, env).unwrap();
         assert!(!isolated.precompute_plan.materializations.is_empty());
@@ -5578,10 +6475,10 @@ mod tests {
             include_str!("../../../docs/examples/asapquery-compatibility-demo-snapshot.json");
         let snapshot: BackendLocalPlanningSnapshot =
             serde_json::from_str(source).expect("strict compatibility demo fixture");
-        snapshot
-            .clone()
-            .compile()
-            .expect("unquoted v1 compatibility startup remains available");
+        assert!(
+            snapshot.clone().compile().is_err(),
+            "discovery fixtures must be priced before deployment"
+        );
         let (local, env) = snapshot.clone().planning_request().unwrap();
         let isolated = PhysicalCompiler.compile(local, env).unwrap();
         assert!(!isolated.precompute_plan.materializations.is_empty());
