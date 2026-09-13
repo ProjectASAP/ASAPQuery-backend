@@ -1,35 +1,8 @@
-//! Physical sketch wire-cost table — per-family OTLP wire footprint.
+//! Per-family OTLP wire footprints used to rank candidate sketch families.
 //!
-//! Retirement note (2026-07): this file originally also carried a
-//! Phase ε.1 three-mode bind-placement selector (`BindMode` +
-//! `select_bind_mode` + `WireWorkload` + `break_even_samples` +
-//! `est_wire_bytes_per_window_per_series`) that decided whether a
-//! sketch runs at the edge, ships raw for backend-side sketching, or
-//! falls back to a Prometheus archive, based on per-workload wire-cost
-//! break-even math. It was fully designed and unit-tested but never
-//! wired into `physical::post_asap::lower::bind_query_expr` (which always
-//! produces `PhysicalExpr::Committed` — see that function's doc) or
-//! anywhere else; `PhysicalExpr::RawAtEdgeSketchAtBackend` /
-//! `RawAtEdgePrometheusArchive` remain structurally unreachable in
-//! production as a result. Removed as dead code rather than kept as
-//! speculative scaffolding. Recoverable from git history
-//! (`chore/retire-tier2-scaffolding`, 2026-07) if bind-mode placement
-//! becomes active work.
-//!
-//! What's left is the cost table alone — genuinely load-bearing today
-//! via [`WireCostTable::for_kind`], consumed by
-//! `physical::post_asap::cost_model::ControlPlaneCostModel` to rank
-//! candidate sketch families by wire cost.
-//!
-//! ## Cost table source
-//!
-//! Sketch wire-state sizes are delta-encoded where the sketch family
-//! supports it. KLL has no delta variant per `Implementation.tex`
-//! (randomised compaction is not additively mergeable; the wire payload
-//! is always full state). Numbers are conservative for typical
-//! observability workloads — a future iteration will refine via observed
-//! agent telemetry once the OnlineMetricsStore feeds back into the
-//! planner.
+//! Sizes assume delta encoding where supported. KLL uses full state because its
+//! randomized compaction is not additively mergeable. Defaults are conservative
+//! estimates for observability workloads, rather than measured telemetry.
 
 use planner_types::post_asap::SketchAlgorithm;
 
@@ -103,26 +76,9 @@ impl WireCostTable {
         }
     }
 
-    /// Lookup the per-flush cost for a sketch family.
-    ///
-    /// `SketchAlgorithm` (unlike the retired `physical::post_asap::SketchAlgorithm`)
-    /// distinguishes heap-bearing from bare frequency sketches at the
-    /// kind level rather than via a `with_heap` param flag. This table
-    /// never modeled the heap's extra bytes separately (the old
-    /// `for_kind` took a bare `SketchAlgorithm` with no visibility into
-    /// `with_heap` at all) — `CmsWithHeap`/`CountSketchWithHeap` reuse
-    /// their bare counterpart's cost to preserve that exact behavior.
-    /// `Kmv`/`Theta` have no established cost number (nothing in this
-    /// repo binds a cardinality intent to either today — the candidate
-    /// list stays `Hll`-only, see `capability.rs`); they reuse `hll_delta`
-    /// as a same-order-of-magnitude placeholder pending real numbers if
-    /// this repo ever adopts them.
-    // Exhaustive over `SketchAlgorithm` alone now (ASAPPlanner#218 split the
-    // old flat `SummaryKind` into `SketchAlgorithm`/`ExactKind` -- the exact-
-    // accumulator arm this match used to need, and its
-    // "exact accumulators have no sketch wire-state cost" panic, are
-    // unreachable by construction now instead of at runtime; see
-    // control_plane/docs/design-asapplanner-pin-migration.md).
+    /// Look up per-flush wire cost. Heap-bearing sketches reuse their bare family
+    /// cost; heap bytes are not priced separately. KMV and Theta reuse the HLL
+    /// estimate because no independent measurement is available.
     pub const fn for_algorithm(&self, algorithm: &SketchAlgorithm) -> SketchWireCost {
         match algorithm {
             // No collector wire implementation is available for this family.

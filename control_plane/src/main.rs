@@ -73,57 +73,18 @@ struct AppState {
     /// input identity; incoming telemetry cannot supply its own descriptors.
     active_summary_catalog:
         Arc<tokio::sync::Mutex<Option<Arc<asap_types::summary_catalog::SummaryCatalog>>>>,
-    /// Phase C (MVP v6): shared `BackendClient` for posting
-    /// `StreamingConfig` JSON / YAML to the ASAPQuery-backend's
-    /// `POST /api/v1/streaming-config` endpoint. Phase B had this
-    /// only on the `Replanner`, so the typed L5 stage_split path in
-    /// `handle_plan` could only `info!`-log the backend JSON it
-    /// emitted. Sharing via `Arc` lets `AppState` and `Replanner`
-    /// both push without owning a duplicate client. `None` when
-    /// `CONTROLLER_BACKEND_ENDPOINT` is unset, matching the
-    /// pre-existing fire-and-forget contract.
+    /// Shared client for posting streaming configs from HTTP planning and replanning.
+    /// `None` when `CONTROLLER_BACKEND_ENDPOINT` is unset; pushes are then skipped.
     backend_client: Option<Arc<backend_client::BackendClient>>,
-    /// Per-`(metric, role)` `BackendStageConfig` cache used to emit
-    /// **cumulative** `StreamingConfig` AND `BackendStorageRouting`
-    /// JSON documents on every plan-emit cycle.
+    /// Per-`(metric, role)` cache for cumulative streaming configs and storage routing.
     ///
-    /// **Why this is (metric, role)-keyed** (B2 cumulative-emit follow-up
-    /// to PR #283): a single metric can carry MULTIPLE [`AggRole`]
-    /// entries (e.g. post-B2 the workload-registry pre-pop loop registers
-    /// `http_requests_total` against BOTH a DDSketch-Quantile role from
-    /// `quantile_over_time(...)` AND an ExactAgg-Sum role from
-    /// `sum by (zone) (http_requests_total)`). Pre-fix the cache was
-    /// keyed by metric name alone, so the second role's
-    /// `BackendStageConfig` overwrote the first. The data plane's
-    /// `POST /api/v1/streaming-config` handler is an atomic full
-    /// `handle.swap(new_config)` (see
-    /// `data_plane/src/drivers/query/servers/http.rs`), so the second
-    /// per-role POST destroys the first role's aggregations on the
-    /// backend → `sum by (zone) (http_requests_total)` returns
-    /// `ExactAgg(Sum) capability not satisfied`.
+    /// Both backend endpoints replace their whole configuration atomically, so each
+    /// push must include every planned metric and role. A metric may have several
+    /// roles: keying only by metric would discard sibling aggregations.
     ///
-    /// **Why this also matters for storage-routing**: `POST
-    /// /api/v1/storage_routing` is similarly an atomic per-tenant SWAP
-    /// — every push replaces the whole tenant's routing table. Pre-fix
-    /// the per-metric cache emitted a single-element `metrics:[…]`
-    /// document per `handle_plan` call, so when N metrics replanned in
-    /// sequence only the last metric's entry survived → archive-shape
-    /// queries fell to `default_engine: sketch_store` → `archive_miss`
-    /// for the other N-1 metrics.
-    ///
-    /// **Cumulative emit semantics** (post-fix): on every plan-emit
-    /// cycle the cache entry for the `(metric, role)` being planned is
-    /// updated, then:
-    ///   * Concatenate `aggregations` + `readouts` across ALL cache
-    ///     entries into a single cumulative `BackendStageConfig`, and
-    ///     post that one config to `/api/v1/streaming-config` so the
-    ///     data plane's swap installs every role's aggregations
-    ///     simultaneously.
-    ///   * Group cache entries by metric name and merge each metric's
-    ///     `BackendStageConfig`s (concat aggregations + readouts) into
-    ///     one entry per metric. Pass that per-metric list to
-    ///     `emit_backend_storage_routing` so a metric carrying both
-    ///     DDSketch + ExactAgg routes both shape families correctly.
+    /// Streaming-config emission concatenates all aggregations and readouts.
+    /// Storage-routing emission first merges roles by metric, so every sketch
+    /// family for that metric contributes to its routing entry.
     backend_routing_cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>>,
 }
 
@@ -136,15 +97,8 @@ async fn main() {
     let api_addr = std::env::var("CONTROLLER_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let opamp_addr =
         std::env::var("CONTROLLER_OPAMP_ADDR").unwrap_or_else(|_| "0.0.0.0:4320".into());
-    // The default tracks the compose service name in
-    // `ASAPCollector/deploy/mvp-singlenode/docker-compose/base.yml`,
-    // which is still `controller:` post Phase-9 single-binary
-    // refactor (both controller and backend ship from
-    // `asap/query-backend:dev`, but they bind separate listeners
-    // under separate compose service names). Using the post-reorg
-    // crate name `control_plane` here doesn't resolve under the
-    // canonical compose stack and bakes a broken endpoint into every
-    // agent yaml the controller emits.
+    // The default must match the compose service name `controller`; the crate
+    // name `control_plane` is not a resolvable hostname in the canonical stack.
     let opamp_ep = std::env::var("CONTROLLER_OPAMP_ENDPOINT")
         .unwrap_or_else(|_| "ws://controller:4320/v1/opamp".into());
     let scrape_interval = Duration::from_secs(
@@ -346,13 +300,8 @@ async fn main() {
         }
     }
 
-    // ── Phase C: shared BackendClient ─────────────────────────────────────────
-    // Built once at startup; shared between Replanner (existing path —
-    // pushes the StreamingConfig YAML on every successful replan) and
-    // AppState (Phase C — pushes the typed L5 backend JSON emitted by
-    // `emit_backend_streaming_config_json` from `handle_plan`). `None` when
-    // `CONTROLLER_BACKEND_ENDPOINT` is unset preserves the
-    // fire-and-forget "skip silently" contract from Phase B.
+    // Share one client between HTTP planning and replanning. An unset
+    // `CONTROLLER_BACKEND_ENDPOINT` disables backend pushes.
     let backend_client_shared: Option<Arc<backend_client::BackendClient>> =
         backend_endpoint.as_ref().map(|endpoint| {
             info!(
@@ -1191,17 +1140,9 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             .await;
     }
 
-    // ── Phase B (MVP v6): typed L5 stage_split → per-stage emitter ────────────
-    // Behind the `USE_TYPED_STAGE_SPLIT` env-var gate so existing
-    // control plane behaviour is unchanged unless explicitly opted in.
-    //
-    // The typed L5 stage-split is now fed by the real **L4 output**: when
-    // the spec carries a `query_string`, `bound_physical` holds the
-    // optimised L3 tree run through `physical::post_asap::bind_query_expr`.
-    // For specs that supply only explicit fields (no `query_string` to
-    // parse), there is no L3 tree to bind, so we fall back to
-    // `bind_workload_typed`, which lowers the flat `QueryWorkload`
-    // summary to a `PhysicalExpr` directly.
+    // The typed stage-split path is gated by `USE_TYPED_STAGE_SPLIT`.
+    // Queries with a parsed expression use the bound physical plan; explicit-field
+    // workloads without a query string use `bind_workload_typed`.
     if let Some(configs) = stage_configs {
         for (stage_id, stage_cfg) in configs {
             match stage_cfg {
@@ -1247,12 +1188,8 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     }
                 }
                 crate::physical::colored_dag::StageConfig::Gateway(gw) => {
-                    // Phase C: AgentRole::Gateway is now wired
-                    // through the OpAMP role-routing path, so
-                    // the gateway YAML is pushed to gateway-role
-                    // collectors the same way the edge YAML is
-                    // pushed to agent-role collectors above.
-                    // Issue #2: gateway broadcast — `$AGENT_ID` placeholder.
+                    // Gateway-role collectors receive gateway YAML. Broadcast configs retain
+                    // the `$AGENT_ID` placeholder for expansion by each collector.
                     match emit::emit_gateway_yaml(&gw, &st.opamp_endpoint, "$AGENT_ID") {
                         Ok(yaml) => {
                             let hash = short_hash(&yaml);
@@ -1774,7 +1711,7 @@ async fn handle_bootstrap_agent_config(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Phase ε.1.5 — runtime dispatch from the X-Agent-Runtime header.
+    // runtime dispatch from the X-Agent-Runtime header.
     // Defaults to `AsapOtel` for legacy agents that don't send
     // the header so the existing OTel-collector contrib build keeps
     // working with no client-side changes.
@@ -2193,11 +2130,8 @@ fn test_app() -> (AppState, axum::Router) {
     test_app_with_backend(None)
 }
 
-/// Phase C test helper: build an `AppState` whose `backend_client` is
-/// optionally set to a real `BackendClient` pointed at a mock URL. The
-/// `None` arm is the legacy path used by every existing test;
-/// `Some(url)` is the new entry point for Phase C tests that exercise
-/// the typed L5 backend-JSON push.
+/// Build a test server with an optional mock backend URL. `None` disables
+/// backend pushes; `Some(url)` exercises typed backend JSON delivery.
 #[cfg(test)]
 fn test_app_with_backend(backend_url: Option<String>) -> (AppState, axum::Router) {
     let online_store = init_online_store();
@@ -2400,7 +2334,7 @@ mod api_tests {
         })
     }
 
-    // ── Phase C: AppState.backend_client wiring ───────────────────────────────
+    // ── AppState.backend_client wiring ───────────────────────────────
 
     /// Default-constructed AppState (no `CONTROLLER_BACKEND_ENDPOINT`)
     /// must leave `backend_client` as `None` so the typed L5 backend
@@ -3165,12 +3099,7 @@ mod api_tests {
         assert!(body["monthly_savings_dollars"].as_f64().unwrap() > 0.0);
     }
 
-    // ── Phase ε.1.5+ — handle_bootstrap_agent_config typed path ────────────────
-    //
-    // These tests verify the deep fix that ports the bootstrap handler
-    // off `generate_agent_collector_config` and onto the typed-stage-split emit
-    // pipeline that `handle_plan` already uses. See the handler's
-    // doc-comment for the legacy ↔ typed behaviour matrix.
+    // Bootstrap and plan-push must use the same typed emission pipeline.
 
     /// Serialises tests that mutate the `USE_TYPED_STAGE_SPLIT` env var
     /// — `cargo test` runs tests in parallel by default and

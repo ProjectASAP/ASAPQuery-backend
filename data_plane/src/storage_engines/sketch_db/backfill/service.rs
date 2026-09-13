@@ -98,8 +98,7 @@ impl Default for BackfillServiceConfig {
 /// the loop gracefully.
 pub struct BackfillService {
     registry: Arc<BackfillRegistry>,
-    /// Phase 5 M2.3.6g — replayed batches land in `SketchStore` only;
-    /// the legacy `Arc<dyn Store>` field is gone.
+    /// Destination for rebuilt windows.
     sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Shared sid mint authority — wired alongside `sketch_index` so
     /// backfilled precompute sids share the namespace with live ingest.
@@ -318,16 +317,9 @@ pub fn noop_reader_factory() -> ReaderFactory {
     })
 }
 
-/// Production-ready `ReaderFactory` covering the source variants
-/// whose readers ship in-tree as of Phase 5h:
-///
-/// * [`BackfillSource::Prometheus`] — routed to
-///   [`super::prometheus_reader::PrometheusReader`].
-///
-/// Other variants return a clear
-/// "not yet implemented" error, which the worker surfaces on
-/// `BackfillJob::error_message` so the control plane / operator sees
-/// exactly which reader is missing.
+/// Default reader factory for Prometheus sources. ClickHouse requires a
+/// deployment reader factory; unsupported sources fail with an error visible
+/// on the backfill job.
 pub fn default_reader_factory() -> ReaderFactory {
     Arc::new(|source, _materialization| match source {
         BackfillSource::Prometheus { url } => {

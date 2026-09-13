@@ -216,7 +216,7 @@ impl PrometheusHttpAdapter {
 }
 
 #[async_trait]
-impl QueryRequestAdapter for PrometheusHttpAdapter {
+impl HttpProtocolAdapter for PrometheusHttpAdapter {
     async fn parse_get_request(
         &self,
         Query(params): Query<HashMap<String, String>>,
@@ -268,10 +268,7 @@ impl QueryRequestAdapter for PrometheusHttpAdapter {
     fn get_range_query_endpoint(&self) -> &'static str {
         "/api/v1/query_range"
     }
-}
 
-#[async_trait]
-impl QueryResponseAdapter for PrometheusHttpAdapter {
     async fn format_success_response(
         &self,
         result: &QueryExecutionResult,
@@ -354,10 +351,7 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
         let response = PrometheusResponse::error("bad_data", "No result for query");
         Ok(Json(serde_json::to_value(response).unwrap()).into_response())
     }
-}
 
-#[async_trait]
-impl HttpProtocolAdapter for PrometheusHttpAdapter {
     fn query_language(&self) -> asap_types::QueryLanguage {
         asap_types::QueryLanguage::PromQl
     }
@@ -376,9 +370,7 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
     ) -> Result<Json<Value>, StatusCode> {
         debug!("Handling runtime info request in Prometheus adapter");
 
-        // M2.3.6g — earliest timestamps now come from SketchStore's
-        // per-sid `first_seen_unix_ms` metadata. Wire field renamed
-        // accordingly below.
+        // Read first-seen timestamps from per-sid metadata for runtime diagnostics.
         let earliest_timestamps = sketch_index.earliest_timestamps_per_series_id();
 
         // Get runtime info from fallback if available

@@ -2,9 +2,6 @@
 
 use std::collections::HashMap;
 
-// Sub-modules — formerly siblings of `planner/cost_model.rs` (now
-// `optimizer/cost/mod.rs`); the 2026-05 refactor pulled each into a
-// dedicated `optimizer/cost/<name>.rs`.
 pub mod delta;
 pub mod online;
 pub mod pareto;

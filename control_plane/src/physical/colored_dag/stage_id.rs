@@ -1,37 +1,12 @@
-//! L5 stage identifiers + topology descriptors.
-//!
-//! Per `control_plane/docs/design.md` §6 `core::physical` (around line ~765):
-//!
-//! - [`StageId`] — the categorical *tier* in the data lifecycle. Topology
-//!   declares which stages exist; allocator paints `PhysicalExpr` nodes
-//!   with one of these.
-//! - [`Topology`] — the deployment-model topology shape. Phase E surfaces
-//!   only [`Topology::ThreeStage`] (DC lifecycle: edge → gateway →
-//!   backend) per the orchestrator's scope reduction. Single-stage and
-//!   zero-stage are reserved for asap-query / asap-fusion deployments
-//!   not in this phase.
-//!
-//! `StageId` is intentionally an enum (not the `pub struct StageId(pub
-//! String)` shape from design.md line 787): Phase E ships only the
-//! 3-stage DC topology, so the variants are closed and exhaustive
-//! `match`es catch typos at compile time. The string-shaped form from
-//! design.md is the right surface once a deployment model registers a
-//! custom stage role; until that happens, the enum is the safer choice.
+//! Stage roles and deployment topologies. Roles are closed enum variants so
+//! allocation matches are exhaustive. Only three-stage allocation is supported.
 
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 
-/// L5 stage role — a categorical tier in the data lifecycle.
-///
-/// Per design.md §3 (line ~120): "Stage (`StageId`) — a categorical tier
-/// in the data lifecycle (edge / gateway / backend / in-process). The
-/// topology declares which stages exist (3-stage / 1-stage / 0-stage).
-/// Stages are roles, not instances."
-///
-/// Multiple `Executor`s may share a `StageId` (e.g. a 50-host edge fleet
-/// has 50 executors all carrying `StageId::Edge`). Phase E operates at
-/// stage granularity; per-executor fan-out is downstream (Phase G+).
+/// A categorical tier, not an executor instance. Multiple executors may share
+/// one role; per-executor fan-out happens downstream of stage allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StageId {
@@ -66,24 +41,8 @@ impl std::fmt::Display for StageId {
     }
 }
 
-/// Deployment-model topology descriptor.
-///
-/// Per design.md §6 `core::physical::topology` (line ~779):
-/// ```ignore
-/// pub mod topology {
-///     pub struct ThreeStage { /* edge → gateway → backend */ }
-///     pub struct SingleStage { /* backend-only */ }
-///     pub struct ZeroStage;   /* in-process */
-/// }
-/// ```
-///
-/// Phase E surfaces only `ThreeStage` (DC lifecycle scope-reduction);
-/// the other variants are reserved as future-proofing — adding them is
-/// purely additive.
-///
-/// (`clippy::enum_variant_names` is silenced — the `*Stage` suffix is
-/// part of the design.md naming, not a typo carrying redundant
-/// prefix.)
+/// Deployment topology. Single-stage and zero-stage variants are reserved;
+/// the allocator currently supports only `ThreeStage`.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

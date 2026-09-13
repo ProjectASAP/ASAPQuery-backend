@@ -52,20 +52,11 @@ fn consume_in_order<T>(items: Vec<T>, mut persist: impl FnMut(&T) -> bool) -> us
     failed
 }
 
-/// Phase 5 M2.3.6 — successor to the M2.3.4 `DualWriteSink`. Writes
-/// precomputes to `SketchStore` only; the legacy `SketchStore`
-/// agg_id-keyed write path is retired.
+/// Write completed precompute windows to the sid-keyed sketch store.
 ///
-/// Reads already prefer `SketchStore` (M2.3.5b's engine cut-over),
-/// so the legacy store no longer receives traffic from either side.
-/// Once the data-plane crate's `Store` trait and `stores/sketch_db/store/*`
-/// modules are deleted (subsequent M2.3.6 sub-PRs), `SketchStore`
-/// will be renamed to `SketchStore` and this type can collapse into
-/// the previously-existing `StoreOutputSink` shape.
-///
-/// Per-batch overhead: one streaming-config snapshot read + per-row
-/// agg-id lookup and sid hash. Completed accumulators are consumed in order,
-/// so a catch-up batch releases each pane as soon as it is serialized.
+/// Read one streaming-config snapshot per batch and resolve each policy through
+/// its fingerprint. Consume accumulators in order so catch-up batches release
+/// each pane as soon as it is serialized.
 pub struct SketchStoreSink {
     sketch_index: Arc<SketchStore>,
     hot_reload: HotReloadStreamingConfig,

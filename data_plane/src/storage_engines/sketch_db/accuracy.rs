@@ -217,10 +217,7 @@ fn shared_profile(params: PlannerParams) -> AccuracyProfile {
 // says it's OK for them to drift — this module is the single
 // authority on *accuracy*, not on *construction*.
 
-/// Reads canonical `d` (depth = rows) / `w` (width = cols) keys.
-/// The legacy `row_num` / `col_num` form was retired in lock-step
-/// with the asapcollector migration to canonical keys — see
-/// `accumulator_factory::cms_params` for the matching change.
+/// Read canonical depth `d` and width `w` parameters.
 fn cms_params(config: &AggregationConfig) -> (u64, u64) {
     let rows = config
         .parameters
@@ -723,10 +720,6 @@ mod tests {
         let p = derive(&base_config(AggregationType::DDSketch, HashMap::new()));
         assert_eq!(p.epsilon, 0.01);
     }
-
-    // (The historical `set_aggregators_are_exact` test verified the
-    // accuracy bound for `SetAggregator` / `DeltaSetAggregator`;
-    // retired alongside the family itself.)
 
     #[test]
     fn legacy_wrapper_types_fall_back_to_exact() {

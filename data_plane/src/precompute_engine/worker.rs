@@ -929,15 +929,8 @@ impl Worker {
             Vec::with_capacity(samples.len());
 
         for (ts, val) in samples {
-            // Raw-mode path does not carry an `AggregationConfig` for
-            // the source aggregation (synthetic agg_id, no source
-            // config). After the PR-6 follow-up retired
-            // `PrecomputedOutput.aggregation_id`, the sink's fallback
-            // branch is gone — outputs carrying `PolicyFingerprint::UNSET`
-            // are dropped at the sink with a warn. Raw-mode is
-            // dev/test-only today (default `raw_mode_aggregation_id=0`),
-            // so this path effectively writes nothing in production;
-            // wiring raw mode to a real policy is a separate concern.
+            // Raw-mode outputs have no source policy. The sink drops
+            // `PolicyFingerprint::UNSET` outputs with a warning.
             let output =
                 PrecomputedOutput::new(ts as u64, ts as u64, None, PolicyFingerprint::UNSET);
             let _ = self.raw_mode_aggregation_id;
@@ -3280,12 +3273,6 @@ aggregations:
             "all 10 first-batch sketches must merge into the persisted output (3 values × 10)"
         );
     }
-
-    // M2.3.6g — `test_sketch_ingest_persists_and_query_returns_non_empty`
-    // deleted: it exercised the retired SketchStore + StoreOutputSink
-    // pair end-to-end. The SketchStoreSink path (M2.3.4+) is covered
-    // by its own dedicated tests in `output_sink::tests` and by
-    // `engine::e2e_feedback_loop_tests`.
 
     /// Pin the agent-emit-shape vs. backend-grouping-config invariant from
     /// hypothesis (A) of the sweep diagnostic. The agent emits one sketch

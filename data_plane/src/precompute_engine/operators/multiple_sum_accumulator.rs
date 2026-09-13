@@ -1,6 +1,6 @@
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
-    MultipleSubpopulationAggregate, MultipleSubpopulationAggregateFactory, SerializableToSink,
+    MultipleSubpopulationAggregate, SerializableToSink,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -247,38 +247,6 @@ impl MultipleSubpopulationAggregate for MultipleSumAccumulator {
 
     fn clone_boxed(&self) -> Box<dyn MultipleSubpopulationAggregate> {
         Box::new(self.clone())
-    }
-}
-
-// Factory implementation for merging
-pub struct MultipleSumAccumulatorFactory;
-
-impl MultipleSubpopulationAggregateFactory for MultipleSumAccumulatorFactory {
-    fn merge_accumulators(
-        &self,
-        accumulators: Vec<Box<dyn MultipleSubpopulationAggregate>>,
-    ) -> Result<Box<dyn MultipleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let mut merged_sums = HashMap::new();
-
-        for acc in accumulators {
-            if acc.type_name() != "MultipleSumAccumulator" {
-                return Err("Cannot merge different accumulator types".into());
-            }
-
-            // Get keys and merge values
-            let keys = acc.get_keys().unwrap();
-            for key in keys {
-                let value = acc.query(Statistic::Sum, &key, None)?;
-                *merged_sums.entry(key).or_insert(0.0) += value;
-            }
-        }
-
-        Ok(Box::new(MultipleSumAccumulator::new_with_sums(merged_sums)))
-    }
-
-    fn create_default(&self) -> Box<dyn MultipleSubpopulationAggregate> {
-        Box::new(MultipleSumAccumulator::new())
     }
 }
 

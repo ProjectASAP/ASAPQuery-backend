@@ -37,7 +37,7 @@
 //!
 //! Every network / parse failure is mapped to a
 //! [`RawSampleReaderError`] variant. The backfill worker
-//! (Phase 5c) stringifies the error into
+//! stringifies the error into
 //! `BackfillJob::error_message` and marks the job `Failed`, so a
 //! broken Prometheus URL fails loud instead of quietly looping.
 

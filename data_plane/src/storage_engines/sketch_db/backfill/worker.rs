@@ -1,59 +1,10 @@
-//! `BackfillWorker` — drives a single [`BackfillJob`] through the
-//! registry state machine.
+//! Drive one backfill job through its registry lifecycle.
 //!
-//! Implements §10.3 (refresh as a separate worker pool) of the
-//! future storage scope ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
-//! Phase 5c scope: one job at a time, synchronous windowing loop,
-//! pluggable processor. The multi-worker pool with priority +
-//! isolation from live ingest (§11.4) lands in a follow-up.
-//!
-//! ## What the worker does
-//!
-//! 1. Calls [`BackfillRegistry::start`] to transition the job from
-//!    `Queued` to `Running`. If that returns `false` (unknown job /
-//!    non-queued), bails out.
-//! 2. Splits the job's `[start_ms, end_ms)` range into
-//!    `windows_total` equal windows. Rounding: any leftover ms from
-//!    integer division is absorbed into the final window so the
-//!    caller sees exactly `windows_total` windows and the full range
-//!    is covered.
-//! 3. For each window in order:
-//!    * Reads matching samples via [`RawSampleReader::read_samples`].
-//!    * Hands them to [`WindowProcessor::process_window`] along with
-//!      the job's `agg_id` and the window's `(start, end)` range.
-//!    * Calls [`BackfillRegistry::tick_progress`] so the §10.4
-//!      coverage tracker sees progress as a monotonically-increasing
-//!      fraction.
-//!    * Re-checks the job status before the next window — if
-//!      `Cancelled`, stops cleanly without `mark_failed`ing (the
-//!      caller already terminalised it).
-//! 4. On all windows succeeding, calls [`BackfillRegistry::mark_complete`].
-//! 5. On any reader or processor error, calls
-//!    [`BackfillRegistry::mark_failed`] with the error stringified
-//!    and bubbles the error up so the caller can react.
-//!
-//! ## Phase 5c scope (what this file covers)
-//!
-//! * `WindowProcessor` trait — the per-window callback the worker
-//!   invokes. Phase 5e implements the real sketch-building
-//!   processor; for now a [`RecordingProcessor`] captures calls for
-//!   tests.
-//! * `BackfillWorker::run_job(job_id, filter, reader, processor)` —
-//!   the one-job-at-a-time driver.
-//! * Tests covering happy path, reader error, processor error,
-//!   mid-run cancellation, single-window edge case, empty-samples
-//!   window, and non-queued job rejection.
-//!
-//! ## Out of scope for 5c (future phases)
-//!
-//! * Multi-worker concurrency + job prioritisation (§11.4) — a
-//!   `BackfillPool` wrapping N `BackfillWorker` tasks polling the
-//!   registry, coming in Phase 5c-2 or 5d.
-//! * Reader selection from `BackfillSource` — Phase 5e wires
-//!   concrete readers per variant.
-//! * Actual sketch construction inside the processor — Phase 5e.
-//! * §6.3 schema barrier enforcement on backfill writes — Phase 5e
-//!   (when the processor actually writes into the store).
+//! Transition Queued to Running, divide the requested range into windows, and
+//! read and process each window in order. The final window absorbs any integer
+//! rounding remainder. Check cancellation between windows, record progress,
+//! and mark the job Complete or Failed. Reader selection and sketch construction
+//! are supplied by the caller.
 
 use std::sync::Arc;
 
@@ -62,11 +13,8 @@ use async_trait::async_trait;
 use super::raw_sample_reader::{LabelFilter, RawSample, RawSampleReader};
 use super::{BackfillRegistry, BackfillStatus};
 
-/// Per-window callback invoked by [`BackfillWorker`] after reading
-/// samples for a window. Phase 5e implements a real processor that
-/// feeds samples into a fresh accumulator and writes the resulting
-/// precompute to the store; for now the trait exists so the worker's
-/// orchestration logic is independently testable.
+/// Per-window callback after source samples are read. Separates job
+/// orchestration from accumulator construction and storage writes.
 #[async_trait]
 pub trait WindowProcessor: Send + Sync {
     async fn process_window(

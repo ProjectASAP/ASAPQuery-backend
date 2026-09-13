@@ -62,10 +62,10 @@ impl std::fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
-/// Trait for parsing incoming HTTP requests into internal query format
-/// Handles Axum extractors directly for different request types (GET/POST)
+/// HTTP query parsing, response formatting, and listener identity.
+/// Fallback transport is handled separately by `FallbackClient`.
 #[async_trait]
-pub trait QueryRequestAdapter: Send + Sync {
+pub trait HttpProtocolAdapter: Send + Sync {
     /// Parse a GET request with query parameters
     async fn parse_get_request(
         &self,
@@ -107,11 +107,7 @@ pub trait QueryRequestAdapter: Send + Sync {
 
     /// Get the HTTP path for range queries (e.g., "/api/v1/query_range")
     fn get_range_query_endpoint(&self) -> &'static str;
-}
 
-/// Trait for formatting query results into protocol-specific HTTP responses
-#[async_trait]
-pub trait QueryResponseAdapter: Send + Sync {
     /// Format a successful query result into protocol response
     async fn format_success_response(
         &self,
@@ -130,13 +126,7 @@ pub trait QueryResponseAdapter: Send + Sync {
 
     /// Format an error when query returns None (unsupported query)
     async fn format_unsupported_query_response(&self) -> Result<Response, StatusCode>;
-}
 
-/// Adapter trait for HTTP-based query protocols (Prometheus HTTP).
-///
-/// Note: Fallback logic is handled separately via FallbackClient
-#[async_trait]
-pub trait HttpProtocolAdapter: QueryRequestAdapter + QueryResponseAdapter + Send + Sync {
     /// Query language accepted at this listener boundary.
     fn query_language(&self) -> asap_types::QueryLanguage;
 
@@ -158,9 +148,6 @@ pub trait HttpProtocolAdapter: QueryRequestAdapter + QueryResponseAdapter + Send
     ///
     /// The adapter can query the SketchStore for internal metrics and
     /// optionally forward to fallback backend for additional info.
-    /// M2.3.6g — switched from `Arc<dyn Store>` to
-    /// `Arc<SketchStore>` now that SketchStore is the only data
-    /// backend.
     async fn handle_runtime_info(
         &self,
         sketch_index: std::sync::Arc<crate::storage_engines::sketch_db::index::SketchStore>,
@@ -171,7 +158,7 @@ pub trait HttpProtocolAdapter: QueryRequestAdapter + QueryResponseAdapter + Send
         sketch_index: std::sync::Arc<crate::storage_engines::sketch_db::index::SketchStore>,
         headers: HashMap<String, String>,
     ) -> Result<Json<Value>, StatusCode> {
-        // Default implementation ignores headers and calls the old method
+        // Adapters may override this to forward request headers.
         let _ = headers;
         self.handle_runtime_info(sketch_index).await
     }
