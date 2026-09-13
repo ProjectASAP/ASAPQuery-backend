@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(test)]
+use tracing::warn;
 
 /// Classification of an HTTP push failure used by the retry layer in
 /// [`crate::emit::backend_push`]. Transient errors are safe to retry
@@ -167,6 +169,7 @@ impl BackendClient {
         }
     }
 
+    #[cfg(test)]
     /// Post streaming configuration as `application/json`. The backend accepts
     /// both JSON and YAML; a non-2xx response is an error for the caller to log.
     pub async fn post_streaming_config_json(&self, json: String) -> Result<()> {
@@ -197,6 +200,7 @@ impl BackendClient {
         }
     }
 
+    #[cfg(test)]
     /// Typed sibling of [`Self::post_streaming_config_json`] for the
     /// retry layer. Returns the same `Ok(())` on 2xx, but on failure
     /// classifies the underlying cause as [`BackendPostError::Transient`]
@@ -239,41 +243,7 @@ impl BackendClient {
         }
     }
 
-    /// Typed sibling of [`Self::post_storage_routing_json`] for the
-    /// retry layer. Identical contract to
-    /// [`Self::post_streaming_config_json_typed`].
-    pub async fn post_storage_routing_json_typed(
-        &self,
-        json: String,
-    ) -> std::result::Result<(), BackendPostError> {
-        let url = derive_storage_routing_url(&self.endpoint);
-        debug!(
-            endpoint = %url,
-            json_bytes = json.len(),
-            "posting storage-routing JSON to ASAPQuery-backend (typed)"
-        );
-        let resp = self
-            .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(json)
-            .send()
-            .await
-            .map_err(classify_reqwest_error)?;
-
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(classify_http_status(
-                status,
-                body,
-                "storage-routing JSON POST",
-            ))
-        }
-    }
-
+    #[cfg(test)]
     /// Post backend storage-routing JSON. Derive the URL by replacing the
     /// `/api/v1/streaming-config` suffix with `/api/v1/storage_routing`; URLs
     /// without that suffix are used verbatim.
@@ -409,6 +379,7 @@ fn derive_physical_plan_url(endpoint: &str) -> String {
 /// end with `/api/v1/streaming-config` (or `/api/v1/streaming_config` —
 /// either spelling is supported) pass through unchanged so tests can
 /// inject a mock-server URL directly.
+#[cfg(test)]
 fn derive_storage_routing_url(endpoint: &str) -> String {
     const STREAMING_PATH_DASH: &str = "/api/v1/streaming-config";
     const STREAMING_PATH_UNDERSCORE: &str = "/api/v1/streaming_config";
@@ -422,6 +393,7 @@ fn derive_storage_routing_url(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
+#[cfg(test)]
 /// Fire-and-forget convenience helper used by the replanner. Logs
 /// errors at WARN and never propagates them — the replanner should
 /// never fail an entire replan because the backend was temporarily

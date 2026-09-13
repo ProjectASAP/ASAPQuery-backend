@@ -36,14 +36,6 @@ impl MultipleMinMaxAccumulator {
         Self::new("max".to_string())
     }
 
-    pub fn new_with_values(values: HashMap<KeyByLabelValues, f64>, sub_type: String) -> Self {
-        if sub_type != "min" && sub_type != "max" {
-            panic!("sub_type must be 'min' or 'max'");
-        }
-
-        Self { values, sub_type }
-    }
-
     pub fn update(&mut self, key: KeyByLabelValues, value: f64) {
         match self.sub_type.as_str() {
             "min" => {
@@ -62,6 +54,7 @@ impl MultipleMinMaxAccumulator {
         }
     }
 
+    #[cfg(test)]
     pub fn add_value(&mut self, key: KeyByLabelValues, value: f64) {
         self.values.insert(key, value);
     }

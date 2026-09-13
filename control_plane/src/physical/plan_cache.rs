@@ -65,6 +65,7 @@ impl CachedDeploymentPlanner {
         self.cache.write().unwrap().remove(metric);
     }
 
+    #[cfg(test)]
     /// Return the metric names that have an established baseline.
     pub fn baseline_metrics(&self) -> Vec<String> {
         self.cache.read().unwrap().keys().cloned().collect()
@@ -89,7 +90,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,

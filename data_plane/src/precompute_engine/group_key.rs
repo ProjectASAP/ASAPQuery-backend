@@ -45,6 +45,7 @@ impl GroupKey {
         }
     }
 
+    #[cfg(test)]
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical
     }

@@ -267,6 +267,7 @@ pub fn encode_ddsketch_envelope(sk: &asap_sketchlib::DdSketch) -> Vec<u8> {
     buf
 }
 
+#[cfg(test)]
 /// Merge two `DdSketch` instances by routing through asap-precompute-rs's
 /// runtime `Sketch::merge`. The result is byte-identical to
 /// `asap_sketchlib::DdSketch::merge_refs(&[a, b])` because

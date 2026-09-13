@@ -197,6 +197,7 @@ impl ThanosQueryEngine {
         ]
     }
 
+    #[cfg(test)]
     /// The infos a forwarded-but-failed answer carries. Includes
     /// the quirk line so the upcoming Step-2.4 e2e demo can pin
     /// fail-loud behaviour.
@@ -654,9 +655,8 @@ pub fn engine_from_env() -> Result<Option<ThanosQueryEngine>, ThanosQueryError> 
 // Test helpers
 // ---------------------------------------------------------------------------
 
-#[doc(hidden)]
-#[cfg(any(test, feature = "extra_debugging"))]
-pub mod test_support {
+#[cfg(test)]
+pub(crate) mod test_support {
     //! Test-only helpers for spinning up an in-process mock
     //! `thanos-query` sidecar. Used by the unit + integration
     //! tests below and by the `routing/query_engine_routing.rs` tests

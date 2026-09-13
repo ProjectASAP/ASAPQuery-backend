@@ -126,18 +126,6 @@ impl PrecomputedOutput {
             policy_fp,
         }
     }
-
-    pub fn get_freshness_debug_string(&self) -> String {
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let freshness = current_time.saturating_sub(self.end_timestamp);
-        format!(
-            "end_timestamp: {}, current_time: {}, freshness: {}",
-            self.end_timestamp, current_time, freshness
-        )
-    }
 }
 
 // ─── Origin tag tests ─────────────────────────────────────────────

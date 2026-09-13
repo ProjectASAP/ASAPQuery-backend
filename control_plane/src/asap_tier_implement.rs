@@ -77,7 +77,7 @@ use asap_aware_mapping::DefaultCostModel;
 use planner_types::post_asap::SummaryNode;
 
 use crate::query_parser::parse_query_expr_canonical;
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::QueryExpr;
 
 /// Fixed accuracy target for this L1 call site (L1 adoption,

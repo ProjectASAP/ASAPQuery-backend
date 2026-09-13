@@ -35,7 +35,6 @@ pub mod runtime_samples;
 pub mod sketch_selection;
 pub mod store;
 pub mod types;
-pub mod types_v2;
 pub mod workload;
 
 /// PromQL → ASAPPlanner's canonical post-ASAP plan via

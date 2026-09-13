@@ -277,14 +277,6 @@ impl SketchInstanceMetadata {
             AggKind::ExactAgg { .. } => None,
         }
     }
-
-    /// Sketch-config accessor mirroring [`Self::sketch_algorithm`].
-    pub fn sketch_config(&self) -> Option<&SketchConfig> {
-        match &self.agg_kind {
-            AggKind::Sketch { config, .. } => Some(config),
-            AggKind::ExactAgg { .. } => None,
-        }
-    }
 }
 
 /// Per-sid storage value — wraps `SidStoreData` in an `RwLock` so the
@@ -644,7 +636,7 @@ pub struct SketchStore {
     /// Reverse index: `policy_fp → {sids}`. Lets the query path resolve
     /// "which sids belong to this policy?" in O(1) without walking
     /// `instances`. Maintained by [`Self::register`] /
-    /// [`Self::remove_instance`] / [`Self::remove_instances_for_agg_config`].
+    /// [`Self::remove_instance`].
     /// Entries with `PolicyFingerprint::UNSET` are NOT recorded (the
     /// sentinel means "no source config"); legacy callers that mint
     /// sids without a fingerprint reach those sids through
@@ -1094,14 +1086,6 @@ impl SketchStore {
         }
     }
 
-    /// The per-item attribute name recorded for `sid`, if any. `Some`
-    /// means the sketch hashes that label's VALUE (so `estimate(value)`
-    /// is meaningful); `None` means per-attribute-set keying (only the
-    /// bucket total is meaningful — keyed selectors must safe-miss).
-    pub fn item_label_for(&self, sid: u64) -> Option<String> {
-        self.item_labels.read().unwrap().get(&sid).cloned()
-    }
-
     /// Resolve a policy fingerprint to the set of sids it has minted.
     /// Returns an empty vector when no sid is bound to the fingerprint
     /// (e.g. fresh policy with no ingest activity yet) or when the
@@ -1142,6 +1126,7 @@ impl SketchStore {
             .is_some_and(|generation| binding.catalog_generation.as_deref() == Some(generation))
     }
 
+    #[cfg(test)]
     /// Live policy count — number of distinct fingerprints with at
     /// least one sid. Useful for telemetry / `/runtime` introspection
     /// (mirrors the legacy "active aggregation count" metric).
@@ -1172,6 +1157,7 @@ impl SketchStore {
         ))
     }
 
+    #[cfg(test)]
     pub fn descriptor_counts(&self) -> (usize, usize) {
         (
             self.descriptors.summary_count(),
@@ -2409,6 +2395,7 @@ impl SketchStore {
         self.series.len()
     }
 
+    #[cfg(test)]
     /// Total count of in-memory SEALED epochs across all sids — i.e.
     /// epochs sealed (pending flush) but not yet evicted to disk. `0`
     /// once the flusher has drained everything. Used by tests and
@@ -3159,51 +3146,6 @@ impl SketchStore {
             ),
         };
         accepted.then_some(sid)
-    }
-
-    /// Phase 5 M2.3.6d — eviction-side helper. Removes every sid in the
-    /// index whose metadata was registered against `agg_cfg`, i.e.
-    /// shares the same metric, agg_type, parameters canonicalization,
-    /// and grouping-keys set the `SketchStoreSink` used at write time.
-    /// Returns how many sids were removed. Used by
-    /// `SchemaEvictionService` to drop a retired schema's residual sid
-    /// state.
-    pub fn remove_instances_for_agg_config(
-        &self,
-        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
-    ) -> usize {
-        let target_metric = agg_cfg.metric.as_str();
-        let target_agg_type = agg_cfg.aggregation_type;
-        let target_params = canonical_parameters(&agg_cfg.parameters);
-        let target_group_keys: BTreeSet<String> = agg_cfg.grouping_labels.iter().cloned().collect();
-
-        // Collect the matching sids under a short read lock; then call
-        // `remove_instance` per sid (which takes its own write lock).
-        let to_remove: Vec<u64> = {
-            let g = self.instances.read().unwrap();
-            g.iter()
-                .filter(|(_, m)| {
-                    if m.metric_name != target_metric {
-                        return false;
-                    }
-                    if m.group_by_keys != target_group_keys {
-                        return false;
-                    }
-                    matches!(
-                        &m.agg_kind,
-                        AggKind::ExactAgg { agg_type, parameters_canonical, .. }
-                            if *agg_type == target_agg_type
-                                && parameters_canonical == &target_params
-                    )
-                })
-                .map(|(sid, _)| *sid)
-                .collect()
-        };
-        let count = to_remove.len();
-        for sid in to_remove {
-            self.remove_instance(sid);
-        }
-        count
     }
 }
 

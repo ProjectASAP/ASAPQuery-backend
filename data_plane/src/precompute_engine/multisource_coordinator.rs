@@ -87,6 +87,7 @@ impl MultiSourceCoordinator {
         })
     }
 
+    #[cfg(test)]
     /// Bind the complete installed producer roster before accepting any input
     /// or barrier. This validates scope; transport authentication and durable
     /// source payload publication remain caller obligations.
@@ -280,6 +281,7 @@ impl MultiSourceCoordinator {
         self.checkpoint_store.advance_watermark(barrier)
     }
 
+    #[cfg(test)]
     pub fn ready_batches(&self) -> io::Result<Vec<ReadyInputBatch>> {
         let _transition = self
             .transition
@@ -330,30 +332,6 @@ impl MultiSourceCoordinator {
             }
         }
         Ok(ready)
-    }
-
-    pub fn publication_key(
-        &self,
-        batch: &ReadyInputBatch,
-        sink_node_id: impl Into<String>,
-        instance_id: SummaryInstanceId,
-        output_definition: PolicyFingerprint,
-        output_lineage: Vec<u8>,
-        state_reference: SummaryStateReference,
-    ) -> AtomicPublicationKey {
-        AtomicPublicationKey {
-            catalog_generation: self.spec.catalog_generation.clone(),
-            dag_id: self.spec.dag_id.clone(),
-            sink_node_id: sink_node_id.into(),
-            instance_id,
-            coordinates: SummaryInstanceCoordinates {
-                summary_definition_id: output_definition.into(),
-                time_range: batch.time_range,
-                group_values: batch.group_values.clone(),
-            },
-            output_lineage,
-            state_reference,
-        }
     }
 
     fn validate_input(&self, input: &StagedSummaryInput) -> io::Result<()> {

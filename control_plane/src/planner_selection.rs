@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use asap_aware_mapping::{
     AccuracyBudgetAllocator, AccuracyEvidenceProvider, AccuracyModel, CostModel, Replacement,
     ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
@@ -256,6 +256,7 @@ pub fn select_summary_default(expr: &QueryExpr) -> Result<Rc<SummaryNode>, Selec
     select_summary(expr, &asap_aware_mapping::DefaultCostModel)
 }
 
+#[cfg(test)]
 /// Search a same-requirement workload cohort through Planner's canonical CSE
 /// and replacement inventory. Physical implementation compatibility is checked
 /// later, before publication; this function never assigns runtime identities.
@@ -272,6 +273,7 @@ pub fn select_workload(
     )
 }
 
+#[cfg(test)]
 /// The entire cohort uses the same scoped accuracy certificate; callers must
 /// not spread one query's evidence to unrelated workload roots.
 pub fn select_workload_with_evidence(
@@ -289,6 +291,7 @@ pub fn select_workload_with_evidence(
     )
 }
 
+#[cfg(test)]
 /// Keep replacement legality and workload-root validation on the same model.
 pub fn select_workload_with_accuracy_model(
     roots: Vec<(usize, Rc<QueryExpr>)>,
@@ -473,21 +476,6 @@ pub fn select_summary_with_evidence(
         Replacement::Rewrite(_) | Replacement::ExactComposition(_) => {
             Err(SelectionError::UnexpectedRewrite)
         }
-    }
-}
-
-/// Select a legal summary when Planner offers one, otherwise preserve the
-/// subtree explicitly. This mirrors the removed single-tree binder's
-/// conservative behavior and is appropriate for serving fallbacks; physical
-/// compilation should use [`select_summary`] so an unimplementable target is
-/// reported rather than silently committed.
-pub fn select_summary_or_keep(
-    expr: &QueryExpr,
-    cost_model: &dyn CostModel,
-) -> Result<Rc<SummaryNode>, SelectionError> {
-    match select_summary(expr, cost_model) {
-        Err(SelectionError::NoLegalCandidate) => keep_pre_asap(expr),
-        result => result,
     }
 }
 

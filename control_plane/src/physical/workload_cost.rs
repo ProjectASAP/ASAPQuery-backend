@@ -255,7 +255,7 @@ pub fn manifest(
             {
                 let parsed = crate::query_parser::parse_query_expr_canonical(
                     query,
-                    crate::types_v2::AccuracyTarget::Exact,
+                    crate::types::AccuracyTarget::Exact,
                 )
                 .map_err(|error| invalid(error.to_string()))?;
                 for metric in exact_source_metrics(&parsed)? {
@@ -868,7 +868,7 @@ mod tests {
         q.query =
             planner_types::workload::Query("max_over_time(a[1m]) + max_over_time(b[1m])".into());
         q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
-            crate::types_v2::AccuracyTarget::Exact,
+            crate::types::AccuracyTarget::Exact,
         );
         let (request, environment) = snapshot.planning_request().unwrap();
         let candidates = with_exact_alternative(request).unwrap();
@@ -962,7 +962,7 @@ mod tests {
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         entry.query = Query("sum(rate(a{job=\"x\"}[1m])) / sum(rate(a{job!=\"x\"}[5m]))".into());
         entry.requirements.accuracy =
-            AccuracyRequirement::Explicit(crate::types_v2::AccuracyTarget::Exact);
+            AccuracyRequirement::Explicit(crate::types::AccuracyTarget::Exact);
         let (request, environment) = snapshot.planning_request().unwrap();
         let candidates = with_exact_alternative(request).unwrap();
         assert!(candidates.len() >= 2);

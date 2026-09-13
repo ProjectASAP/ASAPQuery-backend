@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::types::AccuracyTarget;
 use crate::types::AggType;
-use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
 use planner_types::pre_asap::{ColumnId, CompareOpKind, ScalarValue};
 use planner_types::pre_asap::{Predicate, QueryExpr, Source};
@@ -498,7 +498,7 @@ mod doc_verify_all {
     // `asap_frontend_promql::lower_promql` produces — the only algebra IR
     // the parse path now emits.
     use super::parse_query_expr_canonical;
-    use crate::types_v2::AccuracyTarget;
+    use crate::types::AccuracyTarget;
     use planner_types::pre_asap::QueryExpr;
     use planner_types::pre_asap::{AggIntent, Reduction};
 

@@ -241,18 +241,6 @@ impl SeriesRouter {
         Ok(())
     }
 
-    /// Atomically reserve queue capacity for an entire request and then
-    /// publish it. If any target worker is full or closed, every reservation
-    /// is dropped and no message is enqueued. Remote Write uses this to turn
-    /// bounded-queue pressure into a retryable HTTP response without leaving
-    /// an untracked partial request behind.
-    pub fn try_route_group_batch_atomic(
-        &self,
-        messages: Vec<WorkerMessage>,
-    ) -> Result<(), TryRouteError> {
-        self.try_route_group_batch_with_admission(messages, || Ok(None))
-    }
-
     pub fn try_route_group_batch_with_admission(
         &self,
         messages: Vec<WorkerMessage>,
@@ -302,17 +290,6 @@ impl SeriesRouter {
                 .send(WorkerMessage::Flush)
                 .await
                 .map_err(|e| format!("Failed to send flush to worker {}: {}", i, e))?;
-        }
-        Ok(())
-    }
-
-    /// Broadcast shutdown to all workers.
-    pub async fn broadcast_shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for (i, sender) in self.senders.iter().enumerate() {
-            sender
-                .send(WorkerMessage::Shutdown)
-                .await
-                .map_err(|e| format!("Failed to send shutdown to worker {}: {}", i, e))?;
         }
         Ok(())
     }

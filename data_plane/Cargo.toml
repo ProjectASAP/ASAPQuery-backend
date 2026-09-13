@@ -36,12 +36,8 @@ arc-swap.workspace = true
 # Crate-specific (keep version pinned here)
 form_urlencoded = "1.2"
 axum = "0.7"
-rusqlite = { version = "0.31", features = ["bundled"] }
 bincode = "1.3"
 dashmap = "5.5"
-uuid = { version = "1.0", features = ["v4"] }
-structopt = "0.3"
-urlencoding = "2.1"
 flate2 = "1.0"
 async-trait = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
@@ -61,11 +57,11 @@ asap_otel_proto.workspace = true
 # `asap-gzip` arm's agent. control_plane already pulls tonic with this
 # feature for its RuntimeSamples gRPC.
 tonic = { version = "0.12", features = ["gzip"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 regex = "1"
 prometheus = "0.13"
 lazy_static = "1.4"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest.workspace = true
 tracing-appender = "0.2"
 asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
 # Generic MessagePack codec for decoding the heap-bearing CountSketch

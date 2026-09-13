@@ -348,19 +348,12 @@ impl DeploymentPlanCompiler {
         }
     }
 
-    pub fn with_defaults(defaults: SketchDefaults) -> Self {
-        Self {
-            valid_for: DEFAULT_VALID_FOR,
-            sketch_defaults: defaults,
-        }
-    }
-
     pub fn plan(&self, w: &QueryWorkload) -> CollectionPlan {
         // This legacy scalar cost path cannot certify a failure probability.
         // Exact/zero-error and EpsilonDelta use raw; the typed binder independently
         // checks the full requirement against Planner's family guarantees.
         if w.exact_required
-            || !matches!(w.accuracy, crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+            || !matches!(w.accuracy, crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
         {
             return self.raw_passthrough_plan(w);
         }
@@ -489,7 +482,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
@@ -606,7 +599,7 @@ mod tests {
     #[test]
     fn ddsketch_accuracy_params() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.accuracy = crate::types_v2::AccuracyTarget::Epsilon(0.005);
+        w.accuracy = crate::types::AccuracyTarget::Epsilon(0.005);
         let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::DDSketch {
@@ -619,7 +612,7 @@ mod tests {
     #[test]
     fn hll_precision_coarse_sla() {
         let mut w = workload(vec![AggType::Cardinality]);
-        w.accuracy = crate::types_v2::AccuracyTarget::Epsilon(0.03);
+        w.accuracy = crate::types::AccuracyTarget::Epsilon(0.03);
         let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::HLL { precision } => {
@@ -705,7 +698,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,

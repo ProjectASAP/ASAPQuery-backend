@@ -14,7 +14,6 @@ use control_plane::replan;
 use control_plane::runtime_samples;
 use control_plane::store;
 use control_plane::types;
-use control_plane::types_v2;
 use control_plane::workload;
 
 use axum::{
@@ -520,7 +519,7 @@ struct PhysicalPlanQueryRequest {
     window_secs: u64,
     #[serde(default)]
     group_by: Vec<String>,
-    accuracy: types_v2::AccuracyTarget,
+    accuracy: types::AccuracyTarget,
     lifecycle: physical::compiler::LifecyclePlanningInput,
     window_implementations: Vec<physical::compiler::WindowImplementationCandidate>,
     #[serde(default)]
@@ -577,7 +576,7 @@ impl PhysicalQueryFrontend {
     fn parse(
         self,
         query: &str,
-        accuracy: types_v2::AccuracyTarget,
+        accuracy: types::AccuracyTarget,
     ) -> Result<planner_types::pre_asap::QueryExpr, String> {
         match self {
             Self::PromQl => parse_query_expr_canonical(query, accuracy)
@@ -2384,7 +2383,7 @@ mod api_tests {
     /// HTTP and stored replan inputs share the resolved typed target, including delta.
     #[tokio::test]
     async fn plan_preserves_typed_accuracy_requirements() {
-        use control_plane::types_v2::AccuracyTarget;
+        use control_plane::types::AccuracyTarget;
         for target in [
             AccuracyTarget::Epsilon(0.05),
             AccuracyTarget::EpsilonDelta {
@@ -2514,7 +2513,7 @@ mod api_tests {
             time_window: std::time::Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
@@ -2777,8 +2776,8 @@ mod api_tests {
             accuracy: None,
             dollars: None,
             deployment_model: None,
-            shape: types_v2::QueryShape::default(),
-            data: types_v2::DataShape::default(),
+            shape: types::QueryShape::default(),
+            data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
         let wc = types::WorkloadCharacteristics::default();
@@ -2922,8 +2921,8 @@ mod api_tests {
             accuracy: None,
             dollars: None,
             deployment_model: None,
-            shape: types_v2::QueryShape::default(),
-            data: types_v2::DataShape::default(),
+            shape: types::QueryShape::default(),
+            data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
         let wc = types::WorkloadCharacteristics::default();
@@ -3187,8 +3186,8 @@ mod api_tests {
             accuracy: None,
             dollars: None,
             deployment_model: None,
-            shape: types_v2::QueryShape::default(),
-            data: types_v2::DataShape::default(),
+            shape: types::QueryShape::default(),
+            data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).expect("analyze");
         let wc = types::WorkloadCharacteristics::default();
@@ -3422,8 +3421,8 @@ mod api_tests {
                 accuracy: None,
                 dollars: None,
                 deployment_model: None,
-                shape: types_v2::QueryShape::default(),
-                data: types_v2::DataShape::default(),
+                shape: types::QueryShape::default(),
+                data: types::DataShape::default(),
             };
             let wl = analyzer.analyze(spec).expect("analyze");
             let wc = types::WorkloadCharacteristics::default();

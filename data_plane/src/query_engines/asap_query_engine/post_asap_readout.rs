@@ -1,19 +1,21 @@
-//! `SummaryNode` lowering + execution + conversion into `ASAPTierResult`'s
-//! `(series, coverage)` shape — the core `live_serve.rs` (the serving
-//! cutover) calls into.
+//! Execute installed query DAGs and project their values and coverage.
 
 use std::collections::BTreeMap;
 
 use crate::utils::arithmetic::evaluate_float64_arithmetic as arithmetic;
 
-use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
 use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
-use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
-use crate::query_engines::asap_query_engine::post_asap_planner::{
-    execution_hints, plan_promql_to_post_asap, LoweringSkip,
-};
+/// A planned warm query cannot be served; callers may route to an exact backend.
+#[derive(Debug)]
+pub enum LoweringSkip {
+    Disabled,
+    QueryNotPlanned(String),
+    InvalidQueryPlan(String),
+    MaterializationNotReady(String),
+    ExecuteFailed(String),
+}
 use crate::query_engines::asap_query_engine::summary_executor::{
     GroupState, QueryExecutionContext, SummaryExecutorError, SummaryValue,
 };
@@ -33,27 +35,7 @@ pub struct PostAsapReadoutOutcome {
     pub coverage: Option<(u64, u64)>,
 }
 
-/// Ask ASAPPlanner for the post-ASAP representation of `query`, execute it
-/// against `index` over `[t0_ms, t1_ms]`, and
-/// convert the result into `PostAsapReadoutOutcome`. `Err` covers every reason
-/// this couldn't produce a trustworthy answer — see `LoweringSkip`'s
-/// variants; every one of them means "fall back to the legacy path,"
-/// never "the legacy path is wrong."
-pub fn execute_post_asap_readout(
-    index: &SketchStore,
-    query: &str,
-    t0_ms: u64,
-    t1_ms: u64,
-    is_cumulative: bool,
-    accuracy: AccuracyTarget,
-) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let node = plan_promql_to_post_asap(index, query, accuracy.clone())?;
-    execute_planned_post_asap(index, &node, query, accuracy, t0_ms, t1_ms, is_cumulative)
-}
-
-/// Execute an already-bound QueryPlan entry.  This is the production serving
-/// path: no PromQL lowering, planner cost model, observed-family lookup, or
-/// Installed QueryPlan materialization resolution occurs before this legacy test helper.
+/// Execute the materializations and readouts bound in an installed QueryPlan entry.
 pub fn execute_query_plan_readout(
     index: &SketchStore,
     entry: &asap_types::query_plan::QueryPlanEntry,
@@ -604,80 +586,6 @@ fn execute_physical_query_payload(
     result
 }
 
-/// Plan and execute an instant query without consulting the legacy candidate
-/// analyzer. Lookback and cumulative-vs-per-window behavior come from the
-/// post-ASAP DAG itself.
-pub fn execute_post_asap_instant(
-    index: &SketchStore,
-    query: &str,
-    now_ms: u64,
-    accuracy: AccuracyTarget,
-) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
-    const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
-    let node = plan_promql_to_post_asap(index, query, accuracy.clone())?;
-    let hints = execution_hints(&node);
-    let t0_ms = if hints.full_history {
-        0
-    } else {
-        now_ms.saturating_sub(hints.lookback_ms.unwrap_or(DEFAULT_LOOKBACK_MS))
-    };
-    let outcome = execute_planned_post_asap(
-        index,
-        &node,
-        query,
-        accuracy,
-        t0_ms,
-        now_ms,
-        hints.cumulative_readout,
-    )?;
-    Ok((outcome, t0_ms))
-}
-
-fn execute_planned_post_asap(
-    index: &SketchStore,
-    node: &planner_types::post_asap::SummaryNode,
-    query: &str,
-    accuracy: AccuracyTarget,
-    t0_ms: u64,
-    t1_ms: u64,
-    is_cumulative: bool,
-) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let _ = (query, accuracy);
-    let allowed_materializations = None;
-    let ctx = QueryExecutionContext {
-        index,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-        allowed_materializations,
-    };
-
-    match execute(node, &ctx) {
-        Ok(ExecOutcome::Value(values)) => {
-            let mut coverage: Option<(u64, u64)> = None;
-            let mut series = Vec::new();
-            for (group_key, value) in &values {
-                fold_coverage(&mut coverage, value.coverage());
-                series.extend(summary_value_to_series(group_key, value));
-            }
-            Ok(PostAsapReadoutOutcome { series, coverage })
-        }
-        Ok(ExecOutcome::State(groups)) => {
-            let mut coverage: Option<(u64, u64)> = None;
-            let mut series = Vec::new();
-            for (group_key, state, _family) in &groups {
-                fold_coverage(&mut coverage, state.exact_coverage());
-                let Some(value) = state.exact_value(&None) else {
-                    continue;
-                };
-                series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
-            }
-            Ok(PostAsapReadoutOutcome { series, coverage })
-        }
-        Err(e) => Err(LoweringSkip::ExecuteFailed(format!("{e:?}"))),
-    }
-}
-
 /// `SummaryValue::Points`/`TopK` -> `ASAPTierResult.series`'s row shape.
 /// `TopK`'s ranked-list-per-timestamp shape is pivoted into one row per
 /// item (each row = the group's label map plus an `item` label, one point
@@ -722,6 +630,8 @@ pub(crate) fn fold_coverage(coverage: &mut Option<(u64, u64)>, next: Option<(u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_engines::asap_query_engine::test_plan;
+    use asap_types::query_plan::{ExactReadout, PhysicalGrouping, QueryReadout};
     use planner_types::pre_asap::ArithmeticOpKind;
 
     fn exact_points(metric: &str, service: &str, value: f64) -> PhysicalQueryOutput {
@@ -834,10 +744,6 @@ mod tests {
     use crate::storage_engines::sketch_db::index::{
         AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata, SketchSampleState,
     };
-
-    fn accuracy() -> AccuracyTarget {
-        AccuracyTarget::Epsilon(0.01)
-    }
 
     fn register_hll(idx: &SketchStore, sid: u64, service: &str, items: &[&str]) {
         // precision 14 -- what `ControlPlaneCostModel` actually picks for
@@ -1013,48 +919,60 @@ mod tests {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "api", &["a", "b"]);
         register_hll(&idx, 2, "worker", &["b", "c"]);
-        let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy())
-            .expect("compile-stage fixture");
-        let canonical = asap_types::query_plan::canonical_promql("count(unique_users)").unwrap();
-        let entry = control_plane::query_plan::compile_bound(
-            "q-cardinality".into(),
-            canonical,
-            &node,
-            asap_types::query_plan::InstantExecution {
-                lookback_ms: 60_000,
-                full_history: false,
-                cumulative_readout: true,
+        let config = crate::query_engines::asap_query_engine::test_plan::materialization(
+            "unique_users",
+            "HLL",
+            serde_json::json!({"precision": 14}),
+            &["service"],
+            1000,
+        );
+        let entry = crate::query_engines::asap_query_engine::test_plan::entry(
+            "count(unique_users)",
+            &config,
+            asap_types::query_plan::PhysicalGrouping::PerEntity,
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: asap_types::query_plan::QueryReadout::Cardinality,
             },
-            asap_types::query_plan::FallbackPolicy::ExactBackend,
-            |_node, _family| {
-                Ok(asap_types::query_plan::MaterializationBinding {
-                    item_labels: Vec::new(),
-                    materialization: asap_types::PolicyFingerprint(123).into(),
-                    output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
-                    window_ms: 60_000,
-                    pane_origin_ms: Some(2_000),
-                    readout_lookback_ms: Some(60_000),
-                })
-            },
-        )
-        .unwrap();
+        );
+        crate::query_engines::asap_query_engine::test_plan::install(
+            &idx,
+            &[(config, vec![1])],
+            vec![entry.clone()],
+        );
         let result = execute_query_plan_readout(&idx, &entry, 1_000, 2_000, true)
             .expect("execute formal QueryPlan");
-        assert!(!result.series.is_empty());
+        assert_eq!(result.series.len(), 1, "unbound policy must not contribute");
+        assert_eq!(
+            result.series[0].0.get("service").map(String::as_str),
+            Some("api")
+        );
+        assert!((result.series[0].1[0].1 - 2.0).abs() < 0.1);
     }
 
     #[test]
     fn bare_range_function_keeps_one_series_per_entity() {
         let idx = ddsketch_fixture();
-        let outcome = execute_post_asap_readout(
-            &idx,
-            "quantile_over_time(0.99, latency_ms[1m])",
-            1_000,
-            2_000,
-            true,
-            accuracy(),
-        )
-        .expect("should execute");
+        let config = test_plan::materialization(
+            "latency_ms",
+            "DDSketch",
+            serde_json::json!({"alpha": 0.01}),
+            &[],
+            1000,
+        );
+        let entry = test_plan::entry(
+            "quantile_over_time(0.99, latency_ms[1s])",
+            &config,
+            PhysicalGrouping::PerEntity,
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Quantile { q: 0.99 },
+            },
+        );
+        test_plan::install(&idx, &[(config, vec![1])], vec![entry.clone()]);
+        let outcome = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
         assert_eq!(outcome.series.len(), 1);
     }
 
@@ -1065,9 +983,25 @@ mod tests {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let outcome =
-            execute_post_asap_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy())
-                .expect("should execute");
+        let config = test_plan::materialization(
+            "unique_users",
+            "HLL",
+            serde_json::json!({"precision": 14}),
+            &["service"],
+            1000,
+        );
+        let entry = test_plan::entry(
+            "count(unique_users)",
+            &config,
+            PhysicalGrouping::Reduce(vec![]),
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Cardinality,
+            },
+        );
+        test_plan::install(&idx, &[(config, vec![1, 2])], vec![entry.clone()]);
+        let outcome = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
         assert_eq!(
             outcome.series.len(),
             1,
@@ -1111,9 +1045,20 @@ mod tests {
             (1_000, 2_000),
             Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
         );
-        let outcome =
-            execute_post_asap_readout(&idx, "sum(bytes_total)", 1_000, 2_000, true, accuracy())
-                .expect("should execute");
+        let config =
+            test_plan::materialization("bytes_total", "Sum", serde_json::json!({}), &[], 1000);
+        let entry = test_plan::entry(
+            "sum(bytes_total)",
+            &config,
+            PhysicalGrouping::Reduce(vec![]),
+            1000,
+            QueryPlanNode::ExactReadout {
+                input: QueryNodeId(0),
+                readout: ExactReadout::Sum,
+            },
+        );
+        test_plan::install(&idx, &[(config, vec![1])], vec![entry.clone()]);
+        let outcome = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
         // Window-end-only coverage: a single window (1_000, 2_000) is
         // keyed by its end (2_000) alone, so both bounds equal 2_000 --
         // same semantics as `SummaryValue::coverage()`, reconfirmed for

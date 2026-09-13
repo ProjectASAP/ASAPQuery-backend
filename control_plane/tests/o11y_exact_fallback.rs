@@ -1,7 +1,7 @@
 use control_plane::{
     physical::post_asap::{bind_query_expr, PhysicalExpr, PostAsapPlan},
     query_parser::parse_query_expr_canonical,
-    types_v2::AccuracyTarget,
+    types::AccuracyTarget,
 };
 use planner_types::post_asap::SummaryExpr;
 
@@ -26,14 +26,14 @@ fn o11y_non_summary_roots_preserve_exact_query_semantics() {
             };
             assert_eq!(original.as_ref(), &expr, "query semantics changed: {query}");
             assert_eq!(node.schema.fields.len(), expr.output_schema().unwrap().columns.len());
-            let executable = control_plane::query_plan::compile_bound(
+            let executable = control_plane::query_plan::compile_bound_mapped(
                 "fixture".into(), query.into(), &node,
                 control_plane::query_plan::InstantExecution {
                     lookback_ms: 300_000, full_history: false, cumulative_readout: false,
                 },
                 control_plane::query_plan::FallbackPolicy::Reject,
                 |_, _| panic!("exact fallback must not request summary materializations"),
-            ).unwrap();
+             |_, _| {}).unwrap();
             assert!(matches!(executable.nodes[&executable.root],
                 control_plane::query_plan::QueryPlanNode::ExactFallback { .. }));
             assert!(executable.materialization_bindings().is_empty());

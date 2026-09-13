@@ -12,8 +12,6 @@ use std::time::Duration;
 
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryNode};
 
-use crate::types_v2::BindingName;
-
 /// Backend-local wrapper around the Planner-owned post-ASAP tree.
 ///
 /// It adds only named sharing required during physical placement and emission.
@@ -31,7 +29,7 @@ pub enum PostAsapPlan {
     /// shared by two `SummaryEstimate` parents reading different quantiles.
     LetBinding {
         /// Binding name; must be unique within the surrounding scope.
-        name: BindingName,
+        name: String,
         /// Bound sub-expression.
         expr: Rc<PostAsapPlan>,
         /// In-scope sub-tree — references the binding via `Ref`.
@@ -42,7 +40,7 @@ pub enum PostAsapPlan {
     /// follows the surrounding `LetBinding` chain).
     Ref {
         /// Bound name.
-        name: BindingName,
+        name: String,
     },
 }
 
@@ -168,7 +166,7 @@ mod tests {
             measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
-                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+                accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             }],
             output_names: Vec::new(),
             having: None,

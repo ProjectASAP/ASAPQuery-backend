@@ -72,6 +72,7 @@ pub async fn plan_clickhouse_sql(
     })
 }
 
+#[cfg(test)]
 pub async fn canonicalize_clickhouse_sql(
     sql: &str,
     catalog: &SqlCatalog,
