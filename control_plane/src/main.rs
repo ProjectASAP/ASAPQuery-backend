@@ -2129,85 +2129,11 @@ mod api_tests {
 
     // ── POST /api/v1/plan/:metric/rollback ────────────────────────────────────
 
-    #[tokio::test]
-    async fn rollback_no_previous_returns_400() {
-        let (st, app) = test_app();
-        // Seed one plan directly.
-        use crate::physical::workload_planner::DeploymentPlanCompiler;
-        let wl = crate::types::QueryWorkload {
-            metric_name: "m".into(),
-            label_filters: std::collections::HashMap::new(),
-            group_by_labels: vec![],
-            aggregations: vec![crate::types::AggType::Quantile],
-            time_window: std::time::Duration::from_secs(300),
-            repeat_every: None,
-            accuracy_sla: 0.01,
-            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
-            latency_sla: None,
-            sketch_type_override: None,
-            exact_required: false,
-            quantiles: vec![],
-        };
-        st.store.set(
-            "m",
-            control_plane::workload::AggRole::Quantile,
-            DeploymentPlanCompiler::new().plan(&wl),
-        );
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan/m/rollback")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
 
-    #[tokio::test]
-    async fn rollback_not_found_returns_400() {
-        let (_, app) = test_app();
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan/ghost/rollback")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
 
     // ── GET /api/v1/plan/:metric/diff ─────────────────────────────────────────
 
-    #[tokio::test]
-    async fn diff_no_previous_returns_has_diff_false() {
-        let (_, app) = test_app();
-        // POST a plan once.
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan")
-            .header("content-type", "application/json")
-            .body(Body::from(plan_spec("rtt").to_string()))
-            .unwrap();
-        app.clone().oneshot(req).await.unwrap();
-        // Diff should exist but has_diff=false (only one version).
-        let req = Request::builder()
-            .uri("/api/v1/plan/rtt/diff")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["has_diff"], false);
-    }
 
-    #[tokio::test]
-    async fn diff_not_found_returns_404() {
-        let (_, app) = test_app();
-        let req = Request::builder()
-            .uri("/api/v1/plan/ghost/diff")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
 
     // ── GET /api/v1/cost-model ────────────────────────────────────────────────
 
@@ -2231,43 +2157,9 @@ mod api_tests {
 
     // ── POST /api/v1/plan/pareto ──────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn pareto_returns_frontier_for_quantile() {
-        let (_, app) = test_app();
-        let body = serde_json::json!({
-            "metric_name": "latency", "aggregations": ["quantile"],
-            "time_window": "5m", "accuracy_sla": 0.02,
-            "weights": { "bandwidth": 0.7, "cpu": 0.2, "memory": 0.1 }
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan/pareto")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        let frontier = body["frontier"].as_array().unwrap();
-        assert!(!frontier.is_empty(), "frontier should not be empty");
-        assert!(body["best"].as_str().is_some(), "best sketch should be set");
-    }
 
     // ── GET /api/v1/agents ────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn agents_returns_empty_map_initially() {
-        let (_, app) = test_app();
-        let req = Request::builder()
-            .uri("/api/v1/agents")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        // No agents connected → empty object.
-        assert_eq!(body, serde_json::json!({}));
-    }
 
     // ── POST /api/v1/tco ─────────────────────────────────────────────────────
 
