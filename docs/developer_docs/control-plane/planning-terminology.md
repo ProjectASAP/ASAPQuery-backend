@@ -22,6 +22,7 @@ flowchart TB
         INPUT["BackendLocalPlanningInput<br/>Workload demand + physical inputs + deployment context"]
         LOGICAL["ASAPPlanner + selection adapter<br/>Legal semantic DAG selection"]
         REQUEST["PhysicalCompilationRequest<br/>QueryCompilationInput + enabled materialization keys"]
+        WINDOWS["Generate window candidates<br/>Cadence + evaluation phase + WindowCostModel"]
         COMPILE["PhysicalPlanCompiler<br/>Compile concrete candidate plans"]
         MANIFEST["WorkloadCostManifest<br/>Component implementations and pricing basis"]
         QUOTE["WorkloadQuote<br/>Provider feasibility and component prices"]
@@ -29,11 +30,11 @@ flowchart TB
         SQL["ClickHouse SQL selection and binding<br/>Separate compilation path"]
         PUBLICATION["PhysicalPlanPublication<br/>PhysicalPlanInstallRequest"]
         WORKLOAD --> INPUT
-        INPUT --> LOGICAL --> REQUEST --> COMPILE --> MANIFEST
+        INPUT --> LOGICAL --> REQUEST --> WINDOWS --> COMPILE --> MANIFEST
         MANIFEST --> QUOTE --> EVALUATE --> PUBLICATION
         SQL --> PUBLICATION
     end
-    CONTRACT["Shared asap_types contracts<br/>SummaryCatalog + CollectorPlan + PrecomputePlan<br/>TransmissionPlan + QueryPlan"]
+    CONTRACT["Shared asap_types contracts<br/>SummaryCatalog + CollectorPlan + PrecomputePlan<br/>TransmissionPlan + QueryPlan + StorageRouting"]
     subgraph DP[Data plane]
         STAGE["Validate and stage RuntimePhysicalPlan"]
         ACTIVE["Activate via ActivePhysicalPlanHandle<br/>One immutable generation for all readers"]
@@ -160,3 +161,14 @@ Both field-only and string requests bind from the registered canonical expressio
 Explicit typed accuracy, including epsilon and delta, remains authoritative;
 sketch choices remain physical constraints subject to legal binding. IDs and
 routing hints are retained as registration metadata.
+
+## Latest main integration
+
+Window candidates are generated after semantic DAG selection from cadence, evaluation
+phase and `WindowCostModel` quotes. Compiler provenance stays on each candidate
+(`derived` / `cohort_only`) and is not accepted from serialized input. The old
+external candidate/default-window fields and query-level provenance set are removed
+by upstream #712. Shared panes preserve cadence, phase and evaluation alignment.
+Publication includes storage routing derived from the selected physical plan (#713).
+The former `types_v2` definitions now live in `types` (#717). These upstream API
+removals also apply here; wire-name compatibility covers retained naming-only fields.

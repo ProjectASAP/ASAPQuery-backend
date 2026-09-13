@@ -245,14 +245,6 @@ impl OpampServer {
         }
     }
 
-    /// Broadcasts a config to every connected agent regardless of role.
-    pub async fn push_all(&self, cfg: RemoteConfig) {
-        let ids: Vec<String> = self.agents.read().await.keys().cloned().collect();
-        for id in ids {
-            self.push(&id, cfg.clone()).await;
-        }
-    }
-
     /// Broadcasts a config only to agents matching the given role.
     pub async fn push_to_role(&self, role: AgentRole, cfg: RemoteConfig) {
         let ids: Vec<String> = self

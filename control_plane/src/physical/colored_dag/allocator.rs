@@ -45,7 +45,6 @@ use crate::physical::colored_dag::dag::{ColoredDag, ColoredNode, NodeId};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::physical::post_asap::deployment_expr::PostAsapPlan;
 use crate::physical::post_asap::PhysicalExpr;
-use crate::types_v2::BindingName;
 
 /// Errors surfaced by [`StageAllocator::allocate`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -343,17 +342,6 @@ impl ThreeStageWalker {
     }
 }
 
-// Convenience helper used by tests / external callers that only need a
-// stage lookup keyed by binding name.
-pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<StageId> {
-    dag.nodes.iter().find_map(|n| match &n.expr {
-        PhysicalExpr::Committed(PostAsapPlan::LetBinding { name: n2, .. }) if n2 == name => {
-            Some(n.stage)
-        }
-        _ => None,
-    })
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -417,7 +405,7 @@ mod tests {
             measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
-                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+                accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             }],
             output_names: Vec::new(),
             having: None,

@@ -49,6 +49,7 @@ impl KeyByLabelValues {
         self.labels.join(";")
     }
 
+    #[cfg(test)]
     /// Decode a semicolon-joined string back into a KeyByLabelValues.
     pub fn from_semicolon_str(s: &str) -> Self {
         Self {

@@ -61,6 +61,16 @@ impl PhysicalPlanPublication {
                     .get(&binding.materialization.fingerprint())
                     .copied()
                     .ok_or("query binding has no precompute materialization")?;
+                let full_slide = matches!(
+                    config.window_layout,
+                    crate::WindowMaterializationLayout::FullWindow
+                )
+                .then_some(config.slide_interval.saturating_mul(1_000));
+                if binding.full_window_slide_ms != full_slide {
+                    return Err(
+                        "query full-window cadence differs from precompute definition".into(),
+                    );
+                }
                 if config.stored_window_ms() != binding.window_ms {
                     return Err("query pane differs from precompute stored window".into());
                 }

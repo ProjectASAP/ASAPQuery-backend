@@ -9,10 +9,12 @@ use std::rc::Rc;
 
 use asap_aware_mapping::cost_model::Cost;
 use asap_aware_mapping::{
-    plan_summary_maintenance_lifecycles, AccuracyEvidenceProvider, CostRate, DefaultAccuracyModel,
-    EqualSplitAllocator, Horizon, PropagationStats, SummaryMaintenanceCapabilities,
-    SummaryMaintenanceLifecycleCapabilities, SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
+    plan_summary_maintenance_lifecycles, AccuracyEvidenceProvider, CostRate, Horizon,
+    PropagationStats, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCapabilities,
+    SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
 };
+#[cfg(test)]
+use asap_aware_mapping::{DefaultAccuracyModel, EqualSplitAllocator};
 use planner_types::post_asap::{
     CompositionOperator, EvaluationSchedule, ExecutableDagCompilation, OutputRepresentation,
     PostAsapNodeId, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
@@ -34,8 +36,12 @@ use crate::query_plan::{
     canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
     QueryPlan, QueryPlanEntry,
 };
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::Source;
+
+mod windows;
+pub(super) use windows::gcd;
+pub use windows::{prepare_window_implementations, WindowCostModel};
 
 pub const PLANNER_REVISION: &str = env!("ASAPPLANNER_REVISION");
 pub const BACKEND_REVISION: &str = env!("ASAPQUERY_BACKEND_REVISION");
@@ -115,6 +121,14 @@ pub struct WindowRealizationCandidate {
     pub slide_secs: u64,
     pub layout: asap_types::WindowMaterializationLayout,
     pub cost: WindowRealizationCostQuote,
+    /// Only compiler-generated quotes may be repriced after changing their layout.
+    /// Serialized input always becomes provider evidence.
+    #[serde(skip)]
+    pub derived: bool,
+    /// This offer was generated for a restricted derived-maintenance cohort,
+    /// whose cadence cannot satisfy ordinary raw-state consumers of the same W.
+    #[serde(skip)]
+    pub cohort_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -150,8 +164,6 @@ pub struct PhysicalCompilationRequest {
     /// Original dashboard demand, in the same order as queries. None is legacy input.
     pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<QueryCompilationInput>,
-    /// Compiler-owned quotes eligible for joint pane repricing; never inferred from model labels.
-    pub compiler_priced_window_query_ids: BTreeSet<String>,
     pub topk_membership_evidence_by_query_id: HashMap<String, TopKMembershipEvidence>,
     /// Fresh measured costs for Planner exact/summary composition sites,
     /// scoped to query IDs just like accuracy evidence.
@@ -226,24 +238,11 @@ pub struct BackendLocalPlanningInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPhysicalInputs {
-    /// Provider-priced concrete pane choices keyed by the registered PromQL text.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[serde(
-        rename = "window_candidates",
-        alias = "window_realization_candidates_by_query"
-    )]
-    pub window_realization_candidates_by_query: HashMap<String, Vec<WindowRealizationCandidate>>,
     pub lifecycle_costs: LifecycleUnitCosts,
     pub evidence_observed_at_unix_ms: u64,
     pub evidence_valid_for_ms: u64,
     pub horizon_seconds: f64,
-    #[serde(
-        rename = "window_implementation_id",
-        alias = "default_window_realization_id"
-    )]
-    pub default_window_realization_id: String,
-    #[serde(rename = "implementation_cost", alias = "default_window_cost_quote")]
-    pub default_window_cost_quote: WindowRealizationCostQuote,
+    pub window_cost_model: WindowCostModel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sample_interval_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
@@ -294,6 +293,7 @@ pub use asap_types::producer_plan::{
     TransmissionPlan, TransmissionPlanError, TransmissionRule,
 };
 
+#[cfg(test)]
 /// Build the fixed physical knob from the controller's canonical
 /// epsilon-floor allocator. Degenerate budgets/rates disable sampling.
 pub fn sampling_policy_from_accuracy_budget(
@@ -319,6 +319,7 @@ pub fn sampling_policy_from_accuracy_budget(
     }
 }
 
+#[cfg(test)]
 /// Allocate the deterministic staleness share with the same linear-peel
 /// composition used by `epsilon_alloc`. `None` means the selected sketch
 /// already consumes the budget or communication has no allocated weight.
@@ -428,6 +429,11 @@ pub struct CompiledPhysicalPlan {
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
     pub query_plan: QueryPlan,
+    /// Backend storage-routing table for the metrics this plan materializes.
+    /// Published alongside the plan so the query-shape → engine split always
+    /// describes the generation that is actually installed; without it the
+    /// backend falls back to its default engine and archive-shape queries miss.
+    pub storage_routing: serde_json::Value,
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
     pub cost_comparison: Option<super::workload_cost::CandidatePlanSelectionReport>,
@@ -575,17 +581,6 @@ impl BackendLocalPlanningInput {
                 "QueryWorkload must contain at least one query".into(),
             ));
         }
-        for query in self
-            .physical_inputs
-            .window_realization_candidates_by_query
-            .keys()
-        {
-            if !entries.iter().any(|entry| &entry.query.0 == query) {
-                return Err(CompileError::Snapshot(format!(
-                    "window candidates reference unregistered query `{query}`"
-                )));
-            }
-        }
         let mut queries = Vec::with_capacity(entries.len());
         let mut canonical_roots = Vec::with_capacity(entries.len());
         let mut topk_evidence_by_id = HashMap::new();
@@ -630,14 +625,9 @@ impl BackendLocalPlanningInput {
                 horizon_seconds: self.physical_inputs.horizon_seconds,
                 costs: self.physical_inputs.lifecycle_costs.clone(),
             };
-            let derived_lifecycle = lifecycle.clone();
             let post_asap = crate::planner_selection::keep_pre_asap(&parsed)
                 .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             canonical_roots.push(Rc::new(parsed));
-            let mut cost = self.physical_inputs.default_window_cost_quote.clone();
-            cost.workload_fingerprint =
-                canonical_promql(&query_string).map_err(CompileError::QueryPlan)?;
-            cost.horizon_seconds = self.physical_inputs.horizon_seconds;
             let query_id = format!("compat-query-{index}");
             if let Some(evidence) = self.physical_inputs.topk_evidence.get(&query_string) {
                 topk_evidence_by_id.insert(query_id.clone(), evidence.clone());
@@ -653,22 +643,7 @@ impl BackendLocalPlanningInput {
                 group_by_labels: metadata.group_by_labels,
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
-                window_realization_candidates: self
-                    .physical_inputs
-                    .window_realization_candidates_by_query
-                    .get(&query_string)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        derived_window_candidates(
-                            &self.physical_inputs.default_window_realization_id,
-                            canonical_roots.last().expect("root pushed above"),
-                            lookback_ms,
-                            evaluation_interval_ms,
-                            cost,
-                            &derived_lifecycle,
-                            self.physical_inputs.query_retention_margin_ms,
-                        )
-                    }),
+                window_realization_candidates: Vec::new(),
                 materialization_runtime_policy: RuntimeRulePolicy::default(),
             });
         }
@@ -700,64 +675,13 @@ impl BackendLocalPlanningInput {
             &exact_costs_by_id,
             self.physical_inputs.erp.as_ref(),
         )?;
-        // Derived maintenance currently consumes full, non-overlapping source cohorts.
-        // Restrict only synthesized candidates; deployment-supplied evidence is authoritative.
         for query in &mut queries {
-            if self
-                .physical_inputs
-                .window_realization_candidates_by_query
-                .contains_key(&query.query_string)
-            {
-                continue;
-            }
-            let states = collect_selected_materializations(&query.selected_plan_root, true)
-                .map_err(|reason| CompileError::Query {
-                    query_id: query.query_id.clone(),
-                    reason,
-                })?;
-            let mut full_windows = BTreeSet::new();
-            for state in &states {
-                if let Some(sources) = immutable_materialization_sources(&state.node) {
-                    full_windows.insert(state.window_secs.unwrap_or(query.query_lookback_seconds));
-                    for source in sources {
-                        let (_, window, _) =
-                            selected_input_contract(&source).map_err(|reason| {
-                                CompileError::Query {
-                                    query_id: query.query_id.clone(),
-                                    reason,
-                                }
-                            })?;
-                        full_windows.insert(window.unwrap_or(query.query_lookback_seconds));
-                    }
-                }
-            }
-            let mut seen = BTreeSet::new();
-            query.window_realization_candidates.retain_mut(|candidate| {
-                if !full_windows.contains(&candidate.window_secs) {
-                    return true;
-                }
-                if !seen.insert(candidate.window_secs) {
-                    return false;
-                }
-                candidate.slide_secs = candidate.window_secs;
-                candidate.framework = SummaryWindowFramework::Tumbling;
-                candidate.layout = asap_types::WindowMaterializationLayout::Pane {
-                    pane_secs: candidate.window_secs,
-                };
-                candidate.realization_id = format!(
-                    "{}-{}s-derived-cohort",
-                    self.physical_inputs.default_window_realization_id, candidate.window_secs
-                );
-                candidate.cost = derived_window_cost(
-                    &candidate.cost,
-                    &query.summary_lifecycle_inputs,
-                    candidate.window_secs,
-                    candidate.slide_secs,
-                    &candidate.layout,
-                    self.physical_inputs.query_retention_margin_ms,
-                );
-                true
-            });
+            prepare_window_implementations(
+                query,
+                &self.physical_inputs.window_cost_model,
+                self.environment.target,
+                self.physical_inputs.query_retention_margin_ms,
+            )?;
         }
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
@@ -766,16 +690,6 @@ impl BackendLocalPlanningInput {
                 allow_mixed_summary_and_exact_execution: true,
                 enabled_materialization_keys: None,
                 query_workload: Some(workload),
-                compiler_priced_window_query_ids: queries
-                    .iter()
-                    .filter(|q| {
-                        !self
-                            .physical_inputs
-                            .window_realization_candidates_by_query
-                            .contains_key(&q.query_string)
-                    })
-                    .map(|q| q.query_id.clone())
-                    .collect(),
                 queries,
                 topk_membership_evidence_by_query_id: topk_evidence_by_id,
                 exact_composition_costs: exact_costs_by_id,
@@ -1097,6 +1011,12 @@ impl PhysicalPlanCompiler {
         )?;
         let mut lifecycle_estimates =
             BTreeMap::<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>::new();
+        // Per-metric sketch families this cycle materializes. The storage-routing
+        // classifier turns them into the warm/archive shape split, so routing is
+        // derived from the same decisions that produced the materializations
+        // rather than from a separately maintained table.
+        let mut routed_algorithms =
+            BTreeMap::<String, Vec<planner_types::post_asap::SketchAlgorithm>>::new();
 
         for (query_index, query) in request.queries.iter().enumerate() {
             let evidence = request
@@ -1224,6 +1144,7 @@ impl PhysicalPlanCompiler {
                     }
                 }
             }
+            let cohort_nodes = windows::cohort_nodes(&selected);
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let mut branch_query = query.clone();
                 branch_query.query_lookback_seconds =
@@ -1236,6 +1157,11 @@ impl PhysicalPlanCompiler {
                     .window_realization_candidates
                     .retain(|candidate| {
                         candidate.window_secs == branch_query.query_lookback_seconds
+                            && if cohort_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
+                                windows::is_full_cohort(candidate)
+                            } else {
+                                !candidate.cohort_only
+                            }
                     });
                 let query = &branch_query;
                 let lifecycle_costs = SummaryMaintenanceLifecycleCostInputs {
@@ -1283,10 +1209,51 @@ impl PhysicalPlanCompiler {
                     aggregation_id.clone(),
                     environment.target,
                 );
+                if let SummaryFamilyType::Sketch(kind, _) = &aggregation.family {
+                    routed_algorithms
+                        .entry(aggregation.metric_name.clone())
+                        .or_default()
+                        .push(kind.algorithm().clone());
+                }
                 let precompute_materialization =
                     scoped_materialization(&aggregation, &selected.node)?;
                 let materialization = precompute_materialization.policy_fingerprint();
-                let state_consumers = consumers[&materialization]
+                let consumer_indices = consumers[&materialization]
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        let Some(workload) = &request.query_workload else {
+                            return true;
+                        };
+                        let other = &request.queries[index];
+                        if other.summary_lifecycle_inputs.evaluation_interval_ms
+                            != query.summary_lifecycle_inputs.evaluation_interval_ms
+                        {
+                            return false;
+                        }
+                        let phases = workload
+                            .entries()
+                            .map(|entry| match entry.recurrence {
+                                QueryRecurrence::Repeated(RepeatedDemand::FixedIntervalAt {
+                                    evaluation_phase,
+                                    ..
+                                }) => Some(evaluation_phase.0),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        match (phases[query_index], phases[index]) {
+                            (Some(a), Some(b)) => {
+                                let cadence = u64::from(
+                                    query.summary_lifecycle_inputs.evaluation_interval_ms,
+                                );
+                                let window = query.query_lookback_seconds.saturating_mul(1_000);
+                                a % cadence == b % cadence && a % window == b % window
+                            }
+                            _ => index == query_index,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let state_consumers = consumer_indices
                     .iter()
                     .map(|index| &request.queries[*index])
                     .collect::<Vec<_>>();
@@ -1296,12 +1263,10 @@ impl PhysicalPlanCompiler {
                     &model,
                     &environment,
                     &state_consumers,
-                    request.query_workload.as_ref().map(|workload| {
-                        (
-                            workload,
-                            consumers[&materialization].iter().copied().collect(),
-                        )
-                    }),
+                    request
+                        .query_workload
+                        .as_ref()
+                        .map(|workload| (workload, consumer_indices.clone())),
                 )?;
                 let window_implementation = query.window_realization_candidates.iter()
                     .find(|candidate| candidate.realization_id == planner_selection.window_realization_id
@@ -1339,13 +1304,25 @@ impl PhysicalPlanCompiler {
                 .saturating_mul(1_000);
                 runtime_materialization.pane_origin_ms = shared_pane_origin_ms(
                     request.query_workload.as_ref(),
-                    consumers[&materialization].iter().copied(),
+                    [query_index],
                     pane_width_ms,
                 )
                 .map_err(|reason| CompileError::Query {
                     query_id: query.query_id.clone(),
                     reason,
                 })?;
+                if matches!(
+                    window_implementation.layout,
+                    asap_types::WindowMaterializationLayout::FullWindow
+                ) {
+                    runtime_materialization.pane_origin_ms =
+                        runtime_materialization.pane_origin_ms.map(|end_phase| {
+                            (i128::from(end_phase)
+                                - i128::from(window_implementation.window_secs) * 1_000)
+                                .rem_euclid(i128::from(pane_width_ms))
+                                as i64
+                        });
+                }
                 if let Some(source) = immutable_materialization_sources(&selected.node) {
                     if environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite {
                         return Err(CompileError::Query {
@@ -1663,6 +1640,8 @@ impl PhysicalPlanCompiler {
                         )));
                     }
                     Ok(MaterializationBinding {
+                        full_window_slide_ms: matches!(materialization.window_layout, asap_types::WindowMaterializationLayout::FullWindow)
+                            .then_some(materialization.slide_interval.saturating_mul(1_000)),
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
                         output_grouping: PhysicalGrouping::Reduce(
@@ -1918,6 +1897,10 @@ impl PhysicalPlanCompiler {
                 })?;
         }
         query_plan.validate_against_catalog(&summary_catalog)?;
+        let storage_routing = crate::emit::stage_config::storage_routing_document(
+            crate::emit::stage_config::DEFAULT_TENANT,
+            &routed_algorithms.into_iter().collect::<Vec<_>>(),
+        );
         Ok(CompiledPhysicalPlan {
             envelope,
             summary_catalog,
@@ -1925,6 +1908,7 @@ impl PhysicalPlanCompiler {
             precompute_plan,
             transmission_plan,
             query_plan,
+            storage_routing,
             lifecycle_estimates: lifecycle_estimates.into_values().collect(),
             cost_comparison: None,
             planner_selection_trace: request.planner_selection_trace,
@@ -2253,6 +2237,7 @@ fn requires_exact_erp_fallback(
     })
 }
 
+#[cfg(test)]
 /// Planner-adapter selection step used before physical compilation. Keeping
 /// this separate makes the ownership boundary explicit: callers supply the
 /// selected post-ASAP DAG to [`PhysicalPlanCompiler::compile`].
@@ -2357,7 +2342,8 @@ fn validate_lifecycle_input(
 /// - **update fanout**: this is the layout's whole point (`worker.rs`'s
 ///   `stores_full_windows` branch). A pane takes each sample exactly once; a
 ///   full window takes it into every overlapping window that contains it,
-///   `ceil(W / S)` of them. Charged at the supplied ingestion rate.
+///   averaging `W / S` under the supplied stationary ingestion-rate model.
+///   The maximum simultaneously open count is separately charged as residency.
 /// - **finalizations per read**: the mirror image. A full window is read
 ///   whole; `W / P` panes are composed into one answer. Charged at the
 ///   query's own evaluation cadence.
@@ -2385,9 +2371,7 @@ pub(super) fn derived_window_cost(
     let window = window_secs.max(1) as f64;
     let slide = slide_secs.max(1) as f64;
     let (seal_interval, update_fanout, finalizations_per_read) = match layout {
-        asap_types::WindowMaterializationLayout::FullWindow => {
-            (slide, (window / slide).ceil(), 1.0)
-        }
+        asap_types::WindowMaterializationLayout::FullWindow => (slide, window / slide, 1.0),
         asap_types::WindowMaterializationLayout::Pane { pane_secs } => {
             let pane = (*pane_secs).max(1) as f64;
             (pane, 1.0, (window / pane).ceil())
@@ -2440,6 +2424,7 @@ pub(super) fn derived_window_cost(
 /// has two, and each one becomes its own materialization with its own window.
 /// `time_selection.lookback` is the workload's declared range and is not
 /// required to equal any of them.
+#[cfg(test)]
 fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
     fn visit(expr: &QueryExpr, windows: &mut BTreeSet<u64>) {
         if let QueryExpr::TimeRange { range, .. } = expr {
@@ -2485,6 +2470,7 @@ fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
 /// Explicit snapshot candidates bypass this path. After logical selection,
 /// derived maintenance cohorts are restricted to their supported full windows;
 /// raw additive pane producers may subsequently be shared by Planner.
+#[cfg(test)]
 fn derived_window_candidates(
     implementation_id: &str,
     expr: &QueryExpr,
@@ -2498,74 +2484,23 @@ fn derived_window_candidates(
     if windows.is_empty() {
         windows.insert(lookback_ms / 1_000);
     }
-    // `window_realization_id` reaches lifecycle estimates and cost
-    // manifests, so one label must not describe several shapes. A query with a
-    // single window keeps the snapshot's identity untouched.
-    let distinct = windows.len() > 1;
+    let mut lifecycle = lifecycle.clone();
+    lifecycle.evaluation_interval_ms = evaluation_interval_ms;
     windows
         .into_iter()
-        .flat_map(|window_secs| {
-            let evaluation_secs = u64::from(evaluation_interval_ms) / 1_000;
-            let advances_within_window = evaluation_secs != 0
-                && evaluation_secs < window_secs
-                && window_secs.is_multiple_of(evaluation_secs);
-            let slide_secs = if advances_within_window {
-                evaluation_secs
-            } else {
-                window_secs
-            };
-            let window_label = if distinct {
-                format!("{implementation_id}-{window_secs}s")
-            } else {
-                implementation_id.to_string()
-            };
-            // `Tumbling` pairs only with `Pane` in the validator's
-            // framework/layout table, so a non-sliding shape has no
-            // alternative to rank against and keeps its label unchanged.
-            let layouts: Vec<(String, asap_types::WindowMaterializationLayout)> =
-                if advances_within_window {
-                    vec![
-                        (
-                            format!("{window_label}-pane-{slide_secs}s"),
-                            asap_types::WindowMaterializationLayout::Pane {
-                                pane_secs: slide_secs,
-                            },
-                        ),
-                        (
-                            format!("{window_label}-full-window"),
-                            asap_types::WindowMaterializationLayout::FullWindow,
-                        ),
-                    ]
-                } else {
-                    vec![(
-                        window_label,
-                        asap_types::WindowMaterializationLayout::Pane {
-                            pane_secs: slide_secs,
-                        },
-                    )]
-                };
-            layouts
-                .into_iter()
-                .map(|(id, layout)| WindowRealizationCandidate {
-                    realization_id: id,
-                    framework: if advances_within_window {
-                        SummaryWindowFramework::Sliding
-                    } else {
-                        SummaryWindowFramework::Tumbling
-                    },
-                    window_secs,
-                    slide_secs,
-                    cost: derived_window_cost(
-                        &cost,
-                        lifecycle,
-                        window_secs,
-                        slide_secs,
-                        &layout,
-                        staleness_margin_ms,
-                    ),
-                    layout,
-                })
-                .collect::<Vec<_>>()
+        .flat_map(|window| {
+            windows::derive(
+                &WindowCostModel {
+                    implementation_id: implementation_id.into(),
+                    cost: cost.clone(),
+                    quotes: Vec::new(),
+                },
+                &lifecycle,
+                window,
+                false,
+                PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+                staleness_margin_ms,
+            )
         })
         .collect()
 }
@@ -2600,30 +2535,7 @@ pub(super) fn validate_window_implementations(
                 .layout
                 .validate(candidate.window_secs, candidate.slide_secs)
                 .is_ok()
-            && match (&candidate.framework, &candidate.layout) {
-                (
-                    SummaryWindowFramework::Tumbling | SummaryWindowFramework::Sliding,
-                    asap_types::WindowMaterializationLayout::Pane { .. },
-                )
-                | (
-                    SummaryWindowFramework::Sliding,
-                    asap_types::WindowMaterializationLayout::FullWindow,
-                ) => true,
-                (
-                    SummaryWindowFramework::Extension(name),
-                    asap_types::WindowMaterializationLayout::HierarchicalRollup { .. },
-                ) => name == "backend.exact-hierarchical-rollup.v1",
-                _ => false,
-            }
-            && match environment.target {
-                PhysicalDeploymentTarget::DistributedCollectors => {
-                    matches!(
-                        candidate.layout,
-                        asap_types::WindowMaterializationLayout::FullWindow
-                    ) || matches!(candidate.layout, asap_types::WindowMaterializationLayout::Pane { pane_secs } if pane_secs == candidate.window_secs)
-                }
-                PhysicalDeploymentTarget::BackendLocalRemoteWrite => true,
-            };
+            && windows::supported(candidate, environment.target);
         if !valid {
             return Err(CompileError::Lifecycle {
                 query_id: query.query_id.clone(),
@@ -2846,11 +2758,21 @@ fn select_lifecycle(
             ..DataWorkload::default()
         }),
     };
-    let (workload, indices) =
-        original_workload.unwrap_or((&workload, (0..consumers.len()).collect()));
+    let (workload, indices) = match original_workload {
+        Some((original, indices)) => {
+            let mut original = original.clone();
+            // HTTP demand carries phases and requirements; its per-state source
+            // evidence comes from the same lifecycle input as window pricing.
+            if original.data_workload.is_none() {
+                original.data_workload = workload.data_workload;
+            }
+            (original, indices)
+        }
+        None => (workload, (0..consumers.len()).collect()),
+    };
     let plan = plan_summary_maintenance_lifecycles(
         Rc::new(node.clone()),
-        WorkloadDemand::new(workload, &indices),
+        WorkloadDemand::new(&workload, &indices),
         environment.observed_at_unix_ms,
         Some(Horizon(query.summary_lifecycle_inputs.horizon_seconds)),
         SummaryMaintenanceLifecycleCapabilities {
@@ -3655,7 +3577,7 @@ impl QueryFrontend {
     pub fn parse(
         self,
         query: &str,
-        accuracy: crate::types_v2::AccuracyTarget,
+        accuracy: crate::types::AccuracyTarget,
     ) -> Result<planner_types::pre_asap::QueryExpr, String> {
         crate::query_parser::parse_query_expr_canonical(query, accuracy).map_err(|error| match self
         {
@@ -3706,6 +3628,43 @@ pub use select_logical_roots_with_trace as select_workload_roots_with_trace;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // Every metric the plan materializes must carry a routing entry, or the
+    // backend falls through to its default engine and archive-shape queries
+    // miss. Publication passes this document straight to the data plane.
+    #[test]
+    fn compiled_plan_routes_every_materialized_metric() {
+        let plan = quoted_snapshot(planning_snapshot(), QueryFrontend::PromQl)
+            .compile_promql()
+            .unwrap();
+        let routing = &plan.storage_routing;
+        assert_eq!(routing["default_engine"], "asap_query");
+        let routed: std::collections::BTreeSet<String> = routing["metrics"]
+            .as_array()
+            .expect("routing document carries a metrics array")
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !routed.is_empty(),
+            "a plan with materializations emitted an empty routing table: {routing}"
+        );
+        // Archive-shape claims are what the default engine cannot serve; a
+        // routing entry without them would silently widen the warm tier.
+        for entry in routing["metrics"].as_array().unwrap() {
+            let engines: Vec<&str> = entry["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["engine"].as_str().unwrap())
+                .collect();
+            assert!(
+                engines.contains(&"asap_query"),
+                "metric {} lost its warm target: {entry}",
+                entry["name"]
+            );
+        }
+    }
 
     // Complete deployment quotes must preserve one producer with two window readouts.
     #[test]
@@ -4322,7 +4281,6 @@ pub(crate) mod tests {
         }
         Ok(PhysicalCompilationRequest {
             planner_selection_trace: Vec::new(),
-            compiler_priced_window_query_ids: BTreeSet::new(),
             allow_mixed_summary_and_exact_execution: false,
             enabled_materialization_keys: None,
             query_workload: None,
@@ -4336,6 +4294,8 @@ pub(crate) mod tests {
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
                 window_realization_candidates: vec![WindowRealizationCandidate {
+                    derived: false,
+                    cohort_only: false,
                     realization_id: "collector-tumbling-v1".into(),
                     framework: SummaryWindowFramework::Tumbling,
                     window_secs: 60,
@@ -5553,12 +5513,87 @@ pub(crate) mod tests {
         }
     }
 
+    // A derived cohort must not impose its maintenance cadence on an unrelated raw leaf at the same W.
+    #[test]
+    fn raw_leaf_keeps_its_cadence_beside_a_same_window_derived_cohort() {
+        let mut snapshot = planning_snapshot();
+        let model = snapshot.physical_inputs.window_cost_model.clone();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("quantile(0.9, sum_over_time(m[1m]))".into());
+        entry.demand = RepeatedDemand::FixedIntervalAt {
+            interval: RepetitionInterval(45_000),
+            evaluation_phase: planner_types::workload::TimestampMs(0),
+        };
+        let mut right = snapshot.clone();
+        right.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum_over_time(n[1m])".into());
+        let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+        let (right, _) = right.into_physical_compilation_request().unwrap();
+        let left = request.queries[0].selected_plan_root.clone();
+        let right = right.queries[0].selected_plan_root.clone();
+        let right = Rc::new(SummaryNode {
+            expr: SummaryExpr::ValueOperation {
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                child: right.clone(),
+            },
+            schema: right.schema.clone(),
+            guarantee: None,
+        });
+        request.queries[0].selected_plan_root = Rc::new(SummaryNode {
+            expr: SummaryExpr::BinaryOp {
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                lhs: left.clone(),
+                rhs: right,
+                operator: planner_types::post_asap::BinaryOperator {
+                    kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
+                        planner_types::pre_asap::ArithmeticOpKind::Add,
+                    ),
+                    vector_match: None,
+                },
+            },
+            schema: left.schema.clone(),
+            guarantee: None,
+        });
+        let text = "quantile(0.9, sum_over_time(m[1m])) + sum_over_time(n[1m])";
+        request.queries[0].query_string = text.into();
+        request
+            .query_workload
+            .as_mut()
+            .unwrap()
+            .repeating_queries
+            .as_mut()
+            .unwrap()[0]
+            .query = Query(text.into());
+        prepare_window_implementations(&mut request.queries[0], &model, env.target, 0).unwrap();
+        request.queries[0]
+            .window_realization_candidates
+            .retain(|candidate| {
+                matches!(
+                    candidate.layout,
+                    asap_types::WindowMaterializationLayout::Pane { .. }
+                )
+            });
+        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        assert!(plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .any(|m| m.derived_input.is_some()));
+        let raw = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|m| m.metric == "n")
+            .unwrap();
+        assert_eq!(raw.slide_interval, 45);
+        assert_eq!(raw.window_layout.base_pane_secs(), 15);
+    }
+
     // A full-window producer keeps overlapping accumulators alive even before publication.
     #[test]
     fn derived_window_regression_resident_cost() {
-        let template = planning_snapshot()
-            .physical_inputs
-            .default_window_cost_quote;
+        let template = planning_snapshot().physical_inputs.window_cost_model.cost;
         let mut lifecycle = planning_lifecycle();
         lifecycle.costs = LifecycleUnitCosts {
             build: 0.0,
@@ -5678,15 +5713,13 @@ pub(crate) mod tests {
             .clone()
             .into_physical_compilation_request()
             .unwrap();
-        snapshot
-            .physical_inputs
-            .window_realization_candidates_by_query
-            .insert(
-                query.into(),
-                derived.queries[0].window_realization_candidates.clone(),
-            );
+        snapshot.physical_inputs.window_cost_model.quotes =
+            derived.queries[0].window_realization_candidates.clone();
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        assert!(request.compiler_priced_window_query_ids.is_empty());
+        assert!(request.queries[0]
+            .window_realization_candidates
+            .iter()
+            .any(|c| !c.derived));
         let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
@@ -5713,9 +5746,7 @@ pub(crate) mod tests {
     // answers with results that only change once per window.
     #[test]
     fn derived_window_candidate_follows_the_evaluation_cadence() {
-        let cost = planning_snapshot()
-            .physical_inputs
-            .default_window_cost_quote;
+        let cost = planning_snapshot().physical_inputs.window_cost_model.cost;
         let expr = crate::query_parser::parse_query_expr_canonical(
             "quantile_over_time(0.5, data[5m])",
             AccuracyTarget::Exact,
@@ -5732,11 +5763,11 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (
-                    "id-pane-30s",
+                    "id-300s-slide-30s-pane-30s",
                     asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 }
                 ),
                 (
-                    "id-full-window",
+                    "id-300s-slide-30s-full-window",
                     asap_types::WindowMaterializationLayout::FullWindow
                 ),
             ]
@@ -5758,9 +5789,7 @@ pub(crate) mod tests {
     // not the magnitudes.
     #[test]
     fn derived_window_layout_prices_write_against_read_amplification() {
-        let cost = planning_snapshot()
-            .physical_inputs
-            .default_window_cost_quote;
+        let cost = planning_snapshot().physical_inputs.window_cost_model.cost;
         let expr = crate::query_parser::parse_query_expr_canonical(
             "quantile_over_time(0.5, data[5m])",
             AccuracyTarget::Exact,
@@ -5808,9 +5837,7 @@ pub(crate) mod tests {
     // framework/layout table, so there is no alternative to price against it.
     #[test]
     fn tumbling_shapes_have_no_layout_alternative_to_rank() {
-        let cost = planning_snapshot()
-            .physical_inputs
-            .default_window_cost_quote;
+        let cost = planning_snapshot().physical_inputs.window_cost_model.cost;
         let expr = crate::query_parser::parse_query_expr_canonical(
             "quantile_over_time(0.5, data[5m])",
             AccuracyTarget::Exact,
@@ -5826,7 +5853,7 @@ pub(crate) mod tests {
             0,
         );
         assert_eq!(derived.len(), 1);
-        assert_eq!(derived[0].realization_id, "id");
+        assert_eq!(derived[0].realization_id, "id-300s-slide-300s-pane-300s");
         assert_eq!(derived[0].framework, SummaryWindowFramework::Tumbling);
     }
 
@@ -5836,9 +5863,7 @@ pub(crate) mod tests {
     fn derived_window_candidate_shapes_are_accepted_by_validation() {
         let snapshot = planning_snapshot();
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        let cost = planning_snapshot()
-            .physical_inputs
-            .default_window_cost_quote;
+        let cost = planning_snapshot().physical_inputs.window_cost_model.cost;
         for (lookback_ms, evaluation_ms) in [
             (300_000, 30_000),
             (300_000, 300_000),
@@ -5867,82 +5892,231 @@ pub(crate) mod tests {
         }
     }
 
-    // A cadence that cannot divide the window has no pane width dividing both,
-    // and one at or above the window has nothing to slide within. Both keep the
-    // previous tumbling shape rather than emitting something unschedulable.
+    // Compilation keeps the demand grid while publishing independently sized panes or full windows.
     #[test]
-    fn derived_window_candidate_stays_tumbling_without_a_dividing_cadence() {
-        let cost = planning_snapshot()
-            .physical_inputs
-            .default_window_cost_quote;
-        let expr = crate::query_parser::parse_query_expr_canonical(
-            "quantile_over_time(0.5, data[5m])",
-            AccuracyTarget::Exact,
-        )
-        .unwrap();
-        for evaluation_ms in [300_000, 450_000, 45_000, 0] {
-            let derived = derived_window_candidates(
-                "id",
-                &expr,
-                300_000,
-                evaluation_ms,
-                cost.clone(),
-                &planning_lifecycle(),
-                0,
-            );
-            let candidate = &derived[0];
-            assert_eq!(
-                (
-                    candidate.framework.clone(),
-                    candidate.slide_secs,
-                    candidate.layout.clone()
-                ),
-                (
-                    SummaryWindowFramework::Tumbling,
-                    300,
-                    asap_types::WindowMaterializationLayout::Pane { pane_secs: 300 }
-                ),
-                "cadence {evaluation_ms}"
-            );
+    fn scheduled_window_layouts_preserve_cadence_phase_and_readout() {
+        for (evaluation, pane) in [(20, 20), (45, 15), (60, 60), (120, 60), (90, 30)] {
+            for phase in [0, 5_000] {
+                for full in [false, true] {
+                    if full && evaluation == 60 {
+                        continue;
+                    }
+                    let mut snapshot = planning_snapshot();
+                    let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+                    entry.query = Query("sum_over_time(a[1m])".into());
+                    entry.requirements.accuracy =
+                        AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+                    entry.demand = RepeatedDemand::FixedIntervalAt {
+                        interval: RepetitionInterval(evaluation * 1_000),
+                        evaluation_phase: planner_types::workload::TimestampMs(phase),
+                    };
+                    let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+                    request.queries[0]
+                        .window_realization_candidates
+                        .retain(|c| {
+                            matches!(
+                                c.layout,
+                                asap_types::WindowMaterializationLayout::FullWindow
+                            ) == full
+                        });
+                    let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+                    let config = &plan.precompute_plan.materializations[0];
+                    assert_eq!(config.slide_interval, u64::from(evaluation));
+                    assert_eq!(config.window_size, 60);
+                    assert_eq!(
+                        config.stored_window_ms(),
+                        if full { 60_000 } else { pane * 1_000 }
+                    );
+                    let entry = plan.query_plan.entries.values().next().unwrap();
+                    let binding = entry.materialization_bindings()[0];
+                    for tick in 3..6 {
+                        let end = phase + u64::from(evaluation) * 1_000 * tick;
+                        assert!(
+                            binding.covers_range(end - 60_000, end),
+                            "{evaluation} {phase} {full}"
+                        );
+                        assert!(!binding.covers_range(end - 60_000 + 1, end + 1));
+                    }
+                }
+            }
         }
     }
 
-    // Priced evidence is the evidence producer's to supply. A snapshot that
-    // carries its own candidates keeps them verbatim.
+    // Smaller common panes are selected only when saved maintenance exceeds extra merge work.
     #[test]
-    fn supplied_window_candidates_are_not_replaced_by_the_derivation() {
+    fn different_cadences_share_common_panes_only_when_cheaper() {
+        for read_cost in [0.0, 1_000_000.0] {
+            let mut snapshot = planning_snapshot();
+            snapshot.physical_inputs.lifecycle_costs.read = read_cost;
+            snapshot
+                .physical_inputs
+                .lifecycle_costs
+                .maintenance_per_update = 1.0;
+            let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+            entries[0].query = Query("sum_over_time(a[1m])".into());
+            entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            entries[0].demand = RepeatedDemand::FixedIntervalAt {
+                interval: RepetitionInterval(20_000),
+                evaluation_phase: planner_types::workload::TimestampMs(0),
+            };
+            let mut second = entries[0].clone();
+            second.query = Query("sum_over_time(a[90s])".into());
+            second.demand = RepeatedDemand::FixedIntervalAt {
+                interval: RepetitionInterval(30_000),
+                evaluation_phase: planner_types::workload::TimestampMs(0),
+            };
+            entries.push(second);
+            let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+            for query in &mut request.queries {
+                query.window_realization_candidates.retain(|c| {
+                    matches!(
+                        c.layout,
+                        asap_types::WindowMaterializationLayout::Pane { .. }
+                    )
+                });
+            }
+            let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            assert_eq!(
+                plan.precompute_plan.materializations.len(),
+                if read_cost == 0.0 { 1 } else { 2 }
+            );
+            if read_cost == 0.0 {
+                assert_eq!(
+                    plan.precompute_plan.materializations[0].stored_window_ms(),
+                    10_000
+                );
+                assert_eq!(plan.lifecycle_estimates[0].expected_reads, 25.0);
+                assert_eq!(plan.lifecycle_estimates[0].expected_updates, 30_000.0);
+            }
+        }
+    }
+
+    // An incompatible third consumer cannot disable sharing between the first two.
+    #[test]
+    fn sharing_keeps_profitable_subsets_with_other_phases_or_finer_cadences() {
+        for (third_phase, third_interval) in [(5_000, 20_000), (0, 1_000)] {
+            let mut snapshot = planning_snapshot();
+            snapshot
+                .physical_inputs
+                .lifecycle_costs
+                .maintenance_per_update = 1.0;
+            snapshot.physical_inputs.lifecycle_costs.read =
+                if third_interval == 1_000 { 100.0 } else { 0.0 };
+            let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+            let template = entries[0].clone();
+            entries.clear();
+            for (window, phase, interval) in [
+                (60, 0, 20_000),
+                (120, 0, 20_000),
+                (180, third_phase, third_interval),
+            ] {
+                let mut entry = template.clone();
+                entry.query = Query(format!("sum_over_time(a[{window}s])"));
+                entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+                entry.demand = RepeatedDemand::FixedIntervalAt {
+                    interval: RepetitionInterval(interval),
+                    evaluation_phase: planner_types::workload::TimestampMs(phase),
+                };
+                entries.push(entry);
+            }
+            let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+            for query in &mut request.queries {
+                query.window_realization_candidates.retain(|c| {
+                    matches!(
+                        c.layout,
+                        asap_types::WindowMaterializationLayout::Pane { .. }
+                    )
+                });
+            }
+            let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            assert_eq!(plan.precompute_plan.materializations.len(), 2);
+            assert!(plan
+                .lifecycle_estimates
+                .iter()
+                .any(|e| e.consumer_query_ids.len() == 2));
+        }
+    }
+
+    // A subsecond cadence cannot be rounded into a different supported query schedule.
+    #[test]
+    fn fractional_cadence_uses_native_fallback_without_truncation() {
         let mut snapshot = planning_snapshot();
-        let query_string = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0]
-            .query
-            .0
-            .clone();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("sum_over_time(a[1m])".into());
+        entry.demand = RepeatedDemand::FixedIntervalAt {
+            interval: RepetitionInterval(1_500),
+            evaluation_phase: planner_types::workload::TimestampMs(0),
+        };
+        let (request, env) = snapshot.into_physical_compilation_request().unwrap();
+        assert!(request.queries[0].window_realization_candidates.is_empty());
+        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        assert!(plan.precompute_plan.materializations.is_empty());
+    }
+
+    // Every supported cadence has panes that exactly tile each scheduled range.
+    #[test]
+    fn derived_window_candidates_cover_dividing_nondividing_and_sparse_cadences() {
         let expr = crate::query_parser::parse_query_expr_canonical(
-            "quantile_over_time(0.99, m[1m])",
+            "sum_over_time(data[1m])",
             AccuracyTarget::Exact,
         )
         .unwrap();
-        let mut supplied = derived_window_candidates(
-            "supplied",
-            &expr,
-            60_000,
-            60_000,
-            snapshot.physical_inputs.default_window_cost_quote.clone(),
-            &planning_lifecycle(),
-            0,
-        )
-        .remove(0);
-        supplied.framework = SummaryWindowFramework::Sliding;
-        supplied.slide_secs = 20;
-        supplied.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 20 };
+        for (evaluation_secs, pane_secs) in [(20, 20), (45, 15), (60, 60), (120, 60), (90, 30)] {
+            let candidates = derived_window_candidates(
+                "id",
+                &expr,
+                60_000,
+                evaluation_secs * 1_000,
+                planning_snapshot().physical_inputs.window_cost_model.cost,
+                &planning_lifecycle(),
+                0,
+            );
+            let pane = candidates
+                .iter()
+                .find(|c| {
+                    matches!(
+                        c.layout,
+                        asap_types::WindowMaterializationLayout::Pane { .. }
+                    )
+                })
+                .unwrap();
+            assert_eq!(pane.slide_secs, u64::from(evaluation_secs));
+            assert_eq!(
+                pane.layout,
+                asap_types::WindowMaterializationLayout::Pane { pane_secs }
+            );
+            assert!(pane
+                .layout
+                .validate(pane.window_secs, pane.slide_secs)
+                .is_ok());
+        }
+    }
+
+    // A measured quote replaces only the matching shape, leaving other legal layouts available.
+    #[test]
+    fn measured_window_quote_preserves_shape_and_price() {
+        let mut snapshot = planning_snapshot();
+        let (derived, _) = snapshot
+            .clone()
+            .into_physical_compilation_request()
+            .unwrap();
+        let mut quote = derived.queries[0].window_realization_candidates[0].clone();
+        quote.realization_id = "measured-pane".into();
+        quote.cost.weighted_cost = 8.0;
+        quote.derived = false;
         snapshot
             .physical_inputs
-            .window_realization_candidates_by_query
-            .insert(query_string, vec![supplied.clone()]);
+            .window_cost_model
+            .quotes
+            .push(quote.clone());
         let (request, _) = snapshot.into_physical_compilation_request().unwrap();
-        assert_eq!(
-            request.queries[0].window_realization_candidates,
-            vec![supplied]
-        );
+        assert!(request.queries[0]
+            .window_realization_candidates
+            .contains(&quote));
+        assert!(request.queries[0]
+            .window_realization_candidates
+            .iter()
+            .any(|candidate| candidate.derived));
     }
 
     // End to end: the retained-state count is derived from the pane width, so
@@ -6537,13 +6711,15 @@ pub(crate) mod tests {
             query_workload,
             data_workload,
             physical_inputs: BackendLocalPhysicalInputs {
-                window_realization_candidates_by_query: HashMap::new(),
                 lifecycle_costs: template.summary_lifecycle_inputs.costs,
                 evidence_observed_at_unix_ms: 9_500,
                 evidence_valid_for_ms: 60_000,
                 horizon_seconds: 300.0,
-                default_window_realization_id: "backend-tumbling-v1".into(),
-                default_window_cost_quote: template.window_realization_candidates[0].cost.clone(),
+                window_cost_model: WindowCostModel {
+                    implementation_id: "backend-tumbling-v1".into(),
+                    cost: template.window_realization_candidates[0].cost.clone(),
+                    quotes: Vec::new(),
+                },
                 source_sample_interval_ms: None,
                 query_retention_margin_ms: 0,
                 retained_summary_memory_budget_bytes: DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,

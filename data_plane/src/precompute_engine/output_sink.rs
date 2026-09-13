@@ -15,13 +15,6 @@ use tracing::{debug_span, warn};
 /// /metrics scrape never silently loses policy-miss drops.
 static GLOBAL_DROPPED_POLICY_MISS: AtomicU64 = AtomicU64::new(0);
 
-/// Read the process-global output-sink policy-miss drop count. Exposed
-/// so the /metrics surface can fold it in for sinks not yet wired to an
-/// `IngestObservability`.
-pub fn global_dropped_policy_miss() -> u64 {
-    GLOBAL_DROPPED_POLICY_MISS.load(Ordering::Relaxed)
-}
-
 /// Trait for emitting completed window outputs.
 pub trait OutputSink: Send + Sync {
     fn emit_batch(
@@ -91,6 +84,7 @@ impl SketchStoreSink {
         }
     }
 
+    #[cfg(test)]
     /// CQ-6 — attach a shared `IngestObservability` so this sink's
     /// policy-miss drops increment the same counter the ingest path
     /// reports. Builder-style (returns `self`) so the `new()` signature

@@ -798,19 +798,11 @@ async fn run_shared_dashboard(multi_pane: bool) {
         for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
             entry.time_selection.lookback = Some(planner_types::workload::DurationMs(10_000));
         }
-        let (request, _) = typed.clone().into_physical_compilation_request().unwrap();
-        for query in request.queries {
-            let mut candidates = query.window_realization_candidates;
-            let mut small = candidates[0].clone();
-            small.realization_id = "five-second-pane".into();
-            small.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 5 };
-            small.cost.weighted_cost = 0.0;
-            candidates[0].cost.weighted_cost = 10.0;
-            candidates.push(small);
-            typed
-                .physical_inputs
-                .window_realization_candidates_by_query
-                .insert(query.query_string, candidates);
+        for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
+            entry.demand = planner_types::workload::RepeatedDemand::FixedIntervalAt {
+                interval: planner_types::workload::RepetitionInterval(5_000),
+                evaluation_phase: planner_types::workload::TimestampMs(0),
+            };
         }
     }
     let (request, environment) = typed.clone().into_physical_compilation_request().unwrap();
@@ -859,10 +851,9 @@ async fn run_shared_dashboard(multi_pane: bool) {
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
     if multi_pane {
-        assert_eq!(
-            plan.lifecycle_estimates[0].window_realization_id,
-            "five-second-pane"
-        );
+        assert!(plan.lifecycle_estimates[0]
+            .window_realization_id
+            .contains("pane"));
         for entry in plan.query_plan.entries.values() {
             assert_eq!(entry.instant.lookback_ms, 10_000);
             assert_eq!(entry.materialization_bindings()[0].window_ms, 5_000);
@@ -1269,6 +1260,12 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
                     (base + 1_700, 60.0),
                     (base + 2_900, 5.0),
                     (base + 4_200, 15.0),
+                    // Keep both queried windows populated; missing counter
+                    // panes deliberately use exact fallback.
+                    (base + 5_500, 20.0),
+                    (base + 6_700, 30.0),
+                    (base + 7_900, 5.0),
+                    (base + 9_200, 15.0),
                 ],
             ),
             series_with_labels(
@@ -1725,8 +1722,21 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .await
         .expect("metrics body");
     assert!(metrics.contains("asap_remote_write_requests_total 4"));
-    assert!(metrics.contains("asap_remote_write_samples_total 36"));
-    assert!(metrics.contains("asap_remote_write_duplicates_total 33"));
+    let samples = |request: &WriteRequest| {
+        request
+            .timeseries
+            .iter()
+            .map(|series| series.samples.len())
+            .sum::<usize>()
+    };
+    assert!(metrics.contains(&format!(
+        "asap_remote_write_samples_total {}",
+        samples(&request) + samples(&watermark_advance)
+    )));
+    assert!(metrics.contains(&format!(
+        "asap_remote_write_duplicates_total {}",
+        samples(&request)
+    )));
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }
 

@@ -100,7 +100,7 @@ pub fn pareto_frontier(
     weights: ObjectiveWeights,
     online_store: Option<&online::OnlineMetricsStore>,
 ) -> Vec<ParetoPoint> {
-    if !matches!(workload.accuracy(), crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+    if !matches!(workload.accuracy(), crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
     {
         return Vec::new();
     }
@@ -250,7 +250,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
 
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.02),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.02),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn tight_sla_excludes_inaccurate_sketches() {
         let mut w = quantile_workload();
-        w.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.001));
+        w.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.001));
         let f = pareto_frontier(&w, &default_wc(), ObjectiveWeights::default(), None);
         for p in &f {
             assert!(

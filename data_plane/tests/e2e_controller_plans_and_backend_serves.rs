@@ -62,10 +62,17 @@ fn phase_aligned_now_ns() -> u64 {
 }
 
 async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &JsonValue) {
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
+    let mut runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
         &serde_yaml::to_value(json).unwrap(),
     )
     .unwrap();
+    // The transport payloads below contain one-second states. The legacy
+    // streaming emitter's default window is not their physical layout.
+    for config in runtime.materializations_by_policy_fingerprint.values_mut() {
+        config.window_size = 1;
+        config.slide_interval = 1;
+        config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
+    }
     let mut artifact = physical_fixture::artifact(&runtime);
     if runtime
         .materializations_by_policy_fingerprint
@@ -2358,20 +2365,7 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
 // merges them itself. The gate is gone; this SHOULD exercise the new
 // path serving the shape directly, not a fallback.
 //
-// Correction (sketch_reducer.rs retirement): that claim above wasn't
-// actually true until now. This shape was ALSO hitting a real
-// family/params mismatch on `SummaryExecutor` (serving time picked
-// precision from a hardcoded default accuracy, not what this workload
-// was actually planned/registered with) -- the legacy reducer's
-// `evaluate_cardinality_global` fallback silently masked that miss, so
-// the test passed via the fallback, not the new path. With the reducer
-// gone, the params mismatch is fixed (see `ObservedFamilyCostModel`),
-// but that unmasked a SECOND, independent bug: `effective_is_cumulative`
-// classifies a bare `count(...)` as non-cumulative, so `readout`
-// evaluates per-window instead of merging the whole range -- this test's
-// later "watermark" sample (a distinct, more recent window) then wins
-// over the real data instead of being merged with it. Tracked as
-// https://github.com/ProjectASAP/ASAPQuery-backend/issues/431.
+// The installed cardinality readout merges all bound series and windows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_serve_hll_global_count_merges_across_sids() {
     let _live = LiveServeEnvGuard::enable();

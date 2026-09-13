@@ -89,6 +89,7 @@ pub fn sketch_type_for_op(op: &AggIntent) -> SketchType {
     }
 }
 
+#[cfg(test)]
 /// Resolve the concrete [`SketchType`] for a `PerPartitionWrap` shape —
 /// delegates to the wrapped inner intent. Kept as a separate function so
 /// that the PerPartition structural collapse (Step γ) is a focused
@@ -136,13 +137,7 @@ pub fn sketch_params_for_op(op: &AggIntent) -> SketchParams {
     }
 }
 
-/// Derive [`SketchParams`] for a `PerPartitionWrap` — delegates to the
-/// inner intent. Kept separate for the same Step γ reason as
-/// [`sketch_type_for_per_partition`].
-pub fn sketch_params_for_per_partition(wrap: &PerPartitionWrap) -> SketchParams {
-    sketch_params_for_op(&wrap.inner)
-}
-
+#[cfg(test)]
 /// Combined (type, params) lookup — convenience for callers that need both.
 pub fn sketch_type_and_params(op: &AggIntent) -> (SketchType, SketchParams) {
     (sketch_type_for_op(op), sketch_params_for_op(op))
@@ -177,6 +172,7 @@ pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
     }
 }
 
+#[cfg(test)]
 /// Memory estimate for a `PerPartitionWrap` — scales the inner-intent
 /// estimate by `2 ** keys.len()` (capped at 2**10), matching the legacy
 /// `PerPartition` formula.
@@ -278,7 +274,7 @@ mod tests {
 
     #[test]
     fn op_quantile_yields_ddsketch_type_and_params() {
-        use crate::types_v2::AccuracyTarget;
+        use crate::types::AccuracyTarget;
         let op = AggIntent::Quantile {
             col: None,
             q: 0.5,
@@ -312,7 +308,7 @@ mod tests {
 
     #[test]
     fn memory_quantile() {
-        use crate::types_v2::AccuracyTarget;
+        use crate::types::AccuracyTarget;
         let op = AggIntent::Quantile {
             col: None,
             q: 0.5,

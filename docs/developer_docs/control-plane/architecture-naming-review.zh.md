@@ -33,15 +33,15 @@
 
 **本 PR 的最终落地与迁移方式**
 
-下表记录最终采用的名称；后文保留审查时的备选与理由。实施基线为 `cb3153a8`（#710），继续复用 Planner 的精度类型；随后合并 `47d4332f`（#711），保留最新主分支的接口与历史注释清理。
+下表记录最终采用的名称；后文保留审查时的备选与理由。实施基线为 `cb3153a8`（#710），继续复用 Planner 的精度类型；随后合并 `47d4332f`（#711）与 `ca944a6a`（#712、#713、#717），保留主分支的窗口规划、storage routing 和接口清理。
 
 | 所属边界 / 源码 | 原名称 → 最终名称 |
 |---|---|
 | [编译输入与编译器](../../../control_plane/src/physical/compiler.rs) | `BackendLocalPlanningSnapshot` → `BackendLocalPlanningInput`；`BackendLocalImplementation` → `BackendLocalPhysicalInputs`；`PlanningQuery` → `QueryCompilationInput`；`PlanningRequest` → `PhysicalCompilationRequest`；`PhysicalCompiler` → `PhysicalPlanCompiler`；`PhysicalPlan` → `CompiledPhysicalPlan` |
 | 同上：查询语义 | `post_asap` → `selected_plan_root`；`source` → `legacy_query_source`；`window_secs` → `query_lookback_seconds`；`group_by` → `group_by_labels`；`accuracy` → `accuracy_target`；`lifecycle` → `summary_lifecycle_inputs`；`runtime_policy` → `materialization_runtime_policy` |
-| 同上：候选与证据 | `logical_selection` → `planner_selection_trace`；`materialization_policy` → `enabled_materialization_keys`；`evidence` → `topk_membership_evidence_by_query_id`；`hybrid_execution` → `allow_mixed_summary_and_exact_execution`；`synthesized_window_queries` → `compiler_priced_window_query_ids` |
+| 同上：候选与证据 | `logical_selection` → `planner_selection_trace`；`materialization_policy` → `enabled_materialization_keys`；`evidence` → `topk_membership_evidence_by_query_id`；`hybrid_execution` → `allow_mixed_summary_and_exact_execution`；`synthesized_window_queries` 删除：编译器来源标记改为每个候选的 `derived` / `cohort_only`，不接受序列化输入 |
 | 同上：窗口与成本 | `WindowImplementationCandidate` → `WindowRealizationCandidate`；`ImplementationCostEvidence` → `WindowRealizationCostQuote`；`LifecycleCostEvidence` → `LifecycleUnitCosts`；`LifecyclePlanningInput` → `SummaryLifecyclePlanningInputs`；`window_implementations` → `window_realization_candidates` |
-| 同上：外层配置 | `snapshot_version` → `schema_version`；`implementation` → `physical_inputs`；`window_candidates` → `window_realization_candidates_by_query`；默认 `window_implementation_id` → `default_window_realization_id`；`implementation_cost` → `default_window_cost_quote`；`max_retained_summary_bytes` → `retained_summary_memory_budget_bytes` |
+| 同上：外层配置 | `snapshot_version` → `schema_version`；`implementation` → `physical_inputs`；外部窗口候选与默认窗口字段随 #712 删除，改用 `window_cost_model`；编译器在逻辑选择后按 cadence / phase 生成候选；`max_retained_summary_bytes` → `retained_summary_memory_budget_bytes` |
 | 同上：部署与保留 | `DeploymentEnvironment` → `PhysicalDeploymentContext`；`collector_ids` → `target_collector_ids`；`query_staleness_margin_ms` → `query_retention_margin_ms` |
 | [候选定价与选择](../../../control_plane/src/physical/workload_cost.rs) | `CostDemand` → `CostComponentDemand`；`unit` → `pricing_basis`；`multiplicity` → `occurrences_per_horizon`；`AlternativeCost` → `CandidatePlanEvaluation`；`WorkloadCostComparison` → `CandidatePlanSelectionReport`；`alternative_id` → `candidate_id`；`physical_alternative_id` → `physical_candidate_id`；`alternatives` → `candidate_evaluations` |
 | 同上：方法 | `with_exact_alternative` → `enumerate_exact_and_materialized_candidates`；`bind_alternative` → `compile_candidate_for_pricing`；`prepare_manifests` → `compile_candidates_for_pricing`；`select` → `select_lowest_cost_candidate`；`select_metricsql` → `select_lowest_cost_metricsql_candidate` |
@@ -51,7 +51,9 @@
 | [存储元数据](../../../data_plane/src/storage_engines/sketch_db/index/mod.rs) | `SketchInstanceMetadata` → `SummarySeriesMetadata`；`sketch_index` 字段与变量 → `summary_store`；保留 `SketchStore` 类型 |
 | 其余调用边界 | `types::QueryWorkload` / `LegacyMetricWorkload` 删除，统一到 Planner `QueryWorkload` + `DataWorkload`；`ClickHouseSqlWorkload.sds` → `summary_catalog`；`aggregation_configs` → `materializations_by_policy_fingerprint`；`aggregation_id_for_key/value` → `key_policy_fingerprint/value_policy_fingerprint`；`data_plane::monitor` → `update_sampling` |
 
-迁移规则：**Rust 名称更新，输出 wire 名称保持原样**；反序列化接受新名称作为 alias。旧公共类型导入及主要入口提供 deprecated 转发，但 Rust struct literal 的旧字段拼写无法通过类型别名兼容，源码消费者需要按表迁移。`None` / 空候选集合、浮点频次、报价身份、候选排序、严格小于的选择规则及计划生命周期均保持原义。
+主分支集成补充：共享 pane 保留 cadence、phase 与 evaluation alignment；发布的 storage routing 从选中物理计划生成；`types_v2` 已删除，定义合入 `types`。这些上游删除的接口不提供旧字段兼容。下文涉及旧窗口模板和 query 级来源集合的建议仅属历史审查。
+
+迁移规则：**保留字段的 Rust 名称更新，输出 wire 名称保持原样**；反序列化接受新名称作为 alias。旧公共类型导入及主要入口提供 deprecated 转发，但 Rust struct literal 的旧字段拼写无法通过类型别名兼容，源码消费者需要按表迁移。`None` / 空候选集合、浮点频次、报价身份、候选排序、严格小于的选择规则及计划生命周期均保持原义。
 
 `erp` 保留并明确为 Error–Resource Profile；`WorkloadQuote.executable` 保留，因为它不代表安装或部署已经通过验证。双模式 streaming handle 的读写行为只补充说明；拆分写 API、删除 legacy 路径、统一 SQL 定价以及 typed ID / 时间单位迁移留作独立工作。英文流程图与边界说明见 [Planning terminology and architecture](planning-terminology.md)。
 

@@ -118,6 +118,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
                             QueryNodeId(0),
                             QueryPlanNode::ReadMaterialization {
                                 binding: MaterializationBinding {
+                                    full_window_slide_ms: None,
                                     materialization: config.policy_fingerprint().into(),
                                     output_grouping,
                                     item_labels: config.aggregated_labels.labels.clone(),

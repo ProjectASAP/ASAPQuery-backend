@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
-use crate::types_v2::BindingName;
 use planner_types::post_asap::{
     ExactKind, ExactParams, GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams,
     SketchQuery, SummaryExpr, SummaryFamilyType,
@@ -45,10 +44,10 @@ enum NodeKind<'a> {
     },
     SketchMerge,
     LetBinding {
-        name: &'a BindingName,
+        name: &'a String,
     },
     Ref {
-        name: &'a BindingName,
+        name: &'a String,
     },
     RawAtEdgeSketchAtBackend {
         family: &'a SketchAlgorithm,
@@ -447,14 +446,7 @@ pub enum ColdFormat {
     Intchunk,
 }
 
-impl ColdFormat {
-    /// `true` for the default ([`ColdFormat::Fragment`]). Drives the
-    /// `skip_serializing_if` on [`EdgeStageConfig::cold_format`] so an unset
-    /// format leaves the serialized config byte-identical to today.
-    pub fn is_default(&self) -> bool {
-        matches!(self, ColdFormat::Fragment)
-    }
-}
+impl ColdFormat {}
 
 /// Named default for [`EdgeStageConfig::cold_ship_endpoint`].
 ///

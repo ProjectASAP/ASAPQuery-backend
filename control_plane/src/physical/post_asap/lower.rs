@@ -38,7 +38,7 @@ use thiserror::Error;
 
 use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
 use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::{AggIntent, QueryExpr};
 
 /// Errors surfaced by the `bind_query_expr` lowering.
@@ -61,17 +61,7 @@ pub fn bind_query_expr(
     bind_query_expr_with_cost_model(expr, &cost_model)
 }
 
-/// Like [`bind_query_expr`], but with an explicitly supplied [`CostModel`]
-/// instead of the default planning-time [`ControlPlaneCostModel`].
-///
-/// This is the seam serving-time re-binding needs: `data_plane`'s
-/// live-serving path (`post_asap_planner.rs`) must NOT re-derive family/params
-/// choice independently of what was actually planned — it looks up what's
-/// really registered in the `SketchStore` and hands in a cost model that
-/// echoes that back, so the resulting `SummaryNode` matches reality by
-/// construction rather than by a coincidental accuracy-target match. See
-/// `control_plane/docs/design-target-architecture.md`'s "planning vs
-/// serving" split.
+/// Bind a query using the explicitly supplied planning cost model.
 pub fn bind_query_expr_with_cost_model(
     expr: &QueryExpr,
     cost_model: &dyn CostModel,

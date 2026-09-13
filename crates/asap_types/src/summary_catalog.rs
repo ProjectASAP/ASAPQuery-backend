@@ -62,6 +62,7 @@ pub enum SummaryCatalogError {
 }
 
 impl CatalogGeneration {
+    #[cfg(test)]
     /// Validate an untrusted wire reference against the installed immutable
     /// snapshot and its enclosing plan generation.
     pub fn validate_snapshot(

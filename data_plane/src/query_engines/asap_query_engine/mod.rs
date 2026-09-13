@@ -7,7 +7,6 @@ mod exact_subqueries;
 pub mod live_serve;
 pub mod logical_dag;
 pub mod physical_dag;
-pub mod post_asap_planner;
 pub mod post_asap_readout;
 pub mod summary_exec;
 pub mod summary_executor;
@@ -18,3 +17,6 @@ pub use engine::ASAPQueryEngine;
 
 #[cfg(test)]
 pub mod tests;
+
+#[cfg(test)]
+mod test_plan;

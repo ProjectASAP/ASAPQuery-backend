@@ -248,14 +248,6 @@ impl SeriesIdResolver {
         self.cache.get(&key).map(|v| *v)
     }
 
-    /// Reverse lookup: given a sid, is it known? Used at receive time
-    /// when an Export carries a sid != 0 with empty attributes — backend
-    /// must verify it knows the sid; otherwise stamp `unknown_series_ids`
-    /// in the response.
-    pub fn is_known(&self, sid: u64) -> bool {
-        self.cache.iter().any(|kv| *kv.value() == sid)
-    }
-
     /// Number of registered identities. Used for telemetry / debugging.
     pub fn len(&self) -> usize {
         self.cache.len()

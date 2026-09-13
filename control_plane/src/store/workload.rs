@@ -102,7 +102,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
 
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
@@ -137,7 +137,7 @@ mod tests {
         let s = WorkloadStore::new();
         s.set("m", AggRole::Quantile, wl("m"));
         let mut updated = wl("m");
-        updated.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.05));
+        updated.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.05));
         s.set("m", AggRole::Quantile, updated);
         let got = s.get("m", AggRole::Quantile).unwrap();
         assert_eq!(got.error_bound(), 0.05);
@@ -149,11 +149,11 @@ mod tests {
         // and each entry persists independently of the others.
         let s = WorkloadStore::new();
         let mut wl_q = wl("http_requests_total");
-        wl_q.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.01));
+        wl_q.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.01));
         let mut wl_s = wl("http_requests_total");
-        wl_s.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.02));
+        wl_s.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.02));
         let mut wl_c = wl("http_requests_total");
-        wl_c.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.03));
+        wl_c.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.03));
         s.set("http_requests_total", AggRole::Quantile, wl_q);
         s.set("http_requests_total", AggRole::Sum, wl_s);
         s.set("http_requests_total", AggRole::Count, wl_c);

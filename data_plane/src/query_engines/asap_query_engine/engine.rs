@@ -492,6 +492,7 @@ impl ASAPQueryEngine {
             .filter(|plan| plan.plan_id() != 0)
     }
 
+    #[cfg(test)]
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
     /// `QueryEngine` trait adapter will dispatch to when the ASAP-tier
     /// reducer reports a coverage narrower than the requested range.
@@ -528,34 +529,6 @@ impl ASAPQueryEngine {
     ) -> Self {
         self.control_plane_client = Some(client);
         self
-    }
-
-    /// Resolve the timeline of agg-signatures for a metric over a
-    /// query range. Reads exclusively from the sid catalog via
-    /// [`crate::storage_engines::sketch_db::query::timeline::timeline_for_metric`]
-    /// — schema retirement routed this away from the now-deleted
-    /// per-metric schema registry.
-    ///
-    /// When no `SketchStore` is wired (test contexts that never
-    /// installed one via [`Self::with_sketch_index`]) returns an
-    /// empty vector; downstream dispatch then bails to the default
-    /// single-agg path, identical to the pre-retirement behaviour
-    /// where an empty schema registry produced no segments.
-    pub fn timeline_for_query(
-        &self,
-        metric: &str,
-        t1_ms: u64,
-        t2_ms: u64,
-    ) -> Vec<crate::storage_engines::sketch_db::TimelineSegment> {
-        let Some(idx) = self.summary_store.as_ref() else {
-            return Vec::new();
-        };
-        crate::storage_engines::sketch_db::query::timeline::timeline_for_metric(
-            idx.as_ref(),
-            metric,
-            t1_ms,
-            t2_ms,
-        )
     }
 
     /// Build a minimal `QueryRequirements` from a bare PromQL string —
@@ -697,19 +670,10 @@ impl ASAPQueryEngine {
                         step_ms,
                     )
                 }
-                Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(reason.to_string())),
+                Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::QueryNotPlanned(reason.to_string())),
             },
-            #[cfg(test)]
-            None => crate::query_engines::asap_query_engine::live_serve::serve_from_summary_executor(
-                idx,
-                query,
-                start_ms,
-                end_ms,
-                false,
-                control_plane::types_v2::AccuracyTarget::Epsilon(0.01),
-            ),
-            #[cfg(not(test))]
-            None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(
+
+            None => Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::QueryNotPlanned(
                 "no active physical QueryPlan".into(),
             )),
         };
@@ -723,7 +687,7 @@ impl ASAPQueryEngine {
                         requirement.max_window_ms,
                     );
                 let Some(active) = self.active_physical_plan.as_ref() else {
-                    return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                    return Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::MaterializationNotReady(
                         "physical readiness registry is unavailable".into(),
                     ));
                 };
@@ -734,7 +698,7 @@ impl ASAPQueryEngine {
                         &requirement.materializations,
                         result.coverage,
                     );
-                    return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                    return Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::MaterializationNotReady(
                         format!("coverage {:?} does not completely and freshly cover [{start_ms}, {end_ms}]", result.coverage),
                     ));
                 }
@@ -750,7 +714,7 @@ impl ASAPQueryEngine {
                     &requirement.materializations,
                     coverage,
                 ) {
-                    return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                    return Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::MaterializationNotReady(
                         "physical generation changed while checking readiness".into(),
                     ));
                 }
@@ -1051,14 +1015,10 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             idx, query_entry, now_ms,
                         )
                     },
-                    Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(reason.to_string())),
+                    Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::QueryNotPlanned(reason.to_string())),
                 },
-                #[cfg(test)]
-                None => crate::query_engines::asap_query_engine::live_serve::serve_instant_from_summary_executor(
-                    idx, query, now_ms,
-                ),
-                #[cfg(not(test))]
-                None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(
+
+                None => Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::QueryNotPlanned(
                     "no active physical QueryPlan".into(),
                 )),
             };
@@ -1072,7 +1032,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             requirement.max_window_ms,
                         );
                     let Some(active) = self.active_physical_plan.as_ref() else {
-                        return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                        return Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::MaterializationNotReady(
                             "physical readiness registry is unavailable".into(),
                         ));
                     };
@@ -1083,7 +1043,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             &requirement.materializations,
                             result.coverage,
                         );
-                        return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                        return Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::MaterializationNotReady(
                             format!("coverage {:?} does not completely and freshly cover [{t0_ms}, {now_ms}]", result.coverage),
                         ));
                     }
@@ -1099,7 +1059,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         &requirement.materializations,
                         coverage,
                     ) {
-                        return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                        return Err(crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::MaterializationNotReady(
                             "physical generation changed while checking readiness".into(),
                         ));
                     }
@@ -1621,18 +1581,7 @@ mod aux_pushdown_tests {
 // HLL-Count contract; closes the wire-side ingest gap diagnosis.
 // ===========================================================================
 // ===========================================================================
-// Capability matching — Rate over CountMinSketch (PR #111 honest-gap
-// closure). With the new `Statistic::Rate` arm in
-// `compatible_agg_types`, `rate(<metric>[<range>])` against a CMS-only
-// agg config now matches.
-// ===========================================================================
-/// `QueryEngine::execute` ASAP-tier classification tests.
-/// Pre-Phase-5 the trait adapter unconditionally delegated to
-/// `handle_query`. After Phase 5 wire-in, when a `SketchStore` is
-/// attached, the adapter classifies first and surfaces
-/// `EngineError::CapabilityMiss(SketchStore, ...)` on Ghost / Unknown
-/// / no-instance outcomes so the EngineRouter can fall
-/// through to the archive engine.
+/// Installed plans bind runtime reads and enforce complete coverage.
 #[cfg(test)]
 mod asap_tier_classify_tests {
     use super::*;
@@ -1644,180 +1593,6 @@ mod asap_tier_classify_tests {
     };
     use crate::storage_engines::types::{CleanupPolicy, StreamingConfigHandle};
     use std::collections::{BTreeMap, BTreeSet};
-
-    fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
-        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_config);
-        ASAPQueryEngine::new(15000).with_sketch_index(idx)
-    }
-
-    fn dd_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
-        let cfg = SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        };
-        SummarySeriesMetadata {
-            sid,
-            metric_name: metric.to_string(),
-            group_by_keys: group_by
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<BTreeSet<_>>(),
-            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
-            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                algorithm: SketchAlgorithm::DDSketch,
-                config: cfg.clone(),
-                spatial_filter_canonical: String::new(),
-            },
-            accuracy: Some(AccuracyBound::from_config(&cfg)),
-            first_seen_unix_ms: 0,
-            retired_at_ms: None,
-            expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_returns_capability_miss_when_no_instance_matches() {
-        // No instance for `unknown_metric` is registered → adapter must
-        // capability-miss rather than burn a `handle_query` round-trip.
-        let idx = Arc::new(SketchStore::new());
-        let engine = build_engine_with_index(idx);
-        let err = engine
-            .execute("unknown_metric{zone=\"z0\"}")
-            .await
-            .expect_err("ASAP-tier with no matching instance must yield CapabilityMiss");
-        match err {
-            EngineError::CapabilityMiss { engine_id, .. } => {
-                assert_eq!(
-                    engine_id,
-                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id()
-                );
-            }
-            other => panic!("expected CapabilityMiss, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_returns_capability_miss_when_classify_is_ghost() {
-        // Register instance metadata but never call append_sample. With
-        // `dd_meta`'s `PolicyFingerprint::UNSET`, the engine's policy-fp
-        // lookup misses entirely — there's no policy in the (empty)
-        // registry to bind the sid to. Prior to the legacy-fallback
-        // removal, the engine would walk `instances_matching` and find
-        // the registered sid, classify it as Ghost (no sample state),
-        // and produce a "ghost/unknown" detail. After removal, the
-        // ghost lookup short-circuits at the policy-resolution step.
-        // The CapabilityMiss outcome is preserved; we just don't
-        // pin the detail string.
-        let idx = Arc::new(SketchStore::new());
-        idx.register(dd_meta(1, "http_latency_ms", &["zone"]));
-        let engine = build_engine_with_index(idx);
-        let err = engine
-            .execute("quantile_over_time(0.99, http_latency_ms{zone=\"z0\"}[5m])")
-            .await
-            .expect_err("ghost sid registration must yield CapabilityMiss");
-        match err {
-            EngineError::CapabilityMiss { engine_id, .. } => {
-                assert_eq!(
-                    engine_id,
-                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id()
-                );
-            }
-            other => panic!("expected CapabilityMiss, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_bare_selector_falls_over_to_archive() {
-        // A bare selector has no aggregate root and fails over to archive before
-        // policy lookup, regardless of the registered DDSketch policy.
-        let idx = Arc::new(SketchStore::new());
-        idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
-        idx.append_sample(
-            2,
-            BTreeMap::from([("zone".to_string(), "z0".to_string())]),
-            (1_000, 1_010),
-            SketchSampleState {
-                bytes: vec![0],
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
-            },
-        );
-
-        let engine = build_engine_with_index(idx);
-        let result = engine.execute("http_latency_ms{zone=\"z0\"}").await;
-        match result {
-            Err(EngineError::CapabilityMiss { detail, .. }) => {
-                assert!(
-                    detail.contains("ExactAgg(Sum)")
-                        || detail.contains("no policy")
-                        || detail.contains("NotRealized"),
-                    "expected a capability-miss fall-over to archive: {detail}"
-                );
-            }
-            other => panic!("expected CapabilityMiss fall-over to archive, got {other:?}"),
-        }
-    }
-
-    /// Schema-retirement #5 regression: a sketch sid registered with
-    /// a wider-than-requested `group_by_keys` and `policy_fp=UNSET`
-    /// must still be findable by the query path. Mirrors the MVP
-    /// end-to-end failure (issue #271 / tracking #272): the agent
-    /// emits DDSketch DPs carrying every wire attribute, so the sid
-    /// catalog ends up with `group_by_keys=[zone,rack,node,pod,...]`
-    /// and `derive_sketch_policy_fp` returns `UNSET` because no
-    /// streaming-config policy has that exact key set. The query
-    /// asks for `grouping=[zone]` — a subset. With the policy-fp-only
-    /// lookup the query returned `CapabilityMiss → archive`; with the
-    /// `instances_matching` fallback restored it resolves to the sid
-    /// (and bottoms out at the reducer's sample-state check rather
-    /// than at sid resolution).
-    #[tokio::test]
-    async fn full_attr_sketch_sid_findable_via_subset_grouping() {
-        let idx = Arc::new(SketchStore::new());
-        // Register with the SUPERSET of attrs the agent would emit:
-        // zone, rack, node, pod — none of which the streaming-config
-        // would list directly in `grouping_labels=[zone]`.
-        idx.register(dd_meta(
-            42,
-            "http_latency_ms",
-            &["node", "pod", "rack", "zone"],
-        ));
-        idx.append_sample(
-            42,
-            BTreeMap::from([
-                ("zone".to_string(), "z0".to_string()),
-                ("rack".to_string(), "r0".to_string()),
-                ("node".to_string(), "n0".to_string()),
-                ("pod".to_string(), "p0".to_string()),
-            ]),
-            (1_000, 1_010),
-            SketchSampleState {
-                bytes: vec![0],
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
-            },
-        );
-
-        let engine = build_engine_with_index(idx);
-        // The query asks for grouping=[zone] (subset of registered
-        // group_by_keys). Pre-fix this returned CapabilityMiss because
-        // `series_ids_for_policy(UNSET)` is empty; post-fix the fallback
-        // finds sid 42 via `instances_matching` and the request
-        // proceeds to the reducer.
-        let result = engine
-            .execute("quantile_over_time(0.99, http_latency_ms{zone=\"z0\"}[5m])")
-            .await;
-        // The reducer can't produce a real quantile from the canned
-        // payload (just `vec![0]`), but it MUST reach the reducer —
-        // the sid-resolution-step CapabilityMiss with "no policy for
-        // metric" detail is the regression we're guarding against.
-        if let Err(EngineError::CapabilityMiss { detail, .. }) = &result {
-            assert!(
-                !detail.contains("has no policy for metric"),
-                "regression: sid was lost at policy-resolution step \
-                 instead of being found via instances_matching: {detail}"
-            );
-        }
-    }
 
     /// `sum by (zone) (http_requests_total)` end-to-end via the
     /// `execute(&str)` adapter. Mirrors the MVP acceptance test's Axis-C
@@ -1841,10 +1616,7 @@ mod asap_tier_classify_tests {
         let zones = ["z0", "z1", "z2", "z3"];
         // Anchor windows so the engine's instant-query default
         // lookback (5 min) reaches them.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = 600_000_u64;
         let window_start = now_ms.saturating_sub(60_000);
         let window_end = now_ms.saturating_sub(30_000);
 
@@ -1877,9 +1649,29 @@ mod asap_tier_classify_tests {
             );
         }
 
-        let engine = build_engine_with_index(idx);
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let config = test_plan::materialization(
+            "http_requests_total",
+            "Sum",
+            serde_json::json!({}),
+            &["zone"],
+            30000,
+        );
+        let query = "sum by (zone) (http_requests_total)";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::Reduce(vec!["zone".into()]),
+            30000,
+            QueryPlanNode::ExactReadout {
+                input: QueryNodeId(0),
+                readout: ExactReadout::Sum,
+            },
+        );
+        let engine = test_plan::engine(idx, config, vec![9000, 9001, 9002, 9003], entry);
         let result = engine
-            .execute("sum by (zone) (http_requests_total)")
+            .execute_at(query, window_end)
             .await
             .expect("sum by (zone) must dispatch to ExactAgg reducer, not capability-miss");
 
@@ -2010,16 +1802,79 @@ mod asap_tier_classify_tests {
     /// so the executor returns the HLL distinct-count directly. A single
     /// FULL HLL frame (~500 users) is used so
     /// the instant projection reads the real estimate.
+    /// Stored sketches cannot authorize a query without an installed QueryPlan.
+    #[tokio::test]
+    async fn unplanned_queries_fail_closed_even_with_matching_sketches() {
+        let idx = Arc::new(SketchStore::new());
+        idx.register(hll_meta(7500, "unique_users_per_min"));
+        idx.append_sample(
+            7500,
+            BTreeMap::new(),
+            (1_000, 2_000),
+            SketchSampleState {
+                bytes: encode_hll_with_cardinality(14, 500),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+        let engine = ASAPQueryEngine::new(15000).with_sketch_index(idx);
+        let query = "count(unique_users_per_min)";
+        let instant = engine.execute_at(query, 2_000).await;
+        let range = engine
+            .execute_range_promql_modern(query, 1_000, 2_000, 1_000)
+            .await;
+        assert!(
+            instant.is_err(),
+            "instant execution must require an installed plan"
+        );
+        assert!(
+            range.is_err(),
+            "range execution must require an installed plan"
+        );
+    }
+
+    /// An installed plan authorizes only its exact query identity and still
+    /// requires readable materializations before serving.
+    #[tokio::test]
+    async fn installed_plan_rejects_unknown_queries_and_missing_samples() {
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let idx = Arc::new(SketchStore::new());
+        idx.register(hll_meta(7500, "unique_users_per_min"));
+        let config = test_plan::materialization(
+            "unique_users_per_min",
+            "HLL",
+            serde_json::json!({"precision":14}),
+            &[],
+            1000,
+        );
+        let query = "count(unique_users_per_min)";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::Reduce(vec![]),
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Cardinality,
+            },
+        );
+        let engine = test_plan::engine(idx, config, vec![7500], entry);
+        for query in [query, "count(other_metric)"] {
+            assert!(engine.execute_at(query, 2000).await.is_err());
+            assert!(engine
+                .execute_range_promql_modern(query, 2000, 2000, 1000)
+                .await
+                .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn execute_count_hll_returns_cardinality_not_rowcount() {
         let idx = Arc::new(SketchStore::new());
         let sid = 7500u64;
         idx.register(hll_meta(sid, "unique_users_per_min"));
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = 600_000_u64;
         idx.append_sample(
             sid,
             BTreeMap::new(),
@@ -2030,8 +1885,28 @@ mod asap_tier_classify_tests {
             },
         );
 
-        let engine = build_engine_with_index(idx);
-        let result = engine.execute("count(unique_users_per_min)").await.expect(
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let config = test_plan::materialization(
+            "unique_users_per_min",
+            "HLL",
+            serde_json::json!({"precision":14}),
+            &[],
+            1000,
+        );
+        let query = "count(unique_users_per_min)";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::Reduce(vec![]),
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Cardinality,
+            },
+        );
+        let engine = test_plan::engine(idx, config, vec![7500], entry);
+        let result = engine.execute_at(query, now_ms - 2000).await.expect(
             "count(hll_metric) must dispatch to the Cardinality family \
                  via the candidate capability (empty trace function) and \
                  return the HLL distinct-count, NOT capability-miss",
@@ -2096,10 +1971,7 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_count_hll_global_merges_registers_across_series() {
         let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = 600_000_u64;
         let w_start = now_ms.saturating_sub(3_000);
         let w_end = now_ms.saturating_sub(2_000);
 
@@ -2129,9 +2001,29 @@ mod asap_tier_classify_tests {
             );
         }
 
-        let engine = build_engine_with_index(idx);
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let config = test_plan::materialization(
+            "unique_users_global",
+            "HLL",
+            serde_json::json!({"precision":14}),
+            &[],
+            1000,
+        );
+        let query = "count(unique_users_global)";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::Reduce(vec![]),
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Cardinality,
+            },
+        );
+        let engine = test_plan::engine(idx, config, vec![8200, 8201], entry);
         let result = engine
-            .execute("count(unique_users_global)")
+            .execute_at(query, w_end)
             .await
             .expect("global count(hll_metric) must answer, not capability-miss");
 
@@ -2184,13 +2076,10 @@ mod asap_tier_classify_tests {
         let sid = 7100u64;
         idx.register(kll_meta(sid, "http_requests_total_latency_ms"));
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        // A 10s window ending 5s ago — comfortably inside the 30s range.
-        let window_start = now_ms.saturating_sub(15_000);
-        let window_end = now_ms.saturating_sub(5_000);
+        let now_ms = 600_000_u64;
+        // One complete pane covers the requested 30 second lookback.
+        let window_start = now_ms.saturating_sub(30_000);
+        let window_end = now_ms;
 
         let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
         let bytes = encode_kll_items_proto(269, &items);
@@ -2228,16 +2117,34 @@ mod asap_tier_classify_tests {
 
     async fn engine_quantile_result(
         idx: Arc<SketchStore>,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> crate::query_engines::query_result::QueryResult {
-        let engine = build_engine_with_index(idx);
-        engine
-            .execute("quantile_over_time(0.99, http_requests_total_latency_ms[30s])")
-            .await
-            .expect(
-                "quantile_over_time over a Hit KLL sid must NOT capability-miss \
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let config = test_plan::materialization(
+            "http_requests_total_latency_ms",
+            "DatasketchesKLL",
+            serde_json::json!({"k":269}),
+            &[],
+            30_000,
+        );
+        let query = "quantile_over_time(0.99, http_requests_total_latency_ms[30s])";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::PerEntity,
+            30_000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Quantile { q: 0.99 },
+            },
+        );
+        let sids = idx.snapshot_instances().iter().map(|m| m.sid).collect();
+        let engine = test_plan::engine(idx, config, sids, entry);
+        engine.execute_at(query, now_ms).await.expect(
+            "quantile_over_time over a Hit KLL sid must NOT capability-miss \
                  (if it does, the bug is upstream of the reducer)",
-            )
+        )
     }
 
     fn result_nonempty(r: &crate::query_engines::query_result::QueryResult) -> bool {
@@ -2268,10 +2175,7 @@ mod asap_tier_classify_tests {
         let sid = 7400u64;
         idx.register(kll_meta(sid, "http_requests_total_latency_ms"));
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = 600_000_u64;
 
         let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
         // Full at now-60s..now-55s — OUTSIDE the 30s window.
@@ -2284,11 +2188,11 @@ mod asap_tier_classify_tests {
                 encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
             },
         );
-        // Delta at now-15s..now-5s — INSIDE the window.
+        // A delta pane covers the complete requested lookback.
         idx.append_sample(
             sid,
             BTreeMap::new(),
-            (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
+            (now_ms.saturating_sub(30_000), now_ms),
             SketchSampleState {
                 bytes: encode_kll_items_proto(269, &items),
                 encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta,
@@ -2322,15 +2226,12 @@ mod asap_tier_classify_tests {
         let sid = 7300u64;
         idx.register(kll_meta(sid, "http_requests_total_latency_ms"));
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = 600_000_u64;
         let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
         idx.append_sample(
             sid,
             BTreeMap::new(),
-            (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
+            (now_ms.saturating_sub(30_000), now_ms),
             SketchSampleState {
                 bytes: encode_kll_items_proto(269, &items),
                 encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta,
@@ -2342,148 +2243,6 @@ mod asap_tier_classify_tests {
             result_nonempty(&result),
             "delta-from-empty (PWR) window with no carry-in Full must \
              reconstruct that window's state and return a non-empty result"
-        );
-    }
-
-    /// `rate(http_requests_total[5m])` end-to-end via `execute(&str)`.
-    /// The Planner input marks the inner aggregate as `AggIntent::Rate`;
-    /// bare `rate(...)` is one of the
-    /// shapes `SummaryExecutor` self-excludes before ever binding
-    /// (`LoweringSkip::RateShape` -- it has no rate-division logic), and
-    /// there's no legacy reducer left to fall through to. This test used
-    /// to pin the ExactAgg-rate reducer dispatch; now it pins the
-    /// accepted replacement outcome: capability-miss, failing over to
-    /// archive.
-    #[tokio::test]
-    async fn execute_rate_capability_misses_no_legacy_fallback() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
-
-        let idx = Arc::new(SketchStore::new());
-        // Two zones, each its own sid, two windows each. The windows
-        // span `[now-150s, now-30s]` = 120s of ACTUAL coverage inside
-        // the requested 300s `[5m]` lookback. Post-#301 the rate divisor
-        // is the actual coverage span (`min(300, 120) = 120`), NOT the
-        // nominal 300 — so z0 = (600+600)/120 = 10.0; z1 =
-        // (900+900)/120 = 15.0. (Both windows stay strictly inside
-        // `[engine_now-300_000, engine_now]` so the window-contained
-        // range query captures them regardless of the small skew between
-        // the test's captured `now_ms` and the engine's query-time now.)
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let w1_start = now_ms.saturating_sub(150_000);
-        let w1_end = now_ms.saturating_sub(90_000);
-        let w2_start = w1_end;
-        let w2_end = now_ms.saturating_sub(30_000);
-
-        for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
-            let sid = 11_000 + i as u64;
-            idx.register(SummarySeriesMetadata {
-                sid,
-                metric_name: "http_requests_total".to_string(),
-                group_by_keys: ["zone".to_string()].into_iter().collect(),
-                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
-                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
-                    agg_type: AggregationType::Sum,
-                    parameters_canonical: String::new(),
-                    spatial_filter_canonical: String::new(),
-                },
-                accuracy: None,
-                first_seen_unix_ms: 0,
-                retired_at_ms: None,
-                expires_at_ms: None,
-                policy_fp: asap_types::PolicyFingerprint::UNSET,
-            });
-            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
-                let mut lm = BTreeMap::new();
-                lm.insert("zone".to_string(), zone.to_string());
-                idx.append_precompute(
-                    sid,
-                    lm,
-                    (ws, we),
-                    Box::new(SumAccumulator::with_sum(*per_window)),
-                );
-            }
-        }
-
-        let engine = build_engine_with_index(idx);
-        let result = engine.execute("rate(http_requests_total[5m])").await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "rate() must capability-miss with no legacy reducer fallback, got {result:?}"
-        );
-    }
-
-    /// Regression (issue #301, decision (a)): `sum_over_time(counter[r])`
-    /// shares `Capability::ExactAgg(Sum)` with `rate`/`increase`/`sum`,
-    /// but its PromQL semantic (Σ of CUMULATIVE sample values in `[r]`,
-    /// a quadratic) CANNOT be reconstructed from the per-window deltas
-    /// asap stores. Rather than fabricate a wrong number, the engine
-    /// recognizes exact Sum over a Planner `TimeRange` and returns a
-    /// capability-miss so the query routes to the archive tier. Before
-    /// #301 this returned the delta-sum (1500 here) — a wrong answer the
-    /// caller couldn't distinguish from a correct one.
-    #[tokio::test]
-    async fn execute_sum_over_time_over_counter_capability_misses_to_archive() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
-
-        let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let w1_start = now_ms.saturating_sub(120_000);
-        let w1_end = now_ms.saturating_sub(60_000);
-        let w2_start = w1_end;
-        let w2_end = now_ms.saturating_sub(1_000);
-
-        for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
-            let sid = 13_000 + i as u64;
-            idx.register(SummarySeriesMetadata {
-                sid,
-                metric_name: "http_requests_total".to_string(),
-                group_by_keys: ["zone".to_string()].into_iter().collect(),
-                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
-                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
-                    agg_type: AggregationType::Sum,
-                    parameters_canonical: String::new(),
-                    spatial_filter_canonical: String::new(),
-                },
-                accuracy: None,
-                first_seen_unix_ms: 0,
-                retired_at_ms: None,
-                expires_at_ms: None,
-                policy_fp: asap_types::PolicyFingerprint::UNSET,
-            });
-            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
-                let mut lm = BTreeMap::new();
-                lm.insert("zone".to_string(), zone.to_string());
-                idx.append_precompute(
-                    sid,
-                    lm,
-                    (ws, we),
-                    Box::new(SumAccumulator::with_sum(*per_window)),
-                );
-            }
-        }
-
-        let engine = build_engine_with_index(idx);
-        let err = engine
-            .execute("sum_over_time(http_requests_total[5m])")
-            .await
-            .expect_err(
-                "sum_over_time over a counter sid MUST capability-miss → archive \
-                 (issue #301 decision (a)); it must NOT fabricate a delta-sum",
-            );
-        assert!(
-            matches!(
-                err,
-                crate::query_engines::EngineError::CapabilityMiss { .. }
-            ),
-            "expected CapabilityMiss for sum_over_time over counter, got {err:?}"
         );
     }
 
@@ -2501,14 +2260,11 @@ mod asap_tier_classify_tests {
         use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = 600_000_u64;
         let w1_start = now_ms.saturating_sub(120_000);
         let w1_end = now_ms.saturating_sub(60_000);
         let w2_start = w1_end;
-        let w2_end = now_ms.saturating_sub(1_000);
+        let w2_end = now_ms;
 
         for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 14_000 + i as u64;
@@ -2540,9 +2296,29 @@ mod asap_tier_classify_tests {
             }
         }
 
-        let engine = build_engine_with_index(idx);
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let config = test_plan::materialization(
+            "http_requests_total",
+            "Sum",
+            serde_json::json!({}),
+            &["zone"],
+            60000,
+        );
+        let query = "sum by (zone) (http_requests_total)";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::Reduce(vec!["zone".into()]),
+            120000,
+            QueryPlanNode::ExactReadout {
+                input: QueryNodeId(0),
+                readout: ExactReadout::Sum,
+            },
+        );
+        let engine = test_plan::engine(idx, config, vec![14000, 14001], entry);
         let result = engine
-            .execute("sum by (zone) (http_requests_total)")
+            .execute_at(query, now_ms)
             .await
             .expect("instant sum by zone must succeed");
         let vector = match result {
@@ -2569,203 +2345,6 @@ mod asap_tier_classify_tests {
         assert!(
             (z1 - 1800.0).abs() < 1e-9,
             "z1 cumulative expected 1800 (900+900), got {z1}"
-        );
-    }
-
-    /// `sketch_reducer.rs` retirement, strict-matching decision: Sum and
-    /// Increase are the same physical accumulator, but planning's
-    /// decision for THIS metric (what got registered) is `Sum`, not
-    /// `Increase` -- and serving must reproduce exactly what was
-    /// planned, not treat the two labels as interchangeable. A sid
-    /// registered as `ExactAgg(Sum)` therefore correctly capability-misses
-    /// an `increase(...)` query and fails over to archive, rather than
-    /// silently answering under a label planning never chose.
-    #[tokio::test]
-    async fn execute_increase_over_sum_registered_sid_capability_misses() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
-
-        let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let w1_start = now_ms.saturating_sub(120_000);
-        let w1_end = now_ms.saturating_sub(60_000);
-        let w2_start = w1_end;
-        let w2_end = now_ms.saturating_sub(1_000);
-
-        for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
-            let sid = 15_000 + i as u64;
-            idx.register(SummarySeriesMetadata {
-                sid,
-                metric_name: "http_requests_total".to_string(),
-                group_by_keys: ["zone".to_string()].into_iter().collect(),
-                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
-                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
-                    agg_type: AggregationType::Sum,
-                    parameters_canonical: String::new(),
-                    spatial_filter_canonical: String::new(),
-                },
-                accuracy: None,
-                first_seen_unix_ms: 0,
-                retired_at_ms: None,
-                expires_at_ms: None,
-                policy_fp: asap_types::PolicyFingerprint::UNSET,
-            });
-            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
-                let mut lm = BTreeMap::new();
-                lm.insert("zone".to_string(), zone.to_string());
-                idx.append_precompute(
-                    sid,
-                    lm,
-                    (ws, we),
-                    Box::new(SumAccumulator::with_sum(*per_window)),
-                );
-            }
-        }
-
-        let engine = build_engine_with_index(idx);
-        let result = engine.execute("increase(http_requests_total[5m])").await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "increase() over a Sum-registered sid must capability-miss \
-             (strict planning/serving match), got {result:?}"
-        );
-    }
-
-    /// An inner Rate intent excludes this composed query from summary execution;
-    /// the engine must report a capability miss.
-    #[tokio::test]
-    async fn execute_sum_by_zone_rate_capability_misses_no_legacy_fallback() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
-
-        let idx = Arc::new(SketchStore::new());
-        // Four zones. Two windows each spanning `[now-150s, now-30s]` =
-        // 120s of actual coverage inside the 300s `[5m]` lookback.
-        // Post-#301 the rate divisor is the actual coverage span
-        // (`min(300, 120) = 120`), not the nominal 300.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let w1_start = now_ms.saturating_sub(150_000);
-        let w1_end = now_ms.saturating_sub(90_000);
-        let w2_start = w1_end;
-        let w2_end = now_ms.saturating_sub(30_000);
-
-        let zones = ["z0", "z1", "z2", "z3"];
-        for (i, zone) in zones.iter().enumerate() {
-            let sid = 12_000 + i as u64;
-            idx.register(SummarySeriesMetadata {
-                sid,
-                metric_name: "http_requests_total".to_string(),
-                group_by_keys: ["zone".to_string()].into_iter().collect(),
-                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
-                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
-                    agg_type: AggregationType::Sum,
-                    parameters_canonical: String::new(),
-                    spatial_filter_canonical: String::new(),
-                },
-                accuracy: None,
-                first_seen_unix_ms: 0,
-                retired_at_ms: None,
-                expires_at_ms: None,
-                policy_fp: asap_types::PolicyFingerprint::UNSET,
-            });
-            // per_window: 300, 600, 900, 1200 → per-zone totals 600,
-            // 1200, 1800, 2400 → rates over the 120s coverage are
-            // 5, 10, 15, 20.
-            let per_window = ((i + 1) * 300) as f64;
-            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
-                let mut lm = BTreeMap::new();
-                lm.insert("zone".to_string(), zone.to_string());
-                idx.append_precompute(
-                    sid,
-                    lm,
-                    (ws, we),
-                    Box::new(SumAccumulator::with_sum(per_window)),
-                );
-            }
-        }
-
-        let engine = build_engine_with_index(idx);
-        let result = engine
-            .execute("sum by (zone) (rate(http_requests_total[5m]))")
-            .await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "composed sum-by-rate must capability-miss with no legacy reducer \
-             fallback, got {result:?}"
-        );
-    }
-
-    /// TopK over grouped rate fails over to archive for both K ≥ n and K < n.
-    /// The inner Rate intent excludes the entire query from summary execution.
-    #[tokio::test]
-    async fn execute_topk_over_sum_by_zone_rate_capability_misses_no_legacy_fallback() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
-
-        let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let w_start = now_ms.saturating_sub(150_000);
-        let w_end = now_ms.saturating_sub(30_000);
-
-        let zones = ["z0", "z1", "z2", "z3"];
-        for (i, zone) in zones.iter().enumerate() {
-            let sid = 13_000 + i as u64;
-            idx.register(SummarySeriesMetadata {
-                sid,
-                metric_name: "http_requests_total".to_string(),
-                group_by_keys: ["zone".to_string()].into_iter().collect(),
-                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
-                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
-                    agg_type: AggregationType::Sum,
-                    parameters_canonical: String::new(),
-                    spatial_filter_canonical: String::new(),
-                },
-                accuracy: None,
-                first_seen_unix_ms: 0,
-                retired_at_ms: None,
-                expires_at_ms: None,
-                policy_fp: asap_types::PolicyFingerprint::UNSET,
-            });
-            let per_window = ((i + 1) * 300) as f64;
-            let mut lm = BTreeMap::new();
-            lm.insert("zone".to_string(), zone.to_string());
-            idx.append_precompute(
-                sid,
-                lm,
-                (w_start, w_end),
-                Box::new(SumAccumulator::with_sum(per_window)),
-            );
-        }
-
-        let engine = build_engine_with_index(idx);
-
-        // K ≥ n (5 ≥ 4 zones).
-        let result = engine
-            .execute("topk(5, sum by (zone) (rate(http_requests_total[5m])))")
-            .await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "topk(5, ...) over sum-rate must capability-miss with no legacy \
-             fallback, got {result:?}"
-        );
-
-        // K < n (2 < 4 zones) -- same shape, different K, same outcome.
-        let result = engine
-            .execute("topk(2, sum by (zone) (rate(http_requests_total[5m])))")
-            .await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "topk(2, ...) over sum-rate must capability-miss with no legacy \
-             fallback, got {result:?}"
         );
     }
 
@@ -2844,94 +2423,41 @@ mod asap_tier_classify_tests {
         .encode_to_vec()
     }
 
-    fn now_ms_for_test() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    #[tokio::test]
-    async fn rate_over_cms_frequency_capability_misses_no_legacy_fallback() {
-        // Rate is excluded from summary execution even with a registered frequency
-        // sid, so this request must capability-miss.
-        let now = now_ms_for_test();
-        let idx = Arc::new(SketchStore::new());
-        register_cms_freq_sid(&idx, 7000, "cms_metric", &[], "", 600, now);
-
-        let engine = build_engine_with_index(idx);
-        let result = engine.execute("rate(cms_metric[5m])").await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "rate() over a registered CMS frequency sid must still capability-miss \
-             with no legacy fallback, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rate_over_cms_frequency_misses_when_no_freq_sid() {
-        // No CMS sid registered → the fallback finds nothing and the
-        // query fails over to archive (CapabilityMiss), unchanged.
-        let idx = Arc::new(SketchStore::new());
-        let engine = build_engine_with_index(idx);
-        let err = engine
-            .execute("rate(cms_metric[5m])")
-            .await
-            .expect_err("no freq sid → capability-miss to archive");
-        assert!(matches!(err, EngineError::CapabilityMiss { .. }));
-    }
-
-    #[tokio::test]
-    async fn keyed_cms_frequency_reads_point_estimate_instead_of_total() {
-        use crate::query_engines::query_result::QueryResult;
-        // A per-item selector is bound to Planner's typed PointCount readout.
-        // This synthetic matrix stores 600 only in cell zero; item X hashes
-        // elsewhere, so its estimate is 0. Returning 600 would prove the old
-        // misleading whole-bucket-total behavior had regressed.
-        let now = now_ms_for_test();
-        let idx = Arc::new(SketchStore::new());
-        register_cms_freq_sid(&idx, 7100, "cms_metric", &[], "", 600, now);
-
-        let engine = build_engine_with_index(idx);
-        let result = engine
-            .execute("count_over_time(cms_metric{item=\"X\"}[5m])")
-            .await
-            .expect("keyed CMS frequency should execute through PointCount");
-        let QueryResult::Vector(vector) = result else {
-            panic!("expected instant vector")
-        };
-        assert_eq!(vector.values.len(), 1);
-        assert_eq!(vector.values[0].value, 0.0);
-    }
-
-    #[tokio::test]
-    async fn ordinary_label_filter_is_not_bound_as_frequency_item_key() {
-        let now = now_ms_for_test();
-        let idx = Arc::new(SketchStore::new());
-        register_cms_freq_sid(&idx, 7150, "cms_metric", &[], "", 600, now);
-
-        let engine = build_engine_with_index(idx);
-        let result = engine
-            .execute("count_over_time(cms_metric{region=\"west\"}[5m])")
-            .await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "a spatial label must not be reinterpreted as a sketch item key: {result:?}"
-        );
-    }
-
     #[tokio::test]
     async fn bare_cms_frequency_still_answers_after_p2_6() {
         use crate::query_engines::query_result::QueryResult;
         // Regression guard: the working `count_over_time(cms_metric[5m])`
         // demo (NO item key, empty spatial filter) must still be answered
         // by the warm tier after the P2-6 safe-miss was added.
-        let now = now_ms_for_test();
+        let now = 600_000_u64;
         let idx = Arc::new(SketchStore::new());
         register_cms_freq_sid(&idx, 7200, "cms_metric", &[], "", 600, now);
 
-        let engine = build_engine_with_index(idx);
-        let result = engine.execute("count_over_time(cms_metric[5m])").await;
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let config = test_plan::materialization(
+            "cms_metric",
+            "CountMinSketch",
+            serde_json::json!({"w":512,"d":5}),
+            &[],
+            30000,
+        );
+        let query = "count_over_time(cms_metric[30s])";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::PerEntity,
+            30000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::PointCount {
+                    key: planner_types::pre_asap::ColumnRef::SampleValue,
+                    value: None,
+                },
+            },
+        );
+        let engine = test_plan::engine(idx, config, vec![7200], entry);
+        let result = engine.execute_at(query, now - 30000).await;
         assert!(
             matches!(
                 result,
@@ -2943,14 +2469,7 @@ mod asap_tier_classify_tests {
 }
 
 // ===========================================================================
-// Engine-level integration test for issue #296 — `max by (zone)
-// (quantile_over_time(0.99, m[5m]))` over per-zone ExactAgg(Sum) sids
-// must reach the reducer (not capability-miss). The asap engine's
-// `evaluate` path returns DDSketch-decoded quantile values per zone;
-// the outer-agg fold then collapses each zone's single row into a
-// single value (identity). Pre-fix the query produced a CapabilityMiss
-// because no analyzer-side composition existed.
-// ===========================================================================
+/// A registered series without samples must not hide a readable bound series.
 #[cfg(test)]
 mod outer_agg_integration_tests {
     use super::*;
@@ -2965,12 +2484,6 @@ mod outer_agg_integration_tests {
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::MessagePackCodec;
     use std::collections::{BTreeMap, BTreeSet};
-
-    fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
-        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_config);
-        ASAPQueryEngine::new(15000).with_sketch_index(idx)
-    }
 
     fn dd_sketch_with_values(values: &[f64]) -> Vec<u8> {
         // The msgpack encoding round-trips through
@@ -3008,55 +2521,6 @@ mod outer_agg_integration_tests {
         }
     }
 
-    /// An outer Max requires its own MinMax state in this summary plan.
-    /// An inner quantile sid alone cannot satisfy the whole tree; return a
-    /// capability miss so archive execution can answer the composed query.
-    #[tokio::test]
-    async fn execute_max_by_zone_over_quantile_over_time_capability_misses_pending_asapcontroller_171(
-    ) {
-        let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let w_start = now_ms.saturating_sub(60_000);
-        let w_end = now_ms.saturating_sub(30_000);
-
-        for (i, (zone, vals)) in [
-            (
-                "z0",
-                vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-            ),
-            ("z1", vec![100.0_f64, 200.0, 300.0, 400.0, 500.0]),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let sid = 21_000 + i as u64;
-            idx.register(dd_meta_for(sid, "http_latency_ms", &["zone"]));
-            let bytes = dd_sketch_with_values(vals);
-            idx.append_sample(
-                sid,
-                BTreeMap::from([("zone".to_string(), zone.to_string())]),
-                (w_start, w_end),
-                SketchSampleState {
-                    bytes,
-                    encoding: SketchEncoding::MsgpackFull,
-                },
-            );
-        }
-
-        let engine = build_engine_with_index(idx);
-        let result = engine
-            .execute("max by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))")
-            .await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "max by (zone) over quantile_over_time must capability-miss \
-             pending ASAPController#171, got {result:?}"
-        );
-    }
-
     /// Regression: a candidate's sid set legitimately contains a MIX of
     /// `Ghost` (retired-then-evicted or merged-away, no data) and `Hit`
     /// (Active, carrying live sketch state) sids under the same metric.
@@ -3070,10 +2534,7 @@ mod outer_agg_integration_tests {
     #[tokio::test]
     async fn ghost_sid_does_not_mask_active_hit_sid_for_quantile() {
         let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = 600_000_u64;
         let w_start = now_ms.saturating_sub(60_000);
         let w_end = now_ms.saturating_sub(30_000);
 
@@ -3093,14 +2554,31 @@ mod outer_agg_integration_tests {
             },
         );
 
-        let engine = build_engine_with_index(idx);
-        let result = engine
-            .execute("quantile_over_time(0.99, http_latency_ms[5m])")
-            .await
-            .expect(
-                "a dataless Ghost sid must not abort the query when an \
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        let config = test_plan::materialization(
+            "http_latency_ms",
+            "DDSketch",
+            serde_json::json!({"alpha":0.01}),
+            &["zone"],
+            30000,
+        );
+        let query = "quantile_over_time(0.99, http_latency_ms[30s])";
+        let entry = test_plan::entry(
+            query,
+            &config,
+            PhysicalGrouping::PerEntity,
+            30000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Quantile { q: 0.99 },
+            },
+        );
+        let engine = test_plan::engine(idx, config, vec![1, 2], entry);
+        let result = engine.execute_at(query, w_end).await.expect(
+            "a dataless Ghost sid must not abort the query when an \
                  Active Hit sid under the same metric can answer it",
-            );
+        );
         let vector = match result {
             QueryResult::Vector(v) => v,
             other => panic!("expected Vector, got {other:?}"),
@@ -3114,63 +2592,6 @@ mod outer_agg_integration_tests {
             vector.values[0].value > 0.0,
             "p99 of [1..=10] is a positive quantile, got {}",
             vector.values[0].value
-        );
-    }
-
-    /// `avg by (zone) (quantile_over_time(0.99, m[5m]))` — same
-    /// `sketch_reducer.rs`-retirement gap as
-    /// `execute_max_by_zone_over_quantile_over_time_capability_misses_pending_asapcontroller_171`
-    /// above, except `AggIntent::Avg` maps to `Implementation::PassThrough`
-    /// rather than an accumulator commitment
-    /// (`asap_aware_mapping::boundary::implementation_for_with`), so
-    /// `implement_tree_in_with`'s conservative fallback wraps the WHOLE
-    /// tree — including the otherwise-realizable inner quantile — as one
-    /// opaque `Logical` blob. Same accepted-gap outcome either way:
-    /// capability-miss, pending
-    /// https://github.com/ProjectASAP/ASAPController/issues/171.
-    #[tokio::test]
-    async fn execute_avg_by_zone_over_quantile_over_time_capability_misses_pending_asapcontroller_171(
-    ) {
-        let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let w_start = now_ms.saturating_sub(60_000);
-        let w_end = now_ms.saturating_sub(30_000);
-
-        for (i, (zone, vals)) in [
-            (
-                "z0",
-                vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-            ),
-            ("z1", vec![50.0_f64, 100.0, 150.0, 200.0, 250.0]),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let sid = 22_000 + i as u64;
-            idx.register(dd_meta_for(sid, "http_latency_ms", &["zone"]));
-            let bytes = dd_sketch_with_values(vals);
-            idx.append_sample(
-                sid,
-                BTreeMap::from([("zone".to_string(), zone.to_string())]),
-                (w_start, w_end),
-                SketchSampleState {
-                    bytes,
-                    encoding: SketchEncoding::MsgpackFull,
-                },
-            );
-        }
-
-        let engine = build_engine_with_index(idx);
-        let result = engine
-            .execute("avg by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))")
-            .await;
-        assert!(
-            matches!(result, Err(EngineError::CapabilityMiss { .. })),
-            "avg by (zone) over quantile_over_time must capability-miss \
-             pending ASAPController#171, got {result:?}"
         );
     }
 }
@@ -3280,15 +2701,7 @@ mod hybrid_stitch_tests {
 }
 
 // ---------------------------------------------------------------------------
-// FIX 3 — RANGE-query warm+archive hybrid stitch.
-//
-// The instant path already stitches; the range path historically returned
-// warm-only, so a `[start, end]` request whose warm sketches only cover a
-// suffix lost the prefix. These tests drive `execute_range_promql_modern`
-// with an archive engine wired and warm coverage narrower than the request,
-// and assert the stitched matrix covers the FULL range (prefix from archive,
-// suffix from warm).
-// ---------------------------------------------------------------------------
+/// Planned range execution requires complete warm coverage at every step.
 #[cfg(test)]
 mod range_stitch_tests {
     use super::*;
@@ -3340,7 +2753,7 @@ mod range_stitch_tests {
             sketch_envelope, CountMinState, CounterType, SketchEnvelope,
         };
         use prost::Message;
-        let (rows, cols) = (2u32, 4u32);
+        let (rows, cols) = (5u32, 512u32);
         let mut counts_int = vec![0i64; (rows * cols) as usize];
         counts_int[0] = total;
         let state = CountMinState {
@@ -3380,165 +2793,59 @@ mod range_stitch_tests {
         }
     }
 
-    /// Warm DDSketch covers only the SUFFIX of the requested range
-    /// (two windows near `end`); archive returns a full-range matrix
-    /// including the prefix. The stitched matrix must span the FULL request:
-    /// prefix timestamps come from archive, suffix from warm (warm wins on
-    /// any overlap).
+    /// Incomplete installed materializations must fail closed for archive routing,
+    /// regardless of whether this engine also has an archive client attached.
     #[tokio::test]
-    async fn range_stitches_archive_prefix_with_warm_suffix() {
-        let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        // Requested range: [now-600s, now].
-        let start_ms = now_ms.saturating_sub(600_000);
-        let end_ms = now_ms;
-
-        // Warm windows only in the suffix: [now-200s], [now-100s].
-        // `count_over_time` over a CountMin sid emits one PER-WINDOW total,
-        // so warm contributes a value at BOTH window-ends.
-        let warm_w1_end = now_ms.saturating_sub(200_000);
-        let warm_w2_end = now_ms.saturating_sub(100_000);
-        let warm_w1_total = 100.0_f64;
-        let sid = 9100u64;
-        idx.register(cms_meta(sid, "req_count"));
-        for (w_end, total) in [(warm_w1_end, 100i64), (warm_w2_end, 200i64)] {
+    async fn planned_range_rejects_partial_warm_coverage() {
+        use crate::query_engines::asap_query_engine::test_plan;
+        use asap_types::query_plan::*;
+        for with_archive in [false, true] {
+            let idx = Arc::new(SketchStore::new());
+            idx.register(cms_meta(9100, "req_count"));
             idx.append_sample(
-                sid,
+                9100,
                 BTreeMap::new(),
-                (w_end.saturating_sub(30_000), w_end),
+                (30_000, 60_000),
                 SketchSampleState {
-                    bytes: cms_bytes(total),
+                    bytes: cms_bytes(100),
                     encoding: SketchEncoding::ProtoFull,
                 },
             );
+            let config = test_plan::materialization(
+                "req_count",
+                "CountMinSketch",
+                serde_json::json!({"w":512,"d":5}),
+                &[],
+                30_000,
+            );
+            let query = "count_over_time(req_count[30s])";
+            let entry = test_plan::entry(
+                query,
+                &config,
+                PhysicalGrouping::PerEntity,
+                30_000,
+                QueryPlanNode::SummaryEstimate {
+                    input: QueryNodeId(0),
+                    query: QueryReadout::PointCount {
+                        key: planner_types::pre_asap::ColumnRef::SampleValue,
+                        value: None,
+                    },
+                },
+            );
+            let mut engine = test_plan::engine(idx, config, vec![9100], entry);
+            if with_archive {
+                engine = engine.with_archive_engine(Arc::new(FakeArchive {
+                    matrix: QueryResult::matrix(vec![]),
+                }));
+            }
+            let result = engine
+                .execute_range_promql_modern(query, 30_000, 60_000, 30_000)
+                .await;
+            assert!(
+                matches!(result, Err(EngineError::CapabilityMiss { .. })),
+                "missing first pane must route the entire request to archive: {result:?}"
+            );
         }
-
-        // Archive provides the WHOLE range, including the prefix the warm
-        // tier can't cover. Use the bare empty-label series the DD reducer
-        // emits (so labels line up for the stitch merge).
-        let labels = KeyByLabelValues::new_with_labels(Vec::new());
-        let mut arch_el = RangeVectorElement::new(labels);
-        // Prefix samples (before warm coverage) + a suffix sample warm will win.
-        let prefix_ts = now_ms.saturating_sub(500_000) as i64;
-        let mid_ts = now_ms.saturating_sub(300_000) as i64;
-        arch_el.samples.push(Sample::new(prefix_ts as u64, 999.0));
-        arch_el.samples.push(Sample::new(mid_ts as u64, 998.0));
-        arch_el.samples.push(Sample::new(warm_w1_end, 1.0)); // overlap: warm should win
-        let archive = Arc::new(FakeArchive {
-            matrix: QueryResult::matrix(vec![arch_el]),
-        });
-
-        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_config);
-        let engine = ASAPQueryEngine::new(15000)
-            .with_sketch_index(idx)
-            .with_archive_engine(archive);
-
-        let result = engine
-            .execute_range_promql_modern("count_over_time(req_count[5m])", start_ms, end_ms, 15_000)
-            .await
-            .expect("range query must answer (stitched), not error");
-
-        let m = match result {
-            QueryResult::Matrix(m) => m,
-            other => panic!("expected Matrix, got {other:?}"),
-        };
-        assert_eq!(m.values.len(), 1, "one merged series: {m:?}");
-        let samples = &m.values[0].samples;
-        let ts: std::collections::BTreeSet<i64> =
-            samples.iter().map(|s| s.timestamp as i64).collect();
-
-        // The PREFIX timestamps (only the archive has them) must be present —
-        // this is the whole point of the fix (warm-only would have dropped
-        // them).
-        assert!(
-            ts.contains(&prefix_ts),
-            "archive prefix sample (t={prefix_ts}) must survive the stitch: {ts:?}"
-        );
-        assert!(
-            ts.contains(&mid_ts),
-            "archive mid sample (t={mid_ts}) must survive the stitch: {ts:?}"
-        );
-        // The SUFFIX warm windows must be present too.
-        assert!(
-            ts.contains(&(warm_w1_end as i64)) && ts.contains(&(warm_w2_end as i64)),
-            "warm suffix windows must be present: {ts:?}"
-        );
-
-        // Warm wins on the overlapping timestamp: at warm_w1_end the value
-        // must be the warm per-window total (100), NOT the archive sentinel 1.0.
-        let overlap = samples
-            .iter()
-            .find(|s| s.timestamp == warm_w1_end)
-            .expect("overlap sample present");
-        assert!(
-            (overlap.value - warm_w1_total).abs() < 1e-6,
-            "warm must win on overlap (expected warm total {warm_w1_total}, got {})",
-            overlap.value
-        );
-    }
-
-    /// Control: when warm coverage already spans the request exactly
-    /// (`cov_lo == start_ms && cov_hi == end_ms`), no stitch is needed and the
-    /// warm-only matrix is returned unchanged — the archive is NOT consulted
-    /// even though it's wired. Per-window coverage is window-end-point-based,
-    /// Control: with NO archive engine wired, the range path returns the
-    /// warm-only matrix (no stitch, no error) even when warm coverage is
-    /// narrower than the request — the stitch is gated on a configured
-    /// archive. This pins that the fix doesn't disturb the archive-less
-    /// deployment (the warm tier answers what it can).
-    #[tokio::test]
-    async fn range_warm_only_when_no_archive_engine() {
-        let idx = Arc::new(SketchStore::new());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let start_ms = now_ms.saturating_sub(600_000);
-        let end_ms = now_ms;
-        // Warm covers only one suffix window — narrower than the request.
-        let w_end = now_ms.saturating_sub(100_000);
-        let sid = 9200u64;
-        idx.register(cms_meta(sid, "req_count"));
-        idx.append_sample(
-            sid,
-            BTreeMap::new(),
-            (w_end.saturating_sub(30_000), w_end),
-            SketchSampleState {
-                bytes: cms_bytes(42),
-                encoding: SketchEncoding::ProtoFull,
-            },
-        );
-
-        // No `.with_archive_engine(...)` — stitch must NOT fire.
-        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_config);
-        let engine = ASAPQueryEngine::new(15000).with_sketch_index(idx);
-
-        let result = engine
-            .execute_range_promql_modern("count_over_time(req_count[5m])", start_ms, end_ms, 15_000)
-            .await
-            .expect("range query must answer warm-only");
-        let m = match result {
-            QueryResult::Matrix(m) => m,
-            other => panic!("expected Matrix, got {other:?}"),
-        };
-        // Warm-only: exactly the single warm window-end sample, no archive
-        // prefix injected.
-        let ts: Vec<u64> = m
-            .values
-            .iter()
-            .flat_map(|el| el.samples.iter().map(|s| s.timestamp))
-            .collect();
-        assert_eq!(
-            ts,
-            vec![w_end],
-            "warm-only result must carry just the warm window sample: {ts:?}"
-        );
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ impl SeriesBuffer {
         self.watermark_ms
     }
 
+    #[cfg(test)]
     /// Read all samples in `[start_ms, end_ms)` — inclusive start, exclusive end.
     /// Returns them in timestamp order.
     pub fn read_range(&self, start_ms: i64, end_ms: i64) -> Vec<(i64, f64)> {
@@ -51,6 +52,7 @@ impl SeriesBuffer {
             .collect()
     }
 
+    #[cfg(test)]
     /// Drain (remove and return) all samples with `timestamp_ms < up_to_ms`.
     pub fn drain_up_to(&mut self, up_to_ms: i64) -> Vec<(i64, f64)> {
         let mut drained = Vec::new();

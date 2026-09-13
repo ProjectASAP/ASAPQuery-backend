@@ -54,6 +54,7 @@ impl MonitorCoordinator {
         })
     }
 
+    #[cfg(test)]
     /// Number of configured monitors (test/observability).
     pub fn monitor_count(&self) -> usize {
         self.cfgs.read().unwrap().len()

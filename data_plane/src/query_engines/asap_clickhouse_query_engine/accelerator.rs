@@ -588,6 +588,7 @@ mod tests {
                     read,
                     QueryPlanNode::ReadMaterialization {
                         binding: MaterializationBinding {
+            full_window_slide_ms: None,
                             materialization,
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
                             item_labels: Vec::new(),

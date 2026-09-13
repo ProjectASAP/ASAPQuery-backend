@@ -256,6 +256,7 @@ impl Manifest {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Rewrite the snapshot from the current in-memory live set and
     /// truncate the log. Atomic: the new snapshot goes to a tmp file
     /// first, then rename, then the log is truncated.

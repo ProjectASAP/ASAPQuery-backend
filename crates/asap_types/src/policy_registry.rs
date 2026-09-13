@@ -55,6 +55,7 @@ impl PolicyRegistry {
         Self { policies }
     }
 
+    #[cfg(test)]
     /// Construct + report the count of duplicate fingerprints (entries
     /// where the source contained two configs producing the same
     /// fingerprint and the later one displaced the earlier). Zero in

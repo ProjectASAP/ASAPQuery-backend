@@ -95,7 +95,13 @@ pub struct TopKMembershipEvidence {
 Why this interface exists: it prevents adapters, protocols, and physical
 planning from each implementing their own query-to-summary mapping.
 
-Each `WindowRealizationCandidate` carries a backend-owned implementation
+Snapshot and HTTP adapters provide the same `WindowCostModel`. After logical
+selection, one generator enumerates layouts allowed by each state's maintenance
+requirements and deployment target, then derives or matches layout-specific costs.
+See [repeated window planning](../planning/repeated-dashboard-panes.md) for inputs,
+migration and cadence examples.
+
+Each internally generated `WindowRealizationCandidate` carries a backend-owned implementation
 identity, its Planner `SummaryWindowFramework`, concrete window/pane/state
 layout, and versioned workload-specific CPU, peak-memory, network, storage,
 scan, and calibrated weighted-cost evidence. The compiler collapses several

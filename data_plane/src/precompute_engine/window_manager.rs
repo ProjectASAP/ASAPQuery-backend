@@ -178,6 +178,7 @@ impl WindowManager {
         origin + (timestamp_ms - origin).div_euclid(self.pane_interval_ms) * self.pane_interval_ms
     }
 
+    #[cfg(test)]
     /// All pane starts composing a window, in ascending order.
     /// A window `[ws, ws + window_size)` is composed of
     /// `window_size / slide_interval` consecutive panes.

@@ -38,8 +38,7 @@ const CMS_ROWS: usize = 5;
 const CMS_COLS: usize = 2048;
 // ASAPPlanner's CountSketch guarantee is L2-based: epsilon=sqrt(3/width),
 // with an odd Hoeffding-median depth. The current runtime's packed sign hash
-// limits this width to five rows, which satisfies the explicit delta=0.8
-// contract used only by the CountSketch child process below.
+// limits this width to five rows. The fixture installs these parameters explicitly.
 const COUNT_SKETCH_ROWS: usize = 5;
 const COUNT_SKETCH_COLS: usize = 32_768;
 
@@ -108,7 +107,7 @@ fn envelope(metric: &str, data: Data) -> ExportMetricsServiceRequest {
     }
 }
 
-async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
+async fn start_backend(config_yaml: &str) -> Backend {
     let query_port = unused_port();
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
@@ -165,9 +164,6 @@ async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
         .arg("100")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(delta) = live_delta {
-        command.env("ASAP_SUMMARY_EXECUTOR_DELTA", delta);
-    }
     let child = command.spawn().expect("start production data-plane binary");
     let mut child = ChildGuard(child);
     let client = reqwest::Client::new();
@@ -449,11 +445,7 @@ fn assert_frequency_point_oracle(response: &Value, raw: &[&str], item: &str) {
 #[tokio::test]
 async fn production_kll_matches_raw_quantile_oracle() {
     let metric = "oracle_kll_latency";
-    let backend = start_backend(
-        &config(metric, "DatasketchesKLL", &format!("      k: {K}")),
-        None,
-    )
-    .await;
+    let backend = start_backend(&config(metric, "DatasketchesKLL", &format!("      k: {K}"))).await;
     let raw: Vec<f64> = (1..=101).map(f64::from).collect();
     let timestamp = now_ns().saturating_sub(2_000_000_000);
     post(&backend, kll_export(metric, timestamp, &raw)).await;
@@ -475,10 +467,11 @@ async fn production_kll_matches_raw_quantile_oracle() {
 #[tokio::test]
 async fn production_hll_matches_raw_distinct_oracle() {
     let metric = "oracle_hll_users";
-    let backend = start_backend(
-        &config(metric, "HLL", &format!("      precision: {HLL_PRECISION}")),
-        None,
-    )
+    let backend = start_backend(&config(
+        metric,
+        "HLL",
+        &format!("      precision: {HLL_PRECISION}"),
+    ))
     .await;
     let owned: Vec<String> = (0..2_000).map(|i| format!("user-{i}")).collect();
     let mut raw: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -512,7 +505,7 @@ fn frequency_fixture() -> Vec<&'static str> {
 async fn production_cms_matches_raw_frequency_oracle() {
     let metric = "oracle_cms_frequency";
     let params = format!("      w: {CMS_COLS}\n      d: {CMS_ROWS}");
-    let backend = start_backend(&config(metric, "CountMinSketch", &params), None).await;
+    let backend = start_backend(&config(metric, "CountMinSketch", &params)).await;
     let raw = frequency_fixture();
     let timestamp = now_ns().saturating_sub(2_000_000_000);
     post(&backend, cms_export(metric, timestamp, &raw)).await;
@@ -535,7 +528,7 @@ async fn production_count_sketch_matches_raw_frequency_oracle() {
     // current packed-hash runtime can execute at this width. Keep the default
     // production SLA untouched and declare the weaker contract explicitly
     // for this isolated algorithm-oracle process.
-    let backend = start_backend(&config(metric, "CountSketch", &params), Some("0.8")).await;
+    let backend = start_backend(&config(metric, "CountSketch", &params)).await;
     let raw = frequency_fixture();
     let timestamp = now_ns().saturating_sub(2_000_000_000);
     post(&backend, count_sketch_export(metric, timestamp, &raw)).await;

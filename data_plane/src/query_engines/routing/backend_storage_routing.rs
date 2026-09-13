@@ -347,6 +347,7 @@ impl BackendStorageRouting {
         }
     }
 
+    #[cfg(test)]
     /// Return a copy of this routing table re-scoped to `tenant`.
     /// Used by tests / per-tenant hot-reload to retag a table built
     /// from a tenant-agnostic JSON / YAML payload.

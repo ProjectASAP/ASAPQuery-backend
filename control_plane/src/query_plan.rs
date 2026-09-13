@@ -16,31 +16,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-pub fn compile_bound<F>(
-    query_id: String,
-    canonical_query: String,
-    root: &Rc<SummaryNode>,
-    instant: InstantExecution,
-    fallback: FallbackPolicy,
-    bind: F,
-) -> Result<QueryPlanEntry, QueryPlanError>
-where
-    F: FnMut(
-        &Rc<SummaryNode>,
-        &SummaryFamilyType,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
-{
-    compile_bound_mapped(
-        query_id,
-        canonical_query,
-        root,
-        instant,
-        fallback,
-        bind,
-        |_, _| {},
-    )
-}
-
 pub fn compile_bound_mapped<F, G>(
     query_id: String,
     canonical_query: String,
@@ -77,33 +52,6 @@ where
         instant,
         fallback,
     })
-}
-
-pub fn compile_bound_relational<F>(
-    query_id: String,
-    canonical_query: String,
-    root: &Rc<SummaryNode>,
-    fixed_evaluation: FixedEvaluationRange,
-    instant: InstantExecution,
-    fallback: FallbackPolicy,
-    bind: F,
-) -> Result<QueryPlanEntry, QueryPlanError>
-where
-    F: FnMut(
-        &Rc<SummaryNode>,
-        &SummaryFamilyType,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
-{
-    compile_bound_relational_mapped(
-        query_id,
-        canonical_query,
-        root,
-        fixed_evaluation,
-        instant,
-        fallback,
-        bind,
-        |_, _| {},
-    )
 }
 
 /// Preserve Planner-to-runtime node identities for installed SQL DAGs.
@@ -144,33 +92,6 @@ where
         instant,
         fallback,
     })
-}
-
-/// Compile selected summary nodes and verified native residuals into one DAG.
-/// This is a distinct physical alternative; native execution remains available.
-pub fn compile_bound_composable<F>(
-    query_id: String,
-    canonical_query: String,
-    root: &Rc<SummaryNode>,
-    instant: InstantExecution,
-    fallback: FallbackPolicy,
-    bind: F,
-) -> Result<QueryPlanEntry, QueryPlanError>
-where
-    F: FnMut(
-        &Rc<SummaryNode>,
-        &SummaryFamilyType,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
-{
-    compile_bound_composable_mapped(
-        query_id,
-        canonical_query,
-        root,
-        instant,
-        fallback,
-        bind,
-        |_, _| {},
-    )
 }
 
 /// Compile a composable query while exposing the stable mapping from
@@ -1088,6 +1009,7 @@ mod catalog_binding_tests {
                 QueryNodeId(1),
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
+                        full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: config.policy_fingerprint().into(),
                         output_grouping: PhysicalGrouping::PerEntity,

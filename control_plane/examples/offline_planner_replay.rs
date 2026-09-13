@@ -11,7 +11,7 @@ use control_plane::{
         PostAsapPlan,
     },
     query_parser::parse_query_expr_canonical,
-    types_v2::AccuracyTarget,
+    types::AccuracyTarget,
 };
 use planner_types::post_asap::{SummaryExpr, SummaryFamilyType, SummaryNode};
 use serde_json::{json, Value};

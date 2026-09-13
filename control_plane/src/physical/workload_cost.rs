@@ -274,7 +274,7 @@ pub fn manifest(
             {
                 let parsed = crate::query_parser::parse_query_expr_canonical(
                     query,
-                    crate::types_v2::AccuracyTarget::Exact,
+                    crate::types::AccuracyTarget::Exact,
                 )
                 .map_err(|error| invalid(error.to_string()))?;
                 for metric in exact_source_metrics(&parsed)? {
@@ -835,12 +835,12 @@ mod tests {
         let root = renamed.as_object_mut().unwrap();
         let version = root.remove("snapshot_version").unwrap();
         root.insert("schema_version".into(), version);
-        let mut inputs = root.remove("implementation").unwrap();
-        let physical = inputs.as_object_mut().unwrap();
-        let id = physical.remove("window_implementation_id").unwrap();
-        physical.insert("default_window_realization_id".into(), id);
-        let quote = physical.remove("implementation_cost").unwrap();
-        physical.insert("default_window_cost_quote".into(), quote);
+        let inputs = root.remove("implementation").unwrap();
+        // Upstream window planning now consumes a cost model; removed default
+        // window fields are no longer part of the naming compatibility contract.
+        assert!(inputs.get("window_cost_model").is_some());
+        assert!(inputs.get("window_implementation_id").is_none());
+        assert!(inputs.get("implementation_cost").is_none());
         root.insert("physical_inputs".into(), inputs);
         let environment = root
             .get_mut("environment")
@@ -1063,7 +1063,7 @@ mod tests {
         q.query =
             planner_types::workload::Query("max_over_time(a[1m]) + max_over_time(b[1m])".into());
         q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
-            crate::types_v2::AccuracyTarget::Exact,
+            crate::types::AccuracyTarget::Exact,
         );
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
@@ -1170,7 +1170,7 @@ mod tests {
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         entry.query = Query("sum(rate(a{job=\"x\"}[1m])) / sum(rate(a{job!=\"x\"}[5m]))".into());
         entry.requirements.accuracy =
-            AccuracyRequirement::Explicit(crate::types_v2::AccuracyTarget::Exact);
+            AccuracyRequirement::Explicit(crate::types::AccuracyTarget::Exact);
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         assert!(candidates.len() >= 2);

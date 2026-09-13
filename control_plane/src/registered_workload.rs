@@ -6,15 +6,15 @@ use planner_types::workload::*;
 
 use crate::{
     query_parser::{self, ParsedQuery},
+    types::AccuracyTarget,
     types::{AggType, SketchType, WorkloadCharacteristics},
-    types_v2::AccuracyTarget,
 };
 
 /// Facts about the collector deployment, not query semantics or data arrival.
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentOptions {
     pub sketch_type_override: Option<SketchType>,
-    pub query_id: Option<crate::types_v2::QueryId>,
+    pub query_id: Option<crate::types::QueryId>,
     pub deployment_model: Option<String>,
     pub retained_labels: Vec<String>,
     pub bytes_per_raw_sample: u32,
@@ -533,7 +533,7 @@ mod tests {
     fn recurrence_is_separate_from_arrival() {
         let mut input = spec();
         input.repeat_every = None;
-        input.data = crate::types_v2::DataShape::Batch;
+        input.data = crate::types::DataShape::Batch;
         let once = Analyzer::new().analyze(input.clone()).unwrap();
         assert!(matches!(
             once.entry().recurrence,

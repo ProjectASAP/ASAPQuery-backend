@@ -147,7 +147,7 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     let Some(qs) = entry.query_string.as_ref() else {
         return AggRole::Other;
     };
-    let accuracy = crate::types_v2::accuracy_target_from_legacy_accuracy_sla(entry.accuracy_sla);
+    let accuracy = crate::types::accuracy_target_from_legacy_accuracy_sla(entry.accuracy_sla);
     let Ok(expr) = crate::query_parser::parse_query_expr_canonical(qs, accuracy) else {
         return AggRole::Other;
     };
@@ -404,8 +404,8 @@ pub fn query_spec_for_entry(entry: &WorkloadEntry) -> crate::pipeline::QuerySpec
         accuracy: None,
         dollars: None,
         deployment_model: None,
-        shape: crate::types_v2::QueryShape::default(),
-        data: crate::types_v2::DataShape::default(),
+        shape: crate::types::QueryShape::default(),
+        data: crate::types::DataShape::default(),
     }
 }
 
@@ -597,6 +597,7 @@ impl WorkloadRegistry {
         &self.entries
     }
 
+    #[cfg(test)]
     /// Returns workload entries assigned to a given role.
     pub fn for_role(&self, role: &str) -> Vec<&WorkloadEntry> {
         self.entries

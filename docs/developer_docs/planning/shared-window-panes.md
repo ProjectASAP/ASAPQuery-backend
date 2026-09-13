@@ -1,47 +1,38 @@
 # Shared additive window panes
 
-The fallback window provider prices each query range. After logical selection,
-raw inputs of derived maintenance programs use full, non-overlapping windows,
-matching the current maintenance executor. Explicit `window_candidates` remain
-authoritative and are not rewritten.
+The compiler generates and prices layouts from selected state requirements.
+See [window planning](repeated-dashboard-panes.md) for the input contract and all
+cadence examples.
 
-For backend-local raw SUM states, the backend offers compatible selected pane
-producers to ASAPPlanner's `pane_sharing::select_shared_panes`. The compatibility
-key preserves source, population predicate, projection, accumulator parameters,
-grouping, partitioning, pane width/origin, runtime policy and lifecycle evidence.
-Planner compares independent producers with one producer retained for the longest
-lookback, charging every readout. Only beneficial groups are installed.
+After individual layout selection, backend-local raw SUM producers may share a
+common-divisor pane. Compatibility preserves source, population predicate,
+projection, accumulator parameters, grouping, partitioning, runtime policy,
+accuracy and lifecycle unit-cost evidence. Evaluation intervals may differ;
+each consumer's reads are charged at its own interval. Origins must agree modulo
+the proposed common pane width.
 
-The shared state's physical window is one pane. Logical readout windows stay on
-their original QueryPlan bindings. Retention uses the largest bound lookback.
-For `sum_over_time(a[1m]) / sum_over_time(a[10m])` evaluated every minute, one
-60-second producer retains 11 published states; readouts merge one and ten panes.
-Different metrics, predicates or phases remain separate. Derived inputs, explicit
-window quotes, non-additive state and independently selected FullWindow layouts
-are not rewritten. This pass reuses compatible selected panes; it does not search
-all possible pane widths or re-optimize FullWindow choices jointly.
+The optimizer compares the original producers with one producer at the common
+pane width, retained for the longest lookback. It recalculates build, maintenance,
+retention, retirement and read costs for the new layout. Only a finite, strictly
+cheaper group is installed. Derived maintenance inputs, explicitly quoted selected
+layouts, non-additive states and independently selected complete-window layouts
+are not rewritten. This is a bounded comparison of selected panes, not exhaustive
+search over all layouts or hierarchical rollups.
 
-Layout pricing charges both published retained states and open worker
-accumulators. A full window of width W and step S keeps ceil(W/S) open states;
-a pane producer keeps one. These residency costs are separate from update CPU.
-Nonfinite arithmetic remains invalid evidence rather than becoming a zero quote.
+The shared state's physical window is one pane. Logical readout windows remain
+on the QueryPlan bindings. For `sum_over_time(a[1m]) / sum_over_time(a[10m])`
+evaluated every minute, one 60s producer retains 11 published states, while its
+readouts merge one and ten panes. For separate 60s/20s and 90s/30s demands, a
+10s shared producer may win when maintenance is expensive; independent producers
+remain when the extra reads or pane creation cost more.
 
-## Cross-repository validation
+Costs include published retained states and open worker accumulators. Complete
+windows have at most `ceil(W/E)` open states; their rate-model average update
+fanout is `W/E`, including sparse schedules. Pane producers have one active state.
+These are supplied unit costs and structural estimates, not measurements.
 
-The backend pins Planner commit `ca7546de792d74aee8231e9a1100ca893d9e86d3`, which provides
-`pane_sharing::select_shared_panes`. Normal builds use the Git dependency.
-For coordinated local development, the optional validation script exports only
-the optimizer crate while retaining the pinned IR/frontend revision and restores
-Cargo.lock after the run.
-
-```sh
-python3 tools/test_shared_panes.py --planner /path/to/ASAPPlanner -- \
-  test -p control_plane
-python3 tools/test_shared_panes.py --planner /path/to/ASAPPlanner \
-  --sketchlib /path/to/compatible/asap_sketchlib -- \
-  test -p data_plane --lib compiled_shared_sum_panes_preserve_each_lookback
-```
-
-Use `--toolchain 1.98.0` if needed in the development environment. The data-plane
-checkout requires sketchlib's standard-update guard and interpolated quantile
-interfaces; validation used revision `8c03d7c` for those existing dependencies.
+If the entire compatibility group cannot share, the optimizer selects profitable
+phase-compatible pairs, ordered by savings, and retries the remaining members.
+An incompatible or expensive fine-cadence consumer therefore does not block reuse
+between other consumers. This deterministic greedy selection does not claim a
+globally optimal partition of all workload states.

@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::query_parser;
+use crate::types::{AccuracyTarget, DataShape, QueryId, QueryLanguage, QueryShape};
 use crate::types::{AggType, RegisteredWorkload, SketchType, WorkloadCharacteristics};
-use crate::types_v2::{AccuracyTarget, DataShape, QueryId, QueryLanguage, QueryShape};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -113,7 +113,7 @@ impl Analyzer {
 
     pub fn analyze(&self, spec: QuerySpec) -> anyhow::Result<RegisteredWorkload> {
         let accuracy =
-            crate::types_v2::resolve_accuracy_target(spec.accuracy.as_ref(), spec.accuracy_sla)
+            crate::types::resolve_accuracy_target(spec.accuracy.as_ref(), spec.accuracy_sla)
                 .map_err(|error| anyhow!(error))?;
 
         // ── design.md L1: shape × data cross-product check ─────────────────
@@ -249,7 +249,7 @@ impl Analyzer {
         };
         anyhow::ensure!(
             spec.language.is_none()
-                || matches!(spec.language, Some(crate::types_v2::QueryLanguage::PromQl)),
+                || matches!(spec.language, Some(crate::types::QueryLanguage::PromQl)),
             "metric registration requires PromQL"
         );
         anyhow::ensure!(
@@ -890,7 +890,7 @@ mod tests {
             "data":             "batch"
         }"#;
         let spec: QuerySpec = serde_json::from_str(json).unwrap();
-        assert_eq!(spec.id.as_ref().unwrap().as_str(), "q-001");
+        assert_eq!(spec.id.as_ref().unwrap().0.as_str(), "q-001");
         assert_eq!(spec.language, Some(QueryLanguage::PromQl));
         assert_eq!(spec.accuracy, Some(AccuracyTarget::Epsilon(0.02)));
         assert_eq!(spec.dollars, None);

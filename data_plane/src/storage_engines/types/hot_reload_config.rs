@@ -334,7 +334,7 @@ impl PhysicalPlanLifecycle {
     }
 
     /// Roll back a failed publication without touching active readers or state.
-    pub fn discard_staged(
+    pub(crate) fn discard_staged(
         &self,
         plan_id: u64,
         plan_version: u64,
@@ -433,7 +433,7 @@ impl PhysicalPlanLifecycle {
 
     /// Mark a superseded generation retired after all readers of the old
     /// immutable snapshot have drained.
-    pub fn mark_drained_plan_retired(&self, plan_id: u64, plan_version: u64) {
+    pub(crate) fn mark_drained_plan_retired(&self, plan_id: u64, plan_version: u64) {
         if let Some(status) = self
             .state
             .lock()
@@ -481,7 +481,7 @@ impl ActivePhysicalPlanHandle {
         old
     }
 
-    pub fn materialization_statuses(&self) -> Vec<MaterializationStatus> {
+    pub(crate) fn materialization_statuses(&self) -> Vec<MaterializationStatus> {
         self.readiness
             .lock()
             .expect("materialization readiness lock poisoned")

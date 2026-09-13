@@ -13,7 +13,6 @@ use control_plane::replan;
 use control_plane::runtime_samples;
 use control_plane::store;
 use control_plane::types;
-use control_plane::types_v2;
 use control_plane::workload;
 
 use axum::{
@@ -517,13 +516,10 @@ struct PhysicalPlanQueryRequest {
     window_secs: u64,
     #[serde(default)]
     group_by: Vec<String>,
-    accuracy: types_v2::AccuracyTarget,
+    accuracy: types::AccuracyTarget,
     lifecycle: physical::compiler::SummaryLifecyclePlanningInputs,
-    #[serde(
-        rename = "window_implementations",
-        alias = "window_realization_candidates"
-    )]
-    window_realization_candidates: Vec<physical::compiler::WindowRealizationCandidate>,
+    window_cost_model: physical::compiler::WindowCostModel,
+    evaluation_phase_ms: u64,
     #[serde(default)]
     runtime_policy: physical::compiler::RuntimeRulePolicy,
 }
@@ -660,7 +656,11 @@ async fn compile_and_publish_physical_plan(
         }
     };
     if let Err(error) = backend
-        .post_catalog_plan_typed(&publication, None, &adaptation_evidence)
+        .post_catalog_plan_typed(
+            &publication,
+            Some(bundle.storage_routing.clone()),
+            &adaptation_evidence,
+        )
         .await
     {
         return (
@@ -844,6 +844,8 @@ fn compile_physical_plan_request(
         .as_millis() as u64;
     let mut queries = Vec::with_capacity(request.queries.len());
     let mut canonical_roots = Vec::with_capacity(request.queries.len());
+    let mut window_models = Vec::new();
+    let mut workload_entries = Vec::new();
     for query in request.queries {
         if query.query_id.trim().is_empty()
             || query.metric.trim().is_empty()
@@ -865,6 +867,29 @@ fn compile_physical_plan_request(
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
         };
         canonical_roots.push(std::rc::Rc::new(expr));
+        window_models.push(query.window_cost_model);
+        workload_entries.push(planner_types::workload::RepeatingEntry {
+            query: planner_types::workload::Query(query.query_string.clone()),
+            demand: planner_types::workload::RepeatedDemand::FixedIntervalAt {
+                interval: planner_types::workload::RepetitionInterval(
+                    query.lifecycle.evaluation_interval_ms,
+                ),
+                evaluation_phase: planner_types::workload::TimestampMs(query.evaluation_phase_ms),
+            },
+            requirements: planner_types::workload::QueryRequirements {
+                accuracy: planner_types::workload::AccuracyRequirement::Explicit(
+                    query.accuracy.clone(),
+                ),
+                ..Default::default()
+            },
+            predictability: planner_types::workload::Predictability::Predictable { known_at: None },
+            time_selection: planner_types::workload::TimeSelection {
+                lookback: Some(planner_types::workload::DurationMs(
+                    query.window_secs.saturating_mul(1_000),
+                )),
+                ..Default::default()
+            },
+        });
         queries.push(physical::compiler::QueryCompilationInput {
             query_id: query.query_id,
             query_string: query.query_string,
@@ -876,7 +901,7 @@ fn compile_physical_plan_request(
             group_by_labels: query.group_by,
             accuracy_target: query.accuracy,
             summary_lifecycle_inputs: query.lifecycle,
-            window_realization_candidates: query.window_realization_candidates,
+            window_realization_candidates: Vec::new(),
             materialization_runtime_policy: query.runtime_policy,
         });
     }
@@ -892,10 +917,18 @@ fn compile_physical_plan_request(
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
     };
 
+    for (query, model) in queries.iter_mut().zip(window_models) {
+        physical::compiler::prepare_window_implementations(query, &model, request.target, 0)
+            .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
+    }
     let compilation_request = physical::compiler::PhysicalCompilationRequest {
-        compiler_priced_window_query_ids: Default::default(),
         planner_selection_trace,
-        query_workload: None,
+        query_workload: Some(planner_types::workload::QueryWorkload {
+            language: planner_types::workload::QueryLanguage::PromQL,
+            query_batch: None,
+            repeating_queries: Some(workload_entries),
+            data_workload: None,
+        }),
         queries,
         allow_mixed_summary_and_exact_execution: request.target
             == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite,
@@ -2176,7 +2209,10 @@ mod api_tests {
             include_str!("../../docs/examples/asapquery-planning-snapshot.json"),
         )
         .unwrap();
-        let (planning, _) = snapshot.into_physical_compilation_request().unwrap();
+        let (planning, _) = snapshot
+            .clone()
+            .into_physical_compilation_request()
+            .unwrap();
         let query = &planning.queries[0];
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2186,7 +2222,7 @@ mod api_tests {
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
                 "metric": "m", "window_secs": 60, "accuracy": query.accuracy_target,
-                "lifecycle": query.summary_lifecycle_inputs, "window_implementations": []
+                "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": snapshot.physical_inputs.window_cost_model
             }],
             "collector_ids": ["test"], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
@@ -2240,7 +2276,10 @@ mod api_tests {
             include_str!("../../docs/examples/asapquery-compatibility-demo-snapshot.json"),
         )
         .unwrap();
-        let (planning, _) = snapshot.into_physical_compilation_request().unwrap();
+        let (planning, _) = snapshot
+            .clone()
+            .into_physical_compilation_request()
+            .unwrap();
         let mut query = planning.queries[0].clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2259,7 +2298,7 @@ mod api_tests {
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
                 "metric": metric, "window_secs": query.query_lookback_seconds, "accuracy": query.accuracy_target,
-                "lifecycle": query.summary_lifecycle_inputs, "window_implementations": query.window_realization_candidates
+                "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_realization_candidates[0].cost }
             }],
             "collector_ids": [], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
@@ -2351,7 +2390,7 @@ mod api_tests {
     /// HTTP and stored replan inputs share the resolved typed target, including delta.
     #[tokio::test]
     async fn plan_preserves_typed_accuracy_requirements() {
-        use control_plane::types_v2::AccuracyTarget;
+        use control_plane::types::AccuracyTarget;
         for target in [
             AccuracyTarget::Epsilon(0.05),
             AccuracyTarget::EpsilonDelta {
@@ -2738,8 +2777,8 @@ mod api_tests {
             accuracy: None,
             dollars: None,
             deployment_model: None,
-            shape: types_v2::QueryShape::default(),
-            data: types_v2::DataShape::default(),
+            shape: types::QueryShape::default(),
+            data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
 
@@ -2878,8 +2917,8 @@ mod api_tests {
             accuracy: None,
             dollars: None,
             deployment_model: None,
-            shape: types_v2::QueryShape::default(),
-            data: types_v2::DataShape::default(),
+            shape: types::QueryShape::default(),
+            data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
 
@@ -3138,8 +3177,8 @@ mod api_tests {
             accuracy: None,
             dollars: None,
             deployment_model: None,
-            shape: types_v2::QueryShape::default(),
-            data: types_v2::DataShape::default(),
+            shape: types::QueryShape::default(),
+            data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).expect("analyze");
 
@@ -3373,8 +3412,8 @@ mod api_tests {
                 accuracy: None,
                 dollars: None,
                 deployment_model: None,
-                shape: types_v2::QueryShape::default(),
-                data: types_v2::DataShape::default(),
+                shape: types::QueryShape::default(),
+                data: types::DataShape::default(),
             };
             let wl = analyzer.analyze(spec).expect("analyze");
 

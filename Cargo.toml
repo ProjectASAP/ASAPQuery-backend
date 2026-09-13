@@ -40,6 +40,7 @@ chrono = { version = "0.4", features = ["serde"] }
 promql-parser = { git = "https://github.com/ProjectASAP/promql-parser" }
 tokio = { version = "1.0", features = ["full"] }
 arc-swap = "1.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Internal crates
 asap_types = { path = "crates/asap_types" }

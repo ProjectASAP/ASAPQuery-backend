@@ -41,10 +41,8 @@ impl WindowMaterializationLayout {
     }
 
     pub fn validate(&self, window_secs: u64, slide_secs: u64) -> Result<(), String> {
-        if window_secs == 0 || slide_secs == 0 || slide_secs > window_secs {
-            return Err(
-                "window and slide must be positive and slide must not exceed window".into(),
-            );
+        if window_secs == 0 || slide_secs == 0 {
+            return Err("window and slide must be positive".into());
         }
         match self {
             Self::Pane { pane_secs } => {
@@ -196,14 +194,7 @@ pub struct AggregationIdInfo {
     pub aggregation_type_for_value: AggregationType,
 }
 
-impl AggregationIdInfo {
-    pub fn policy_fp_for_key(&self) -> PolicyFingerprint {
-        PolicyFingerprint(self.key_policy_fingerprint)
-    }
-    pub fn policy_fp_for_value(&self) -> PolicyFingerprint {
-        PolicyFingerprint(self.value_policy_fingerprint)
-    }
-}
+impl AggregationIdInfo {}
 
 /// Compatibility name for legacy streaming-config and precompute call sites.
 /// New CompiledPhysicalPlan code should use [`PrecomputeMaterialization`].
@@ -352,11 +343,6 @@ impl PrecomputeMaterialization {
     /// addressed identity, NOT a controller-allocated counter id.
     pub fn policy_fp_u64(&self) -> u64 {
         self.policy_fingerprint().as_u64()
-    }
-
-    pub fn with_original_yaml(mut self, yaml: String) -> Self {
-        self.original_yaml = yaml;
-        self
     }
 
     pub fn deserialize_from_json(

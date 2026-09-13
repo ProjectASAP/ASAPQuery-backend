@@ -694,28 +694,6 @@ impl<P> SealedEpoch<P> {
         }
     }
 
-    /// Count of distinct time windows in this sealed epoch — O(N)
-    /// scan (entries are sorted, so consecutive dupes are adjacent).
-    pub fn distinct_window_count(&self) -> usize {
-        let mut count = 0usize;
-        let mut last: Option<TimestampRange> = None;
-        for (w, _, _) in &self.entries {
-            if last != Some(*w) {
-                count += 1;
-                last = Some(*w);
-            }
-        }
-        count
-    }
-
-    /// Sorted-deduplicated windows. Used by the legacy SketchStore to
-    /// surface the windows that were dropped on epoch eviction.
-    pub fn unique_windows(&self) -> Vec<TimestampRange> {
-        let mut windows: Vec<TimestampRange> = self.entries.iter().map(|(w, _, _)| *w).collect();
-        windows.dedup();
-        windows
-    }
-
     /// Remove all entries whose window is in `windows`. O(N) scan;
     /// preserves sortedness since `retain` keeps relative order.
     pub fn remove_windows(&mut self, windows: &[TimestampRange]) {

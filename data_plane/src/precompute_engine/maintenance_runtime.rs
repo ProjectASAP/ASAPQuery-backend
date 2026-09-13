@@ -842,6 +842,7 @@ fn evaluate_frozen_maintenance_sink(
     Ok((state, digest))
 }
 
+#[cfg(test)]
 /// Execute an installed, single-population maintenance subDAG from frozen
 /// base panes and publish its complete output through the durable part path.
 /// This initial entry point accepts non-overlapping output windows; sliding
