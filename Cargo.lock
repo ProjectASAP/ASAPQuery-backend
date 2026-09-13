@@ -461,6 +461,7 @@ name = "asap_types"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asap-aware-mapping",
  "asap-types",
  "base64 0.21.7",
  "clap 4.6.6",

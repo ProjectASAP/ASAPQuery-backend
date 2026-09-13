@@ -12,7 +12,7 @@
 //!
 //! ## Scope of this module
 //!
-//! Pure derivation: `AccuracyProfile::derive(&AggregationConfig)`
+//! Pure derivation: `derive(&AggregationConfig)`
 //! looks at `aggregation_type` and the relevant entries in
 //! `config.parameters` and returns an `AccuracyProfile`. No
 //! runtime measurement, no sampling — just the textbook bound.
@@ -24,238 +24,191 @@
 //! ("how far off might this answer be?") the theoretical bound
 //! is the honest upper envelope.
 //!
-//! ## Bounds we encode
-//!
-//! | Sketch | `kind` | ε formula | δ formula |
-//! |---|---|---|---|
-//! | Sum / Min / Max / Increase | `Exact` | 0 | 0 |
-//! | CountMinSketch(w, d) | `AdditiveFrequency` | e / w | 1 / 2^d |
-//! | CountMinSketchWithHeap(w, d, k) | `TopK` | max(e/w, 1/k) | 1 / 2^d |
-//! | CountSketch(w, d) | `AdditiveFrequency` | 1 / √w | 1 / 2^d |
-//! | HLL(p) | `RelativeCardinality` | 1.04 / √(2^p) | — (Gaussian std-dev) |
-//! | KLL(k) | `RankQuantile` | ≈ 2.296 / √k (worst-case constant) | 1 / 100 (fixed) |
-//! | DDSketch(α) | `RelativeQuantile` | α | 0 (deterministic α guarantee) |
-//!
-//! Constants are chosen to match the tighter published bounds
-//! rather than loose textbook versions; sources are cited inline
-//! in each branch of [`AccuracyProfile::derive`].
-//!
-// See `docs/design_docs/summary-storage.md` for backend storage guarantees.
+//! CMS, HLL, KLL, and DDSketch profiles come from ASAPPlanner's
+//! `DefaultAccuracyModel`. HLL reports relative standard error with unknown
+//! failure probability (`delta: null`), rather than a deterministic guarantee.
+//! CountSketch, heap-retention extensions, and GOS augmentation remain local.
+
+use serde::{Deserialize, Serialize};
 
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::AggregationType;
-pub use asap_types::{AccuracyKind, AccuracyProfile};
-use serde::{Deserialize, Serialize};
 
-/// Backend-specific derivation over the installed aggregation config.
+pub use asap_types::accuracy::{AccuracyKind, AccuracyProfile};
+use planner_types::post_asap::SketchParams as PlannerParams;
+
+/// Derive an [`AccuracyProfile`] from a pinned
+/// [`AggregationConfig`]. Reads `aggregation_type` and any
+/// necessary entries in `parameters`; falls back to exact for
+/// unknown / legacy variants (harmless — the caller just gets
+/// "0 error" rather than a panic).
+///
+/// GOS continuous-query envelope (design-gos-unified-edge-telemetry.md §4,
+/// Theorem 1): when the edge gates delta transmission by the GOS relative
+/// threshold (`parameters["gos_delta_epsilon"] = ε_st > 0`), the warm
+/// sketch answered from delta-applied state carries an extra DETERMINISTIC
+/// staleness term of at most `ε_st` (relative) at any query time — it adds
+/// linearly to the sketch's own probabilistic bound (`ε_total = ε_sk +
+/// ε_st`; the random parts compose in quadrature but the staleness part is
+/// adversarial, so linear addition is the honest envelope). δ is
+/// unchanged (staleness is not probabilistic).
+pub fn derive(config: &AggregationConfig) -> AccuracyProfile {
+    let mut profile = derive_sketch_only(config);
+    let eps_st = config
+        .parameters
+        .get("gos_delta_epsilon")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if eps_st > 0.0 && profile.kind != AccuracyKind::Exact {
+        profile.epsilon += eps_st;
+    }
+    profile
+}
+
+/// Source adapter for installed aggregation configs.
 pub trait BackendAccuracyProfile {
     fn derive(config: &AggregationConfig) -> Self;
     fn derive_sketch_only(config: &AggregationConfig) -> Self;
 }
-
 impl BackendAccuracyProfile for AccuracyProfile {
-    /// Derive an [`AccuracyProfile`] from a pinned
-    /// [`AggregationConfig`]. Reads `aggregation_type` and any
-    /// necessary entries in `parameters`; falls back to exact for
-    /// unknown / legacy variants (harmless — the caller just gets
-    /// "0 error" rather than a panic).
-    ///
-    /// GOS continuous-query envelope (design-gos-unified-edge-telemetry.md §4,
-    /// Theorem 1): when the edge gates delta transmission by the GOS relative
-    /// threshold (`parameters["gos_delta_epsilon"] = ε_st > 0`), the warm
-    /// sketch answered from delta-applied state carries an extra DETERMINISTIC
-    /// staleness term of at most `ε_st` (relative) at any query time — it adds
-    /// linearly to the sketch's own probabilistic bound (`ε_total = ε_sk +
-    /// ε_st`; the random parts compose in quadrature but the staleness part is
-    /// adversarial, so linear addition is the honest envelope). δ is
-    /// unchanged (staleness is not probabilistic).
     fn derive(config: &AggregationConfig) -> Self {
-        let mut profile = Self::derive_sketch_only(config);
-        let eps_st = config
-            .parameters
-            .get("gos_delta_epsilon")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        if eps_st > 0.0 && profile.kind != AccuracyKind::Exact {
-            profile.epsilon += eps_st;
-        }
-        profile
+        derive(config)
     }
-
-    /// The sketch's own theoretical bound, without the GOS staleness term.
     fn derive_sketch_only(config: &AggregationConfig) -> Self {
-        match config.aggregation_type {
-            AggregationType::UnivMon => Self {
-                epsilon: f64::MAX,
-                delta: 1.0,
-                kind: AccuracyKind::Uncalibrated,
-            },
-            // Exact aggregates. (The `SetAggregator` /
-            // `DeltaSetAggregator` exact-set-membership family lived
-            // here too before its retirement.)
-            AggregationType::Sum
-            | AggregationType::Increase
-            | AggregationType::MinMax
-            | AggregationType::MultipleSum
-            | AggregationType::MultipleIncrease
-            | AggregationType::MultipleMinMax => Self::exact(),
+        derive_sketch_only(config)
+    }
+}
 
-            // CountMinSketch: classic Cormode-Muthukrishnan bound.
-            // ε = e/w, δ = 1/2^d with w = width, d = depth. We
-            // pull w from `parameters["w"]` and d from
-            // `parameters["d"]` — the canonical keys the controller
-            // emits and `accumulator_factory::cms_params` reads.
-            // Defaults to (rows=4, cols=1000) when absent.
-            AggregationType::CountMinSketch => {
-                let (rows, cols) = cms_params(config);
-                // Using natural e ≈ 2.71828 for tighter bound.
-                // Source: Cormode & Muthukrishnan, "An improved
-                // data stream summary: the count-min sketch and
-                // its applications," J. Algorithms 55(1) 2005.
-                let epsilon = std::f64::consts::E / (cols as f64).max(1.0);
-                let delta = 0.5_f64.powi(rows as i32);
-                Self {
-                    epsilon,
-                    delta,
-                    kind: AccuracyKind::AdditiveFrequency,
-                }
-            }
+/// The sketch's own theoretical bound, without the GOS staleness term.
+fn derive_sketch_only(config: &AggregationConfig) -> AccuracyProfile {
+    match config.aggregation_type {
+        AggregationType::UnivMon => AccuracyProfile {
+            epsilon: f64::MAX,
+            delta: Some(1.0),
+            kind: AccuracyKind::Uncalibrated,
+        },
+        // Exact aggregates. (The `SetAggregator` /
+        // `DeltaSetAggregator` exact-set-membership family lived
+        // here too before its retirement.)
+        AggregationType::Sum
+        | AggregationType::Increase
+        | AggregationType::MinMax
+        | AggregationType::MultipleSum
+        | AggregationType::MultipleIncrease
+        | AggregationType::MultipleMinMax => AccuracyProfile::exact(),
 
-            // CountMinSketchWithHeap: CMS frequency estimator
-            // coupled with a heap of the top-`k` heaviest items
-            // (Metwally et al.'s SpaceSaving-style retention).
-            // Two bounds apply:
-            //   * per-item point-lookup: ε_point = e/w
-            //     (inherited from the CMS part)
-            //   * top-K retention: any item with true frequency
-            //     ≥ N/heap_size is guaranteed to be in the top-K
-            //     output; each retained count is within N/heap_size
-            //     of the true value (SpaceSaving guarantee).
-            // We report the **tighter** of the two as the
-            // user-facing ε — typically the heap bound
-            // `1/heap_size` dominates when heap_size ≪ w, and the
-            // CMS bound `e/w` dominates when the heap is generously
-            // sized. `kind = TopK` signals that ε is the
-            // combined frequency + retention guarantee.
-            // δ stays `1/2^d` from the CMS half; retention itself
-            // is deterministic given an adversarial-free stream,
-            // but the count estimate remains probabilistic at
-            // depth d.
-            // Sources:
-            //   - Cormode & Muthukrishnan 2005 (CMS bound)
-            //   - Metwally, Agrawal, El Abbadi. "Efficient
-            //     computation of frequent and top-k elements in
-            //     data streams." ICDT 2005. (top-K retention)
-            AggregationType::CountMinSketchWithHeap => {
-                let (rows, cols) = cms_params(config);
-                let heap = cms_heap_size(config);
-                let cms_epsilon = std::f64::consts::E / (cols as f64).max(1.0);
-                let heap_epsilon = 1.0 / (heap as f64).max(1.0);
-                // Worst of the two — a user should expect errors
-                // no bigger than `ε · N`.
-                let epsilon = cms_epsilon.max(heap_epsilon);
-                let delta = 0.5_f64.powi(rows as i32);
-                Self {
-                    epsilon,
-                    delta,
-                    kind: AccuracyKind::TopK,
-                }
-            }
+        AggregationType::CountMinSketch => {
+            let (rows, cols) = cms_params(config);
+            shared_profile(PlannerParams::Cms {
+                depth: u32::try_from(rows).unwrap_or(u32::MAX).max(1),
+                width: u32::try_from(cols).unwrap_or(u32::MAX).max(1),
+            })
+        }
 
-            // CountSketch: ε = 1/√w, δ = 1/2^d (Charikar-Chen-
-            // Farach-Colton). Signed counters → tighter epsilon
-            // than CMS but same confidence ramp with depth.
-            AggregationType::CountSketch => {
-                let (rows, cols) = cms_params(config);
-                let epsilon = 1.0 / (cols as f64).max(1.0).sqrt();
-                let delta = 0.5_f64.powi(rows as i32);
-                Self {
-                    epsilon,
-                    delta,
-                    kind: AccuracyKind::AdditiveFrequency,
-                }
-            }
-
-            // CountSketchWithHeap: CountSketch frequency estimator
-            // paired with a top-k heap. Mirrors the
-            // CountMinSketchWithHeap branch above — the CountSketch
-            // half gives ε_point = 1/√w; the heap half gives
-            // ε_heap = 1/heap_size for retention. Report the
-            // tighter (max) of the two.
-            AggregationType::CountSketchWithHeap => {
-                let (rows, cols) = cms_params(config);
-                let heap = cms_heap_size(config);
-                let cs_epsilon = 1.0 / (cols as f64).max(1.0).sqrt();
-                let heap_epsilon = 1.0 / (heap as f64).max(1.0);
-                let epsilon = cs_epsilon.max(heap_epsilon);
-                let delta = 0.5_f64.powi(rows as i32);
-                Self {
-                    epsilon,
-                    delta,
-                    kind: AccuracyKind::TopK,
-                }
-            }
-
-            // HLL: std-dev ≈ 1.04/√m, m = 2^precision. Report
-            // this as relative error ε; δ is the Gaussian
-            // std-dev convention (stored as 0 because our δ
-            // field is "confidence parameter" not "variance";
-            // future AccuracyKind::RelativeCardinality variant
-            // could carry the Gaussian flavor explicitly).
-            // Source: Flajolet et al., "HyperLogLog: the analysis
-            // of a near-optimal cardinality estimation algorithm,"
-            // DMTCS 2007.
-            AggregationType::HLL => {
-                let p = hll_precision(config);
-                let m = (1u64 << p) as f64;
-                Self {
-                    epsilon: 1.04 / m.sqrt(),
-                    delta: 0.0,
-                    kind: AccuracyKind::RelativeCardinality,
-                }
-            }
-
-            // KLL: rank error ε = C/√k with δ ≤ 0.01 (fixed
-            // confidence; KLL's theoretical guarantee). Empirical
-            // C ≈ 2.296 for the standard floating-point KLL
-            // variant implemented here.
-            // Source: Karnin, Lang, Liberty. "Optimal quantile
-            // approximation in streams," FOCS 2016.
-            AggregationType::DatasketchesKLL | AggregationType::HydraKLL => {
-                let k = kll_k(config);
-                Self {
-                    epsilon: 2.296 / (k as f64).max(1.0).sqrt(),
-                    delta: 0.01,
-                    kind: AccuracyKind::RankQuantile,
-                }
-            }
-
-            // DDSketch: α is the relative quantile error directly
-            // — it's a design parameter of the sketch, not a
-            // probabilistic bound. δ = 0 (deterministic).
-            // Source: Masson, Rim, Lee. "DDSketch: a fast and
-            // fully-mergeable quantile sketch with relative-error
-            // guarantees," VLDB 2019.
-            AggregationType::DDSketch => {
-                let alpha = ddsketch_alpha(config);
-                Self {
-                    epsilon: alpha,
-                    delta: 0.0,
-                    kind: AccuracyKind::RelativeQuantile,
-                }
-            }
-
-            // Legacy / wrapper variants. Return exact — they are
-            // config-shape placeholders that dispatch to concrete
-            // aggregator types elsewhere; their accuracy profile
-            // depends on the sub_type, which the factory resolves
-            // at updater-construction time. Phase 6.4 v2 can walk
-            // sub_type to give a tighter answer.
-            AggregationType::SingleSubpopulation | AggregationType::MultipleSubpopulation => {
-                Self::exact()
+        // CountMinSketchWithHeap: CMS frequency estimator
+        // coupled with a heap of the top-`k` heaviest items
+        // (Metwally et al.'s SpaceSaving-style retention).
+        // Two bounds apply:
+        //   * per-item point-lookup: ε_point = e/w
+        //     (inherited from the CMS part)
+        //   * top-K retention: any item with true frequency
+        //     ≥ N/heap_size is guaranteed to be in the top-K
+        //     output; each retained count is within N/heap_size
+        //     of the true value (SpaceSaving guarantee).
+        // We report the **tighter** of the two as the
+        // user-facing ε — typically the heap bound
+        // `1/heap_size` dominates when heap_size ≪ w, and the
+        // CMS bound `e/w` dominates when the heap is generously
+        // sized. `kind = TopK` signals that ε is the
+        // combined frequency + retention guarantee.
+        // δ stays `exp(-d)` from the CMS half; retention itself
+        // is deterministic given an adversarial-free stream,
+        // but the count estimate remains probabilistic at
+        // depth d.
+        // Sources:
+        //   - Cormode & Muthukrishnan 2005 (CMS bound)
+        //   - Metwally, Agrawal, El Abbadi. "Efficient
+        //     computation of frequent and top-k elements in
+        //     data streams." ICDT 2005. (top-K retention)
+        AggregationType::CountMinSketchWithHeap => {
+            let (rows, cols) = cms_params(config);
+            let heap = cms_heap_size(config);
+            let cms = shared_profile(PlannerParams::Cms {
+                depth: u32::try_from(rows).unwrap_or(u32::MAX).max(1),
+                width: u32::try_from(cols).unwrap_or(u32::MAX).max(1),
+            });
+            let heap_epsilon = 1.0 / (heap as f64).max(1.0);
+            // Worst of the two — a user should expect errors
+            // no bigger than `ε · N`.
+            let epsilon = cms.epsilon.max(heap_epsilon);
+            let delta = cms.delta;
+            AccuracyProfile {
+                epsilon,
+                delta,
+                kind: AccuracyKind::TopK,
             }
         }
+
+        // CountSketch: ε = 1/√w, δ = 1/2^d (Charikar-Chen-
+        // Farach-Colton). Signed counters → tighter epsilon
+        // than CMS but same confidence ramp with depth.
+        AggregationType::CountSketch => {
+            let (rows, cols) = cms_params(config);
+            let epsilon = 1.0 / (cols as f64).max(1.0).sqrt();
+            let delta = Some(0.5_f64.powi(rows as i32));
+            AccuracyProfile {
+                epsilon,
+                delta,
+                kind: AccuracyKind::AdditiveFrequency,
+            }
+        }
+
+        // CountSketchWithHeap: CountSketch frequency estimator
+        // paired with a top-k heap. Mirrors the
+        // CountMinSketchWithHeap branch above — the CountSketch
+        // half gives ε_point = 1/√w; the heap half gives
+        // ε_heap = 1/heap_size for retention. Report the
+        // tighter (max) of the two.
+        AggregationType::CountSketchWithHeap => {
+            let (rows, cols) = cms_params(config);
+            let heap = cms_heap_size(config);
+            let cs_epsilon = 1.0 / (cols as f64).max(1.0).sqrt();
+            let heap_epsilon = 1.0 / (heap as f64).max(1.0);
+            let epsilon = cs_epsilon.max(heap_epsilon);
+            let delta = Some(0.5_f64.powi(rows as i32));
+            AccuracyProfile {
+                epsilon,
+                delta,
+                kind: AccuracyKind::TopK,
+            }
+        }
+
+        AggregationType::HLL => shared_profile(PlannerParams::Hll {
+            precision: u8::try_from(hll_precision(config)).unwrap_or(14),
+        }),
+        AggregationType::DatasketchesKLL | AggregationType::HydraKLL => {
+            shared_profile(PlannerParams::Kll {
+                k: kll_k(config).max(1),
+            })
+        }
+        AggregationType::DDSketch => shared_profile(PlannerParams::DDSketch {
+            alpha: ddsketch_alpha(config),
+        }),
+
+        // Legacy / wrapper variants. Return exact — they are
+        // config-shape placeholders that dispatch to concrete
+        // aggregator types elsewhere; their accuracy profile
+        // depends on the sub_type, which the factory resolves
+        // at updater-construction time. Phase 6.4 v2 can walk
+        // sub_type to give a tighter answer.
+        AggregationType::SingleSubpopulation | AggregationType::MultipleSubpopulation => {
+            AccuracyProfile::exact()
+        }
     }
+}
+
+fn shared_profile(params: PlannerParams) -> AccuracyProfile {
+    AccuracyProfile::from_sketch_params(&params).expect("shared family has a numeric planner bound")
 }
 
 // Parameter extraction helpers. Kept file-local (not pub) because
@@ -369,7 +322,7 @@ impl AccuracyEnvelope {
             return None;
         }
         let mut epsilon = 0.0_f64;
-        let mut delta = 0.0_f64;
+        let mut delta = Some(0.0_f64);
         // Pick the "most lossy" kind: any non-Exact wins over
         // Exact; if mixed non-Exact kinds span segments we pick
         // the first non-Exact and trust the per-segment data for
@@ -379,9 +332,11 @@ impl AccuracyEnvelope {
             if s.profile.epsilon > epsilon {
                 epsilon = s.profile.epsilon;
             }
-            if s.profile.delta > delta {
-                delta = s.profile.delta;
-            }
+            // A known bound from another segment cannot fill unknown confidence.
+            delta = match (delta, s.profile.delta) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
             if matches!(kind, AccuracyKind::Exact) && !matches!(s.profile.kind, AccuracyKind::Exact)
             {
                 kind = s.profile.kind;
@@ -439,18 +394,149 @@ mod tests {
         )
     }
 
+    /// Both source adapters must agree for the same normalized family parameters.
+    #[test]
+    fn planner_and_backend_shared_family_parity() {
+        use control_plane::types::SketchParams;
+        let cases = vec![
+            (
+                SketchParams::CountMinSketch {
+                    rows: 4,
+                    cols: 1000,
+                    metric_name: "m".into(),
+                },
+                AggregationType::CountMinSketch,
+                json!({"d": 4, "w": 1000}),
+            ),
+            (
+                SketchParams::CountMinSketch {
+                    rows: 7,
+                    cols: 4096,
+                    metric_name: "m".into(),
+                },
+                AggregationType::CountMinSketch,
+                json!({"d": 7, "w": 4096}),
+            ),
+            (
+                SketchParams::HLL { precision: 14 },
+                AggregationType::HLL,
+                json!({"precision": 14}),
+            ),
+            (
+                SketchParams::HLL { precision: 10 },
+                AggregationType::HLL,
+                json!({"p": 10}),
+            ),
+            (
+                SketchParams::KLL {
+                    k: 200,
+                    quantiles: vec![],
+                },
+                AggregationType::DatasketchesKLL,
+                json!({"K": 200}),
+            ),
+            (
+                SketchParams::KLL {
+                    k: 512,
+                    quantiles: vec![],
+                },
+                AggregationType::HydraKLL,
+                json!({"k": 512}),
+            ),
+            (
+                SketchParams::DDSketch {
+                    relative_accuracy: 0.01,
+                    quantiles: vec![],
+                },
+                AggregationType::DDSketch,
+                json!({"alpha": 0.01}),
+            ),
+            (
+                SketchParams::DDSketch {
+                    relative_accuracy: 0.05,
+                    quantiles: vec![],
+                },
+                AggregationType::DDSketch,
+                json!({"alpha": 0.05}),
+            ),
+        ];
+        for (params, family, wire) in cases {
+            let config = base_config(family, serde_json::from_value(wire).unwrap());
+            let planner = control_plane::accuracy::derive(&params);
+            let backend = derive(&config);
+            assert_eq!(planner, backend, "parameters: {params:?}");
+            assert_eq!(
+                serde_json::to_value(planner).unwrap(),
+                serde_json::to_value(backend).unwrap()
+            );
+        }
+    }
+
+    /// GOS widens epsilon without inventing confidence for HLL.
+    #[test]
+    fn shared_family_gos_preserves_planner_confidence() {
+        for family in [
+            AggregationType::CountMinSketch,
+            AggregationType::HLL,
+            AggregationType::DatasketchesKLL,
+            AggregationType::DDSketch,
+        ] {
+            let base = derive(&base_config(family, HashMap::new()));
+            let widened = derive(&base_config(
+                family,
+                HashMap::from([("gos_delta_epsilon".into(), json!(0.05))]),
+            ));
+            assert_eq!(widened.epsilon, base.epsilon + 0.05);
+            assert_eq!(widened.delta, base.delta);
+            assert_eq!(widened.kind, base.kind);
+        }
+    }
+
+    /// Unknown confidence stays unknown regardless of segment order.
+    #[test]
+    fn envelope_preserves_unknown_failure_probability() {
+        let hll = derive(&base_config(AggregationType::HLL, HashMap::new()));
+        assert_eq!(hll.delta, None);
+        for profiles in [
+            [hll, AccuracyProfile::exact()],
+            [AccuracyProfile::exact(), hll],
+        ] {
+            let segments = profiles
+                .into_iter()
+                .enumerate()
+                .map(|(i, profile)| PerSegmentAccuracy {
+                    agg_id: i as u64,
+                    range_ms: [i as i64, i as i64 + 1],
+                    profile,
+                })
+                .collect();
+            let envelope = AccuracyEnvelope::from_segments(segments).unwrap();
+            assert_eq!(envelope.profile.delta, None);
+            assert!(serde_json::to_value(envelope).unwrap()["delta"].is_null());
+        }
+    }
+
+    /// Backend-only UnivMon must not acquire a calibrated shared-family bound.
+    #[test]
+    fn univmon_remains_uncalibrated() {
+        let profile = derive(&base_config(AggregationType::UnivMon, HashMap::new()));
+        assert_eq!(profile.kind, AccuracyKind::Uncalibrated);
+        assert_eq!(profile.epsilon, f64::MAX);
+        assert_eq!(profile.delta, Some(1.0));
+    }
+
     #[test]
     fn sum_is_exact() {
-        let p = AccuracyProfile::derive(&base_config(AggregationType::Sum, HashMap::new()));
+        let p = derive(&base_config(AggregationType::Sum, HashMap::new()));
         assert_eq!(p.kind, AccuracyKind::Exact);
         assert_eq!(p.epsilon, 0.0);
-        assert_eq!(p.delta, 0.0);
+        assert_eq!(p.delta, Some(0.0));
     }
 
     #[test]
     fn min_max_increase_are_exact() {
         for t in [AggregationType::MinMax, AggregationType::Increase] {
-            let p = AccuracyProfile::derive(&base_config(t, HashMap::new()));
+            let p = derive(&base_config(t, HashMap::new()));
             assert_eq!(p.kind, AccuracyKind::Exact);
         }
     }
@@ -463,10 +549,9 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("d".to_string(), json!(5));
         params.insert("w".to_string(), json!(256));
-        let base =
-            AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params.clone()));
+        let base = derive(&base_config(AggregationType::CountSketch, params.clone()));
         params.insert("gos_delta_epsilon".to_string(), json!(0.05));
-        let widened = AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params));
+        let widened = derive(&base_config(AggregationType::CountSketch, params));
         assert!((widened.epsilon - (base.epsilon + 0.05)).abs() < 1e-12);
         assert_eq!(widened.delta, base.delta);
         assert_eq!(widened.kind, base.kind);
@@ -478,7 +563,7 @@ mod tests {
         // stray parameter must not fabricate an ε>0 "exact" answer.
         let mut params = HashMap::new();
         params.insert("gos_delta_epsilon".to_string(), json!(0.05));
-        let p = AccuracyProfile::derive(&base_config(AggregationType::Sum, params));
+        let p = derive(&base_config(AggregationType::Sum, params));
         assert_eq!(p.epsilon, 0.0);
         assert_eq!(p.kind, AccuracyKind::Exact);
     }
@@ -488,23 +573,23 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("d".to_string(), json!(5));
         params.insert("w".to_string(), json!(2718));
-        let p = AccuracyProfile::derive(&base_config(AggregationType::CountMinSketch, params));
+        let p = derive(&base_config(AggregationType::CountMinSketch, params));
         // e / 2718 ≈ 0.0010001 — very close to 0.001.
         assert_eq!(p.kind, AccuracyKind::AdditiveFrequency);
         assert!((p.epsilon - std::f64::consts::E / 2718.0).abs() < 1e-12);
         // δ = 1/2^5 = 0.03125
-        assert!((p.delta - 0.03125).abs() < 1e-12);
+        assert!((p.delta.unwrap() - (-5.0_f64).exp()).abs() < 1e-12);
     }
 
     #[test]
     fn cms_uses_defaults_when_params_absent() {
-        let p = AccuracyProfile::derive(&base_config(
+        let p = derive(&base_config(
             AggregationType::CountMinSketch,
             HashMap::new(),
         ));
         // Defaults rows=4, cols=1000 per accumulator_factory.
         assert!((p.epsilon - std::f64::consts::E / 1000.0).abs() < 1e-12);
-        assert!((p.delta - 0.0625).abs() < 1e-12); // 1/16
+        assert!((p.delta.unwrap() - (-4.0_f64).exp()).abs() < 1e-12); // 1/16
     }
 
     #[test]
@@ -515,13 +600,13 @@ mod tests {
         params.insert("d".to_string(), json!(5));
         params.insert("w".to_string(), json!(1_000_000));
         params.insert("heap_size".to_string(), json!(10_000));
-        let p = AccuracyProfile::derive(&base_config(
+        let p = derive(&base_config(
             AggregationType::CountMinSketchWithHeap,
             params,
         ));
         assert_eq!(p.kind, AccuracyKind::TopK);
         assert!((p.epsilon - 1.0 / 10_000.0).abs() < 1e-12);
-        assert!((p.delta - 1.0 / 32.0).abs() < 1e-12); // 1/2^5
+        assert!((p.delta.unwrap() - (-5.0_f64).exp()).abs() < 1e-12); // 1/2^5
     }
 
     #[test]
@@ -532,7 +617,7 @@ mod tests {
         params.insert("d".to_string(), json!(4));
         params.insert("w".to_string(), json!(100));
         params.insert("heap_size".to_string(), json!(1_000_000));
-        let p = AccuracyProfile::derive(&base_config(
+        let p = derive(&base_config(
             AggregationType::CountMinSketchWithHeap,
             params,
         ));
@@ -547,7 +632,7 @@ mod tests {
         params.insert("w".to_string(), json!(1000));
         // heap_size absent → default 100 → 1/100 = 0.01 dominates
         // e/1000 ≈ 0.00272.
-        let p = AccuracyProfile::derive(&base_config(
+        let p = derive(&base_config(
             AggregationType::CountMinSketchWithHeap,
             params,
         ));
@@ -564,7 +649,7 @@ mod tests {
             params.insert("d".to_string(), json!(4));
             params.insert("w".to_string(), json!(1_000_000));
             params.insert(alias.to_string(), json!(500));
-            let p = AccuracyProfile::derive(&base_config(
+            let p = derive(&base_config(
                 AggregationType::CountMinSketchWithHeap,
                 params,
             ));
@@ -581,17 +666,17 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("d".to_string(), json!(4));
         params.insert("w".to_string(), json!(100));
-        let p = AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params));
+        let p = derive(&base_config(AggregationType::CountSketch, params));
         assert_eq!(p.kind, AccuracyKind::AdditiveFrequency);
         assert!((p.epsilon - 0.1).abs() < 1e-9); // 1/√100 = 0.1
-        assert!((p.delta - 0.0625).abs() < 1e-12); // 1/2^4
+        assert!((p.delta.unwrap() - 0.0625).abs() < 1e-12); // Backend-only CountSketch convention.
     }
 
     #[test]
     fn hll_epsilon_matches_flajolet_bound() {
         let mut params = HashMap::new();
         params.insert("precision".to_string(), json!(14));
-        let p = AccuracyProfile::derive(&base_config(AggregationType::HLL, params));
+        let p = derive(&base_config(AggregationType::HLL, params));
         assert_eq!(p.kind, AccuracyKind::RelativeCardinality);
         // 1.04 / √16384 = 1.04 / 128 = 0.008125
         assert!((p.epsilon - 0.008125).abs() < 1e-9);
@@ -599,7 +684,7 @@ mod tests {
 
     #[test]
     fn hll_uses_default_precision_14() {
-        let p = AccuracyProfile::derive(&base_config(AggregationType::HLL, HashMap::new()));
+        let p = derive(&base_config(AggregationType::HLL, HashMap::new()));
         assert!((p.epsilon - 0.008125).abs() < 1e-9);
     }
 
@@ -607,35 +692,35 @@ mod tests {
     fn kll_epsilon_matches_karnin_lang_liberty_bound() {
         let mut params = HashMap::new();
         params.insert("K".to_string(), json!(200));
-        let p = AccuracyProfile::derive(&base_config(AggregationType::DatasketchesKLL, params));
+        let p = derive(&base_config(AggregationType::DatasketchesKLL, params));
         assert_eq!(p.kind, AccuracyKind::RankQuantile);
-        // 2.296 / √200 ≈ 0.16235
-        assert!((p.epsilon - 2.296 / 200.0_f64.sqrt()).abs() < 1e-12);
-        assert!((p.delta - 0.01).abs() < 1e-12);
+        // Planner uses the DataSketches empirical 99th-percentile rank-error fit.
+        assert!((p.epsilon - 2.296 / 200.0_f64.powf(0.9723)).abs() < 1e-12);
+        assert!((p.delta.unwrap() - 0.01).abs() < 1e-12);
     }
 
     #[test]
     fn hydra_kll_follows_the_same_kll_bound() {
         let mut params = HashMap::new();
         params.insert("k".to_string(), json!(400));
-        let p = AccuracyProfile::derive(&base_config(AggregationType::HydraKLL, params));
-        // 2.296 / √400 = 2.296 / 20 = 0.1148
-        assert!((p.epsilon - 0.1148).abs() < 1e-9);
+        let p = derive(&base_config(AggregationType::HydraKLL, params));
+        // Planner uses the DataSketches empirical 99th-percentile rank-error fit.
+        assert!((p.epsilon - 2.296 / 400.0_f64.powf(0.9723)).abs() < 1e-12);
     }
 
     #[test]
     fn ddsketch_epsilon_is_alpha_directly() {
         let mut params = HashMap::new();
         params.insert("alpha".to_string(), json!(0.02));
-        let p = AccuracyProfile::derive(&base_config(AggregationType::DDSketch, params));
+        let p = derive(&base_config(AggregationType::DDSketch, params));
         assert_eq!(p.kind, AccuracyKind::RelativeQuantile);
         assert_eq!(p.epsilon, 0.02);
-        assert_eq!(p.delta, 0.0);
+        assert_eq!(p.delta, Some(0.0));
     }
 
     #[test]
     fn ddsketch_uses_default_alpha_0_01() {
-        let p = AccuracyProfile::derive(&base_config(AggregationType::DDSketch, HashMap::new()));
+        let p = derive(&base_config(AggregationType::DDSketch, HashMap::new()));
         assert_eq!(p.epsilon, 0.01);
     }
 
@@ -653,7 +738,7 @@ mod tests {
             AggregationType::SingleSubpopulation,
             AggregationType::MultipleSubpopulation,
         ] {
-            let p = AccuracyProfile::derive(&base_config(t, HashMap::new()));
+            let p = derive(&base_config(t, HashMap::new()));
             assert_eq!(p.kind, AccuracyKind::Exact);
         }
     }
@@ -662,7 +747,7 @@ mod tests {
     fn accuracy_profile_roundtrips_through_serde() {
         let input = AccuracyProfile {
             epsilon: 0.008125,
-            delta: 0.0,
+            delta: None,
             kind: AccuracyKind::RelativeCardinality,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -680,11 +765,11 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("d".to_string(), json!(4));
         params.insert("w".to_string(), json!(10000));
-        let cms = AccuracyProfile::derive(&base_config(
+        let cms = derive(&base_config(
             AggregationType::CountMinSketch,
             params.clone(),
         ));
-        let cs = AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params));
+        let cs = derive(&base_config(AggregationType::CountSketch, params));
         // cms.epsilon = e/10000 ≈ 2.718e-4
         // cs.epsilon = 1/√10000 = 0.01 = 1e-2
         // So cms < cs (for w=10000). They cross at w = e.
