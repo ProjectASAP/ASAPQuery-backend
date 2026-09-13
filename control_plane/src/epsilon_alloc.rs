@@ -19,9 +19,6 @@
 //! control_plane has no dependency on data_plane, so the canonical one-liner is
 //! re-stated here — keep the two in sync.)
 
-
-
-
 /// Admission sampling probability under the unified ε-floor law,
 /// `p = 1/(1 + ε²·rate)`.
 ///
@@ -34,7 +31,6 @@ pub fn derive_sample_p(epsilon: f64, rate: f64) -> f64 {
     }
     1.0 / (1.0 + epsilon * epsilon * rate)
 }
-
 
 /// GOS budget split (design §7, Layer B) — **exact linear peel**.
 ///
@@ -73,15 +69,6 @@ pub fn split_budget(eps_total: f64, eps_sketch: f64, w_edge: f64, w_comm: f64) -
         .sqrt();
     (eps_sa, eps_st)
 }
-
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -127,10 +114,4 @@ mod tests {
         assert!(derive_sample_p(0.05, 100.0) > derive_sample_p(0.05, 10_000.0));
         assert!(derive_sample_p(0.01, 1000.0) > derive_sample_p(0.10, 1000.0));
     }
-
-
-
-
-
-
 }

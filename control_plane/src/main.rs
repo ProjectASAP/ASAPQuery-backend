@@ -1348,12 +1348,6 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         .into_response()
 }
 
-
-
-
-
-
-
 async fn handle_get_plan(
     State(st): State<AppState>,
     Path(metric): Path<String>,
@@ -1394,9 +1388,6 @@ async fn handle_get_plan(
     )
         .into_response()
 }
-
-
-
 
 /// Bootstrap YAML config for agent collectors.
 ///
@@ -1715,7 +1706,6 @@ async fn emit_bootstrap_typed(
     )
     .with_context(|| format!("emit_for_runtime failed for `{metric}`"))
 }
-
 
 /// Returns the current EMA cost model state — blended benchmark + observed costs
 /// per sketch type.  Useful for diagnosing whether the online cost model has
