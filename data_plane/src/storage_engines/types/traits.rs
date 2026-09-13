@@ -1,5 +1,4 @@
 use crate::storage_engines::types::KeyByLabelValues;
-use serde_json::Value;
 use std::collections::HashMap;
 
 use asap_types::AggregationType;
@@ -221,23 +220,6 @@ pub trait MultipleSubpopulationAggregate: AggregateCore {
     fn clone_boxed(&self) -> Box<dyn MultipleSubpopulationAggregate>;
 }
 
-/// Factory traits for creating and merging accumulators (object-safe)
-pub trait SingleSubpopulationAggregateFactory {
-    fn merge_accumulators(
-        &self,
-        accumulators: Vec<Box<dyn SingleSubpopulationAggregate>>,
-    ) -> Result<Box<dyn SingleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>;
-    fn create_default(&self) -> Box<dyn SingleSubpopulationAggregate>;
-}
-
-pub trait MultipleSubpopulationAggregateFactory {
-    fn merge_accumulators(
-        &self,
-        accumulators: Vec<Box<dyn MultipleSubpopulationAggregate>>,
-    ) -> Result<Box<dyn MultipleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>;
-    fn create_default(&self) -> Box<dyn MultipleSubpopulationAggregate>;
-}
-
 /// Trait for merging multiple accumulators of the same type
 pub trait MergeableAccumulator<T> {
     fn merge_accumulators(
@@ -264,18 +246,6 @@ impl Clone for Box<dyn MultipleSubpopulationAggregate> {
     fn clone(&self) -> Self {
         self.clone_boxed()
     }
-}
-
-/// Factory trait for creating accumulators from serialized data
-pub trait AccumulatorFactory {
-    fn create_from_json(
-        accumulator_type: &str,
-        data: &Value,
-    ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>>;
-    fn create_from_bytes(
-        accumulator_type: &str,
-        buffer: &[u8],
-    ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>>;
 }
 
 #[cfg(test)]

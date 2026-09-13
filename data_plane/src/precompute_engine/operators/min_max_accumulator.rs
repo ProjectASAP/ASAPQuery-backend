@@ -1,6 +1,6 @@
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
-    SingleSubpopulationAggregate, SingleSubpopulationAggregateFactory,
+    SingleSubpopulationAggregate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -257,74 +257,6 @@ impl SingleSubpopulationAggregate for MinMaxAccumulator {
 
     fn clone_boxed(&self) -> Box<dyn SingleSubpopulationAggregate> {
         Box::new(self.clone())
-    }
-}
-
-// Factory implementation for merging
-pub struct MinMaxAccumulatorFactory {
-    pub sub_type: String,
-}
-
-impl MinMaxAccumulatorFactory {
-    pub fn new_min() -> Self {
-        Self {
-            sub_type: "min".to_string(),
-        }
-    }
-
-    pub fn new_max() -> Self {
-        Self {
-            sub_type: "max".to_string(),
-        }
-    }
-}
-
-impl SingleSubpopulationAggregateFactory for MinMaxAccumulatorFactory {
-    fn merge_accumulators(
-        &self,
-        accumulators: Vec<Box<dyn SingleSubpopulationAggregate>>,
-    ) -> Result<Box<dyn SingleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        if accumulators.is_empty() {
-            return match self.sub_type.as_str() {
-                "min" => Ok(Box::new(MinMaxAccumulator::new_min())),
-                "max" => Ok(Box::new(MinMaxAccumulator::new_max())),
-                _ => Err(format!("Unsupported sub_type: {}", self.sub_type).into()),
-            };
-        }
-
-        let mut result_value = match self.sub_type.as_str() {
-            "min" => f64::INFINITY,
-            "max" => f64::NEG_INFINITY,
-            _ => return Err(format!("Unsupported sub_type: {}", self.sub_type).into()),
-        };
-
-        for acc in accumulators {
-            let value = match self.sub_type.as_str() {
-                "min" => acc.query(Statistic::Min, None)?,
-                "max" => acc.query(Statistic::Max, None)?,
-                _ => return Err(format!("Unsupported sub_type: {}", self.sub_type).into()),
-            };
-
-            result_value = match self.sub_type.as_str() {
-                "min" => result_value.min(value),
-                "max" => result_value.max(value),
-                _ => return Err(format!("Unsupported sub_type: {}", self.sub_type).into()),
-            };
-        }
-
-        Ok(Box::new(MinMaxAccumulator::with_value(
-            result_value,
-            self.sub_type.clone(),
-        )))
-    }
-
-    fn create_default(&self) -> Box<dyn SingleSubpopulationAggregate> {
-        match self.sub_type.as_str() {
-            "min" => Box::new(MinMaxAccumulator::new_min()),
-            "max" => Box::new(MinMaxAccumulator::new_max()),
-            _ => Box::new(MinMaxAccumulator::new_min()), // Default fallback
-        }
     }
 }
 
