@@ -29,17 +29,14 @@ pub mod pipeline;
 pub mod planner_selection;
 pub mod query_parser;
 pub mod query_plan;
-pub mod query_planning;
 pub mod replan;
 pub mod runtime_samples;
-pub mod sketch_selection;
 pub mod store;
 pub mod types;
 pub mod workload;
 
 /// PromQL → ASAPPlanner's canonical post-ASAP plan via
 /// `asap_aware_mapping::bind::implement_tree`.
-pub mod asap_tier_implement;
 
 /// Crate-wide test-only utilities for serialising access to process-global
 /// state (environment variables).
