@@ -1,22 +1,24 @@
-//! Lower Planner-selected current-series operators; never discover query rewrites here.
+//! Lower typed population operators according to executor membership capabilities.
 use super::compiler::{CompileError, PlanningQuery, PlanningRequest};
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
     logical::{Grouping, LabelMatch, LabelMatcher, LogicalOperator},
 };
-use planner_types::post_asap::{current_series::*, SummaryExpr, SummaryNode, ValueOperation};
+use planner_types::post_asap::{
+    maintained_population::*, SummaryExpr, SummaryNode, ValueOperation,
+};
 
-fn selected(node: &SummaryNode) -> Option<(&CurrentSeriesPopulation, &CurrentSeriesReadout)> {
+fn selected(node: &SummaryNode) -> Option<(&MaintainedPopulation, &PopulationReadout)> {
     let SummaryExpr::ValueOperation {
         child,
-        operation: ValueOperation::ReadCurrentSeries { readout },
+        operation: ValueOperation::ReadPopulation { readout },
         ..
     } = &node.expr
     else {
         return None;
     };
     let SummaryExpr::ValueOperation {
-        operation: ValueOperation::MaintainCurrentSeries { population },
+        operation: ValueOperation::MaintainPopulation { population },
         ..
     } = &child.expr
     else {
@@ -25,11 +27,14 @@ fn selected(node: &SummaryNode) -> Option<(&CurrentSeriesPopulation, &CurrentSer
     Some((population, readout))
 }
 
+pub(super) fn supported_node(node: &SummaryNode) -> bool {
+    selected(node).is_some_and(|(population, _)| {
+        matches!(population.input, PopulationInput::CurrentSeries(_))
+    })
+}
+
 pub(super) fn supported(request: &PlanningRequest) -> bool {
-    request
-        .queries
-        .iter()
-        .any(|q| selected(&q.post_asap).is_some())
+    request.queries.iter().any(|q| supported_node(&q.post_asap))
 }
 
 pub(super) fn operator(
@@ -38,6 +43,9 @@ pub(super) fn operator(
 ) -> Result<Option<LogicalOperator>, CompileError> {
     let Some((spec, readout)) = selected(&query.post_asap) else {
         return Ok(None);
+    };
+    let PopulationInput::CurrentSeries(input) = &spec.input else {
+        return Err(CompileError::Query { query_id: query.query_id.clone(), reason: "maintained table-row populations require a row-update executor; remote-write current-series state is incompatible".into() });
     };
     let populations: std::collections::BTreeSet<_> = request
         .queries
@@ -53,8 +61,8 @@ pub(super) fn operator(
         .min(1_073_741_824)
         / populations.len().max(1) as u64;
     let population = SeriesPopulation {
-        metric: spec.metric.clone(),
-        matchers: spec
+        metric: input.metric.clone(),
+        matchers: input
             .matchers
             .iter()
             .map(|m| LabelMatcher {
@@ -69,10 +77,10 @@ pub(super) fn operator(
             })
             .collect(),
         grouping: Grouping {
-            labels: spec.grouping.clone(),
-            without: spec.without,
+            labels: input.grouping.clone(),
+            without: input.without,
         },
-        lookback_ms: spec.lookback_ms,
+        lookback_ms: input.lookback_ms,
         max_k: spec.max_k as u64,
         quantiles: spec.quantiles,
         max_bytes,
@@ -85,11 +93,11 @@ pub(super) fn operator(
     };
     population.validate()?;
     let readout = match readout {
-        CurrentSeriesReadout::Quantile { q } => SeriesReadout::Quantile { q: *q },
-        CurrentSeriesReadout::TopK { k } => SeriesReadout::TopK { k: *k as u64 },
-        CurrentSeriesReadout::Sum => SeriesReadout::Sum,
-        CurrentSeriesReadout::Count => SeriesReadout::Count,
-        CurrentSeriesReadout::Average => SeriesReadout::Average,
+        PopulationReadout::Quantile { q } => SeriesReadout::Quantile { q: *q },
+        PopulationReadout::TopK { k } => SeriesReadout::TopK { k: *k as u64 },
+        PopulationReadout::Sum => SeriesReadout::Sum,
+        PopulationReadout::Count => SeriesReadout::Count,
+        PopulationReadout::Average => SeriesReadout::Average,
     };
     Ok(Some(LogicalOperator::CurrentSeries {
         population,

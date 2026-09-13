@@ -50,4 +50,4 @@ pub use plan::{CostEstimate, ExecutionMode, PipelineStage, PlanNode, PlanSummary
 
 pub mod publication;
 
-pub(crate) mod current_series;
+pub(crate) mod maintained_population;

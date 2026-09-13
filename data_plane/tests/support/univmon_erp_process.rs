@@ -139,6 +139,45 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             .any(|m| m.aggregation_type == asap_types::AggregationType::UnivMon),
         "{plan:#?}"
     );
+    // All three readouts can use one state when the selected parameters and
+    // population agree. Each still needs its own calibration evidence.
+    let mut shared_fixture = fixture.clone();
+    shared_fixture["implementation"]["erp"]["runtime"]["allowed_algorithms"] =
+        serde_json::json!(["UnivMon"]);
+    let records = shared_fixture["implementation"]["erp"]["artifact"]["records"]
+        .as_array_mut()
+        .unwrap();
+    records.remove(0);
+    let shared = quote_snapshot_for_test(
+        serde_json::from_value::<BackendLocalPlanningSnapshot>(shared_fixture.clone()).unwrap(),
+    )
+    .compile()
+    .unwrap();
+    assert_eq!(
+        shared.precompute_plan.materializations.len(),
+        1,
+        "distinct, L2 and entropy share one frequency population: {shared:#?}"
+    );
+    assert_eq!(
+        shared.precompute_plan.materializations[0].aggregation_type,
+        asap_types::AggregationType::UnivMon
+    );
+    for query in queries {
+        let entry = shared
+            .query_plan
+            .entries
+            .values()
+            .find(|e| e.canonical_query == query)
+            .unwrap();
+        assert!(
+            !entry.nodes.values().any(|n| matches!(
+                n,
+                control_plane::query_plan::QueryPlanNode::ExactFallback { .. }
+                    | control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
+            )),
+            "{entry:#?}"
+        );
+    }
     // Removing only entropy evidence must leave the L2 path executable.
     let mut missing_entropy = fixture.clone();
     for row in missing_entropy["implementation"]["erp"]["artifact"]["records"]
@@ -188,6 +227,8 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             ..
         }
     )));
+    let plan = shared;
+    let fixture = shared_fixture;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fallback_url = format!("http://{}", listener.local_addr().unwrap());
     let fallback = tokio::spawn(async move {

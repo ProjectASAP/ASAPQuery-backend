@@ -18,7 +18,7 @@ Rechecked after merging main `674b9573` (#699): the four implementation files co
 
 ## PR #700 correction
 
-The original backend `current_series.rs` parsed PromQL and independently assembled a maintained-state alternative. The correction moves recognition and workload sharing into Planner's `CurrentSeriesStrategy`, adds typed maintenance/readout operators, removes `PlanningRequest.current_series`, and lowers the selected operators directly. Regression tests check that the installed Planner DAG contains the producer and that changing catalog text does not change physical operator binding.
+The original backend `current_series.rs` parsed PromQL and independently assembled a maintained-state alternative. The correction moves recognition and workload sharing into Planner's `MaintainedPopulationStrategy`, adds typed maintenance/readout operators, removes `PlanningRequest.current_series`, and lowers the selected operators directly. Regression tests check that the installed Planner DAG contains the producer and that changing catalog text does not change physical operator binding.
 
 ## Within the backend's responsibility
 

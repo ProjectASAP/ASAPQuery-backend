@@ -973,7 +973,7 @@ impl PhysicalCompiler {
         environment: DeploymentEnvironment,
         metricsql: bool,
     ) -> Result<PhysicalPlan, CompileError> {
-        if super::current_series::supported(&request)
+        if super::maintained_population::supported(&request)
             && (metricsql
                 || environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite)
         {
@@ -1119,7 +1119,9 @@ impl PhysicalCompiler {
                 .collect::<Vec<_>>();
             // An exact native fallback has no maintained state and must not
             // depend on evidence for unused window/state implementations.
-            if selected.is_empty() && super::current_series::operator(&request, query)?.is_none() {
+            if selected.is_empty()
+                && super::maintained_population::operator(&request, query)?.is_none()
+            {
                 continue;
             }
             let executable =
@@ -1491,20 +1493,21 @@ impl PhysicalCompiler {
             );
         }
 
-        let plan_id = if request.hybrid_execution || super::current_series::supported(&request) {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
-            "typed-local-residual-v3-counter-index".hash(&mut hash);
-            super::current_series::supported(&request).hash(&mut hash);
-            request.materialization_policy.hash(&mut hash);
-            for query in &request.queries {
-                format!("{:?}", query.post_asap).hash(&mut hash);
-            }
-            hash.finish()
-        } else {
-            stable_workload_plan_id(&plan_materializations, &request.queries)
-        };
+        let plan_id =
+            if request.hybrid_execution || super::maintained_population::supported(&request) {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
+                "typed-local-residual-v3-counter-index".hash(&mut hash);
+                super::maintained_population::supported(&request).hash(&mut hash);
+                request.materialization_policy.hash(&mut hash);
+                for query in &request.queries {
+                    format!("{:?}", query.post_asap).hash(&mut hash);
+                }
+                hash.finish()
+            } else {
+                stable_workload_plan_id(&plan_materializations, &request.queries)
+            };
         let envelope = PlanEnvelope {
             plan_id,
             plan_version: environment.plan_version,
@@ -1651,7 +1654,7 @@ impl PhysicalCompiler {
                     false
                 };
             let mut entry = if let Some(operator) =
-                super::current_series::operator(&request, query)?
+                super::maintained_population::operator(&request, query)?
             {
                 let root = crate::query_plan::QueryNodeId(0);
                 let compiled = executable_dags[query_index]
@@ -3683,7 +3686,7 @@ pub(crate) mod tests {
         assert_eq!(populations.len(), 1);
         let installed = serde_json::to_string(&plan.precompute_plan.executable_dags).unwrap();
         assert!(
-            installed.contains("MaintainCurrentSeries"),
+            installed.contains("MaintainPopulation"),
             "shared state must originate in the installed Planner DAG"
         );
     }
@@ -3699,24 +3702,59 @@ pub(crate) mod tests {
             )
             .unwrap(),
         );
-        let strategy = asap_aware_mapping::current_series::CurrentSeriesStrategy::new(
+        let strategy = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
             std::slice::from_ref(&root),
         );
         request.queries[0].post_asap = strategy.candidate(&root).unwrap();
-        let before = super::super::current_series::operator(&request, &request.queries[0])
+        let before = super::super::maintained_population::operator(&request, &request.queries[0])
             .unwrap()
             .unwrap();
         request.queries[0].query_string = "quantile(0.99, b)".into();
-        let after = super::super::current_series::operator(&request, &request.queries[0])
+        let after = super::super::maintained_population::operator(&request, &request.queries[0])
             .unwrap()
             .unwrap();
         assert_eq!(before, after);
         request.queries[0].post_asap = crate::planner_selection::keep_pre_asap(&root).unwrap();
         assert!(
-            super::super::current_series::operator(&request, &request.queries[0])
+            super::super::maintained_population::operator(&request, &request.queries[0])
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // A valid table-row DAG cannot be served by remote-write latest-series state.
+    #[test]
+    fn maintained_table_population_requires_a_compatible_executor() {
+        let mut request = request("sql", "quantile(0.5, a)");
+        let mut root = crate::query_parser::parse_query_expr_canonical(
+            "quantile(0.5, a)",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let planner_types::pre_asap::QueryExpr::Aggregate { child, .. } = &mut root else {
+            unreachable!()
+        };
+        let planner_types::pre_asap::QueryExpr::Scan { source, schema, .. } = Rc::make_mut(child)
+        else {
+            unreachable!()
+        };
+        *source = planner_types::pre_asap::Source::Table {
+            table_ref: "samples".into(),
+        };
+        schema.closed = true;
+        let root = Rc::new(root);
+        let rule = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+            std::slice::from_ref(&root),
+        );
+        let candidate = rule.candidate(&root).unwrap();
+        planner_types::post_asap::compile_executable_dag(&candidate).unwrap();
+        assert!(!super::super::maintained_population::supported_node(
+            &candidate
+        ));
+        request.queries[0].post_asap = candidate;
+        let error = super::super::maintained_population::operator(&request, &request.queries[0])
+            .unwrap_err();
+        assert!(error.to_string().contains("row-update executor"), "{error}");
     }
 
     // The Planner's minimum state lowers without reconstructing direction from text.

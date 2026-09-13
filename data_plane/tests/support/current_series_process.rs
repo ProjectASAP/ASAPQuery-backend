@@ -61,17 +61,15 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
             let plan = PhysicalCompiler
                 .compile(candidate.clone(), env.clone())
                 .ok()?;
-            let warm =
-                candidate.queries.iter().all(|query| {
-                    matches!(
-                        &query.post_asap.expr,
-                        planner_types::post_asap::SummaryExpr::ValueOperation {
-                            operation:
-                                planner_types::post_asap::ValueOperation::ReadCurrentSeries { .. },
-                            ..
-                        }
-                    )
-                });
+            let warm = candidate.queries.iter().all(|query| {
+                matches!(
+                    &query.post_asap.expr,
+                    planner_types::post_asap::SummaryExpr::ValueOperation {
+                        operation: planner_types::post_asap::ValueOperation::ReadPopulation { .. },
+                        ..
+                    }
+                )
+            });
             let manifest = workload_cost::manifest(&plan, &candidate.queries).unwrap();
             Some(WorkloadQuote {
                 unit_costs: manifest

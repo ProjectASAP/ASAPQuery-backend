@@ -6,9 +6,9 @@ alternative for `quantile(q, metric)` and `topk(k, metric)`, including `by` and
 literals. Selector offsets, `@`, nested input expressions and MetricsQL use the
 existing alternatives; they are not admitted by this implementation.
 
-ASAPPlanner owns this transformation through the opt-in `CurrentSeriesStrategy`
-over canonical IR. It emits `MaintainCurrentSeries` at maintenance time and
-`ReadCurrentSeries` at read time, with source/filter/group identity, quantile
+ASAPPlanner owns this transformation through the opt-in `MaintainedPopulationStrategy`
+over canonical IR. It emits `MaintainPopulation` at maintenance time and
+`ReadPopulation` at read time, with source/filter/group identity, quantile
 consumers and the maximum requested k in its typed contract. Compatible producers
 are shared by Planner CSE. The backend consumes these nodes, binds resource and
 input-lag limits, and retains the Planner DAG in the installed plan. It does not
@@ -70,3 +70,18 @@ Prometheus instance with `--web.enable-remote-write-receiver`, then run the proc
 test. It writes the same samples to both services and compares values and labels
 for quantiles and TopK, including value replacement and staleness. Test quotes are
 synthetic and must not be used as performance evidence.
+
+The Planner population IR also represents table-row multisets. They share the
+aggregate rule and readout vocabulary with current-series populations, but not
+the membership contract. The backend remote-write executor admits only the
+current-series variant; explicitly selected table-row state returns a capability
+error until a row-update/deletion executor is available. Existing SQL window
+summary compilation remains independent of this capability.
+
+The generalization is covered by six SQL frontend tests in Planner (quantiles,
+scalar readouts, TopK limits, grouping, filters and invalid value columns), backend
+capability rejection, and the current-series process test against Prometheus 3.5.
+The UnivMon process test also installs one shared materialization for distinct,
+frequency L2 and entropy with identical input/window/parameters, checks all three
+readouts against held-out raw values, and checks readout-specific missing-evidence
+fallback. This establishes sharing and correctness, not a measured speedup.

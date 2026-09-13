@@ -15,7 +15,7 @@ alternatives, and enforces runtime population and coverage constraints.
 - The temporal-average rule emits independently maintained sum and observation
   count, exact finalization, and division. The backend can share their sum/count
   producer without inventing an average rewrite.
-- Current-series rules emit `MaintainCurrentSeries` and `ReadCurrentSeries` for
+- Current-series rules emit `MaintainPopulation` and `ReadPopulation` for
   quantile, TopK, sum, count, and average, globally or grouped. The backend keeps
   each series' latest live value and handles replacement, stale markers, expiry,
   and bounded resources. This is exact current-population state, not an

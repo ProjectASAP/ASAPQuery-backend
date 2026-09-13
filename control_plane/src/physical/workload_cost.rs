@@ -680,7 +680,7 @@ fn select_with_frontend(
 pub fn with_exact_alternative(
     request: PlanningRequest,
 ) -> Result<Vec<PlanningRequest>, CompileError> {
-    let already_selected = super::current_series::supported(&request);
+    let already_selected = super::maintained_population::supported(&request);
     let mut alternatives = materialization_alternatives(request)?;
     if already_selected {
         return Ok(alternatives);
@@ -695,8 +695,16 @@ pub fn with_exact_alternative(
             _ => unreachable!("native alternative retains canonical roots"),
         })
         .collect();
-    let strategy = asap_aware_mapping::current_series::CurrentSeriesStrategy::new(&roots);
-    let candidates: Vec<_> = roots.iter().map(|root| strategy.candidate(root)).collect();
+    let strategy =
+        asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(&roots);
+    let candidates: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            strategy
+                .candidate(root)
+                .filter(|node| super::maintained_population::supported_node(node))
+        })
+        .collect();
     if candidates.iter().any(Option::is_some) {
         // Current-series rules are compatible with window summaries in other
         // workload roots. Preserve each priced temporal alternative and mask.
