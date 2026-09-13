@@ -96,7 +96,7 @@ def main():
     implementation["query_staleness_margin_ms"] = max(0, (args.repetitions - 1) * args.interval_ms)
     implementation.update(evidence_observed_at_unix_ms=now, evidence_valid_for_ms=86400000, horizon_seconds=horizon)
     implementation["lifecycle_costs"] = dict.fromkeys(("build", "maintenance_per_update", "read", "retention_per_second", "retirement"), 1.0)
-    implementation["implementation_cost"].update(model_version="UNCALIBRATED-enumeration-only", observed_at_unix_ms=now,
+    implementation["window_cost_model"]["cost"].update(model_version="UNCALIBRATED-enumeration-only", observed_at_unix_ms=now,
         valid_for_ms=86400000, horizon_seconds=horizon, cpu_cost=1.0, peak_memory_bytes=0, network_bytes=0,
         storage_bytes=0, source_scan_bytes=0, weighted_cost=1.0)
     # Plan lifecycle is control-plane wall time. Historical event timestamps

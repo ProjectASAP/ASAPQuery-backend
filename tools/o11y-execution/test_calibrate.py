@@ -67,11 +67,11 @@ class CalibrationTests(unittest.TestCase):
         # Inclusive measured phases determine the coarse model; input count only normalizes updates.
         from update_global_profile import update
         self.measurements["candidates"][0]["resources"] = {"peak_memory_bytes": 123, "storage_bytes": 456}
-        snapshot = {"implementation": {"horizon_seconds": 60, "implementation_cost": {}},
+        snapshot = {"implementation": {"horizon_seconds": 60, "window_cost_model": {"cost": {}}},
                     "workload_cost_evidence": {"old": True}}
         result, audit = update(snapshot, self.measurements, 20)
         self.assertEqual(result["implementation"]["lifecycle_costs"]["maintenance_per_update"], 0.5)
-        self.assertEqual(result["implementation"]["implementation_cost"]["cpu_cost"], 40)
+        self.assertEqual(result["implementation"]["window_cost_model"]["cost"]["cpu_cost"], 40)
         self.assertNotIn("workload_cost_evidence", result)
         self.assertIn("not measured zero", " ".join(audit["limitations"]))
 

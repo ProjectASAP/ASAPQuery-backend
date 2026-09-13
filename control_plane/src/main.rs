@@ -522,7 +522,8 @@ struct PhysicalPlanQueryRequest {
     group_by: Vec<String>,
     accuracy: types_v2::AccuracyTarget,
     lifecycle: physical::compiler::LifecyclePlanningInput,
-    window_implementations: Vec<physical::compiler::WindowImplementationCandidate>,
+    window_cost_model: physical::compiler::WindowCostModel,
+    evaluation_phase_ms: u64,
     #[serde(default)]
     runtime_policy: physical::compiler::RuntimeRulePolicy,
 }
@@ -871,6 +872,8 @@ fn compile_physical_plan_request(
         .as_millis() as u64;
     let mut queries = Vec::with_capacity(request.queries.len());
     let mut canonical_roots = Vec::with_capacity(request.queries.len());
+    let mut window_models = Vec::new();
+    let mut workload_entries = Vec::new();
     for query in request.queries {
         if query.query_id.trim().is_empty()
             || query.metric.trim().is_empty()
@@ -892,6 +895,29 @@ fn compile_physical_plan_request(
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
         };
         canonical_roots.push(std::rc::Rc::new(expr));
+        window_models.push(query.window_cost_model);
+        workload_entries.push(planner_types::workload::RepeatingEntry {
+            query: planner_types::workload::Query(query.query_string.clone()),
+            demand: planner_types::workload::RepeatedDemand::FixedIntervalAt {
+                interval: planner_types::workload::RepetitionInterval(
+                    query.lifecycle.evaluation_interval_ms,
+                ),
+                evaluation_phase: planner_types::workload::TimestampMs(query.evaluation_phase_ms),
+            },
+            requirements: planner_types::workload::QueryRequirements {
+                accuracy: planner_types::workload::AccuracyRequirement::Explicit(
+                    query.accuracy.clone(),
+                ),
+                ..Default::default()
+            },
+            predictability: planner_types::workload::Predictability::Predictable { known_at: None },
+            time_selection: planner_types::workload::TimeSelection {
+                lookback: Some(planner_types::workload::DurationMs(
+                    query.window_secs.saturating_mul(1_000),
+                )),
+                ..Default::default()
+            },
+        });
         queries.push(physical::compiler::PlanningQuery {
             query_id: query.query_id,
             query_string: query.query_string,
@@ -903,7 +929,7 @@ fn compile_physical_plan_request(
             group_by: query.group_by,
             accuracy: query.accuracy,
             lifecycle: query.lifecycle,
-            window_implementations: query.window_implementations,
+            window_implementations: Vec::new(),
             runtime_policy: query.runtime_policy,
         });
     }
@@ -919,10 +945,18 @@ fn compile_physical_plan_request(
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
     };
 
+    for (query, model) in queries.iter_mut().zip(window_models) {
+        physical::compiler::prepare_window_implementations(query, &model, request.target, 0)
+            .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
+    }
     let planning_request = physical::compiler::PlanningRequest {
-        synthesized_window_queries: Default::default(),
         logical_selection,
-        query_workload: None,
+        query_workload: Some(planner_types::workload::QueryWorkload {
+            language: planner_types::workload::QueryLanguage::PromQL,
+            query_batch: None,
+            repeating_queries: Some(workload_entries),
+            data_workload: None,
+        }),
         queries,
         hybrid_execution: request.target
             == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite,
@@ -2210,7 +2244,7 @@ mod api_tests {
             include_str!("../../docs/examples/asapquery-planning-snapshot.json"),
         )
         .unwrap();
-        let (planning, _) = snapshot.planning_request().unwrap();
+        let (planning, _) = snapshot.clone().planning_request().unwrap();
         let query = &planning.queries[0];
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2220,7 +2254,7 @@ mod api_tests {
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
                 "metric": "m", "window_secs": 60, "accuracy": query.accuracy,
-                "lifecycle": query.lifecycle, "window_implementations": []
+                "lifecycle": query.lifecycle, "evaluation_phase_ms": 0, "window_cost_model": snapshot.implementation.window_cost_model
             }],
             "collector_ids": ["test"], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
@@ -2274,7 +2308,7 @@ mod api_tests {
             include_str!("../../docs/examples/asapquery-compatibility-demo-snapshot.json"),
         )
         .unwrap();
-        let (planning, _) = snapshot.planning_request().unwrap();
+        let (planning, _) = snapshot.clone().planning_request().unwrap();
         let mut query = planning.queries[0].clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2292,7 +2326,7 @@ mod api_tests {
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
                 "metric": metric, "window_secs": query.window_secs, "accuracy": query.accuracy,
-                "lifecycle": query.lifecycle, "window_implementations": query.window_implementations
+                "lifecycle": query.lifecycle, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_implementations[0].cost }
             }],
             "collector_ids": [], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,

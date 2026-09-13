@@ -789,19 +789,11 @@ async fn run_shared_dashboard(multi_pane: bool) {
         for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
             entry.time_selection.lookback = Some(planner_types::workload::DurationMs(10_000));
         }
-        let (request, _) = typed.clone().planning_request().unwrap();
-        for query in request.queries {
-            let mut candidates = query.window_implementations;
-            let mut small = candidates[0].clone();
-            small.implementation_id = "five-second-pane".into();
-            small.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 5 };
-            small.cost.weighted_cost = 0.0;
-            candidates[0].cost.weighted_cost = 10.0;
-            candidates.push(small);
-            typed
-                .implementation
-                .window_candidates
-                .insert(query.query_string, candidates);
+        for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
+            entry.demand = planner_types::workload::RepeatedDemand::FixedIntervalAt {
+                interval: planner_types::workload::RepetitionInterval(5_000),
+                evaluation_phase: planner_types::workload::TimestampMs(0),
+            };
         }
     }
     let (request, environment) = typed.clone().planning_request().unwrap();
@@ -847,10 +839,9 @@ async fn run_shared_dashboard(multi_pane: bool) {
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
     if multi_pane {
-        assert_eq!(
-            plan.lifecycle_estimates[0].window_implementation_id,
-            "five-second-pane"
-        );
+        assert!(plan.lifecycle_estimates[0]
+            .window_implementation_id
+            .contains("pane"));
         for entry in plan.query_plan.entries.values() {
             assert_eq!(entry.instant.lookback_ms, 10_000);
             assert_eq!(entry.materialization_bindings()[0].window_ms, 5_000);

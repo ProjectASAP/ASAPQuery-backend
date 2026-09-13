@@ -12,7 +12,7 @@ plans, plus one target-specific `CollectorPlan` per Collector.
 - `queries`: query ID, PromQL, metric, window seconds, grouping labels, a
   typed `AccuracyTarget`, and lifecycle evidence (evaluation interval,
   ingestion rate/freshness, optimization horizon, and primitive state costs),
-  plus executor-feasible `window_implementations` with versioned,
+  plus `window_cost_model` and `evaluation_phase_ms` with versioned,
   workload-scoped physical cost evidence;
 - `collector_ids`: the required OpAMP agent IDs;
 - `capability_snapshot_id` and the exact `planner_revision`;

@@ -972,6 +972,7 @@ mod tests {
                     QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: MaterializationBinding {
+                            full_window_slide_ms: None,
                             materialization: config.policy_fingerprint().into(),
                             output_grouping: PhysicalGrouping::PerEntity,
                             item_labels: vec![],
@@ -1021,19 +1022,20 @@ mod tests {
             canonical,
             &node,
             asap_types::query_plan::InstantExecution {
-                lookback_ms: 60_000,
+                lookback_ms: 1_000,
                 full_history: false,
                 cumulative_readout: true,
             },
             asap_types::query_plan::FallbackPolicy::ExactBackend,
             |_node, _family| {
                 Ok(asap_types::query_plan::MaterializationBinding {
+                    full_window_slide_ms: None,
                     item_labels: Vec::new(),
                     materialization: asap_types::PolicyFingerprint(123).into(),
                     output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
-                    window_ms: 60_000,
-                    pane_origin_ms: Some(2_000),
-                    readout_lookback_ms: Some(60_000),
+                    window_ms: 1_000,
+                    pane_origin_ms: Some(0),
+                    readout_lookback_ms: Some(1_000),
                 })
             },
         )
@@ -1119,6 +1121,104 @@ mod tests {
         // same semantics as `SummaryValue::coverage()`, reconfirmed for
         // `exact_coverage` by this module's A0 test in `summary_executor.rs`.
         assert_eq!(outcome.coverage, Some((2_000, 2_000)));
+    }
+
+    // Exercise the compiled plan and runtime bucket assignment against raw integer samples.
+    #[test]
+    fn compiled_window_schedules_execute_exact_ranges() {
+        use crate::precompute_engine::window_manager::WindowManager;
+        use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+        for evaluation_secs in [20, 45, 60, 120, 90] {
+            for phase_ms in [0, 5_000] {
+                for full in [false, true] {
+                    if full && evaluation_secs == 60 {
+                        continue;
+                    }
+                    let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
+                        "../../../../docs/examples/asapquery-planning-snapshot.json"
+                    ))
+                    .unwrap();
+                    let entry = &mut snapshot["query_workload"]["repeating_queries"][0];
+                    entry["query"] = serde_json::json!("sum_over_time(a[1m])");
+                    entry["requirements"]["accuracy"]["explicit"] = serde_json::json!("Exact");
+                    entry["demand"]["fixed_interval_at"] = serde_json::json!({
+                        "interval": evaluation_secs * 1_000, "evaluation_phase": phase_ms
+                    });
+                    let snapshot: BackendLocalPlanningSnapshot =
+                        serde_json::from_value(snapshot).unwrap();
+                    let (mut request, env) = snapshot.planning_request().unwrap();
+                    request.queries[0].window_implementations.retain(|c| {
+                        matches!(
+                            c.layout,
+                            asap_types::WindowMaterializationLayout::FullWindow
+                        ) == full
+                    });
+                    let plan = PhysicalCompiler.compile(request, env).unwrap();
+                    let config = &plan.precompute_plan.materializations[0];
+                    let manager = WindowManager::with_layout(
+                        config.window_size,
+                        config.slide_interval,
+                        config.pane_origin_ms,
+                        &config.window_layout,
+                    );
+                    let mut buckets = BTreeMap::<(u64, u64), f64>::new();
+                    for second in 1..=800 {
+                        for start in manager.stored_bucket_starts(second * 1_000 - 1) {
+                            let (_, end) = manager.stored_bucket_bounds(start);
+                            if start >= 0 && end <= 800_000 {
+                                *buckets.entry((start as u64, end as u64)).or_default() +=
+                                    second as f64;
+                            }
+                        }
+                    }
+                    let idx = SketchStore::new();
+                    idx.register(SketchInstanceMetadata {
+                        sid: 7,
+                        metric_name: "a".into(),
+                        group_by_keys: Default::default(),
+                        capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
+                        agg_kind: AggKind::ExactAgg {
+                            agg_type: asap_types::AggregationType::Sum,
+                            parameters_canonical: String::new(),
+                            spatial_filter_canonical: String::new(),
+                        },
+                        accuracy: None,
+                        first_seen_unix_ms: 0,
+                        retired_at_ms: None,
+                        expires_at_ms: None,
+                        policy_fp: config.policy_fingerprint(),
+                    });
+                    for (bounds, sum) in buckets {
+                        idx.append_precompute(
+                            7,
+                            BTreeMap::new(),
+                            bounds,
+                            Box::new(
+                                crate::precompute_engine::operators::SumAccumulator::with_sum(sum),
+                            ),
+                        );
+                    }
+                    let entry = plan.query_plan.entries.values().next().unwrap();
+                    for tick in 3..6 {
+                        let end = phase_ms + evaluation_secs * 1_000 * tick;
+                        let (outcome, _) = super::super::live_serve::serve_instant_from_query_plan(
+                            &idx, entry, end,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("E={evaluation_secs} phase={phase_ms} full={full}: {error:?}")
+                        });
+                        let expected = ((end / 1_000 - 59)..=end / 1_000).sum::<u64>() as f64;
+                        assert_eq!(outcome.series[0].1.last().unwrap().1, expected);
+                        assert!(super::super::live_serve::serve_instant_from_query_plan(
+                            &idx,
+                            entry,
+                            end + 1
+                        )
+                        .is_err());
+                    }
+                }
+            }
+        }
     }
 
     // Compile the two readouts, store one pane series, and execute the actual ratio.
@@ -1262,6 +1362,7 @@ mod tests {
                     asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: asap_types::query_plan::MaterializationBinding {
+                            full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
@@ -1358,6 +1459,7 @@ mod tests {
                     asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: asap_types::query_plan::MaterializationBinding {
+                            full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
