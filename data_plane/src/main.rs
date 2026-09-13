@@ -151,19 +151,6 @@ struct Args {
     #[arg(long, default_value = "http://localhost:9090")]
     prometheus_server: String,
 
-    /// Control-plane endpoint for capability-miss notifications
-    /// (PR G). When set, `ASAPQueryEngine` fires a fire-and-forget
-    /// POST to this URL every time a query can't find a compatible
-    /// stored aggregation, so the control plane can generate a new
-    /// sketch plan. When unset (default), capability misses fall
-    /// through to the §5.2 fallback silently.
-    /// Example: `http://control-plane.svc:8080/api/v1/plan`
-    ///
-    /// Falls back to the `ASAP_CONTROL_PLANE_URL` env var when the
-    /// flag is not passed — `deploy/docker-compose/base.yml` sets
-    /// the env var so the MVP demo doesn't need a per-arg overlay.
-    #[arg(long, env = "ASAP_CONTROL_PLANE_URL")]
-    control_plane_endpoint: Option<String>,
 
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
@@ -436,9 +423,6 @@ fn validate_profile(args: &Args) -> Result<()> {
     }
     if args.backend_storage_routing.is_some() {
         excluded.push("--backend-storage-routing");
-    }
-    if args.control_plane_endpoint.is_some() {
-        excluded.push("--control-plane-endpoint");
     }
     if !excluded.is_empty() {
         return Err(format!(
@@ -774,7 +758,7 @@ async fn main() -> Result<()> {
     // Query execution reads generation-consistent runtime configuration from
     // the ActivePhysicalPlan installed below.
     let engine = {
-        let mut engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
+        let engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
             // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
             // SketchStore to the query engine so SeriesLookup classification
             // drives the Phase 6 archive failover via
@@ -784,24 +768,6 @@ async fn main() -> Result<()> {
             .with_active_physical_plan(active_physical_plan.clone())
             .with_exact_subquery_endpoint(args.prometheus_server.clone())
             .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
-        if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
-            info!(
-                "Capability-miss notifications enabled → {}",
-                control_plane_endpoint
-            );
-            let client: Arc<dyn data_plane::drivers::control_plane_client::ControlPlaneClient> =
-                Arc::new(
-                    data_plane::drivers::control_plane_client::HttpControlPlaneClient::new(
-                        control_plane_endpoint.clone(),
-                    ),
-                );
-            engine = engine.with_control_plane_client(client);
-        } else {
-            info!(
-                "Capability-miss notifications disabled \
-                 (pass --control-plane-endpoint=<url> to enable)"
-            );
-        }
         engine
     };
 

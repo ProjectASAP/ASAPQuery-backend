@@ -7,7 +7,7 @@ use control_plane::metrics_exposer;
 use control_plane::monitor;
 use control_plane::opamp;
 use control_plane::physical;
-use control_plane::pipeline;
+use control_plane::pipeline::Analyzer;
 use control_plane::query_parser;
 use control_plane::replan;
 use control_plane::runtime_samples;
@@ -16,7 +16,7 @@ use control_plane::types;
 use control_plane::workload;
 
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,16 +31,16 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use emit::{emit_for_runtime, AgentRuntime};
-use emit::{generate_agent_collector_config, post_typed_backend_for_role};
+use emit::generate_agent_collector_config;
 use monitor::{Endpoint, ScrapedData, Scraper, Thresholds, Violation};
-use opamp::{AgentRole, OpampServer, RemoteConfig};
+use opamp::OpampServer;
 use physical::colored_dag::emitter::BackendStageConfig;
 use physical::deployment_cost::online as online_cost_model;
 use physical::deployment_cost::online::{init_store as init_online_store, OnlineMetricsStore};
 use physical::deployment_cost::tco;
 use physical::deployment_cost::DeploymentCostPlanner;
 use physical::plan_cache::CachedDeploymentPlanner;
-use pipeline::{Analyzer, QuerySpec};
+
 use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
 use store::{PlanStore, WorkloadStore};
@@ -52,12 +52,8 @@ use workload::WorkloadRegistry;
 
 #[derive(Clone)]
 struct AppState {
-    analyzer: Arc<Analyzer>,
-    planner: Arc<CachedDeploymentPlanner>,
-    store: Arc<PlanStore>,
     workload_store: Arc<WorkloadStore>,
     opamp: Arc<OpampServer>,
-    scraper: Arc<Scraper>,
     replanner: Arc<Replanner>,
     online_store: OnlineMetricsStore,
     opamp_endpoint: String,
@@ -73,16 +69,6 @@ struct AppState {
     /// Shared client for posting streaming configs from HTTP planning and replanning.
     /// `None` when `CONTROLLER_BACKEND_ENDPOINT` is unset; pushes are then skipped.
     backend_client: Option<Arc<backend_client::BackendClient>>,
-    /// Per-`(metric, role)` cache for cumulative streaming configs and storage routing.
-    ///
-    /// Both backend endpoints replace their whole configuration atomically, so each
-    /// push must include every planned metric and role. A metric may have several
-    /// roles: keying only by metric would discard sibling aggregations.
-    ///
-    /// Streaming-config emission concatenates all aggregations and readouts.
-    /// Storage-routing emission first merges roles by metric, so every sketch
-    /// family for that metric contributes to its routing entry.
-    backend_routing_cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -391,12 +377,8 @@ async fn main() {
 
     let runtime_samples_store = runtime_samples::RuntimeSamplesStore::new(1024);
     let state = AppState {
-        analyzer: Arc::new(Analyzer::new()),
-        planner,
-        store: Arc::clone(&plan_store),
         workload_store: Arc::clone(&workload_store),
         opamp: Arc::clone(&opamp_srv),
-        scraper: Arc::clone(&scraper),
         replanner: Arc::clone(&replanner),
         online_store: Arc::clone(&online_store),
         opamp_endpoint: opamp_ep,
@@ -404,7 +386,6 @@ async fn main() {
         runtime_samples: Arc::clone(&runtime_samples_store),
         active_summary_catalog: Arc::new(tokio::sync::Mutex::new(None)),
         backend_client: backend_client_shared,
-        backend_routing_cache: Arc::clone(&backend_routing_cache),
     };
 
     // ── Background tasks ──────────────────────────────────────────────────────
@@ -462,7 +443,6 @@ async fn main() {
         .with_state(metrics_state);
 
     let app = Router::new()
-        .route("/api/v1/plan", post(handle_plan))
         .route(
             "/api/v1/physical-plan/cost-manifests",
             post(handle_workload_cost_manifests),
@@ -487,7 +467,6 @@ async fn main() {
             "/api/v1/clickhouse-plan/automatic/compile-and-publish",
             post(handle_compile_and_publish_automatic_clickhouse_plan),
         )
-        .route("/api/v1/plan/:metric", get(handle_get_plan))
         .route(
             "/api/v1/collector-config/agent",
             get(handle_bootstrap_agent_config),
@@ -1076,318 +1055,13 @@ fn workload_cost_manifests(
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) -> impl IntoResponse {
-    let wc = spec.workload.clone();
-    let query_string = spec.query_string.clone();
-    let workload = match st.analyzer.analyze(spec) {
-        Ok(w) => w,
-        Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
-    };
 
-    let plan = st.planner.plan(&workload, Some(&wc));
 
-    // Derive deployment configs from the bound query. Keep its Rc-backed DAG
-    // scoped before any await so the handler future remains Send.
-    let stage_configs = {
-        let mut bound_physical: Option<control_plane::physical::post_asap::PhysicalExpr> = None;
-        if let Some(ref qs) = query_string {
-            match parse_query_expr_canonical(qs, workload.accuracy.clone()) {
-                Err(e) => {
-                    warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
-                }
-                Ok(qe) => {
-                    // L4 sketch binding: lower the optimised L3 tree to the
-                    // sketch-bound `PhysicalExpr` IR — the typed L5's input.
-                    bound_physical = control_plane::physical::post_asap::bind_query_expr(
-                        &qe,
-                        workload.accuracy.clone(),
-                    )
-                    .ok();
-                }
-            }
-        }
 
-        let stage_configs: Option<
-            std::collections::HashMap<
-                crate::physical::colored_dag::StageId,
-                crate::physical::colored_dag::StageConfig,
-            >,
-        > = if physical::stage_split::typed_stage_split_enabled() {
-            let deployment_expr = bound_physical
-                .or_else(|| physical::workload_planner::bind_workload_typed(&workload));
-            deployment_expr.and_then(|pe| physical::stage_split::split_typed_three_stage(&pe))
-        } else {
-            None
-        };
 
-        stage_configs
-    };
 
-    // B2 (metric, role): derive the role from the request's
-    // query_string + optional `sketch_type` override so the
-    // store keys at (metric, role) granularity. Without the role
-    // a second POST for the same metric with a different shape
-    // (Quantile vs Sum) would silently overwrite the prior plan.
-    let role = {
-        let entry = control_plane::workload::WorkloadEntry {
-            metric_name: workload.metric_name.clone(),
-            query_string: query_string.clone(),
-            accuracy_sla: workload.accuracy_sla,
-            assign_to_role: String::from("agent"),
-            sketch_family_override: workload.sketch_type_override.clone(),
-            target_path: None,
-            grouping_labels: workload.group_by_labels.clone(),
-            // Role derivation does not depend on sampling; default 1.0.
-            sample_p: 1.0,
-            // Role derivation does not depend on the cardinality hint.
-            distinct_keys_per_window: None,
-            // Role derivation does not depend on the inner item dimension.
-            item_label: None,
-            // Role derivation does not depend on monitoring.
-            monitor: None,
-            repeat_every: None,
-        };
-        control_plane::workload::derive_agg_role(&entry)
-    };
-    st.store.set(&workload.metric_name, role, plan.clone());
-    // Persist workload so the replanner can re-run plan() without the original spec.
-    st.workload_store
-        .set(&workload.metric_name, role, workload.clone(), wc);
 
-    // ── Push agent config to agent-role collectors ────────────────────────────
-    if let Ok(agent_yaml) = generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint)
-    {
-        let hash = short_hash(&agent_yaml);
-        st.opamp
-            .push_to_role(
-                AgentRole::Agent,
-                RemoteConfig {
-                    config_hash: hash,
-                    yaml: agent_yaml,
-                },
-            )
-            .await;
-    }
 
-    // The typed stage-split path is gated by `USE_TYPED_STAGE_SPLIT`.
-    // Queries with a parsed expression use the bound physical plan; explicit-field
-    // workloads without a query string use `bind_workload_typed`.
-    if let Some(configs) = stage_configs {
-        for (stage_id, stage_cfg) in configs {
-            match stage_cfg {
-                crate::physical::colored_dag::StageConfig::Edge(mut edge) => {
-                    // MVP blocker B3 — patch per-metric grouping
-                    // labels onto the edge cfg so the 5-sketch
-                    // routing emitter prepends a
-                    // `transform/keep_for_*` OTTL processor in
-                    // front of each sketch pipeline. The typed
-                    // L5 emitter leaves
-                    // `metric_to_grouping_labels` empty by
-                    // design (same rationale as the
-                    // `agg.grouping = workload.group_by_labels`
-                    // patch on the Backend stage below).
-                    edge.metric_to_grouping_labels.insert(
-                        workload.metric_name.clone(),
-                        workload.group_by_labels.clone(),
-                    );
-                    // Issue #2: broadcast push — no single agent id
-                    // in scope, so emit `$AGENT_ID` placeholder and
-                    // rely on the agent container's env to expand it
-                    // at boot. Per-agent re-pushes (push_config_to_agent
-                    // / replan_metric inner loop) get the real id.
-                    match emit::emit_edge_yaml(&edge, &st.opamp_endpoint, "$AGENT_ID") {
-                        Ok(yaml) => {
-                            let hash = short_hash(&yaml);
-                            info!(
-                                stage = "edge",
-                                bytes = yaml.len(),
-                                "[USE_TYPED_STAGE_SPLIT] pushing typed edge YAML"
-                            );
-                            st.opamp
-                                .push_to_role(
-                                    AgentRole::Agent,
-                                    RemoteConfig {
-                                        config_hash: hash,
-                                        yaml,
-                                    },
-                                )
-                                .await;
-                        }
-                        Err(e) => warn!(error = %e, "emit_edge_yaml failed"),
-                    }
-                }
-                crate::physical::colored_dag::StageConfig::Gateway(gw) => {
-                    // Gateway-role collectors receive gateway YAML. Broadcast configs retain
-                    // the `$AGENT_ID` placeholder for expansion by each collector.
-                    match emit::emit_gateway_yaml(&gw, &st.opamp_endpoint, "$AGENT_ID") {
-                        Ok(yaml) => {
-                            let hash = short_hash(&yaml);
-                            info!(
-                                stage = "gateway",
-                                bytes = yaml.len(),
-                                "[USE_TYPED_STAGE_SPLIT] pushing typed gateway YAML"
-                            );
-                            st.opamp
-                                .push_to_role(
-                                    AgentRole::Gateway,
-                                    RemoteConfig {
-                                        config_hash: hash,
-                                        yaml,
-                                    },
-                                )
-                                .await;
-                        }
-                        Err(e) => warn!(error = %e, "emit_gateway_yaml failed"),
-                    }
-                }
-                crate::physical::colored_dag::StageConfig::Backend(mut be) => {
-                    // Patch metric_name + grouping from the
-                    // workload spec. The typed L5 emitter:
-                    //   * sets `metric_name` from
-                    //     `edge.source_metric`, which is
-                    //     populated by `extract_edge_facts`
-                    //     walking the `Logical(Scan{...})`
-                    //     chain. The path-recovery isn't
-                    //     guaranteed across every binder
-                    //     output shape, so we belt-and-brace
-                    //     it with `workload.metric_name`.
-                    //   * leaves `grouping` empty because the
-                    //     canonical L3 `QueryExpr::Aggregate.by`
-                    //     is positional `ColumnId`s against a
-                    //     synthesized schema with no label
-                    //     columns (open-set label naming is
-                    //     a Step γ TODO in
-                    //     `intent_algebra::column_resolution`).
-                    // `QueryWorkload` carries both unambiguously,
-                    // and every aggregation under one workload
-                    // shares them — so the patch is uniform.
-                    let item_labels = emit::collect_metric_to_item_label(
-                        &st.workload_registry,
-                        &st.workload_store,
-                    );
-                    for agg in &mut be.aggregations {
-                        if agg.metric_name.is_empty() {
-                            agg.metric_name = workload.metric_name.clone();
-                        }
-                        if agg.window_secs == 0 {
-                            agg.window_secs = workload.time_window.as_secs();
-                        }
-                        agg.grouping = workload.group_by_labels.clone();
-                        agg.item_label = item_labels.get(&agg.metric_name).cloned();
-                    }
-                    // Option B unification: every typed cumulative
-                    // emit (handle_plan here, Replanner triggers
-                    // below, startup pre-pop tick, OpAMP
-                    // on-connect tick) flows through the same
-                    // helper. See [`post_typed_backend_for_role`]
-                    // doc for the swap-semantics rationale +
-                    // cumulative-cache contract.
-                    // CDM monitor specs from the workload registry
-                    // (global; coordinator_url unused for the backend's
-                    // agg_id/τ/window-only entries).
-                    let monitors = st.workload_registry.monitor_intents("");
-                    post_typed_backend_for_role(
-                        st.backend_client.as_ref(),
-                        &st.backend_routing_cache,
-                        &workload.metric_name,
-                        role,
-                        be,
-                        &monitors,
-                    )
-                    .await;
-
-                    // Mention stage_id so `match` arms aren't
-                    // collapsed into untagged log lines if the
-                    // tracing filter drops the per-arm event.
-                    let _ = stage_id;
-                }
-            }
-        }
-    } else if physical::stage_split::typed_stage_split_enabled() {
-        warn!(
-            metric = %workload.metric_name,
-            "[USE_TYPED_STAGE_SPLIT] split_typed_three_stage returned None; \
-             legacy plan output unaffected"
-        );
-    }
-
-    // ── Update scrape-endpoint sketch types and agent→(metric, role) mapping ──
-    let sketch_type = plan.agent_config.sketch_type.clone();
-    for agent_id in st.opamp.connected_agents().await {
-        st.scraper
-            .set_sketch_type(&agent_id, sketch_type.clone())
-            .await;
-        st.replanner
-            .register_agent(&agent_id, &workload.metric_name, role)
-            .await;
-    }
-
-    let agents = st.opamp.connected_agents().await;
-    let cost = &plan.transmission_cost_summary;
-    (
-        StatusCode::OK,
-        Json(json!({
-            "metric":              workload.metric_name,
-            "sketch_type":         plan.agent_config.sketch_type.to_string(),
-            "mode":                plan.agent_config.mode.to_string(),
-            "aggregate_by":        plan.agent_config.aggregate_by,
-            "valid_until":         plan.valid_until,
-            "agents_notified":     agents.len(),
-            "delta_decision":      plan.delta_decision,
-            "transmission_costs": {
-                "raw_bytes_per_sec":                   cost.raw_bytes_per_sec,
-                "sketch_full_bytes_per_sec":            cost.sketch_full_bytes_per_sec,
-                "sketch_delta_bytes_per_sec":           cost.sketch_delta_bytes_per_sec,
-                "delta_cpu_overhead_micros_per_sample": cost.delta_cpu_overhead_micros_per_sample,
-                "delta_memory_overhead_bytes":          cost.delta_memory_overhead_bytes,
-                "estimated_fill_rate":                  cost.estimated_fill_rate,
-                "flush_rate_hz":                        cost.flush_rate_hz,
-            },
-        })),
-    )
-        .into_response()
-}
-
-async fn handle_get_plan(
-    State(st): State<AppState>,
-    Path(metric): Path<String>,
-) -> impl IntoResponse {
-    // B2 (metric, role): return every role's plan for this metric.
-    // Wire shape (additive, no breaking change): when only one role is
-    // registered, the response still carries the pre-B2 top-level
-    // `sketch_type` / `valid_until` fields for backward compat. The
-    // new `roles` array is always present so clients can opt in to
-    // the multi-role view.
-    let plans = st.store.get_all_for_metric(&metric);
-    if plans.is_empty() {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("plan not found for metric {metric:?}"),
-        )
-            .into_response();
-    }
-    let roles: Vec<serde_json::Value> = plans
-        .iter()
-        .map(|(role, plan)| {
-            json!({
-                "role": role.as_str(),
-                "sketch_type": plan.agent_config.sketch_type.to_string(),
-                "valid_until": plan.valid_until,
-            })
-        })
-        .collect();
-    let first = &plans[0].1;
-    (
-        StatusCode::OK,
-        Json(json!({
-            "metric":      metric,
-            "sketch_type": first.agent_config.sketch_type.to_string(),
-            "valid_until": first.valid_until,
-            "roles":       roles,
-        })),
-    )
-        .into_response()
-}
 
 /// Bootstrap YAML config for agent collectors.
 ///
@@ -1751,13 +1425,6 @@ async fn handle_tco(Json(req): Json<TcoRequest>) -> impl IntoResponse {
     (StatusCode::OK, Json(estimate))
 }
 
-fn short_hash(s: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -1795,12 +1462,8 @@ fn test_app_with_backend(backend_url: Option<String>) -> (AppState, axum::Router
     ));
     let backend_client = backend_url.map(|u| Arc::new(backend_client::BackendClient::new(u)));
     let state = AppState {
-        analyzer: Arc::new(Analyzer::new()),
-        planner,
-        store: Arc::clone(&plan_store),
         workload_store: Arc::clone(&workload_store),
         opamp,
-        scraper,
         replanner,
         online_store,
         opamp_endpoint: "ws://ctrl:4320/v1/opamp".into(),
@@ -1808,11 +1471,8 @@ fn test_app_with_backend(backend_url: Option<String>) -> (AppState, axum::Router
         runtime_samples: runtime_samples::RuntimeSamplesStore::new(64),
         active_summary_catalog: Arc::new(tokio::sync::Mutex::new(None)),
         backend_client,
-        backend_routing_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let router = axum::Router::new()
-        .route("/api/v1/plan", axum::routing::post(handle_plan))
-        .route("/api/v1/plan/:metric", axum::routing::get(handle_get_plan))
         .route("/api/v1/cost-model", axum::routing::get(handle_cost_model))
         .route("/api/v1/tco", axum::routing::post(handle_tco))
         .route(
@@ -1953,14 +1613,6 @@ mod api_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    fn plan_spec(metric: &str) -> serde_json::Value {
-        serde_json::json!({
-            "metric_name":  metric,
-            "aggregations": ["quantile"],
-            "time_window":  "5m",
-            "accuracy_sla": 0.01
-        })
-    }
 
     // ── AppState.backend_client wiring ───────────────────────────────
 
@@ -1990,142 +1642,13 @@ mod api_tests {
 
     // ── POST /api/v1/plan ─────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn plan_happy_path() {
-        let (_, app) = test_app();
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan")
-            .header("content-type", "application/json")
-            .body(Body::from(plan_spec("latency").to_string()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["metric"], "latency");
-        assert!(body["sketch_type"].as_str().is_some());
-        assert!(body["valid_until"].as_str().is_some());
-        assert!(body.get("plan_summary").is_none());
-        assert!(body["transmission_costs"].is_object());
-    }
 
-    /// HTTP and stored replan inputs share the resolved typed target, including delta.
-    #[tokio::test]
-    async fn plan_preserves_typed_accuracy_requirements() {
-        use control_plane::types::AccuracyTarget;
-        for target in [
-            AccuracyTarget::Epsilon(0.05),
-            AccuracyTarget::EpsilonDelta {
-                epsilon: 0.05,
-                delta: 0.001,
-            },
-            AccuracyTarget::Exact,
-        ] {
-            let (state, app) = test_app();
-            let mut body = plan_spec("typed_accuracy_metric");
-            body["accuracy_sla"] = serde_json::json!(0.2);
-            body["accuracy"] = serde_json::to_value(&target).unwrap();
-            body["sketch_type"] = serde_json::to_value(types::SketchType::DDSketch).unwrap();
-            body["query_string"] =
-                serde_json::json!("quantile_over_time(0.9, typed_accuracy_metric[5m])");
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/plan")
-                        .header("content-type", "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let stored = state
-                .workload_store
-                .get_all_for_metric("typed_accuracy_metric");
-            assert_eq!(stored.len(), 1);
-            assert_eq!(stored[0].1.accuracy, target);
-            let plans = state.store.get_all_for_metric("typed_accuracy_metric");
-            assert_eq!(plans.len(), 1);
-            if matches!(target, AccuracyTarget::Epsilon(_)) {
-                let types::SketchParams::DDSketch {
-                    relative_accuracy, ..
-                } = plans[0].1.agent_config.sketch_params
-                else {
-                    panic!("expected pinned DDS plan")
-                };
-                assert!((relative_accuracy - 0.05).abs() < 1e-12);
-            } else {
-                assert_eq!(plans[0].1.agent_config.output_mode, types::OutputMode::Raw);
-            }
-        }
-    }
 
-    #[tokio::test]
-    async fn plan_invalid_spec_returns_422() {
-        let (_, app) = test_app();
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"metric_name":"","aggregations":["quantile"],"time_window":"5m","accuracy_sla":0.01}"#))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
 
-    #[tokio::test]
-    async fn plan_invalid_aggregation_returns_422() {
-        let (_, app) = test_app();
-        let bad = serde_json::json!({
-            "metric_name": "m", "aggregations": ["histogram"],
-            "time_window": "5m", "accuracy_sla": 0.01
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan")
-            .header("content-type", "application/json")
-            .body(Body::from(bad.to_string()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
 
     // ── GET /api/v1/plan/:metric ──────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn get_plan_not_found_returns_404() {
-        let (_, app) = test_app();
-        let req = Request::builder()
-            .uri("/api/v1/plan/nonexistent")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
 
-    #[tokio::test]
-    async fn get_plan_after_post() {
-        let (_, app) = test_app();
-        // POST first
-        let post_req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/plan")
-            .header("content-type", "application/json")
-            .body(Body::from(plan_spec("cpu").to_string()))
-            .unwrap();
-        let post_resp = app.clone().oneshot(post_req).await.unwrap();
-        assert_eq!(post_resp.status(), StatusCode::OK);
-        // Then GET
-        let get_req = Request::builder()
-            .uri("/api/v1/plan/cpu")
-            .body(Body::empty())
-            .unwrap();
-        let get_resp = app.oneshot(get_req).await.unwrap();
-        assert_eq!(get_resp.status(), StatusCode::OK);
-        let body = body_json(get_resp).await;
-        assert_eq!(body["metric"], "cpu");
-    }
 
     // ── GET /api/v1/cost-model ────────────────────────────────────────────────
 
@@ -2266,7 +1789,7 @@ mod api_tests {
 
         // Pre-populate plan store (simulating what main() does with workload registry).
         let analyzer = Analyzer::new();
-        let spec = pipeline::QuerySpec {
+        let spec = control_plane::pipeline::QuerySpec {
             query_string: None,
             metric_name: "http_latency".into(),
             label_filters: Default::default(),
@@ -2411,7 +1934,7 @@ mod api_tests {
 
         // Seed workload + plan for "metric_a".
         let analyzer = Analyzer::new();
-        let spec = pipeline::QuerySpec {
+        let spec = control_plane::pipeline::QuerySpec {
             query_string: None,
             metric_name: "metric_a".into(),
             label_filters: Default::default(),
@@ -2676,7 +2199,7 @@ mod api_tests {
         // 3. Pre-populate workload_store + plan_store the same way
         //    main()'s startup loop does.
         let analyzer = Analyzer::new();
-        let spec = pipeline::QuerySpec {
+        let spec = control_plane::pipeline::QuerySpec {
             query_string: None,
             metric_name: metric.to_string(),
             label_filters: Default::default(),
@@ -2698,10 +2221,6 @@ mod api_tests {
         };
         let wl = analyzer.analyze(spec).expect("analyze");
         let wc = types::WorkloadCharacteristics::default();
-        let plan = state.planner.plan(&wl, Some(&wc));
-        state
-            .store
-            .set(metric, control_plane::workload::AggRole::Quantile, plan);
         state
             .workload_store
             .set(metric, control_plane::workload::AggRole::Quantile, wl, wc);
@@ -2711,8 +2230,6 @@ mod api_tests {
 
         // 5. Rebuild the router with the updated state.
         let router = axum::Router::new()
-            .route("/api/v1/plan", axum::routing::post(handle_plan))
-            .route("/api/v1/plan/:metric", axum::routing::get(handle_get_plan))
             .route("/api/v1/cost-model", axum::routing::get(handle_cost_model))
             .route("/api/v1/tco", axum::routing::post(handle_tco))
             .route(
@@ -2901,7 +2418,7 @@ mod api_tests {
         //    main()'s startup loop does.
         let analyzer = Analyzer::new();
         for m in metrics.iter() {
-            let spec = pipeline::QuerySpec {
+            let spec = control_plane::pipeline::QuerySpec {
                 query_string: None,
                 metric_name: (*m).into(),
                 label_filters: Default::default(),
@@ -2923,10 +2440,6 @@ mod api_tests {
             };
             let wl = analyzer.analyze(spec).expect("analyze");
             let wc = types::WorkloadCharacteristics::default();
-            let plan = state.planner.plan(&wl, Some(&wc));
-            state
-                .store
-                .set(*m, control_plane::workload::AggRole::Quantile, plan);
             state
                 .workload_store
                 .set(*m, control_plane::workload::AggRole::Quantile, wl, wc);
@@ -3093,10 +2606,8 @@ mod api_tests {
             let spec = control_plane::workload::query_spec_for_entry(entry);
             if let Ok(wl) = analyzer.analyze(spec) {
                 let wc = types::WorkloadCharacteristics::default();
-                let plan = state.planner.plan(&wl, Some(&wc));
                 let metric_name = wl.metric_name.clone();
                 let role = control_plane::workload::derive_agg_role(entry);
-                state.store.set(&metric_name, role, plan);
                 state.workload_store.set(&metric_name, role, wl, wc);
             }
         }
@@ -3179,298 +2690,5 @@ mod api_tests {
         assert!(!yaml.contains("name == \"top_endpoint_qps\""));
     }
 
-    // ── Regression: archive tier covers all 5 sketched metrics ────────────────
-    //
-    // The backend's `POST /api/v1/storage_routing` handler is an atomic
-    // per-tenant SWAP — every push replaces the whole tenant's routing
-    // table. Pre-fix, `handle_plan` posted a single-element
-    // `metrics:[…]` document per call, so when the demo POSTed
-    // `/api/v1/plan` for each of the 5 sketched contract metrics in
-    // sequence, only the LAST metric's entry survived in the backend.
-    // The other 4 metrics defaulted to `sketch_store` (which has
-    // no ASAP-tier sketch state for archive-shape queries) → the
-    // demo's accuracy reducer logged `archive_miss` for those metrics
-    // even though gorillas3 wrote their TSDB blocks to MinIO and
-    // Thanos had them indexed.
-    //
-    // The fix wires `state.backend_routing_cache` so each
-    // `handle_plan` cycle posts the **cumulative** routing table.
-    // This regression test replays the demo's per-metric POST sequence
-    // against a mock backend, captures every body, and asserts the
-    // final swap covers all 5 sketched metrics simultaneously.
-    #[tokio::test]
-    async fn storage_routing_cumulative_push_covers_all_planned_metrics() {
-        // Activate the typed-stage-split path (the only path that
-        // emits storage-routing JSON; the legacy path no-ops).
-        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
-        // Mock backend that captures every storage-routing body.
-        // We re-use the mock pattern from `backend_client::tests` —
-        // an axum router that drains the request body into a shared
-        // sink. Mounted at the canonical `/api/v1/storage_routing`
-        // path so `BackendClient`'s URL-rewrite hits it directly.
-        type SinkInner = std::sync::Mutex<Vec<String>>;
-        let sink: Arc<SinkInner> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink_capture = Arc::clone(&sink);
-        let mock_app = axum::Router::new().route(
-            "/api/v1/physical-plan",
-            axum::routing::post(move |body: axum::body::Bytes| {
-                let sink = Arc::clone(&sink_capture);
-                async move {
-                    let s = String::from_utf8_lossy(&body).to_string();
-                    sink.lock().unwrap().push(s);
-                    axum::http::StatusCode::OK
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, mock_app).await.unwrap();
-        });
-        // Brief settle so the bind is observable before the first POST.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Build an AppState with the backend pointed at the mock URL.
-        // Use the streaming-config alias so `BackendClient` derives
-        // the matching `/api/v1/storage_routing` URL.
-        let backend_url = format!("http://{addr}/api/v1/streaming-config");
-        let (state, _) = test_app_with_backend(Some(backend_url));
-
-        // Mount only `/api/v1/plan` — that's the path the demo
-        // exercises; we don't need bootstrap or other routes.
-        let app = axum::Router::new()
-            .route("/api/v1/plan", axum::routing::post(handle_plan))
-            .with_state(state.clone());
-
-        // The two quantile-compatible sketched contract metrics. Each gets a
-        // separate POST /api/v1/plan, mirroring the demo's
-        // per-workload plan-emit cycle.
-        let sketched = [
-            "http_requests_total_latency_ms", // DDSketch
-            "request_size_bytes",             // KLL
-        ];
-
-        for m in &sketched {
-            let app = app.clone();
-            let req = Request::builder()
-                .method("POST")
-                .uri("/api/v1/plan")
-                .header("content-type", "application/json")
-                .body(Body::from(plan_spec(m).to_string()))
-                .unwrap();
-            let resp = app.oneshot(req).await.unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "POST /api/v1/plan for `{m}` must return 200",
-            );
-        }
-
-        // Publication is dispatched asynchronously; wait for every accepted
-        // plan instead of racing the background HTTP tasks.
-        for _ in 0..100 {
-            if sink.lock().unwrap().len() == sketched.len() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // Drain the mock sink: every plan-emit must have produced exactly one body.
-        let bodies = sink.lock().unwrap().clone();
-        assert_eq!(
-            bodies.len(),
-            sketched.len(),
-            "expected one storage-routing POST per plan; got {} bodies",
-            bodies.len(),
-        );
-
-        // The LAST captured body is the one the backend will leave
-        // installed (the swap is destructive — last write wins). It
-        // MUST list all planned metrics, otherwise the swap would
-        // erase the routing entries for the metrics planned earlier
-        // in the sequence and the backend would default them to
-        // `sketch_store` → archive_miss for those metrics' archive
-        // queries even though gorillas3's TSDB blocks are present in
-        // MinIO and Thanos has them indexed.
-        let last: serde_json::Value =
-            serde_json::from_str(bodies.last().unwrap()).expect("last body is valid JSON");
-        let metric_names: std::collections::BTreeSet<String> = last["storage_routing"]["metrics"]
-            .as_array()
-            .expect("metrics array")
-            .iter()
-            .map(|m| m["name"].as_str().unwrap().to_string())
-            .collect();
-        for m in &sketched {
-            assert!(
-                metric_names.contains(*m),
-                "final cumulative storage-routing table missing metric `{m}`; \
-                 contains only {metric_names:?}\nfull body: {}",
-                bodies.last().unwrap(),
-            );
-        }
-
-        // Each metric entry must carry a `thanos_query` target — the
-        // archive-tier dispatch that lets backend forward archive-shape
-        // queries to Thanos. Without this target the metric falls back
-        // to `default_engine: sketch_store` and the archive miss
-        // reproduces.
-        for m in last["storage_routing"]["metrics"].as_array().unwrap() {
-            let targets = m["targets"].as_array().expect("targets array");
-            let engines: Vec<&str> = targets
-                .iter()
-                .map(|t| t["engine"].as_str().unwrap())
-                .collect();
-            assert!(
-                engines.contains(&"thanos_query"),
-                "metric `{}` missing `thanos_query` target; engines={engines:?}",
-                m["name"].as_str().unwrap(),
-            );
-        }
-    }
-
-    // ── Regression: cumulative streaming-config across (metric, role) ─────────
-    //
-    // PR #283 made `WorkloadStore` and `PlanStore` (metric, role)-keyed,
-    // so a single metric can carry MULTIPLE aggregation roles (e.g.
-    // post-B2 `http_requests_total` has both a DDSketch-Quantile entry
-    // from `quantile_over_time(...)` AND an ExactAgg-Sum entry from
-    // `sum by (zone) (...)` in the workload store).
-    //
-    // Pre-this-fix the streaming-config emit path in `handle_plan` was
-    // still metric-keyed and posted the CURRENT iteration's
-    // `BackendStageConfig` alone. The data plane's
-    // `POST /api/v1/streaming-config` handler is an atomic full
-    // `handle.swap(new_config)`, so the second per-(metric, role) plan
-    // POST destroyed the first one's aggregations on the backend and
-    // `sum by (zone) (http_requests_total)` lands with
-    // `ExactAgg(Sum) capability not satisfied`.
-    //
-    // This test replays the demo's per-metric plan-POST sequence
-    // against a mock backend and captures every streaming-config body.
-    // The LAST body (the one the data plane's swap installs) MUST
-    // carry aggregations from EVERY prior plan POST, otherwise the
-    // swap erases the earlier metrics' rows and the data plane can't
-    // answer queries against them.
-    //
-    // The (metric, role) cache key is exercised in tandem by the live
-    // mvp-workload.yaml pre-pop loop (the workload registry lists 3
-    // entries for `http_requests_total`) → see the MVP acceptance-test
-    // pipeline. This in-process test exercises the cumulative-merge
-    // plumbing in isolation against the same emit path used by both
-    // the pre-pop loop and per-request replans.
-    #[tokio::test]
-    async fn streaming_config_cumulative_push_covers_all_planned_metrics() {
-        // Activate the typed-stage-split path (the only path that emits
-        // the typed streaming-config JSON; the legacy emit path no-ops).
-        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
-
-        // Mock backend that captures every streaming-config body. Same
-        // pattern as the sibling `storage_routing_cumulative_push_...`
-        // test — an axum router that drains the request body into a
-        // shared sink. Mounted at the canonical
-        // `/api/v1/streaming-config` path so `BackendClient`'s URL
-        // forwarding hits it directly.
-        type SinkInner = std::sync::Mutex<Vec<String>>;
-        let sink: Arc<SinkInner> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink_capture = Arc::clone(&sink);
-        let mock_app = axum::Router::new().route(
-            "/api/v1/physical-plan",
-            axum::routing::post(move |body: axum::body::Bytes| {
-                let sink = Arc::clone(&sink_capture);
-                async move {
-                    let s = String::from_utf8_lossy(&body).to_string();
-                    sink.lock().unwrap().push(s);
-                    axum::http::StatusCode::OK
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, mock_app).await.unwrap();
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Build an AppState with the backend pointed at the mock URL.
-        let backend_url = format!("http://{addr}/api/v1/streaming-config");
-        let (state, _) = test_app_with_backend(Some(backend_url));
-        let app = axum::Router::new()
-            .route("/api/v1/plan", axum::routing::post(handle_plan))
-            .with_state(state.clone());
-
-        // The quantile-compatible sketched contract metrics — the same
-        // set the sibling `storage_routing_cumulative_push_...` test
-        // exercises. Each gets a separate `POST /api/v1/plan`. Pre-fix the metric-only cache
-        // would have collapsed sequential same-metric POSTs onto one
-        // slot; this test uses 5 distinct metrics so the assertion
-        // surfaces the cumulative-merge gap (every metric's row must
-        // survive every other metric's swap).
-        let sketched = ["http_requests_total_latency_ms", "request_size_bytes"];
-
-        for m in &sketched {
-            let app = app.clone();
-            let req = Request::builder()
-                .method("POST")
-                .uri("/api/v1/plan")
-                .header("content-type", "application/json")
-                .body(Body::from(plan_spec(m).to_string()))
-                .unwrap();
-            let resp = app.oneshot(req).await.unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "POST /api/v1/plan for `{m}` must return 200",
-            );
-        }
-
-        // Publication is dispatched asynchronously; wait for every accepted
-        // plan instead of racing the background HTTP tasks.
-        for _ in 0..100 {
-            if sink.lock().unwrap().len() == sketched.len() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // Drain the mock sink: every plan-emit must have produced exactly one body.
-        let bodies = sink.lock().unwrap().clone();
-        assert_eq!(
-            bodies.len(),
-            sketched.len(),
-            "expected one streaming-config POST per plan; got {} bodies",
-            bodies.len(),
-        );
-
-        // The LAST body is the one the data plane's swap installs
-        // (the swap is destructive — last write wins). It MUST list
-        // aggregations for all planned metrics, otherwise the
-        // swap erases the earlier metrics' rows and queries against
-        // them fail with `…capability not satisfied` — the
-        // streaming-config analogue of the storage-routing
-        // `archive_miss` failure documented on the sibling test.
-        let last: serde_json::Value =
-            serde_json::from_str(bodies.last().unwrap()).expect("last body is valid JSON");
-        let aggs = last["precompute_plan"]["materializations"]
-            .as_array()
-            .expect("aggregations array on cumulative streaming-config body");
-        // Wire-format note: `build_backend_aggregation_json` writes
-        // the field under key `metric` (NOT `metric_name`) — see
-        // `emit/stage_config.rs::build_backend_aggregation_json`.
-        let metric_names: std::collections::BTreeSet<String> = aggs
-            .iter()
-            .filter_map(|a| {
-                a.get("metric")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        for m in &sketched {
-            assert!(
-                metric_names.contains(*m),
-                "final cumulative streaming-config missing aggregations \
-                 for metric `{m}`; contains only {metric_names:?}\n\
-                 full body: {}",
-                bodies.last().unwrap(),
-            );
-        }
-    }
 }
