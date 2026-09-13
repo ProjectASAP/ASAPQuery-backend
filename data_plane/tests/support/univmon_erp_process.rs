@@ -108,6 +108,8 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         .map(|query| {
             let mut entry = template.clone();
             entry["query"] = (*query).into();
+            // ERP evidence is calibrated for one complete five-second population.
+            entry["demand"]["fixed_interval_at"]["interval"] = serde_json::json!(5000);
             entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.2}});
             entry
         })
@@ -291,6 +293,10 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         assert!(observed.invalid_reason.is_none(), "{observed:?}");
         assert!(!observed.populations.is_empty());
         assert_eq!(observed.window_end_ms - observed.window_start_ms, 5000);
+        for population in &observed.populations {
+            assert_eq!(population.shape.event_count(), Some(raw.len() as u64));
+            assert_eq!(population.shape.sorted_counts.len(), 128);
+        }
         assert!(plan
             .summary_catalog
             .materializations

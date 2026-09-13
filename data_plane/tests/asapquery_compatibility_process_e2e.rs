@@ -1248,6 +1248,12 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
                     (base + 1_700, 60.0),
                     (base + 2_900, 5.0),
                     (base + 4_200, 15.0),
+                    // Keep both queried windows populated; missing counter
+                    // panes deliberately use exact fallback.
+                    (base + 5_500, 20.0),
+                    (base + 6_700, 30.0),
+                    (base + 7_900, 5.0),
+                    (base + 9_200, 15.0),
                 ],
             ),
             series_with_labels(
