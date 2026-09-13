@@ -48,8 +48,7 @@ fn quote_snapshot_for_frontend_test(
     let quotes = workload_cost::with_exact_alternative(request)
         .unwrap()
         .into_iter()
-        .enumerate()
-        .filter_map(|(_index, candidate)| {
+        .filter_map(|candidate| {
             let plan = if metricsql {
                 PhysicalCompiler.compile_metricsql(candidate.clone(), environment.clone())
             } else {
