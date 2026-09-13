@@ -18,6 +18,7 @@ pub enum ClickHouseFormat {
     TabSeparated,
     JsonEachRow,
     Json,
+    JsonCompact { quote_64bit_integers: bool },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +85,12 @@ pub fn from_series_rows(
 
 impl ClickHouseQueryResult {
     pub fn encode(&self, format: ClickHouseFormat) -> Result<Vec<u8>, ClickHouseResultError> {
+        if let ClickHouseFormat::JsonCompact {
+            quote_64bit_integers,
+        } = format
+        {
+            return self.encode_json_compact(quote_64bit_integers);
+        }
         if self.batches.iter().any(|batch| {
             batch
                 .columns()
@@ -159,7 +166,7 @@ impl ClickHouseQueryResult {
                             .finish()
                             .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
                     }
-                    ClickHouseFormat::Json => {}
+                    ClickHouseFormat::Json | ClickHouseFormat::JsonCompact { .. } => {}
                 }
             }
         }
@@ -167,6 +174,55 @@ impl ClickHouseQueryResult {
             return self.encode_json_document();
         }
         Ok(output)
+    }
+
+    fn encode_json_compact(
+        &self,
+        quote_64bit_integers: bool,
+    ) -> Result<Vec<u8>, ClickHouseResultError> {
+        let mut rows = Vec::new();
+        let mut meta = Vec::new();
+        if let Some(batch) = self.batches.first() {
+            meta = batch.schema().fields().iter().map(|f| serde_json::json!({"name":f.name(), "type":clickhouse_type(f.data_type(),f.is_nullable())})).collect();
+        }
+        for batch in &self.batches {
+            for row in 0..batch.num_rows() {
+                let mut values = Vec::new();
+                for array in batch.columns() {
+                    if !matches!(
+                        array.data_type(),
+                        DataType::Boolean
+                            | DataType::Int64
+                            | DataType::UInt64
+                            | DataType::Float64
+                            | DataType::Utf8
+                    ) {
+                        return Err(ClickHouseResultError::Arrow(
+                            "JSONCompact supports scalar table population output".into(),
+                        ));
+                    }
+                    let value = if !array.is_null(row)
+                        && quote_64bit_integers
+                        && matches!(array.data_type(), DataType::Int64 | DataType::UInt64)
+                    {
+                        serde_json::Value::String(
+                            array_value_to_string(array.as_ref(), row)
+                                .map_err(|e| ClickHouseResultError::Arrow(e.to_string()))?,
+                        )
+                    } else {
+                        serde_json::to_value(JsonArrowValue {
+                            array: array.as_ref(),
+                            row,
+                        })?
+                    };
+                    values.push(value);
+                }
+                rows.push(values);
+            }
+        }
+        Ok(serde_json::to_vec(
+            &serde_json::json!({"meta":meta,"data":rows,"rows":rows.len(),"statistics":{"elapsed":0.0,"rows_read":rows.len(),"bytes_read":0}}),
+        )?)
     }
 
     fn encode_json_document(&self) -> Result<Vec<u8>, ClickHouseResultError> {

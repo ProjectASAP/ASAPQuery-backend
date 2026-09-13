@@ -3,6 +3,8 @@
 //! ASAPPlanner owns SQL parsing and canonicalization. This module only joins
 //! that frontend to the same post-ASAP physical mapping used by PromQL.
 
+pub mod table_population;
+
 use asap_frontend_sql::{lower_sql_dialect, SqlCatalog};
 use planner_types::pre_asap::QueryExpr;
 use planner_types::types::AccuracyTarget;
@@ -239,6 +241,20 @@ pub async fn compile_automatic_clickhouse_workload(
     ),
     ClickHousePlanningError,
 > {
+    compile_automatic_clickhouse_workload_selected(request, None, None).await
+}
+
+async fn compile_automatic_clickhouse_workload_selected(
+    request: &ClickHouseSqlAutomaticWorkload,
+    selected: Option<&HashMap<String, serde_json::Value>>,
+    maintenance: Option<&asap_types::query_plan::table_rows::TableRowsMaintenance>,
+) -> Result<
+    (
+        crate::physical::publication::PhysicalPlanPublication,
+        std::collections::BTreeMap<String, serde_json::Value>,
+    ),
+    ClickHousePlanningError,
+> {
     let catalog = SqlCatalog {
         tables: request.tables.clone(),
     };
@@ -251,11 +267,42 @@ pub async fn compile_automatic_clickhouse_workload(
         validate_sql_evaluation(query)?;
         // Selection runs once. Compilation installs only SummaryAgg nodes
         // actually visited in this selected DAG, never a scripted family.
-        let mut planned =
-            plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+        let mut planned = if let Some(selected) = selected {
+            let canonical = lower_sql_dialect(
+                &query.sql,
+                &catalog,
+                SqlDialect::ClickhouseSQL,
+                request.accuracy.clone(),
+            )
+            .await
+            .map_err(|e| ClickHousePlanningError::Lower(e.to_string()))?;
+            let roots = selected
+                .values()
+                .cloned()
+                .map(serde_json::from_value::<Rc<QueryExpr>>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| ClickHousePlanningError::Lower(e.to_string()))?;
+            let strategy =
+                asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+                    &roots,
+                );
+            let candidate = strategy
+                .candidate(&Rc::new(canonical.clone()))
+                .ok_or_else(|| {
+                    ClickHousePlanningError::Lower("missing selected row candidate".into())
+                })?;
+            ClickHousePlannedQuery {
+                canonical_sql: canonical_sql_identity(&canonical),
+                canonical,
+                physical: PhysicalExpr::committed(candidate),
+                selection_trace: serde_json::json!({"strategy": "MaintainedPopulationStrategy"}),
+            }
+        } else {
+            plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?
+        };
         let selection_trace = std::mem::take(&mut planned.selection_trace);
         let template = planned.canonical_sql.clone();
-        let (entry, installed) = compile_selected_sql(query, planned, |node, family| {
+        let (mut entry, installed) = compile_selected_sql(query, planned, |node, family| {
             let config = materialize_selected_sql(node, family, query)
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
             let binding = MaterializationBinding {
@@ -272,6 +319,11 @@ pub async fn compile_automatic_clickhouse_workload(
                 .or_insert(config);
             Ok(binding)
         })?;
+        for node in entry.nodes.values_mut() {
+            if let crate::query_plan::QueryPlanNode::ReadTablePopulation { population, .. } = node {
+                population.maintenance = maintenance.cloned();
+            }
+        }
         index_sql_template(&mut window_templates, template, &entry);
         selection_traces.insert(entry.canonical_query.clone(), selection_trace);
         let key = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &entry.canonical_query);

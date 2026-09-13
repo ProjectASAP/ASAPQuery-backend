@@ -11,3 +11,5 @@ pub use server::{
     ClickHouseHttpServer,
 };
 pub mod accelerator;
+
+pub mod table_rows;

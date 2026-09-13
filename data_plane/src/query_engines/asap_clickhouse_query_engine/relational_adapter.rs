@@ -33,10 +33,12 @@ pub enum ClickHouseRelationalError {
     Arrow(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum Cell {
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(super) enum Cell {
     Null,
     Int64(i64),
+    // Canonical Count is a bounded integer; SQL retains its native unsigned wire type.
+    UInt64(u64),
     Float64(f64),
     Utf8(String),
     Bool(bool),
@@ -188,8 +190,8 @@ fn parse_clickhouse_timestamp(value: &serde_json::Value, clickhouse_type: &str) 
 
 #[derive(Clone, Debug)]
 pub struct ClickHouseRelation {
-    rows: Vec<Vec<Cell>>,
-    fields: Vec<(String, DataType, bool)>,
+    pub(super) rows: Vec<Vec<Cell>>,
+    pub(super) fields: Vec<(String, DataType, bool)>,
     pub coverage: Option<(u64, u64)>,
 }
 
@@ -289,13 +291,48 @@ impl ClickHouseRelation {
     }
 
     pub fn into_result(self) -> Result<ClickHouseQueryResult, ClickHouseRelationalError> {
+        let unsigned = (0..self.fields.len())
+            .map(|column| {
+                self.rows
+                    .iter()
+                    .any(|row| matches!(row.get(column), Some(Cell::UInt64(_))))
+            })
+            .collect::<Vec<_>>();
         let fields = self
             .fields
             .iter()
-            .map(|(name, dtype, nullable)| Field::new(name, arrow_type(dtype), *nullable))
+            .enumerate()
+            .map(|(i, (name, dtype, nullable))| {
+                Field::new(
+                    name,
+                    if unsigned[i] {
+                        ArrowDataType::UInt64
+                    } else {
+                        arrow_type(dtype)
+                    },
+                    *nullable,
+                )
+            })
             .collect::<Vec<_>>();
         let columns = (0..self.fields.len())
-            .map(|column| build_array(&self.rows, column, &self.fields[column].1))
+            .map(|column| {
+                if unsigned[column] {
+                    let values = self
+                        .rows
+                        .iter()
+                        .map(|row| match row.get(column) {
+                            Some(Cell::UInt64(v)) => Ok(Some(*v)),
+                            Some(Cell::Null) => Ok(None),
+                            _ => Err(ClickHouseRelationalError::Invalid(
+                                "mixed signed/unsigned SQL result column".into(),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(Arc::new(arrow::array::UInt64Array::from(values)) as ArrayRef)
+                } else {
+                    build_array(&self.rows, column, &self.fields[column].1)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| ClickHouseRelationalError::Arrow(error.to_string()))?;
@@ -489,7 +526,7 @@ impl ClickHouseRelationalAdapter {
     }
 }
 
-fn fields_from_schema(schema: &SummarySchema) -> Vec<(String, DataType, bool)> {
+pub(super) fn fields_from_schema(schema: &SummarySchema) -> Vec<(String, DataType, bool)> {
     schema
         .fields
         .iter()

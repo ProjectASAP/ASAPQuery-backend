@@ -370,10 +370,18 @@ pub(crate) fn exact_source_metrics(
     Ok(metrics)
 }
 
-pub(super) type PricedComponents = (Cost, BTreeMap<String, f64>);
+pub(crate) type PricedComponents = (Cost, BTreeMap<String, f64>);
 
 impl WorkloadCostEvidence {
     fn validate(&self, env: &DeploymentEnvironment) -> Result<(), CompileError> {
+        self.validate_at(env.observed_at_unix_ms, env.max_evidence_age_ms)
+    }
+
+    pub(crate) fn validate_at(
+        &self,
+        observed_at_unix_ms: u64,
+        max_evidence_age_ms: u64,
+    ) -> Result<(), CompileError> {
         if self.backend_revision != super::compiler::BACKEND_REVISION
             || self.planner_revision != super::compiler::PLANNER_REVISION
         {
@@ -388,16 +396,16 @@ impl WorkloadCostEvidence {
         if self.data_snapshot_id.trim().is_empty()
             || self.model_version.trim().is_empty()
             || self.valid_for_ms == 0
-            || self.observed_at_unix_ms > env.observed_at_unix_ms
-            || env.observed_at_unix_ms - self.observed_at_unix_ms
-                > self.valid_for_ms.min(env.max_evidence_age_ms)
+            || self.observed_at_unix_ms > observed_at_unix_ms
+            || observed_at_unix_ms - self.observed_at_unix_ms
+                > self.valid_for_ms.min(max_evidence_age_ms)
         {
             return Err(invalid("missing, future or stale evidence generation"));
         }
         Ok(())
     }
 
-    pub(super) fn price(
+    pub(crate) fn price(
         &self,
         manifest: &WorkloadCostManifest,
     ) -> Result<PricedComponents, (&'static str, String)> {

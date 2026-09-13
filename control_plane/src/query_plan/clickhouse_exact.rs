@@ -125,6 +125,39 @@ fn aggregate(intent: &AggIntent, schema: &Schema) -> Result<String, String> {
         )?
     ))
 }
+/// A closed table population verifies the native table's complete row schema,
+/// including columns not used by a quantile but returned by SELECT * TopK.
+pub(super) fn render_population_snapshot(expr: &QueryExpr) -> Result<String, String> {
+    let QueryExpr::Scan {
+        source: Source::Table { table_ref },
+        predicates,
+        schema,
+    } = expr
+    else {
+        return Err("table population requires a direct table scan".into());
+    };
+    if !schema.closed {
+        return Err("table population requires a closed source schema".into());
+    }
+    let table = table_ref
+        .split('.')
+        .map(quoted)
+        .collect::<Vec<_>>()
+        .join(".");
+    let filters = predicates
+        .iter()
+        .map(|p| scalar(&p.0, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!(
+        "SELECT * FROM {table}{}",
+        if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filters.join(" AND "))
+        }
+    ))
+}
+
 /// Composite cuts retain their own canonical predicates; caller bounds are not
 /// injected into descendant scans (which may belong to independent windows).
 pub(super) fn render(expr: &QueryExpr) -> Result<String, String> {

@@ -520,6 +520,14 @@ async fn main() {
     let app = Router::new()
         .route("/api/v1/plan", post(handle_plan))
         .route(
+            "/api/v1/clickhouse-plan/table-populations/cost-manifests",
+            post(handle_table_population_manifests),
+        )
+        .route(
+            "/api/v1/clickhouse-plan/table-populations/compile-and-publish",
+            post(handle_table_population_deployment),
+        )
+        .route(
             "/api/v1/physical-plan/cost-manifests",
             post(handle_workload_cost_manifests),
         )
@@ -2285,6 +2293,35 @@ fn test_app_with_backend(backend_url: Option<String>) -> (AppState, axum::Router
         )
         .with_state(state.clone());
     (state, router)
+}
+
+async fn handle_table_population_manifests(
+    Json(request): Json<clickhouse::table_population::TablePopulationWorkload>,
+) -> axum::response::Response {
+    match tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current()
+            .block_on(clickhouse::table_population::candidates(&request))
+    })
+    .await
+    {
+        Ok(Ok(candidates)) => Json(candidates).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+async fn handle_table_population_deployment(
+    State(state): State<AppState>,
+    Json(request): Json<clickhouse::table_population::TablePopulationDeployment>,
+) -> axum::response::Response {
+    match tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(clickhouse::table_population::compile(&request))
+    })
+    .await
+    {
+        Ok(Ok(publication)) => publish_clickhouse_plan(&state, publication, None).await,
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
 }
 
 #[cfg(test)]

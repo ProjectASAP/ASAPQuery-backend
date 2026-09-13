@@ -61,6 +61,15 @@ fn execute_relation_subtree(
     is_cumulative: bool,
 ) -> Result<ClickHouseRelation, String> {
     match entry.nodes.get(&root) {
+        Some(QueryPlanNode::ReadTablePopulation { output_schema, .. }) => {
+            if output_schema != expected_schema {
+                return Err("table population output schema mismatch".into());
+            }
+            prepared
+                .get(&root)
+                .cloned()
+                .ok_or_else(|| "table population is not ready".into())
+        }
         Some(QueryPlanNode::ExternalExact { request, .. }) => {
             if request.language != asap_types::QueryLanguage::ClickHouseSql {
                 return Err("ClickHouse DAG contains an external leaf for another language".into());
@@ -266,13 +275,18 @@ fn execute_sql_dag_with_external_unfenced(
         ids.iter().any(|id| {
             matches!(
                 entry.nodes.get(id),
-                Some(QueryPlanNode::RelationalJoin { .. } | QueryPlanNode::ExternalExact { .. })
+                Some(
+                    QueryPlanNode::RelationalJoin { .. }
+                        | QueryPlanNode::ExternalExact { .. }
+                        | QueryPlanNode::ReadTablePopulation { .. }
+                )
             )
         })
     });
     if has_relational_join {
         let root_schema = match entry.nodes.get(&entry.root) {
-            Some(QueryPlanNode::Relational { output_schema, .. })
+            Some(QueryPlanNode::ReadTablePopulation { output_schema, .. })
+            | Some(QueryPlanNode::Relational { output_schema, .. })
             | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => output_schema.clone(),
             Some(QueryPlanNode::ExternalExact { request, .. }) => {
                 let asap_types::query_plan::ExternalExactOutput::Relation { schema } =

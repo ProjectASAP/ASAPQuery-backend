@@ -270,6 +270,7 @@ where
                 | QueryPlanNode::Relational { input, .. } => *input = remap[input],
                 QueryPlanNode::Scalar { .. }
                 | QueryPlanNode::ReadMaterialization { .. }
+                | QueryPlanNode::ReadTablePopulation { .. }
                 | QueryPlanNode::ExactFallback { .. } => {}
             }
             self.nodes.insert(remap[&local], physical);
@@ -330,6 +331,59 @@ where
         }
 
         let physical = match &node.expr {
+            SummaryExpr::ValueOperation {
+                child,
+                operation: planner_types::post_asap::ValueOperation::ReadPopulation { readout },
+                ..
+            } if self.preserve_relational => {
+                use planner_types::post_asap::{
+                    maintained_population::PopulationInput, ValueOperation,
+                };
+                let SummaryExpr::ValueOperation {
+                    child: scan,
+                    operation: ValueOperation::MaintainPopulation { population },
+                    ..
+                } = &child.expr
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "population readout lacks maintenance input".into(),
+                    ));
+                };
+                let PopulationInput::Rows {
+                    input,
+                    value_column,
+                    grouping,
+                } = &population.input
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "SQL cannot read a current-series population".into(),
+                    ));
+                };
+                let SummaryExpr::KeepPreAsap(actual_input) = &scan.expr else {
+                    return Err(QueryPlanError::Invalid(
+                        "table population maintenance must consume the declared scan".into(),
+                    ));
+                };
+                if !population.matches_input(actual_input) || !population.supports(readout) {
+                    return Err(QueryPlanError::Invalid(
+                        "incompatible table population input/readout".into(),
+                    ));
+                }
+                QueryPlanNode::ReadTablePopulation {
+                    population: asap_types::query_plan::table_rows::TableRowsPopulation {
+                        snapshot_sql: clickhouse_exact::render_population_snapshot(input)
+                            .map_err(QueryPlanError::Invalid)?,
+                        input_schema: scan.schema.clone(),
+                        value_column: *value_column,
+                        grouping: grouping.keys().to_vec(),
+                        max_k: population.max_k,
+                        quantiles: population.quantiles,
+                        maintenance: None,
+                    },
+                    readout: readout.clone(),
+                    output_schema: node.schema.clone(),
+                }
+            }
             SummaryExpr::RelationalJoin {
                 left,
                 right,

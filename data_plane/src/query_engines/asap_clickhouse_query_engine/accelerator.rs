@@ -23,6 +23,7 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 
 pub struct CatalogClickHouseAccelerator {
     pub store: Arc<SketchStore>,
+    table_rows: super::table_rows::TableRowsRuntime,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     exact_backend: Option<Arc<dyn ClickHouseExactBackend>>,
 }
@@ -31,6 +32,7 @@ impl CatalogClickHouseAccelerator {
     pub fn empty(store: Arc<SketchStore>) -> Self {
         Self {
             store,
+            table_rows: Default::default(),
             active_physical_plan: None,
             exact_backend: None,
         }
@@ -68,8 +70,70 @@ impl CatalogClickHouseAccelerator {
         start_ms: u64,
         end_ms: u64,
         request_context: &ClickHouseQueryRequest,
+        generation: (u64, u64),
     ) -> Result<PreparedExternalLeaves, String> {
         let mut prepared = PreparedExternalLeaves::new();
+        for (id, node) in &entry.nodes {
+            let asap_types::query_plan::QueryPlanNode::ReadTablePopulation {
+                population,
+                readout,
+                output_schema,
+            } = node
+            else {
+                continue;
+            };
+            let accepted_age = request_context
+                .headers
+                .get("x-asap-max-snapshot-age-ms")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let policy = population
+                .maintenance
+                .as_ref()
+                .ok_or("missing table snapshot policy")?;
+            if accepted_age.is_none_or(|age| age < policy.max_snapshot_age_ms)
+                || request_context.database() != Some(policy.database.as_str())
+            {
+                return Err(
+                    "SQL request must bind the installed database and explicitly accept its snapshot age bound".into(),
+                );
+            }
+            if request_context.headers.contains_key("authorization")
+                || request_context
+                    .headers
+                    .keys()
+                    .any(|k| k.as_str().starts_with("x-clickhouse-"))
+                || request_context.parameters.keys().any(|k| {
+                    !matches!(
+                        k.as_str(),
+                        "query"
+                            | "database"
+                            | "default_format"
+                            | "query_id"
+                            | "output_format_json_quote_64bit_integers"
+                    )
+                })
+            {
+                return Err(
+                    "per-request SQL credentials/settings require native evaluation".into(),
+                );
+            }
+            let backend = self
+                .exact_backend
+                .as_ref()
+                .ok_or("table snapshots require a ClickHouse source")?;
+            let relation = self.table_rows.read(
+                super::table_rows::TableRowsReadContext {
+                    generation,
+                    backend: Arc::clone(backend),
+                    active: self.active_physical_plan.as_ref().unwrap().clone(),
+                },
+                population,
+                readout,
+                output_schema,
+            )?;
+            prepared.insert(*id, relation);
+        }
         let leaves = entry.nodes.iter().filter_map(|(id, node)| match node {
             asap_types::query_plan::QueryPlanNode::ExternalExact { request, inputs }
                 if request.language == asap_types::QueryLanguage::ClickHouseSql
@@ -147,6 +211,33 @@ impl CatalogClickHouseAccelerator {
 }
 
 fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat, String> {
+    if request
+        .format()
+        .is_some_and(|f| f.eq_ignore_ascii_case("JSONCompact"))
+    {
+        if request.parameters.keys().any(|k| {
+            (k.starts_with("output_format_") && k != "output_format_json_quote_64bit_integers")
+                || k == "format_tsv_null_representation"
+        }) {
+            return Err("unsupported JSONCompact output setting".into());
+        }
+        let quote =
+            match request
+                .parameters
+                .get("output_format_json_quote_64bit_integers")
+                .map(String::as_str)
+            {
+                Some("0") => false,
+                Some("1") => true,
+                _ => return Err(
+                    "JSONCompact requires explicit output_format_json_quote_64bit_integers=0 or 1"
+                        .into(),
+                ),
+            };
+        return Ok(ClickHouseFormat::JsonCompact {
+            quote_64bit_integers: quote,
+        });
+    }
     if let Some(setting) = request.parameters.keys().find(|key| {
         key.starts_with("output_format_") || key.as_str() == "format_tsv_null_representation"
     }) {
@@ -269,7 +360,16 @@ impl CatalogClickHouseAccelerator {
             range.end_ms = end_ms;
         }
         let prepared = match self
-            .prepare_external_exact(entry, range.start_ms, range.end_ms, request)
+            .prepare_external_exact(
+                entry,
+                range.start_ms,
+                range.end_ms,
+                request,
+                (
+                    physical.query_plan.plan_id,
+                    physical.query_plan.plan_version,
+                ),
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -294,7 +394,9 @@ impl CatalogClickHouseAccelerator {
                     headers.insert(
                         "content-type",
                         HeaderValue::from_static(match format {
-                            ClickHouseFormat::Json | ClickHouseFormat::JsonEachRow => {
+                            ClickHouseFormat::Json
+                            | ClickHouseFormat::JsonEachRow
+                            | ClickHouseFormat::JsonCompact { .. } => {
                                 "application/json; charset=UTF-8"
                             }
                             ClickHouseFormat::TabSeparated => {
@@ -1147,7 +1249,7 @@ mod tests {
         );
         let accelerator = accelerator.with_exact_backend(Arc::new(FixedExactSubtree));
         let prepared = accelerator
-            .prepare_external_exact(&entry, 0, 2_000, &request)
+            .prepare_external_exact(&entry, 0, 2_000, &request, (0, 0))
             .await
             .unwrap();
         let ClickHouseDagOutcome::Accelerated(result) = execute_sql_dag_with_external(

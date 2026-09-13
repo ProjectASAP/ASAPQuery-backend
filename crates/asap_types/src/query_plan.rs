@@ -7,6 +7,7 @@
 
 pub mod current_series;
 pub mod logical;
+pub mod table_rows;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -373,6 +374,21 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            if let QueryPlanNode::ReadTablePopulation {
+                population,
+                readout,
+                output_schema,
+            } = node
+            {
+                if self.language != QueryLanguage::ClickHouseSql {
+                    return Err(QueryPlanError::Invalid(
+                        "table populations require SQL execution".into(),
+                    ));
+                }
+                population
+                    .validate_output(readout, output_schema)
+                    .map_err(QueryPlanError::Invalid)?;
+            }
             if let QueryPlanNode::Logical { operator, inputs } = node {
                 operator.validate(inputs.len())?;
             }
@@ -544,6 +560,11 @@ pub struct ExternalExactRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    ReadTablePopulation {
+        population: table_rows::TableRowsPopulation,
+        readout: planner_types::post_asap::maintained_population::PopulationReadout,
+        output_schema: planner_types::post_asap::SummarySchema,
+    },
     RelationalJoin {
         inputs: [QueryNodeId; 2],
         join_kind: planner_types::pre_asap::JoinKind,
@@ -612,9 +633,10 @@ pub enum QueryPlanNode {
 impl QueryPlanNode {
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
-            Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
-                &[]
-            }
+            Self::Scalar { .. }
+            | Self::ReadMaterialization { .. }
+            | Self::ReadTablePopulation { .. }
+            | Self::ExactFallback { .. } => &[],
             Self::Binary { inputs, .. } | Self::RelationalJoin { inputs, .. } => inputs,
             Self::ReduceSum { input, .. }
             | Self::Relational { input, .. }
