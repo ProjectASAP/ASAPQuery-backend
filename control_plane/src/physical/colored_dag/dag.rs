@@ -1,22 +1,6 @@
-//! L5 colored DAG — `PhysicalExpr` nodes painted with `StageId`.
-//!
-//! Per `control_plane/docs/design.md` §3 (line ~123): "A 'stage assignment'
-//! is a colouring of the L4-bound `PhysicalExpr` DAG by `StageId`, with
-//! sketch-merge / data-shipping nodes inserted on the cut edges."
-//!
-//! [`ColoredDag`] is the IR the [`crate::physical::colored_dag::Emitter`]
-//! consumes. It carries:
-//!
-//! - the `nodes` vector (every visited `PhysicalExpr` node keyed by
-//!   [`NodeId`], with its assigned `StageId`),
-//! - the `edges` vector (parent → child references from the DAG walk),
-//!   carried so future Phase G+ work can detect cross-stage cut edges
-//!   for explicit data-shipping op insertion.
-//!
-//! Today the emitter consumes the per-stage *bucket* of nodes (`nodes
-//! filtered by stage`) plus the root sketch-state metadata; cut-edge
-//! reasoning is left as a Phase G hook (the `edges` vector is the data
-//! it needs).
+//! Physical DAG nodes assigned to stages. [`ColoredDag`] retains parent-child
+//! edges, including cross-stage edges, alongside the per-stage node buckets
+//! consumed by the emitter.
 
 #![allow(dead_code)]
 
@@ -57,15 +41,8 @@ pub struct ColoredNode {
     pub stage: StageId,
 }
 
-/// L5 colored DAG. The output of [`crate::physical::colored_dag::StageAllocator::allocate`].
-///
-/// Per design.md §6: "L5 colors the DAG by `StageId` and emits
-/// per-executor configs. Same `PhysicalExpr` input; topology and emitter
-/// differ per deployment model."
-///
-/// `Default::default()` returns the empty `Topology::ThreeStage` shape —
-/// that's the only topology Phase E ships, so the default is safe and
-/// useful for the allocator's incremental-build path.
+/// Output of [`crate::physical::colored_dag::StageAllocator::allocate`].
+/// The default is an empty three-stage DAG for incremental construction.
 #[derive(Debug, Clone)]
 pub struct ColoredDag {
     /// Topology this colouring was produced under.
@@ -119,10 +96,7 @@ impl ColoredDag {
         seen
     }
 
-    /// Cut edges — edges where parent and child end up on different
-    /// stages. These are the wire-format hops (OpAMP push / OTLP /
-    /// `StreamingConfig`) the emitter must materialize. Phase E reports
-    /// them; Phase G+ inserts explicit data-shipping ops on them.
+    /// Edges crossing stage boundaries. They describe the required transport hops.
     pub fn cut_edges(&self) -> Vec<(NodeId, NodeId)> {
         self.edges
             .iter()

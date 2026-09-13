@@ -1,31 +1,9 @@
-//! Serving-time execution model for the post-ASAP IR — the counterpart to
-//! `asap_aware_mapping::bind`'s planning-time `QueryExpr -> SummaryNode`.
+//! Backend execution model for ASAPPlanner's post-ASAP IR.
+//! Adapted from ASAPPlanner's summary executor.
 //!
-//! **Vendored, not upstream.** This module used to be
-//! `asap_sketch::exec` (`crates/sketch/src/exec.rs`) in what's now
-//! ASAPPlanner. It was deleted there in
-//! [ASAPPlanner#190](https://github.com/ProjectASAP/ASAPPlanner/issues/190)
-//! (folded into #197) on the grounds that "the only implementors anywhere
-//! in this workspace are `MockExecutor`/`ReductionSpyExecutor`, both
-//! `#[cfg(test)]`-only... no bin, example, or downstream crate in this
-//! repo constructs or runs a real executor" — true from ASAPPlanner's own
-//! repo, but this module's very own [`SummaryExecutor`] trait *is*
-//! implemented for real by
-//! [`summary_executor::AsapSummaryExecutor`](crate::query_engines::asap_query_engine::summary_executor),
-//! just in this (different) repo, which upstream's search couldn't see.
-//! ASAPPlanner's own README now explicitly scopes itself away from
-//! execution ("not doing any physical query planning") and lists
-//! connecting its output to a real backend as an open question (#1) — see
-//! `control_plane/docs/design-asapplanner-pin-migration.md` §3.2 for the
-//! full account. Ported here verbatim in spirit (same trait shape, same
-//! tree-walking algorithm, same tests) with one adaptation: ASAPPlanner
-//! split the old flat `SummaryKind`/`SummaryParams` pair into a
-//! per-family `SummaryFamilyType` tagged union
-//! (ASAPPlanner#218) before `exec.rs` was deleted, so `SummaryAgg`'s
-//! `kind`/`params` fields collapsed into one `family: SummaryFamilyType`
-//! field on the real, current `SummaryExpr::SummaryAgg` — this module's
-//! `find_candidates`/`ExecOutcome::State` follow that shape rather than
-//! the pre-split one the last upstream copy of `exec.rs` had.
+//! [`SummaryExecutor`] supplies storage and readout operations; the tree walker
+//! executes the selected summary plan. The concrete backend implementation is
+//! `AsapSummaryExecutor` in the sibling `summary_executor` module.
 
 use std::collections::BTreeMap;
 

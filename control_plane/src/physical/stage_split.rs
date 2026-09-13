@@ -1,15 +1,5 @@
-//! L5 stage split — assign the L4 `PhysicalExpr` DAG across pipeline stages.
-//!
-//! The control plane's L5: take the sketch-bound `PhysicalExpr` produced
-//! by `physical::post_asap::bind_query_expr`, colour its DAG by `StageId`
-//! across the DC three-stage topology (`crate::physical::colored_dag::
-//! StageAllocator` + `ThreeStageEmitter`), and return one
-//! `StageConfig` per stage for the per-stage emitters in
-//! `crate::emit::stage_config` to materialise into wire bytes.
-//!
-//! An earlier `QueryExpr`-consuming, `StagedPlan`-producing path
-//! (`split_expr_by_stage`) was the redundant second L5 — it has been
-//! retired; `split_typed_three_stage` below is the sole L5.
+//! Assign the bound physical DAG to edge, gateway, and backend stages.
+//! [`split_typed_three_stage`] returns structured stage configs for wire emission.
 
 /// Env-var that opts *out* of the typed L5 stage_split path. The typed
 /// path — `physical::post_asap::PhysicalExpr` (L4) → `split_typed_three_stage`

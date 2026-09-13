@@ -1,50 +1,12 @@
-//! Phase B (MVP v6) — turn a typed L5 [`StageConfig`] map (produced by
-//! [`crate::physical::colored_dag::ThreeStageEmitter`]) into the **wire bytes** the
-//! three executors actually consume:
+//! Turn typed stage configs into wire configuration for edge, gateway, and backend.
 //!
-//! - [`emit_edge_yaml`] → OTel-collector YAML for the edge agent (OTLP
-//!   receiver → per-sketch processor(s) → OTLP exporter to gateway).
-//! - [`emit_gateway_yaml`] → OTel-collector YAML for the gateway
-//!   aggregator (OTLP receiver → per-family `*merge` processor(s) → OTLP
-//!   exporter to backend).
-//! - [`emit_backend_streaming_config_json`] → JSON document matching the
-//!   ASAPQuery-backend `POST /api/v1/streaming-config` API surface,
-//!   sourced from the typed [`BackendStageConfig`]. The legacy
-//!   `generate_streaming_config_yaml` `CollectionPlan`-shaped emitter
-//!   was retired in the Option B unification (see
-//!   [`crate::emit::backend_push`]).
-//! - [`emit_backend_storage_routing`] → JSON document matching the
-//!   ASAPQuery-backend `POST /api/v1/storage_routing` API surface —
-//!   per-metric query-shape → engine routing table (Phase α). Sources
-//!   the per-metric sketch families from the typed [`BackendStageConfig`]
-//!   inputs and turns them into `(metric, [target])` rows the backend's
-//!   HTTP query handler consults via `BackendStorageRouting::lookup_with_shape`.
+//! * [`emit_edge_yaml`] and [`emit_gateway_yaml`] produce collector YAML.
+//! * [`emit_backend_streaming_config_json`] produces precompute configuration.
+//! * [`emit_backend_storage_routing`] maps metrics and query shapes to engines.
 //!
-//! These four functions are deliberately **stage-shaped**, not
-//! plan-shaped: the typed L5 emitter has already split the PhysicalExpr
-//! across edge / gateway / backend, so each function only sees the slice
-//! that's relevant to its executor. The legacy `agent.rs` emitter still
-//! operates on the flat `AgentCollectorConfig`; the legacy backend
-//! emitter targeted a "backend-role" OTel merge collector tier that was
-//! never deployed and has been retired — typed L5 routes `StageId::Backend`
-//! directly to asapquery-backend's precompute engine over HTTP via
-//! `emit_backend_streaming_config_json`.
-//!
-//! All three are pure transformations: no I/O. The `opamp_endpoint`
-//! parameter is the controller's WebSocket URL the emitted YAML's
-//! `extensions.opamp` block must point at; the caller threads it
-//! through from `AppState::opamp_endpoint`. The `agent_id` parameter
-//! is the identity the agent presents in the `X-Agent-ID` WS header
-//! when it reconnects after a controller-pushed restart (Issue #2 —
-//! without this header the controller's OpAMP server can't re-identify
-//! the agent). Broadcast callers that don't have a single agent in
-//! scope pass the literal placeholder `"$AGENT_ID"` and rely on the
-//! agent container's env to expand it at boot.
-//!
-//! NOTE: the memory_limiter soft threshold the 5-sketch routing path
-//! emits can be tuned via the controller's `ASAP_AGENT_MEMORY_LIMIT_MIB`
-//! env var (default 1280 MiB). Operators bumping the agent container's
-//! cgroup limit raise both together. See `emit_edge_yaml_5sketch_routing`.
+//! These are pure transformations. Callers supply the OpAMP endpoint and agent
+//! identity; broadcast configs use `$AGENT_ID` for expansion by each collector.
+//! Backend pushes go through the cumulative helper in `backend_push`.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -179,26 +141,9 @@ pub fn clamp_window_secs(w: Option<u64>) -> Option<u64> {
     w.map(|s| s.clamp(MIN_WINDOW_SECS, MAX_WINDOW_SECS))
 }
 
-/// Process-level gate selecting the FUSED single-pipeline `asap_edge`
-/// edge wire shape (issue #46) over the legacy `routing`-connector
-/// per-family fan-out.
-///
-/// **Default OFF** so the established 5-sketch routing emit (and its
-/// large unit-test surface) is unchanged for callers who haven't
-/// migrated the agent build yet. Set `ASAP_EDGE_FUSED=1` (or
-/// `true` / `yes`) on the controller process to switch every
-/// `metric_to_family`-populated edge config to the fused
-/// `[memory_limiter, cumulativetodelta, asap_edge]` pipeline that the
-/// new fused agent processor consumes.
-///
-/// We gate on an env var (mirroring `typed_stage_split_enabled()` /
-/// `ASAP_AGENT_MEMORY_LIMIT_MIB`) rather than a new `EdgeStageConfig`
-/// field so the change is additive: no struct-literal churn across the
-/// ~17 construction sites, no serde wire-shape bump, and the two emit
-/// paths read the IDENTICAL `cfg` fields. The flag is the canonical
-/// migration switch — once the fused agent build is the default
-/// deployment the gate's default flips to ON (and the routing path is
-/// retired).
+/// Process-level switch for the fused `asap_edge` pipeline. Set
+/// `ASAP_EDGE_FUSED=1` (or `true` / `yes`) to enable it. Default is off.
+/// Both fused and per-family routing consume the same `EdgeStageConfig`.
 pub fn fused_asap_edge_enabled() -> bool {
     matches!(
         std::env::var("ASAP_EDGE_FUSED").as_deref(),
@@ -208,18 +153,9 @@ pub fn fused_asap_edge_enabled() -> bool {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Build the OTel-collector YAML for an edge agent from the typed L5
-/// [`EdgeStageConfig`] payload.
-///
-/// The `opamp_endpoint` is embedded under `extensions.opamp.server.ws.endpoint`
-/// so the agent can receive runtime config updates without restart.
-///
-/// The emitter does NOT resolve `ExportTarget::Stage(_)` to a concrete
-/// network address; Phase C plumbs a `DeploymentConstraints` resolver
-/// that maps the symbolic stage role to e.g. `gateway:4317`. Until
-/// then, we emit a documented placeholder (`gateway:4317`) so the YAML
-/// is syntactically valid and round-trips through Otel's loader for
-/// integration tests.
+/// Build collector YAML from a typed [`EdgeStageConfig`]. The OpAMP endpoint
+/// lets the agent receive configuration updates. Symbolic export targets use
+/// default hostnames unless an explicit endpoint is supplied.
 pub fn emit_edge_yaml(
     cfg: &EdgeStageConfig,
     opamp_endpoint: &str,
@@ -388,7 +324,7 @@ pub fn emit_edge_yaml(
     // ── Phase ε.1 Mode 3 / Phase 3.2.5 Bug (b) — per-pipeline routing ─────
     // Two routing axes can fire from a single edge agent:
     //
-    //   * Phase ε.1: Mode-3 metrics carry `asap.mode = prometheus_archive`
+    //   * Mode-3 metrics carry `asap.mode = prometheus_archive`
     //     as a data-point attribute and dispatch to the Prometheus OTLP
     //     receiver via a separate `otlphttp/prometheus` exporter.
     //   * Phase 3.2.5 Bug (b): warm-passthrough metrics (the freshness
@@ -650,25 +586,10 @@ pub fn emit_gateway_yaml(
     serde_yaml::to_string(&doc).context("serialize gateway stage config")
 }
 
-/// Build the JSON document the ASAPQuery-backend's
-/// `POST /api/v1/streaming-config` endpoint accepts, sourced from the
-/// typed L5 [`BackendStageConfig`].
+/// Build backend streaming-config JSON from [`BackendStageConfig`].
 ///
-/// Output shape: a top-level `aggregations` array of
-/// `{ aggregationType, aggregationSubType, metric, labels, parameters,
-/// windowSize, windowType, spatialFilter, aggregationInput }` rows.
-/// (The legacy `generate_streaming_config_yaml` YAML emitter that
-/// shipped the same shape from a `CollectionPlan` was retired in the
-/// Option B unification — see [`crate::emit::backend_push`].)
-/// `aggregationId` is **not** emitted — identity is content-addressed in
-/// the backend via `PolicyFingerprint(u64)`.
-/// We additionally surface a parallel `readouts` array so the backend's
-/// query engine can prepare per-readout dispatch entries up-front (the
-/// existing YAML form has no readouts list because the legacy planner
-/// materialises one aggregation per metric and infers readouts from the
-/// PromQL query at execution time; Phase B's typed `BackendStageConfig`
-/// carries the readouts explicitly, so we ship them too — backends that
-/// don't recognise the field will ignore it without erroring).
+/// Emit aggregation rows and explicit readouts. Omit `aggregationId`: the backend
+/// derives policy identity from configuration content.
 pub fn emit_backend_streaming_config_json(
     cfg: &BackendStageConfig,
     monitors: &[crate::emit::monitor::MonitorIntent],
@@ -704,7 +625,7 @@ pub fn emit_backend_streaming_config_json(
     Ok(doc)
 }
 
-/// Phase α (MVP): build the JSON document the ASAPQuery-backend's
+/// build the JSON document the ASAPQuery-backend's
 /// `POST /api/v1/storage_routing` endpoint accepts, sourced from the
 /// typed L5 [`BackendStageConfig`] payloads emitted by [`crate::planner::stage_split`].
 ///
@@ -736,7 +657,7 @@ pub fn emit_backend_streaming_config_json(
 /// }
 /// ```
 ///
-/// ## Classification rules (Phase α)
+/// ## Classification rules
 ///
 /// For each `(metric, BackendStageConfig)` we derive a target list by
 /// inspecting the L4 sketch families landed at the backend:
@@ -805,7 +726,7 @@ pub fn emit_backend_storage_routing_for_tenant(
     }))
 }
 
-/// Phase ε.1 — same as [`emit_backend_storage_routing`] but also
+/// same as [`emit_backend_storage_routing`] but also
 /// emits `thanos_query` engine entries for Mode 3 metrics.
 ///
 /// Mode-3 metrics have NO `BackendStageConfig` entry (the backend doesn't
@@ -902,10 +823,7 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
     if has_hll {
         warm_shapes.push("count");
     }
-    // Heap-bearing kinds count too — `SummaryKind` (unlike the retired
-    // `physical::post_asap::SummaryKind`) promotes `with_heap` to a distinct
-    // identity variant, but a topk-bound Count-Sketch/CMS aggregation
-    // still needs to register here exactly as it did before the split.
+    // Heap-bearing frequency sketches also contribute their routing capability.
     let has_count_sketch = algorithms.iter().any(|k| {
         matches!(
             k,
@@ -1330,38 +1248,13 @@ fn emit_edge_yaml_5sketch_routing(
         }
     }
 
-    // ── ASAPCollector#403: edge-aggregate Sum-role counters ────────────────
+    // Sum-role counters with grouping labels and no sketch-family assignment
+    // use a per-metric sum pipeline. This ships one series per grouping tuple.
+    // Ungrouped counters remain raw passthrough; sketched counters keep their
+    // sketch pipeline.
     //
-    // A Sum-role metric (in `cumulative_counter_metrics`) whose marquee
-    // queries are `sum by (<labels>) (...)` previously fell through the
-    // routing connector's `default_pipelines` into `raw_passthrough` (no
-    // aggregation): every counter datapoint across the full wire-attr
-    // cardinality (e.g. ~10k zone×rack×node×pod series) streamed
-    // continuously to the backend, which did the Sum-by-grouping fan-in
-    // centrally. That inverts the edge-aggregation value prop and was the
-    // dominant driver of the asap arm's backend-ingress blowup
-    // (~12 Mbps of ~12.5 Mbps measured).
-    //
-    // Fix (mirrors the static agent config's `metrics/sum_aggregate`
-    // pipeline): for each Sum-role metric that (a) has grouping_labels
-    // declared and (b) is NOT routed to any sketch family, register a
-    // dedicated `metricstransform/sumby_<metric>` processor +
-    // `metrics/sum_aggregate_<metric>` pipeline and route the metric
-    // there instead of letting it default to raw_passthrough. The agent
-    // then ships one summed series per grouping-label tuple per flush
-    // window. The backend's `evaluate_exact_agg` produces the identical
-    // `sum by (<labels>)` and per-group `rate` answers at reduced
-    // cardinality.
-    //
-    // gorillas3 (cold-tier archive) still writes RAW full-cardinality
-    // samples on this pipeline BEFORE the metricstransform collapses the
-    // stream, preserving cold-fallback drill-down (e.g.
-    // `count(metric{<label>="..."})`).
-    //
-    // A metric already mapped to a sketch family is left on its
-    // sketch path (it isn't a plain Sum-role passthrough). A Sum-role
-    // metric with NO grouping labels keeps the raw_passthrough default
-    // (no grouping to aggregate by).
+    // Archive processing precedes grouping so cold queries retain full-cardinality
+    // raw samples for drill-down.
     let mut sum_aggregate_pipelines: Vec<(String, String)> = Vec::new();
     {
         let mut sum_metrics: Vec<&String> = cfg
@@ -1423,7 +1316,7 @@ fn emit_edge_yaml_5sketch_routing(
         ));
     }
 
-    // Phase ε.1 — Mode 3 prometheus-archive routing folds in via the
+    // Mode 3 prometheus-archive routing folds in via the
     // `asap.mode` attribute axis. The dedicated
     // `metrics/prometheus_archive` pipeline ships the metric to
     // Prometheus's native OTLP receiver via `otlphttp/prometheus`.
@@ -1586,7 +1479,7 @@ fn emit_edge_yaml_5sketch_routing(
         );
     }
 
-    // Phase ε.1 — Mode 3 prometheus-archive pipeline (raw passthrough
+    // Mode 3 prometheus-archive pipeline (raw passthrough
     // to the Prometheus OTLP exporter). No sketch processors; only the
     // Prometheus exporter target is referenced.
     if has_prometheus_archive {
@@ -2431,17 +2324,8 @@ fn build_gorillas3_yaml(window_secs: u64) -> String {
     let secret_key = env_or("ASAP_MINIO_SECRET_KEY", "asap-local-only");
     let tenant = env_or("ASAP_TENANT", "default");
     let tsdb_bucket = env_or("ASAP_GORILLA_TSDB_BUCKET", "asap-gorilla-tsdb");
-    // Note: `prefix_template` placeholders (`{tenant}`, `{metric}`,
-    // `{YYYY}`, …) are resolved by the gorillas3 processor at write
-    // time, not by the YAML loader — they stay as literal `{...}`
-    // tokens in the emitted YAML.
-    //
-    // Phase 2 (post-ASAPCollector#387): the legacy `bucket:` field is
-    // no longer read at runtime — only `tsdb_bucket:` (the TSDB block
-    // destination) drives the gorillas3 writer. We therefore stop
-    // emitting `bucket:` here. The agent's gorillas3 Config struct
-    // still carries a `Bucket` field for mapstructure compatibility,
-    // but it stays at its zero value, which is fine post-#387.
+    // The gorillas3 processor resolves prefix placeholders at write time; keep
+    // them literal in YAML. `tsdb_bucket` is the write destination.
     format!(
         "window_interval: {window_secs}s\n\
 drop_original: false\n\
@@ -2675,11 +2559,8 @@ fn build_default_edge_processor_block(
     build_edge_processor_block(&synthetic, window_secs, &[], metric_name_hint, sample_p)
 }
 
-/// Resolve an `ExportTarget` to a concrete `endpoint:port` string. Phase
-/// B uses documented placeholder hostnames (`data-plane:4317` for the
-/// edge→backend default; `gateway:4317` is reachable when a caller
-/// explicitly opts in via `default_host`) for symbolic stages — Phase C
-/// plumbs a real `DeploymentConstraints::executors()` resolver.
+/// Resolve an export target to `endpoint:port`. Symbolic stages use the
+/// caller's default host; explicit targets supply their own endpoint.
 fn resolve_export_endpoint(default_host: &str, target: &ExportTarget) -> String {
     // The backend/gateway OTLP ingest port is normally 4317. Single-host
     // deployments (e.g. the single-node MVP collapse) run the agent's OTLP
@@ -3077,14 +2958,8 @@ fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
     }
 }
 
-/// The wire-string key for a `SketchQuery::PointCount` readout.
-///
-/// `SampleValue` and `Wildcard` both wire to the legacy `"*"` sentinel
-/// (`physical::post_asap::rules::bind_cms_count`, retired by Step B, used the
-/// literal string `"*"` to mean "all rows / no specific key"; the L5
-/// emitter's per-group resolution already special-cases that string) —
-/// there's no real queryable column for a plain `Count`/`Frequency`
-/// readout in either case, so both collapse to the same sentinel.
+/// Wire key for a point-count readout. `SampleValue` and `Wildcard` map to
+/// `"*"`, the all-rows sentinel, because neither names a queryable column.
 fn column_ref_to_wire_key(col: &ColumnRef) -> String {
     match col {
         ColumnRef::Named(name) => name.clone(),
@@ -3093,19 +2968,9 @@ fn column_ref_to_wire_key(col: &ColumnRef) -> String {
     }
 }
 
-/// Collapse a heap-bearing `SketchAlgorithm` to its bare counterpart.
-/// Identity for every other kind.
-///
-/// The 5-sketch routing-connector edge YAML path (`emit_edge_yaml`'s
-/// `USE_5SKETCH_ROUTING` branch and its `metric_to_family` sibling)
-/// keys its fixed `FAMILY_ORDER` list and lookup maps on the 5 bare
-/// families only — matching the retired `physical::post_asap::SketchAlgorithm`,
-/// which had no heap-bearing variant at all (`with_heap` was a
-/// `SketchParams` field, invisible to anything keying on kind alone).
-/// A committed heap-bearing kind (`CmsWithHeap`/`CountSketchWithHeap`,
-/// from a topk binding) needs to normalize through this before it's
-/// used as a key or set member in that path, or it silently fails to
-/// match its bare `FAMILY_ORDER` entry.
+/// Normalize heap-bearing families to their bare counterpart for edge routing.
+/// The fixed family-order list and lookup maps use bare-family keys; a TopK
+/// binding must normalize before lookup so it reaches the correct processor.
 fn base_family(kind: &SketchAlgorithm) -> SketchAlgorithm {
     match kind {
         SketchAlgorithm::CmsWithHeap => SketchAlgorithm::Cms,
@@ -3682,7 +3547,7 @@ mod tests {
         assert!(yaml.contains("custom-gw:5317"), "{yaml}");
     }
 
-    // ── Phase α: BackendStorageRouting emitter tests ──────────────────────
+    // ── BackendStorageRouting emitter tests ──────────────────────
 
     /// Helper: build a single-aggregation BackendStageConfig of the
     /// requested kind. `aggregation_id` is hard-coded — the routing
@@ -4027,7 +3892,7 @@ mod tests {
         assert_eq!(targets[1]["engine"], "thanos_query");
     }
 
-    // ── Phase β: emit_backend_streaming_config_json snapshot for new pattern coverage ──
+    // ── emit_backend_streaming_config_json snapshot for new pattern coverage ──
     //
     // The archive-only L3 intents (Absent, Present, Delta, Deriv, …)
     // bind to `PhysicalExpr::Logical` rather than producing a `BackendAggregation`,
@@ -4205,7 +4070,7 @@ mod tests {
         assert_eq!(v["readouts"][0]["q"], 0.99);
     }
 
-    // ── Phase ε.1: three-mode wire shape tests ────────────────────────────
+    // ── three-mode wire shape tests ────────────────────────────
 
     /// Mode 1 (sketch at edge) keeps the existing aggregation_input
     /// default — `sketch_envelope` — so legacy plans round-trip
@@ -4309,7 +4174,7 @@ mod tests {
                 label_proj: vec!["service.name".to_string()],
             }],
             // RawAtEdgePrometheusArchive auto-populates the archive
-            // tier list as well (Phase 3.2.5): the Mode-3 metric also
+            // tier list as well: the Mode-3 metric also
             // lands in the Gorilla-S3 archive so the ASAP-tier engine
             // can serve last_over_time(...) queries.
             archive_tier_metrics: vec![ArchiveTierMetric {
@@ -4396,7 +4261,7 @@ mod tests {
             !yaml.contains("metrics/asap_tier"),
             "no Mode 3 → main pipeline keeps the legacy `metrics:` name\n{yaml}"
         );
-        // Phase 3.2.5 — without archive_tier_metrics no gorillas3 block.
+        // without archive_tier_metrics no gorillas3 block.
         assert!(
             !yaml.contains("gorillas3"),
             "no archive tier → no gorillas3 processor\n{yaml}"
@@ -5821,7 +5686,7 @@ mod tests {
         );
     }
 
-    // ── B1-downstream gorillas3 bucket Phase 2: drop `bucket:` ────────────
+    // ── B1-downstream gorillas3 bucket drop `bucket:` ────────────
 
     /// ASAPCollector#387 retired the gorillas3 `Bucket` field's
     /// runtime use — only `TSDBBucket` drives writes. The controller

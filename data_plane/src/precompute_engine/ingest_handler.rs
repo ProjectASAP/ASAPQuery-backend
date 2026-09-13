@@ -124,42 +124,20 @@ pub struct IngestState {
     pub hot_reload_config: HotReloadStreamingConfig,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
-    /// Per-series snapshot cache for delta-sketch reconstitution
-    /// (paper §6.2 B3 / B4). On arrival of a full `ENCODING_PROTO`
-    /// / `ENCODING_MSGPACK` frame the ingest path stores a clone of
-    /// the decoded accumulator keyed by the metric's series_key. On
-    /// arrival of a subsequent `ENCODING_PROTO_DELTA` frame it looks
-    /// up the cached base, clones it, applies the delta via
-    /// `apply_modified_otlp_delta_bytes`, and updates the cache so
-    /// the next delta composes correctly.
+    /// Per-series reconstructed sketch bases, keyed by series identity. Full frames
+    /// replace the base; delta frames update it. Window boundaries reset the base.
+    /// DashMap allows independent series to update concurrently.
     ///
-    /// DashMap chosen over `Mutex<HashMap>` so concurrent OTLP
-    /// receiver tasks don't serialize on cache access — each
-    /// series_key is an independent shard.
-    ///
-    /// Growth is bounded by the active series set in the running
-    /// streaming config; no explicit eviction yet. A cold-store
-    /// follow-up will add TTL-based eviction keyed by last-seen
-    /// timestamp so long-running deployments don't leak memory
-    /// on retired series.
-    ///
-    /// The value is a [`SnapshotCacheEntry`] — the reconstructed base
-    /// plus the window start it belongs to — so the delta-apply path can
-    /// rotate (reset) the base at a per-series window boundary.
-    ///
-    /// RES-1 — growth is now bounded by [`IngestState::note_window_and_sweep`],
-    /// which opportunistically evicts entries whose `window_start` lags
-    /// more than `IngestObservability::snapshot_max_window_lag_nanos`
-    /// behind the newest observed window. Called on every cached-base
-    /// insert from the OTLP ingest path.
+    /// [`IngestState::note_window_and_sweep`] bounds growth by evicting bases whose
+    /// window start falls behind the newest observed window by the configured lag.
     pub sketch_snapshots: dashmap::DashMap<String, SnapshotCacheEntry>,
-    /// Phase 4 — centralized series_id resolver. Shared across the OTLP
+    /// centralized series_id resolver. Shared across the OTLP
     /// receive path (sid resolution + `unknown_series_ids` population) and
     /// the `ResolveSeriesIDs` RPC (eager batch resolution from the agent's
     /// exporter). Holding it on `IngestState` lets every ingest source
     /// reach the same idempotent compute-or-mint cache.
     pub series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
-    /// Phase 5 — two-level sketch ASAP tier (instance metadata +
+    /// two-level sketch ASAP tier (instance metadata +
     /// per-sid columnar state). Populated by the OTLP ingest path on
     /// every modified-OTLP first-class sketch DataPoint; queried by
     /// the `ASAPQueryEngine` query path (ASAP-tier hit / ghost / unknown

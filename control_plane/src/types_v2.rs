@@ -32,21 +32,9 @@ pub use asap_types::QueryLanguage;
 
 // ── AccuracyTarget ────────────────────────────────────────────────────────────
 
-/// Per-target accuracy SLA, in the typed form `design.md` §6 calls for.
-///
-/// Re-exported from `planner_types::types` (formerly `asap_ir::types` -- ASAPPlanner
-/// consolidated `asap-ir` into `asap-types`, see
-/// control_plane/docs/design-asapplanner-pin-migration.md) rather than
-/// defined locally -- `AggIntent`'s `accuracy` fields are typed against
-/// ASAPPlanner's `AccuracyTarget`, so keeping a separate local type here
-/// would force a conversion at every one of the ~400 `AggIntent` call
-/// sites. Two real differences from the pre-merge local type, both
-/// confirmed safe to fold on (no external YAML/JSON persists the old wire
-/// shape -- only one in-Rust test fixture, `pipeline.rs`, needed updating):
-/// - Wire shape: was `#[serde(tag = "kind", content = "value")]`
-///   (`{"kind": "epsilon", "value": 0.02}`); now serde's default
-///   externally-tagged representation (`{"Epsilon": 0.02}`).
-/// - `EpsilonDelta`'s second field is `epsilon`, not `eps`.
+/// Per-target accuracy SLA, shared with ASAPPlanner's `AggIntent` fields.
+/// Uses Planner's externally tagged serde representation, e.g.
+/// `{"Epsilon": 0.02}`; `EpsilonDelta` names its bound `epsilon`.
 pub use planner_types::types::AccuracyTarget;
 
 /// Translate the legacy `accuracy_sla: f64` field -- a fractional

@@ -1,4 +1,4 @@
-//! Phase ε.1.5 — Telegraf TOML emitter (per-runtime mirror of
+//! Telegraf TOML emitter (per-runtime mirror of
 //! [`super::stage_config::emit_edge_yaml`]).
 //!
 //! `asap-telegraf` is the Telegraf-runtime variant of the ASAP edge
@@ -16,18 +16,14 @@
 //! * `outputs.http` — generic HTTP POST output. For Mode 3 we use this
 //!   with the `prometheusremotewrite` serializer so the agent can ship
 //!   raw samples to Prometheus's remote-write endpoint
-//!   (`/api/v1/write`). This is a documented Phase ε.1.5 deviation
-//!   from the OTel-collector path's `otlphttp/prometheus` exporter:
+//!   (`/api/v1/write`). This differs from the OTel-collector path's `otlphttp/prometheus` exporter:
 //!   Telegraf has no OTLP-HTTP serializer, but Prometheus's
 //!   remote-write endpoint accepts the same physical archive that the
 //!   OTLP receiver writes to, so the **archive contents end up
 //!   identical**. The wire framing differs; the storage outcome does
 //!   not.
 //!
-//! Three modes (the placement decision itself is made upstream in
-//! `stage_split`; the `BindMode`-shaped selector Phase ε.1 sketched out
-//! in `physical::deployment_cost::wire` was never wired in and was removed in the
-//! 2026-07 retirement pass — see that module's doc):
+//! Placement modes selected by the upstream stage splitter:
 //!
 //! 1. `SketchAtEdge` — `[[processors.allsketches]]` between
 //!    `[[inputs.opentelemetry]]` and `[[outputs.opentelemetry]]`.

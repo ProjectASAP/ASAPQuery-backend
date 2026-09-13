@@ -36,39 +36,12 @@ fn mvp_deployment_policy(
     })
 }
 
-/// Bind a `QueryWorkload` into the typed L4 [`crate::physical::post_asap::PhysicalExpr`]
-/// IR, when callers want to inspect the typed binding alongside the
-/// legacy `CollectionPlan` output.
+/// Bind a flat workload to a typed physical expression for stage emission.
 ///
-/// **Family-per-metric picker** (issue #46, MVP demo). The contract pins
-/// six metric→family rows (`http_latency_ms` → DDSketch, `request_size_bytes`
-/// → KLL, `unique_users_per_min` → HLL, `top_endpoint_qps` → CountSketch,
-/// `endpoint_request_freq` → CMS, `http_requests_total` → raw). The
-/// deployment policy below handles the contract rows and falls back to the
-/// `AggType`-driven default (Quantile→DDSketch, Cardinality→HLL,
-/// Frequency→CMS) for any other metric name.
-///
-/// **`sketch_type_override` wins.** When the workload-spec carries a
-/// `sketch_type_override`, that field bypasses the capability-matched
-/// default and pins the family directly (modulo `(sketch, statistic)`
-/// validity — an override that violates the catalog is rejected and the
-/// fallback path runs). This is the spec's `sketch_family_override`
-/// behaviour.
-///
-/// **`SumRateCount` declines.** Metrics whose contract row is "raw
-/// passthrough" (`http_requests_total`) return `None` — the typed path
-/// has no sketch to bind, and the legacy `plan()` path produces the
-/// raw-passthrough `CollectionPlan`.
-///
-/// Returns `None` when the workload shape is not yet supported by the
-/// typed path (multi-intent, exact-required, raw-passthrough metric, or
-/// no aggregations) — the caller should then fall back to the legacy
-/// `plan()` output.
-///
-/// Phase B (MVP v6) wires `main::handle_plan` to call this whenever
-/// the parallel `USE_TYPED_STAGE_SPLIT` gate is enabled — the bound
-/// `PhysicalExpr` is then fed into `planner::stage_split::split_typed_three_stage`
-/// + the per-stage emitters in `config::stage_config`.
+/// An explicit sketch override takes precedence when valid for the statistic.
+/// Otherwise deployment contract rows select the family, with aggregation-type
+/// defaults for other metrics. Unsupported and raw-passthrough workloads
+/// return `None`.
 pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_evidence(w, None, None)
 }

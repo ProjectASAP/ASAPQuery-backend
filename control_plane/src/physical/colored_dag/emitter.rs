@@ -1,29 +1,8 @@
-//! L5 emitter — turns a [`ColoredDag`] into per-stage configs.
+//! Build per-stage configuration from a [`ColoredDag`].
 //!
-//! Per `control_plane/docs/design.md` §1219: "L4 chose the sketch family +
-//! params. L5 colors the DAG by `StageId` and emits per-executor
-//! configs. Same `PhysicalExpr` input; topology and emitter differ per
-//! deployment model."
-//!
-//! Phase E ships [`ThreeStageEmitter`] for the DC topology (edge →
-//! gateway → backend). Each per-stage [`StageConfig`] is a structured
-//! description that the OpAMP push (Phase G+) and the backend client
-//! (Phase G+) materialise into wire bytes:
-//!
-//! - [`StageConfig::Edge`] — the agent OpAMP YAML's logical content:
-//!   scrape source, optional window, the chosen sketch processor, and
-//!   the OTLP exporter pointer to gateway.
-//! - [`StageConfig::Gateway`] — the gateway OpAMP YAML's logical
-//!   content: an OTLP receiver, the sketch-merge processor list, and
-//!   the OTLP exporter pointer to backend.
-//! - [`StageConfig::Backend`] — the backend `StreamingConfig`'s logical
-//!   content: a list of `(aggregation_id → (sketch_kind, params))`
-//!   tuples plus the readout query catalog.
-//!
-//! Emitters do NOT push to executors here — they produce the structured
-//! output. The actual push (`crate::opamp::OpampServer::push_to_role`,
-//! `crate::backend_client::StreamingConfigClient::post`) is wired in
-//! Phase G+.
+//! [`ThreeStageEmitter`] handles edge → gateway → backend. Configs describe
+//! sketch processors, merge processors, backend aggregations, and readouts.
+//! Wire serialization and delivery are handled by the deployment emitters.
 
 #![allow(dead_code)]
 
@@ -89,12 +68,7 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
     match expr {
         PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::KeepPreAsap(qe) => NodeKind::Logical(qe),
-            // `SummaryAgg`'s `kind`/`params` fields collapsed into one
-            // `family: SummaryFamilyType` field (ASAPPlanner#218 --
-            // see control_plane/docs/design-asapplanner-pin-migration.md);
-            // the exact-vs-sketch classification this used to need
-            // `is_exact_accumulator` for is now which enum variant
-            // `family` is, not a value-level check on `kind`.
+            // The `family` variant distinguishes exact accumulators from sketches.
             SummaryExpr::SummaryAgg {
                 family: planner_types::post_asap::SummaryFamilyType::ExactAggregate(..),
                 ..
@@ -153,7 +127,7 @@ pub enum EmitError {
     UnsupportedTopology(Topology, Topology),
     /// A sketch processor name could not be derived for the supplied
     /// `SketchAlgorithm`. Should not occur with the catalog ranges shipped
-    /// in Phase C — kept as a defensive error for future kinds.
+    /// in kept as a defensive error for future kinds.
     #[error("no edge processor known for sketch kind {0:?}")]
     NoEdgeProcessor(SketchAlgorithm),
     /// Backend would emit an empty StreamingConfig because no sketch
@@ -166,10 +140,7 @@ pub enum EmitError {
     UnsupportedHeapUpdate,
 }
 
-/// Generic emitter trait — Phase E ships only [`ThreeStageEmitter`]; future
-/// phases add `SingleStageEmitter` (asap-query), `ZeroStageEmitter`
-/// (asap-fusion), and friends. The trait keeps the dispatch surface
-/// uniform so `planner::stage_split` can pick at runtime.
+/// Produce per-stage configuration from a colored DAG.
 pub trait Emitter {
     /// Lower a colored DAG into one [`StageConfig`] per occupied stage.
     /// Returns a map keyed by `StageId` for stable consumer access; any
@@ -233,7 +204,7 @@ pub struct EdgeStageConfig {
     /// in); emitters produce the abstract `Self` and downstream code
     /// fills in `gateway:4317` / similar.
     pub exporter_target: ExportTarget,
-    /// Phase ε.1 — Mode 3 routing destinations, when one or more
+    /// Mode 3 routing destinations, when one or more
     /// `RawAtEdgePrometheusArchive` nodes coloured to this edge stage.
     /// Each entry produces a separate `otlphttp/prometheus` exporter +
     /// pipeline tagged `asap.mode=prometheus_archive` so the agent's
@@ -242,7 +213,7 @@ pub struct EdgeStageConfig {
     /// Empty list = no Mode 3 metrics → no `otlphttp/prometheus`
     /// exporter is emitted (the YAML is identical to Phase β).
     pub prometheus_archive_metrics: Vec<PrometheusArchiveMetric>,
-    /// Phase 3.2.5 — archive-tier metrics that should flow through the
+    /// archive-tier metrics that should flow through the
     /// `gorillas3` processor at the edge agent (write a Gorilla-S3
     /// chunk + Prometheus TSDB block to MinIO so the ASAP-tier query
     /// engine and the Thanos store-gateway can both serve them).
@@ -260,7 +231,7 @@ pub struct EdgeStageConfig {
     /// counter samples in MinIO so the Gorilla-S3 / Thanos archive
     /// can answer `last_over_time(...)`).
     pub archive_tier_metrics: Vec<ArchiveTierMetric>,
-    /// Phase 3.2.5 — metrics that must be carried through the
+    /// metrics that must be carried through the
     /// ASAP-tier pipeline WITHOUT the family-specific sketch processor
     /// renaming them. The freshness probes are timestamp counters by
     /// design (the wire value `unix_ts_ms_of_emission` IS the freshness
@@ -531,7 +502,7 @@ pub fn default_cold_external_labels() -> Vec<(String, String)> {
     vec![("cluster".to_string(), cluster)]
 }
 
-/// Phase 3.2.5 — one archive-tier metric the agent should land in
+/// one archive-tier metric the agent should land in
 /// MinIO via the `gorillas3` processor (Gorilla-S3 chunks + Prometheus
 /// TSDB blocks for the Thanos store-gateway). The `metric` field is
 /// used both for the control-plane-side bookkeeping and (downstream) for
@@ -550,7 +521,7 @@ pub struct ArchiveTierMetric {
     pub window_secs: Option<u64>,
 }
 
-/// Phase ε.1 — one Mode-3 metric the agent forwards to Prometheus's
+/// one Mode-3 metric the agent forwards to Prometheus's
 /// native OTLP receiver. The agent's `routing` processor matches on
 /// `attributes["asap.mode"] == "prometheus_archive"` and dispatches to
 /// the `otlphttp/prometheus` exporter.
@@ -713,7 +684,7 @@ pub struct BackendAggregation {
     /// Runtime accumulator mode derived from SummaryAgg.input.weight, never
     /// from the TopK readout. None retains the legacy value-update default.
     pub heap_update_mode: Option<&'static str>,
-    /// Phase ε.1 — what shape the backend ingests for this
+    /// what shape the backend ingests for this
     /// aggregation. Mode 1 (sketch at edge) / sketch_envelope is the
     /// default (the wire payload is a sketch state already). Mode 2
     /// (raw at edge → sketch at backend) sets this to `raw` so the
@@ -723,7 +694,7 @@ pub struct BackendAggregation {
     pub aggregation_input: AggregationInput,
 }
 
-/// Phase ε.1 — what wire shape the backend ingests for an aggregation.
+/// what wire shape the backend ingests for an aggregation.
 /// Determines whether the backend builds the sketch from raw samples
 /// (Mode 2) or accepts pre-built sketch state from upstream (Mode 1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

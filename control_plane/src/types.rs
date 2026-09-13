@@ -194,19 +194,8 @@ impl std::fmt::Display for SketchType {
     }
 }
 
-// Moved from the retired `physical::post_asap::sketch_params` (Stage 3 of the
-// sketch-identity unification — see
-// scratchpad/artifacts/enum-unification-plan.md) when `physical::post_asap::SketchAlgorithm`
-// was replaced by `planner_types::post_asap::SummaryKind` (later `planner_types::post_asap::
-// SketchAlgorithm` once ASAPPlanner split the old flat `SummaryKind` per-family —
-// see control_plane/docs/design-asapplanner-pin-migration.md). `SketchType::
-// from(SketchAlgorithm)` only covers the 5 canonical families this legacy type has
-// room for — physical deployment callers only
-// ever feed it kinds sourced from `default_capability_table`/
-// `load_capability_overrides`, which are exhaustively those 5, all
-// approximate-sketch families (no exact-accumulator kind is ever passed
-// here, so the post-split `SketchAlgorithm` — never `ExactKind` — is the right
-// upstream type to convert from/to).
+// Only the five sketch families in the deployment capability table can be
+// converted to this deployment vocabulary; exact accumulators are not inputs.
 impl From<planner_types::post_asap::SketchAlgorithm> for SketchType {
     fn from(k: planner_types::post_asap::SketchAlgorithm) -> Self {
         use planner_types::post_asap::SketchAlgorithm;

@@ -415,7 +415,7 @@ impl QueryEngine for ThanosQueryEngine {
             // Forwarder doesn't materialise samples locally;
             // upstream thanos-query owns the memory budget. We
             // surface a generous ceiling so the cost-aware
-            // dispatcher (Phase-6) prefers thanos for large
+            // dispatcher prefers thanos for large
             // streams once it lands.
             supports_streams_above_bytes: usize::MAX,
         }

@@ -1,22 +1,5 @@
-//! The `SummaryExecutor` serving path — the sole way `data_plane` answers
-//! a query from the sketch tier. `shadow_compare.rs` (diagnostic-only
-//! comparison against the legacy reducer, used to validate this path
-//! before it went live) and `sketch_reducer.rs` (the legacy reducer
-//! itself) are both retired: neither was "ground truth" any more than
-//! this path is, and once this path was the default-on live serving
-//! path (design-target-architecture.md Part A), keeping a second,
-//! independently-planned answering mechanism around only meant two
-//! things could silently disagree with each other, not that either was
-//! more trustworthy. See
-//! `data_plane/docs/l4node-plan-executor-design.md` and the Phase 2
-//! plan's "What 'safe to serve' means, precisely" section for the exact
-//! gate this applies.
-//!
-//! `try_serve_from_summary_executor` returning `None` (flag off, a
-//! self-excluded shape like `rate()`/`irate()`/`topk(K, sum
-//! by(...)(rate(...)))`/keyed-CMS point-estimate, or no matching
-//! registered sid) means the query fails over to archive — there is no
-//! other sketch-tier path left to try.
+//! Execute sketch-tier queries through `SummaryExecutor`. Returning `None`
+//! means this path cannot answer and the caller must fail over to archive.
 
 use std::collections::BTreeMap;
 
@@ -86,18 +69,9 @@ fn summary_executor_live_value(value: Option<&str>) -> bool {
     })
 }
 
-/// Try to serve `query` entirely from `SummaryExecutor`. Returns `None`
-/// whenever the query can't be served this way (flag off, a
-/// self-excluded shape, no matching registered sid, or lowering/execution
-/// failed) — the caller fails over to archive. `Some(...)` means this
-/// answered the query.
-///
-/// This used to carry a third fallback reason: a grouping-ambiguity gate
-/// that declined any empty-`by` shape producing >1 group
-/// (ASAPController#163). That gate is gone — `Reduction`
-/// (ASAPController#165) lets `summary_executor.rs` resolve both halves of
-/// the ambiguity correctly on its own, so there is no longer a shape to
-/// decline. See `PostAsapReadoutOutcome`'s doc for the full reasoning.
+/// Try to serve `query` through `SummaryExecutor`. Return `None` if disabled,
+/// excluded by shape, missing a matching sid, or unable to lower or execute.
+/// The caller then falls back to archive.
 pub fn try_serve_from_summary_executor(
     index: &SketchStore,
     query: &str,

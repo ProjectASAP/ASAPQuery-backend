@@ -74,9 +74,6 @@ use std::collections::HashMap;
 
 /// Simple query engine for processing PromQL-like queries against precomputed data
 pub struct ASAPQueryEngine {
-    // Phase 5 M2.3.6g — `store: Arc<dyn Store>` field retired. The
-    // engine reads precomputes exclusively from `SketchStore` after
-    // M2.3.6f. Constructor signatures no longer take a `store` arg.
     #[allow(dead_code)]
     prometheus_scrape_interval: u64,
     /// Optional `ControlPlaneClient` used to notify the control plane
@@ -85,11 +82,11 @@ pub struct ASAPQueryEngine {
     /// misses fall through to the §5.2 fallback silently, matching
     /// pre-PR-G behavior. Set via `with_control_plane_client`.
     control_plane_client: Option<Arc<dyn crate::drivers::control_plane_client::ControlPlaneClient>>,
-    /// Phase 5 — ASAP-tier sketch index. When `Some`, the trait's
+    /// ASAP-tier sketch index. When `Some`, the trait's
     /// `execute` adapter classifies the query's metric/group-by against
     /// the index and short-circuits to `EngineError::CapabilityMiss` when
     /// no ASAP-tier identity covers the request — driving the
-    /// EngineRouter's archive failover (Phase 6). When `None`, the
+    /// EngineRouter's archive failover. When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
     sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
@@ -505,7 +502,7 @@ impl ASAPQueryEngine {
         self
     }
 
-    /// Phase 5 — attach the shared `SketchStore` so the `QueryEngine`
+    /// attach the shared `SketchStore` so the `QueryEngine`
     /// trait adapter's classify+failover logic is active. Without this
     /// call, the engine keeps the pre-Phase-5 behavior (route every
     /// query through `handle_query`).
@@ -808,7 +805,7 @@ impl ASAPQueryEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-5: `QueryEngine` trait impl.
+// `QueryEngine` trait impl.
 //
 // Adapter only — does NOT change `handle_query` or any other existing
 // surface. The trait's `execute(&str)` walks the same `handle_query` code
@@ -1134,15 +1131,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             return Ok(warm_qr);
         }
 
-        // No-sketch-index fallback. The legacy
-        // `handle_query` path used to live here and provide the
-        // capability-miss notify side-effect through
-        // `find_compatible_aggregation_with_miss_notify`. With legacy
-        // retired (B7.5), this branch fires the notify directly so the
-        // control-plane feedback loop still closes — required by
-        // `capability_miss_http_e2e_tests::http_capability_miss_feedback_loop_closes_over_http`,
-        // which wires the engine WITHOUT `.with_sketch_index(...)` and
-        // therefore lands here on every miss.
+        // Without a sketch index, notify the control plane directly on a capability
+        // miss so the feedback loop also works for this configuration.
         if let Some(req) = Self::requirements_from_query_str(query) {
             crate::drivers::control_plane_client::spawn_capability_miss_notify(
                 &self.control_plane_client,
@@ -1430,23 +1420,8 @@ mod sketch_query_tests {
     // }
 }
 
-// ============================================================
-// Phase 1b tests: AuxStats pushdown on `query_precompute_for_statistic`
-// ============================================================
-//
-// Proves that when a statistic is covered by typed aux columns, the
-// query path returns the aux value without ever calling the
-// accumulator's `query_statistic` method. When the statistic is NOT
-// covered, the code falls through to `query_statistic`.
-//
-// B7.5 retirement note: the in-process `capability_miss_feedback_loop_closes`
-// + `capability_miss_idempotent_on_repeat` tests that previously lived
-// adjacent to this module were retired alongside their probe surface
-// (`find_compatible_aggregation_with_miss_notify`). The
-// capability-miss feedback loop is now exercised end-to-end via
-// `crate::tests::capability_miss_http_e2e_tests::http_capability_miss_feedback_loop_closes_over_http`,
-// which round-trips a real HTTP capability-miss through the modern
-// `execute()` path's `spawn_capability_miss_notify` calls.
+// Typed auxiliary statistics must answer covered queries without invoking
+// the accumulator query method; uncovered statistics use that method.
 #[cfg(test)]
 mod aux_pushdown_tests {
     use super::*;
@@ -1649,12 +1624,12 @@ mod aux_pushdown_tests {
 // `compatible_agg_types`, `rate(<metric>[<range>])` against a CMS-only
 // agg config now matches.
 // ===========================================================================
-/// Phase 5 — `QueryEngine::execute` ASAP-tier classification tests.
+/// `QueryEngine::execute` ASAP-tier classification tests.
 /// Pre-Phase-5 the trait adapter unconditionally delegated to
 /// `handle_query`. After Phase 5 wire-in, when a `SketchStore` is
 /// attached, the adapter classifies first and surfaces
 /// `EngineError::CapabilityMiss(SketchStore, ...)` on Ghost / Unknown
-/// / no-instance outcomes so the EngineRouter (Phase 6) can fall
+/// / no-instance outcomes so the EngineRouter can fall
 /// through to the archive engine.
 #[cfg(test)]
 mod asap_tier_classify_tests {
@@ -1752,19 +1727,8 @@ mod asap_tier_classify_tests {
 
     #[tokio::test]
     async fn execute_bare_selector_falls_over_to_archive() {
-        // L1 adoption (design-target-architecture.md Part B), accepted
-        // behavior change: `lower_promql` doesn't implicitly wrap a bare
-        // selector in `Aggregate { Sum }` the way the retired local
-        // parser did (see `control_plane`'s
-        // `asap_tier_analysis::bare_selector_is_no_longer_asap_tier_answerable`),
-        // so this rejects with `NoCallNodeFound` again -- a DIFFERENT
-        // reason than the (now-stale) comment this replaced expected, but
-        // the routing OUTCOME is unchanged either way: capability-miss,
-        // fails over to archive. The `SketchStore` here holding only a
-        // DDSketch (quantile) policy is now moot for this specific query
-        // (rejected before ever reaching policy lookup), kept for the
-        // fixture's own sake / in case the bare-selector shape changes
-        // again.
+        // A bare selector has no aggregate root and fails over to archive before
+        // policy lookup, regardless of the registered DDSketch policy.
         let idx = Arc::new(SketchStore::new());
         idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
         idx.append_sample(
@@ -2668,13 +2632,8 @@ mod asap_tier_classify_tests {
         );
     }
 
-    /// `sum by (zone) (rate(http_requests_total[5m]))` end-to-end.
-    /// The canonical Planner input contains an inner `AggIntent::Rate`, so
-    /// the post-ASAP resolver returns `RateShape` before execution, with no
-    /// legacy reducer left to fall through to. This
-    /// test used to pin the `evaluate_exact_agg_rate` composed-candidate
-    /// dispatch; now it pins the accepted replacement outcome:
-    /// capability-miss.
+    /// An inner Rate intent excludes this composed query from summary execution;
+    /// the engine must report a capability miss.
     #[tokio::test]
     async fn execute_sum_by_zone_rate_capability_misses_no_legacy_fallback() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
@@ -2740,17 +2699,8 @@ mod asap_tier_classify_tests {
         );
     }
 
-    /// `sketch_reducer.rs` retirement: `topk(K, sum by (zone)
-    /// (rate(...)))` -- the multinode demo's flagship query -- contains
-    /// an inner `rate(...)` call, so every candidate carries
-    /// `outer_fn=OuterFn::Rate` and `RateShape` self-excludes the whole
-    /// query from `SummaryExecutor` before ever binding. The engine's
-    /// `try_topk_over_rate_fallback` (the only thing that used to answer
-    /// this shape, via the ExactAgg(Sum) sids + an in-engine top-k slice)
-    /// is retired along with `sketch_reducer.rs` -- there is no fallback
-    /// left. Pins the accepted replacement outcome: capability-miss, at
-    /// both K ≥ n and K < n (this shape's fallback used to slice
-    /// differently in each case; now both just fail over to archive).
+    /// TopK over grouped rate fails over to archive for both K ≥ n and K < n.
+    /// The inner Rate intent excludes the entire query from summary execution.
     #[tokio::test]
     async fn execute_topk_over_sum_by_zone_rate_capability_misses_no_legacy_fallback() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
@@ -2901,15 +2851,8 @@ mod asap_tier_classify_tests {
 
     #[tokio::test]
     async fn rate_over_cms_frequency_capability_misses_no_legacy_fallback() {
-        // `sketch_reducer.rs` retirement: `rate(cms_metric[5m])` lowers to
-        // ExactAgg(Sum)+Rate, but the sid is FrequencyEstimate -- no
-        // ExactAgg sid matches, and `rate(...)` is also `RateShape`-excluded
-        // from `SummaryExecutor` regardless. The engine's frequency-rate
-        // fallback (`try_rate_over_frequency_fallback`) that used to answer
-        // this shape (Σ per-window frequency total ÷ coverage-clamped
-        // range) is retired along with `sketch_reducer.rs` -- even with a
-        // real registered freq sid, this now capability-misses, same as
-        // the no-sid case below.
+        // Rate is excluded from summary execution even with a registered frequency
+        // sid, so this request must capability-miss.
         let now = now_ms_for_test();
         let idx = Arc::new(SketchStore::new());
         register_cms_freq_sid(&idx, 7000, "cms_metric", &[], "", 600, now);
@@ -3063,24 +3006,9 @@ mod outer_agg_integration_tests {
         }
     }
 
-    /// `sketch_reducer.rs` retirement: `max by (zone)
-    /// (quantile_over_time(0.99, http_latency_ms[5m]))` used to reach the
-    /// legacy reducer (which answers the INNER `QuantileApprox` candidate
-    /// only, ignoring the outer `max`, then applies `apply_outer_agg_fold`
-    /// -- identity here, since each zone already has one row). There's no
-    /// equivalent in `SummaryExecutor`'s single-tree-bind model: the outer
-    /// `AggIntent::Max` commits unconditionally to its own `MinMax`
-    /// accumulator (`asap_aware_mapping::boundary::implementation_for_with`), which
-    /// requires a real, independently-registered `MinMax` sid that never
-    /// exists for this shape -- so the whole tree fails to realize even
-    /// though the inner quantile would answer fine standalone. This is a
-    /// genuine upstream L4 gap (filed as
-    /// https://github.com/ProjectASAP/ASAPController/issues/171 --
-    /// composing an outer exact fold over an already-realized inner
-    /// summary has no representation today), not something this
-    /// deployment routes around locally -- same category as the
-    /// `TopK { accuracy: Exact }` gap (ASAPController#151). Accepted for
-    /// now: capability-miss, failing over to archive.
+    /// An outer Max requires its own MinMax state in this summary plan.
+    /// An inner quantile sid alone cannot satisfy the whole tree; return a
+    /// capability miss so archive execution can answer the composed query.
     #[tokio::test]
     async fn execute_max_by_zone_over_quantile_over_time_capability_misses_pending_asapcontroller_171(
     ) {

@@ -66,13 +66,9 @@ impl PrecomputeEngine {
         // Build the router that owns the senders; it will be shared via IngestState.
         let router = SeriesRouter::new(senders);
 
-        // Ingest state holds the hot-reload handle — it re-snapshots
-        // agg_configs on each ingest batch, so new aggregations from
-        // a config swap are visible immediately.
-        //
-        // The agg_id-keyed `SchemaRegistry` has been retired — sid-level
-        // lifecycle status now lives on `SketchStore` and reconcile
-        // runs against the same snapshot the ingest path consults.
+        // Snapshot the hot-reload configuration on each ingest batch so policy
+        // changes are visible immediately. Sid lifecycle reconciliation uses
+        // the same snapshot as ingestion.
         let ingest_state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),

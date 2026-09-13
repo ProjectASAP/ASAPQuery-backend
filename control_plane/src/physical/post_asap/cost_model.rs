@@ -1,37 +1,9 @@
-//! `ControlPlaneCostModel` — plugs control_plane's own sketch-family
-//! selection + parameter-sizing policy into
-//! `asap_aware_mapping::bind::implement_tree_in_with` via the two `CostModel`
-//! extension points (`rank_candidates` for family choice, `size_params`
-//! for parameter sizing — the latter added by ASAPController PR #146
-//! specifically to support this migration).
+//! Deployment family selection and parameter sizing for ASAPPlanner binding.
 //!
-//! Ports the decisions previously made by the `bind_kll_quantile` /
-//! `bind_ddsketch_quantile` / `bind_hll_cardinality` / `bind_cms_count` /
-//! `bind_cms_topk` `Rule`s verbatim — same accuracy-bound citations, same
-//! priority order, same recall-tier logic — just re-homed behind the
-//! `CostModel` trait instead of a bespoke `Rule` dispatcher, so the L3→L4
-//! walk itself (schema derivation, `col`/`by` computation, DAG
-//! construction) can be `asap_aware_mapping::bind`'s rather than a forked copy.
-//!
-//! `AggIntent::Extension` (control_plane's `Frequency` point-query) used
-//! to be one of two shapes `implement_tree_in_with` couldn't realize even
-//! with this `CostModel` plugged in — `boundary::implementation_for_with`
-//! now consults [`ControlPlaneCostModel::realize_extension`]/
-//! [`readout_extension`](CostModel::readout_extension) for it instead of
-//! hardcoding `PassThrough` (ASAPController#150).
-//!
-//! One shape remains genuinely unreachable via this `CostModel`, because
-//! the decision of *whether* to call into `rank_candidates`/`size_params`
-//! at all is made upstream, before the `CostModel` is ever consulted:
-//!
-//! - `AggIntent::TopK { accuracy: AccuracyTarget::Exact, .. }` — routes to
-//!   `exact_realization`, which has no accumulator form for `TopK` and
-//!   returns `PassThrough`, so `implement_tree_in_with` falls through to
-//!   its own `Logical` fallback for this shape unchanged. There is no
-//!   local pre-pass binding it: the `BindCountSketchOnTopK` rule that
-//!   once did was deleted (see `lower.rs`'s module doc) — this is a
-//!   genuine, still-open `asap-plan` coverage gap (ASAPController#151),
-//!   not something this deployment routes around locally.
+//! `rank_candidates` chooses a family; `size_params` sets its parameters.
+//! Frequency extensions use `realize_extension` and `readout_extension`.
+//! Exact TopK falls back to logical execution upstream because it has no
+//! exact accumulator realization; these cost-model hooks cannot bind it.
 
 #![allow(dead_code)]
 

@@ -45,7 +45,7 @@ pub use planner_types::types::AccuracyTarget;
 ///   collapses the old per-`metric_storage` sequences into one shared
 ///   ASAP-first-then-archive contract.
 /// * `PrometheusRemote` keeps its own single-backend sequence
-///   `[PrometheusRemote]` (Phase ε.2): the metric's raw samples never
+///   `[PrometheusRemote]`: the metric's raw samples never
 ///   landed in ASAP-managed storage, so there is no ASAP-tier sketch to
 ///   fall back on and the accuracy hint does not apply. A missing
 ///   engine surfaces as a `NoEngineRegistered` 503 from the HTTP
@@ -82,7 +82,7 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // Phase-5: storage-backend routing
+    // storage-backend routing
     //
     // The Phase-5 `EngineRouter` (see `query_engine_routing.rs`) consults
     // `compatible_storage_backends(stat, accuracy, metric_storage)` to pick

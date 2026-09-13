@@ -1244,42 +1244,14 @@ fn project_group_key(
         .collect()
 }
 
-/// Group-key construction for `find_candidates`, shared by both the
-/// `Sketch` and `ExactAgg` branches -- driven directly by the post-ASAP IR's
-/// `Reduction` (ASAPController#163/#164/#165), not inferred from whether
-/// `by` happens to be empty.
+/// Construct group keys from the explicit post-ASAP reduction, for both
+/// sketches and exact accumulators.
 ///
-/// This replaces the old family-specific split (`sketch_group_key` vs.
-/// `project_group_key` used bare): before `Reduction` existed on
-/// `SummaryAgg`, an empty `by: Vec<ColumnId>` was genuinely ambiguous --
-/// it could mean either "no explicit grouping was even resolvable" (a
-/// bare per-series range function like `quantile_over_time(0.99,
-/// http_latency_ms[10s])`, where the post-ASAP plan has no reference to any
-/// label column at all) or "a real cross-series reduction with zero
-/// grouping columns" (`count(hll_metric)`, `sum(...)`-shaped). Those two
-/// cases need OPPOSITE group-key behavior and the old `by: &[ColumnId]`
-/// signature could not tell them apart -- `sketch_group_key`'s heuristic
-/// (treat empty `by` as "keep every series distinct" for the Sketch
-/// family only) fixed the first case but could not fix the second, since
-/// by the time `find_candidates` saw a bare `[]`, the distinction was
-/// already lost.
+/// * `PerEntity` preserves the full sid label map and keeps entities distinct.
+/// * `Reduce(by)` projects onto the requested keys. Empty keys produce `{}`
+///   for every candidate, merging all candidates into one group.
 ///
-/// `Reduction` restores it directly:
-/// - `PerEntity`: no grouping concept at all -- use the sid's own FULL
-///   label map, matching the legacy `sketch_reducer.rs::evaluate_core`
-///   path's behavior exactly (it passes `series_label_values` straight
-///   through, unconditionally), so distinct series always stay distinct
-///   rows. Applies uniformly to both families now (previously
-///   `ExactAgg`'s `project_group_key` had no equivalent, since `Sum`/
-///   `Increase`-shaped exact aggregations only ever reach an unqualified
-///   PromQL aggregation operator, which is never `PerEntity`).
-/// - `Reduce(by)`: a genuine reduction. Project onto `by_names` as
-///   before -- when `by_names` is empty this naturally returns the SAME
-///   `{}` key for every matching candidate, correctly merging them into
-///   one group (the fix for the `count(hll_metric)`-style case the old
-///   `by: &[ColumnId]` signature couldn't resolve). When non-empty, an
-///   explicit grouping was resolvable from the query (e.g. `quantile by
-///   (zone) (...)`), so project onto it as requested.
+/// An empty column list alone cannot distinguish these two semantics.
 fn resolve_group_key(
     reduction: &Reduction,
     by_names: &[String],

@@ -50,12 +50,9 @@ pub enum BindingError {
     Implement(#[from] crate::planner_selection::SelectionError),
 }
 
-/// Lower an L3 `QueryExpr` to L4/L5 under the supplied workload-level
-/// accuracy target, via [`ControlPlaneCostModel`] (this deployment's
-/// planning-time family/sizing preferences). The result is always
-/// [`PhysicalExpr::Committed`] — this walk never picks a Phase ε.1
-/// backend/archive placement; that's a separate, later L5 decision
-/// (`physical::deployment_cost::wire`).
+/// Lower an L3 query under the supplied accuracy target using
+/// [`ControlPlaneCostModel`]. Returns [`PhysicalExpr::Committed`]; placement
+/// is separate from summary selection.
 pub fn bind_query_expr(
     expr: &QueryExpr,
     accuracy: AccuracyTarget,
@@ -99,12 +96,6 @@ fn bind_recursive(
         } => Ok(PostAsapPlan::Summary(
             crate::planner_selection::keep_pre_asap(expr)?,
         )),
-        // `QueryExpr::LetBinding`/`::Ref` don't exist in the canonical IR
-        // anymore (ASAPPlanner#181/#192 -- see
-        // control_plane/docs/design-asapplanner-pin-migration.md), so
-        // this walk can never actually receive that shape; the arms that
-        // used to produce `PostAsapPlan::LetBinding`/`PostAsapPlan::Ref` here are
-        // gone with it.
 
         // The canonical L3 IR places `TimeRange` *above* a single-statistic
         // sketchable `Aggregate` (`lower_promql`'s window-swap; was
@@ -141,17 +132,8 @@ fn bind_recursive(
             bind_recursive(&pushed, cost_model)
         }
 
-        // `AggIntent::Count { accuracy: Exact }` — `boundary::implementation_for`'s
-        // `exact_realization` actively binds this to `ExactKind::Count`,
-        // but this deployment's data plane has no count accumulator: its
-        // `SumAccumulator` only tracks `sum: f64`, so a `Count`
-        // accumulator would silently return the sum of sample VALUES, not
-        // the sample count (PR #200/#201, reverted — see the retired
-        // `bind_exact_agg.rs`). Force the same fallback `implement_tree_with`
-        // uses for unbound shapes, via the public `bind::logical`
-        // ASAPController exposes for exactly this "deployment knows
-        // better" case — no local schema-lift duplication needed. Stays
-        // on archive, matching today's behavior.
+        // Exact Count cannot use this deployment's Sum accumulator: it counts
+        // values rather than samples. Keep it logical for archive execution.
         QueryExpr::Aggregate {
             measures: aggs,
             having: None,
@@ -176,19 +158,9 @@ fn bind_recursive(
     }
 }
 
-/// Rewrite every `AggIntent::Rate` reachable via the `Aggregate` spine
-/// (nested `Aggregate.child` chains — the only shape `implement_tree_in_with`
-/// itself recurses through; see its "conservative fallbacks" docs) to
-/// `AggIntent::Increase`.
-///
-/// `boundary::implementation_for` gives `Rate` its own `SummaryKind::Rate`;
-/// this deployment's data plane has no accumulator family for it — rate is
-/// computed as `increase / window_seconds`, a scalar division on the
-/// `Increase` accumulator's output applied at readout, not a separate
-/// accumulator (see the retired `bind_exact_agg.rs`, which bound both to
-/// the same accumulator for the same reason). Representing `Rate` as
-/// `Increase` up through L4 preserves that — the L5 emitter is still the
-/// one that knows to apply the division.
+/// Rewrite Rate to Increase along the aggregate spine traversed by Planner.
+/// This deployment computes rate by dividing the Increase readout by window
+/// seconds, rather than storing a separate Rate accumulator.
 fn rewrite_rate_to_increase(expr: &QueryExpr) -> QueryExpr {
     match expr {
         QueryExpr::Aggregate {

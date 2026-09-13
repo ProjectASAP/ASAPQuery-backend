@@ -213,12 +213,7 @@ mod tests {
 
     #[test]
     fn bare_selector_has_no_aggregate_root_to_implement() {
-        // L1 adoption (design-target-architecture.md Part B), accepted
-        // behavior change -- see
-        // asap_tier_analysis::bare_selector_is_no_longer_asap_tier_answerable's
-        // comment: `lower_promql` doesn't implicitly wrap a bare selector
-        // in `Aggregate { Sum }` the way the retired local parser did, so
-        // there's no `Aggregate` node here at all to find a root at.
+        // A bare selector has no `Aggregate` node, so there is no ASAP-tier root.
         let roots =
             implement_promql_for_asap_tier("http_requests_total").expect("parses and implements");
         assert!(roots.is_empty(), "{roots:?}");
@@ -324,16 +319,8 @@ mod tests {
     /// behavior shift.
     #[test]
     fn implement_frequency_as_agg_test() {
-        // Per this test's own prior instructions: the gap it used to
-        // document (under-realizing to `Logical` because `asap-plan` had
-        // no `Extension`/`Frequency` opinion) is now closed -- not via an
-        // `Extension` hook, but because L1 adoption
-        // (design-target-architecture.md Part B) makes `count_over_time`
-        // lower directly to `AggIntent::Count { accuracy: Epsilon(...) }`
-        // (a real, first-class, non-exact intent) rather than needing
-        // this deployment's `Frequency` extension wrapper at all --
-        // `asap-plan` realizes a non-exact `Count` as a real CMS-backed
-        // `SummaryAgg` + `SummaryEstimate` on its own.
+        // Approximate `count_over_time` lowers to a first-class `Count` intent,
+        // which Planner realizes as CMS-backed `SummaryAgg` + `SummaryEstimate`.
         let roots = implement_promql_for_asap_tier("count_over_time(http_requests_total[5m])")
             .expect("parses and implements");
         assert_eq!(roots.len(), 1);
