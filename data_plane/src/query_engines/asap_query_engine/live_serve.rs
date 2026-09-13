@@ -191,6 +191,7 @@ mod tests {
                     asap_types::query_plan::QueryNodeId(1),
                     asap_types::query_plan::QueryPlanNode::ReadMaterialization {
                         binding: asap_types::query_plan::MaterializationBinding {
+                            full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,

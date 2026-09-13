@@ -123,6 +123,17 @@ impl QueryPlan {
                         "zero physical pane duration".into(),
                     ));
                 }
+                if binding.full_window_slide_ms.is_some()
+                    != matches!(
+                        identity.window_layout,
+                        crate::WindowMaterializationLayout::FullWindow
+                    )
+                    || binding.full_window_slide_ms == Some(0)
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "query storage layout differs from catalog definition".into(),
+                    ));
+                }
                 if binding.pane_origin_ms != identity.pane_origin_ms {
                     return Err(QueryPlanError::Invalid(
                         "query pane origin differs from catalog definition".into(),
@@ -424,6 +435,10 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
+    /// Complete-window storage advances independently of its stored extent.
+    /// None denotes disjoint pane storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_window_slide_ms: Option<u64>,
     pub materialization: SummaryDefinitionId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
@@ -442,6 +457,33 @@ pub struct MaterializationBinding {
     /// Semantic query lookback, independent of the physical pane duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readout_lookback_ms: Option<u64>,
+}
+
+impl MaterializationBinding {
+    /// Both range boundaries must identify complete stored state. Full windows
+    /// use a start grid; their end grid is displaced by the window width.
+    pub fn covers_range(&self, start_ms: u64, end_ms: u64) -> bool {
+        let Some(origin) = self.pane_origin_ms else {
+            return false;
+        };
+        if self.window_ms == 0 || end_ms <= start_ms {
+            return false;
+        }
+        let start = i128::from(start_ms) - i128::from(origin);
+        match self.full_window_slide_ms {
+            Some(slide) => {
+                slide != 0
+                    && end_ms - start_ms == self.window_ms
+                    && start.rem_euclid(i128::from(slide)) == 0
+            }
+            None => {
+                start.rem_euclid(i128::from(self.window_ms)) == 0
+                    && (i128::from(end_ms) - i128::from(origin))
+                        .rem_euclid(i128::from(self.window_ms))
+                        == 0
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

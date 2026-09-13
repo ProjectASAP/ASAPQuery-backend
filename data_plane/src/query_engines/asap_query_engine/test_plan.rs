@@ -54,10 +54,15 @@ pub(super) fn entry(
                 QueryNodeId(0),
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
+                        full_window_slide_ms: matches!(
+                            config.window_layout,
+                            asap_types::WindowMaterializationLayout::FullWindow
+                        )
+                        .then_some(config.slide_interval * 1000),
                         materialization: config.policy_fingerprint().into(),
                         output_grouping: grouping,
                         item_labels: config.aggregated_labels.labels.clone(),
-                        window_ms: config.slide_interval * 1000,
+                        window_ms: config.stored_window_ms(),
                         pane_origin_ms: config.pane_origin_ms,
                         readout_lookback_ms: Some(lookback_ms),
                     },

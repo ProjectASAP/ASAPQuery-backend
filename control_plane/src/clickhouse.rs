@@ -260,9 +260,14 @@ pub async fn compile_automatic_clickhouse_workload(
             let config = materialize_selected_sql(node, family, query)
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
             let binding = MaterializationBinding {
+                full_window_slide_ms: matches!(
+                    config.window_layout,
+                    asap_types::WindowMaterializationLayout::FullWindow
+                )
+                .then_some(config.slide_interval.saturating_mul(1_000)),
                 materialization: config.policy_fingerprint().into(),
                 output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
-                window_ms: config.slide_interval * 1000,
+                window_ms: config.stored_window_ms(),
                 pane_origin_ms: config.pane_origin_ms,
                 readout_lookback_ms: Some(query.end_ms - query.start_ms),
                 item_labels: config.aggregated_labels.labels.clone(),
@@ -600,9 +605,14 @@ fn bind_selected_node(
         ));
     }
     Ok(MaterializationBinding {
+        full_window_slide_ms: matches!(
+            selected.window_layout,
+            asap_types::WindowMaterializationLayout::FullWindow
+        )
+        .then_some(selected.slide_interval.saturating_mul(1_000)),
         materialization: selected.policy_fingerprint().into(),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),
-        window_ms: selected.slide_interval.saturating_mul(1000),
+        window_ms: selected.stored_window_ms(),
         pane_origin_ms: selected.pane_origin_ms,
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
         item_labels: selected.aggregated_labels.labels.clone(),

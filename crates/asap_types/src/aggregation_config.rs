@@ -41,10 +41,8 @@ impl WindowMaterializationLayout {
     }
 
     pub fn validate(&self, window_secs: u64, slide_secs: u64) -> Result<(), String> {
-        if window_secs == 0 || slide_secs == 0 || slide_secs > window_secs {
-            return Err(
-                "window and slide must be positive and slide must not exceed window".into(),
-            );
+        if window_secs == 0 || slide_secs == 0 {
+            return Err("window and slide must be positive".into());
         }
         match self {
             Self::Pane { pane_secs } => {

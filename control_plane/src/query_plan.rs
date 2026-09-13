@@ -1187,6 +1187,7 @@ mod catalog_binding_tests {
                 QueryNodeId(1),
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
+                        full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: config.policy_fingerprint().into(),
                         output_grouping: PhysicalGrouping::PerEntity,

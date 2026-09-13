@@ -154,18 +154,7 @@ fn execute_relation_subtree(
                     is_cumulative,
                 )
                 .map_err(|error| format!("incomplete leaf coverage: {error:?}"))?;
-                let origin = binding
-                    .pane_origin_ms
-                    .ok_or_else(|| "incomplete leaf coverage: missing pane origin".to_owned())?;
-                let start = i64::try_from(t0_ms)
-                    .map_err(|_| "incomplete leaf coverage: start exceeds i64".to_owned())?;
-                let end = i64::try_from(t1_ms)
-                    .map_err(|_| "incomplete leaf coverage: end exceeds i64".to_owned())?;
-                let pane = i64::try_from(binding.window_ms)
-                    .map_err(|_| "incomplete leaf coverage: pane exceeds i64".to_owned())?;
-                if pane <= 0
-                    || (start - origin).rem_euclid(pane) != 0
-                    || (end - origin).rem_euclid(pane) != 0
+                if !binding.covers_range(t0_ms, t1_ms)
                     || !complete_pane_coverage(
                         leaf_outcome.coverage,
                         (t0_ms, t1_ms),
@@ -174,7 +163,7 @@ fn execute_relation_subtree(
                 {
                     return Err(format!(
                         "incomplete leaf coverage: requested ({t0_ms}, {t1_ms}), observed {:?}, pane {} origin {}",
-                        leaf_outcome.coverage, binding.window_ms, origin
+                        leaf_outcome.coverage, binding.window_ms, binding.pane_origin_ms.unwrap_or(0)
                     ));
                 }
             }
