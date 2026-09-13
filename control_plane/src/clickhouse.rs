@@ -335,7 +335,7 @@ fn materialize_selected_sql(
     family: &planner_types::post_asap::SummaryFamilyType,
     query: &ClickHouseSqlWorkloadEntry,
 ) -> Result<asap_types::PrecomputeMaterialization, String> {
-    use crate::physical::colored_dag::emitter::{AggregationInput, BackendAggregation};
+    use crate::physical::backend_stage::{AggregationInput, BackendAggregation};
     use planner_types::{post_asap::SummaryExpr, pre_asap::Reduction};
     let SummaryExpr::SummaryAgg {
         reduction: Reduction::Reduce(keys),

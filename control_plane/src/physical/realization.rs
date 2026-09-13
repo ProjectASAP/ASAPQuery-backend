@@ -11,13 +11,6 @@ use asap_aware_mapping::cost_model::Cost;
 use planner_types::post_asap::SummaryWindowFramework;
 
 pub(crate) trait RealizationProvider {
-    fn stages(
-        &self,
-        expression: &super::post_asap::PhysicalExpr,
-        topology: super::colored_dag::Topology,
-    ) -> anyhow::Result<
-        std::collections::HashMap<super::colored_dag::StageId, super::colored_dag::StageConfig>,
-    >;
 
     fn windows(
         &self,
@@ -44,17 +37,6 @@ pub(crate) trait RealizationProvider {
 pub(crate) struct ExistingRealizations;
 
 impl RealizationProvider for ExistingRealizations {
-    fn stages(
-        &self,
-        expression: &super::post_asap::PhysicalExpr,
-        topology: super::colored_dag::Topology,
-    ) -> anyhow::Result<
-        std::collections::HashMap<super::colored_dag::StageId, super::colored_dag::StageConfig>,
-    > {
-        use super::colored_dag::{Emitter, StageAllocator, ThreeStageEmitter};
-        let dag = StageAllocator.allocate(expression, topology)?;
-        Ok(ThreeStageEmitter.emit_per_stage(&dag)?)
-    }
 
     fn windows(
         &self,
