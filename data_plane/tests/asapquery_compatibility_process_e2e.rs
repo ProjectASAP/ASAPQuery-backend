@@ -1710,8 +1710,21 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .await
         .expect("metrics body");
     assert!(metrics.contains("asap_remote_write_requests_total 4"));
-    assert!(metrics.contains("asap_remote_write_samples_total 36"));
-    assert!(metrics.contains("asap_remote_write_duplicates_total 33"));
+    let samples = |request: &WriteRequest| {
+        request
+            .timeseries
+            .iter()
+            .map(|series| series.samples.len())
+            .sum::<usize>()
+    };
+    assert!(metrics.contains(&format!(
+        "asap_remote_write_samples_total {}",
+        samples(&request) + samples(&watermark_advance)
+    )));
+    assert!(metrics.contains(&format!(
+        "asap_remote_write_duplicates_total {}",
+        samples(&request)
+    )));
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }
 

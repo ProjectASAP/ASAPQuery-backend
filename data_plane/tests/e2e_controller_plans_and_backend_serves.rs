@@ -63,10 +63,17 @@ fn phase_aligned_now_ns() -> u64 {
 }
 
 async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &JsonValue) {
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
+    let mut runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
         &serde_yaml::to_value(json).unwrap(),
     )
     .unwrap();
+    // The transport payloads below contain one-second states. The legacy
+    // streaming emitter's default window is not their physical layout.
+    for config in runtime.aggregation_configs.values_mut() {
+        config.window_size = 1;
+        config.slide_interval = 1;
+        config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
+    }
     let mut artifact = physical_fixture::artifact(&runtime);
     if runtime
         .aggregation_configs
