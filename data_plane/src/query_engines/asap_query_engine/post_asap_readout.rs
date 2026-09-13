@@ -23,39 +23,11 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 /// where `samples` is `(window_end_unix_ms, value)`.
 pub type SeriesRows = Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>;
 
-/// The result of lowering + executing a query through
-/// `SummaryExecutor`, converted into the same shape `ASAPTierResult`
-/// uses, regardless of whether the answer came from the sketch
-/// (`ExecOutcome::Value`) or `ExactAgg` (`ExecOutcome::State`) side —
-/// callers that only care about "did this answer the query, and is it
-/// safe to trust" don't need to know which.
-/// NOTE — this used to carry an `ambiguous_merge_risk` flag, and
-/// `live_serve.rs` used it to DECLINE to serve an ambiguous shape.
-/// That gate is now removed, because the ambiguity it guarded against no
-/// longer exists.
+/// Summary execution result projected into `ASAPTierResult`, for both sketch
+/// values and exact accumulator states.
 ///
-/// It existed because an empty `by: Vec<ColumnId>` was indistinguishable
-/// between "no grouping concept applies" (the group split is correct) and
-/// "an aggregation operator asked to reduce everything" (the groups
-/// should have been merged) — exactly
-/// [ASAPController#163](https://github.com/ProjectASAP/ASAPController/issues/163).
-/// Unable to tell which, the safe move was to fall back to the legacy
-/// path whenever an empty `by` produced >1 group.
-///
-/// ASAPController#165 removed that ambiguity at the source by making the
-/// reduction kind explicit (`Reduction::{PerEntity, Reduce(GroupKeys)}`),
-/// and `summary_executor.rs::resolve_group_key` now acts on it directly.
-/// Both branches are resolved correctly BEFORE reaching here:
-///
-/// * `PerEntity` — the multi-group split is definitionally right (one row
-///   per entity, never merged), so it was never a "risk" to begin with.
-/// * `Reduce([])` — every candidate shares one group key, so the outcome
-///   has exactly ONE group and the old `values.len() > 1` trigger cannot
-///   fire at all.
-///
-/// The flag would therefore be unconditionally `false` today; keeping it
-/// would mean keeping a heuristic that can only ever misfire (declining
-/// correct `PerEntity` answers) now that the real signal is available.
+/// Grouping is resolved before this projection: `PerEntity` preserves each
+/// entity, while `Reduce([])` merges every candidate into a single group.
 pub struct PostAsapReadoutOutcome {
     pub series: SeriesRows,
     pub coverage: Option<(u64, u64)>,
@@ -1088,19 +1060,8 @@ mod tests {
 
     #[test]
     fn global_merge_shape_now_merges_instead_of_being_declined() {
-        // The exact ASAPController#163 shape: two HLL sids, no explicit
-        // by(), an aggregation-operator query. This test previously
-        // asserted `ambiguous_merge_risk == true` and TWO unmerged series
-        // -- i.e. it pinned the old workaround, where an empty `by` left
-        // `find_candidates` unable to tell "reduce everything" apart from
-        // "no grouping concept," so `live_serve` declined to serve the
-        // shape at all.
-        //
-        // With `Reduction` (ASAPController#165) that ambiguity is gone:
-        // `count(...)` is a genuine aggregation operator, so it lowers to
-        // `Reduce([])` and `resolve_group_key` gives every candidate the
-        // SAME group key -- the two sids MERGE into one answer, which is
-        // what the query actually asked for. No gate, no fallback.
+        // An ungrouped count reduces two HLL sids into one answer. `Reduce([])`
+        // assigns both candidates the same group key so their states merge.
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);

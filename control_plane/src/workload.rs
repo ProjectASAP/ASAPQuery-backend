@@ -371,34 +371,12 @@ pub struct WorkloadEntry {
     pub repeat_every: Option<String>,
 }
 
-/// Build the planning [`crate::pipeline::QuerySpec`] a declarative registry
-/// entry describes.
+/// Build the planning spec from a declarative registry entry.
 ///
-/// **Why this exists**: the YAML → planner conversion used to be an inline
-/// struct literal, hand-copied into the controller's startup pre-population
-/// loop and into the test helpers that claim to mimic it. Every field added to
-/// [`WorkloadEntry`] then had to be re-threaded in each copy, and
-/// `repeat_every` is the field that proves the cost: the HTTP
-/// `POST /api/v1/plan` path carried the declared cadence into
-/// [`crate::types::LegacyMetricWorkload::repeat_every`] while the startup path pinned
-/// `None`, so the same declaration was costed with two different batch-mode
-/// flush periods depending on which entry point registered it.
-///
-/// Field notes preserved from the original loop:
-/// * MVP blocker B4 — `time_window` is left EMPTY when the entry carries a
-///   `query_string` so the analyzer parses the matrix-selector `[range]`
-///   instead of a hardcoded `5m` overriding what the operator wrote. Entries
-///   without a query string keep the historical `5m` default, because the
-///   parser has nothing to read and the analyzer errors out without one.
-/// * MVP blocker B3 — `grouping_labels` is threaded into `group_by_labels`.
-///   The analyzer merges it with any `by (...)` keys the PromQL parser
-///   surfaces, which `collect_metric_to_grouping_labels` drops into
-///   `EdgeStageConfig::metric_to_grouping_labels` so the agent's
-///   `keep_keys(datapoint.attributes, [...])` OTTL processor strips wire attrs
-///   down to this list BEFORE sketching.
-/// * `sketch_family_override` is threaded into `QuerySpec::sketch_type`, which
-///   populates `LegacyMetricWorkload::sketch_type_override` — what `bind_workload_typed`
-///   reads to honour the MVP §46 HLL / CountSketch / CountMinSketch pins.
+/// Use one conversion for startup and HTTP planning so cadence and sizing agree.
+/// Leave `time_window` empty for query strings: the parser must read the declared
+/// range. Explicit-field entries default to `5m`. Grouping labels and sketch
+/// overrides must reach the planner and the edge configuration.
 pub fn query_spec_for_entry(entry: &WorkloadEntry) -> crate::pipeline::QuerySpec {
     crate::pipeline::QuerySpec {
         query_string: entry.query_string.clone(),
@@ -1067,16 +1045,8 @@ mod tests {
 
     #[test]
     fn agg_role_classic_bucket_histogram_quantile_is_other() {
-        // L1 adoption (design-target-architecture.md Part B), accepted
-        // behavior change: the retired local parser unconditionally
-        // substituted `histogram_quantile(...)` with a sketchable
-        // `Quantile` intent. `lower_promql` instead detects the classic
-        // `_bucket` + `rate(...)` shape and produces the real,
-        // exact-only `AggIntent::HistogramQuantile`, which `capability_for`
-        // has no sketch-family mapping for (see
-        // `asap_tier_analysis::analyze_histogram_quantile_partially_answerable_via_inner_composition`).
-        // `derive_agg_role`'s wildcard arm correctly routes it to `Other`
-        // rather than misclassifying it as a sketch-routable `Quantile`.
+        // Classic `_bucket` + `rate(...)` histogram quantiles lower to the
+        // exact-only `HistogramQuantile` intent, classified here as `Other`.
         assert_eq!(
             derive_agg_role(&entry(
                 "m",

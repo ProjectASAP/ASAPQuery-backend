@@ -14,7 +14,7 @@
 //! exist when an agent registers a pre-merge identity that the gateway
 //! folds into a different (post-merge) identity before backend ever sees
 //! the sketch payload. Query path treats ghost sids as ASAP-tier MISS
-//! and falls through to Thanos archive (Phase 6).
+//! and falls through to Thanos archive.
 //!
 //! See design doc §4.6 ("OTLP metadata model + backend store layout") at
 //! `docs/design_docs/series-identity.md`.
@@ -37,10 +37,6 @@ use crate::storage_engines::sketch_db::sds::{
     DataDescriptor, SdsBinding, SummaryDescriptor, SummaryDescriptorRegistry,
 };
 
-// Phase-5 reorg: payload taxonomy + sid hashing + accuracy moved to
-// `sketch_db::data`. Re-exported here so existing call sites
-// (`crate::storage_engines::sketch_db::index::*`) keep compiling
-// during the reorg.
 pub use crate::storage_engines::sketch_db::data::{
     canonical_parameters, AccuracyBound, AggKind, AggPayload, AggregationType, Capability,
     SketchAlgorithm, SketchConfig, SketchEncoding, SketchSampleState, SketchTimeSeries,
@@ -191,20 +187,11 @@ fn build_attrs_fp_and_label_map(
     Ok((attrs_fp, label_values_map))
 }
 
-/// Metadata for one logical sketch instance, keyed by `series_id`.
-/// Populated at ingest time when a sketch DataPoint with a fresh sid
-/// arrives (or `(metric, attrs)` produces a fresh sid via the
-/// SeriesIdResolver). Subsequent emits of the same sid append to the
-/// associated `SidStoreData` without re-touching this metadata.
+/// Metadata for one logical sketch instance, keyed by sid. Ingest registers it
+/// on first sight; later writes append to the associated per-sid storage.
 ///
-/// **Lifecycle fields** (Phase 5 M1): mirror `AggSchema`'s
-/// `Active → Retired → Expired` state machine so the sid-keyed path
-/// has the same write-side barrier semantics as the agg_id-keyed path.
-/// `status()` is derived from `retired_at_ms` + `expires_at_ms` and
-/// the wall clock — never stored directly. M2 cuts the ingest barrier
-/// over from `SchemaRegistry::is_writable(agg_id)` to
-/// `SketchStore::is_writable(sid)`; until then both registries run
-/// side by side.
+/// Lifecycle status is derived from retirement and expiry timestamps plus the
+/// wall clock. Only active instances accept writes.
 #[derive(Debug, Clone)]
 pub struct SummarySeriesMetadata {
     pub sid: u64,
@@ -262,10 +249,7 @@ impl SummarySeriesMetadata {
         }
     }
 
-    /// Whether this sid accepts writes. Equivalent to
-    /// `status() == AggStatus::Active`. Phase 5 ingest barrier
-    /// (M2 cutover) will call this in place of
-    /// `SchemaRegistry::is_writable(agg_id)`.
+    /// Whether this sid accepts writes: `status() == AggStatus::Active`.
     pub fn is_writable(&self) -> bool {
         matches!(self.status(), AggStatus::Active)
     }
@@ -302,10 +286,6 @@ impl SummarySeriesMetadata {
         }
     }
 }
-
-// `SketchSampleState`, `SketchEncoding`, `SketchTimeSeries`, and
-// `AggPayload` moved to `sketch_db::data` in the Phase-5 reorg; they're
-// re-exported at the top of this file for backwards compatibility.
 
 /// Per-sid storage value — wraps `SidStoreData` in an `RwLock` so the
 /// outer DashMap stays read-mostly and per-sid writes don't block one
@@ -576,13 +556,9 @@ impl From<&asap_types::producer_plan::SummaryFrameIdentity> for IncompleteSummar
     }
 }
 
-/// Two-level sketch index. Replaces the legacy `aggregation_id`-keyed
-/// SimpleStore lookup once Phase 5 wiring lands at the streaming engine
-/// ingest path and the query path.
-///
-/// `instances` is keyed under a `RwLock<HashMap>` because the registration
-/// rate is low (one write per first-seen sid) and reads dominate;
-/// `series` is a `DashMap` because per-sid writes happen on every DP.
+/// Two-level sketch index. Metadata uses `RwLock<HashMap>` for infrequent
+/// registration and frequent reads; per-sid data uses `DashMap` for writes on
+/// every datapoint.
 #[derive(Clone, Copy)]
 pub(crate) struct SummaryReadRevision {
     admission: u64,
@@ -2606,11 +2582,7 @@ impl SketchStore {
         }
     }
 
-    // ── Phase 5 M1: lifecycle-status surface ─────────────────────────
-    //
-    // Mirror the `SchemaRegistry` lifecycle methods so the ingest /
-    // eviction paths can cut over from `agg_id` to `sid` in M2. Until
-    // M2 lands, both registries run side by side.
+    // Sid lifecycle transitions and status lookup.
 
     /// Whether `sid` accepts writes. Equivalent to
     /// `status(sid) == AggStatus::Active`. Returns `false` for
@@ -2938,12 +2910,8 @@ impl SketchStore {
 }
 
 impl SketchStore {
-    /// Phase 5 M2.3.6g — runtime-info / diagnostic helper. Returns the
-    /// per-sid `first_seen_unix_ms` for every registered sid. The
-    /// legacy `Store::get_earliest_timestamp_per_aggregation_id` returned
-    /// an analogous `agg_id → ts` map; this is the SketchStore
-    /// equivalent. HTTP server's `/api/v1/status/runtimeinfo` adapter
-    /// surfaces it under the JSON field `earliest_timestamp_per_sid`.
+    /// Return first-seen timestamps per sid for runtime diagnostics. The HTTP
+    /// adapter exposes this as `earliest_timestamp_per_sid`.
     pub fn earliest_timestamps_per_series_id(&self) -> std::collections::HashMap<u64, u64> {
         let g = self.instances.read().unwrap();
         g.iter()
@@ -3494,13 +3462,8 @@ impl SketchStore {
     }
 }
 
-// ── Phase 5 M2.3.6b — EpochSource impl ──────────────────────────────────────
-//
-// Lets the existing persistence flusher (`store/persistence/flusher.rs`)
-// drive `SketchStore` instead of `SketchStorePerKey`. The `agg_id: u64`
-// field on `SealedEpochRef` / `EpochSnapshot` carries a `sid` here —
-// the trait keeps the historical name so the flusher / manifest /
-// part-writer stay untouched.
+// Persistence epoch interface. The `agg_id` field on epoch references carries
+// a sid in this store; persistence readers and writers must interpret it so.
 impl crate::storage_engines::sketch_db::index::persistence::EpochSource for SketchStore {
     fn flush_before_ms(&self) -> Option<u64> {
         let cutoff = self

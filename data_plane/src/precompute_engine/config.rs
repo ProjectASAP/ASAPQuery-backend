@@ -45,13 +45,8 @@ pub struct PrecomputeEngineConfig {
     /// emitted as mergeable corrections. Default: 5000 ms.
     #[serde(default = "default_wall_clock_max_open_grace_period_ms")]
     pub wall_clock_max_open_grace_period_ms: i64,
-    /// Optional path where the `SchemaRegistry` persists per-`agg_id`
-    /// lifecycle state across restarts (sketch DB Phase 2c). When
-    /// set, the registry loads prior `created_at_ms` / `retired_at_ms`
-    /// timestamps from the file on startup and atomically rewrites
-    /// the file after every config-driven reconcile. When `None`,
-    /// the registry is memory-only and the §7 timeline reflects only
-    /// post-restart history.
+    /// Compatibility option for schema persistence. Sid lifecycle persistence is
+    /// managed by the sketch store.
     #[serde(default)]
     pub schema_persist_path: Option<std::path::PathBuf>,
 }

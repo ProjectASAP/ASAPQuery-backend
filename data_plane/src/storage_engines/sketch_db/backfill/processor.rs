@@ -1,67 +1,16 @@
-//! `BackfillWindowProcessor` — the Phase 5e implementation of
-//! [`WindowProcessor`] that actually rebuilds sketches and writes
-//! them into the store.
+//! Rebuild window accumulators from a raw sample reader and write them to storage.
 //!
-//! Implements §10 (refreshable view maintenance) of the sketch DB
-//! design ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
-//! Reads raw samples from a [`RawSampleReader`] (Phase 5b), groups
-//! them by the agg's `grouping_labels` just like live ingest does,
-//! and writes per-(group, window) precomputes to the store.
+//! Backfill runs in its own worker, separate from live ingestion and active panes.
+//! It shares the pure accumulator factory with live ingest and records written
+//! windows in the backfill registry for coverage lookup.
 //!
-//! ## Separation from live ingest
+//! Jobs created through `BackfillRegistry::create_checked` end at or before the
+//! materialization's creation time, keeping replay ranges disjoint from live
+//! ingestion.
 //!
-//! The user's Phase 5e direction was: "backfill should be a wholly
-//! separate path; workers / results / data should carry distinct
-//! identification; prefer isolation even at the cost of some
-//! duplication." The code structure honours this:
-//!
-//! * **Separate worker**: processor runs inside a `BackfillWorker`
-//!   (Phase 5c), which is in turn driven by a `BackfillService`
-//!   tokio task that is NOT part of the `PrecomputeEngine`.
-//! * **Separate output path**: writes go straight to the
-//!   `Store::insert_precomputed_output_batch` call without passing
-//!   through `OutputSink`/`PrecomputeEngine`/`WindowManager`. The
-//!   live worker does the same call at the end of its chain, but
-//!   the backfill path gets there through its own code.
-//! * **Distinct identification**: after every successful batch
-//!   write the processor calls
-//!   `BackfillRegistry::record_window_written(job_id, agg_id,
-//!   window_range)`. Phase 5f's coverage tracker will consult this
-//!   list to distinguish `Backfilled { job_id }` from `Missing`
-//!   without needing a provenance field on the on-disk precompute
-//!   format.
-//! * **Shared primitives (deliberately)**: the pure
-//!   `create_accumulator_updater` factory is reused (via
-//!   [`super::backfill_window_builder::build_backfilled_accumulator`]).
-//!   See that module's doc for why.
-//!
-//! ## Time-disjoint invariant
-//!
-//! The processor never checks `is_writable(agg_id)` or locks
-//! against live writes on the same `(agg_id, window)` — the
-//! [`BackfillRegistry::create_checked`] constructor already
-//! enforces that the backfill range ends at-or-before the agg's
-//! `created_at_ms`. Live ingest owns `[created_at, ∞)`; backfill
-//! owns `[0, created_at)`. Disjoint by construction.
-//!
-//! ## Determinism (§10.5)
-//!
-//! For deployments where live ingest goes through Prometheus
-//! remote write (backend-native sketch construction), the
-//! backfilled sketch is **bit-identical** to what live would have
-//! produced from the same samples in the same order, because both
-//! paths call `create_accumulator_updater` + `update_single` /
-//! `update_keyed` in ingest order. The live-vs-backfill parity
-//! test in this file locks that invariant.
-//!
-//! For deployments where live goes through the DataCollector
-//! OTLP path (DC builds the sketch via sketchlib-go and the
-//! backend only deserialises), bit-identicalness requires the
-//! Go-side sketchlib and the Rust-side sketch-core to produce
-//! identical output for the same input. That cross-language
-//! audit is tracked as separate work; today, backfill in such
-//! deployments is "approximately equivalent within sketch error
-//! bounds ε".
+//! For backend-native construction, the same samples in the same order use the
+//! same factory and update operations as live ingest. Cross-language collector
+//! construction requires separate parity verification.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -178,11 +127,8 @@ pub struct BackfillWindowProcessor {
     /// `AggregationConfig` for `agg_id`. The snapshot is cheap
     /// (Arc refcount bump) so we don't optimise further.
     config: StreamingConfigHandle,
-    /// Phase 5 M2.3.6g — replayed batches land here. The legacy
-    /// `Arc<dyn Store>` field is gone; SketchStore is the only
-    /// destination. Optional so tests that don't observe write
-    /// effects can skip attaching one (the processor becomes a
-    /// registry-only logger in that case).
+    /// Destination for rebuilt windows. Tests may omit it to record registry
+    /// provenance without storing payloads.
     summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Shared sid mint authority. Same `SeriesIdResolver` the OTel
     /// ingest path uses, so backfilled precompute sids land in the
@@ -366,13 +312,8 @@ impl WindowProcessor for BackfillWindowProcessor {
             batch.push((sid, output, accumulator));
         }
 
-        // Phase 5 M2.3.6g — replayed batches land in SketchStore only.
-        // No legacy SketchStore write path remains. When no
-        // sketch_index is attached (tests), the writes are simply
-        // dropped — the registry still records the (agg_id, range)
-        // provenance below. When sketch_index is attached but no
-        // resolver was provided, the precompute write is skipped
-        // with a warn — sid minting requires the shared resolver.
+        // Tests without a sketch index record provenance only. Writes with an index
+        // require the shared sid resolver; otherwise log a warning and skip them.
         if let Some(idx) = self.summary_store.as_ref() {
             match self.series_resolver.as_ref() {
                 Some(_resolver) => {
@@ -622,25 +563,8 @@ mod tests {
         // every expected write.
     }
 
-    /// ## The parity test (§10.5 determinism invariant)
-    ///
-    /// This is the test that locks the "backfill produces the same
-    /// sketch as live" claim from the module doc. For the raw-ingest
-    /// path (sketch-core-native construction), a backfilled
-    /// accumulator MUST serialise to exactly the same bytes as a
-    /// live-built accumulator fed the same samples in the same order.
-    ///
-    /// The test builds two SumAccumulators from the same sample
-    /// sequence (one via the live path's `create_accumulator_updater`
-    /// plus `update_single`, and one via the backfill path's
-    /// `build_backfilled_accumulator`) and asserts their
-    /// `serialize_to_bytes()` outputs are byte-identical.
-    ///
-    /// A similar CMS parity test would be ideal; it's skipped here
-    /// because `CountMinSketchAccumulator::new` in sketch-core takes
-    /// more params than we exercise elsewhere and would require
-    /// deeper wiring. If Phase 5e needs stronger coverage, add a
-    /// CMS-specific parity test — it'll follow the exact same shape.
+    /// Sum accumulators built by live and backfill paths must serialize identically
+    /// when given the same ordered samples.
     #[test]
     fn backfill_builds_bit_identical_sum_accumulator_to_live() {
         use crate::precompute_engine::accumulator_factory::create_accumulator_updater;

@@ -31,18 +31,7 @@ pub enum Origin {
     Backfilled { job_id: u64 },
 }
 
-/// One window of one (sid, label-values) group's emitted aggregation
-/// state. Produced by `PrecomputeWorker` / `BackfillWindowProcessor`
-/// and consumed by `SketchStoreSink::append_to_index`.
-///
-/// **PR-6 follow-up:** the `aggregation_id: u64` field that this struct
-/// used to carry alongside `policy_fp` is gone — `policy_fp` is the
-/// only identity handle. PR 4 added `policy_fp` as a parallel field
-/// with `aggregation_id` kept for legacy compat; PR 5 retired
-/// `AggregationConfig::aggregation_id`; this PR completes the cleanup
-/// by retiring the field on `PrecomputedOutput` too. Sinks resolve the
-/// source config via `PolicyRegistry::get(policy_fp)`.
-/// In-process proof of which accepted input revision a window includes.
+/// Proof of which accepted input revision a window includes.
 #[derive(Debug, Clone)]
 pub struct SummaryInputRevision {
     pub generation: std::sync::Arc<asap_types::sds::CatalogGeneration>,

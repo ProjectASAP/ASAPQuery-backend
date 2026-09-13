@@ -1,18 +1,5 @@
-//! `ASAPTierResult` — the per-series, per-window scalar-result shape
-//! `SummaryExecutor` (via `live_serve.rs`/`post_asap_readout.rs`) fills in for
-//! the engine to adapt into `QueryResult`.
-//!
-//! This module used to also hold `SketchReducer`, the legacy per-Capability
-//! reducer that answered queries directly from decoded sketch bytes before
-//! `SummaryExecutor` existed. It's retired: neither it nor
-//! `shadow_compare.rs` (the diagnostic comparison that validated
-//! `SummaryExecutor` against it) was any more "ground truth" than the
-//! `SummaryExecutor` path itself, and keeping a second, independently
-//! re-derived answering mechanism around after `SummaryExecutor` became
-//! the live default only meant two things could silently disagree with
-//! each other. `ASAPTierResult` survives because it's the shared
-//! wire-shape both the old reducer and `live_serve.rs` produced —
-//! nothing about it is reducer-specific.
+//! Per-series, per-window scalar results produced by summary execution and
+//! adapted by the query engine into `QueryResult`.
 
 use std::collections::BTreeMap;
 

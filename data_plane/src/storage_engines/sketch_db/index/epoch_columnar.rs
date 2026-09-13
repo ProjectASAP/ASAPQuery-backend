@@ -1,37 +1,12 @@
-//! Epoch-partitioned columnar storage — generic payload type.
+//! Epoch-partitioned columnar storage with a generic payload type.
 //!
-//! Lifted from `sketch_store::common` (legacy SketchStore index)
-//! with the payload column type made generic so the new SketchStore
-//! (Phase 5) can reuse the legacy's six storage optimizations
-//! (`INDEX_DESIGN.md`) without dragging in `Arc<dyn AggregateCore>`
-//! dynamic dispatch.
+//! Parallel window, label-id, and payload columns let range scans inspect only
+//! window metadata. Indexes store offsets rather than cloning payloads; the
+//! window index is built lazily and invalidated on insert. Monotonic ingestion
+//! skips redundant probes, and rotation preallocates epoch buffers.
 //!
-//! # Optimizations carried over from legacy
-//!
-//! | Opt | What |
-//! |-----|------|
-//! | 1 | Lazy `window_to_ids` index — built on first exact query, invalidated cheaply on insert |
-//! | 2 | Offset-based index — stores `u32` column offsets, not payload clones |
-//! | 3 | Monotonic ingest fast path — skip `HashSet` probe for consecutive same-window inserts |
-//! | 4 | Batch metadata hoisting — caller responsibility (the OTLP receive path groups DPs by sid) |
-//! | 5 | Columnar storage — three parallel arrays; range scan touches only `windows_col` |
-//! | 6 | Pre-allocated epoch buffers on rotation |
-//!
-//! # Differences from legacy
-//!
-//! - **Generic payload type**: `MutableEpoch<P>` instead of
-//!   `Vec<Arc<dyn AggregateCore>>`. The new SketchStore stores
-//!   `SketchSampleState` directly (typed bytes + encoding tag) — no
-//!   dyn dispatch, no Arc cloning, payload moves into the column.
-//! - **Series-values keyed via `LabelValuesId = u32`** (renamed from
-//!   legacy `MetricID = u32`). The intern table maps the per-series
-//!   group-by VALUES vector to a compact ID, since the SketchStore's
-//!   sid already captures the metric identity at the level above.
-//!
-//! See INDEX_DESIGN.md in `sketch_store/` for the full complexity
-//! analysis (Insert O(1), range query O(M) mutable / O(log N + k)
-//! sealed, etc.) — those bounds carry over verbatim because the
-//! algorithmic structure is unchanged.
+//! Label-value vectors are interned as `LabelValuesId`; the owning sid already
+//! identifies the metric. Callers can hoist shared metadata when batching writes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 

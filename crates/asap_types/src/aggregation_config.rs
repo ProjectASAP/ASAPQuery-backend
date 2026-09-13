@@ -89,17 +89,8 @@ impl WindowMaterializationLayout {
     }
 }
 
-/// Per-aggregation policy carried in the streaming config.
-///
-/// **PR 5 (merged-sid-identity refactor)** retired the
-/// controller-allocated `aggregation_id: u64` field. Identity is now
-/// content-addressed via [`PolicyFingerprint`] — derive on demand with
-/// [`PolicyFingerprint::from_config(&cfg)`].
-///
-/// The YAML wire shape no longer carries `aggregationId` (the
-/// controller stopped emitting it in M2.2; this PR makes the backend
-/// stop reading it). Existing fixtures that still spell out
-/// `aggregationId: N` parse cleanly — the field is silently dropped.
+/// Per-aggregation policy with content-derived [`PolicyFingerprint`] identity.
+/// An `aggregationId` field in input YAML is ignored for compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputeMaterialization {
     pub aggregation_type: AggregationType,

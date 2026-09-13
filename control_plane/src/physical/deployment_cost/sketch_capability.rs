@@ -91,11 +91,7 @@ struct SketchCapabilitiesFile {
     count_min_sketch: SketchCapabilityYaml,
 }
 
-/// Compiled-in capability defaults — one entry per [`SketchAlgorithm`].
-/// Replaces the per-variant `sketch_capability(SketchType)` function
-/// that previously lived in `algebra/optimizer.rs`. Numerical values
-/// are mirrored from the YAML so the in-process defaults match the
-/// reference deployment file.
+/// Compiled-in capability defaults, mirrored from the reference deployment YAML.
 pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> {
     let mut map = HashMap::new();
     map.insert(
@@ -166,11 +162,8 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
     map
 }
 
-/// Load sketch capability overrides from a YAML file. Falls back to
-/// [`default_capability_table`] if the file is missing or malformed.
-/// Physical replacement for the retired logical capability loader.
-///
-/// Env var: `CONTROLLER_SKETCH_CAPABILITIES=path/to/this/file.yml`.
+/// Load overrides from `CONTROLLER_SKETCH_CAPABILITIES`. Missing or malformed
+/// files fall back to [`default_capability_table`].
 pub fn load_capability_overrides(path: &str) -> HashMap<SketchAlgorithm, SketchCapability> {
     if let Ok(contents) = std::fs::read_to_string(path) {
         if let Ok(file) = serde_yaml::from_str::<SketchCapabilitiesFile>(&contents) {

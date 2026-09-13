@@ -1,49 +1,11 @@
-//! `SchemaEvictionService` — background task that drops
-//! `AggStatus::Expired` schemas' data and removes them from the
-//! registry.
+//! Remove expired sid instances and their stored data on a periodic sweep.
 //!
-//! Implements the §6.2 "scheduled for deletion by the time-TTL
-//! sweep" semantics the lifecycle enum promises. Sits alongside
-//! the SketchStore's age-based `persistence_delete_older_than`
-//! retention — the two are independent:
+//! Lifecycle retention is separate from age-based data retention. Configure
+//! `persistence_delete_older_than > retirement_retention` so whole-instance
+//! eviction can precede age-based record removal.
 //!
-//! * **Schema retention** (this module): lifecycle-driven. When a
-//!   schema is removed from `StreamingConfig` it transitions
-//!   `Active → Retired → Expired`; when `expires_at_ms` passes we
-//!   drop its `agg_id`.
-//! * **Data retention** (SketchStore): age-driven. Records
-//!   older than `persistence_delete_older_than` get swept up
-//!   regardless of schema.
-//!
-//! ## Ordering guideline
-//!
-//! The user's design rule is: `persistence_delete_older_than >
-//! retirement_retention`. That way data-retention never beats
-//! schema-eviction to the punch on an Expired schema's records —
-//! schema-eviction takes them out cleanly in one bulk drop
-//! (O(1)-ish per the `drop_agg_id` contract) before data-retention
-//! would wade in record-by-record. `SchemaEvictionService` logs a
-//! `warn!` at startup if the ordering is inverted.
-//!
-//! ## What the service does on each tick
-//!
-//! 1. Snapshot the schema registry: collect every `AggStatus::Expired`
-//!    schema.
-//! 2. For each Expired schema's `agg_id`:
-//!    - Cancel any `Running` backfill job targeting that agg_id
-//!      (they're writing to data about to be dropped — wasted work).
-//!    - Call `store.drop_agg_id(agg_id)` to evict the windows.
-//!    - `schema_registry.remove_schema(agg_id)` to drop the registry
-//!      entry so it won't be re-evicted next tick.
-//! 3. Log an audit line per eviction with `agg_id`, metric,
-//!    `retired_at_ms`, windows evicted.
-//!
-//! ## Dry-run
-//!
-//! `--schema-eviction-dry-run` sets `dry_run: true`. Every step
-//! above runs through the discovery + logging, but `drop_agg_id`
-//! and `remove_schema` are skipped. Use this to validate a new
-//! retention value before letting it delete anything.
+//! Dry-run logs discovered instances without removing them. Backfill jobs are
+//! policy-keyed, so this sid-level sweep does not cancel those jobs.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,9 +18,7 @@ use crate::storage_engines::sketch_db::backfill::BackfillRegistry;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::lifecycle::{AggStatus, DEFAULT_RETIREMENT_RETENTION};
 
-/// Configuration for the eviction loop. Separate from
-/// `SchemaRegistry`'s `retirement_retention` because the service
-/// owns the poll schedule, not the data model.
+/// Eviction schedule and dry-run configuration.
 #[derive(Clone, Debug)]
 pub struct SchemaEvictionConfig {
     /// How often to scan for Expired schemas. Coarse (default 5 min)
@@ -78,15 +38,8 @@ impl Default for SchemaEvictionConfig {
     }
 }
 
-/// Long-running tokio task that drops `Expired` sids' data.
-///
-/// Post-schema-retirement: the sweep is sid-driven. `SchemaRegistry`
-/// is gone; this service iterates the sid catalog directly and
-/// removes any sid whose status has progressed past `Retired`.
-/// `BackfillRegistry` is retained so future sid↔backfill wiring can
-/// reattach (today the sweep no longer cancels in-flight backfills
-/// because backfill jobs remain agg_id-keyed; a follow-up will
-/// rekey them on sid and restore the cancel step).
+/// Background task that removes expired instances from the sid catalog.
+/// The backfill registry is retained but is not consulted for cancellation.
 pub struct SchemaEvictionService {
     backfill: Arc<BackfillRegistry>,
     summary_store: Arc<SketchStore>,

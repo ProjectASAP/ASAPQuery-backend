@@ -148,22 +148,8 @@ pub fn create_engine_single_pop_with_aggregated(
     ASAPQueryEngine::new(1).with_sketch_index(summary_store)
 }
 
-/// Creates a ASAPQueryEngine with dual-input (separate value and keys
-/// aggregations). Currently dead code — the only historical caller
-/// exercised the retired `SetAggregator` / `DeltaSetAggregator`
-/// key-tracking pair. Retained as a builder utility for future
-/// dual-input shapes (e.g. HydraKLL value + a not-yet-defined key
-/// aggregation); delete if no caller materialises.
-///
-/// # Arguments
-/// * `metric` - Metric name
-/// * `value_agg_type` - Accumulator type for values
-/// * `key_agg_type` - Accumulator type for keys
-/// * `grouping_labels` - Store GROUP BY columns
-/// * `aggregated_labels` - Labels that key the accumulator internally
-/// * `value_data` - Data for value aggregation (agg_id=1)
-/// * `keys_data` - Data for keys aggregation (agg_id=2)
-/// * `promql_query` - The PromQL query string
+/// Build a test engine with separate value and key aggregations. Each input
+/// carries its own accumulator type, labels, and samples.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub fn create_engine_dual_input(

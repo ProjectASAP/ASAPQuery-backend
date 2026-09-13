@@ -1,42 +1,13 @@
-//! Typed cumulative push of `BackendStageConfig` to the ASAPQuery-backend.
+//! Cumulative backend configuration push shared by planning and replanning.
 //!
-//! Single entrypoint — [`post_typed_backend_for_role`] — invoked from
-//! every plan-emit cycle (HTTP `POST /api/v1/plan`, the replanner's
-//! plan-expiry / SLA-violation triggers, startup pre-pop tick, OpAMP
-//! on-connect tick). It:
+//! Each push updates the per-`(metric, role)` cache, concatenates all aggregations
+//! and readouts in deterministic order, then posts streaming configuration.
+//! Storage routing merges those entries by metric before posting. Both endpoints
+//! replace their configuration atomically, so a push must preserve sibling roles
+//! and metrics.
 //!
-//!   1. Updates the per-`(metric, role)` cache with the new
-//!      `BackendStageConfig`.
-//!   2. Builds a **cumulative** `BackendStageConfig` whose
-//!      `aggregations` + `readouts` concatenate every cache entry's,
-//!      ordered deterministically (`(metric, role.as_str())` ascending)
-//!      so the emitted JSON body is reproducible across runs and tests.
-//!   3. POSTs the cumulative streaming-config JSON to
-//!      `/api/v1/streaming-config` — the data plane's atomic
-//!      `handle.swap(new_config)` then installs every role's
-//!      aggregations simultaneously.
-//!   4. Groups cache entries by metric, merges each metric's
-//!      `BackendStageConfig`s, and POSTs the per-metric merged routing
-//!      table to `/api/v1/storage_routing`.
-//!
-//! **Why one helper, not two paths**: prior to Option B the control
-//! plane had two emit paths into the backend:
-//!
-//!   * the typed cumulative path from `handle_plan` (post PR #287) —
-//!     correct under the data plane's swap semantics;
-//!   * the legacy single-aggregation path from `Replanner`
-//!     (`generate_streaming_config_yaml`) — emits ONE aggregation per
-//!     POST. Under the swap, this WIPES the cumulative state on the
-//!     backend the moment plan-expiry or accuracy-violation fires it.
-//!
-//! Option B unifies both call sites through this helper so the swap
-//! semantics are honoured at every emit cycle, and the legacy YAML
-//! emitter is retired.
-//!
-//! Fire-and-forget contract: every error (emit failure, HTTP transport
-//! error, non-2xx response) logs at WARN and returns — never panics,
-//! never propagates. The next replan cycle retries with the latest
-//! plan.
+//! Emission and transport errors log at WARN and return. The next planning cycle
+//! retries with the latest configuration.
 
 use std::collections::{BTreeMap, HashMap};
 // `Future` is only referenced by the now-test-only `retry_transient`
@@ -1005,7 +976,7 @@ mod tests {
     /// re-plan, so the restarted backend recovers its config.
     #[tokio::test]
     async fn repost_after_simulated_backend_reset_re_pushes_full_config() {
-        // Phase 1: initial plan lands on the first backend instance.
+        // initial plan lands on the first backend instance.
         let (url1, mock1) =
             start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
         let client1 = StdArc::new(BackendClient::new(url1));
@@ -1022,7 +993,7 @@ mod tests {
         assert_eq!(mock1.streaming_hits.load(StdOrdering::SeqCst), 1);
         assert_eq!(mock1.routing_hits.load(StdOrdering::SeqCst), 1);
 
-        // Phase 2: the backend silently restarts — model it as a brand-new
+        // the backend silently restarts — model it as a brand-new
         // mock with zero recorded hits. NOTHING expires, NO replan fires.
         let (url2, mock2) =
             start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;

@@ -33,19 +33,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-/// Canonical sid identity — `(metric_name, attrs_fingerprint, agg_kind_canonical)`.
+/// Canonical sid identity: `(metric_name, attrs_fingerprint, agg_kind_canonical)`.
 ///
-/// This is the same 3-tuple that the retired `compute_sketch_sid` /
-/// `compute_sid` functions hashed over, just held as a string key
-/// for the registry-allocated mint path.
-///
-/// - `attrs_fingerprint` — keys sorted lexicographically, then
-///   `key=value;`-joined. Matches the patched OTel-Go exporter so
-///   sender and receiver agree bit-exactly.
-/// - `agg_kind_canonical` — the stable string form of `AggKind` (see
-///   `sketch_db::data::AggKind::canonical_string`). Distinguishes
-///   different aggregations over the same series — e.g. a DDSketch
-///   and a Sum on the same `(metric, attrs)` get separate sids.
+/// Sort attribute keys and join `key=value;` pairs exactly as the patched
+/// OTel-Go exporter does. The aggregation kind separates different summaries
+/// over the same metric and attributes.
 type CacheKey = (String, String, String);
 
 /// Idempotent compute-or-mint resolver. Atomic per-key — concurrent

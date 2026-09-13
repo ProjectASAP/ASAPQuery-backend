@@ -134,11 +134,7 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
 
 #[test]
 fn bind_kll_quantile_basic() {
-    // The retired `BindKllOnQuantile` rule struct's direct `.apply()`
-    // call is replaced by forcing the Kll family via
-    // `ForcedFamilyCostModel` — bypassing the DDSketch/KLL dispatcher
-    // tie-break exercised separately by
-    // `bind_picks_ddsketch_over_kll_when_eps_explicit` below.
+    // Force KLL to test its binding independently of family ranking.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model =
         ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchAlgorithm::Kll);
@@ -167,8 +163,7 @@ fn bind_kll_quantile_basic() {
 
 #[test]
 fn bind_ddsketch_quantile_basic() {
-    // Same shape as `bind_kll_quantile_basic`, forcing DDSketch instead
-    // of the retired `BindDDSketchOnQuantile` rule struct.
+    // Force DDSketch to test its quantile binding.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model =
         ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchAlgorithm::DDSketch);
@@ -446,12 +441,7 @@ fn bind_exact_accuracy_disables_quantile_binding() {
     }
 }
 
-// ── Phase β: pattern-migration coverage ───────────────────────────────────────
-//
-// The five PromQL pattern shapes defined in `asap-planner-rs/src/planner/
-// patterns.rs` each have a control plane L3/L4 equivalent. These tests are the
-// per-shape cross-reference asserting the L1→L3→L4 path produces a
-// matching binding without going back through asap-planner-rs.
+// PromQL pattern coverage through canonical parsing and physical binding.
 
 /// `ONLY_TEMPORAL` — `quantile_over_time(0.99, m[5m])`.
 /// asap-planner-rs path: ONLY_TEMPORAL pattern 1 → KLL/DDSketch summary.
@@ -599,17 +589,7 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     }
 }
 
-/// Phase β archive-only intent: any of the no-ASAP-tier-family entries
-/// (`Absent`, `Present`, `Delta`, …) binds to a `Logical` pass-through,
-/// and the L5 emitter / Phase α routing reads `AggIntent::archive_only()
-/// == true` to flag the StreamingConfig entry for the archive tier.
-///
-/// `histogram_quantile(...)` was previously an L3 intent here but is no
-/// longer — it's a PromQL/MetricsQL language-level operator that the
-/// parser substitutes (Step γ5) into a plain `Aggregate { Quantile(φ) }`,
-/// NOT a semantic intent. The L1→L3 lowerer's documented contract is
-/// `histogram_quantile(q, bucket_metric) → AggIntent::Quantile { q, .. }`;
-/// bucket-aware reduction is a physical-planner concern.
+/// Archive-only intents produce logical pass-through plans.
 #[test]
 fn phase_b_pattern_archive_only_routes_to_archive() {
     let intent = AggIntent::Absent;
@@ -641,19 +621,7 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
     }
 }
 
-// ── Phase β: end-to-end pattern equivalence with asap-planner-rs ─────────────
-//
-// The asap-planner-rs test suite drives a set of canonical PromQL workloads
-// (`tests/comparison/test_data/configs/*.yaml`). For each, the legacy
-// planner produces a StreamingConfig with one or more `aggregation_id`
-// entries keyed on (sketch_kind, sketch_params).
-//
-// Phase β asserts the CONTROL PLANE's L1→L3→L4 path produces a functionally
-// equivalent set of bound aggregations for the same input strings. We
-// don't load the YAML files — that would couple the control plane to the
-// asap-planner-rs test fixture layout. Instead each test embeds the
-// representative query string from the corresponding fixture YAML and
-// pins the expected (sketch_kind | archive-only) outcome.
+// Representative PromQL workloads pin the expected sketch or archive binding.
 
 /// Helper: parse a PromQL string to the canonical L3 `QueryExpr`, bind to
 /// L4. Returns the produced `PhysicalExpr` for assertion.
@@ -811,11 +779,7 @@ fn phase_b_e2e_archive_only_e2e_binding() {
     assert!(crate::emit::extract_root_sketch_algorithm(&bound).is_none());
 }
 
-/// Cross-cutting: every Phase β archive-only intent reaches
-/// `bind_query_expr` and lands as a `Logical` pass-through whose contents
-/// the L5 emitter can route via `archive_only()`. Mirrors Phase γ's
-/// "delete asap-planner-rs without losing coverage" goal — none of these
-/// raise an error or panic; all produce a valid L4 expression.
+/// Archive-only intents must produce valid logical expressions without errors.
 #[test]
 fn phase_b_archive_only_intents_round_trip_through_binder() {
     let intents = vec![

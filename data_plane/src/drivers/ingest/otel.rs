@@ -229,7 +229,7 @@ impl MetricsService for MetricsServiceImpl {
             // refresh stale entries and pick up brand-new ones from this
             // field without a separate `ResolveSeriesIDs` round-trip.
             series_assignments: outcome.series_assignments,
-            // Phase 4 — backend signals senders to evict cached sids here
+            // backend signals senders to evict cached sids here
             // when this Export carried a sid the resolver does not
             // recognize (sid-cache divergence — e.g. after a backend
             // restart without persistence, or when the sender's sid
@@ -666,17 +666,9 @@ async fn route_otlp_to_precompute(
         .map(|plan| plan.streaming_config.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
     let agg_configs = snap.materializations();
-    // Schema retirement #5 — the agg_id-keyed `SchemaRegistry` is
-    // gone; sid-level lifecycle now lives on `SketchStore`. Reconcile
-    // against the current streaming config so newly-added /
-    // newly-retired sids transition immediately. The §6.3 ingest
-    // barrier is enforced at the sid level inside
-    // `SketchStore::ingest_precompute_for_agg_config`.
-    //
-    // Gated on the config `Arc` identity: the streaming config only
-    // changes on a (rare) control-plane swap, so in steady state this
-    // collapses to a single relaxed atomic load and skips the full
-    // catalog scan — the dominant ingest-path CPU cost in profiling.
+    // Reconcile sid lifecycle using the current streaming-config snapshot.
+    // The store enforces the write barrier for retired and expired instances.
+    // A config-Arc identity check skips catalog scans while the config is unchanged.
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest_state.summary_store.as_ref(),
         &snap,
@@ -700,14 +692,8 @@ async fn route_otlp_to_precompute(
     let mut by_bucket: HashMap<u64, (BucketTuple, Vec<SampleTuple>)> = HashMap::new();
     let mut raw_matched = 0usize;
     let mut raw_unmatched = 0usize;
-    // Schema retirement #3 (plan step #3) dropped the agg_id-keyed
-    // `schemas.is_writable` ingest barrier. The §6.3 contract still
-    // holds: `SketchStore::ingest_precompute_for_agg_config` rejects
-    // writes targeting retired/expired sids at the sid-level
-    // (per-sid `is_writable`). The retained empty map below feeds
-    // `flush_barrier_drops` so the counter / log shape doesn't
-    // change for /metrics consumers; once schema/ is fully retired
-    // the counter moves to sid-level wiring.
+    // The store enforces the sid-level write barrier. This empty map preserves
+    // the barrier-log interface without duplicating that check.
     let raw_barrier_drops: HashMap<u64, u64> = HashMap::new();
 
     for point in points {
@@ -946,10 +932,7 @@ async fn route_modified_otlp_sketches_to_precompute(
         preflight_summary_frames(request, ingest_state, active)?;
     }
     let agg_configs = snap.materializations();
-    // Schema retirement #5 — agg_id-keyed registry retired; sid-level
-    // reconcile is the only path going forward. See the raw-OTLP
-    // routine above for the full rationale (incl. the config-Arc gate
-    // that skips the catalog scan when the config is unchanged).
+    // Reconcile sid lifecycle only when the configuration snapshot changes.
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest_state.summary_store.as_ref(),
         &snap,
@@ -976,7 +959,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     // Schema-keyed barrier dropped (see `raw_barrier_drops` above);
     // sid-level barrier in `SketchStore` carries §6.3 going forward.
     let barrier_drops: HashMap<u64, u64> = HashMap::new();
-    // Phase 4 — sids the receiver did not recognize this Export. Returned
+    // sids the receiver did not recognize this Export. Returned
     // to the caller so the gRPC / HTTP handler can stamp them into
     // `ExportMetricsServiceResponse.unknown_series_ids`. Senders evict
     // these sids and re-emit with attributes; backend re-resolves and
@@ -1366,7 +1349,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                     }
 
-                    // Phase 5 — register a `SummarySeriesMetadata` on
+                    // register a `SummarySeriesMetadata` on
                     // first sight of `sid` and append this DP's sketch
                     // state to the per-sid columnar storage. The instance
                     // is keyed by sid, so subsequent DPs on the same sid
@@ -2228,16 +2211,16 @@ struct ModifiedOtlpSketchDp {
     time_unix_nano: u64,
     sketch: Vec<u8>,
     encoding: i32,
-    /// Phase 4 — sender-supplied series_id, 0 when unset / first emit.
+    /// sender-supplied series_id, 0 when unset / first emit.
     /// Backend's resolver mints a fresh sid when this is 0 with attrs
     /// populated; pushes the sid into `unknown_series_ids` when this is
     /// non-zero with empty attrs and the resolver doesn't recognize it.
     series_id: u64,
-    /// Phase 5 — DataPoint-level start of the sketch window. Combined
+    /// DataPoint-level start of the sketch window. Combined
     /// with `time_unix_nano` to form the `(start_ms, end_ms)` window
     /// the SketchStore's columnar storage keys on.
     start_time_unix_nano: u64,
-    /// Phase 5 — sketch-instance configuration lifted off the parent
+    /// sketch-instance configuration lifted off the parent
     /// container. Drives `SummarySeriesMetadata.sketch_config` and the
     /// derived `AccuracyBound`.
     container_config: crate::storage_engines::sketch_db::index::SketchConfig,
@@ -3631,7 +3614,7 @@ mod dispatcher_tests {
     }
 }
 
-/// Phase 4 — sid-resolution gate tests. Construct an OTLP DDSketch
+/// sid-resolution gate tests. Construct an OTLP DDSketch
 /// Export with one DataPoint per scenario, run it through
 /// `route_modified_otlp_sketches_to_precompute`, and assert on the
 /// returned `unknown_series_ids` plus the SeriesIdResolver / SketchStore

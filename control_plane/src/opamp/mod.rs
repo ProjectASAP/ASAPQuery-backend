@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(AgentRole::from_header("BACKEND"), AgentRole::Backend);
     }
 
-    /// Phase C: `Gateway` is a recognised role and round-trips through
+    /// `Gateway` is a recognised role and round-trips through
     /// the OpAMP `X-Agent-Role` header parser. This locks in the wire
     /// vocabulary that the typed L5 stage_split path relies on when it
     /// calls `push_to_role(AgentRole::Gateway, ...)` and expects to
@@ -793,7 +793,7 @@ mod tests {
         assert_ne!(AgentRole::Gateway, AgentRole::Backend);
     }
 
-    /// Phase C: a gateway-role client connecting via WebSocket appears
+    /// a gateway-role client connecting via WebSocket appears
     /// in `connected_agents_with_roles` tagged as `Gateway`. Together
     /// with the from_header test above this proves the role plumbs
     /// through the connect path that `push_to_role` selects on.

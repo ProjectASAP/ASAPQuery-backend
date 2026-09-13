@@ -1,35 +1,10 @@
-//! Sid-level reconcile against a fresh `StreamingConfig` snapshot —
-//! schema retirement #4.
+//! Reconcile sid lifecycle against a streaming configuration snapshot.
 //!
-//! Mirrors the "retire orphans" half of the legacy
-//! [`SchemaRegistry::reconcile`](crate::storage_engines::sketch_db::schema::SchemaRegistry::reconcile)
-//! but reads / writes the sid catalog directly. The "add new ids"
-//! half is implicit in the sid model: sids are minted lazily by the
-//! ingest path on first write (see
-//! `SketchStore::ingest_precompute_for_agg_config` and the modified-OTLP
-//! sketch path), so there is nothing to pre-register up front.
+//! Retire precompute instances whose content signature is absent from the
+//! configuration. New sids are registered lazily by ingestion.
 //!
-//! ## Signature comparison
-//!
-//! Each sid carries a content signature `(metric_name, agg_kind,
-//! group_by_keys)` derived from the agg-config + attrs at ingest time.
-//! Each agg-config in the new `StreamingConfig` likewise canonicalizes
-//! to a signature. A sid is "orphaned" when its signature does not
-//! match any agg-config in the new config — at that point ingest can
-//! no longer route to it, and it must be retired so the eviction
-//! sweep can later drop it.
-//!
-//! Sketch-typed agg-configs are not yet covered: the
-//! `AggregationConfig` shape doesn't carry a `SketchAlgorithm` /
-//! `SketchConfig` natively (control plane pushes them through a parallel
-//! capability-routing channel). For now the reconciler treats every
-//! agg-config as a precompute signature; sketch sids never compare
-//! equal so they're never retired by this path. That matches the
-//! pre-retirement behavior: `SchemaRegistry::reconcile` only retired
-//! agg_ids in its own registry, which mirrored the
-//! `StreamingConfig.materializations_by_policy_fingerprint` map (also precompute-only).
-//! Sketch lifecycle stays driven by the control plane's eviction RPC
-//! until M3 unifies the two.
+//! Sketch sids use different signatures from the precompute configuration and
+//! are excluded from this reconciliation; their lifecycle is managed separately.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;

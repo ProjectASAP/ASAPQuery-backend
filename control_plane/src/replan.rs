@@ -508,23 +508,9 @@ impl Replanner {
                 self.opamp.push(&agent_id, cfg).await;
             }
         }
-        // Option B: post the typed cumulative `StreamingConfig` +
-        // `BackendStorageRouting` JSON to the backend through the
-        // SAME helper `main::handle_plan` uses. The shared
-        // `backend_routing_cache` (when wired via
-        // `with_backend_routing_cache`) is updated under the helper's
-        // lock and the cumulative POST surfaces every `(metric, role)`
-        // pair the controller has planned — so the data plane's
-        // atomic `handle.swap(new_config)` never wipes sibling
-        // aggregations the way the retired
-        // `generate_streaming_config_yaml` single-aggregation YAML
-        // path did.
-        //
-        // The cache is shared with `AppState`; if the Replanner was
-        // built without one (test fixture), we fall back to a
-        // throwaway local cache so the helper still emits — the
-        // cumulative semantics degrade gracefully (the Replanner is
-        // the sole writer in that scenario).
+        // Push cumulative typed configuration through the same helper as HTTP planning.
+        // The shared cache preserves every metric and role under atomic backend swaps.
+        // Tests without a shared cache use a local cache with this replanner as sole writer.
         if stage_split::typed_stage_split_enabled() {
             if let Some(be) = self.build_backend_stage_config(&workload, role) {
                 let fallback_cache = self.backend_routing_cache.clone();

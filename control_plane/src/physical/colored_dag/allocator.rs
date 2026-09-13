@@ -209,11 +209,7 @@ impl ThreeStageWalker {
                 StageId::Backend
             }
 
-            // ── SummaryAgg: always edge per design.md §6 batched-queries
-            // table — true for both approximate sketches (the old
-            // `SketchAgg`) and exact accumulators (the old `ExactAgg`);
-            // `SummaryKind` unifies both into the same node shape, and
-            // both landed on Edge before this migration too.
+            // Summary aggregation runs at the edge for both sketches and exact accumulators.
             SummaryExpr::SummaryAgg { child, .. } => {
                 let (cid, _) = self.visit_l4node(child)?;
                 self.dag.edges.push((id, cid));

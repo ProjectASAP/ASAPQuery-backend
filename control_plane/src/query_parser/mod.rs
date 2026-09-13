@@ -1,29 +1,10 @@
-//! SP-1 query workload extraction — PromQL parser.
+//! PromQL workload extraction through `asap_frontend_promql::lower_promql`.
 //!
-//! L1 adoption (`control_plane/docs/design-target-architecture.md` Part
-//! B): the PromQL parsing + L1→L2→L3 lowering previously done by this
-//! crate's own `promql.rs` (retired) is now `asap_frontend_promql::lower_promql`
-//! directly — no local parser, no local L2 relational tree. This crate's
-//! own `intent_algebra::lower.rs` two heuristics (multi-agg fusion, the
-//! windowed-Count-as-Frequency trigger) do **not** run anymore; per
-//! explicit direction, this adopts whatever `AggIntent` classification
-//! ASAPController's `asap_l2::lower` produces as-is (e.g. a classic
-//! `by (le)` `histogram_quantile(...)` now correctly classifies as the
-//! exact `AggIntent::HistogramQuantile`, not the sketchable `Quantile`
-//! this deployment previously forced; grouped/windowed `count_over_time`
-//! becomes plain exact `Count`, not the `Frequency` extension) rather
-//! than reconciling it back to the old local behavior.
+//! ASAPPlanner owns parsing and intent classification. Both entry points require
+//! an explicit `AccuracyTarget` because lowering can size summaries.
 //!
-//! # Entry points
-//!
-//! | Function | Returns | Use |
-//! |---|---|---|
-//! | [`parse_query_expr_canonical`] | canonical `query_expr::QueryExpr` | Full algebra IR |
-//! | [`parse_query`] | `ParsedQuery` | Backward compat with existing analyzer |
-//!
-//! Both now take an explicit [`AccuracyTarget`] — `lower_promql` requires
-//! one (accuracy-driven parameter sizing happens as early as L1/L2 for
-//! some intents), where the old local pipeline took none.
+//! * [`parse_query_expr_canonical`] returns the canonical query expression.
+//! * [`parse_query`] projects it into `ParsedQuery` for workload analysis.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -446,6 +427,72 @@ pub(super) fn debs_hint(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACC: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
+
+    // Focused unit contracts for the PromQL parse entry point.
+
+    #[test]
+    fn promql_dispatched_correctly() {
+        // `by` belongs to the aggregate operator, not the function call.
+        let pq = parse_query("sum by (host) (quantile_over_time(0.99, latency[5m]))", ACC).unwrap();
+        assert!(pq.aggregations.contains(&AggType::Quantile));
+        assert_eq!(pq.quantiles, vec![0.99]);
+    }
+
+    #[test]
+    fn parse_query_expr_returns_expr() {
+        let pq = parse_query(
+            "topk by (symbol) (10, count_over_time(financial_last_trade_price[5m]))",
+            ACC,
+        )
+        .unwrap();
+        // Should parse without error and extract the metric name.
+        assert_eq!(pq.metric_name, "financial_last_trade_price");
+    }
+
+    // ── canonical-IR entry point ─────────────────────────────────────────────
+
+    #[test]
+    fn canonical_query_quantile_yields_aggregate_over_time_range() {
+        use planner_types::pre_asap::QueryExpr as CQueryExpr;
+        // Range-vector selectors lower to `TimeRange`; `Window` represents streaming
+        // windows. The aggregate sits directly above the range selector.
+        let expr = parse_query_expr_canonical(
+            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
+            ACC,
+        )
+        .unwrap();
+        match expr {
+            CQueryExpr::Aggregate { child, .. } => {
+                assert!(matches!(*child, CQueryExpr::TimeRange { .. }));
+            }
+            other => panic!("expected canonical Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_query_avg_over_time_yields_aggregate_over_time_range() {
+        use planner_types::pre_asap::QueryExpr as CQueryExpr;
+        // A bare `avg_over_time(m[w])` (no `by`) lowers to canonical
+        // `Aggregate { child: TimeRange { child: Scan } }`.
+        let expr =
+            parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])", ACC).unwrap();
+        match expr {
+            CQueryExpr::Aggregate { child, .. } => match (*child).clone() {
+                CQueryExpr::TimeRange { child, .. } => {
+                    assert!(matches!(*child, CQueryExpr::Scan { .. }));
+                }
+                other => panic!("expected canonical TimeRange, got {other:?}"),
+            },
+            other => panic!("expected canonical Aggregate, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod doc_verify_all {
     // Pins the design.md §6 worked examples against the canonical IR
     // `asap_frontend_promql::lower_promql` produces — the only algebra IR
@@ -524,75 +571,6 @@ mod doc_verify_all {
                 }
             }
             other => panic!("expected Aggregate with TopK intent, got {other:?}"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const ACC: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
-
-    // Focused unit contracts for the PromQL parse entry point.
-
-    #[test]
-    fn promql_dispatched_correctly() {
-        // `by` belongs to the aggregate operator, not the function call.
-        let pq = parse_query("sum by (host) (quantile_over_time(0.99, latency[5m]))", ACC).unwrap();
-        assert!(pq.aggregations.contains(&AggType::Quantile));
-        assert_eq!(pq.quantiles, vec![0.99]);
-    }
-
-    #[test]
-    fn parse_query_expr_returns_expr() {
-        let pq = parse_query(
-            "topk by (symbol) (10, count_over_time(financial_last_trade_price[5m]))",
-            ACC,
-        )
-        .unwrap();
-        // Should parse without error and extract the metric name.
-        assert_eq!(pq.metric_name, "financial_last_trade_price");
-    }
-
-    // ── canonical-IR entry point ─────────────────────────────────────────────
-
-    #[test]
-    fn canonical_query_quantile_yields_aggregate_over_time_range() {
-        use planner_types::pre_asap::QueryExpr as CQueryExpr;
-        // `asap_l2::lower` models a range-vector selector (`m[5m]`) as
-        // `TimeRange`, not `Window` -- `Window` is reserved for real
-        // streaming/tumbling windows. `Aggregate` sits directly on top,
-        // no `Window` wrapper (see this module's own doc for why this
-        // differs from the retired local parser's shape).
-        let expr = parse_query_expr_canonical(
-            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
-            ACC,
-        )
-        .unwrap();
-        match expr {
-            CQueryExpr::Aggregate { child, .. } => {
-                assert!(matches!(*child, CQueryExpr::TimeRange { .. }));
-            }
-            other => panic!("expected canonical Aggregate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn canonical_query_avg_over_time_yields_aggregate_over_time_range() {
-        use planner_types::pre_asap::QueryExpr as CQueryExpr;
-        // A bare `avg_over_time(m[w])` (no `by`) lowers to canonical
-        // `Aggregate { child: TimeRange { child: Scan } }`.
-        let expr =
-            parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])", ACC).unwrap();
-        match expr {
-            CQueryExpr::Aggregate { child, .. } => match (*child).clone() {
-                CQueryExpr::TimeRange { child, .. } => {
-                    assert!(matches!(*child, CQueryExpr::Scan { .. }));
-                }
-                other => panic!("expected canonical TimeRange, got {other:?}"),
-            },
-            other => panic!("expected canonical Aggregate, got {other:?}"),
         }
     }
 }

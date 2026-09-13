@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
-use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
+use crate::drivers::query::adapters::{AdapterConfig, HttpProtocolAdapter, PrometheusHttpAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
 use crate::query_engines::routing::{
     AccuracyTarget, EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
@@ -145,7 +145,7 @@ pub struct HttpServer {
     /// `KeyByLabelNames` Prometheus needs to populate the `metric`
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
     query_router: Arc<EngineRouter>,
-    /// M2.3.6g — SketchStore replaces `Arc<dyn Store>`.
+    /// Sketch storage for runtime diagnostics.
     summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
@@ -161,19 +161,16 @@ pub struct HttpServer {
     /// [`Self::with_backend_storage_routing`]; production deploys
     /// bootstrap from `deploy/configs/backend-storage-routing.yaml`
     /// (legacy form) or the control plane's first
-    /// `POST /api/v1/storage_routing` push (Phase α).
+    /// `POST /api/v1/storage_routing` push.
     ///
-    /// Phase α: this field is now a `HotReloadBackendStorageRouting`
+    /// `HotReloadBackendStorageRouting` is an atomic routing snapshot
     /// — an `ArcSwap`-backed wrapper that supports atomic at-runtime
     /// swap from the `POST /api/v1/storage_routing` endpoint. The
     /// existing read path snapshots the wrapper once per request
     /// (`handle.snapshot().lookup_with_shape(...)`); swap is observed
     /// by the next request without restart.
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
-    /// Backfill registry (sketch DB §10). `None` until Phase 5e
-    /// wires a worker pool; in the interim, jobs created via the
-    /// HTTP endpoints stay `Queued` and are visible via the list
-    /// endpoint — useful shadow-mode testing before workers exist.
+    /// Backfill registry shared with the worker and HTTP job endpoints.
     backfill: Option<Arc<crate::storage_engines::sketch_db::BackfillRegistry>>,
     /// SketchStore data-retention horizon in millis, mirroring
     /// `--persistence-delete-older-than-secs` at the CLI. Used by the
@@ -205,9 +202,7 @@ struct AppState {
     query_engine: Arc<ASAPQueryEngine>,
     /// See [`HttpServer::query_router`].
     query_router: Arc<EngineRouter>,
-    /// Phase 5 M2.3.6g — SketchStore replaces `Arc<dyn Store>` as the
-    /// only data backend HTTP-side endpoints consult. Today the only
-    /// consumer is the runtime-info handler.
+    /// Attach sketch storage for HTTP runtime diagnostics.
     summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
@@ -333,7 +328,7 @@ impl HttpServer {
 
     /// Attach a per-metric storage-backend routing table. The table is
     /// wrapped in a hot-reload handle internally so the
-    /// `POST /api/v1/storage_routing` endpoint (Phase α) can swap it
+    /// `POST /api/v1/storage_routing` endpoint can swap it
     /// atomically without restart.
     ///
     /// Bootstrap typically comes from
@@ -357,7 +352,7 @@ impl HttpServer {
         self
     }
 
-    /// Phase α (MVP): attach a pre-built hot-reload routing handle.
+    /// Attach a pre-built hot-reload routing handle.
     /// Used by callers that want to share the same handle with other
     /// subsystems (e.g. the query-router for diagnostics) — the
     /// `with_backend_storage_routing` builder is the simpler entry
@@ -372,10 +367,8 @@ impl HttpServer {
     }
 
     /// Attach a `BackfillRegistry` so the `/api/v1/db/backfill`
-    /// HTTP endpoints (Phase 5d) can create and inspect jobs. Jobs
-    /// stay `Queued` until Phase 5e's worker pool is wired; the
-    /// endpoints are still useful for shadow-mode validation of the
-    /// control plane's REFRESH dispatch logic.
+    /// HTTP endpoints can create and inspect jobs. Jobs
+    /// remain `Queued` unless a backfill worker is enabled.
     pub fn with_backfill_registry(
         mut self,
         registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
@@ -412,11 +405,11 @@ impl HttpServer {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         srv_metrics::register_all();
 
-        // Create adapter using factory
-        let adapter = self
-            .adapter_override
-            .clone()
-            .unwrap_or_else(|| create_http_adapter(self.config.adapter_config.clone()));
+        let adapter = self.adapter_override.clone().unwrap_or_else(|| {
+            Arc::new(PrometheusHttpAdapter::new(
+                self.config.adapter_config.clone(),
+            ))
+        });
 
         let query_endpoint = adapter.get_query_endpoint();
         let runtime_info_path = adapter.get_runtime_info_path();
@@ -482,7 +475,7 @@ impl HttpServer {
                 get(handle_physical_plan_status),
             )
             .route("/api/v1/summary-inventory", get(handle_summary_inventory))
-            // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
+            // control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
             .route(
@@ -546,11 +539,11 @@ impl HttpServer {
     /// make the testing intent explicit; production callers should use
     /// the regular `start()` method.
     pub async fn start_test_server(&self) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
-        // Create adapter using factory
-        let adapter = self
-            .adapter_override
-            .clone()
-            .unwrap_or_else(|| create_http_adapter(self.config.adapter_config.clone()));
+        let adapter = self.adapter_override.clone().unwrap_or_else(|| {
+            Arc::new(PrometheusHttpAdapter::new(
+                self.config.adapter_config.clone(),
+            ))
+        });
 
         let query_endpoint = adapter.get_query_endpoint();
         let runtime_info_path = adapter.get_runtime_info_path();
@@ -608,7 +601,7 @@ impl HttpServer {
                 get(handle_physical_plan_status),
             )
             .route("/api/v1/summary-inventory", get(handle_summary_inventory))
-            // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
+            // control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
             .route(
@@ -713,12 +706,6 @@ async fn process_query_request(
             };
         }
     }
-
-    // (Phase γ: legacy in-backend query tracker removed — the
-    // ASAPCollector controller now observes queries via its own
-    // PromQL scrape side-channel and pushes plans / routing tables
-    // back to the backend. See README "post-consolidation backend
-    // scope" prose.)
 
     // Phase-6 Fix 1: per-query engine override.
     //
@@ -883,7 +870,7 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
     }
 
     if let Some(routing_handle) = state.backend_storage_routing.as_ref() {
-        // Phase α: snapshot the hot-reload handle once per request,
+        // snapshot the hot-reload handle once per request,
         // scoped to this request's tenant. The snapshot resolves to
         // the named tenant's table when present, else the
         // `default` tenant's table. Concurrent per-tenant swaps from
@@ -1272,19 +1259,9 @@ fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
     Some((metric, range_ms))
 }
 
-/// Direct `ASAPQueryEngine::execute(&str)` dispatch — B7.5 retired
-/// the legacy `handle_query` path; this handler is now a thin
-/// wrapper around the modern `QueryEngine::execute(&str)` trait
-/// surface, which classifies via the analyzer + ASAP-tier reducer
-/// and fires capability-miss notifies natively. Adds a
-/// `data_source: asap_query` info-line at the JSON layer so Phase-6
-/// callers can byte-compare regardless of the dispatch path.
-///
-/// Trait dispatch loses `KeyByLabelNames` (the trait returns just
-/// `QueryResult`); we surface an empty `KeyByLabelNames`, identical
-/// to how `process_via_router` handles the same trait surface — the
-/// Prometheus adapter renders an empty `metric: {}` object, a valid
-/// shape that PromQL clients accept.
+/// Execute through the query-engine trait and add `data_source: asap_query`
+/// to the HTTP response. Trait results use the same label adaptation as
+/// router dispatch.
 async fn process_via_simple_engine(
     state: &AppState,
     parsed_request: &ParsedQueryRequest,
@@ -2263,9 +2240,6 @@ async fn process_range_query_request(
             Err(status) => status.into_response(),
         };
     }
-
-    // (Phase γ: legacy in-backend query tracker removed — see
-    // companion comment in `handle_instant_query`.)
 
     // Execute range query with engine
     let query_start_time = Instant::now();
@@ -3650,19 +3624,11 @@ aggregations:
         assert_eq!(body["segments"].as_array().unwrap().len(), 0);
     }
 
-    // ─── Phase 5d: backfill HTTP endpoint tests ─────────────────────────────
+    // ─── backfill HTTP endpoint tests ─────────────────────────────
 
-    /// Build a test server wired with a backfill registry and a sid
-    /// catalog that pre-registers the listed sids as Active.
-    /// `POST /api/v1/db/backfill` runs `create_checked`, which after
-    /// the schema retirement final cut is expected to accept the sid
-    /// catalog (sibling slice migrates `create_checked`'s signature).
-    ///
-    /// PR 5: `active_agg_ids` is now a list of test markers used to
-    /// build per-metric configs (`metric_{marker}`). The streaming
-    /// config is keyed on each config's policy fingerprint; the
-    /// returned vector lets callers translate marker→fingerprint so
-    /// HTTP POSTs target the right agg_id on the wire.
+    /// Build a server with a backfill registry and active sid fixtures. Test
+    /// markers generate per-metric configs; the returned fingerprints let callers
+    /// target those configs through HTTP.
     async fn setup_test_server_with_backfill_and_sids(
         registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
         active_agg_ids: &[u64],
@@ -4005,15 +3971,8 @@ aggregations:
         assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     }
 
-    // ── Phase-6 follow-up: EngineRouter wired into the HTTP query path ──────
-    //
-    // These tests cover the deliverable in the
-    // `feat/http-server-wire-engine-router` PR — every query that
-    // arrives through `/api/v1/query` now consults the
-    // `StreamingConfig::storage_backend()` axis and dispatches via the
-    // `EngineRouter` for non-ASAP-tier metrics. The wire response
-    // carries a `data_source: <id>` info-line so dashboards / e2e
-    // tests can byte-compare which engine answered.
+    // HTTP routing tests verify configured engine dispatch and the response
+    // `data_source` annotation.
 
     use crate::query_engines::routing::{EngineCapabilities, QueryEngine};
     use crate::query_engines::{EngineError, QueryResult};
@@ -4389,22 +4348,8 @@ aggregations:
 
     #[tokio::test]
     async fn http_returns_503_when_no_engines_registered() {
-        // Pin `storage_backend = PrometheusRemote` but register no
-        // Prometheus forwarder (only `ASAPQueryEngine` is registered
-        // under `asap_query`). The router walks
-        // `compatible_storage_backends = [PrometheusRemote]` and bails
-        // out with `NoEngineRegistered`, which the HTTP layer surfaces
-        // as 503.
-        //
-        // ASAP-first refactor note: this test used to pin
-        // `GorillaObjectStore` and rely on the old archive-only
-        // `[GorillaObjectStore]` sequence. Under the ASAP-first policy
-        // a `GorillaObjectStore` metric now resolves to
-        // `[SketchStore, GorillaObjectStore]` — the registered
-        // ASAP engine is tried first and CapabilityMisses, yielding a
-        // 404 (`AllFailed`) rather than a 503. `PrometheusRemote` keeps
-        // its single-backend slot, so it remains the canonical "engine
-        // missing → 503" path.
+        // PrometheusRemote has one eligible backend. Without its engine registered,
+        // the router must return `NoEngineRegistered`, surfaced as HTTP 503.
         let server_port =
             setup_test_server_with_empty_router(StorageBackend::PrometheusRemote).await;
         let client = Client::new();
@@ -5069,7 +5014,7 @@ aggregations:
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
-    // ── Phase α: BackendStorageRouting hot-reload HTTP integration ────
+    // ── BackendStorageRouting hot-reload HTTP integration ────
 
     /// Standard test wiring for the `/api/v1/storage_routing` endpoint:
     /// install an empty hot-reload routing handle, hold the handle so
@@ -5983,8 +5928,7 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    // M2.3.6g — earliest timestamps come from SketchStore's per-sid
-    // `first_seen_unix_ms` metadata. Always succeeds (no I/O).
+    // Per-sid first-seen timestamps are available without I/O.
     let timestamps = state.summary_store.earliest_timestamps_per_series_id();
     let body = serde_json::json!({
         "status": "success",
@@ -5994,20 +5938,9 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-// ─── StreamingConfig hot-reload (PR E) ───────────────────────────────────
-//
-// `GET /api/v1/streaming-config`  — return the currently active config
-//                                   as JSON (debug / verification).
-// `POST /api/v1/streaming-config` — accept a YAML body, parse, and
-//                                   atomically swap via ArcSwap.
-//
-// Phase 1 scope: the swap only takes effect for new readers that
-// snapshot after the swap. `ASAPQueryEngine`, the ingest router, and
-// in-flight precompute workers all hold startup snapshots today and
-// ignore the swap until they are rebuilt — see the module doc on
-// `StreamingConfigHandle` for the full contract. Tests POST a new
-// config and verify it via the GET endpoint; control plane integration
-// and per-query re-snapshot are phase 2.
+// Streaming configuration endpoints: GET returns the active snapshot; POST
+// parses a replacement and atomically publishes it to new snapshot readers.
+// In-flight operations retain their existing snapshot.
 
 async fn handle_get_streaming_config(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;
@@ -6517,7 +6450,7 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-// ── Phase α: BackendStorageRouting hot-reload endpoints ────────────
+// ── BackendStorageRouting hot-reload endpoints ────────────
 
 /// `GET /api/v1/storage_routing` — return a JSON snapshot of the
 /// currently-active per-metric `BackendStorageRouting` table.
@@ -6651,16 +6584,8 @@ async fn handle_post_storage_routing(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-/// §15.2 of the sketch DB design: expose the sid catalog over HTTP so
-/// operators and the control plane can inspect aggregation lifecycle
-/// state without attaching a debugger. Filter by `?status=` —
-/// `active` / `retired` / `expired` / `all` (default `all`).
-///
-/// Route is kept at the historical `/api/v1/db/schemas` path so
-/// external callers don't break; the response now surfaces the
-/// sid-level [`SummarySeriesMetadata`] entries (with field `sid`
-/// instead of `agg_id`) since the per-agg_id `SchemaRegistry` has
-/// been retired.
+/// Expose sid metadata at `/api/v1/db/schemas` for API compatibility.
+/// Filter with `status=active|retired|expired|all` (default `all`).
 async fn handle_get_schemas(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -6713,11 +6638,7 @@ fn status_str(s: crate::storage_engines::sketch_db::AggStatus) -> &'static str {
     }
 }
 
-/// JSON encoding of a single sid registry entry, replacing the legacy
-/// `schema_to_json(&AggSchema)`. The field set mirrors the schema
-/// shape where it makes sense — `status`, `retired_at_ms`,
-/// `expires_at_ms`, `metric_name` — and adds the sid-native fields
-/// (`sid`, `group_by_keys`, `agg_kind`, `first_seen_unix_ms`).
+/// Encode sid metadata, including identity, lifecycle timestamps, and status.
 fn sid_instance_to_json(
     m: &crate::storage_engines::sketch_db::index::SummarySeriesMetadata,
     descriptors: Option<&(
@@ -6977,18 +6898,9 @@ async fn handle_post_backfill_job(
         return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
     }
 
-    // Schema retirement final cut: the legacy `SchemaRegistry` is
-    // gone. `create_checked` now takes the `AggregationConfig`
-    // directly + an explicit `created_at_ms`. We look up the
-    // config from the streaming-config snapshot; if it's missing
-    // we surface the same 404 `UnknownAgg` the registry used to
-    // produce. `created_at_ms` is the earliest `first_seen_unix_ms`
-    // across the sid catalog for this agg-config's signature —
-    // the post-retirement analogue of `AggSchema.created_at_ms`
-    // (which tracked wall-clock when the agg first appeared in a
-    // streaming-config swap). If no sid has ingested for this
-    // config yet, fall back to wall-clock now so the time-disjoint
-    // invariant degrades to "live ingest hasn't started".
+    // Resolve the aggregation from the current streaming-config snapshot, or
+    // return 404 `UnknownAgg`. Its earliest matching sid timestamp bounds the
+    // backfill range; with no ingested sid, use the current time.
     let Some(handle) = state.hot_reload_config.as_ref() else {
         let body = serde_json::json!({
             "status": "error",

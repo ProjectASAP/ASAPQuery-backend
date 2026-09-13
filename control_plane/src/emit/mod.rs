@@ -1,19 +1,5 @@
-//! `emit/` — per-deployment-model plan emitters (L5 output side).
-//!
-//! Per `control_plane/docs/design.md` §5 `core::emit`. The 2026-05
-//! layered-cleanup refactor consolidated the former
-//! `controller/src/config/` directory here. Mapping:
-//!
-//! | Old path | New path |
-//! |---|---|
-//! | `config/agent.rs` | [`agent`] |
-//! | `config/backend.rs` | *retired — emitted YAML for a "backend-role" OTel merge collector tier that was never deployed; superseded by the typed L5's [`stage_config::emit_backend_streaming_config_json`] which posts to asapquery-backend's precompute engine over HTTP* |
-//! | `config/asapquery_backend.rs` | *retired — `generate_streaming_config_yaml` was the legacy single-aggregation `CollectionPlan`-shaped emitter for `POST /api/v1/streaming-config`; under the data plane's atomic `handle.swap(new_config)` it would WIPE sibling `(metric, role)` aggregations on every fire. Replaced by [`backend_push::post_typed_backend_for_role`], which posts a cumulative typed `BackendStageConfig` derived from the shared per-`(metric, role)` cache* |
-//! | *(new)* | [`backend_push`] |
-//! | `config/stage_config.rs` | [`stage_config`] (TODO: split into `opamp` + `streaming_config` + `inference_config` per design.md §5; deferred from refactor 2026-05 because the 3,020-line monolith mixes OTel-collector YAML emit, ASAPQuery-backend JSON emit, and shared internals — clean split needs ownership reorganisation, not file renames) |
-//! | `config/stage_config_otap.rs` | [`otap`] |
-//! | `config/stage_config_telegraf.rs` | [`telegraf`] |
-//! | `config/workloads.rs` | [`crate::workload`] (top-level — design.md §5 puts `workload` next to `emit`, not inside it) |
+//! Per-deployment plan emitters. Typed stage configs become collector
+//! configuration, backend streaming configuration, and storage routing.
 
 pub mod agent;
 pub mod backend_push;
@@ -50,25 +36,9 @@ use anyhow::Result;
 use planner_types::post_asap::{SketchAlgorithm, SummaryExpr, SummaryNode};
 use std::rc::Rc;
 
-/// Phase ε.1.5 — which edge runtime an agent identifies as.
-///
-/// Today every agent the controller has built for runs the OTel-collector
-/// (`AsapOtel`); Phase ε.1.5 adds the two new runtime variants the
-/// per-runtime emitters target. The runtime is reported by the agent on
-/// OpAMP `on_connect` (header `X-Agent-Runtime`); when absent (legacy
-/// agents) the controller defaults to `AsapOtel` so the existing
-/// behaviour is preserved.
-///
-/// Phase ε.1.5 commits the enum + emit-dispatch function. Threading the
-/// runtime through OpAMP `on_connect` and into the typed L5 emit path
-/// is a follow-up — the emitters can be exercised in isolation today
-/// (the Phase ε.1.5 test suite does exactly that).
-///
-/// Naming history: the variants were originally `Sketchcollector` /
-/// `Sketchotap` / `Sketchtelegraf`; the rename to `AsapOtel` /
-/// `AsapOtap` / `AsapTelegraf` (PR `refactor/rename-edge-runtimes-...`)
-/// drops the v0 `sketch*` prefix in favour of the symmetric `asap-*`
-/// namespace. `from_header` accepts both forms during transition.
+/// Edge runtime reported through the OpAMP `X-Agent-Runtime` header.
+/// Missing headers default to `AsapOtel`. `from_header` accepts both
+/// `asap-*` and `sketch*` names for compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[derive(Default)]
@@ -97,7 +67,7 @@ impl AgentRuntime {
     }
 }
 
-/// Phase ε.1.5 — dispatch the edge emit by agent runtime. Mirrors
+/// dispatch the edge emit by agent runtime. Mirrors
 /// `emit_edge_yaml`'s `(cfg, opamp_endpoint) -> String` shape; the OTAP
 /// and Telegraf emitters take an additional optional Prometheus URL
 /// override which we pass through `prometheus_url`.
@@ -300,11 +270,7 @@ fn extract_from_plan(plan: &PostAsapPlan) -> Option<SketchAlgorithm> {
 
 fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchAlgorithm> {
     match &node.expr {
-        // `SummaryAgg`'s `kind`/`params` collapsed into one `family:
-        // SummaryFamilyType` field (ASAPPlanner#218 -- see
-        // control_plane/docs/design-asapplanner-pin-migration.md); the
-        // exact-vs-sketch check this used to need `is_exact_accumulator`
-        // for is now which enum variant `family` is.
+        // The `family` variant distinguishes exact accumulators from sketches.
         SummaryExpr::SummaryAgg {
             family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
             ..

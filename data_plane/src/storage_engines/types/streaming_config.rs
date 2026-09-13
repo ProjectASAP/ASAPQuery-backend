@@ -131,11 +131,8 @@ impl StreamingConfig {
 
         if let Some(aggregations) = data.get("aggregations").and_then(|v| v.as_sequence()) {
             for aggregation_data in aggregations {
-                // Read per-agg retention directly from the YAML entry
-                // (previously was looked up via inference_config's
-                // query→agg map). `aggregationId` is no longer
-                // required — `AggregationConfig::from_yaml_data`
-                // derives it from content when absent (M2 follow-up).
+                // Retention comes from each aggregation entry; identity is derived from
+                // its configuration content.
                 let num_aggregates_to_retain = aggregation_data
                     .get("numAggregatesToRetain")
                     .and_then(|v| v.as_u64());

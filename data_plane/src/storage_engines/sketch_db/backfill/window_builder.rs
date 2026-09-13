@@ -1,51 +1,8 @@
-//! Sketch construction for the backfill path.
+//! Build a backfill window accumulator from source samples in ingestion order.
 //!
-//! Implements the "real rebuild" piece of §10 (refreshable view
-//! maintenance) from the sketch DB design
-//! ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
-//! Given an `AggregationConfig` and a batch of raw samples for one
-//! `(agg_id, window)` pair, produces the `Box<dyn AggregateCore>`
-//! that would have been produced had those samples flowed through
-//! live ingest in the same order.
-//!
-//! ## Shared primitive vs duplicated code
-//!
-//! The user's direction for Phase 5e was: "backfill functions should
-//! all be separate, not reusing the live path." The interpretation
-//! here splits two things that could each be called "the live path":
-//!
-//! 1. **The worker pipeline**: `PrecomputeEngine` → `SeriesRouter`
-//!    → `Worker` → `active_panes` → `WindowManager` →
-//!    `output_sink.emit_batch`. This is stateful infrastructure
-//!    that owns live latency budgets. **NOT reused** — the backfill
-//!    service runs a completely separate tokio task, uses its own
-//!    writer, and never touches an `active_pane`.
-//!
-//! 2. **The `create_accumulator_updater` factory**: a pure function
-//!    `AggregationConfig -> Box<dyn AccumulatorUpdater>`. Takes no
-//!    shared state, has no latency budget, is a 60-line match
-//!    statement. **IS reused** by this module.
-//!
-//! The reuse is deliberate: duplicating the factory would mean every
-//! new sketch type needs matching entries in two places, and the
-//! ε-precision end-to-end determinism test would catch drift only
-//! post-merge. Centralising on one factory makes "live ≡ backfill"
-//! a build-time invariant rather than a runtime one.
-//!
-//! If this interpretation is wrong — if the requirement is strict
-//! duplication accepting the drift risk — swap
-//! `create_accumulator_updater` below for a copy-pasted match
-//! statement. Everything else in the backfill module tree is
-//! already its own code path.
-//!
-//! ## Phase 5e scope (this file)
-//!
-//! * `build_backfilled_accumulator(config, samples) -> Box<dyn
-//!   AggregateCore>` — the pure function that rebuilds one
-//!   window's accumulator from its samples.
-//! * Handles both SingleSubpopulation (update_single) and
-//!   MultipleSubpopulation (update_keyed) dispatch — mirrors
-//!   `worker::apply_sample`.
+//! Backfill has its own worker pipeline and does not touch live active panes.
+//! It shares the pure accumulator factory and update primitives with live ingest
+//! so both paths use the same sketch semantics.
 
 use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater,

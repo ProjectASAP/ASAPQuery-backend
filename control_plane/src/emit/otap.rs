@@ -1,4 +1,4 @@
-//! Phase ε.1.5 — OTAP Dataflow DAG YAML emitter (per-runtime mirror of
+//! OTAP Dataflow DAG YAML emitter (per-runtime mirror of
 //! [`super::stage_config::emit_edge_yaml`]).
 //!
 //! `asap-otap` uses the otap-dataflow Rust runtime; its config surface is
@@ -9,10 +9,7 @@
 //! and registers under the URN `urn:otel:exporter:otlp_http` via
 //! `linkme`'s `distributed_slice(OTAP_EXPORTER_FACTORIES)`.
 //!
-//! Three modes (the placement decision itself is made upstream in
-//! `stage_split`; the `BindMode`-shaped selector Phase ε.1 sketched out
-//! in `physical::deployment_cost::wire` was never wired in and was removed in the
-//! 2026-07 retirement pass — see that module's doc):
+//! Placement modes selected by the upstream stage splitter:
 //!
 //! 1. `SketchAtEdge` — DAG includes a sketch processor node between the
 //!    OTLP receiver and the OTLP gRPC exporter to the gateway. (The
@@ -26,7 +23,7 @@
 //!    (`/api/v1/otlp/v1/metrics`).
 //!
 //! The function consumes the same [`EdgeStageConfig`] the OTel-collector
-//! emitter does — Phase ε.1.5 keeps the typed L5 plan as the single
+//! emitter does, keeping the typed plan as the single
 //! source of truth across all three runtimes. The emitter dispatches per
 //! `EdgeStageConfig` via the same `prometheus_archive_metrics` /
 //! `sketch_processors` signals the OTel-collector emitter uses (Mode 3
@@ -60,19 +57,11 @@ const URN_OTLP_GRPC_EXPORTER: &str = "exporter:otlp_grpc";
 /// URN of the OTLP receiver (gRPC + HTTP).
 const URN_OTLP_RECEIVER: &str = "receiver:otlp";
 
-/// URN of the asap_sketches processor registered in the otap-patch tree.
-/// Phase ε.1.5 wires the URN abstractly; the binary side lands the
-/// plugin in `otap-patch/plugins/asap_sketches/` per
-/// [`docs/design-asap-otap-rust-integration.md`].
+/// URN of the sketch processor registered by the OTAP plugin.
 const URN_ASAP_SKETCHES_PROCESSOR: &str = "processor:asap_sketches";
 
-// ── DAG YAML structural types ────────────────────────────────────────────────
-//
-// These mirror the otap-dataflow `engine`/`groups`/`pipelines`/`nodes`
-// schema in `otel-arrow/rust/otap-dataflow/configs/*.yaml`. We keep a
-// minimal set to round-trip; the full schema (channel_capacity policies,
-// engine settings, etc.) is left at struct defaults — Phase ε.1.5 only
-// commits the wiring shape, not policy.
+// Structural subset of the OTAP DAG configuration. Omitted engine and channel
+// policy fields retain their runtime defaults.
 
 #[derive(Serialize)]
 struct OtapDag {
