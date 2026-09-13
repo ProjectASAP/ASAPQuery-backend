@@ -1097,21 +1097,31 @@ mod tests {
         // shape at all.
         //
         // With `Reduction` (ASAPController#165) that ambiguity is gone:
-        // `count(...)` is a genuine aggregation operator, so it lowers to
+        // the outer aggregator is a genuine reduction, so it lowers to
         // `Reduce([])` and `resolve_group_key` gives every candidate the
         // SAME group key -- the two sids MERGE into one answer, which is
         // what the query actually asked for. No gate, no fallback.
+        //
+        // The distinct-count idiom is `count(distinct_over_time(v[w]))`;
+        // bare `count(v)` is a row count upstream and an HLL sid rightly
+        // cannot serve it.
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let outcome =
-            execute_post_asap_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy())
-                .expect("should execute");
+        let outcome = execute_post_asap_readout(
+            &idx,
+            "count(distinct_over_time(unique_users[1m]))",
+            1_000,
+            2_000,
+            true,
+            accuracy(),
+        )
+        .expect("should execute");
         assert_eq!(
             outcome.series.len(),
             1,
-            "a by-less count() is a full reduction -- both HLL sids must merge into ONE \
-             series, not stay split (and not be declined), got {:?}",
+            "a by-less distinct count is a full reduction -- both HLL sids must merge into \
+             ONE series, not stay split (and not be declined), got {:?}",
             outcome.series
         );
         // Disjoint item sets {a,b,c} + {d,e,f} -> merged cardinality ~6.

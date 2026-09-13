@@ -886,7 +886,8 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
         SummaryFamilyType::ExactAggregate(ExactKind::Count, _) => Some(ExactReadout::Count),
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
-        SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _) => Some(ExactReadout::Max),
+        SummaryFamilyType::ExactAggregate(ExactKind::Min, _) => Some(ExactReadout::Min),
+        SummaryFamilyType::ExactAggregate(ExactKind::Max, _) => Some(ExactReadout::Max),
         _ => None,
     }
 }

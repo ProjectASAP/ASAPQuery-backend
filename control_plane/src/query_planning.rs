@@ -215,7 +215,8 @@ fn planned_capability(
                 | planner_types::post_asap::ExactKind::IRate => {
                     asap_types::AggregationType::Increase
                 }
-                planner_types::post_asap::ExactKind::MinMax => asap_types::AggregationType::MinMax,
+                planner_types::post_asap::ExactKind::Min => asap_types::AggregationType::Min,
+                planner_types::post_asap::ExactKind::Max => asap_types::AggregationType::Max,
             };
             Capability::ExactAgg(agg)
         }

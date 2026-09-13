@@ -588,7 +588,7 @@ impl Replanner {
     /// `count(metric)`) AND the role classifies as
     /// Sum/Count/Other/Topk, synthesize a single ExactAgg-shaped
     /// `BackendStageConfig` carrying an `agg_type_override` of
-    /// `"Sum"` / `"Increase"` / `"MinMax"` so the cumulative
+    /// `"Sum"` / `"Increase"` / `"Min"` / `"Max"` so the cumulative
     /// streaming-config still surfaces the metric to the backend.
     /// Without this fallback the typed cumulative POST would omit
     /// every Sum-shaped metric and `sum by (zone) (…)` queries would
@@ -653,7 +653,8 @@ impl Replanner {
         let exact_kind = match agg_type_override? {
             "Sum" => planner_types::post_asap::ExactKind::Sum,
             "Count" => planner_types::post_asap::ExactKind::Count,
-            "MinMax" => planner_types::post_asap::ExactKind::MinMax,
+            "Min" => planner_types::post_asap::ExactKind::Min,
+            "Max" => planner_types::post_asap::ExactKind::Max,
             "Increase" | "Rate" => planner_types::post_asap::ExactKind::Increase,
             _ => return None,
         };
@@ -662,9 +663,8 @@ impl Replanner {
             planner_types::post_asap::ExactKind::Count => {
                 planner_types::post_asap::ExactParams::Count
             }
-            planner_types::post_asap::ExactKind::MinMax => {
-                planner_types::post_asap::ExactParams::MinMax
-            }
+            planner_types::post_asap::ExactKind::Min => planner_types::post_asap::ExactParams::Min,
+            planner_types::post_asap::ExactKind::Max => planner_types::post_asap::ExactParams::Max,
             planner_types::post_asap::ExactKind::Increase => {
                 planner_types::post_asap::ExactParams::Increase
             }

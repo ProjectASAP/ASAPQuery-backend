@@ -1451,7 +1451,8 @@ mod sketch_query_tests {
 mod aux_pushdown_tests {
     use super::*;
     use crate::precompute_engine::operators::{
-        min_max_accumulator::MinMaxAccumulator, sum_accumulator::SumAccumulator,
+        max_accumulator::MaxAccumulator, min_accumulator::MinAccumulator,
+        sum_accumulator::SumAccumulator,
     };
     use crate::storage_engines::types::AggregationType;
     use asap_types::Statistic;
@@ -1610,8 +1611,8 @@ mod aux_pushdown_tests {
     #[test]
     fn real_min_max_accumulator_uses_aux_fast_path() {
         let engine = make_engine();
-        let min_acc = MinMaxAccumulator::with_value(3.0, "min".to_string());
-        let max_acc = MinMaxAccumulator::with_value(99.0, "max".to_string());
+        let min_acc = MinAccumulator::with_value(3.0);
+        let max_acc = MaxAccumulator::with_value(99.0);
         assert_eq!(
             engine
                 .query_precompute_for_statistic(&min_acc, &Statistic::Min, &None, &HashMap::new())
@@ -2039,8 +2040,8 @@ mod asap_tier_classify_tests {
 
     /// REGRESSION of the HLL `count(metric)` "No result" e2e failure
     /// (`controller_plan_to_query_full_roundtrip_hll`) isolated to the
-    /// engine layer. `count(unique_users_per_min)` is the distinct-count
-    /// idiom. The Planner DAG represents this as a cardinality readout,
+    /// engine layer. `count(distinct_over_time(unique_users_per_min[w]))`
+    /// is the distinct-count idiom (bare `count(v)` is a row count). The Planner DAG represents this as a cardinality readout,
     /// so the executor returns the HLL distinct-count directly. A single
     /// FULL HLL frame (~500 users) is used so
     /// the instant projection reads the real estimate.
@@ -2065,14 +2066,17 @@ mod asap_tier_classify_tests {
         );
 
         let engine = build_engine_with_index(idx);
-        let result = engine.execute("count(unique_users_per_min)").await.expect(
-            "count(hll_metric) must dispatch to the Cardinality family \
-                 via the candidate capability (empty trace function) and \
-                 return the HLL distinct-count, NOT capability-miss",
-        );
+        let result = engine
+            .execute("count(distinct_over_time(unique_users_per_min[1m]))")
+            .await
+            .expect(
+                "the distinct-count idiom must dispatch to the Cardinality \
+                 family via the candidate capability (empty trace function) \
+                 and return the HLL distinct-count, NOT capability-miss",
+            );
         assert!(
             result_nonempty(&result),
-            "count(unique_users_per_min) over an HLL sid must return a \
+            "the distinct-count idiom over an HLL sid must return a \
              non-empty cardinality estimate (regression: empty `asap_query` \
              No-result)"
         );
@@ -2165,9 +2169,9 @@ mod asap_tier_classify_tests {
 
         let engine = build_engine_with_index(idx);
         let result = engine
-            .execute("count(unique_users_global)")
+            .execute("count(distinct_over_time(unique_users_global[1m]))")
             .await
-            .expect("global count(hll_metric) must answer, not capability-miss");
+            .expect("global distinct count over HLL sids must answer, not capability-miss");
 
         // GLOBAL distinct is a single scalar — exactly one element.
         let est = match &result {
@@ -2175,7 +2179,7 @@ mod asap_tier_classify_tests {
                 assert_eq!(
                     v.values.len(),
                     1,
-                    "global count() must collapse to ONE merged estimate, got {} \
+                    "a global distinct count must collapse to ONE merged estimate, got {} \
                      (per-series leak): {v:?}",
                     v.values.len()
                 );

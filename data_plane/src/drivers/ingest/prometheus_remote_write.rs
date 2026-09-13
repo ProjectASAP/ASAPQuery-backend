@@ -710,8 +710,10 @@ fn route_messages(
                         config.aggregation_type,
                         asap_types::AggregationType::Increase
                             | asap_types::AggregationType::MultipleIncrease
-                            | asap_types::AggregationType::MinMax
-                            | asap_types::AggregationType::MultipleMinMax
+                            | asap_types::AggregationType::Min
+                            | asap_types::AggregationType::Max
+                            | asap_types::AggregationType::MultipleMin
+                            | asap_types::AggregationType::MultipleMax
                     ));
             let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
                 Vec::new()

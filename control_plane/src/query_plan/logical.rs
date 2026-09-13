@@ -903,7 +903,7 @@ pub(crate) fn selected_range_max_materialization(
     if !matches!(
         &node.expr,
         SummaryExpr::SummaryAgg {
-            family: SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _),
+            family: SummaryFamilyType::ExactAggregate(ExactKind::Max, _),
             reduction: planner_types::pre_asap::Reduction::PerEntity,
             ..
         }

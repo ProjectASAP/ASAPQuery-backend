@@ -62,7 +62,7 @@ pub enum Capability {
     /// wire format can answer this. `Any` required matches either
     /// `CmsWithHeap` or `CountSketchWithHeap`.
     FrequencyTopk(Option<SketchAlgorithm>),
-    /// Exact-aggregation ASAP-tier state — Sum / Count / MinMax / Avg /
+    /// Exact-aggregation ASAP-tier state — Sum / Count / Min / Max / Avg /
     /// Rate / Increase / SetAggregator etc. Backed by a per-accumulator
     /// payload (`AggPayload::ExactAgg` in the data plane). One variant
     /// per [`AggregationType`] — the inner enum names the concrete
@@ -386,8 +386,8 @@ fn sketch_algorithms_compatible(
 /// True when `available` is the multi-population equivalent of
 /// `required`'s single-population variant — i.e. a `MultipleSum`
 /// policy can serve a `Sum` query (via re-aggregation across keys),
-/// `MultipleIncrease` can serve `Increase`, `MultipleMinMax` can
-/// serve `MinMax`. Asymmetric: this returns `false` for the reverse
+/// `MultipleIncrease` can serve `Increase`, `MultipleMax` can
+/// serve `Max`. Asymmetric: this returns `false` for the reverse
 /// direction (single-pop can't recover keys that have been collapsed
 /// away).
 fn multi_pop_satisfies_single(required: AggregationType, available: AggregationType) -> bool {
@@ -395,7 +395,8 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
         (required, available),
         (AggregationType::Sum, AggregationType::MultipleSum)
             | (AggregationType::Increase, AggregationType::MultipleIncrease)
-            | (AggregationType::MinMax, AggregationType::MultipleMinMax)
+            | (AggregationType::Min, AggregationType::MultipleMin)
+            | (AggregationType::Max, AggregationType::MultipleMax)
     )
 }
 
@@ -428,9 +429,12 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     }
     match intent {
         AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
-        AggIntent::Min { .. } | AggIntent::Max { .. } => {
-            Some(Capability::ExactAgg(AggregationType::MinMax))
-        }
+        // Direction is part of the capability: a stored minimum cannot
+        // answer `max_over_time` and vice versa, so these must not
+        // collapse onto one `ExactAgg` the way they did while Planner
+        // had a single `MinMax` accumulator.
+        AggIntent::Min { .. } => Some(Capability::ExactAgg(AggregationType::Min)),
+        AggIntent::Max { .. } => Some(Capability::ExactAgg(AggregationType::Max)),
         AggIntent::Increase | AggIntent::Rate => {
             Some(Capability::ExactAgg(AggregationType::Increase))
         }
@@ -571,22 +575,34 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_min_returns_exact_agg_minmax() {
+    fn capability_for_min_returns_exact_agg_min() {
         // Min/Max are exact, mergeable accumulators -- no approximation
         // needed at all -- matching ASAPController's own
         // `crates/plan/src/boundary.rs` treatment.
         assert_eq!(
             capability_for(&AggIntent::Min { col: None }),
-            Some(Capability::ExactAgg(AggregationType::MinMax))
+            Some(Capability::ExactAgg(AggregationType::Min))
         );
     }
 
     #[test]
-    fn capability_for_max_returns_exact_agg_minmax() {
+    fn capability_for_max_returns_exact_agg_max() {
         assert_eq!(
             capability_for(&AggIntent::Max { col: None }),
-            Some(Capability::ExactAgg(AggregationType::MinMax))
+            Some(Capability::ExactAgg(AggregationType::Max))
         );
+    }
+
+    #[test]
+    fn exact_agg_min_and_max_do_not_satisfy_each_other() {
+        // The whole point of splitting the family: a deployed minimum
+        // sid must never be routed a `max_over_time` read.
+        assert!(!Capability::ExactAgg(AggregationType::Min)
+            .is_satisfied_by(&Capability::ExactAgg(AggregationType::Max)));
+        assert!(!Capability::ExactAgg(AggregationType::Max)
+            .is_satisfied_by(&Capability::ExactAgg(AggregationType::Min)));
+        assert!(!Capability::ExactAgg(AggregationType::Min)
+            .is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleMax)));
     }
 
     #[test]
@@ -805,10 +821,10 @@ mod tests {
 
     #[test]
     fn is_satisfied_by_exact_agg_different_types_do_not_match() {
-        // Sum required, MinMax indexed → no match. No wildcard for
+        // Sum required, Max indexed → no match. No wildcard for
         // ExactAgg — every agg_type stands on its own.
         let required = Capability::ExactAgg(AggregationType::Sum);
-        let indexed = Capability::ExactAgg(AggregationType::MinMax);
+        let indexed = Capability::ExactAgg(AggregationType::Max);
         assert!(!required.is_satisfied_by(&indexed));
     }
 
@@ -848,11 +864,13 @@ mod tests {
         let cases = [
             AggregationType::Sum,
             AggregationType::Increase,
-            AggregationType::MinMax,
+            AggregationType::Min,
+            AggregationType::Max,
             AggregationType::DatasketchesKLL,
             AggregationType::MultipleSum,
             AggregationType::MultipleIncrease,
-            AggregationType::MultipleMinMax,
+            AggregationType::MultipleMin,
+            AggregationType::MultipleMax,
             AggregationType::HydraKLL,
             AggregationType::CountMinSketch,
             AggregationType::CountMinSketchWithHeap,

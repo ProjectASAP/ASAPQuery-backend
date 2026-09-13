@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ca7546de792d74aee8231e9a1100ca893d9e86d3#ca7546de792d74aee8231e9a1100ca893d9e86d3"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=029ff2fe041172c94c2d32c90b185bc83c5e8a57#029ff2fe041172c94c2d32c90b185bc83c5e8a57"
 dependencies = [
  "asap-types",
  "serde",
@@ -384,7 +384,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ca7546de792d74aee8231e9a1100ca893d9e86d3#ca7546de792d74aee8231e9a1100ca893d9e86d3"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=029ff2fe041172c94c2d32c90b185bc83c5e8a57#029ff2fe041172c94c2d32c90b185bc83c5e8a57"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0 (git+https://github.com/ProjectASAP/promql-parser?rev=9fede7eecca923c9882fe256484d00d37f8706cb)",
@@ -393,7 +393,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ca7546de792d74aee8231e9a1100ca893d9e86d3#ca7546de792d74aee8231e9a1100ca893d9e86d3"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=029ff2fe041172c94c2d32c90b185bc83c5e8a57#029ff2fe041172c94c2d32c90b185bc83c5e8a57"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -416,12 +416,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ca7546de792d74aee8231e9a1100ca893d9e86d3#ca7546de792d74aee8231e9a1100ca893d9e86d3"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=029ff2fe041172c94c2d32c90b185bc83c5e8a57#029ff2fe041172c94c2d32c90b185bc83c5e8a57"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ca7546de792d74aee8231e9a1100ca893d9e86d3#ca7546de792d74aee8231e9a1100ca893d9e86d3"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=029ff2fe041172c94c2d32c90b185bc83c5e8a57#029ff2fe041172c94c2d32c90b185bc83c5e8a57"
 dependencies = [
  "serde",
  "serde_json",

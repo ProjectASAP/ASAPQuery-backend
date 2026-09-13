@@ -2938,7 +2938,10 @@ fn build_gateway_merge_block(mp: &GatewayMergeProcessor) -> Value {
 ///
 /// * `aggregationType` — sketch family.
 /// * `aggregationSubType` — always empty; reserved for future
-///   sub-family distinctions.
+///   sub-family distinctions. Min/max direction used to ride here
+///   because Planner had one `MinMax` accumulator for both; it is
+///   `aggregationType: Min` / `Max` now, so nothing reads this field
+///   to pick a direction.
 /// * `metric` — source metric the aggregation runs over.
 /// * `labels.{grouping,rollup,aggregated}` — three label lists the
 ///   backend's `KeyByLabelNames` parser keys on. Today the typed L5
@@ -2969,7 +2972,8 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
             match kind {
                 ExactKind::Sum => "Sum",
                 ExactKind::Count => "Count",
-                ExactKind::MinMax => "MinMax",
+                ExactKind::Min => "Min",
+                ExactKind::Max => "Max",
                 ExactKind::Increase => "Increase",
                 ExactKind::Rate => "Rate",
                 ExactKind::IRate => "IRate",
@@ -3023,13 +3027,7 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
         clamp_window_secs(Some(agg.window_secs)).expect("clamp_window_secs preserves Some");
     json!({
         "aggregationType": aggregation_type,
-        "aggregationSubType": if matches!(
-            &agg.family,
-            planner_types::post_asap::SummaryFamilyType::ExactAggregate(
-                planner_types::post_asap::ExactKind::MinMax,
-                _
-            )
-        ) { "max" } else { "" },
+        "aggregationSubType": "",
         "metric": agg.metric_name,
         "labels": {
             "grouping": agg.grouping,

@@ -1212,7 +1212,7 @@ mod tests {
             ("variant", serde_json::json!(1)),
         );
         let count_60 = materialization(
-            AggregationType::MinMax,
+            AggregationType::Max,
             "requests",
             60,
             10,

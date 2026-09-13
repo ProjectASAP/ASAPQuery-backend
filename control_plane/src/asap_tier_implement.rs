@@ -258,20 +258,33 @@ mod tests {
     }
 
     #[test]
-    fn avg_over_time_is_not_yet_realizable_matching_capability_for_today() {
-        // Avg = Sum / Count needs a cross-policy join implement_tree_in_with
-        // doesn't build (matches capability_for(&AggIntent::Avg) => None
-        // on the flat path -- see asap_tier_analysis.rs and lower.rs's
-        // AggFunc::Avg comment). Use avg_over_time (a range-vector
-        // function), not bare instant avg(...) -- only the former is
-        // guaranteed to lower through AggFunc::Avg in this frontend.
+    fn avg_over_time_realizes_as_a_checked_sum_over_count_division() {
+        // Avg = Sum / Count. Planner rewrites the temporal average into a
+        // read-time division of two exact accumulators, guarded by
+        // `checked_finite_division` so an overflowing quotient falls back to
+        // the original query instead of serving an infinity. Use
+        // avg_over_time (a range-vector function), not bare instant avg(...)
+        // -- only the former is guaranteed to lower through AggFunc::Avg in
+        // this frontend.
         let roots = implement_promql_for_asap_tier("avg_over_time(http_requests_total[5m])")
             .expect("parses and implements");
         assert_eq!(roots.len(), 1);
+        let SummaryExpr::BinaryOp { operator, .. } = &roots[0].expr else {
+            panic!("avg_over_time realizes as a division: {:?}", roots[0].expr);
+        };
         assert!(
-            matches!(roots[0].expr, SummaryExpr::KeepPreAsap(_)),
-            "Avg has no ASAP-tier realization yet on either path: {:?}",
-            roots[0].expr,
+            matches!(
+                operator.kind,
+                planner_types::pre_asap::BinaryOpKind::Arithmetic(
+                    planner_types::pre_asap::ArithmeticOpKind::Div
+                )
+            ),
+            "expected a division operator: {operator:?}",
+        );
+        assert!(
+            operator.checked_finite_division,
+            "the temporal-average rewrite must stay guarded against an \
+             overflowing quotient: {operator:?}",
         );
     }
 

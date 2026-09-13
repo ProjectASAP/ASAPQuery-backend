@@ -3255,6 +3255,8 @@ mod tests {
         ];
         operation.output_schema.time_index = Some(0);
         let mut operator = BinaryOperator {
+            checked_relative_division: false,
+            checked_finite_division: false,
             kind: BinaryOpKind::Arithmetic(ArithmeticOpKind::Sub),
             vector_match: None,
         };

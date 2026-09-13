@@ -95,10 +95,12 @@ impl BackendAccuracyProfile for AccuracyProfile {
             // here too before its retirement.)
             AggregationType::Sum
             | AggregationType::Increase
-            | AggregationType::MinMax
+            | AggregationType::Min
+            | AggregationType::Max
             | AggregationType::MultipleSum
             | AggregationType::MultipleIncrease
-            | AggregationType::MultipleMinMax => Self::exact(),
+            | AggregationType::MultipleMin
+            | AggregationType::MultipleMax => Self::exact(),
 
             // CountMinSketch: classic Cormode-Muthukrishnan bound.
             // ε = e/w, δ = 1/2^d with w = width, d = depth. We
@@ -449,7 +451,11 @@ mod tests {
 
     #[test]
     fn min_max_increase_are_exact() {
-        for t in [AggregationType::MinMax, AggregationType::Increase] {
+        for t in [
+            AggregationType::Min,
+            AggregationType::Max,
+            AggregationType::Increase,
+        ] {
             let p = AccuracyProfile::derive(&base_config(t, HashMap::new()));
             assert_eq!(p.kind, AccuracyKind::Exact);
         }

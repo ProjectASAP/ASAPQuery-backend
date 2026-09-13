@@ -627,6 +627,7 @@ pub enum ExactReadout {
     Count,
     Increase,
     Rate,
+    Min,
     Max,
 }
 
