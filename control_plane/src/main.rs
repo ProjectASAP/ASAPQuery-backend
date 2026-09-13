@@ -2127,14 +2127,6 @@ mod api_tests {
         assert_eq!(body["metric"], "cpu");
     }
 
-    // ── POST /api/v1/plan/:metric/rollback ────────────────────────────────────
-
-
-
-    // ── GET /api/v1/plan/:metric/diff ─────────────────────────────────────────
-
-
-
     // ── GET /api/v1/cost-model ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2154,12 +2146,6 @@ mod api_tests {
             assert!(s["observations"].as_u64().is_some());
         }
     }
-
-    // ── POST /api/v1/plan/pareto ──────────────────────────────────────────────
-
-
-    // ── GET /api/v1/agents ────────────────────────────────────────────────────
-
 
     // ── POST /api/v1/tco ─────────────────────────────────────────────────────
 
