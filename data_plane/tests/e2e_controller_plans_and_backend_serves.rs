@@ -8,7 +8,7 @@
 //!     ─PromQL /api/v1/query─►
 //!   query answer
 //!
-//! The control plane drives the streaming-config: a `QueryWorkload`
+//! The control plane drives the streaming-config: a `RegisteredWorkload`
 //! goes through `bind_workload_typed` → `split_typed_three_stage` →
 //! `emit_backend_streaming_config_json`, the resulting JSON is posted
 //! to the backend's `/api/v1/streaming-config` endpoint in parser tests.
@@ -34,7 +34,6 @@
 //!    PromQL, asserts the response is well-formed for the planned
 //!    metric.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 #[path = "support/physical_fixture.rs"]
@@ -127,7 +126,7 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
         .insert(stack.otlp_http_port, plan);
 }
 
-use control_plane::types::{AggType, QueryWorkload, WorkloadCharacteristics};
+use control_plane::types::{AggType, RegisteredWorkload, WorkloadCharacteristics};
 use data_plane::storage_engines::types::StreamingConfigHandle;
 use serde_json::Value as JsonValue;
 
@@ -149,7 +148,7 @@ use prost::Message;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Build a `QueryWorkload` with the given parameters. Mirrors the
+/// Build a `RegisteredWorkload` with the given parameters. Mirrors the
 /// `WorkloadAnalyzer` output shape but constructed directly for tests.
 fn build_workload_with_override(
     metric_name: &str,
@@ -159,21 +158,34 @@ fn build_workload_with_override(
     group_by_labels: Vec<String>,
     quantiles: Vec<f64>,
     sketch_type_override: Option<SketchType>,
-) -> QueryWorkload {
-    QueryWorkload {
-        metric_name: metric_name.to_string(),
-        label_filters: HashMap::new(),
-        group_by_labels,
-        aggregations,
-        time_window,
-        repeat_every: None,
-        accuracy: control_plane::types_v2::AccuracyTarget::Epsilon(accuracy_sla),
-        accuracy_sla,
-        latency_sla: None,
-        sketch_type_override,
-        exact_required: false,
-        quantiles,
-    }
+) -> RegisteredWorkload {
+    let query = match aggregations.as_slice() {
+        [AggType::Quantile] => format!(
+            "quantile_over_time({}, {metric_name}[{}s])",
+            quantiles.first().copied().unwrap_or(0.99),
+            time_window.as_secs()
+        ),
+        [AggType::Cardinality] => format!(
+            "distinct_over_time({metric_name}[{}s])",
+            time_window.as_secs()
+        ),
+        [AggType::Frequency] => {
+            format!("count_over_time({metric_name}[{}s])", time_window.as_secs())
+        }
+        _ => panic!("fixture requires one canonical aggregation"),
+    };
+    control_plane::pipeline::Analyzer::new()
+        .analyze(
+            serde_json::from_value(serde_json::json!({
+                "query_string": query,
+                "group_by_labels": group_by_labels,
+                "accuracy_sla": 1.0 - accuracy_sla,
+                "accuracy": {"Epsilon": accuracy_sla},
+                "sketch_type": sketch_type_override,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
 }
 
 /// Convenience wrapper — no sketch_type_override.
@@ -184,7 +196,7 @@ fn build_workload(
     time_window: Duration,
     group_by_labels: Vec<String>,
     quantiles: Vec<f64>,
-) -> QueryWorkload {
+) -> RegisteredWorkload {
     build_workload_with_override(
         metric_name,
         aggregations,
@@ -196,7 +208,7 @@ fn build_workload(
     )
 }
 
-/// Run the controller's planning pipeline end-to-end on a `QueryWorkload`
+/// Run the controller's planning pipeline end-to-end on a `RegisteredWorkload`
 /// and return the `BackendStageConfig` the controller would emit from
 /// for it — the same object both `emit_backend_streaming_config_json`
 /// (legacy JSON) and the catalog-backed physical-plan compiler
@@ -204,11 +216,11 @@ fn build_workload(
 ///
 /// Mirrors the `handle_plan` flow's `StageConfig::Backend(mut be)`
 /// branch — including the post-emit grouping patch (#245) so the config
-/// carries `grouping` from `workload.group_by_labels`.
+/// carries `grouping` from `workload.group_by_labels()`.
 fn plan_backend_stage_config(
-    workload: &QueryWorkload,
+    workload: &RegisteredWorkload,
 ) -> control_plane::physical::colored_dag::BackendStageConfig {
-    let deployment_expr = if workload.metric_name == "top_endpoint_qps" {
+    let deployment_expr = if workload.metric_name() == "top_endpoint_qps" {
         let evidence = control_plane::physical::compiler::TopKMembershipEvidence {
             selected_lower_bound: 101.0,
             excluded_upper_bound: 100.0,
@@ -242,20 +254,20 @@ fn plan_backend_stage_config(
     // workload directly, the same way #245 patches grouping.
     for agg in &mut backend_cfg.aggregations {
         if agg.metric_name.is_empty() {
-            agg.metric_name = workload.metric_name.clone();
+            agg.metric_name = workload.metric_name().clone();
         }
         if agg.window_secs == 0 {
-            agg.window_secs = workload.time_window.as_secs();
+            agg.window_secs = workload.time_window().as_secs();
         }
-        agg.grouping = workload.group_by_labels.clone();
+        agg.grouping = workload.group_by_labels().clone();
     }
     backend_cfg
 }
 
-/// Run the controller's planning pipeline end-to-end on a `QueryWorkload`
+/// Run the controller's planning pipeline end-to-end on a `RegisteredWorkload`
 /// and return the streaming-config JSON document the controller would
 /// POST to the backend's `/api/v1/streaming-config` endpoint.
-fn plan_streaming_config_json(workload: &QueryWorkload) -> JsonValue {
+fn plan_streaming_config_json(workload: &RegisteredWorkload) -> JsonValue {
     let backend_cfg = plan_backend_stage_config(workload);
     // No continuous-monitoring (CDM) intents in these tests — pass an empty
     // slice (the `&[MonitorIntent]` arg added when CDM monitor specs landed).
@@ -946,7 +958,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
     assert_eq!(
         names,
         vec!["zone"],
-        "controller must thread workload.group_by_labels → labels.grouping (#245)\n\
+        "controller must thread workload.group_by_labels() → labels.grouping (#245)\n\
          {streaming_config_json}"
     );
 

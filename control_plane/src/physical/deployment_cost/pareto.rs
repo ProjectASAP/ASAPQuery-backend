@@ -95,12 +95,12 @@ pub struct ParetoPoint {
 /// If `online_store` is `Some` the scoring uses EMA-blended costs; otherwise
 /// it falls back to the static benchmark table.
 pub fn pareto_frontier(
-    workload: &LegacyMetricWorkload,
+    workload: &RegisteredWorkload,
     wc: &WorkloadCharacteristics,
     weights: ObjectiveWeights,
     online_store: Option<&online::OnlineMetricsStore>,
 ) -> Vec<ParetoPoint> {
-    if !matches!(workload.accuracy, crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+    if !matches!(workload.accuracy(), crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
     {
         return Vec::new();
     }
@@ -182,7 +182,7 @@ fn all_sketch_types() -> Vec<SketchType> {
 fn apply_delta(
     st: SketchType,
     plan: &mut CollectionPlan,
-    w: &LegacyMetricWorkload,
+    w: &RegisteredWorkload,
     wc: &WorkloadCharacteristics,
     table: &HashMap<SketchType, SketchCosts>,
 ) {
@@ -241,21 +241,22 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn quantile_workload() -> LegacyMetricWorkload {
-        LegacyMetricWorkload {
+    fn quantile_workload() -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: "latency".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: vec![AggType::Quantile],
             time_window: Duration::from_secs(300),
             repeat_every: None,
-            accuracy_sla: 0.02,
+
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.02),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![],
         }
+        .build()
     }
 
     fn default_wc() -> WorkloadCharacteristics {
@@ -369,11 +370,8 @@ mod tests {
 
     #[test]
     fn tight_sla_excludes_inaccurate_sketches() {
-        let w = LegacyMetricWorkload {
-            accuracy_sla: 0.001, // very tight — only DDSketch at 0.1% accuracy can meet this
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.001),
-            ..quantile_workload()
-        };
+        let mut w = quantile_workload();
+        w.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.001));
         let f = pareto_frontier(&w, &default_wc(), ObjectiveWeights::default(), None);
         for p in &f {
             assert!(

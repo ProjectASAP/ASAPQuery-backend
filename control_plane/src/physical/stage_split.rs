@@ -88,25 +88,26 @@ mod l5_walk_propagation_tests {
     //! TODO in `intent_algebra::column_resolution`).
 
     use crate::physical::colored_dag::StageConfig;
-    use crate::types::{AggType, LegacyMetricWorkload};
+    use crate::types::{AggType, RegisteredWorkload};
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn workload(metric: &str, group_by: Vec<String>, window: Duration) -> LegacyMetricWorkload {
-        LegacyMetricWorkload {
+    fn workload(metric: &str, group_by: Vec<String>, window: Duration) -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: metric.to_string(),
             label_filters: HashMap::new(),
             group_by_labels: group_by,
             aggregations: vec![AggType::Quantile],
             time_window: window,
             repeat_every: None,
-            accuracy_sla: 0.01,
+
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![0.99],
         }
+        .build()
     }
 
     #[test]

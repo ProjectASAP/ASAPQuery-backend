@@ -1,4 +1,4 @@
-//! Persists the `LegacyMetricWorkload` + `WorkloadCharacteristics` associated with
+//! Persists the canonical workload and deployment options associated with
 //! each planned `(metric, AggRole)` pair so that the re-planner can re-run
 //! `plan()` without needing the original `QuerySpec` HTTP payload.
 //!
@@ -11,14 +11,14 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::types::{LegacyMetricWorkload, WorkloadCharacteristics};
+use crate::types::RegisteredWorkload;
 use crate::workload::AggRole;
 
 /// Composite key `(metric_name, role)` for the store.
 pub type WorkloadKey = (String, AggRole);
 
 pub struct WorkloadStore {
-    inner: RwLock<HashMap<WorkloadKey, (LegacyMetricWorkload, WorkloadCharacteristics)>>,
+    inner: RwLock<HashMap<WorkloadKey, RegisteredWorkload>>,
 }
 
 impl Default for WorkloadStore {
@@ -41,26 +41,16 @@ impl WorkloadStore {
     /// only happen when metric AND role coincide — re-registering the
     /// same `(metric, role)` is the legitimate update path (controller
     /// HTTP `POST /api/v1/plan` re-issuing the same shape).
-    pub fn set(
-        &self,
-        metric: impl Into<String>,
-        role: AggRole,
-        wl: LegacyMetricWorkload,
-        wc: WorkloadCharacteristics,
-    ) {
+    pub fn set(&self, metric: impl Into<String>, role: AggRole, wl: RegisteredWorkload) {
         self.inner
             .write()
             .unwrap()
-            .insert((metric.into(), role), (wl, wc));
+            .insert((metric.into(), role), wl);
     }
 
-    /// Returns a clone of `(workload, characteristics)` for the
+    /// Returns a clone of the registration for the
     /// `(metric, role)` pair if known.
-    pub fn get(
-        &self,
-        metric: &str,
-        role: AggRole,
-    ) -> Option<(LegacyMetricWorkload, WorkloadCharacteristics)> {
+    pub fn get(&self, metric: &str, role: AggRole) -> Option<RegisteredWorkload> {
         self.inner
             .read()
             .unwrap()
@@ -68,19 +58,16 @@ impl WorkloadStore {
             .cloned()
     }
 
-    /// Returns every `(workload, characteristics)` pair registered for
+    /// Returns every `(role, registration)` pair registered for
     /// `metric`, across all roles. Empty vec when nothing is registered
     /// for the metric. Order is unspecified — sort if determinism matters.
-    pub fn get_all_for_metric(
-        &self,
-        metric: &str,
-    ) -> Vec<(AggRole, LegacyMetricWorkload, WorkloadCharacteristics)> {
+    pub fn get_all_for_metric(&self, metric: &str) -> Vec<(AggRole, RegisteredWorkload)> {
         self.inner
             .read()
             .unwrap()
             .iter()
             .filter(|((m, _), _)| m == metric)
-            .map(|((_, role), (wl, wc))| (*role, wl.clone(), wc.clone()))
+            .map(|((_, role), wl)| (*role, wl.clone()))
             .collect()
     }
 
@@ -106,34 +93,30 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn wl(name: &str) -> LegacyMetricWorkload {
-        LegacyMetricWorkload {
+    fn wl(name: &str) -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: name.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: vec![AggType::Quantile],
             time_window: Duration::from_secs(300),
             repeat_every: None,
-            accuracy_sla: 0.01,
+
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![],
         }
+        .build()
     }
 
     #[test]
     fn set_and_get() {
         let s = WorkloadStore::new();
-        s.set(
-            "latency",
-            AggRole::Quantile,
-            wl("latency"),
-            WorkloadCharacteristics::default(),
-        );
-        let (got, _) = s.get("latency", AggRole::Quantile).unwrap();
-        assert_eq!(got.metric_name, "latency");
+        s.set("latency", AggRole::Quantile, wl("latency"));
+        let got = s.get("latency", AggRole::Quantile).unwrap();
+        assert_eq!(got.metric_name(), "latency");
     }
 
     #[test]
@@ -145,34 +128,19 @@ mod tests {
     #[test]
     fn unknown_role_for_known_metric_returns_none() {
         let s = WorkloadStore::new();
-        s.set(
-            "m",
-            AggRole::Quantile,
-            wl("m"),
-            WorkloadCharacteristics::default(),
-        );
+        s.set("m", AggRole::Quantile, wl("m"));
         assert!(s.get("m", AggRole::Sum).is_none());
     }
 
     #[test]
     fn overwrite_same_role_replaces() {
         let s = WorkloadStore::new();
-        s.set(
-            "m",
-            AggRole::Quantile,
-            wl("m"),
-            WorkloadCharacteristics::default(),
-        );
+        s.set("m", AggRole::Quantile, wl("m"));
         let mut updated = wl("m");
-        updated.accuracy_sla = 0.05;
-        s.set(
-            "m",
-            AggRole::Quantile,
-            updated,
-            WorkloadCharacteristics::default(),
-        );
-        let (got, _) = s.get("m", AggRole::Quantile).unwrap();
-        assert_eq!(got.accuracy_sla, 0.05);
+        updated.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.05));
+        s.set("m", AggRole::Quantile, updated);
+        let got = s.get("m", AggRole::Quantile).unwrap();
+        assert_eq!(got.error_bound(), 0.05);
     }
 
     #[test]
@@ -181,51 +149,33 @@ mod tests {
         // and each entry persists independently of the others.
         let s = WorkloadStore::new();
         let mut wl_q = wl("http_requests_total");
-        wl_q.accuracy_sla = 0.01;
+        wl_q.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.01));
         let mut wl_s = wl("http_requests_total");
-        wl_s.accuracy_sla = 0.02;
+        wl_s.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.02));
         let mut wl_c = wl("http_requests_total");
-        wl_c.accuracy_sla = 0.03;
-        s.set(
-            "http_requests_total",
-            AggRole::Quantile,
-            wl_q,
-            WorkloadCharacteristics::default(),
-        );
-        s.set(
-            "http_requests_total",
-            AggRole::Sum,
-            wl_s,
-            WorkloadCharacteristics::default(),
-        );
-        s.set(
-            "http_requests_total",
-            AggRole::Count,
-            wl_c,
-            WorkloadCharacteristics::default(),
-        );
+        wl_c.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.03));
+        s.set("http_requests_total", AggRole::Quantile, wl_q);
+        s.set("http_requests_total", AggRole::Sum, wl_s);
+        s.set("http_requests_total", AggRole::Count, wl_c);
 
         // All three persist (the pre-B2 store would have collapsed
         // them onto one key, only the last survives).
         assert_eq!(
             s.get("http_requests_total", AggRole::Quantile)
                 .unwrap()
-                .0
-                .accuracy_sla,
+                .error_bound(),
             0.01
         );
         assert_eq!(
             s.get("http_requests_total", AggRole::Sum)
                 .unwrap()
-                .0
-                .accuracy_sla,
+                .error_bound(),
             0.02
         );
         assert_eq!(
             s.get("http_requests_total", AggRole::Count)
                 .unwrap()
-                .0
-                .accuracy_sla,
+                .error_bound(),
             0.03
         );
         // `get_all_for_metric` surfaces all three.
@@ -236,18 +186,8 @@ mod tests {
     #[test]
     fn remove_clears_only_target_role() {
         let s = WorkloadStore::new();
-        s.set(
-            "m",
-            AggRole::Quantile,
-            wl("m"),
-            WorkloadCharacteristics::default(),
-        );
-        s.set(
-            "m",
-            AggRole::Sum,
-            wl("m"),
-            WorkloadCharacteristics::default(),
-        );
+        s.set("m", AggRole::Quantile, wl("m"));
+        s.set("m", AggRole::Sum, wl("m"));
         s.remove("m", AggRole::Quantile);
         assert!(s.get("m", AggRole::Quantile).is_none());
         assert!(s.get("m", AggRole::Sum).is_some());
@@ -311,18 +251,13 @@ mod tests {
         let store = WorkloadStore::new();
         for entry in &entries {
             let role = derive_agg_role(entry);
-            store.set(
-                &entry.metric_name,
-                role,
-                wl(&entry.metric_name),
-                WorkloadCharacteristics::default(),
-            );
+            store.set(&entry.metric_name, role, wl(&entry.metric_name));
         }
 
         // Both distinct roles persist after the loop (vs pre-B2: only
         // the last `set` survives because the key was metric only).
         let all = store.get_all_for_metric("http_requests_total");
-        let roles: std::collections::HashSet<_> = all.iter().map(|(r, _, _)| *r).collect();
+        let roles: std::collections::HashSet<_> = all.iter().map(|(r, _)| *r).collect();
         assert!(
             roles.contains(&crate::workload::AggRole::Sum),
             "Sum-role plan must survive after the pre-pop loop; got {roles:?}"
@@ -336,18 +271,8 @@ mod tests {
     #[test]
     fn keys_returns_all_pairs() {
         let s = WorkloadStore::new();
-        s.set(
-            "a",
-            AggRole::Quantile,
-            wl("a"),
-            WorkloadCharacteristics::default(),
-        );
-        s.set(
-            "b",
-            AggRole::Sum,
-            wl("b"),
-            WorkloadCharacteristics::default(),
-        );
+        s.set("a", AggRole::Quantile, wl("a"));
+        s.set("b", AggRole::Sum, wl("b"));
         let mut keys = s.keys();
         keys.sort();
         assert_eq!(

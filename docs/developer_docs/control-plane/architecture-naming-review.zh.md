@@ -6,6 +6,31 @@
 
 本文件保留实施前的架构审查与决策依据。当前实现及迁移规则见 [Planning terminology and architecture](planning-terminology.md)。其中明确列出此次命名迁移与保留为后续工作的结构调整。
 
+**追加实施：删除扁平 workload，统一 canonical 模型**
+
+[注册模型](../../../control_plane/src/registered_workload.rs)、[输入转换](../../../control_plane/src/pipeline.rs) 和 [注册存储](../../../control_plane/src/store/workload.rs) 已改为直接使用 ASAPPlanner 的 `QueryWorkload` 及内嵌 `DataWorkload`。`LegacyMetricWorkload` 与旧 `types::QueryWorkload` 别名删除。`RegisteredWorkload` 只组合 canonical workload 与部署选项，不保存第二份扁平查询字段或 `ParsedQuery`。
+
+| 原字段 / 对象 | canonical 或部署归属 | 重复判断与迁移含义 |
+|---|---|---|
+| `metric_name`、过滤条件、聚合、quantiles | `QueryWorkload` 中的完整查询表达式 | 旧字段是表达式的重复投影；现在按需解析，不独立存储 |
+| `exact_required` | 从 canonical 表达式推导当前 stage 编译能力 | 不再独立存储，也不替代用户的 accuracy requirement |
+| `accuracy` / `accuracy_sla` | entry 的 `requirements.accuracy` | 删除可变标量镜像；入口兼容旧 SLA，显式 `EpsilonDelta` 完整保留 |
+| `latency_sla` | `requirements.response_latency` | 查询响应要求，不是数据到达频率 |
+| `repeat_every` / `shape` | batch entry 或 repeating entry 的 demand | 明确一次执行与固定周期；毫秒转换检查溢出，不推导数据到达模式 |
+| `time_window` | 查询 range 与一致的 `time_selection.lookback` | 不把执行周期、历史时间点和 lookback 混成一个窗口 |
+| `series_count`、每系列采样速率 | `DataWorkload.input_cardinality`、`ingestion_rate` | 本单 metric 适配器约定 cardinality 为活跃 series；10 series × 5 Hz = 50 samples/s |
+| 分布、来源与证据时效 | `DataWorkload.distribution` / `Evidence<T>` | 存储时保留；未知或过期证据不可退回已知默认值 |
+| sketch pin、保留标签、wire bytes、memory cap | `DeploymentOptions` | 是部署约束，不属于查询语义或数据到达事实 |
+| `distinct_keys_per_window` | 部署侧每次 flush 的 item 基数估计 | 与 series cardinality 不是同一总体，不合并 |
+| `WorkloadCharacteristics` | 兼容输入 DTO / 临时成本投影 | 不再与查询模型一起重复存储；重规划从 canonical evidence 获取有效值 |
+| `QueryId` / deployment model | 注册元数据 | 保留标识和路由提示，不伪称已经执行额外约束 |
+
+迁移包含有意的入口行为变化：字段式 quantile 生成显式 0.99 分位查询，frequency 生成时间范围内的 item count；不再给已有查询硬塞 `quantile`。查询与显式 metric/window/aggregation/filter 冲突时返回错误，要求调用者修改查询表达式。旧 `group_by_labels` 中用于 collector 保留的标签放在部署选项，不改写查询 GROUP BY。
+
+单 metric 注册接口拒绝不能无损投影的多 selector、非等值过滤、offset/@、子查询、`without`、历史 time selection、未支持的 cadence 以及未实施的 dollars 约束。更完整的查询继续走已有完整编译接口。数据到达模式与查询周期独立；Batch 表示静态数据，持续 ingestion rate 为零。公开 canonical 构造器也验证这些边界，不能绕过入口校验后静默降级。
+
+测试覆盖 canonical 查询与精度/周期/数据证据的存储往返、aggregate sample rate、过期/未知证据、cadence 范围检查及不支持的投影。英文流程架构图见 [Planning terminology and architecture](planning-terminology.md)。下文中提出临时命名 `LegacyMetricWorkload` 的内容保留为审查历史，已被本节的实际删除方案取代。
+
 **本 PR 的最终落地与迁移方式**
 
 下表记录最终采用的名称；后文保留审查时的备选与理由。实施基线为 `cb3153a8`（#710），继续复用 Planner 的精度类型；随后合并 `47d4332f`（#711），保留最新主分支的接口与历史注释清理。
@@ -24,7 +49,7 @@
 | [共享运行时算子](../../../crates/asap_types/src/query_plan/residual.rs) | `query_plan::logical::LogicalOperator` → `query_plan::residual::ResidualQueryOperator`；backend 对应模块迁移到 `residual`，保留旧模块导出 |
 | [运行时计划与句柄](../../../data_plane/src/storage_engines/types/hot_reload_config.rs) | `ActivePhysicalPlan` → `RuntimePhysicalPlan`；`HotReloadActivePhysicalPlan` → `ActivePhysicalPlanHandle`；`HotReloadStreamingConfig` → `StreamingConfigHandle`；`runtime_config` → `streaming_config`；active handle 的 `snapshot` → `active_snapshot`；`from_active` → `from_active_physical_plan`；`retire_drained` → `mark_drained_plan_retired` |
 | [存储元数据](../../../data_plane/src/storage_engines/sketch_db/index/mod.rs) | `SketchInstanceMetadata` → `SummarySeriesMetadata`；`sketch_index` 字段与变量 → `summary_store`；保留 `SketchStore` 类型 |
-| 其余调用边界 | `types::QueryWorkload` → `LegacyMetricWorkload`；`ClickHouseSqlWorkload.sds` → `summary_catalog`；`aggregation_configs` → `materializations_by_policy_fingerprint`；`aggregation_id_for_key/value` → `key_policy_fingerprint/value_policy_fingerprint`；`data_plane::monitor` → `update_sampling` |
+| 其余调用边界 | `types::QueryWorkload` / `LegacyMetricWorkload` 删除，统一到 Planner `QueryWorkload` + `DataWorkload`；`ClickHouseSqlWorkload.sds` → `summary_catalog`；`aggregation_configs` → `materializations_by_policy_fingerprint`；`aggregation_id_for_key/value` → `key_policy_fingerprint/value_policy_fingerprint`；`data_plane::monitor` → `update_sampling` |
 
 迁移规则：**Rust 名称更新，输出 wire 名称保持原样**；反序列化接受新名称作为 alias。旧公共类型导入及主要入口提供 deprecated 转发，但 Rust struct literal 的旧字段拼写无法通过类型别名兼容，源码消费者需要按表迁移。`None` / 空候选集合、浮点频次、报价身份、候选排序、严格小于的选择规则及计划生命周期均保持原义。
 

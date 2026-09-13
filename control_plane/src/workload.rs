@@ -237,7 +237,7 @@ pub struct WorkloadEntry {
     /// Optional explicit sketch family override. When set, the planner pins
     /// this family for the metric (modulo `(sketch, statistic)` validity
     /// by ASAPPlanner's legal candidate enumeration). Threaded
-    /// into `LegacyMetricWorkload::sketch_type_override` by the registry pre-pop
+    /// into `RegisteredWorkload::sketch_type_override` by the registry pre-pop
     /// path so the typed L4 binding (`bind_workload_typed`) honours it.
     ///
     /// MVP-§46 contract entries 5–8 in `deploy/configs/mvp-workload.yaml`
@@ -264,12 +264,12 @@ pub struct WorkloadEntry {
     /// http_requests_total_latency_ms[30s])` carries no `by (...)`
     /// clause, so the PromQL parser surfaces an EMPTY group_by_labels.
     /// Without a declarative field the analyzer ends up with an empty
-    /// `LegacyMetricWorkload.group_by_labels` → an empty `keep_keys` list →
+    /// `RegisteredWorkload.group_by_labels` → an empty `keep_keys` list →
     /// the agent strips ALL attrs and mints a single sid per metric
     /// (instead of one per `(metric, zone)`), defeating the streaming-
     /// config contract.
     ///
-    /// Threaded into `LegacyMetricWorkload::group_by_labels` by the registry
+    /// Threaded into `RegisteredWorkload::group_by_labels` by the registry
     /// pre-pop loop in `main`, so it merges with any `by (...)` keys
     /// the PromQL parser surfaces. Empty / missing ⇒ same behaviour as
     /// pre-B3 (no allowlist injected).
@@ -363,7 +363,7 @@ pub struct WorkloadEntry {
     /// to reach the planner with *different* flush periods — the startup path
     /// hardcoded `None`. Threaded into `QuerySpec::repeat_every` by the
     /// registry pre-pop loop in `main`, which the analyzer parses into
-    /// [`crate::types::LegacyMetricWorkload::repeat_every`].
+    /// [`crate::types::RegisteredWorkload::repeat_every`].
     ///
     /// `None` / missing ⇒ unchanged behaviour (the cost model falls back to
     /// its window-derived flush rate).
@@ -383,7 +383,11 @@ pub fn query_spec_for_entry(entry: &WorkloadEntry) -> crate::pipeline::QuerySpec
         metric_name: entry.metric_name.clone(),
         label_filters: Default::default(),
         group_by_labels: entry.grouping_labels.clone(),
-        aggregations: vec!["quantile".into()],
+        aggregations: if entry.query_string.is_some() {
+            vec![]
+        } else {
+            vec!["quantile".into()]
+        },
         time_window: if entry.query_string.is_some() {
             String::new()
         } else {
@@ -635,13 +639,13 @@ mod tests {
         let analyzer = crate::pipeline::Analyzer::new();
         let declared = analyzer.analyze(query_spec_for_entry(&entries[0])).unwrap();
         assert_eq!(
-            declared.repeat_every,
+            declared.repeat_every(),
             Some(std::time::Duration::from_secs(30))
         );
         // An entry that declares no cadence keeps the historical `None`, so the
         // cost model falls back to its window-derived flush rate.
         let undeclared = analyzer.analyze(query_spec_for_entry(&entries[1])).unwrap();
-        assert_eq!(undeclared.repeat_every, None);
+        assert_eq!(undeclared.repeat_every(), None);
     }
 
     /// A cadence the duration parser cannot read is a declaration error, not a

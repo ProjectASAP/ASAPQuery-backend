@@ -7,6 +7,18 @@ records the reasoning and the original-to-proposed naming checklist for #709.
 ```mermaid
 flowchart TB
     subgraph CP[Control plane]
+        DTO["JSON / YAML compatibility input"]
+        NORMALIZE["Analyzer<br/>Validate and normalize once"]
+        WORKLOAD["ASAPPlanner QueryWorkload<br/>Query + requirements + recurrence + time selection"]
+        DATA["ASAPPlanner DataWorkload<br/>Arrival + rate + cardinality + evidence freshness"]
+        OPTIONS["DeploymentOptions<br/>Sketch constraint + retained labels + wire size + memory cap"]
+        REGISTRY["WorkloadStore<br/>Canonical workload + deployment options per metric and role"]
+        METRIC["Metric deployment planning and replanning<br/>Derive query metadata and fresh cost inputs"]
+        DTO --> NORMALIZE --> WORKLOAD
+        DATA --> WORKLOAD
+        WORKLOAD --> REGISTRY
+        OPTIONS --> REGISTRY
+        REGISTRY --> METRIC
         INPUT["BackendLocalPlanningInput<br/>Workload demand + physical inputs + deployment context"]
         LOGICAL["ASAPPlanner + selection adapter<br/>Legal semantic DAG selection"]
         REQUEST["PhysicalCompilationRequest<br/>QueryCompilationInput + enabled materialization keys"]
@@ -16,6 +28,7 @@ flowchart TB
         EVALUATE["CandidatePlanEvaluation<br/>Select the lowest-cost feasible enumerated candidate"]
         SQL["ClickHouse SQL selection and binding<br/>Separate compilation path"]
         PUBLICATION["PhysicalPlanPublication<br/>PhysicalPlanInstallRequest"]
+        WORKLOAD --> INPUT
         INPUT --> LOGICAL --> REQUEST --> COMPILE --> MANIFEST
         MANIFEST --> QUOTE --> EVALUATE --> PUBLICATION
         SQL --> PUBLICATION
@@ -33,14 +46,17 @@ flowchart TB
     end
     PUBLICATION --> CONTRACT --> STAGE
     PUBLICATION -->|OpAMP| COLLECTOR[ASAPCollector]
+    METRIC -->|Stage configuration via OpAMP| COLLECTOR
     COLLECTOR -->|OTLP frames| MAINTAIN
     RAW[Raw time-series samples] -->|Remote Write| MAINTAIN
     QUERY -->|Exact execution or fallback| EXACT[Prometheus / VictoriaMetrics / ClickHouse]
 ```
 
 SQL shares publication and runtime contracts; it does not currently use the
-time-series workload quote-selection path. Legacy flat metric workloads and
-stage emission remain a separate compatibility path.
+time-series workload quote-selection path. Metric stage emission remains a
+separate deployment path, but its stored semantic input now uses the same Planner
+`QueryWorkload` and embedded `DataWorkload` types. `LegacyMetricWorkload` and its
+old `types::QueryWorkload` alias are deleted.
 
 ## Domain boundaries
 
@@ -76,8 +92,8 @@ This preserves old consumers, exact manifest comparisons, and serialized
 identity inputs. Diagnostic enums retain their old string representations,
 including unknown strings and the missing-status default.
 
-Old public type imports and selected method/function names remain deprecated
-forwarders. This does **not** preserve old Rust struct-literal field names;
+Other old public type imports and selected method/function names remain deprecated
+forwarders. The flat workload type is removed without a compatibility alias. This does **not** preserve old Rust struct-literal field names;
 workspace callers migrate with the definitions. External Rust source consumers
 must update fields using the review's mapping before these compatibility
 imports are removed. No removal date is set until consumer migration is known.
@@ -91,7 +107,7 @@ publication validation, and activation behavior are unchanged.
 
 The implementation clarifies planning/compiler types, candidate pricing and
 diagnostics, publication conversion, runtime generations, streaming views,
-series metadata, legacy metric workloads, residual query operators, and the
+series metadata, canonical workload registration, residual query operators, and the
 data-plane update-sampling module. Existing re-exports remain compatibility
 entrypoints rather than duplicate implementations.
 
@@ -107,4 +123,40 @@ The review also identifies follow-up work that is intentionally separate:
 - Changing window units, schema versions, identity encodings, or typed ID
   ownership.
 
-These require their own behavior contracts and are not hidden in a naming PR.
+These remain separate from the naming changes and the canonical workload migration.
+
+## Canonical workload registration
+
+`RegisteredWorkload` is a backend registration envelope, containing only the
+Planner `QueryWorkload` and `DeploymentOptions`. It does not store a parsed query
+or a second set of metric, accuracy, window, cadence or data-rate fields.
+`ParsedQuery` is an ephemeral adapter view; `WorkloadCharacteristics` is an input
+DTO and a transient cost projection. The cached planner obtains that projection
+from canonical evidence, and unavailable evidence skips rate-based cost selection.
+
+For this single-metric adapter, `input_cardinality` denotes active time series and
+`ingestion_rate` is the aggregate sample rate: 10 series at 5 Hz produces 50
+samples/s. Distinct item keys per flush remain a separate deployment estimate.
+Evidence provenance and freshness survive registry round trips. Unknown or stale
+facts do not become declared defaults. Batch data has `AtRest` arrival and no
+ongoing ingestion; repetition remains independent of arrival.
+
+Compatibility field-only inputs generate explicit queries: quantile uses
+`quantile_over_time(0.99, ...)`, cardinality uses `distinct_over_time(...)`, and
+frequency uses a temporal item count. Filter values are JSON-escaped before query
+parsing. Source and label identifiers must be accepted by the PromQL frontend.
+The old `group_by_labels` input also supplies collector retention labels; these
+are deployment options and do not introduce a query GROUP BY.
+
+The single-metric registration route accepts one query entry, one selector,
+equality filters, one-shot or fixed-interval demand, and supported real-time
+selection. It rejects conflicting query/field overrides, multi-selector input,
+regex or negative matching, offset/@, subqueries, `without`, unsupported cadence
+forms, historical time-selection metadata and unenforced dollar constraints.
+Cadences are checked before conversion to Planner milliseconds. The full query
+compilation APIs retain their broader query support.
+
+Both field-only and string requests bind from the registered canonical expression.
+Explicit typed accuracy, including epsilon and delta, remains authoritative;
+sketch choices remain physical constraints subject to legal binding. IDs and
+routing hints are retained as registration metadata.

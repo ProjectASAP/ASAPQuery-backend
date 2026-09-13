@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::query_parser;
-use crate::types::{AggType, LegacyMetricWorkload, SketchType, WorkloadCharacteristics};
+use crate::types::{AggType, RegisteredWorkload, SketchType, WorkloadCharacteristics};
 use crate::types_v2::{AccuracyTarget, DataShape, QueryId, QueryLanguage, QueryShape};
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -19,8 +19,8 @@ use crate::types_v2::{AccuracyTarget, DataShape, QueryId, QueryLanguage, QuerySh
 /// 2. **Query string** — supply a raw PromQL string in
 ///    `query_string`.  The analyzer parses it and fills in `metric_name`,
 ///    `aggregations`, `group_by_labels`, `label_filters`, and `time_window`
-///    automatically.  Any explicit fields that are non-empty / non-default
-///    **override** the parsed values, so the two approaches compose.
+///    automatically. Explicit semantic fields must agree with the expression;
+///    conflicting overrides are rejected before registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuerySpec {
     /// Raw PromQL query string to parse (SP-1 automatic extraction).
@@ -29,49 +29,38 @@ pub struct QuerySpec {
     #[serde(default)]
     pub query_string: Option<String>,
 
-    /// Metric name override.  Required when `query_string` is absent.
+    /// Metric identity. Required without a query; must match a supplied query.
     #[serde(default)]
     pub metric_name: String,
     #[serde(default)]
     pub label_filters: HashMap<String, String>,
+    /// Additional labels the collector must retain; does not rewrite query GROUP BY.
     #[serde(default)]
     pub group_by_labels: Vec<String>,
-    /// Aggregation type overrides ("quantile", "cardinality", "frequency").
+    /// Field-only aggregation ("quantile", "cardinality", "frequency").
     /// Required when `query_string` is absent.
     #[serde(default)]
     pub aggregations: Vec<String>,
-    /// Time window override (e.g. "5m").  Required when `query_string` is absent.
+    /// Time window (e.g. "5m"). Required without a query; otherwise must agree.
     #[serde(default)]
     pub time_window: String,
     #[serde(default)]
     pub repeat_every: Option<String>,
     pub accuracy_sla: f64,
     pub latency_sla: Option<String>,
-    /// Optional: pin a specific sketch type, bypassing the cost-model planner.
+    /// Optional implementation constraint, still subject to Planner legality.
     pub sketch_type: Option<SketchType>,
     /// Observable data-stream characteristics used for delta / raw-vs-sketch
     /// bandwidth comparison. Omit to use conservative defaults.
     #[serde(default)]
     pub workload: WorkloadCharacteristics,
 
-    // ── design.md alignment: new fields, defaulted for back-compat ────────
-    //
-    // These fields converge `QuerySpec` toward the typed schema in
-    // `control_plane/docs/design.md` §6 `core::workload`. Each is defaulted
-    // so the existing JSON API surface (POST /api/v1/plan handlers,
-    // pre-population from `workloads.yaml`, the test fixtures elsewhere
-    // in the control plane) keeps working without supplying them. The
-    // accuracy target is consumed by parsing and binding. The other fields
-    // retain the partial support described in `Analyzer::analyze`.
-    /// Stable identifier preserved across replan cycles. Optional;
-    /// auto-derived from `metric_name + accuracy_sla` if omitted
-    /// (existing API callers don't supply this).
+    /// Optional stable registration identifier, preserved as metadata.
     #[serde(default)]
     pub id: Option<QueryId>,
 
-    /// Source language. Inferred from `query_string` syntax / parser
-    /// dispatch when omitted (existing API callers default to PromQL
-    /// behavior, which matches today's `query_parser::parse_query`).
+    /// This metric-registration endpoint accepts PromQL; other languages use
+    /// their dedicated compilation paths.
     #[serde(default)]
     pub language: Option<QueryLanguage>,
 
@@ -82,8 +71,8 @@ pub struct QuerySpec {
     #[serde(default)]
     pub accuracy: Option<AccuracyTarget>,
 
-    /// Per-evaluation $ budget. Optional; the cost model picks freely
-    /// when unset.
+    /// Reserved compatibility field. Explicit dollar constraints are rejected
+    /// because metric registration does not implement them.
     #[serde(default)]
     pub dollars: Option<f64>,
 
@@ -122,7 +111,7 @@ impl Analyzer {
         Self
     }
 
-    pub fn analyze(&self, spec: QuerySpec) -> anyhow::Result<LegacyMetricWorkload> {
+    pub fn analyze(&self, spec: QuerySpec) -> anyhow::Result<RegisteredWorkload> {
         let accuracy =
             crate::types_v2::resolve_accuracy_target(spec.accuracy.as_ref(), spec.accuracy_sla)
                 .map_err(|error| anyhow!(error))?;
@@ -133,8 +122,8 @@ impl Analyzer {
         // hard rejections are at L1 because they have no semantically
         // valid plan: a streaming query over a static dataset, and a
         // streaming query over a mutable relation (no retraction-aware
-        // sketches in the catalog yet). Everything else is accepted
-        // here — downstream rule firing can still narrow further.
+        // sketches in the catalog yet). Canonical conversion below also checks
+        // which recurrence and data shapes this deployment path can represent.
         match (&spec.shape, &spec.data) {
             (QueryShape::Streaming, DataShape::Batch) => {
                 return Err(anyhow!(
@@ -152,18 +141,6 @@ impl Analyzer {
             }
             _ => {}
         }
-
-        // Compatibility reporting only: all semantic consumers use `accuracy`.
-        let accuracy_sla = if spec.accuracy.is_none() {
-            spec.accuracy_sla
-        } else {
-            match accuracy {
-                AccuracyTarget::Exact => 1.0,
-                AccuracyTarget::Epsilon(epsilon) | AccuracyTarget::EpsilonDelta { epsilon, .. } => {
-                    1.0 - epsilon
-                }
-            }
-        };
 
         // ── Step 1: parse query_string if provided ─────────────────────────
         // Parsing and downstream binding receive this same resolved target.
@@ -187,12 +164,6 @@ impl Analyzer {
         let aggregations = if !spec.aggregations.is_empty() {
             parse_agg_types(&spec.aggregations)?
         } else if let Some(ref p) = parsed {
-            if p.aggregations.is_empty() && !p.exact_required {
-                return Err(anyhow!(
-                    "could not infer aggregation type from query_string; \
-                     provide explicit aggregations"
-                ));
-            }
             p.aggregations.clone()
         } else {
             return Err(anyhow!("at least one aggregation is required"));
@@ -212,12 +183,8 @@ impl Analyzer {
             return Err(anyhow!("time_window is required (or provide query_string)"));
         };
 
-        // ── Step 5: resolve dimensions (group_by + label_filter keys) ──────
-        // Parsed values are the base; explicit spec fields override / extend.
-        let parsed_group_by = parsed
-            .as_ref()
-            .map(|p| p.group_by_labels.as_slice())
-            .unwrap_or(&[]);
+        // ── Step 5: resolve filters; conflicts are checked against the query ─
+        // Collector retention labels remain independent deployment options.
         let parsed_filters: HashMap<String, String> = parsed
             .as_ref()
             .map(|p| p.label_filters.clone())
@@ -228,12 +195,6 @@ impl Analyzer {
             m.extend(spec.label_filters.clone()); // explicit overrides parsed
             m
         };
-
-        let filter_keys: Vec<String> = merged_filters.keys().cloned().collect();
-        let all_group_by: Vec<String> = dedup_dims(
-            &dedup_dims(parsed_group_by, &spec.group_by_labels),
-            &filter_keys,
-        );
 
         // ── Step 6: scalar fields ──────────────────────────────────────────
         let repeat_every = spec
@@ -250,36 +211,153 @@ impl Analyzer {
             .transpose()
             .with_context(|| "invalid latency_sla")?;
 
-        let exact_required = parsed.as_ref().map(|p| p.exact_required).unwrap_or(false);
-        let quantiles = parsed
-            .as_ref()
-            .map(|p| p.quantiles.clone())
-            .unwrap_or_default();
-
-        // These remaining compatibility fields do not yet feed the flat planner.
-        let _ = (
-            &spec.shape,
-            &spec.data,
-            &spec.id,
-            &spec.language,
-            &spec.dollars,
-            &spec.deployment_model,
+        use crate::registered_workload::{declared, DeploymentOptions};
+        use planner_types::workload::*;
+        let query = if let Some(query) = &spec.query_string {
+            let p = parsed.as_ref().expect("parsed above");
+            anyhow::ensure!(metric_name == p.metric_name && time_window == p.time_window
+                && aggregations == p.aggregations && merged_filters == p.label_filters,
+                "explicit overrides conflict with query_string; update the query expression instead");
+            query.clone()
+        } else {
+            anyhow::ensure!(
+                aggregations.len() == 1,
+                "field-only input requires one aggregation"
+            );
+            let mut filters: Vec<_> = merged_filters
+                .iter()
+                .map(|(k, v)| format!("{k}={}", serde_json::to_string(v).expect("string")))
+                .collect();
+            filters.sort();
+            let selector = if filters.is_empty() {
+                metric_name.clone()
+            } else {
+                format!("{}{{{}}}", metric_name, filters.join(","))
+            };
+            match aggregations[0] {
+                AggType::Quantile => format!(
+                    "quantile_over_time(0.99, {selector}[{}s])",
+                    time_window.as_secs()
+                ),
+                AggType::Cardinality => {
+                    format!("distinct_over_time({selector}[{}s])", time_window.as_secs())
+                }
+                AggType::Frequency => {
+                    format!("count_over_time({selector}[{}s])", time_window.as_secs())
+                }
+            }
+        };
+        anyhow::ensure!(
+            spec.language.is_none()
+                || matches!(spec.language, Some(crate::types_v2::QueryLanguage::PromQl)),
+            "metric registration requires PromQL"
         );
-
-        Ok(LegacyMetricWorkload {
-            metric_name,
-            label_filters: merged_filters,
-            group_by_labels: all_group_by,
-            aggregations,
-            time_window,
-            repeat_every,
-            accuracy,
-            accuracy_sla,
-            latency_sla,
-            sketch_type_override: spec.sketch_type,
-            exact_required,
-            quantiles,
-        })
+        anyhow::ensure!(
+            spec.dollars.is_none(),
+            "dollars constraints are not supported by metric registration"
+        );
+        let cadence = match spec.shape {
+            QueryShape::Periodic { every } => {
+                anyhow::ensure!(repeat_every.is_none_or(|r| r == every), "conflicting repetition intervals");
+                Some(every)
+            },
+            QueryShape::Streaming => return Err(anyhow!("streaming demand without a fixed cadence is not supported; specify periodic demand")),
+            QueryShape::OneShot => repeat_every,
+        };
+        let requirements = QueryRequirements {
+            accuracy: AccuracyRequirement::Explicit(accuracy),
+            response_latency: latency_sla
+                .map(|d| LatencyRequirement::ExplicitMaxMs(d.as_secs_f64() * 1000.0))
+                .unwrap_or(LatencyRequirement::Unspecified),
+        };
+        let time_selection = TimeSelection {
+            scope: QueryTimeScope::RealTime,
+            lookback: crate::registered_workload::metric_query_range(&query)?
+                .map(|range| u64::try_from(range.as_millis()).map(DurationMs))
+                .transpose()?,
+            as_of: None,
+        };
+        let (query_batch, repeating_queries) = if let Some(cadence) = cadence {
+            anyhow::ensure!(
+                cadence.subsec_nanos().is_multiple_of(1_000_000),
+                "repetition interval requires whole milliseconds"
+            );
+            let interval = u32::try_from(cadence.as_millis())
+                .context("repetition interval exceeds u32 milliseconds")?;
+            anyhow::ensure!(interval > 0, "repetition interval must be positive");
+            (
+                None,
+                Some(vec![RepeatingEntry {
+                    query: Query(query),
+                    demand: RepeatedDemand::FixedInterval(RepetitionInterval(interval)),
+                    requirements,
+                    predictability: Predictability::Predictable { known_at: None },
+                    time_selection,
+                }]),
+            )
+        } else {
+            (
+                Some(vec![BatchEntry {
+                    query: Query(query),
+                    requirements,
+                    predictability: Predictability::AdHoc,
+                    invocations: 1,
+                    execute_at: None,
+                    time_selection,
+                }]),
+                None,
+            )
+        };
+        let wc = &spec.workload;
+        let rate = wc.series_count as f64 * wc.samples_per_sec_per_series;
+        anyhow::ensure!(
+            wc.samples_per_sec_per_series.is_finite()
+                && wc.samples_per_sec_per_series >= 0.0
+                && rate.is_finite(),
+            "sample rate must be finite and nonnegative"
+        );
+        let arrival = match spec.data {
+            DataShape::Batch => DataArrival::AtRest,
+            DataShape::AppendOnlyStream => DataArrival::ContinuouslyIngesting,
+            DataShape::Mixed => DataArrival::Mixed,
+            DataShape::Mutable => {
+                return Err(anyhow!(
+                    "mutable data is not supported by metric registration"
+                ))
+            }
+        };
+        let data_workload = Some(DataWorkload {
+            arrival,
+            ingestion_rate: declared(Rate(if matches!(spec.data, DataShape::Batch) {
+                0.0
+            } else {
+                rate
+            })),
+            input_cardinality: declared(wc.series_count),
+            distribution: declared(match wc.data_distribution {
+                crate::types::DataDistribution::Zipf => DataDistribution::Zipf,
+                crate::types::DataDistribution::Uniform => DataDistribution::Uniform,
+                crate::types::DataDistribution::Bursty => DataDistribution::Bursty,
+            }),
+            ingestion_volume: Evidence::default(),
+        });
+        RegisteredWorkload::new(
+            QueryWorkload {
+                language: QueryLanguage::PromQL,
+                query_batch,
+                repeating_queries,
+                data_workload,
+            },
+            DeploymentOptions {
+                sketch_type_override: spec.sketch_type,
+                query_id: spec.id,
+                deployment_model: spec.deployment_model,
+                retained_labels: dedup_dims(&spec.group_by_labels, &[]),
+                bytes_per_raw_sample: wc.bytes_per_raw_sample,
+                distinct_keys_per_window: wc.distinct_keys_per_window,
+                memory_budget_bytes: wc.memory_budget_bytes,
+            },
+        )
     }
 }
 
@@ -301,12 +379,16 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
                 .parse()
                 .map_err(|_| anyhow!("invalid number in duration {:?}", s))?;
             current_num.clear();
-            match ch {
-                'h' => total_secs += n * 3600,
-                'm' => total_secs += n * 60,
-                's' => total_secs += n,
+            let multiplier = match ch {
+                'h' => 3600,
+                'm' => 60,
+                's' => 1,
                 _ => return Err(anyhow!("unknown unit {:?} in duration {:?}", ch, s)),
-            }
+            };
+            total_secs = n
+                .checked_mul(multiplier)
+                .and_then(|part| total_secs.checked_add(part))
+                .ok_or_else(|| anyhow!("duration overflow in {:?}", s))?;
         }
     }
     if !current_num.is_empty() {
@@ -394,12 +476,12 @@ mod tests {
     #[test]
     fn valid_spec() {
         let w = Analyzer::new().analyze(basic_spec()).unwrap();
-        assert_eq!(w.metric_name, "request_latency");
-        assert_eq!(w.accuracy_sla, 0.01);
-        assert_eq!(w.time_window, Duration::from_secs(300));
-        assert_eq!(w.repeat_every, Some(Duration::from_secs(60)));
-        assert_eq!(w.latency_sla, Some(Duration::from_secs(600)));
-        assert_eq!(w.aggregations, vec![AggType::Quantile]);
+        assert_eq!(w.metric_name(), "request_latency");
+        assert!(((1.0 - w.error_bound()) - 0.01).abs() < 1e-12);
+        assert_eq!(w.time_window(), Duration::from_secs(300));
+        assert_eq!(w.repeat_every(), Some(Duration::from_secs(60)));
+        assert_eq!(w.latency_sla(), Some(Duration::from_secs(600)));
+        assert_eq!(w.aggregations(), vec![AggType::Quantile]);
     }
 
     #[test]
@@ -407,22 +489,22 @@ mod tests {
         let mut spec = basic_spec();
         spec.label_filters = [
             ("service".into(), "api".into()),
-            ("host.name".into(), "h1".into()),
+            ("host_name".into(), "h1".into()),
         ]
         .into();
-        spec.group_by_labels = vec!["host.name".into(), "region".into()];
+        spec.group_by_labels = vec!["host_name".into(), "region".into()];
         let w = Analyzer::new().analyze(spec).unwrap();
-        for dim in &["host.name", "region", "service"] {
+        for dim in &["host_name", "region", "service"] {
             assert!(
-                w.group_by_labels.contains(&dim.to_string()),
+                w.group_by_labels().contains(&dim.to_string()),
                 "missing {dim}"
             );
         }
         // host.name must appear exactly once after dedup
         assert_eq!(
-            w.group_by_labels
+            w.group_by_labels()
                 .iter()
-                .filter(|d| d.as_str() == "host.name")
+                .filter(|d| d.as_str() == "host_name")
                 .count(),
             1
         );
@@ -432,11 +514,7 @@ mod tests {
     fn multiple_aggregations() {
         let mut spec = basic_spec();
         spec.aggregations = vec!["cardinality".into(), "frequency".into()];
-        let w = Analyzer::new().analyze(spec).unwrap();
-        assert_eq!(
-            w.aggregations,
-            vec![AggType::Cardinality, AggType::Frequency]
-        );
+        assert!(Analyzer::new().analyze(spec).is_err());
     }
 
     #[test]
@@ -550,43 +628,35 @@ mod tests {
                 "sum by (host) (quantile_over_time(0.99, latency[5m]))",
             ))
             .unwrap();
-        assert_eq!(w.metric_name, "latency");
-        assert_eq!(w.aggregations, vec![AggType::Quantile]);
-        assert_eq!(w.time_window, Duration::from_secs(300));
-        assert_eq!(w.quantiles, vec![0.99]);
-        assert!(w.exact_required);
+        assert_eq!(w.metric_name(), "latency");
+        assert_eq!(w.aggregations(), vec![AggType::Quantile]);
+        assert_eq!(w.time_window(), Duration::from_secs(300));
+        assert_eq!(w.quantiles(), vec![0.99]);
+        assert!(w.exact_required());
     }
 
-    /// Explicit metric_name overrides the name derived from query_string.
+    /// A conflicting metric field cannot change only the stored projection.
     #[test]
     fn explicit_metric_name_overrides_parsed() {
         let mut spec = qs_only("sum by (host) (avg_over_time(cpu[5m]))");
         spec.metric_name = "my_custom_metric".into();
-        let w = Analyzer::new().analyze(spec).unwrap();
-        assert_eq!(w.metric_name, "my_custom_metric");
-        // aggregations still come from parse — `avg_over_time` is exact
-        // (no ASAP-tier sketch substitute for `AggIntent::Avg`), so
-        // `aggregations` stays empty and `exact_required` flips instead.
-        assert_eq!(w.aggregations, Vec::<AggType>::new());
-        assert!(w.exact_required);
+        assert!(Analyzer::new().analyze(spec).is_err());
     }
 
-    /// Explicit time_window overrides the window derived from query_string.
+    /// A conflicting window cannot disagree with the canonical expression.
     #[test]
     fn explicit_time_window_overrides_parsed() {
         let mut spec = qs_only("sum by (host) (avg_over_time(cpu[5m]))");
         spec.time_window = "1h".into();
-        let w = Analyzer::new().analyze(spec).unwrap();
-        assert_eq!(w.time_window, Duration::from_secs(3600));
+        assert!(Analyzer::new().analyze(spec).is_err());
     }
 
-    /// Explicit aggregations override those derived from query_string.
+    /// A conflicting aggregation cannot replace canonical query semantics.
     #[test]
     fn explicit_aggregations_override_parsed() {
         let mut spec = qs_only("sum by (host) (avg_over_time(cpu[5m]))"); // → Quantile
         spec.aggregations = vec!["cardinality".into()];
-        let w = Analyzer::new().analyze(spec).unwrap();
-        assert_eq!(w.aggregations, vec![AggType::Cardinality]);
+        assert!(Analyzer::new().analyze(spec).is_err());
     }
 
     /// sum_over_time is a stateful exact aggregation; exact_required is set.
@@ -597,8 +667,8 @@ mod tests {
                 "sum by (service) (sum_over_time(request_bytes[1h]))",
             ))
             .unwrap();
-        assert!(w.exact_required, "sum_over_time must set exact_required");
-        assert_eq!(w.aggregations, vec![]);
+        assert!(w.exact_required(), "sum_over_time must set exact_required");
+        assert_eq!(w.aggregations(), vec![]);
     }
 
     /// DDSketch quantile φ values are surfaced through the workload.
@@ -609,7 +679,7 @@ mod tests {
                 "sum by (host) (quantile_over_time(0.5, latency[5m]))",
             ))
             .unwrap();
-        assert_eq!(w.quantiles, vec![0.5]);
+        assert_eq!(w.quantiles(), vec![0.5]);
     }
 
     /// Existing callers that supply all fields explicitly and omit
@@ -617,30 +687,30 @@ mod tests {
     #[test]
     fn backward_compat_no_query_string() {
         let w = Analyzer::new().analyze(basic_spec()).unwrap();
-        assert_eq!(w.metric_name, "request_latency");
-        assert_eq!(w.aggregations, vec![AggType::Quantile]);
-        assert_eq!(w.time_window, Duration::from_secs(300));
-        assert!(!w.exact_required);
-        assert!(w.quantiles.is_empty());
+        assert_eq!(w.metric_name(), "request_latency");
+        assert_eq!(w.aggregations(), vec![AggType::Quantile]);
+        assert_eq!(w.time_window(), Duration::from_secs(300));
+        assert!(!w.exact_required());
+        assert_eq!(w.quantiles(), vec![0.99]);
     }
 
     // ── design.md alignment tests ─────────────────────────────────────────────
 
     /// Typed `accuracy: Some(Epsilon(0.05))` overrides the legacy
     /// `accuracy_sla: 0.99` (which would translate to `Epsilon(0.01)`),
-    /// and the resolved value flows through to `LegacyMetricWorkload.accuracy_sla`.
+    /// and the resolved value flows through to `RegisteredWorkload.accuracy_sla`.
     #[test]
     fn typed_accuracy_overrides_legacy_accuracy_sla() {
         let mut spec = basic_spec();
         spec.accuracy_sla = 0.99; // legacy: ε = 0.01
         spec.accuracy = Some(AccuracyTarget::Epsilon(0.05));
         let w = Analyzer::new().analyze(spec).unwrap();
-        // The resolved 1.0 - 0.05 = 0.95 must reach the LegacyMetricWorkload, not
+        // The resolved 1.0 - 0.05 = 0.95 must reach the RegisteredWorkload, not
         // the legacy 0.99.
         assert!(
-            (w.accuracy_sla - 0.95).abs() < 1e-9,
+            ((1.0 - w.error_bound()) - 0.95).abs() < 1e-9,
             "got {}",
-            w.accuracy_sla
+            (1.0 - w.error_bound())
         );
     }
 
@@ -683,10 +753,9 @@ mod tests {
             let mut spec = basic_spec();
             spec.accuracy_sla = 0.2;
             spec.accuracy = Some(target.clone());
-            let mut workload = Analyzer::new().analyze(spec).unwrap();
-            assert_eq!(workload.accuracy, target);
-            // Mutating the deprecated reporting view cannot affect semantic binding.
-            workload.accuracy_sla = 0.9999;
+            let workload = Analyzer::new().analyze(spec).unwrap();
+            assert_eq!(workload.accuracy(), target);
+            // Canonical requirements have no independently mutable scalar mirror.
             let bound = crate::physical::workload_planner::bind_workload_typed(&workload);
             if target == AccuracyTarget::Exact {
                 assert!(
@@ -728,7 +797,7 @@ mod tests {
         spec.accuracy_sla = 0.5;
         spec.accuracy = Some(AccuracyTarget::Exact);
         let w = Analyzer::new().analyze(spec).unwrap();
-        assert_eq!(w.accuracy_sla, 1.0);
+        assert_eq!((1.0 - w.error_bound()), 1.0);
     }
 
     /// L1 rejects `(QueryShape::Streaming, DataShape::Batch)` per the
@@ -759,14 +828,13 @@ mod tests {
         );
     }
 
-    /// `(QueryShape::Streaming, DataShape::AppendOnlyStream)` — the
-    /// canonical streaming case — is accepted.
+    /// Continuous demand needs a supported cadence before metric registration.
     #[test]
-    fn l1_accepts_streaming_over_append_only_stream() {
+    fn rejects_streaming_demand_without_fixed_cadence() {
         let mut spec = basic_spec();
         spec.shape = QueryShape::Streaming;
         spec.data = DataShape::AppendOnlyStream;
-        assert!(Analyzer::new().analyze(spec).is_ok());
+        assert!(Analyzer::new().analyze(spec).is_err());
     }
 
     /// JSON without any of the new fields parses correctly via serde —
@@ -791,14 +859,14 @@ mod tests {
         assert_eq!(spec.data, DataShape::AppendOnlyStream);
         // And the analyzer accepts it.
         let w = Analyzer::new().analyze(spec).unwrap();
-        assert_eq!(w.metric_name, "request_latency");
+        assert_eq!(w.metric_name(), "request_latency");
         // Legacy accuracy_sla=0.99 round-trips through resolution
         // (no typed `accuracy` supplied → translate from legacy →
         // Epsilon(0.01) → back to 1 - 0.01 = 0.99).
         assert!(
-            (w.accuracy_sla - 0.99).abs() < 1e-9,
+            ((1.0 - w.error_bound()) - 0.99).abs() < 1e-9,
             "got {}",
-            w.accuracy_sla
+            (1.0 - w.error_bound())
         );
     }
 
@@ -816,7 +884,7 @@ mod tests {
             "id":               "q-001",
             "language":         "prom_ql",
             "accuracy":         { "Epsilon": 0.02 },
-            "dollars":          0.001,
+            "dollars":          null,
             "deployment_model": "asaplifecycle",
             "shape":            { "kind": "periodic", "every": { "secs": 60, "nanos": 0 } },
             "data":             "batch"
@@ -825,7 +893,7 @@ mod tests {
         assert_eq!(spec.id.as_ref().unwrap().as_str(), "q-001");
         assert_eq!(spec.language, Some(QueryLanguage::PromQl));
         assert_eq!(spec.accuracy, Some(AccuracyTarget::Epsilon(0.02)));
-        assert_eq!(spec.dollars, Some(0.001));
+        assert_eq!(spec.dollars, None);
         assert_eq!(spec.deployment_model.as_deref(), Some("asaplifecycle"));
         assert!(matches!(spec.shape, QueryShape::Periodic { .. }));
         assert_eq!(spec.data, DataShape::Batch);
@@ -835,9 +903,9 @@ mod tests {
         // typed `accuracy: Epsilon(0.02)` overrode the legacy 0.5 →
         // resolved accuracy_sla in the workload is 1.0 - 0.02 = 0.98.
         assert!(
-            (w.accuracy_sla - 0.98).abs() < 1e-9,
+            ((1.0 - w.error_bound()) - 0.98).abs() < 1e-9,
             "got {}",
-            w.accuracy_sla
+            (1.0 - w.error_bound())
         );
     }
 }

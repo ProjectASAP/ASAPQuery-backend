@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::physical::deployment_cost::DeploymentCostPlanner;
-use crate::types::{CollectionPlan, LegacyMetricWorkload, WorkloadCharacteristics};
+use crate::types::{CollectionPlan, RegisteredWorkload};
 
 pub struct CachedDeploymentPlanner {
     inner: DeploymentCostPlanner,
@@ -34,12 +34,8 @@ impl CachedDeploymentPlanner {
 
     /// Return the baseline plan for this metric, or run the cost model and
     /// establish a new baseline if this is the first request for the metric.
-    pub fn plan(
-        &self,
-        workload: &LegacyMetricWorkload,
-        wc: Option<&WorkloadCharacteristics>,
-    ) -> CollectionPlan {
-        let key = &workload.metric_name;
+    pub fn plan(&self, workload: &RegisteredWorkload) -> CollectionPlan {
+        let key = &workload.metric_name();
 
         // Fast path: return the cached plan if one exists.
         {
@@ -50,7 +46,8 @@ impl CachedDeploymentPlanner {
         }
 
         // Slow path: first request for this metric — run cost optimisation.
-        let plan = self.inner.plan(workload, wc);
+        let facts = workload.characteristics_at(chrono::Utc::now().timestamp_millis() as u64);
+        let plan = self.inner.plan(workload, facts.as_ref());
         self.cache
             .write()
             .unwrap()
@@ -80,21 +77,22 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn workload(metric: &str) -> LegacyMetricWorkload {
-        LegacyMetricWorkload {
+    fn workload(metric: &str) -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: metric.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: vec![AggType::Quantile],
             time_window: Duration::from_secs(300),
             repeat_every: None,
-            accuracy_sla: 0.01,
+
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![0.99],
         }
+        .build()
     }
 
     fn planner() -> CachedDeploymentPlanner {
@@ -104,7 +102,7 @@ mod tests {
     #[test]
     fn first_call_produces_a_plan() {
         let p = planner();
-        let plan = p.plan(&workload("latency"), None);
+        let plan = p.plan(&workload("latency"));
         // Cost model picks the cheapest sketch that meets the SLA; verify
         // we got a valid plan.  transmit_sketch defaults to false (enabled
         // by DeploymentCostPlanner when appropriate).
@@ -114,11 +112,11 @@ mod tests {
     #[test]
     fn second_call_returns_same_plan() {
         let p = planner();
-        let first = p.plan(&workload("latency"), None);
+        let first = p.plan(&workload("latency"));
         // Change the workload — the baseline planner must ignore it.
         let mut w2 = workload("latency");
-        w2.aggregations = vec![AggType::Cardinality];
-        let second = p.plan(&w2, None);
+        w2.set_accuracy(crate::types_v2::AccuracyTarget::Exact);
+        let second = p.plan(&w2);
         assert_eq!(
             first.agent_config.sketch_type, second.agent_config.sketch_type,
             "baseline plan must not change even when workload changes"
@@ -128,8 +126,8 @@ mod tests {
     #[test]
     fn different_metrics_get_independent_plans() {
         let p = planner();
-        let a = p.plan(&workload("metric_a"), None);
-        let b = p.plan(&workload("metric_b"), None);
+        let a = p.plan(&workload("metric_a"));
+        let b = p.plan(&workload("metric_b"));
         // Both plans are valid (exact sketch type may differ by cost model
         // internals, but we just check they are independently produced).
         let _ = (a, b);
@@ -139,12 +137,12 @@ mod tests {
     #[test]
     fn reset_allows_re_plan() {
         let p = planner();
-        let first = p.plan(&workload("latency"), None);
+        let first = p.plan(&workload("latency"));
         p.reset("latency");
         assert!(p.baseline_metrics().is_empty());
         // After reset the planner will run the cost model again on the same
         // workload and should produce an equivalent plan.
-        let second = p.plan(&workload("latency"), None);
+        let second = p.plan(&workload("latency"));
         assert_eq!(
             first.agent_config.sketch_type, second.agent_config.sketch_type,
             "same workload after reset should produce the same sketch type"
@@ -154,9 +152,9 @@ mod tests {
     #[test]
     fn baseline_metrics_lists_all_seen_metrics() {
         let p = planner();
-        p.plan(&workload("cpu"), None);
-        p.plan(&workload("mem"), None);
-        p.plan(&workload("cpu"), None); // repeat — should not double-count
+        p.plan(&workload("cpu"));
+        p.plan(&workload("mem"));
+        p.plan(&workload("cpu")); // repeat — should not double-count
         let mut metrics = p.baseline_metrics();
         metrics.sort();
         assert_eq!(metrics, vec!["cpu", "mem"]);

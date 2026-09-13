@@ -6,8 +6,8 @@
 //! Shared execution and installation contracts live in `asap_types`.
 //!
 //! `physical::compiler`, `physical::workload_cost`, and `clickhouse` are the
-//! current compilation paths. Flat metric workloads and stage emission remain
-//! compatibility paths. Their public modules are workspace integration APIs,
+//! current compilation paths. Metric stage emission consumes the same canonical
+//! workload model through a registration adapter. Public modules are integration APIs,
 //! not an independent wire schema or a second semantic planner.
 
 #![allow(
@@ -37,6 +37,7 @@ pub mod planner_selection;
 pub mod query_parser;
 pub mod query_plan;
 pub mod query_planning;
+pub mod registered_workload;
 pub mod replan;
 pub mod runtime_samples;
 pub mod sketch_selection;

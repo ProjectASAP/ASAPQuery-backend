@@ -1,10 +1,32 @@
-//! Compatibility compiler from legacy flat workloads to physical deployment
+//! Compiler from registered canonical workloads to physical deployment
 //! plans. Summary selection delegates to ASAPPlanner.
 
 use chrono::Utc;
 use std::time::Duration;
 
 use crate::types::*;
+
+/// Bind the complete registered expression used by the HTTP deployment path.
+pub fn bind_registered_query(
+    w: &RegisteredWorkload,
+) -> anyhow::Result<crate::physical::post_asap::PhysicalExpr> {
+    let query = crate::query_parser::parse_query_expr_canonical(&w.entry().query.0, w.accuracy())?;
+    if let Some(sketch) = &w.deployment.sketch_type_override {
+        let cost_model = crate::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
+            w.accuracy(),
+            planner_types::post_asap::SketchAlgorithm::from(sketch.clone()),
+        );
+        Ok(crate::physical::post_asap::bind_query_expr_with_cost_model(
+            &query,
+            &cost_model,
+        )?)
+    } else {
+        Ok(crate::physical::post_asap::bind_query_expr(
+            &query,
+            w.accuracy(),
+        )?)
+    }
+}
 
 pub const DEFAULT_VALID_FOR: Duration = Duration::from_secs(10 * 60);
 
@@ -36,14 +58,14 @@ fn mvp_deployment_policy(
     })
 }
 
-/// Bind a flat workload to a typed physical expression for stage emission.
+/// Derive a typed collector expression from a registered canonical workload.
 ///
 /// An explicit sketch override takes precedence when valid for the statistic.
 /// Otherwise deployment contract rows select the family, with aggregation-type
 /// defaults for other metrics. Unsupported and raw-passthrough workloads
 /// return `None`.
 pub fn bind_workload_typed(
-    w: &LegacyMetricWorkload,
+    w: &RegisteredWorkload,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_evidence(w, None, None)
 }
@@ -53,7 +75,7 @@ pub fn bind_workload_typed(
 /// evidence is absent; callers that have validated a fresh certificate use
 /// this entry point instead.
 pub fn bind_workload_typed_with_topk_evidence(
-    w: &LegacyMetricWorkload,
+    w: &RegisteredWorkload,
     evidence: &crate::physical::compiler::TopKMembershipEvidence,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_evidence(w, None, Some(evidence))
@@ -64,21 +86,21 @@ pub fn bind_workload_typed_with_topk_evidence(
 /// query's actual per-item filter value through to the bound
 /// `SketchQuery::PointCount` -- `None` (what `bind_workload_typed` itself
 /// passes) gives the bare bucket total, same as before this parameter
-/// existed. `LegacyMetricWorkload` itself carries no `item_label` field (adding
+/// existed. `RegisteredWorkload` itself carries no `item_label` field (adding
 /// one would break its 30+ struct-literal construction sites across the
 /// crate), so callers that know a metric's item_label -- e.g.
 /// `emit::collect_metric_to_family`'s loop, which already has `entry:
 /// &WorkloadEntry` and `workload.label_filters` in scope -- pass it in
 /// directly instead.
 pub fn bind_workload_typed_with_item_filter(
-    w: &LegacyMetricWorkload,
+    w: &RegisteredWorkload,
     item_filter: Option<(&str, &str)>,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_evidence(w, item_filter, None)
 }
 
 fn bind_workload_typed_with_evidence(
-    w: &LegacyMetricWorkload,
+    w: &RegisteredWorkload,
     item_filter: Option<(&str, &str)>,
     topk_evidence: Option<&crate::physical::compiler::TopKMembershipEvidence>,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
@@ -98,12 +120,12 @@ fn bind_workload_typed_with_evidence(
     // `top_endpoint_qps` / `endpoint_request_freq`) parse to
     // `exact_required: true` and the typed binder declines, so the
     // 5-sketch routing emitter never sees them.
-    let metric_is_contract_row = mvp_deployment_policy(&w.metric_name).is_some();
-    let operator_pinned_sketch = w.sketch_type_override.is_some();
-    if w.exact_required && !metric_is_contract_row && !operator_pinned_sketch {
+    let metric_is_contract_row = mvp_deployment_policy(&w.metric_name()).is_some();
+    let operator_pinned_sketch = w.deployment.sketch_type_override.is_some();
+    if w.exact_required() && !metric_is_contract_row && !operator_pinned_sketch {
         return None;
     }
-    if w.aggregations.len() != 1 {
+    if w.aggregations().len() != 1 && !metric_is_contract_row {
         return None;
     }
 
@@ -113,7 +135,7 @@ fn bind_workload_typed_with_evidence(
     // default. The metric-name match owns the demo contract rows; the
     // AggType fallback covers everything else.
     let (statistic, default_kind) =
-        mvp_deployment_policy(&w.metric_name).unwrap_or_else(|| match w.aggregations[0] {
+        mvp_deployment_policy(&w.metric_name()).unwrap_or_else(|| match w.aggregations()[0] {
             AggType::Quantile => (DeploymentIntent::Quantile, SketchAlgorithm::DDSketch),
             AggType::Cardinality => (DeploymentIntent::Cardinality, SketchAlgorithm::Hll),
             AggType::Frequency => (DeploymentIntent::Frequency, SketchAlgorithm::Cms),
@@ -141,6 +163,7 @@ fn bind_workload_typed_with_evidence(
     // instead so the binding never produces a nonsense (sketch, stat)
     // pair.
     let override_kind: Option<SketchAlgorithm> = w
+        .deployment
         .sketch_type_override
         .as_ref()
         .map(|st| SketchAlgorithm::from(st.clone()));
@@ -148,7 +171,7 @@ fn bind_workload_typed_with_evidence(
     // the intent. An invalid override produces no candidate below.
     let kind = override_kind.unwrap_or(default_kind);
 
-    let accuracy = w.accuracy.clone();
+    let accuracy = w.accuracy().clone();
     let intent_accuracy = accuracy.clone();
 
     // Build the matching L3 `AggIntent` for the picked statistic class.
@@ -159,7 +182,7 @@ fn bind_workload_typed_with_evidence(
     let intent = match statistic {
         DeploymentIntent::Quantile => L3AggIntent::Quantile {
             col: None,
-            q: w.quantiles.first().copied().unwrap_or(0.99),
+            q: w.quantiles().first().copied().unwrap_or(0.99),
             accuracy: intent_accuracy,
         },
         DeploymentIntent::Cardinality => L3AggIntent::Cardinality {
@@ -180,7 +203,7 @@ fn bind_workload_typed_with_evidence(
 
     let scan = QueryExpr::Scan {
         source: Source::TimeSeries {
-            metric: w.metric_name.clone(),
+            metric: w.metric_name().clone(),
         },
         // This synthetic scan only exists to drive `Bind*` rule dispatch
         // against a representative `Aggregate` shape — the rules key off
@@ -215,7 +238,7 @@ fn bind_workload_typed_with_evidence(
         ),
     };
     let windowed = QueryExpr::TimeRange {
-        range: w.time_window,
+        range: w.time_window(),
         child: Box::new(scan).into(),
     };
     // Planner's weighted Top-K contract deliberately accepts only an
@@ -357,30 +380,39 @@ impl DeploymentPlanCompiler {
         }
     }
 
-    pub fn plan(&self, w: &LegacyMetricWorkload) -> CollectionPlan {
+    pub fn plan(&self, w: &RegisteredWorkload) -> CollectionPlan {
         // This legacy scalar cost path cannot certify a failure probability.
         // Exact/zero-error and EpsilonDelta use raw; the typed binder independently
         // checks the full requirement against Planner's family guarantees.
-        if w.exact_required
-            || !matches!(w.accuracy, crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+        if w.exact_required()
+            || !matches!(w.accuracy(), crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
         {
             return self.raw_passthrough_plan(w);
         }
 
-        let sketch_type = crate::physical::sketch_catalog::sketch_type_for_agg(&w.aggregations);
+        if w.deployment.sketch_type_override.is_some() && bind_workload_typed(w).is_none() {
+            return self.raw_passthrough_plan(w);
+        }
+        let sketch_type = w
+            .deployment
+            .sketch_type_override
+            .clone()
+            .unwrap_or_else(|| {
+                crate::physical::sketch_catalog::sketch_type_for_agg(&w.aggregations())
+            });
         let sketch_params = crate::physical::sketch_catalog::build_sketch_params(
             &self.sketch_defaults,
             &sketch_type,
             w.error_bound(),
-            &w.quantiles,
+            &w.quantiles(),
         );
         let (mode, window_duration) = select_window_strategy(w);
 
-        let mut aggregate_by = w.group_by_labels.clone();
+        let mut aggregate_by = w.group_by_labels().clone();
         aggregate_by.sort();
 
         let mut label_matchers: Vec<String> = w
-            .label_filters
+            .label_filters()
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
@@ -419,11 +451,11 @@ impl DeploymentPlanCompiler {
 
     /// Returns a raw-passthrough plan for queries that require exact per-sample
     /// computation (RSI, MACD, stochastic oscillator, etc.).
-    fn raw_passthrough_plan(&self, w: &LegacyMetricWorkload) -> CollectionPlan {
+    fn raw_passthrough_plan(&self, w: &RegisteredWorkload) -> CollectionPlan {
         let valid_until = Utc::now() + chrono::Duration::seconds(self.valid_for.as_secs() as i64);
 
         let mut label_matchers: Vec<String> = w
-            .label_filters
+            .label_filters()
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
@@ -467,10 +499,10 @@ pub use crate::physical::sketch_catalog::{build_sketch_params, default_sketch_pa
 ///
 /// Rule: if `latency_sla >= time_window` (or unset) → window mode.
 ///       otherwise → batch mode (gateway/backend merges on query).
-pub fn select_window_strategy(w: &LegacyMetricWorkload) -> (ProcessorMode, Option<Duration>) {
-    match w.latency_sla {
-        None => (ProcessorMode::Window, Some(w.time_window)),
-        Some(ls) if ls >= w.time_window => (ProcessorMode::Window, Some(w.time_window)),
+pub fn select_window_strategy(w: &RegisteredWorkload) -> (ProcessorMode, Option<Duration>) {
+    match w.latency_sla() {
+        None => (ProcessorMode::Window, Some(w.time_window())),
+        Some(ls) if ls >= w.time_window() => (ProcessorMode::Window, Some(w.time_window())),
         _ => (ProcessorMode::Batch, None),
     }
 }
@@ -482,21 +514,22 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn workload(aggs: Vec<AggType>) -> LegacyMetricWorkload {
-        LegacyMetricWorkload {
+    fn workload(aggs: Vec<AggType>) -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: "test".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: aggs,
             time_window: Duration::from_secs(300),
             repeat_every: None,
-            accuracy_sla: 0.01,
+
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![],
         }
+        .build()
     }
 
     #[test]
@@ -531,7 +564,7 @@ mod tests {
             (SketchType::CountMinSketch, SketchAlgorithm::DDSketch),
         ] {
             let mut w = workload(vec![AggType::Quantile]);
-            w.sketch_type_override = Some(ov.clone());
+            w.deployment.sketch_type_override = Some(ov.clone());
             let pe = bind_workload_typed(&w)
                 .unwrap_or_else(|| panic!("bind declined for override {ov:?}"));
             assert_eq!(
@@ -543,20 +576,19 @@ mod tests {
     }
 
     #[test]
-    fn quantile_priority_wins() {
-        let plan = DeploymentPlanCompiler::new()
-            .plan(&workload(vec![AggType::Quantile, AggType::Cardinality]));
-        assert_eq!(
-            plan.agent_config.sketch_type,
-            SketchType::DDSketch,
-            "quantile should take priority over cardinality"
-        );
+    fn mixed_field_aggregations_require_explicit_queries() {
+        let spec = serde_json::from_value(serde_json::json!({
+            "metric_name": "test", "time_window": "5m", "accuracy_sla": 0.99,
+            "aggregations": ["quantile", "cardinality"]
+        }))
+        .unwrap();
+        assert!(crate::pipeline::Analyzer::new().analyze(spec).is_err());
     }
 
     #[test]
     fn window_mode_when_latency_geq_time_window() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.latency_sla = Some(Duration::from_secs(600)); // 10m >= 5m
+        w.set_latency_sla(Some(Duration::from_secs(600))); // 10m >= 5m
         let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.mode, ProcessorMode::Window);
         assert_eq!(
@@ -568,7 +600,7 @@ mod tests {
     #[test]
     fn batch_mode_when_latency_lt_time_window() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.latency_sla = Some(Duration::from_secs(60)); // 1m < 5m
+        w.set_latency_sla(Some(Duration::from_secs(60))); // 1m < 5m
         let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.mode, ProcessorMode::Batch);
         assert_eq!(plan.agent_config.window_duration, None);
@@ -577,7 +609,7 @@ mod tests {
     #[test]
     fn no_latency_sla_defaults_to_window() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.latency_sla = None;
+        w.set_latency_sla(None);
         let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.mode, ProcessorMode::Window);
     }
@@ -585,7 +617,7 @@ mod tests {
     #[test]
     fn aggregate_by_sorted() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.group_by_labels = vec!["zone".into(), "host.name".into(), "service".into()];
+        w.deployment.retained_labels = vec!["zone".into(), "host.name".into(), "service".into()];
         let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(
             plan.agent_config.aggregate_by,
@@ -596,11 +628,13 @@ mod tests {
     #[test]
     fn label_matchers_from_filters() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.label_filters = [
-            ("env".into(), "prod".into()),
-            ("service".into(), "web".into()),
-        ]
-        .into();
+        w.set_label_filters(
+            [
+                ("env".into(), "prod".into()),
+                ("service".into(), "web".into()),
+            ]
+            .into(),
+        );
         let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.label_matchers.len(), 2);
     }
@@ -608,7 +642,7 @@ mod tests {
     #[test]
     fn ddsketch_accuracy_params() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.accuracy = crate::types_v2::AccuracyTarget::Epsilon(0.005);
+        w.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.005));
         let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::DDSketch {
@@ -621,7 +655,7 @@ mod tests {
     #[test]
     fn hll_precision_coarse_sla() {
         let mut w = workload(vec![AggType::Cardinality]);
-        w.accuracy = crate::types_v2::AccuracyTarget::Epsilon(0.03);
+        w.set_accuracy(crate::types_v2::AccuracyTarget::Epsilon(0.03));
         let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::HLL { precision } => {
@@ -698,21 +732,22 @@ mod tests {
     /// contract rows; the AggType still has to be a valid one (the enum
     /// has no `TopK` variant, so for `top_endpoint_qps` we pass
     /// `Frequency` and rely on the metric-name reclassification).
-    fn workload_for(metric: &str, agg: AggType) -> LegacyMetricWorkload {
-        LegacyMetricWorkload {
+    fn workload_for(metric: &str, agg: AggType) -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: metric.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: vec![agg],
             time_window: Duration::from_secs(300),
             repeat_every: None,
-            accuracy_sla: 0.01,
+
             accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![],
         }
+        .build()
     }
 
     fn topk_evidence() -> crate::physical::compiler::TopKMembershipEvidence {
@@ -806,6 +841,31 @@ mod tests {
         ));
     }
 
+    /// Canonical binding must preserve pins for both field-only and string requests.
+    #[test]
+    fn canonical_binding_preserves_field_only_sketch_pins() {
+        for sketch in [SketchType::KLL, SketchType::DDSketch] {
+            for use_query_string in [false, true] {
+                let mut input = serde_json::json!({
+                    "metric_name": "latency", "aggregations": ["quantile"], "time_window": "5m",
+                    "accuracy_sla": 0.99, "sketch_type": sketch,
+                });
+                if use_query_string {
+                    input["query_string"] =
+                        serde_json::json!("quantile_over_time(0.99, latency[5m])");
+                }
+                let workload = crate::pipeline::Analyzer::new()
+                    .analyze(serde_json::from_value(input).unwrap())
+                    .unwrap();
+                let bound = bind_registered_query(&workload).unwrap();
+                assert_eq!(
+                    extract_family(&bound),
+                    Some(SketchAlgorithm::from(sketch.clone()))
+                );
+            }
+        }
+    }
+
     #[test]
     fn typed_binding_endpoint_request_freq_binds_cms() {
         // Contract: `endpoint_request_freq` → CMS (Frequency). `Frequency`
@@ -869,7 +929,7 @@ mod tests {
         // for Quantile per the capability matrix, so the override is
         // honoured.
         let mut w = workload_for("http_latency_ms", AggType::Quantile);
-        w.sketch_type_override = Some(SketchType::KLL);
+        w.deployment.sketch_type_override = Some(SketchType::KLL);
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
@@ -883,7 +943,7 @@ mod tests {
         // `request_size_bytes`'s contract row is KLL (rank-err); a
         // workload override of `DDSketch` flips it back to DDSketch.
         let mut w = workload_for("request_size_bytes", AggType::Quantile);
-        w.sketch_type_override = Some(SketchType::DDSketch);
+        w.deployment.sketch_type_override = Some(SketchType::DDSketch);
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
@@ -900,7 +960,7 @@ mod tests {
         // metric, the planner should accept it instead of falling
         // back to the canonical CountSketch default.
         let mut w = workload_for("top_endpoint_qps", AggType::Frequency);
-        w.sketch_type_override = Some(SketchType::CountMinSketch);
+        w.deployment.sketch_type_override = Some(SketchType::CountMinSketch);
         let bound = bind_workload_typed_with_topk_evidence(&w, &topk_evidence())
             .expect("CMS Top-K override must bind with evidence");
         assert_eq!(extract_family(&bound), Some(SketchAlgorithm::CmsWithHeap));
@@ -926,7 +986,7 @@ mod tests {
         // matrix rejects the override, and the planner falls back to
         // the contract-row default (DDSketch for `http_latency_ms`).
         let mut w = workload_for("http_latency_ms", AggType::Quantile);
-        w.sketch_type_override = Some(SketchType::HLL);
+        w.deployment.sketch_type_override = Some(SketchType::HLL);
         let bound = bind_workload_typed(&w).expect("fallback should bind");
         assert_eq!(
             extract_family(&bound),

@@ -9,7 +9,6 @@ use control_plane::monitor;
 use control_plane::opamp;
 use control_plane::physical;
 use control_plane::pipeline;
-use control_plane::query_parser;
 use control_plane::replan;
 use control_plane::runtime_samples;
 use control_plane::store;
@@ -44,7 +43,6 @@ use physical::deployment_cost::tco;
 use physical::deployment_cost::DeploymentCostPlanner;
 use physical::plan_cache::CachedDeploymentPlanner;
 use pipeline::{Analyzer, QuerySpec};
-use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
 use store::{PlanStore, WorkloadStore};
 use types::AgentCollectorConfig;
@@ -255,7 +253,7 @@ async fn main() {
     //
     // Critical: thread `sketch_family_override` from each registry entry
     // into the QuerySpec's `sketch_type` field — that's what populates
-    // `LegacyMetricWorkload::sketch_type_override`, which the typed planner
+    // `RegisteredWorkload::sketch_type_override`, which the typed planner
     // (`bind_workload_typed`) reads to honour MVP §46 entries 5–8 (HLL /
     // CountSketch / CountMinSketch). Without this stitch the workloads
     // round-trip through the analyzer with a None override and the
@@ -286,11 +284,10 @@ async fn main() {
             let role = control_plane::workload::derive_agg_role(entry);
             match analyzer.analyze(spec) {
                 Ok(wl) => {
-                    let wc = types::WorkloadCharacteristics::default();
-                    let plan = planner.plan(&wl, Some(&wc));
-                    let metric_name = wl.metric_name.clone();
+                    let plan = planner.plan(&wl);
+                    let metric_name = wl.metric_name().clone();
                     plan_store.set(&metric_name, role, plan);
-                    workload_store.set(&metric_name, role, wl, wc);
+                    workload_store.set(&metric_name, role, wl);
                 }
                 Err(e) => {
                     warn!(metric = %entry.metric_name, role = %role, error = %e,
@@ -1032,35 +1029,19 @@ fn workload_cost_manifests(
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) -> impl IntoResponse {
-    let wc = spec.workload.clone();
-    let query_string = spec.query_string.clone();
     let workload = match st.analyzer.analyze(spec) {
         Ok(w) => w,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     };
 
-    let plan = st.planner.plan(&workload, Some(&wc));
+    let query_string = Some(workload.entry().query.0);
+
+    let plan = st.planner.plan(&workload);
 
     // Derive deployment configs from the bound query. Keep its Rc-backed DAG
     // scoped before any await so the handler future remains Send.
     let stage_configs = {
-        let mut bound_physical: Option<control_plane::physical::post_asap::PhysicalExpr> = None;
-        if let Some(ref qs) = query_string {
-            match parse_query_expr_canonical(qs, workload.accuracy.clone()) {
-                Err(e) => {
-                    warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
-                }
-                Ok(qe) => {
-                    // L4 sketch binding: lower the optimised L3 tree to the
-                    // sketch-bound `PhysicalExpr` IR — the typed L5's input.
-                    bound_physical = control_plane::physical::post_asap::bind_query_expr(
-                        &qe,
-                        workload.accuracy.clone(),
-                    )
-                    .ok();
-                }
-            }
-        }
+        let bound_physical = physical::workload_planner::bind_registered_query(&workload).ok();
 
         let stage_configs: Option<
             std::collections::HashMap<
@@ -1085,13 +1066,13 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // (Quantile vs Sum) would silently overwrite the prior plan.
     let role = {
         let entry = control_plane::workload::WorkloadEntry {
-            metric_name: workload.metric_name.clone(),
+            metric_name: workload.metric_name().clone(),
             query_string: query_string.clone(),
-            accuracy_sla: workload.accuracy_sla,
+            accuracy_sla: 1.0 - workload.error_bound(),
             assign_to_role: String::from("agent"),
-            sketch_family_override: workload.sketch_type_override.clone(),
+            sketch_family_override: workload.deployment.sketch_type_override.clone(),
             target_path: None,
-            grouping_labels: workload.group_by_labels.clone(),
+            grouping_labels: workload.group_by_labels().clone(),
             // Role derivation does not depend on sampling; default 1.0.
             sample_p: 1.0,
             // Role derivation does not depend on the cardinality hint.
@@ -1104,10 +1085,10 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         };
         control_plane::workload::derive_agg_role(&entry)
     };
-    st.store.set(&workload.metric_name, role, plan.clone());
+    st.store.set(workload.metric_name(), role, plan.clone());
     // Persist workload so the replanner can re-run plan() without the original spec.
     st.workload_store
-        .set(&workload.metric_name, role, workload.clone(), wc);
+        .set(workload.metric_name(), role, workload.clone());
 
     // ── Push agent config to agent-role collectors ────────────────────────────
     if let Ok(agent_yaml) = generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint)
@@ -1142,8 +1123,8 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     // `agg.grouping = workload.group_by_labels`
                     // patch on the Backend stage below).
                     edge.metric_to_grouping_labels.insert(
-                        workload.metric_name.clone(),
-                        workload.group_by_labels.clone(),
+                        workload.metric_name().clone(),
+                        workload.group_by_labels().clone(),
                     );
                     // Issue #2: broadcast push — no single agent id
                     // in scope, so emit `$AGENT_ID` placeholder and
@@ -1213,7 +1194,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     //     columns (open-set label naming is
                     //     a Step γ TODO in
                     //     `intent_algebra::column_resolution`).
-                    // `LegacyMetricWorkload` carries both unambiguously,
+                    // `RegisteredWorkload` carries both unambiguously,
                     // and every aggregation under one workload
                     // shares them — so the patch is uniform.
                     let item_labels = emit::collect_metric_to_item_label(
@@ -1222,12 +1203,12 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     );
                     for agg in &mut be.aggregations {
                         if agg.metric_name.is_empty() {
-                            agg.metric_name = workload.metric_name.clone();
+                            agg.metric_name = workload.metric_name().clone();
                         }
                         if agg.window_secs == 0 {
-                            agg.window_secs = workload.time_window.as_secs();
+                            agg.window_secs = workload.time_window().as_secs();
                         }
-                        agg.grouping = workload.group_by_labels.clone();
+                        agg.grouping = workload.group_by_labels().clone();
                         agg.item_label = item_labels.get(&agg.metric_name).cloned();
                     }
                     // Option B unification: every typed cumulative
@@ -1244,7 +1225,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     post_typed_backend_for_role(
                         st.backend_client.as_ref(),
                         &st.backend_routing_cache,
-                        &workload.metric_name,
+                        &workload.metric_name(),
                         role,
                         be,
                         &monitors,
@@ -1260,7 +1241,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         }
     } else if physical::stage_split::typed_stage_split_enabled() {
         warn!(
-            metric = %workload.metric_name,
+            metric = %workload.metric_name(),
             "[USE_TYPED_STAGE_SPLIT] split_typed_three_stage returned None; \
              legacy plan output unaffected"
         );
@@ -1273,7 +1254,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             .set_sketch_type(&agent_id, sketch_type.clone())
             .await;
         st.replanner
-            .register_agent(&agent_id, &workload.metric_name, role)
+            .register_agent(&agent_id, &workload.metric_name(), role)
             .await;
     }
 
@@ -1282,7 +1263,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     (
         StatusCode::OK,
         Json(json!({
-            "metric":              workload.metric_name,
+            "metric":              workload.metric_name(),
             "sketch_type":         plan.agent_config.sketch_type.to_string(),
             "mode":                plan.agent_config.mode.to_string(),
             "aggregate_by":        plan.agent_config.aggregate_by,
@@ -1433,7 +1414,7 @@ async fn handle_plan_auto(
             // the data-plane coordinator derives the live ε-floor p.
             st.workload_registry.insert_runtime(entry);
             // (2) Best-effort SKETCH registration: analyze a query for this metric
-            // and register the LegacyMetricWorkload (with the chosen sketch) so replan
+            // and register the RegisteredWorkload (with the chosen sketch) so replan
             // emits a fresh sketch plan. The pipeline analyzer accepts a narrower
             // grammar than the planner's, so this is non-fatal on rejection.
             for q in &req.queries {
@@ -1443,14 +1424,9 @@ async fn handle_plan_auto(
                     continue;
                 };
                 if let Ok(mut wl) = st.analyzer.analyze(spec) {
-                    if wl.metric_name == metric {
-                        wl.sketch_type_override = sketch.clone();
-                        st.workload_store.set(
-                            &metric,
-                            role,
-                            wl,
-                            control_plane::types::WorkloadCharacteristics::default(),
-                        );
+                    if wl.metric_name() == metric {
+                        wl.deployment.sketch_type_override = sketch.clone();
+                        st.workload_store.set(&metric, role, wl);
                         break;
                     }
                 }
@@ -1484,12 +1460,18 @@ async fn handle_pareto(
     State(st): State<AppState>,
     Json(req): Json<ParetoRequest>,
 ) -> impl IntoResponse {
-    let wc = req.spec.workload.clone();
     let workload = match st.analyzer.analyze(req.spec) {
         Ok(w) => w,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     };
 
+    let Some(wc) = workload.characteristics_at(chrono::Utc::now().timestamp_millis() as u64) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "fresh data evidence is required for cost comparison",
+        )
+            .into_response();
+    };
     let frontier = pareto_frontier(&workload, &wc, req.weights, Some(&st.online_store));
 
     if frontier.is_empty() {
@@ -1518,7 +1500,7 @@ async fn handle_pareto(
     (
         StatusCode::OK,
         Json(json!({
-            "metric":   workload.metric_name,
+            "metric":   workload.metric_name(),
             "frontier": points,
             "best":     best,
         })),
@@ -1850,7 +1832,7 @@ async fn emit_bootstrap_typed(
     //      stays the source of the edge config.
     let mut chosen: Option<(String, crate::physical::post_asap::PhysicalExpr)> = None;
     'outer: for cand in &candidates {
-        for (_, wl, _) in st.workload_store.get_all_for_metric(cand) {
+        for (_, wl) in st.workload_store.get_all_for_metric(cand) {
             if let Some(expr) = physical::workload_planner::bind_workload_typed(&wl) {
                 chosen = Some((cand.clone(), expr));
                 break 'outer;
@@ -2401,7 +2383,7 @@ mod api_tests {
                 .workload_store
                 .get_all_for_metric("typed_accuracy_metric");
             assert_eq!(stored.len(), 1);
-            assert_eq!(stored[0].1.accuracy, target);
+            assert_eq!(stored[0].1.accuracy(), target);
             let plans = state.store.get_all_for_metric("typed_accuracy_metric");
             assert_eq!(plans.len(), 1);
             if matches!(target, AccuracyTarget::Epsilon(_)) {
@@ -2491,20 +2473,14 @@ mod api_tests {
         let (st, app) = test_app();
         // Seed one plan directly.
         use crate::physical::workload_planner::DeploymentPlanCompiler;
-        let wl = crate::types::LegacyMetricWorkload {
-            metric_name: "m".into(),
-            label_filters: std::collections::HashMap::new(),
-            group_by_labels: vec![],
-            aggregations: vec![crate::types::AggType::Quantile],
-            time_window: std::time::Duration::from_secs(300),
-            repeat_every: None,
-            accuracy_sla: 0.01,
-            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
-            latency_sla: None,
-            sketch_type_override: None,
-            exact_required: false,
-            quantiles: vec![],
-        };
+        let wl = Analyzer::new()
+            .analyze(
+                serde_json::from_value(serde_json::json!({
+                    "query_string": "quantile_over_time(0.99, m[5m])", "accuracy_sla": 0.99
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         st.store.set(
             "m",
             control_plane::workload::AggRole::Quantile,
@@ -2766,8 +2742,8 @@ mod api_tests {
             data: types_v2::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
-        let wc = types::WorkloadCharacteristics::default();
-        let plan = planner.plan(&wl, Some(&wc));
+
+        let plan = planner.plan(&wl);
         // B2 (metric, role): pre-populate using the same role the
         // on_connect callback's `derive_agg_role(entry)` will compute
         // for this test's workloads.yaml entry (no query_string + no
@@ -2779,12 +2755,7 @@ mod api_tests {
             control_plane::workload::AggRole::Other,
             plan,
         );
-        workload_store.set(
-            "http_latency",
-            control_plane::workload::AggRole::Other,
-            wl,
-            wc,
-        );
+        workload_store.set("http_latency", control_plane::workload::AggRole::Other, wl);
 
         // Build replanner and late-binding cells.
         let replanner_cell: Arc<tokio::sync::RwLock<Option<Arc<Replanner>>>> =
@@ -2911,15 +2882,10 @@ mod api_tests {
             data: types_v2::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
-        let wc = types::WorkloadCharacteristics::default();
-        let plan = planner.plan(&wl, Some(&wc));
+
+        let plan = planner.plan(&wl);
         plan_store.set("metric_a", control_plane::workload::AggRole::Quantile, plan);
-        workload_store.set(
-            "metric_a",
-            control_plane::workload::AggRole::Quantile,
-            wl,
-            wc,
-        );
+        workload_store.set("metric_a", control_plane::workload::AggRole::Quantile, wl);
 
         let replanner = Arc::new(Replanner::new(
             Arc::clone(&planner),
@@ -3176,14 +3142,14 @@ mod api_tests {
             data: types_v2::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).expect("analyze");
-        let wc = types::WorkloadCharacteristics::default();
-        let plan = state.planner.plan(&wl, Some(&wc));
+
+        let plan = state.planner.plan(&wl);
         state
             .store
             .set(metric, control_plane::workload::AggRole::Quantile, plan);
         state
             .workload_store
-            .set(metric, control_plane::workload::AggRole::Quantile, wl, wc);
+            .set(metric, control_plane::workload::AggRole::Quantile, wl);
 
         // 4. Swap in the populated registry.
         state.workload_registry = registry;
@@ -3411,14 +3377,14 @@ mod api_tests {
                 data: types_v2::DataShape::default(),
             };
             let wl = analyzer.analyze(spec).expect("analyze");
-            let wc = types::WorkloadCharacteristics::default();
-            let plan = state.planner.plan(&wl, Some(&wc));
+
+            let plan = state.planner.plan(&wl);
             state
                 .store
                 .set(*m, control_plane::workload::AggRole::Quantile, plan);
             state
                 .workload_store
-                .set(*m, control_plane::workload::AggRole::Quantile, wl, wc);
+                .set(*m, control_plane::workload::AggRole::Quantile, wl);
         }
 
         // 4. Swap in the populated registry.
@@ -3581,12 +3547,11 @@ mod api_tests {
         for entry in registry.entries() {
             let spec = control_plane::workload::query_spec_for_entry(entry);
             if let Ok(wl) = analyzer.analyze(spec) {
-                let wc = types::WorkloadCharacteristics::default();
-                let plan = state.planner.plan(&wl, Some(&wc));
-                let metric_name = wl.metric_name.clone();
+                let plan = state.planner.plan(&wl);
+                let metric_name = wl.metric_name().clone();
                 let role = control_plane::workload::derive_agg_role(entry);
                 state.store.set(&metric_name, role, plan);
-                state.workload_store.set(&metric_name, role, wl, wc);
+                state.workload_store.set(&metric_name, role, wl);
             }
         }
 
