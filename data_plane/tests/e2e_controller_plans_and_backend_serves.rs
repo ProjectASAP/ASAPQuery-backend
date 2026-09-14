@@ -8,7 +8,7 @@
 //!     ─PromQL /api/v1/query─►
 //!   query answer
 //!
-//! The control plane drives the streaming-config: a `QueryWorkload`
+//! The control plane drives the streaming-config: a `RegisteredWorkload`
 //! goes through `bind_workload_typed` → `split_typed_three_stage` →
 //! `emit_backend_streaming_config_json`, the resulting JSON is posted
 //! to the backend's `/api/v1/streaming-config` endpoint in parser tests.
@@ -34,7 +34,6 @@
 //!    PromQL, asserts the response is well-formed for the planned
 //!    metric.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 #[path = "support/physical_fixture.rs"]
@@ -69,14 +68,14 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
     .unwrap();
     // The transport payloads below contain one-second states. The legacy
     // streaming emitter's default window is not their physical layout.
-    for config in runtime.aggregation_configs.values_mut() {
+    for config in runtime.materializations_by_policy_fingerprint.values_mut() {
         config.window_size = 1;
         config.slide_interval = 1;
         config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
     }
     let mut artifact = physical_fixture::artifact(&runtime);
     if runtime
-        .aggregation_configs
+        .materializations_by_policy_fingerprint
         .values()
         .any(|c| c.metric == "http_requests_total_latency_ms")
     {
@@ -134,8 +133,8 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
         .insert(stack.otlp_http_port, plan);
 }
 
-use control_plane::types::{AggType, QueryWorkload, WorkloadCharacteristics};
-use data_plane::storage_engines::types::HotReloadStreamingConfig;
+use control_plane::types::{AggType, RegisteredWorkload, WorkloadCharacteristics};
+use data_plane::storage_engines::types::StreamingConfigHandle;
 use serde_json::Value as JsonValue;
 
 use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -156,7 +155,7 @@ use prost::Message;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Build a `QueryWorkload` with the given parameters. Mirrors the
+/// Build a `RegisteredWorkload` with the given parameters. Mirrors the
 /// `WorkloadAnalyzer` output shape but constructed directly for tests.
 fn build_workload_with_override(
     metric_name: &str,
@@ -166,21 +165,34 @@ fn build_workload_with_override(
     group_by_labels: Vec<String>,
     quantiles: Vec<f64>,
     sketch_type_override: Option<SketchType>,
-) -> QueryWorkload {
-    QueryWorkload {
-        metric_name: metric_name.to_string(),
-        label_filters: HashMap::new(),
-        group_by_labels,
-        aggregations,
-        time_window,
-        repeat_every: None,
-        accuracy: control_plane::types::AccuracyTarget::Epsilon(accuracy_sla),
-        accuracy_sla,
-        latency_sla: None,
-        sketch_type_override,
-        exact_required: false,
-        quantiles,
-    }
+) -> RegisteredWorkload {
+    let query = match aggregations.as_slice() {
+        [AggType::Quantile] => format!(
+            "quantile_over_time({}, {metric_name}[{}s])",
+            quantiles.first().copied().unwrap_or(0.99),
+            time_window.as_secs()
+        ),
+        [AggType::Cardinality] => format!(
+            "distinct_over_time({metric_name}[{}s])",
+            time_window.as_secs()
+        ),
+        [AggType::Frequency] => {
+            format!("count_over_time({metric_name}[{}s])", time_window.as_secs())
+        }
+        _ => panic!("fixture requires one canonical aggregation"),
+    };
+    control_plane::pipeline::Analyzer::new()
+        .analyze(
+            serde_json::from_value(serde_json::json!({
+                "query_string": query,
+                "group_by_labels": group_by_labels,
+                "accuracy_sla": 1.0 - accuracy_sla,
+                "accuracy": {"Epsilon": accuracy_sla},
+                "sketch_type": sketch_type_override,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
 }
 
 /// Convenience wrapper — no sketch_type_override.
@@ -191,7 +203,7 @@ fn build_workload(
     time_window: Duration,
     group_by_labels: Vec<String>,
     quantiles: Vec<f64>,
-) -> QueryWorkload {
+) -> RegisteredWorkload {
     build_workload_with_override(
         metric_name,
         aggregations,
@@ -203,7 +215,7 @@ fn build_workload(
     )
 }
 
-/// Run the controller's planning pipeline end-to-end on a `QueryWorkload`
+/// Run the controller's planning pipeline end-to-end on a `RegisteredWorkload`
 /// and return the `BackendStageConfig` the controller would emit from
 /// for it — the same object both `emit_backend_streaming_config_json`
 /// (legacy JSON) and the catalog-backed physical-plan compiler
@@ -211,11 +223,11 @@ fn build_workload(
 ///
 /// Mirrors the `handle_plan` flow's `StageConfig::Backend(mut be)`
 /// branch — including the post-emit grouping patch (#245) so the config
-/// carries `grouping` from `workload.group_by_labels`.
+/// carries `grouping` from `workload.group_by_labels()`.
 fn plan_backend_stage_config(
-    workload: &QueryWorkload,
+    workload: &RegisteredWorkload,
 ) -> control_plane::physical::colored_dag::BackendStageConfig {
-    let deployment_expr = if workload.metric_name == "top_endpoint_qps" {
+    let deployment_expr = if workload.metric_name() == "top_endpoint_qps" {
         let evidence = control_plane::physical::compiler::TopKMembershipEvidence {
             selected_lower_bound: 101.0,
             excluded_upper_bound: 100.0,
@@ -249,20 +261,20 @@ fn plan_backend_stage_config(
     // workload directly, the same way #245 patches grouping.
     for agg in &mut backend_cfg.aggregations {
         if agg.metric_name.is_empty() {
-            agg.metric_name = workload.metric_name.clone();
+            agg.metric_name = workload.metric_name().clone();
         }
         if agg.window_secs == 0 {
-            agg.window_secs = workload.time_window.as_secs();
+            agg.window_secs = workload.time_window().as_secs();
         }
-        agg.grouping = workload.group_by_labels.clone();
+        agg.grouping = workload.group_by_labels().clone();
     }
     backend_cfg
 }
 
-/// Run the controller's planning pipeline end-to-end on a `QueryWorkload`
+/// Run the controller's planning pipeline end-to-end on a `RegisteredWorkload`
 /// and return the streaming-config JSON document the controller would
 /// POST to the backend's `/api/v1/streaming-config` endpoint.
-fn plan_streaming_config_json(workload: &QueryWorkload) -> JsonValue {
+fn plan_streaming_config_json(workload: &RegisteredWorkload) -> JsonValue {
     let backend_cfg = plan_backend_stage_config(workload);
     // No continuous-monitoring (CDM) intents in these tests — pass an empty
     // slice (the `&[MonitorIntent]` arg added when CDM monitor specs landed).
@@ -270,21 +282,21 @@ fn plan_streaming_config_json(workload: &QueryWorkload) -> JsonValue {
         .expect("emit_backend_streaming_config_json must succeed")
 }
 
-/// Spin up an in-process backend HTTP server with `HotReloadStreamingConfig`
+/// Spin up an in-process backend HTTP server with `StreamingConfigHandle`
 /// wired through both the query engine and the POST `/api/v1/streaming-config`
 /// handler. Returns `(port, hot_reload_handle)` — the latter so tests can
 /// also inspect the current config from the controller's side.
-async fn start_backend_http_server() -> (u16, HotReloadStreamingConfig) {
+async fn start_backend_http_server() -> (u16, StreamingConfigHandle) {
     use data_plane::drivers::query::adapters::config::AdapterConfig;
     use data_plane::drivers::query::servers::{HttpServer, HttpServerConfig};
     use data_plane::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     use data_plane::storage_engines::sketch_db::index::SketchStore;
     use data_plane::storage_engines::types::StreamingConfig;
 
-    let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-    let sketch_index = Arc::new(SketchStore::new());
+    let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+    let summary_store = Arc::new(SketchStore::new());
     let query_engine =
-        Arc::new(ASAPQueryEngine::new(15_000).with_sketch_index(sketch_index.clone()));
+        Arc::new(ASAPQueryEngine::new(15_000).with_sketch_index(summary_store.clone()));
 
     let adapter_config = AdapterConfig::prometheus_promql(
         "http://127.0.0.1:9999".to_string(), // unused — no forwarding in this test
@@ -296,7 +308,7 @@ async fn start_backend_http_server() -> (u16, HotReloadStreamingConfig) {
         adapter_config,
     };
 
-    let server = HttpServer::new(http_config, query_engine, sketch_index)
+    let server = HttpServer::new(http_config, query_engine, summary_store)
         .with_hot_reload_config(hot_reload.clone());
 
     let port = server
@@ -352,7 +364,7 @@ fn _wc_anchor() -> WorkloadCharacteristics {
 
 /// Full test stack: PrecomputeEngine + SketchStoreSink + OtlpReceiver +
 /// HttpServer, all sharing the same `SketchStore` and
-/// `HotReloadStreamingConfig` so a controller-posted streaming-config
+/// `StreamingConfigHandle` so a controller-posted streaming-config
 /// is visible to the engine's accumulator routing, the engine's window
 /// outputs land in `SketchStore`, and the query engine reads from the
 /// same store.
@@ -380,17 +392,17 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     use data_plane::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     use data_plane::storage_engines::sketch_db::index::SketchStore;
 
-    let sketch_index = Arc::new(SketchStore::new());
-    let active = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
+    let summary_store = Arc::new(SketchStore::new());
+    let active = data_plane::storage_engines::types::ActivePhysicalPlanHandle::new(
         physical_fixture::bootstrap(),
     );
-    let hot_reload = HotReloadStreamingConfig::from_active(active.clone());
+    let hot_reload = StreamingConfigHandle::from_active_physical_plan(active.clone());
     let series_resolver = Arc::new(SeriesIdResolver::new());
 
     // SketchStoreSink writes precompute output back into SketchStore so
     // the query engine can find it.
     let sink = Arc::new(SketchStoreSink::new(
-        sketch_index.clone(),
+        summary_store.clone(),
         hot_reload.clone(),
         series_resolver.clone(),
     ));
@@ -413,7 +425,7 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
         hot_reload.clone(),
         sink,
         series_resolver.clone(),
-        sketch_index.clone(),
+        summary_store.clone(),
     );
     let ingest_state = engine.ingest_state();
     tokio::spawn(async move {
@@ -448,10 +460,10 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
             // `sketch_index` via OTLP ingest (the engine's
             // `precompute_engine` shares the Arc), but the query
             // path can't see them without this binding.
-            .with_sketch_index(sketch_index.clone())
+            .with_sketch_index(summary_store.clone())
             .with_active_physical_plan(active.clone()),
     );
-    let server = HttpServer::new(http_config, query_engine, sketch_index)
+    let server = HttpServer::new(http_config, query_engine, summary_store)
         .with_hot_reload_config(hot_reload.clone())
         .with_active_physical_plan(active);
     let backend_port = server
@@ -953,7 +965,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
     assert_eq!(
         names,
         vec!["zone"],
-        "controller must thread workload.group_by_labels → labels.grouping (#245)\n\
+        "controller must thread workload.group_by_labels() → labels.grouping (#245)\n\
          {streaming_config_json}"
     );
 
@@ -965,7 +977,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
     assert_eq!(active["aggregation_count"], 1);
 
     // Walk the streaming_config object to find the registered grouping
-    // labels. The snapshot path is `streaming_config.aggregation_configs.
+    // labels. The snapshot path is `streaming_config.materializations_by_policy_fingerprint.
     // <fp_u64_string>.grouping_labels.<inner-shape>`.
     let cfgs = active["streaming_config"]["aggregation_configs"]
         .as_object()
@@ -1015,7 +1027,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
 //   * Modified-OTLP `DdSketchDataPoint` wire encoding + the backend's
 //     OTLP HTTP receiver accept the payload (no 4xx/5xx).
 //   * The full stack (PrecomputeEngine + SketchStoreSink + OtlpReceiver
-//     + HttpServer all sharing SketchStore + HotReloadStreamingConfig)
+//     + HttpServer all sharing SketchStore + StreamingConfigHandle)
 //     comes up and stays up under POST + query traffic.
 //   * The OTLP-ingested sketch lands in `SketchStore` keyed by the
 //     right `PolicyFingerprint` (or via the `instances_matching`

@@ -63,7 +63,7 @@ pub use asap_types::AggregationType;
 /// Sketch-instance configuration carried per-Metric on the OTLP wire
 /// (Phase 2 lifted these from per-DP up to the parent sketch container).
 /// Backend reads the relevant variant at ingest time and stores it in
-/// `SketchInstanceMetadata.agg_kind`.
+/// `SummarySeriesMetadata.agg_kind`.
 #[derive(Debug, Clone)]
 pub enum SketchConfig {
     UnivMon {

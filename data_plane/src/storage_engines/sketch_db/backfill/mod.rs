@@ -863,6 +863,29 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// 2026-05 reorg: backfill-* and the two BackfillSource impls moved
+// into this folder as submodules.
+pub mod clickhouse_reader;
+pub mod processor;
+pub mod prometheus_reader;
+pub mod raw_sample_reader;
+pub mod service;
+pub mod window_builder;
+pub mod worker;
+
+pub use clickhouse_reader::{clickhouse_reader_factory, ClickHouseReader, ClickHouseReaderConfig};
+pub use processor::BackfillWindowProcessor;
+pub use prometheus_reader::PrometheusReader;
+pub use raw_sample_reader::{
+    LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
+};
+pub use service::{
+    default_reader_factory, noop_reader_factory, BackfillService, BackfillServiceConfig,
+    BackfillServiceHandle, ReaderFactory,
+};
+pub use window_builder::build_backfilled_accumulator;
+pub use worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1405,26 +1428,3 @@ mod tests {
         assert_eq!(r.coverage(1, (50, 10)), Coverage::Complete);
     }
 }
-
-// 2026-05 reorg: backfill-* and the two BackfillSource impls moved
-// into this folder as submodules.
-pub mod clickhouse_reader;
-pub mod processor;
-pub mod prometheus_reader;
-pub mod raw_sample_reader;
-pub mod service;
-pub mod window_builder;
-pub mod worker;
-
-pub use clickhouse_reader::{clickhouse_reader_factory, ClickHouseReader, ClickHouseReaderConfig};
-pub use processor::BackfillWindowProcessor;
-pub use prometheus_reader::PrometheusReader;
-pub use raw_sample_reader::{
-    LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
-};
-pub use service::{
-    default_reader_factory, noop_reader_factory, BackfillService, BackfillServiceConfig,
-    BackfillServiceHandle, ReaderFactory,
-};
-pub use window_builder::build_backfilled_accumulator;
-pub use worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};

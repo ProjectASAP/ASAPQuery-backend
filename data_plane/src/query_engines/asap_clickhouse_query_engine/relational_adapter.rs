@@ -1093,6 +1093,183 @@ fn build_array(
 }
 
 #[cfg(test)]
+mod scalar_contract_tests {
+    use super::*;
+    use planner_types::pre_asap::{Column, Schema};
+
+    fn function(name: &str, args: Vec<QueryExpr>) -> QueryExpr {
+        QueryExpr::FunctionCall {
+            name: name.into(),
+            args,
+        }
+    }
+    fn text(value: &str) -> QueryExpr {
+        QueryExpr::Literal(ScalarValue::Utf8(value.into()))
+    }
+
+    #[test]
+    fn map_access_uses_declared_default_and_first_duplicate() {
+        let dtype = DataType::Map {
+            key: Box::new(DataType::Utf8),
+            value: Box::new(DataType::Int64),
+            value_nullable: false,
+        };
+        let schema = Schema::new(vec![Column::new("m", dtype, false)]);
+        let access = function("asap_map_access", vec![QueryExpr::Column(0), text("a")]);
+        assert_eq!(
+            eval(&access, &[Cell::Map(vec![])], &schema).unwrap(),
+            Cell::Int64(0)
+        );
+        assert_eq!(
+            eval(
+                &access,
+                &[Cell::Map(vec![
+                    (Cell::Utf8("a".into()), Cell::Int64(7)),
+                    (Cell::Utf8("a".into()), Cell::Int64(9))
+                ])],
+                &schema
+            )
+            .unwrap(),
+            Cell::Int64(7)
+        );
+        let nullable = Schema::new(vec![Column::new(
+            "m",
+            DataType::Map {
+                key: Box::new(DataType::Utf8),
+                value: Box::new(DataType::Int64),
+                value_nullable: true,
+            },
+            false,
+        )]);
+        assert_eq!(
+            eval(&access, &[Cell::Map(vec![])], &nullable).unwrap(),
+            Cell::Null
+        );
+        let null_key = function(
+            "asap_map_access",
+            vec![QueryExpr::Column(0), QueryExpr::Literal(ScalarValue::Null)],
+        );
+        assert_eq!(
+            eval(&null_key, &[Cell::Map(vec![])], &schema).unwrap(),
+            Cell::Null
+        );
+    }
+
+    #[test]
+    fn map_concat_preserves_duplicates_and_empty_map() {
+        let map = |value| {
+            function(
+                "map",
+                vec![text("a"), QueryExpr::Literal(ScalarValue::Int64(value))],
+            )
+        };
+        let concat = function("mapConcat", vec![function("map", vec![]), map(7), map(9)]);
+        let schema = Schema::new(vec![]);
+        assert_eq!(
+            eval(&concat, &[], &schema).unwrap(),
+            Cell::Map(vec![
+                (Cell::Utf8("a".into()), Cell::Int64(7)),
+                (Cell::Utf8("a".into()), Cell::Int64(9))
+            ])
+        );
+        let mixed = function(
+            "map",
+            vec![
+                text("a"),
+                QueryExpr::Literal(ScalarValue::Int64(1)),
+                text("b"),
+                QueryExpr::Literal(ScalarValue::Float64(2.5)),
+            ],
+        );
+        assert!(eval(&mixed, &[], &schema).is_err());
+    }
+
+    #[test]
+    fn sorting_nested_nan_fails_before_comparator_can_treat_it_as_equal() {
+        let dtype = DataType::Map {
+            key: Box::new(DataType::Utf8),
+            value: Box::new(DataType::Float64),
+            value_nullable: false,
+        };
+        let input = ClickHouseRelation {
+            rows: vec![vec![Cell::Map(vec![(
+                Cell::Utf8("a".into()),
+                Cell::Float64(f64::NAN),
+            )])]],
+            fields: vec![("m".into(), dtype.clone(), false)],
+            coverage: None,
+        };
+        let schema = SummarySchema {
+            fields: vec![planner_types::post_asap::SummaryField {
+                name: "m".into(),
+                dtype: SummaryFamilyType::Plain(dtype),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let operation = ValueOperation::Sort {
+            keys: vec![SortKey {
+                expr: QueryExpr::Column(0),
+                ascending: true,
+                nulls_first: false,
+            }],
+            partition_by: planner_types::pre_asap::GroupKeys::none(),
+        };
+        assert!(ClickHouseRelationalAdapter
+            .apply_operation(&operation, &schema, input)
+            .is_err());
+    }
+
+    #[test]
+    fn mixed_comparison_preserves_integer_precision_and_boundaries() {
+        assert_eq!(
+            integer_float_cmp(9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            integer_float_cmp(i64::MAX, 9_223_372_036_854_775_808.0),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            integer_float_cmp(i64::MIN, -9_223_372_036_854_775_808.0),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(integer_float_cmp(-1, -1.5), Some(Ordering::Greater));
+        assert_eq!(integer_float_cmp(1, 1.5), Some(Ordering::Less));
+        assert_eq!(integer_float_cmp(0, f64::INFINITY), Some(Ordering::Less));
+        assert_eq!(
+            integer_float_cmp(0, f64::NEG_INFINITY),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(integer_float_cmp(0, f64::NAN), None);
+    }
+
+    #[test]
+    fn integer_modulo_never_rounds_through_float() {
+        assert_eq!(
+            arithmetic(
+                &ArithmeticOpKind::Mod,
+                Cell::Int64(9_007_199_254_740_993),
+                Cell::Int64(2)
+            )
+            .unwrap(),
+            Cell::Int64(1)
+        );
+        assert_eq!(
+            arithmetic(&ArithmeticOpKind::Mod, Cell::Int64(-7), Cell::Int64(3)).unwrap(),
+            Cell::Int64(-1)
+        );
+        assert!(arithmetic(&ArithmeticOpKind::Mod, Cell::Int64(7), Cell::Int64(0)).is_err());
+        assert!(arithmetic(
+            &ArithmeticOpKind::Mod,
+            Cell::Int64(i64::MIN),
+            Cell::Int64(-1)
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use planner_types::{
@@ -1513,182 +1690,5 @@ mod tests {
                 .value(0),
             0.2
         );
-    }
-}
-
-#[cfg(test)]
-mod scalar_contract_tests {
-    use super::*;
-    use planner_types::pre_asap::{Column, Schema};
-
-    fn function(name: &str, args: Vec<QueryExpr>) -> QueryExpr {
-        QueryExpr::FunctionCall {
-            name: name.into(),
-            args,
-        }
-    }
-    fn text(value: &str) -> QueryExpr {
-        QueryExpr::Literal(ScalarValue::Utf8(value.into()))
-    }
-
-    #[test]
-    fn map_access_uses_declared_default_and_first_duplicate() {
-        let dtype = DataType::Map {
-            key: Box::new(DataType::Utf8),
-            value: Box::new(DataType::Int64),
-            value_nullable: false,
-        };
-        let schema = Schema::new(vec![Column::new("m", dtype, false)]);
-        let access = function("asap_map_access", vec![QueryExpr::Column(0), text("a")]);
-        assert_eq!(
-            eval(&access, &[Cell::Map(vec![])], &schema).unwrap(),
-            Cell::Int64(0)
-        );
-        assert_eq!(
-            eval(
-                &access,
-                &[Cell::Map(vec![
-                    (Cell::Utf8("a".into()), Cell::Int64(7)),
-                    (Cell::Utf8("a".into()), Cell::Int64(9))
-                ])],
-                &schema
-            )
-            .unwrap(),
-            Cell::Int64(7)
-        );
-        let nullable = Schema::new(vec![Column::new(
-            "m",
-            DataType::Map {
-                key: Box::new(DataType::Utf8),
-                value: Box::new(DataType::Int64),
-                value_nullable: true,
-            },
-            false,
-        )]);
-        assert_eq!(
-            eval(&access, &[Cell::Map(vec![])], &nullable).unwrap(),
-            Cell::Null
-        );
-        let null_key = function(
-            "asap_map_access",
-            vec![QueryExpr::Column(0), QueryExpr::Literal(ScalarValue::Null)],
-        );
-        assert_eq!(
-            eval(&null_key, &[Cell::Map(vec![])], &schema).unwrap(),
-            Cell::Null
-        );
-    }
-
-    #[test]
-    fn map_concat_preserves_duplicates_and_empty_map() {
-        let map = |value| {
-            function(
-                "map",
-                vec![text("a"), QueryExpr::Literal(ScalarValue::Int64(value))],
-            )
-        };
-        let concat = function("mapConcat", vec![function("map", vec![]), map(7), map(9)]);
-        let schema = Schema::new(vec![]);
-        assert_eq!(
-            eval(&concat, &[], &schema).unwrap(),
-            Cell::Map(vec![
-                (Cell::Utf8("a".into()), Cell::Int64(7)),
-                (Cell::Utf8("a".into()), Cell::Int64(9))
-            ])
-        );
-        let mixed = function(
-            "map",
-            vec![
-                text("a"),
-                QueryExpr::Literal(ScalarValue::Int64(1)),
-                text("b"),
-                QueryExpr::Literal(ScalarValue::Float64(2.5)),
-            ],
-        );
-        assert!(eval(&mixed, &[], &schema).is_err());
-    }
-
-    #[test]
-    fn sorting_nested_nan_fails_before_comparator_can_treat_it_as_equal() {
-        let dtype = DataType::Map {
-            key: Box::new(DataType::Utf8),
-            value: Box::new(DataType::Float64),
-            value_nullable: false,
-        };
-        let input = ClickHouseRelation {
-            rows: vec![vec![Cell::Map(vec![(
-                Cell::Utf8("a".into()),
-                Cell::Float64(f64::NAN),
-            )])]],
-            fields: vec![("m".into(), dtype.clone(), false)],
-            coverage: None,
-        };
-        let schema = SummarySchema {
-            fields: vec![planner_types::post_asap::SummaryField {
-                name: "m".into(),
-                dtype: SummaryFamilyType::Plain(dtype),
-                nullable: false,
-            }],
-            time_index: None,
-        };
-        let operation = ValueOperation::Sort {
-            keys: vec![SortKey {
-                expr: QueryExpr::Column(0),
-                ascending: true,
-                nulls_first: false,
-            }],
-            partition_by: planner_types::pre_asap::GroupKeys::none(),
-        };
-        assert!(ClickHouseRelationalAdapter
-            .apply_operation(&operation, &schema, input)
-            .is_err());
-    }
-
-    #[test]
-    fn mixed_comparison_preserves_integer_precision_and_boundaries() {
-        assert_eq!(
-            integer_float_cmp(9_007_199_254_740_993, 9_007_199_254_740_992.0),
-            Some(Ordering::Greater)
-        );
-        assert_eq!(
-            integer_float_cmp(i64::MAX, 9_223_372_036_854_775_808.0),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            integer_float_cmp(i64::MIN, -9_223_372_036_854_775_808.0),
-            Some(Ordering::Equal)
-        );
-        assert_eq!(integer_float_cmp(-1, -1.5), Some(Ordering::Greater));
-        assert_eq!(integer_float_cmp(1, 1.5), Some(Ordering::Less));
-        assert_eq!(integer_float_cmp(0, f64::INFINITY), Some(Ordering::Less));
-        assert_eq!(
-            integer_float_cmp(0, f64::NEG_INFINITY),
-            Some(Ordering::Greater)
-        );
-        assert_eq!(integer_float_cmp(0, f64::NAN), None);
-    }
-
-    #[test]
-    fn integer_modulo_never_rounds_through_float() {
-        assert_eq!(
-            arithmetic(
-                &ArithmeticOpKind::Mod,
-                Cell::Int64(9_007_199_254_740_993),
-                Cell::Int64(2)
-            )
-            .unwrap(),
-            Cell::Int64(1)
-        );
-        assert_eq!(
-            arithmetic(&ArithmeticOpKind::Mod, Cell::Int64(-7), Cell::Int64(3)).unwrap(),
-            Cell::Int64(-1)
-        );
-        assert!(arithmetic(&ArithmeticOpKind::Mod, Cell::Int64(7), Cell::Int64(0)).is_err());
-        assert!(arithmetic(
-            &ArithmeticOpKind::Mod,
-            Cell::Int64(i64::MIN),
-            Cell::Int64(-1)
-        )
-        .is_err());
     }
 }

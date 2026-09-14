@@ -738,7 +738,7 @@ fn phase_b_e2e_rate_falls_through_to_logical() {
 /// The legacy single-expression binder cannot choose a frequency sketch for
 /// value-ranked `topk(sum(rate(...)))` without membership evidence. The
 /// workload planner handles this query as query-time Sort+Limit over its
-/// recursively planned child; its coverage lives in `query_plan::logical`.
+/// recursively planned child; its coverage lives in `query_plan::residual`.
 #[test]
 fn phase_b_legacy_topk_requires_membership_evidence() {
     let query = "topk(10, sum by (instance) (rate(http_requests_total[5m])))";

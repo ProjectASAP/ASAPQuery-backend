@@ -1,31 +1,15 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::Duration;
 
 // ── Workload characteristics ───────────────────────────────────────────────────
 
-/// Hint about the statistical distribution of keys in the data stream.
-/// Affects fill-rate estimation and therefore delta compression projections.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DataDistribution {
-    /// Zipf-distributed keys (s ≈ 1.1).  A small number of keys dominate,
-    /// so only a fraction of sketch cells are touched per window.  This is
-    /// the typical production case.
-    #[default]
-    Zipf,
-    /// All keys are equally probable.  Every window fills the sketch more
-    /// uniformly; delta compression benefit is lower.
-    Uniform,
-    /// Traffic arrives in bursts with a concentrated key set.  Effective
-    /// fill rate is lower on average but spikes can reach Uniform levels.
-    Bursty,
-}
+pub use planner_types::workload::DataDistribution;
 
 /// Observable characteristics of the incoming data stream.
 ///
-/// Callers supply these alongside a [`QueryWorkload`] so the planner can
+/// Compatibility input and transient cost projection of canonical data facts.
+/// The registry stores Planner DataWorkload; cost routines use this view to
 /// compare raw vs. sketch-full vs. sketch-delta transmission costs and
 /// estimate the CPU / memory overhead at the SDK or agent collector.
 ///
@@ -251,41 +235,7 @@ impl std::fmt::Display for ProcessorMode {
 
 // ── Core types ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-pub struct QueryWorkload {
-    pub metric_name: String,
-    pub label_filters: HashMap<String, String>,
-    pub group_by_labels: Vec<String>,
-    pub aggregations: Vec<AggType>,
-    pub time_window: Duration,
-    pub repeat_every: Option<Duration>,
-    /// Authoritative query requirement; never reconstructed from the legacy view.
-    pub accuracy: crate::types::AccuracyTarget,
-    /// Deprecated confidence-style view retained for compatibility reporting only.
-    pub accuracy_sla: f64,
-    pub latency_sla: Option<Duration>,
-    /// When set, the planner must use this sketch type instead of running
-    /// the cost model. Allows pinning for collectors that support a subset.
-    pub sketch_type_override: Option<SketchType>,
-    /// When true, sketches offer no benefit and the plan must use raw
-    /// pass-through (SP-2–SP-4 collapse to raw-preservation).
-    /// Set for stateful per-sample queries (RSI, MACD, stochastic, SUM).
-    pub exact_required: bool,
-    /// Quantile φ targets implied by the query (e.g. [0.5] for TWAP,
-    /// [0.0, 1.0] for price range).  Empty for non-quantile workloads.
-    pub quantiles: Vec<f64>,
-}
-
-impl QueryWorkload {
-    /// Scalar sizing input for legacy cost formulas, not a confidence guarantee.
-    pub fn error_bound(&self) -> f64 {
-        match self.accuracy {
-            crate::types::AccuracyTarget::Exact => 0.0,
-            crate::types::AccuracyTarget::Epsilon(epsilon)
-            | crate::types::AccuracyTarget::EpsilonDelta { epsilon, .. } => epsilon,
-        }
-    }
-}
+pub use crate::registered_workload::RegisteredWorkload;
 
 // ── Sketch defaults (YAML-configurable) ──────────────────────────────────────
 

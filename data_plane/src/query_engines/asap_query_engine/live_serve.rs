@@ -131,7 +131,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::storage_engines::sketch_db::data::AggKind;
-    use crate::storage_engines::sketch_db::index::{Capability, SketchInstanceMetadata};
+    use crate::storage_engines::sketch_db::index::{Capability, SummarySeriesMetadata};
 
     #[test]
     fn flag_off_spellings_disable_live_serve() {
@@ -149,7 +149,7 @@ mod tests {
     fn formal_range_plan_returns_exact_requested_steps() {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(901);
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 9,
             metric_name: "bytes".into(),
             group_by_keys: std::collections::BTreeSet::new(),

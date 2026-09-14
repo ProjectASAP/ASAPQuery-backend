@@ -341,19 +341,18 @@ pub fn collect_metric_to_family(
         // by several capabilities accumulates several families, so its
         // samples fan into each per-family pipeline at the agent and the
         // backend serves every (metric, capability) the workload needs.
-        for (_, workload, _wc) in workload_store.get_all_for_metric(&entry.metric_name) {
+        for (_, workload) in workload_store.get_all_for_metric(&entry.metric_name) {
             // If this metric declares an `item_label` (its inner
             // high-cardinality dimension, e.g. "endpoint") and the
             // parsed query's own label filters name a value for it (e.g.
             // `{endpoint="checkout"}`), thread that through as the
             // `Frequency` intent's actual per-item filter -- see
             // `bind_workload_typed_with_item_filter`'s doc.
-            let item_filter = entry.item_label.as_deref().and_then(|label| {
-                workload
-                    .label_filters
-                    .get(label)
-                    .map(|v| (label, v.as_str()))
-            });
+            let filters = workload.label_filters();
+            let item_filter = entry
+                .item_label
+                .as_deref()
+                .and_then(|label| filters.get(label).map(|v| (label, v.as_str())));
             let Some(deployment_expr) =
                 crate::physical::workload_planner::bind_workload_typed_with_item_filter(
                     &workload,
@@ -404,12 +403,15 @@ pub fn collect_metric_to_grouping_labels(
         // pre-B2 semantics ("the entry the controller pre-popped first
         // wins") in the common case AND lets a multi-role metric still
         // emit a single keep_keys OTTL processor per metric.
-        if let Some((_, workload, _)) = workload_store
+        if let Some((_, workload)) = workload_store
             .get_all_for_metric(&entry.metric_name)
             .into_iter()
             .next()
         {
-            out.insert(entry.metric_name.clone(), workload.group_by_labels.clone());
+            out.insert(
+                entry.metric_name.clone(),
+                workload.group_by_labels().clone(),
+            );
         }
     }
     out
@@ -603,7 +605,7 @@ pub fn collect_cumulative_counter_metrics(
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entry in registry.entries() {
         // `derive_agg_role` reads the WorkloadEntry directly (query
-        // string + family override), not the lowered QueryWorkload, so
+        // string + family override), not the lowered RegisteredWorkload, so
         // we classify the registry entry. We still consult the
         // workload_store to confirm the metric was successfully
         // pre-populated (matching the contract of the sibling
@@ -866,24 +868,18 @@ mod runtime_tests {
     // Reproduces the live demo gap: 3 of 6 (HLL, CountSketch, CMS) silently
     // drop because the analyzer pre-population path doesn't propagate
     // `sketch_family_override` from the workload YAML into
-    // `QueryWorkload::sketch_type_override`.
+    // `RegisteredWorkload::sketch_type_override`.
 
     /// Mimics the pre-population loop in `main()` — turns each
-    /// `WorkloadEntry` into a `QueryWorkload` via the shared `Analyzer`.
+    /// `WorkloadEntry` into a `RegisteredWorkload` via the shared `Analyzer`.
     fn populate_store_from_registry(registry: &WorkloadRegistry, store: &WorkloadStore) {
         use crate::pipeline::Analyzer;
-        use crate::types;
         let analyzer = Analyzer::new();
         for entry in registry.entries() {
             let spec = crate::workload::query_spec_for_entry(entry);
             if let Ok(wl) = analyzer.analyze(spec) {
                 let role = crate::workload::derive_agg_role(entry);
-                store.set(
-                    &entry.metric_name,
-                    role,
-                    wl,
-                    types::WorkloadCharacteristics::default(),
-                );
+                store.set(&entry.metric_name, role, wl);
             }
         }
     }
@@ -1090,12 +1086,12 @@ mod runtime_tests {
     /// fan into three pipelines.
     ///
     /// We populate the store directly with three `(metric, role)`
-    /// `QueryWorkload`s — one per capability — so the test pins
+    /// `RegisteredWorkload`s — one per capability — so the test pins
     /// `collect_metric_to_family`'s union semantics independently of the
     /// analyzer's query-string → AggType parsing.
     #[test]
     fn collect_metric_to_family_unions_multiple_capabilities_per_metric() {
-        use crate::types::{AggType, QueryWorkload, SketchType, WorkloadCharacteristics};
+        use crate::types::{AggType, RegisteredWorkload, SketchType};
         use crate::workload::AggRole;
         use planner_types::post_asap::SketchAlgorithm;
         use std::collections::BTreeSet;
@@ -1122,35 +1118,34 @@ mod runtime_tests {
         let mk = |agg: AggType,
                   override_family: Option<SketchType>,
                   quantiles: Vec<f64>|
-         -> QueryWorkload {
-            QueryWorkload {
+         -> RegisteredWorkload {
+            crate::registered_workload::fixtures::WorkloadFixture {
                 metric_name: METRIC.to_string(),
                 label_filters: Default::default(),
                 group_by_labels: Vec::new(),
                 aggregations: vec![agg],
                 time_window: Duration::from_secs(60),
                 repeat_every: None,
-                accuracy_sla: 0.01,
+
                 accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
                 latency_sla: None,
                 sketch_type_override: override_family,
                 exact_required: false,
                 quantiles,
             }
+            .build()
         };
         // Quantile → DDSketch (explicit override valid for Quantile).
         store.set(
             METRIC,
             AggRole::Quantile,
             mk(AggType::Quantile, Some(SketchType::DDSketch), vec![0.99]),
-            WorkloadCharacteristics::default(),
         );
         // Cardinality → HLL (override valid for the Cardinality class).
         store.set(
             METRIC,
             AggRole::Count,
             mk(AggType::Cardinality, Some(SketchType::HLL), Vec::new()),
-            WorkloadCharacteristics::default(),
         );
         // Frequency → CMS. This deployment's capability catalog exposes
         // CountSketch only for TopK, so the incompatible override is ignored;
@@ -1163,7 +1158,6 @@ mod runtime_tests {
                 Some(SketchType::CountSketch),
                 Vec::new(),
             ),
-            WorkloadCharacteristics::default(),
         );
 
         let map = collect_metric_to_family(&registry, &store);
@@ -1187,7 +1181,7 @@ mod runtime_tests {
     // Pre-B3 the WorkloadEntry YAML had no way to declare grouping
     // labels — the analyzer pulled them only from PromQL `by (...)`
     // clauses. Bare `quantile_over_time(0.99, metric[30s])` carries no
-    // `by`, so `QueryWorkload.group_by_labels` ended up empty, so
+    // `by`, so `RegisteredWorkload.group_by_labels` ended up empty, so
     // `collect_metric_to_grouping_labels` returned `{metric: vec![]}`,
     // so the 5-sketch routing emitter wrote
     // `keep_keys(datapoint.attributes, [])` — stripping ALL attrs
@@ -1196,7 +1190,7 @@ mod runtime_tests {
     //
     // Post-B3 a declarative `grouping_labels: [zone]` on WorkloadEntry
     // is threaded through the pre-pop QuerySpec → analyzer →
-    // QueryWorkload.group_by_labels → collect_metric_to_grouping_labels
+    // RegisteredWorkload.group_by_labels → collect_metric_to_grouping_labels
     // → the emitter's keep_keys list. Without this round-trip the
     // end-to-end test's sid catalog stays empty-per-zone.
     #[test]
@@ -1222,7 +1216,7 @@ mod runtime_tests {
         populate_store_from_registry(&registry, &store);
 
         // The analyzer must have threaded grouping_labels into
-        // QueryWorkload.group_by_labels.
+        // RegisteredWorkload.group_by_labels.
         let map = collect_metric_to_grouping_labels(&registry, &store);
         assert_eq!(
             map.get("http_requests_total_latency_ms"),

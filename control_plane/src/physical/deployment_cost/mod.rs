@@ -97,7 +97,7 @@ pub struct PlanScore {
 /// Estimates resource costs for a given plan + workload using the provided cost table.
 pub fn score_with(
     plan: &CollectionPlan,
-    w: &QueryWorkload,
+    w: &RegisteredWorkload,
     table: &HashMap<SketchType, SketchCosts>,
 ) -> PlanScore {
     let st = &plan.agent_config.sketch_type;
@@ -126,13 +126,13 @@ pub fn score_with(
         cpu_micros_per_sample: costs.cpu_micros_per_sample,
         memory_bytes: memory,
         estimated_error: err,
-        meets_sla: matches!(w.accuracy, crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+        meets_sla: matches!(w.accuracy(), crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
             && err <= sla,
     }
 }
 
 /// Estimates resource costs for a given plan + workload.
-pub fn score(plan: &CollectionPlan, w: &QueryWorkload) -> PlanScore {
+pub fn score(plan: &CollectionPlan, w: &RegisteredWorkload) -> PlanScore {
     let table = benchmark_table();
     let st = &plan.agent_config.sketch_type;
 
@@ -164,7 +164,7 @@ pub fn score(plan: &CollectionPlan, w: &QueryWorkload) -> PlanScore {
         cpu_micros_per_sample: costs.cpu_micros_per_sample,
         memory_bytes: memory,
         estimated_error: err,
-        meets_sla: matches!(w.accuracy, crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+        meets_sla: matches!(w.accuracy(), crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
             && err <= sla,
     }
 }
@@ -233,25 +233,25 @@ impl DeploymentCostPlanner {
     ///
     /// `wc` drives the delta transmission decision: fill rate, flush rate,
     /// CPU / memory overhead, and raw vs. sketch bandwidth comparison.
-    /// Pass `None` to use conservative defaults (1 000 series, 100 Hz,
-    /// 100 B/sample, Zipf distribution, no memory budget).
-    pub fn plan(&self, w: &QueryWorkload, wc: Option<&WorkloadCharacteristics>) -> CollectionPlan {
-        if !matches!(w.accuracy, crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0) {
+    /// `None` means no usable data evidence: retain the legal rule-based plan
+    /// without estimating rate-dependent costs from fabricated defaults.
+    pub fn plan(
+        &self,
+        w: &RegisteredWorkload,
+        wc: Option<&WorkloadCharacteristics>,
+    ) -> CollectionPlan {
+        if !matches!(w.accuracy(), crate::types::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+        {
             return self.inner.plan(w);
         }
-        let default_wc;
-        let wc = match wc {
-            Some(c) => c,
-            None => {
-                default_wc = WorkloadCharacteristics::default();
-                &default_wc
-            }
+        let Some(wc) = wc else {
+            return self.inner.plan(w);
         };
 
         let table = self.cost_table();
 
         // If a specific sketch type is pinned, use it directly.
-        if let Some(st) = &w.sketch_type_override {
+        if let Some(st) = &w.deployment.sketch_type_override {
             let params = default_sketch_params(st, w.error_bound());
             let (mode, window_duration) = select_window_strategy(w);
             let mut plan = self.inner.plan(w);
@@ -263,7 +263,8 @@ impl DeploymentCostPlanner {
             return plan;
         }
 
-        let candidates = crate::physical::sketch_catalog::candidates_for_workload(&w.aggregations);
+        let candidates =
+            crate::physical::sketch_catalog::candidates_for_workload(&w.aggregations());
 
         // Start with the rule-based plan as the baseline.
         let baseline = self.inner.plan(w);
@@ -301,7 +302,7 @@ impl DeploymentCostPlanner {
 /// Runs the delta cost model and writes the decision into the plan using a provided cost table.
 fn apply_delta_decision_with(
     plan: &mut CollectionPlan,
-    w: &QueryWorkload,
+    w: &RegisteredWorkload,
     wc: &WorkloadCharacteristics,
     table: &HashMap<SketchType, SketchCosts>,
 ) {
@@ -345,21 +346,22 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    fn workload(aggs: Vec<AggType>) -> QueryWorkload {
-        QueryWorkload {
+    fn workload(aggs: Vec<AggType>) -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: "test".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: aggs,
             time_window: Duration::from_secs(300),
             repeat_every: None,
-            accuracy_sla: 0.01,
+
             accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![],
         }
+        .build()
     }
 
     fn dummy_plan(st: SketchType) -> CollectionPlan {
@@ -403,10 +405,10 @@ mod tests {
 
     #[test]
     fn ddsketch_fails_tight_sla() {
-        let w = QueryWorkload {
-            accuracy_sla: 0.001,
-            accuracy: crate::types::AccuracyTarget::Epsilon(0.001),
-            ..workload(vec![AggType::Quantile])
+        let w = {
+            let mut w = workload(vec![AggType::Quantile]);
+            w.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.001));
+            w
         };
         // Force 1% params despite tighter SLA.
         let mut plan = dummy_plan(SketchType::DDSketch);
@@ -428,18 +430,20 @@ mod tests {
 
     #[test]
     fn dim_multiplier_increases_bandwidth() {
-        let w_few = QueryWorkload {
-            group_by_labels: vec!["host".into()],
-            ..workload(vec![AggType::Quantile])
+        let w_few = {
+            let mut w = workload(vec![AggType::Quantile]);
+            w.deployment.retained_labels = vec!["host".into()];
+            w
         };
-        let w_many = QueryWorkload {
-            group_by_labels: vec![
+        let w_many = {
+            let mut w = workload(vec![AggType::Quantile]);
+            w.deployment.retained_labels = vec![
                 "host".into(),
                 "service".into(),
                 "zone".into(),
                 "region".into(),
-            ],
-            ..workload(vec![AggType::Quantile])
+            ];
+            w
         };
         let pl = DeploymentPlanCompiler::new();
         let s_few = score(&pl.plan(&w_few), &w_few);
@@ -449,10 +453,10 @@ mod tests {
 
     #[test]
     fn kll_error_formula() {
-        let w = QueryWorkload {
-            accuracy_sla: 0.02,
-            accuracy: crate::types::AccuracyTarget::Epsilon(0.02),
-            ..workload(vec![AggType::Quantile])
+        let w = {
+            let mut w = workload(vec![AggType::Quantile]);
+            w.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.02));
+            w
         };
         let mut plan = dummy_plan(SketchType::KLL);
         plan.agent_config.sketch_params = SketchParams::KLL {
@@ -471,27 +475,28 @@ mod tests {
             (AggType::Cardinality, 0.01),
             (AggType::Frequency, 0.02),
         ] {
-            let w = QueryWorkload {
-                accuracy_sla: sla,
-                accuracy: crate::types::AccuracyTarget::Epsilon(sla),
-                ..workload(vec![agg])
+            let w = {
+                let mut w = workload(vec![agg]);
+                w.set_accuracy(crate::types::AccuracyTarget::Epsilon(sla));
+                w
             };
             let plan = pl.plan(&w, None);
             let s = score(&plan, &w);
             assert!(
                 s.meets_sla,
                 "agg={} sla={sla}: plan does not meet SLA (error={})",
-                w.aggregations[0], s.estimated_error
+                w.aggregations()[0],
+                s.estimated_error
             );
         }
     }
 
     #[test]
     fn cost_model_prefers_lower_bandwidth_for_cardinality() {
-        let w = QueryWorkload {
-            accuracy_sla: 0.02,
-            accuracy: crate::types::AccuracyTarget::Epsilon(0.02),
-            ..workload(vec![AggType::Cardinality])
+        let w = {
+            let mut w = workload(vec![AggType::Cardinality]);
+            w.set_accuracy(crate::types::AccuracyTarget::Epsilon(0.02));
+            w
         };
         let plan = DeploymentCostPlanner::new().plan(&w, None);
         assert_eq!(

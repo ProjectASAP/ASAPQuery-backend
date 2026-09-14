@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::physical::{compiler::BackendLocalPlanningSnapshot, erp::ErpShapeObserver};
+use control_plane::physical::{compiler::BackendLocalPlanningInput, erp::ErpShapeObserver};
 
 fn measured_profiles(raw: &[f64]) -> Value {
     let mut records = Vec::new();
@@ -102,9 +102,8 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
             ),
             control_plane::physical::erp::ErpParameterDecision::Empirical { .. }
         ));
-        let snapshot: BackendLocalPlanningSnapshot =
-            serde_json::from_value(fixture.clone()).unwrap();
-        let plan = quote_snapshot_for_test(snapshot).compile().unwrap();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture.clone()).unwrap();
+        let plan = quote_snapshot_for_test(snapshot).compile_promql().unwrap();
         assert_eq!(
             plan.precompute_plan.materializations.len(),
             1,

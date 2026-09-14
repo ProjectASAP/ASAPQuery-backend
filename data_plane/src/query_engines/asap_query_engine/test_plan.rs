@@ -3,10 +3,10 @@
 
 use super::engine::ASAPQueryEngine;
 use crate::drivers::query::servers::http::{
-    build_active_physical_plan, PhysicalPlanInstallRequest,
+    validate_and_build_runtime_plan, PhysicalPlanInstallRequest,
 };
 use crate::storage_engines::sketch_db::index::SketchStore;
-use crate::storage_engines::types::{BackendStorageRouting, HotReloadActivePhysicalPlan};
+use crate::storage_engines::types::{ActivePhysicalPlanHandle, BackendStorageRouting};
 use asap_types::precompute_plan::{PlanEnvelope, PrecomputePlan, BACKEND_COMPAT};
 use asap_types::query_plan::*;
 use asap_types::PrecomputeMaterialization;
@@ -83,7 +83,7 @@ pub(super) fn install(
     index: &SketchStore,
     configs: &[(PrecomputeMaterialization, Vec<u64>)],
     entries: Vec<QueryPlanEntry>,
-) -> HotReloadActivePhysicalPlan {
+) -> ActivePhysicalPlanHandle {
     let envelope = PlanEnvelope {
         plan_id: 1,
         plan_version: 1,
@@ -101,7 +101,7 @@ pub(super) fn install(
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), materializations, &["fixture".into()]).unwrap();
     precompute.summary_catalog = Some(catalog.reference().unwrap());
-    let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
+    let mut transmission = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute,
         &BTreeMap::new(),
@@ -118,7 +118,7 @@ pub(super) fn install(
             index.register(metadata);
         }
     }
-    let active = build_active_physical_plan(
+    let active = validate_and_build_runtime_plan(
         PhysicalPlanInstallRequest {
             summary_catalog: catalog,
             collector_plans: vec![],
@@ -139,7 +139,7 @@ pub(super) fn install(
         Arc::new(BackendStorageRouting::empty()),
     )
     .unwrap();
-    HotReloadActivePhysicalPlan::new(active)
+    ActivePhysicalPlanHandle::new(active)
 }
 
 pub(super) fn engine(

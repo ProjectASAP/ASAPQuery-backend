@@ -1,6 +1,6 @@
 use super::compiler::{
     derived_window_cost, gcd, retained_state_count, CollectorMaterialization,
-    MaterializationLifecycleEstimate, PlanningRequest, RuntimeRulePolicy,
+    MaterializationLifecycleEstimate, PhysicalCompilationRequest, RuntimeRulePolicy,
 };
 use asap_types::WindowMaterializationLayout;
 use planner_types::post_asap::{PostAsapNodeId, SummaryWindowFramework};
@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Only raw additive states are eligible; derived cohorts retain their full-window identity.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn share_additive_panes(
-    request: &PlanningRequest,
+    request: &PhysicalCompilationRequest,
     materializations: &mut [asap_types::PrecomputeMaterialization],
     producers: &mut Vec<CollectorMaterialization>,
     plan_producers: &mut [CollectorMaterialization],
@@ -62,11 +62,10 @@ pub(super) fn share_additive_panes(
         // Provenance belongs to the selected layout, not to its request entry point.
         if consumers.iter().any(|index| {
             !request.queries[*index]
-                .window_implementations
+                .window_realization_candidates
                 .iter()
                 .any(|candidate| {
-                    candidate.implementation_id == estimate.window_implementation_id
-                        && candidate.derived
+                    candidate.realization_id == estimate.window_realization_id && candidate.derived
                 })
         }) {
             continue;
@@ -74,12 +73,12 @@ pub(super) fn share_additive_panes(
         let Some(policy) = policies.get(&old) else {
             continue;
         };
-        let mut lifecycle = query.lifecycle.clone();
+        let mut lifecycle = query.summary_lifecycle_inputs.clone();
         lifecycle.evaluation_interval_ms = 0;
         if consumers.iter().any(|index| {
-            let mut other = request.queries[*index].lifecycle.clone();
+            let mut other = request.queries[*index].summary_lifecycle_inputs.clone();
             other.evaluation_interval_ms = 0;
-            other != lifecycle || request.queries[*index].accuracy != query.accuracy
+            other != lifecycle || request.queries[*index].accuracy_target != query.accuracy_target
         }) {
             continue;
         }
@@ -95,7 +94,7 @@ pub(super) fn share_additive_panes(
             canonical.policy_fingerprint(),
             serde_json::to_string(&lifecycle).unwrap(),
             serde_json::to_string(policy).unwrap(),
-            serde_json::to_string(&query.accuracy).unwrap(),
+            serde_json::to_string(&query.accuracy_target).unwrap(),
         );
         let index = physical.len();
         if let Some(group) = groups.iter_mut().find(|group| keys[group[0]] == key) {
@@ -131,7 +130,7 @@ pub(super) fn share_additive_panes(
         let mut canonical = physical[group.members[0]].1.clone();
         canonical.num_aggregates_to_retain = Some(retained_state_count(
             group.lookback_ms,
-            request.query_staleness_margin_ms,
+            request.query_retention_margin_ms,
             canonical.slide_interval * 1000,
             &canonical.window_layout,
         ));
@@ -157,7 +156,7 @@ pub(super) fn share_additive_panes(
         combined.expected_reads = 0.0;
         combined.expected_updates = 0.0;
         combined.lifecycle_cost = group.cost;
-        combined.window_implementation_id = format!("shared-pane-{}", new.0);
+        combined.window_realization_id = format!("shared-pane-{}", new.0);
         for index in group.members {
             let old = physical[index].0;
             if let Some(estimate) = estimates.remove(&old) {
@@ -199,7 +198,7 @@ pub(super) fn share_additive_panes(
             producer.window_layout = canonical.window_layout.clone();
             producer.pane_origin_ms = canonical.pane_origin_ms;
             producer.abstract_window_framework = SummaryWindowFramework::Tumbling;
-            producer.window_implementation_id = estimates[&new].window_implementation_id.clone();
+            producer.window_realization_id = estimates[&new].window_realization_id.clone();
         }
     }
     let mut seen = BTreeSet::new();
@@ -216,7 +215,7 @@ struct SharedGroup {
 }
 
 fn select_shared_groups(
-    request: &PlanningRequest,
+    request: &PhysicalCompilationRequest,
     physical: &[(
         asap_types::PolicyFingerprint,
         asap_types::PrecomputeMaterialization,
@@ -257,14 +256,14 @@ fn select_shared_groups(
             let (old, m) = &physical[index];
             let consumers = &member_consumers[index];
             let query = &request.queries[*consumers.first().unwrap()];
-            let selected_id = &estimates[old].window_implementation_id;
+            let selected_id = &estimates[old].window_realization_id;
             let template = &query
-                .window_implementations
+                .window_realization_candidates
                 .iter()
-                .find(|candidate| &candidate.implementation_id == selected_id)
+                .find(|candidate| &candidate.realization_id == selected_id)
                 .unwrap()
                 .cost;
-            let mut maintenance = query.lifecycle.clone();
+            let mut maintenance = query.summary_lifecycle_inputs.clone();
             maintenance.costs.read = 0.0;
             independent += derived_window_cost(
                 template,
@@ -272,7 +271,7 @@ fn select_shared_groups(
                 m.window_size,
                 m.slide_interval,
                 &m.window_layout,
-                request.query_staleness_margin_ms,
+                request.query_retention_margin_ms,
             )
             .weighted_cost;
             producer = producer.max(
@@ -282,12 +281,12 @@ fn select_shared_groups(
                     m.window_size,
                     m.slide_interval,
                     &WindowMaterializationLayout::Pane { pane_secs },
-                    request.query_staleness_margin_ms,
+                    request.query_retention_margin_ms,
                 )
                 .weighted_cost,
             );
             for &consumer in consumers {
-                let lifecycle = &request.queries[consumer].lifecycle;
+                let lifecycle = &request.queries[consumer].summary_lifecycle_inputs;
                 let unit_reads = lifecycle.costs.read * lifecycle.horizon_seconds
                     / (f64::from(lifecycle.evaluation_interval_ms) / 1_000.0);
                 independent +=

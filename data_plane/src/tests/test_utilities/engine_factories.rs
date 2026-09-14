@@ -21,14 +21,14 @@ use std::collections::HashMap;
 /// Each factory gets its own resolver instance; tests are isolated so
 /// the `next_sid = 1, 2, ...` counter doesn't bleed between fixtures.
 fn ingest_with_fresh_resolver(
-    sketch_index: &crate::storage_engines::sketch_db::index::SketchStore,
+    summary_store: &crate::storage_engines::sketch_db::index::SketchStore,
     resolver: &std::sync::Arc<SeriesIdResolver>,
     agg_cfg: &AggregationConfig,
     output: &PrecomputedOutput,
     accumulator: &dyn AggregateCore,
 ) -> Option<u64> {
     let resolver = resolver.clone();
-    sketch_index.ingest_precompute_for_agg_config(
+    summary_store.ingest_precompute_for_agg_config(
         |m, fp, ak| resolver.resolve(m, fp, ak),
         agg_cfg,
         output,
@@ -88,7 +88,7 @@ pub fn create_engine_single_pop_with_aggregated(
         .cloned()
         .collect();
 
-    let mut aggregation_configs = HashMap::new();
+    let mut materializations_by_policy_fingerprint = HashMap::new();
     let agg_config = AggregationConfig {
         population_key_encoding: Default::default(),
         aggregation_type,
@@ -116,15 +116,15 @@ pub fn create_engine_single_pop_with_aggregated(
         value_source_column: None,
     };
     let agg_id = agg_config.policy_fp_u64();
-    aggregation_configs.insert(agg_id, agg_config);
+    materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
-        aggregation_configs,
+        materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
         monitors: Vec::new(),
     });
 
-    let sketch_index =
+    let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
 
@@ -142,10 +142,10 @@ pub fn create_engine_single_pop_with_aggregated(
             key,
             asap_types::PolicyFingerprint(agg_id),
         );
-        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg, &output, acc.as_ref());
     }
 
-    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
 }
 
 /// Build a test engine with separate value and key aggregations. Each input
@@ -172,7 +172,7 @@ pub fn create_engine_dual_input(
         .cloned()
         .collect();
 
-    let mut aggregation_configs = HashMap::new();
+    let mut materializations_by_policy_fingerprint = HashMap::new();
 
     // Value aggregation
     let value_agg_config = AggregationConfig {
@@ -202,7 +202,7 @@ pub fn create_engine_dual_input(
         value_source_column: None,
     };
     let value_id = value_agg_config.policy_fp_u64();
-    aggregation_configs.insert(value_id, value_agg_config);
+    materializations_by_policy_fingerprint.insert(value_id, value_agg_config);
 
     // Keys aggregation
     let keys_agg_config = AggregationConfig {
@@ -232,15 +232,15 @@ pub fn create_engine_dual_input(
         value_source_column: None,
     };
     let keys_id = keys_agg_config.policy_fp_u64();
-    aggregation_configs.insert(keys_id, keys_agg_config);
+    materializations_by_policy_fingerprint.insert(keys_id, keys_agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
-        aggregation_configs,
+        materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
         monitors: Vec::new(),
     });
 
-    let sketch_index =
+    let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
 
@@ -261,7 +261,7 @@ pub fn create_engine_dual_input(
             key,
             asap_types::PolicyFingerprint(value_id),
         );
-        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_1, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_1, &output, acc.as_ref());
     }
     for (label_values_opt, acc) in keys_data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
@@ -271,10 +271,10 @@ pub fn create_engine_dual_input(
             key,
             asap_types::PolicyFingerprint(keys_id),
         );
-        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
 
-    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
 }
 
 /// Creates a ASAPQueryEngine with two independent metrics, each with their own
@@ -298,7 +298,7 @@ pub fn create_engine_two_metrics(
     let labels_a: Vec<String> = grouping_labels_a.iter().map(|s| s.to_string()).collect();
     let labels_b: Vec<String> = grouping_labels_b.iter().map(|s| s.to_string()).collect();
 
-    let mut aggregation_configs = HashMap::new();
+    let mut materializations_by_policy_fingerprint = HashMap::new();
 
     let agg_config_a = AggregationConfig {
         population_key_encoding: Default::default(),
@@ -327,7 +327,7 @@ pub fn create_engine_two_metrics(
         value_source_column: None,
     };
     let id_a = agg_config_a.policy_fp_u64();
-    aggregation_configs.insert(id_a, agg_config_a);
+    materializations_by_policy_fingerprint.insert(id_a, agg_config_a);
 
     let agg_config_b = AggregationConfig {
         population_key_encoding: Default::default(),
@@ -356,15 +356,15 @@ pub fn create_engine_two_metrics(
         value_source_column: None,
     };
     let id_b = agg_config_b.policy_fp_u64();
-    aggregation_configs.insert(id_b, agg_config_b);
+    materializations_by_policy_fingerprint.insert(id_b, agg_config_b);
 
     let streaming_config = Arc::new(StreamingConfig {
-        aggregation_configs,
+        materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
         monitors: Vec::new(),
     });
 
-    let sketch_index =
+    let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg_1 = streaming_config
@@ -384,7 +384,7 @@ pub fn create_engine_two_metrics(
             key,
             asap_types::PolicyFingerprint(id_a),
         );
-        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_1, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_1, &output, acc.as_ref());
     }
     for (label_values_opt, acc) in data_b {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
@@ -394,10 +394,10 @@ pub fn create_engine_two_metrics(
             key,
             asap_types::PolicyFingerprint(id_b),
         );
-        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
     let _ = (query_a, query_b);
-    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
 }
 
 /// Creates a ASAPQueryEngine with three independent metrics, each with their own
@@ -426,7 +426,7 @@ pub fn create_engine_three_metrics(
     let labels_b: Vec<String> = grouping_labels_b.iter().map(|s| s.to_string()).collect();
     let labels_c: Vec<String> = grouping_labels_c.iter().map(|s| s.to_string()).collect();
 
-    let mut aggregation_configs = HashMap::new();
+    let mut materializations_by_policy_fingerprint = HashMap::new();
     let mut ids: Vec<u64> = Vec::new();
 
     for (agg_type, labels, metric) in [
@@ -462,16 +462,16 @@ pub fn create_engine_three_metrics(
         };
         let id = cfg.policy_fp_u64();
         ids.push(id);
-        aggregation_configs.insert(id, cfg);
+        materializations_by_policy_fingerprint.insert(id, cfg);
     }
 
     let streaming_config = Arc::new(StreamingConfig {
-        aggregation_configs,
+        materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
         monitors: Vec::new(),
     });
 
-    let sketch_index =
+    let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfgs: Vec<_> = ids
@@ -495,12 +495,12 @@ pub fn create_engine_three_metrics(
                 key,
                 asap_types::PolicyFingerprint(agg_id),
             );
-            ingest_with_fresh_resolver(&sketch_index, &resolver, agg_cfg, &output, acc.as_ref());
+            ingest_with_fresh_resolver(&summary_store, &resolver, agg_cfg, &output, acc.as_ref());
         }
     }
 
     let _ = (labels_a, labels_b, labels_c, query_a, query_b, query_c);
-    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps for testing merge.
@@ -515,7 +515,7 @@ pub fn create_engine_multi_timestamp(
     let grouping_label_strings: Vec<String> =
         grouping_labels.iter().map(|s| s.to_string()).collect();
 
-    let mut aggregation_configs = HashMap::new();
+    let mut materializations_by_policy_fingerprint = HashMap::new();
     let agg_config = AggregationConfig {
         population_key_encoding: Default::default(),
         aggregation_type,
@@ -543,15 +543,15 @@ pub fn create_engine_multi_timestamp(
         value_source_column: None,
     };
     let agg_id = agg_config.policy_fp_u64();
-    aggregation_configs.insert(agg_id, agg_config);
+    materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
-        aggregation_configs,
+        materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
         monitors: Vec::new(),
     });
 
-    let sketch_index =
+    let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg = streaming_config
@@ -566,9 +566,9 @@ pub fn create_engine_multi_timestamp(
             key,
             asap_types::PolicyFingerprint(agg_id),
         );
-        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg, &output, acc.as_ref());
     }
-    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps and configurable window.
@@ -589,7 +589,7 @@ pub fn create_engine_multi_timestamp_with_window(
     let grouping_label_strings: Vec<String> =
         grouping_labels.iter().map(|s| s.to_string()).collect();
 
-    let mut aggregation_configs = HashMap::new();
+    let mut materializations_by_policy_fingerprint = HashMap::new();
     let agg_config = AggregationConfig {
         population_key_encoding: Default::default(),
         aggregation_type,
@@ -617,15 +617,15 @@ pub fn create_engine_multi_timestamp_with_window(
         value_source_column: None,
     };
     let agg_id = agg_config.policy_fp_u64();
-    aggregation_configs.insert(agg_id, agg_config);
+    materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
-        aggregation_configs,
+        materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
         monitors: Vec::new(),
     });
 
-    let sketch_index =
+    let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg = streaming_config
@@ -640,7 +640,7 @@ pub fn create_engine_multi_timestamp_with_window(
             key,
             asap_types::PolicyFingerprint(agg_id),
         );
-        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg, &output, acc.as_ref());
     }
-    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
 }

@@ -124,6 +124,107 @@ impl ClickHouseHttpServer {
     }
 }
 
+fn request(
+    method: Method,
+    params: HashMap<String, String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<ClickHouseQueryRequest, Response> {
+    let parameters: BTreeMap<_, _> = params.into_iter().collect();
+    let sql = parameters
+        .get("query")
+        .cloned()
+        .or_else(|| String::from_utf8(body.to_vec()).ok())
+        .unwrap_or_default();
+    if sql.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "missing query").into_response());
+    }
+    Ok(ClickHouseQueryRequest {
+        method,
+        sql,
+        body,
+        parameters,
+        headers,
+    })
+}
+
+async fn query_get(
+    State(state): State<ServerState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let request = match request(Method::GET, params, headers, Bytes::new()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    execute_or_fallback(&state, &request).await
+}
+
+async fn query_post(
+    State(state): State<ServerState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request = match request(Method::POST, params, headers, body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    execute_or_fallback(&state, &request).await
+}
+
+async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryRequest) -> Response {
+    match state.accelerator.execute(request).await {
+        ClickHouseAccelerationOutcome::Accelerated(response) => {
+            let mut response = raw_response(response);
+            response
+                .headers_mut()
+                .entry("x-asap-execution")
+                .or_insert(axum::http::HeaderValue::from_static("warm"));
+            response
+                .headers_mut()
+                .entry("x-asap-execution-detail")
+                .or_insert(axum::http::HeaderValue::from_static("asap"));
+            response
+        }
+        ClickHouseAccelerationOutcome::Fallback(reason) => {
+            tracing::info!(
+                failure_stage = reason.stage(),
+                failure_reason = reason.reason_code(),
+                failure_detail = ?reason,
+                "ClickHouse acceleration routed to exact fallback"
+            );
+            let stage = reason.stage();
+            let reason = reason.reason_code();
+            return match state.fallback.execute(request).await {
+                Ok(v) => {
+                    let mut response = raw_response(v);
+                    for (name, value) in [
+                        ("x-asap-execution", "exact_fallback"),
+                        ("x-asap-execution-detail", reason),
+                        ("x-asap-failure-stage", stage),
+                        ("x-asap-failure-reason", reason),
+                    ] {
+                        response.headers_mut().insert(
+                            axum::http::HeaderName::from_static(name),
+                            axum::http::HeaderValue::from_static(value),
+                        );
+                    }
+                    response
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+            };
+        }
+    }
+}
+
+async fn ping(State(state): State<ServerState>) -> Response {
+    match state.fallback.ping().await {
+        Ok(v) => raw_response(v),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,106 +406,5 @@ mod tests {
             assert_eq!(response.headers()["x-asap-failure-reason"], expected_detail);
             assert_eq!(*fallback.sql.lock().unwrap(), vec!["SELECT 1"]);
         }
-    }
-}
-
-fn request(
-    method: Method,
-    params: HashMap<String, String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<ClickHouseQueryRequest, Response> {
-    let parameters: BTreeMap<_, _> = params.into_iter().collect();
-    let sql = parameters
-        .get("query")
-        .cloned()
-        .or_else(|| String::from_utf8(body.to_vec()).ok())
-        .unwrap_or_default();
-    if sql.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "missing query").into_response());
-    }
-    Ok(ClickHouseQueryRequest {
-        method,
-        sql,
-        body,
-        parameters,
-        headers,
-    })
-}
-
-async fn query_get(
-    State(state): State<ServerState>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    let request = match request(Method::GET, params, headers, Bytes::new()) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    execute_or_fallback(&state, &request).await
-}
-
-async fn query_post(
-    State(state): State<ServerState>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let request = match request(Method::POST, params, headers, body) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    execute_or_fallback(&state, &request).await
-}
-
-async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryRequest) -> Response {
-    match state.accelerator.execute(request).await {
-        ClickHouseAccelerationOutcome::Accelerated(response) => {
-            let mut response = raw_response(response);
-            response
-                .headers_mut()
-                .entry("x-asap-execution")
-                .or_insert(axum::http::HeaderValue::from_static("warm"));
-            response
-                .headers_mut()
-                .entry("x-asap-execution-detail")
-                .or_insert(axum::http::HeaderValue::from_static("asap"));
-            response
-        }
-        ClickHouseAccelerationOutcome::Fallback(reason) => {
-            tracing::info!(
-                failure_stage = reason.stage(),
-                failure_reason = reason.reason_code(),
-                failure_detail = ?reason,
-                "ClickHouse acceleration routed to exact fallback"
-            );
-            let stage = reason.stage();
-            let reason = reason.reason_code();
-            return match state.fallback.execute(request).await {
-                Ok(v) => {
-                    let mut response = raw_response(v);
-                    for (name, value) in [
-                        ("x-asap-execution", "exact_fallback"),
-                        ("x-asap-execution-detail", reason),
-                        ("x-asap-failure-stage", stage),
-                        ("x-asap-failure-reason", reason),
-                    ] {
-                        response.headers_mut().insert(
-                            axum::http::HeaderName::from_static(name),
-                            axum::http::HeaderValue::from_static(value),
-                        );
-                    }
-                    response
-                }
-                Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-            };
-        }
-    }
-}
-
-async fn ping(State(state): State<ServerState>) -> Response {
-    match state.fallback.ping().await {
-        Ok(v) => raw_response(v),
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }

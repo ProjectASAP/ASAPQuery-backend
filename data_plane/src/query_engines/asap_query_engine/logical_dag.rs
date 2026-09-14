@@ -4,8 +4,8 @@ use crate::query_engines::{
     EngineError,
 };
 use crate::storage_engines::types::KeyByLabelValues;
-use asap_types::query_plan::logical::{
-    Aggregation, BinaryOperation, Grouping, LogicalOperator, TemporalOperation,
+use asap_types::query_plan::residual::{
+    Aggregation, BinaryOperation, Grouping, ResidualQueryOperator, TemporalOperation,
 };
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use std::collections::{BTreeMap, BTreeSet};
@@ -185,9 +185,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             QueryPlanNode::Logical { operator, inputs } => {
                 if matches!(
                     operator,
-                    LogicalOperator::Scan { .. }
-                        | LogicalOperator::ExactSubquery { .. }
-                        | LogicalOperator::CandidateExactSubquery { .. }
+                    ResidualQueryOperator::Scan { .. }
+                        | ResidualQueryOperator::ExactSubquery { .. }
+                        | ResidualQueryOperator::CandidateExactSubquery { .. }
                 ) {
                     return Err(miss(
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
@@ -224,7 +224,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
     }
     fn logical(
         &mut self,
-        operator: LogicalOperator,
+        operator: ResidualQueryOperator,
         inputs: &[QueryNodeId],
         at: i64,
     ) -> Result<Value, EngineError> {
@@ -235,14 +235,14 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
-            LogicalOperator::ExactSubquery { .. }
-            | LogicalOperator::CandidateExactSubquery { .. } => {
+            ResidualQueryOperator::ExactSubquery { .. }
+            | ResidualQueryOperator::CandidateExactSubquery { .. } => {
                 Err(miss("Prometheus exact leaf was not prepared"))
             }
-            LogicalOperator::Scan { .. } => {
+            ResidualQueryOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
-            LogicalOperator::UnaryNegate => match self.eval(input(0)?, at)? {
+            ResidualQueryOperator::UnaryNegate => match self.eval(input(0)?, at)? {
                 Value::Scalar(value) => Ok(Value::Scalar(-value)),
                 Value::Vector(values) => Ok(Value::Vector(
                     values
@@ -252,7 +252,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 )),
                 _ => Err(miss("cannot negate range vector")),
             },
-            LogicalOperator::VectorToScalar => {
+            ResidualQueryOperator::VectorToScalar => {
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Scalar(if values.len() == 1 {
                     values[0].1
@@ -260,18 +260,18 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                     f64::NAN
                 }))
             }
-            LogicalOperator::Aggregate {
+            ResidualQueryOperator::Aggregate {
                 operation,
                 grouping,
             } => {
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Vector(aggregate(operation, &grouping, values)))
             }
-            LogicalOperator::TopKSelection { k, grouping } => {
+            ResidualQueryOperator::TopKSelection { k, grouping } => {
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Vector(topk_selection(k, &grouping, values)))
             }
-            LogicalOperator::Binary {
+            ResidualQueryOperator::Binary {
                 operation,
                 return_bool,
             } => {
@@ -279,7 +279,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 let right = self.eval(input(1)?, at)?;
                 binary(operation, return_bool, left, right)
             }
-            LogicalOperator::Temporal { operation } => {
+            ResidualQueryOperator::Temporal { operation } => {
                 let Value::Matrix(values, start, end) = self.eval(input(0)?, at)? else {
                     return Err(miss("temporal operator requires range vector"));
                 };
@@ -340,7 +340,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         .collect(),
                 ))
             }
-            LogicalOperator::Sort { descending } => {
+            ResidualQueryOperator::Sort { descending } => {
                 let mut values = vector(self.eval(input(0)?, at)?)?;
                 values.sort_by(|a, b| {
                     if a.1.is_nan() && b.1.is_nan() {
@@ -357,7 +357,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 });
                 Ok(Value::Vector(values))
             }
-            LogicalOperator::HistogramQuantile => {
+            ResidualQueryOperator::HistogramQuantile => {
                 let Value::Scalar(quantile) = self.eval(input(0)?, at)? else {
                     return Err(miss("quantile requires scalar"));
                 };
@@ -374,7 +374,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         .collect(),
                 ))
             }
-            LogicalOperator::Subquery {
+            ResidualQueryOperator::Subquery {
                 range_ms,
                 step_ms,
                 offset_ms,
@@ -804,7 +804,7 @@ mod topk_tests {
 
     #[test]
     fn installed_topk_combines_with_prometheus_exact_child() {
-        let mut entry = control_plane::query_plan::logical::compile_logical(
+        let mut entry = control_plane::query_plan::residual::compile_logical(
             "hybrid-topk".into(),
             "topk(2, m)".into(),
             InstantExecution {
@@ -815,7 +815,7 @@ mod topk_tests {
             FallbackPolicy::ExactBackend,
         )
         .unwrap();
-        control_plane::query_plan::logical::finalize_residuals(&mut entry).unwrap();
+        control_plane::query_plan::residual::finalize_residuals(&mut entry).unwrap();
         let leaf = entry
             .nodes
             .iter()
@@ -823,7 +823,7 @@ mod topk_tests {
                 matches!(
                     node,
                     QueryPlanNode::Logical {
-                        operator: LogicalOperator::ExactSubquery { .. },
+                        operator: ResidualQueryOperator::ExactSubquery { .. },
                         ..
                     }
                 )
@@ -890,7 +890,7 @@ mod topk_tests {
                         (
                             QueryNodeId(0),
                             QueryPlanNode::Logical {
-                                operator: LogicalOperator::ExactSubquery {
+                                operator: ResidualQueryOperator::ExactSubquery {
                                     query: "m[1s]".into(),
                                 },
                                 inputs: vec![],
@@ -899,7 +899,7 @@ mod topk_tests {
                         (
                             QueryNodeId(1),
                             QueryPlanNode::Logical {
-                                operator: LogicalOperator::Temporal { operation },
+                                operator: ResidualQueryOperator::Temporal { operation },
                                 inputs: vec![QueryNodeId(0)],
                             },
                         ),
@@ -974,7 +974,7 @@ mod topk_tests {
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: LogicalOperator::TopKSelection {
+                        operator: ResidualQueryOperator::TopKSelection {
                             k: 2,
                             grouping: Grouping {
                                 labels: vec![],

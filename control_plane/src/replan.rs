@@ -33,7 +33,7 @@ use crate::physical::plan_cache::CachedDeploymentPlanner;
 use crate::physical::stage_split;
 use crate::physical::workload_planner as rules;
 use crate::store::{PlanStore, WorkloadStore};
-use crate::types::QueryWorkload;
+use crate::types::RegisteredWorkload;
 use crate::workload::AggRole;
 
 fn short_hash(s: &str) -> String {
@@ -227,12 +227,12 @@ impl Replanner {
         role: AggRole,
         agent_id: &str,
     ) -> Option<String> {
-        let (workload, _wc) = self.workload_store.get(metric, role)?;
+        let workload = self.workload_store.get(metric, role)?;
         self.try_emit_typed_edge_yaml_for_workload(&workload, agent_id)
     }
 
     /// Same as [`try_emit_typed_edge_yaml`] but takes the
-    /// `QueryWorkload` directly. Used by `replan_metric` which already
+    /// `RegisteredWorkload` directly. Used by `replan_metric` which already
     /// has the workload in scope.
     ///
     /// `agent_id` is threaded into the emitted opamp `X-Agent-ID` header
@@ -240,7 +240,7 @@ impl Replanner {
     /// pass `"$AGENT_ID"` and rely on the agent container's env.
     fn try_emit_typed_edge_yaml_for_workload(
         &self,
-        workload: &QueryWorkload,
+        workload: &RegisteredWorkload,
         agent_id: &str,
     ) -> Option<String> {
         let deployment_expr = rules::bind_workload_typed(workload)?;
@@ -426,7 +426,7 @@ impl Replanner {
             return false;
         }
         let mut any = false;
-        for (role, _, _) in pairs {
+        for (role, _) in pairs {
             if self.replan_metric_role(metric, role).await {
                 any = true;
             }
@@ -437,7 +437,7 @@ impl Replanner {
     /// Re-plans a single `(metric, role)` pair and pushes updated configs.
     /// Returns `true` on success, `false` if the pair is unknown.
     pub async fn replan_metric_role(&self, metric: &str, role: AggRole) -> bool {
-        let Some((workload, wc)) = self.workload_store.get(metric, role) else {
+        let Some(workload) = self.workload_store.get(metric, role) else {
             warn!(metric, role = %role, "replan requested but workload not found in store");
             return false;
         };
@@ -448,7 +448,8 @@ impl Replanner {
         // previously established baseline — the whole point of a re-plan is to
         // re-optimise with current EMA data.
         self.planner.reset(metric);
-        let plan = self.planner.plan(&workload, Some(&wc));
+
+        let plan = self.planner.plan(&workload);
         self.plan_store.set(metric, role, plan.clone());
 
         // Push agent config only to agents registered for this specific
@@ -582,7 +583,7 @@ impl Replanner {
     /// return `No result for query`.
     fn build_backend_stage_config(
         &self,
-        workload: &QueryWorkload,
+        workload: &RegisteredWorkload,
         role: AggRole,
     ) -> Option<BackendStageConfig> {
         // ── Typed sketch path (Quantile / Cardinality / TopK / Frequency) ──
@@ -597,7 +598,7 @@ impl Replanner {
                     // through `extract_edge_facts` fails, and always leaves
                     // `grouping` empty (`QueryExpr::Aggregate.by` is positional
                     // `ColumnId`s with no label-name resolution today). The
-                    // `QueryWorkload` carries both unambiguously, and every
+                    // `RegisteredWorkload` carries both unambiguously, and every
                     // aggregation under one workload shares them.
                     // Per-metric item_label (the high-card dimension a CMS/CountSketch
                     // hashes): threaded into the policy params so the data-plane ingest
@@ -611,12 +612,12 @@ impl Replanner {
                         .unwrap_or_default();
                     for agg in &mut be.aggregations {
                         if agg.metric_name.is_empty() {
-                            agg.metric_name = workload.metric_name.clone();
+                            agg.metric_name = workload.metric_name().clone();
                         }
                         if agg.window_secs == 0 {
-                            agg.window_secs = workload.time_window.as_secs();
+                            agg.window_secs = workload.time_window().as_secs();
                         }
-                        agg.grouping = workload.group_by_labels.clone();
+                        agg.grouping = workload.group_by_labels().clone();
                         agg.item_label = item_labels.get(&agg.metric_name).cloned();
                     }
                     return Some(be);
@@ -666,17 +667,17 @@ impl Replanner {
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
         use planner_types::post_asap::SummaryFamilyType;
-        let window_secs = workload.time_window.as_secs().max(1);
+        let window_secs = workload.time_window().as_secs().max(1);
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 item_label: None,
                 heap_update_mode: None,
-                aggregation_id: format!("exact-{}-{}", workload.metric_name, role),
-                metric_name: workload.metric_name.clone(),
+                aggregation_id: format!("exact-{}-{}", workload.metric_name(), role),
+                metric_name: workload.metric_name().clone(),
                 family: SummaryFamilyType::ExactAggregate(exact_kind, exact_params),
                 window_secs,
                 spatial_filter: String::new(),
-                grouping: workload.group_by_labels.clone(),
+                grouping: workload.group_by_labels().clone(),
                 // ExactAgg consumes raw values at the backend (the agent
                 // ships counter samples; the backend's
                 // SumAccumulator integrates them).
@@ -886,21 +887,22 @@ mod tests {
         ))
     }
 
-    fn test_workload(metric: &str) -> (QueryWorkload, WorkloadCharacteristics) {
-        let wl = QueryWorkload {
+    fn test_workload(metric: &str) -> (RegisteredWorkload, WorkloadCharacteristics) {
+        let wl = crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: metric.into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: vec![AggType::Quantile],
             time_window: Duration::from_secs(300),
             repeat_every: None,
-            accuracy_sla: 0.01,
+
             accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![],
-        };
+        }
+        .build();
         (wl, WorkloadCharacteristics::default())
     }
 
@@ -944,8 +946,8 @@ mod tests {
     #[tokio::test]
     async fn replan_known_metric_updates_plan_store() {
         let r = make_replanner();
-        let (wl, wc) = test_workload("latency");
-        r.workload_store.set("latency", AggRole::Quantile, wl, wc);
+        let (wl, _wc) = test_workload("latency");
+        r.workload_store.set("latency", AggRole::Quantile, wl);
         r.plan_store.set("latency", AggRole::Quantile, make_plan());
 
         let ok = r.replan_metric("latency").await;
@@ -958,8 +960,8 @@ mod tests {
     #[tokio::test]
     async fn replan_expired_replans_only_expired() {
         let r = make_replanner();
-        let (wl, wc) = test_workload("old");
-        r.workload_store.set("old", AggRole::Quantile, wl, wc);
+        let (wl, _wc) = test_workload("old");
+        r.workload_store.set("old", AggRole::Quantile, wl);
 
         // Insert an already-expired plan.
         let mut expired_plan = make_plan();
@@ -967,8 +969,8 @@ mod tests {
         r.plan_store.set("old", AggRole::Quantile, expired_plan);
 
         // Insert a still-active plan for "active".
-        let (awl, awc) = test_workload("active");
-        r.workload_store.set("active", AggRole::Quantile, awl, awc);
+        let (awl, _awc) = test_workload("active");
+        r.workload_store.set("active", AggRole::Quantile, awl);
         r.plan_store.set("active", AggRole::Quantile, make_plan());
 
         r.replan_expired().await;
@@ -981,8 +983,8 @@ mod tests {
     #[tokio::test]
     async fn register_then_violation_replans_correct_metric() {
         let r = make_replanner();
-        let (wl, wc) = test_workload("req_rate");
-        r.workload_store.set("req_rate", AggRole::Quantile, wl, wc);
+        let (wl, _wc) = test_workload("req_rate");
+        r.workload_store.set("req_rate", AggRole::Quantile, wl);
         r.plan_store.set("req_rate", AggRole::Quantile, make_plan());
 
         r.register_agent("agent-1", "req_rate", AggRole::Quantile)
@@ -1011,15 +1013,13 @@ mod tests {
     #[tokio::test]
     async fn replan_multi_role_metric_updates_both_plans() {
         let r = make_replanner();
-        let (wl_q, wc_q) = test_workload("http_requests_total");
-        let mut wl_s = wl_q.clone();
-        wl_s.aggregations = vec![AggType::Quantile]; // analyzer-shaped (test fixture)
-        let wc_s = wc_q.clone();
+        let (wl_q, _wc_q) = test_workload("http_requests_total");
+        let wl_s = wl_q.clone();
 
         r.workload_store
-            .set("http_requests_total", AggRole::Quantile, wl_q, wc_q);
+            .set("http_requests_total", AggRole::Quantile, wl_q);
         r.workload_store
-            .set("http_requests_total", AggRole::Sum, wl_s, wc_s);
+            .set("http_requests_total", AggRole::Sum, wl_s);
         r.plan_store
             .set("http_requests_total", AggRole::Quantile, make_plan());
         r.plan_store
@@ -1047,10 +1047,9 @@ mod tests {
     #[tokio::test]
     async fn replan_metric_role_only_touches_target_role() {
         let r = make_replanner();
-        let (wl, wc) = test_workload("m");
-        r.workload_store
-            .set("m", AggRole::Quantile, wl.clone(), wc.clone());
-        r.workload_store.set("m", AggRole::Sum, wl, wc);
+        let (wl, _wc) = test_workload("m");
+        r.workload_store.set("m", AggRole::Quantile, wl.clone());
+        r.workload_store.set("m", AggRole::Sum, wl);
 
         // Make the Sum-role plan expired and Quantile plan fresh.
         let mut sum_plan = make_plan();
@@ -1077,10 +1076,9 @@ mod tests {
     #[tokio::test]
     async fn agent_serving_multiple_roles_triggers_per_role_replan() {
         let r = make_replanner();
-        let (wl, wc) = test_workload("m");
-        r.workload_store
-            .set("m", AggRole::Quantile, wl.clone(), wc.clone());
-        r.workload_store.set("m", AggRole::Sum, wl, wc);
+        let (wl, _wc) = test_workload("m");
+        r.workload_store.set("m", AggRole::Quantile, wl.clone());
+        r.workload_store.set("m", AggRole::Sum, wl);
         r.plan_store.set("m", AggRole::Quantile, make_plan());
         r.plan_store.set("m", AggRole::Sum, make_plan());
 
@@ -1131,8 +1129,8 @@ mod tests {
         let _env = EnvVarGuard::set("USE_TYPED_STAGE_SPLIT", "1");
 
         let r = make_replanner();
-        let (wl, wc) = test_workload("latency");
-        r.workload_store.set("latency", AggRole::Quantile, wl, wc);
+        let (wl, _wc) = test_workload("latency");
+        r.workload_store.set("latency", AggRole::Quantile, wl);
         r.plan_store.set("latency", AggRole::Quantile, make_plan());
 
         let yaml = r
@@ -1185,8 +1183,8 @@ mod tests {
         let _env = EnvVarGuard::unset("USE_TYPED_STAGE_SPLIT");
 
         let r = make_replanner();
-        let (wl, wc) = test_workload("latency");
-        r.workload_store.set("latency", AggRole::Quantile, wl, wc);
+        let (wl, _wc) = test_workload("latency");
+        r.workload_store.set("latency", AggRole::Quantile, wl);
         r.plan_store.set("latency", AggRole::Quantile, make_plan());
 
         // Drive the legacy emitter directly — same code

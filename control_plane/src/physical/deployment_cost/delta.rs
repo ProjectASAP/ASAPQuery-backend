@@ -129,12 +129,12 @@ pub fn delta_benchmark_table() -> HashMap<SketchType, DeltaCosts> {
 /// A shorter flush period means:
 ///   • fewer inserts accumulate per period  → lower fill rate → better delta
 ///   • more flushes per second              → higher total CPU overhead
-pub fn flush_period_secs(plan: &CollectionPlan, w: &QueryWorkload) -> f64 {
+pub fn flush_period_secs(plan: &CollectionPlan, w: &RegisteredWorkload) -> f64 {
     if let Some(wd) = plan.agent_config.window_duration {
         return wd.as_secs_f64();
     }
     // Batch mode: use repeat_every as a proxy for the batch arrival interval.
-    w.repeat_every
+    w.repeat_every()
         .unwrap_or(Duration::from_secs(1))
         .as_secs_f64()
         .max(0.001) // guard against zero
@@ -196,7 +196,7 @@ fn estimate_distinct_keys(inserts_per_flush: f64, wc: &WorkloadCharacteristics) 
 pub fn estimate_fill_rate(
     wc: &WorkloadCharacteristics,
     plan: &CollectionPlan,
-    w: &QueryWorkload,
+    w: &RegisteredWorkload,
 ) -> f64 {
     let flush_secs = flush_period_secs(plan, w);
     let inserts_per_flush = wc.samples_per_sec_per_series * wc.series_count as f64 * flush_secs;
@@ -313,7 +313,7 @@ pub const RAW_PASSTHROUGH_SAMPLE_RATE_THRESHOLD: f64 = 10.0;
 ///   7. Otherwise → UseDelta.
 pub fn decide_delta(
     plan: &CollectionPlan,
-    w: &QueryWorkload,
+    w: &RegisteredWorkload,
     wc: &WorkloadCharacteristics,
     bytes_per_series_per_sec: f64,
 ) -> (DeltaDecision, TransmissionCostSummary) {
@@ -474,21 +474,22 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
 
-    fn workload_for(agg: AggType) -> QueryWorkload {
-        QueryWorkload {
+    fn workload_for(agg: AggType) -> RegisteredWorkload {
+        crate::registered_workload::fixtures::WorkloadFixture {
             metric_name: "m".into(),
             label_filters: HashMap::new(),
             group_by_labels: vec![],
             aggregations: vec![agg],
             time_window: Duration::from_secs(300),
             repeat_every: Some(Duration::from_secs(10)),
-            accuracy_sla: 0.01,
+
             accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
             quantiles: vec![],
         }
+        .build()
     }
 
     fn make_plan(st: SketchType, window: Option<Duration>) -> CollectionPlan {
@@ -549,7 +550,7 @@ mod tests {
     #[test]
     fn flush_period_uses_repeat_every_in_batch_mode() {
         let mut w = workload_for(AggType::Frequency);
-        w.repeat_every = Some(Duration::from_secs(15));
+        w.set_repeat_every(Some(Duration::from_secs(15)));
         let plan = make_plan(SketchType::CountMinSketch, None);
         assert_eq!(flush_period_secs(&plan, &w), 15.0);
     }
@@ -557,7 +558,7 @@ mod tests {
     #[test]
     fn flush_period_batch_fallback_is_one_second() {
         let mut w = workload_for(AggType::Frequency);
-        w.repeat_every = None;
+        w.set_repeat_every(None);
         let plan = make_plan(SketchType::CountMinSketch, None);
         assert_eq!(flush_period_secs(&plan, &w), 1.0);
     }

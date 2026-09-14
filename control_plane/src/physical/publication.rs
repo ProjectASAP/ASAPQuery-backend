@@ -1,9 +1,9 @@
 //! Control-plane construction of the shared catalog publication contract.
-use super::compiler::PhysicalPlan;
+use super::compiler::CompiledPhysicalPlan;
 pub use asap_types::plan_publication::{PhysicalPlanInstallRequest, PhysicalPlanPublication};
 
-impl PhysicalPlan {
-    pub fn publication(&self) -> Result<PhysicalPlanPublication, String> {
+impl CompiledPhysicalPlan {
+    pub fn to_publication_artifact(&self) -> Result<PhysicalPlanPublication, String> {
         let artifact = PhysicalPlanPublication {
             summary_catalog: self.summary_catalog.clone(),
             precompute_plan: self.precompute_plan.clone(),
@@ -13,5 +13,12 @@ impl PhysicalPlan {
         };
         artifact.validate()?;
         Ok(artifact)
+    }
+}
+
+impl CompiledPhysicalPlan {
+    #[deprecated(note = "Use to_publication_artifact")]
+    pub fn publication(&self) -> Result<PhysicalPlanPublication, String> {
+        self.to_publication_artifact()
     }
 }

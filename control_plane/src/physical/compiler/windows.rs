@@ -8,9 +8,9 @@ use asap_types::WindowMaterializationLayout;
 #[serde(deny_unknown_fields)]
 pub struct WindowCostModel {
     pub implementation_id: String,
-    pub cost: ImplementationCostEvidence,
+    pub cost: WindowRealizationCostQuote,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub quotes: Vec<WindowImplementationCandidate>,
+    pub quotes: Vec<WindowRealizationCandidate>,
 }
 
 pub(in crate::physical) fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -20,7 +20,7 @@ pub(in crate::physical) fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
-pub(super) fn is_full_cohort(candidate: &WindowImplementationCandidate) -> bool {
+pub(super) fn is_full_cohort(candidate: &WindowRealizationCandidate) -> bool {
     candidate.slide_secs == candidate.window_secs
         && candidate.layout
             == WindowMaterializationLayout::Pane {
@@ -40,7 +40,7 @@ pub(super) fn cohort_nodes(states: &[SelectedMaterialization]) -> BTreeSet<usize
 }
 
 pub(super) fn supported(
-    candidate: &WindowImplementationCandidate,
+    candidate: &WindowRealizationCandidate,
     target: PhysicalDeploymentTarget,
 ) -> bool {
     candidate
@@ -66,12 +66,12 @@ pub(super) fn supported(
 
 pub(super) fn derive(
     model: &WindowCostModel,
-    lifecycle: &LifecyclePlanningInput,
+    lifecycle: &SummaryLifecyclePlanningInputs,
     window_secs: u64,
     full_cohort: bool,
     target: PhysicalDeploymentTarget,
     staleness_margin_ms: u64,
-) -> Vec<WindowImplementationCandidate> {
+) -> Vec<WindowRealizationCandidate> {
     let evaluation_ms = u64::from(lifecycle.evaluation_interval_ms);
     // Runtime layouts have second precision. Never truncate a fractional cadence.
     if window_secs == 0 || evaluation_ms == 0 || evaluation_ms % 1_000 != 0 {
@@ -99,8 +99,8 @@ pub(super) fn derive(
                 WindowMaterializationLayout::Pane { pane_secs } => format!("pane-{pane_secs}s"),
                 _ => "full-window".into(),
             };
-            let candidate = WindowImplementationCandidate {
-                implementation_id: format!(
+            let candidate = WindowRealizationCandidate {
+                realization_id: format!(
                     "{}-{window_secs}s-slide-{slide_secs}s-{suffix}",
                     model.implementation_id
                 ),
@@ -129,7 +129,7 @@ pub(super) fn derive(
 }
 
 pub fn prepare_window_implementations(
-    query: &mut PlanningQuery,
+    query: &mut QueryCompilationInput,
     model: &WindowCostModel,
     target: PhysicalDeploymentTarget,
     staleness_margin_ms: u64,
@@ -143,9 +143,9 @@ pub fn prepare_window_implementations(
     let mut model = model.clone();
     let fingerprint = canonical_promql(&query.query_string).map_err(CompileError::QueryPlan)?;
     model.cost.workload_fingerprint = fingerprint.clone();
-    model.cost.horizon_seconds = query.lifecycle.horizon_seconds;
+    model.cost.horizon_seconds = query.summary_lifecycle_inputs.horizon_seconds;
     let states = collect_selected_materializations(
-        &query.post_asap,
+        &query.selected_plan_root,
         target == PhysicalDeploymentTarget::BackendLocalRemoteWrite,
     )
     .map_err(|reason| CompileError::Query {
@@ -157,7 +157,7 @@ pub fn prepare_window_implementations(
         .iter()
         .map(|state| {
             (
-                state.window_secs.unwrap_or(query.window_secs),
+                state.window_secs.unwrap_or(query.query_lookback_seconds),
                 cohorts.contains(&(Rc::as_ptr(&state.node) as usize)),
             )
         })
@@ -167,7 +167,7 @@ pub fn prepare_window_implementations(
         .flat_map(|&(window, cohort)| {
             derive(
                 &model,
-                &query.lifecycle,
+                &query.summary_lifecycle_inputs,
                 window,
                 cohort,
                 target,
@@ -198,7 +198,7 @@ pub fn prepare_window_implementations(
                     is_full_cohort(quote)
                 } else {
                     quote.slide_secs.saturating_mul(1_000)
-                        == u64::from(query.lifecycle.evaluation_interval_ms)
+                        == u64::from(query.summary_lifecycle_inputs.evaluation_interval_ms)
                 }
         });
         if !applicable || !supported(quote, target) {
@@ -206,7 +206,7 @@ pub fn prepare_window_implementations(
                 query_id: query.query_id.clone(),
                 reason: format!(
                     "window quote `{}` does not match an executable state layout",
-                    quote.implementation_id
+                    quote.realization_id
                 ),
             });
         }
@@ -218,12 +218,12 @@ pub fn prepare_window_implementations(
         let mut quote = quote.clone();
         quote.derived = false;
         quote.cohort_only = quote.slide_secs.saturating_mul(1_000)
-            != u64::from(query.lifecycle.evaluation_interval_ms);
+            != u64::from(query.summary_lifecycle_inputs.evaluation_interval_ms);
         candidates.push(quote);
     }
     let mut unique = BTreeMap::new();
     for candidate in &candidates {
-        if let Some(previous) = unique.insert(&candidate.implementation_id, candidate) {
+        if let Some(previous) = unique.insert(&candidate.realization_id, candidate) {
             if previous != candidate {
                 return Err(CompileError::Lifecycle {
                     query_id: query.query_id.clone(),
@@ -233,8 +233,8 @@ pub fn prepare_window_implementations(
         }
     }
     let mut ids = BTreeSet::new();
-    candidates.retain(|candidate| ids.insert(candidate.implementation_id.clone()));
-    query.window_implementations = candidates;
+    candidates.retain(|candidate| ids.insert(candidate.realization_id.clone()));
+    query.window_realization_candidates = candidates;
     Ok(())
 }
 
@@ -242,7 +242,7 @@ pub fn prepare_window_implementations(
 mod tests {
     use super::*;
 
-    fn snapshot() -> BackendLocalPlanningSnapshot {
+    fn snapshot() -> BackendLocalPlanningInput {
         serde_json::from_str(include_str!(
             "../../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -253,9 +253,9 @@ mod tests {
     #[test]
     fn collector_generation_excludes_partial_panes_and_sparse_full_windows() {
         let snapshot = snapshot();
-        let model = snapshot.implementation.window_cost_model.clone();
-        let (request, _) = snapshot.planning_request().unwrap();
-        let mut lifecycle = request.queries[0].lifecycle.clone();
+        let model = snapshot.physical_inputs.window_cost_model.clone();
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        let mut lifecycle = request.queries[0].summary_lifecycle_inputs.clone();
         for (interval, expected_count) in [
             (20_000, 1),
             (45_000, 1),
@@ -284,10 +284,10 @@ mod tests {
     #[test]
     fn quotes_cannot_bypass_layout_or_runtime_constraints() {
         let snapshot = snapshot();
-        let mut model = snapshot.implementation.window_cost_model.clone();
-        let (request, _) = snapshot.planning_request().unwrap();
+        let mut model = snapshot.physical_inputs.window_cost_model.clone();
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
         let mut query = request.queries[0].clone();
-        query.lifecycle.evaluation_interval_ms = 20_000;
+        query.summary_lifecycle_inputs.evaluation_interval_ms = 20_000;
         prepare_window_implementations(
             &mut query,
             &model,
@@ -295,7 +295,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut quote = query.window_implementations[0].clone();
+        let mut quote = query.window_realization_candidates[0].clone();
         quote.layout = WindowMaterializationLayout::Pane { pane_secs: 30 };
         model.quotes = vec![quote.clone()];
         assert!(prepare_window_implementations(
@@ -325,11 +325,13 @@ mod tests {
     #[test]
     fn conflicting_quote_ids_and_duplicate_shapes_are_rejected() {
         let snapshot = snapshot();
-        let mut model = snapshot.implementation.window_cost_model.clone();
-        let (request, _) = snapshot.planning_request().unwrap();
+        let mut model = snapshot.physical_inputs.window_cost_model.clone();
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
         let mut query = request.queries[0].clone();
-        let mut quote = query.window_implementations[0].clone();
-        quote.implementation_id = query.window_implementations[1].implementation_id.clone();
+        let mut quote = query.window_realization_candidates[0].clone();
+        quote.realization_id = query.window_realization_candidates[1]
+            .realization_id
+            .clone();
         model.quotes = vec![quote.clone()];
         assert!(prepare_window_implementations(
             &mut query,
@@ -338,7 +340,7 @@ mod tests {
             0
         )
         .is_err());
-        quote.implementation_id = "duplicate-shape".into();
+        quote.realization_id = "duplicate-shape".into();
         model.quotes.push(quote);
         assert!(prepare_window_implementations(
             &mut query,
@@ -352,12 +354,12 @@ mod tests {
     // External serialization never grants permission to reinterpret measured prices.
     #[test]
     fn serialized_generated_quote_loses_compiler_provenance() {
-        let (request, _) = snapshot().planning_request().unwrap();
-        let candidate = &request.queries[0].window_implementations[0];
+        let (request, _) = snapshot().into_physical_compilation_request().unwrap();
+        let candidate = &request.queries[0].window_realization_candidates[0];
         assert!(candidate.derived);
         let value = serde_json::to_value(candidate).unwrap();
         assert!(value.get("derived").is_none());
-        let decoded: WindowImplementationCandidate = serde_json::from_value(value).unwrap();
+        let decoded: WindowRealizationCandidate = serde_json::from_value(value).unwrap();
         assert!(!decoded.derived);
     }
 }

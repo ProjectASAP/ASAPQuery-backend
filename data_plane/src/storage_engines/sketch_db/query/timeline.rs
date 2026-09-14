@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use xxhash_rust::xxh64::xxh64;
 
 use crate::storage_engines::sketch_db::data::{AggKind, SketchAlgorithm, SketchConfig};
-use crate::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
+use crate::storage_engines::sketch_db::index::{SketchStore, SummarySeriesMetadata};
 use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 
 /// A single `(agg_id, clipped_range)` segment returned by
@@ -129,7 +129,7 @@ struct SignatureKey {
     encoded: Vec<u8>,
 }
 
-fn signature_key(meta: &SketchInstanceMetadata) -> SignatureKey {
+fn signature_key(meta: &SummarySeriesMetadata) -> SignatureKey {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(meta.metric_name.as_bytes());
     buf.push(0);
@@ -168,7 +168,7 @@ impl Default for AggSignatureGroup {
 }
 
 impl AggSignatureGroup {
-    fn fold_in(&mut self, meta: &SketchInstanceMetadata) {
+    fn fold_in(&mut self, meta: &SummarySeriesMetadata) {
         // Stable signature id: xxh64 over the same canonical encoding
         // `signature_key` uses. Computed lazily on first fold-in;
         // every sid in the group produces the same hash.
@@ -297,8 +297,8 @@ mod tests {
         first_seen: i64,
         retired: Option<u64>,
         expires: Option<u64>,
-    ) -> SketchInstanceMetadata {
-        SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.into(),
             group_by_keys: BTreeSet::new(),

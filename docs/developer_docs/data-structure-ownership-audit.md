@@ -19,15 +19,17 @@ It classifies operators such as `topk`, `rate`, and `quantile`; the control-plan
 `QueryShape` describes evaluation lifecycle (`one_shot`, `streaming`, or
 `periodic`). The distinct names prevent accidental cross-layer use.
 
-## Remaining migration
+## Shared contracts and compatibility imports
 
-`QueryPlan`, `PrecomputePlan`, `TransmissionPlan`, and `CollectorPlan` are wire
-contracts currently defined in `control_plane`, so the data-plane crate depends
-on the whole control-plane crate to deserialize and execute them. A later change
-should move only their serde DTOs and validation-independent identifiers into
-`asap_types`, leaving selection, compilation, publication validation, HTTP
-handlers, and execution in their current owners. That migration should preserve
-the JSON schema and use compile-time conversion at the compiler boundary.
+`QueryPlan`, `PrecomputePlan`, `TransmissionPlan`, `CollectorPlan`,
+`SummaryCatalog`, and the publication/install envelopes are now defined in
+`asap_types`. Control-plane modules retain compatibility re-exports; these are
+not independent DTO implementations. Selection and compilation stay in the
+control plane, while installation, ingestion, and query execution stay in the
+data plane. Shared contracts retain their validation methods.
+
+See [planning terminology](control-plane/planning-terminology.md) for the
+compiled-plan/runtime-plan distinction and the wire-preserving naming migration.
 
 Planner's `planner_types::workload::QueryLanguage` and backend
 `asap_types::QueryLanguage` also have different scopes. They should remain

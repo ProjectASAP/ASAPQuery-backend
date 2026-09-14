@@ -3,7 +3,7 @@
 //!
 //! The in-process version of this loop already lives in
 //! `simple_engine.rs::e2e_feedback_loop_tests` — it swaps the
-//! `HotReloadStreamingConfig` handle directly from a mock
+//! `StreamingConfigHandle` handle directly from a mock
 //! `ControlPlaneClient`. What was missing, and what this file adds,
 //! is the **real HTTP round-trip**:
 //!
@@ -18,7 +18,7 @@
 //!    │   3. receive miss → craft config YAML
 //!    ▼
 //!  POST backend:/api/v1/streaming-config (real HTTP)
-//!    │   4. HotReloadStreamingConfig.swap
+//!    │   4. StreamingConfigHandle.swap
 //!    ▼
 //!  GET backend:/api/v1/streaming-config
 //!        → aggregation_count ≥ 1 (loop closed)
@@ -39,7 +39,7 @@ use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
 #[cfg(test)]
-use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
 use axum::{extract::State, routing::post, Router};
 use reqwest::Client;
 use serde_json::Value;
@@ -99,7 +99,7 @@ fn expected_fp_for(metric: &str) -> u64 {
     let data: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml parses");
     let sc = crate::storage_engines::types::StreamingConfig::from_yaml_data(&data)
         .expect("yaml decodes");
-    *sc.aggregation_configs
+    *sc.materializations_by_policy_fingerprint
         .keys()
         .next()
         .expect("one agg in the canned plan")
@@ -162,7 +162,7 @@ async fn start_mock_control_plane(state: MockControlPlaneState) -> u16 {
     port
 }
 
-async fn start_backend(control_plane_url: String, hot_reload: HotReloadStreamingConfig) -> u16 {
+async fn start_backend(control_plane_url: String, hot_reload: StreamingConfigHandle) -> u16 {
     let _streaming_config = hot_reload.snapshot();
     let engine = Arc::new(
         ASAPQueryEngine::new(15_000)
@@ -226,7 +226,7 @@ async fn poll_until_plan_active(
 async fn spin_up_loop(
     metric: &str,
     expected_agg_id: u64,
-) -> (String, MockControlPlaneState, HotReloadStreamingConfig) {
+) -> (String, MockControlPlaneState, StreamingConfigHandle) {
     let control_plane_state = MockControlPlaneState {
         received_count: Arc::new(AtomicUsize::new(0)),
         pushed_plan_ts: Arc::new(Mutex::new(None)),
@@ -240,7 +240,7 @@ async fn spin_up_loop(
     let control_plane_url = format!("http://127.0.0.1:{control_plane_port}/api/v1/plan");
 
     // 2. backend up, with control-plane URL baked in
-    let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+    let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
     let backend_port = start_backend(control_plane_url, hot_reload.clone()).await;
     let backend_url = format!("http://127.0.0.1:{backend_port}");
 

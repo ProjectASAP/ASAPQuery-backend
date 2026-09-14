@@ -132,7 +132,7 @@ pub trait EpochSource: Send + Sync {
     fn approx_memory_bytes(&self) -> usize;
 
     /// Persistable instance metadata for `sid` — the pieces of the store's
-    /// `SketchInstanceMetadata` the QUERY path needs but the on-disk part
+    /// `SummarySeriesMetadata` the QUERY path needs but the on-disk part
     /// format does NOT carry (metric name, group-by KEYS, structured
     /// `AggKind`). Called by the flusher right before it makes a part
     /// durable so recovery can re-register the sid as a queryable instance

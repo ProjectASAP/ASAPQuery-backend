@@ -1,6 +1,6 @@
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::HotReloadStreamingConfig;
+use crate::storage_engines::types::StreamingConfigHandle;
 use asap_types::aggregation_config::AggregationConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,7 +121,7 @@ pub struct IngestState {
     /// Hot-reloadable streaming config. On each ingest batch, the
     /// router snapshots the latest config to derive agg_configs.
     /// This replaces the old frozen `Vec<Arc<AggregationConfig>>`.
-    pub hot_reload_config: HotReloadStreamingConfig,
+    pub hot_reload_config: StreamingConfigHandle,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
     /// Per-series reconstructed sketch bases, keyed by series identity. Full frames
@@ -142,7 +142,7 @@ pub struct IngestState {
     /// every modified-OTLP first-class sketch DataPoint; queried by
     /// the `ASAPQueryEngine` query path (ASAP-tier hit / ghost / unknown
     /// classification drives the Phase 6 archive failover).
-    pub sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+    pub summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     /// CQ-6 / RES-1 — per-reason silent-drop counters plus the
     /// `sketch_snapshots` eviction configuration. Grouped into one
     /// `Default`-constructible field so the counters can live on
@@ -163,10 +163,17 @@ impl IngestState {
         self.hot_reload_config.snapshot()
     }
 
+    pub fn active_physical_plan_snapshot(
+        &self,
+    ) -> Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>> {
+        self.hot_reload_config.active_physical_plan_snapshot()
+    }
+
+    #[deprecated(note = "use active_physical_plan_snapshot")]
     pub fn physical_plan_snapshot(
         &self,
-    ) -> Option<Arc<crate::storage_engines::types::ActivePhysicalPlan>> {
-        self.hot_reload_config.physical_plan_snapshot()
+    ) -> Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>> {
+        self.active_physical_plan_snapshot()
     }
 
     /// RES-1 — record that a per-series snapshot base for `window_start`
@@ -331,7 +338,7 @@ mod tests {
         map.insert(agg_id, make_config(agg_id, metric));
         let streaming = StreamingConfig::new(map);
         let hot_reload =
-            crate::storage_engines::types::HotReloadStreamingConfig::new(streaming.clone());
+            crate::storage_engines::types::StreamingConfigHandle::new(streaming.clone());
 
         let state = Arc::new(IngestState {
             router,
@@ -343,7 +350,7 @@ mod tests {
             series_resolver: Arc::new(
                 crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
             ),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            summary_store: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
 

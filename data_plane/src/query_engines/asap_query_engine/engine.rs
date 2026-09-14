@@ -89,7 +89,7 @@ pub struct ASAPQueryEngine {
     /// EngineRouter's archive failover. When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
-    sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
+    summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Phase-5 hybrid-stitch hook — set by `with_archive_engine` from
     /// `main.rs`'s engine builder. When the ASAP-tier reducer reports a
     /// `ASAPTierResult.coverage` narrower than the requested
@@ -104,7 +104,7 @@ pub struct ASAPQueryEngine {
         Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
     /// Generation-consistent physical snapshot used by the production query
     /// path. The QueryPlan and SummaryCatalog must come from the same snapshot.
-    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
     exact_subquery_endpoint: Option<String>,
     metricsql_exact_subquery_endpoint: Option<String>,
     exact_subquery_client: reqwest::Client,
@@ -117,7 +117,7 @@ impl ASAPQueryEngine {
         now_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
-        let physical = self.physical_plan_snapshot().ok_or_else(|| {
+        let physical = self.active_physical_plan_snapshot().ok_or_else(|| {
             crate::query_engines::EngineError::capability_miss(
                 "query_plan",
                 "no active physical plan",
@@ -129,7 +129,9 @@ impl ASAPQueryEngine {
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
-        let leaves = self.prepare_logical(&physical, planned, &[now_ms]).await?;
+        let leaves = self
+            .prepare_query_inputs(&physical, planned, &[now_ms])
+            .await?;
         let (mut result, mut stats) =
             self.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
         stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
@@ -146,7 +148,7 @@ impl ASAPQueryEngine {
         step_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
-        let physical = self.physical_plan_snapshot().ok_or_else(|| {
+        let physical = self.active_physical_plan_snapshot().ok_or_else(|| {
             crate::query_engines::EngineError::capability_miss(
                 "query_plan",
                 "no active physical plan",
@@ -163,12 +165,12 @@ impl ASAPQueryEngine {
     }
 
     /// Construct the query executor. Runtime configuration is read only from
-    /// the generation-consistent `ActivePhysicalPlan` installed separately.
+    /// the generation-consistent `RuntimePhysicalPlan` installed separately.
     pub fn new(prometheus_scrape_interval: u64) -> Self {
         Self {
             prometheus_scrape_interval,
             control_plane_client: None,
-            sketch_index: None,
+            summary_store: None,
             archive_engine: None,
             active_physical_plan: None,
             exact_subquery_endpoint: None,
@@ -189,9 +191,9 @@ impl ASAPQueryEngine {
         self.metricsql_exact_subquery_endpoint = Some(endpoint);
         self
     }
-    async fn prepare_logical(
+    async fn prepare_query_inputs(
         &self,
-        physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
@@ -256,7 +258,7 @@ impl ASAPQueryEngine {
 
     fn execute_logical_entry(
         &self,
-        physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
         leaves: &super::logical_dag::PreparedLeaves,
         at: u64,
@@ -269,7 +271,7 @@ impl ASAPQueryEngine {
     > {
         use crate::query_engines::EngineError;
         let revision = self
-            .sketch_index
+            .summary_store
             .as_ref()
             .map(|index| index.summary_update_revision());
         let result =
@@ -301,7 +303,7 @@ impl ASAPQueryEngine {
                 subtree.instant.full_history = false;
                 subtree.instant.cumulative_readout = true;
                 let requirement = readiness_requirement(&subtree);
-                let index = self.sketch_index.as_ref().ok_or_else(|| {
+                let index = self.summary_store.as_ref().ok_or_else(|| {
                     EngineError::capability_miss(
                         "installed_logical_dag",
                         "summary store unavailable",
@@ -382,7 +384,7 @@ impl ASAPQueryEngine {
                 ))
             });
         let current = self
-            .sketch_index
+            .summary_store
             .as_ref()
             .map(|index| index.summary_update_revision());
         if match (revision, current) {
@@ -400,7 +402,7 @@ impl ASAPQueryEngine {
 
     async fn execute_logical_range(
         &self,
-        physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
         start: u64,
         end: u64,
@@ -420,7 +422,7 @@ impl ASAPQueryEngine {
         let times: Vec<u64> = (0..=(end - start) / step)
             .map(|n| start + n * step)
             .collect();
-        let leaves = self.prepare_logical(physical, entry, &times).await?;
+        let leaves = self.prepare_query_inputs(physical, entry, &times).await?;
         let mut series =
             std::collections::BTreeMap::<Vec<(String, String)>, RangeVectorElement>::new();
         let mut total = super::logical_dag::ExecutionStats::default();
@@ -475,18 +477,18 @@ impl ASAPQueryEngine {
 
     pub fn with_active_physical_plan(
         mut self,
-        handle: crate::storage_engines::types::HotReloadActivePhysicalPlan,
+        handle: crate::storage_engines::types::ActivePhysicalPlanHandle,
     ) -> Self {
         self.active_physical_plan = Some(handle);
         self
     }
 
-    fn physical_plan_snapshot(
+    fn active_physical_plan_snapshot(
         &self,
-    ) -> Option<Arc<crate::storage_engines::types::ActivePhysicalPlan>> {
+    ) -> Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>> {
         self.active_physical_plan
             .as_ref()
-            .map(|handle| handle.snapshot())
+            .map(|handle| handle.active_snapshot())
             .filter(|plan| plan.plan_id() != 0)
     }
 
@@ -511,7 +513,7 @@ impl ASAPQueryEngine {
         mut self,
         index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
-        self.sketch_index = Some(index);
+        self.summary_store = Some(index);
         self
     }
 
@@ -628,7 +630,7 @@ impl ASAPQueryEngine {
         step_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
-        if let Some(physical) = self.physical_plan_snapshot() {
+        if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
                 if entry.nodes.values().any(|node| {
                     matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
@@ -639,14 +641,14 @@ impl ASAPQueryEngine {
                 }
             }
         }
-        let Some(idx) = self.sketch_index.as_ref() else {
+        let Some(idx) = self.summary_store.as_ref() else {
             return Err(crate::query_engines::EngineError::capability_miss(
                 crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                 format!("ASAPQueryEngine: no sketch index for `{query}` — failing over"),
             ));
         };
 
-        let physical_plan = self.physical_plan_snapshot();
+        let physical_plan = self.active_physical_plan_snapshot();
         let mut readiness = None;
         let planned = match physical_plan.as_ref() {
             Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
@@ -972,10 +974,10 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         now_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
-        if let Some(physical) = self.physical_plan_snapshot() {
+        if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
                 let leaves = self
-                    .prepare_logical(&physical, entry, &[now_ms])
+                    .prepare_query_inputs(&physical, entry, &[now_ms])
                     .await
                     .map_err(|error| {
                         tracing::warn!(query, error = %error, "installed query DAG preparation failed");
@@ -998,8 +1000,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         // SummaryCatalog/materialization resolver → SID lookup → DAG executor.
         // A typed resolver/executor error becomes CapabilityMiss, which lets
         // EngineRouter continue to the archive backend.
-        if let Some(idx) = self.sketch_index.as_ref() {
-            let physical_plan = self.physical_plan_snapshot();
+        if let Some(idx) = self.summary_store.as_ref() {
+            let physical_plan = self.active_physical_plan_snapshot();
             let mut readiness = None;
             let planned = match physical_plan.as_ref() {
                 Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
@@ -1457,11 +1459,11 @@ mod aux_pushdown_tests {
 
     fn make_engine() -> ASAPQueryEngine {
         use crate::storage_engines::types::{
-            CleanupPolicy, HotReloadStreamingConfig, StreamingConfig,
+            CleanupPolicy, StreamingConfig, StreamingConfigHandle,
         };
 
         let sc = Arc::new(StreamingConfig::new(HashMap::new()));
-        let hr = HotReloadStreamingConfig::from_arc(sc.clone());
+        let hr = StreamingConfigHandle::from_arc(sc.clone());
         let _ = sc;
         ASAPQueryEngine::new(60)
     }
@@ -1586,10 +1588,10 @@ mod asap_tier_classify_tests {
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
     use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchInstanceMetadata,
-        SketchSampleState, SketchStore,
+        AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchSampleState, SketchStore,
+        SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig};
+    use crate::storage_engines::types::{CleanupPolicy, StreamingConfigHandle};
     use std::collections::{BTreeMap, BTreeSet};
 
     /// `sum by (zone) (http_requests_total)` end-to-end via the
@@ -1620,7 +1622,7 @@ mod asap_tier_classify_tests {
 
         for (i, zone) in zones.iter().enumerate() {
             let sid = 9000 + i as u64;
-            idx.register(SketchInstanceMetadata {
+            idx.register(SummarySeriesMetadata {
                 sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
@@ -1704,14 +1706,14 @@ mod asap_tier_classify_tests {
         assert_eq!(by_zone.get("z3").copied(), Some(400.0));
     }
 
-    // Build a now-anchored KLL `SketchInstanceMetadata` + sample so the
+    // Build a now-anchored KLL `SummarySeriesMetadata` + sample so the
     // engine's instant/range default lookbacks reach it. Mirrors the
     // live MVP workload: the agent emits a bare-named KLL sketch
     // (`http_requests_total_latency_ms`) into the SketchStore.
-    fn kll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn kll_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         // Latest ASAPPlanner sizes an epsilon=0.01 KLL at k=269.
         let cfg = SketchConfig::Kll { k: 269 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1746,10 +1748,10 @@ mod asap_tier_classify_tests {
         env.encode_to_vec()
     }
 
-    fn hll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn hll_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         // Latest ASAPPlanner requires p=14 for a 1% HLL error target.
         let cfg = SketchConfig::Hll { precision: 14 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -2266,7 +2268,7 @@ mod asap_tier_classify_tests {
 
         for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 14_000 + i as u64;
-            idx.register(SketchInstanceMetadata {
+            idx.register(SummarySeriesMetadata {
                 sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
@@ -2362,7 +2364,7 @@ mod asap_tier_classify_tests {
     ) {
         // Matches ControlPlaneCostModel's epsilon=0.01 CMS sizing.
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
@@ -2476,9 +2478,9 @@ mod outer_agg_integration_tests {
     use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
-        SketchInstanceMetadata, SketchSampleState, SketchStore,
+        SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::HotReloadStreamingConfig;
+    use crate::storage_engines::types::StreamingConfigHandle;
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::MessagePackCodec;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2494,11 +2496,11 @@ mod outer_agg_integration_tests {
         sk.to_msgpack().expect("ddsketch msgpack serialization")
     }
 
-    fn dd_meta_for(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
+    fn dd_meta_for(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
@@ -2708,9 +2710,9 @@ mod range_stitch_tests {
     use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
-        SketchInstanceMetadata, SketchSampleState, SketchStore,
+        SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{HotReloadStreamingConfig, KeyByLabelValues};
+    use crate::storage_engines::types::{KeyByLabelValues, StreamingConfigHandle};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2771,9 +2773,9 @@ mod range_stitch_tests {
     /// A CountMin FrequencyEstimate sid — `count_over_time` over it emits one
     /// PER-WINDOW sample (not a single cumulative scalar), which is what the
     /// range stitch needs so warm contributes one value per covered window.
-    fn cms_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -2852,13 +2854,13 @@ mod range_stitch_tests {
             FallbackPolicy, InstantExecution, QueryLanguage, QueryNodeId, QueryPlanEntry,
             QueryPlanNode,
         };
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let mut plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let identity = asap_types::query_plan::canonical_promql("1 + 2").unwrap();
         plan.query_plan.entries.insert(
@@ -2888,7 +2890,7 @@ mod range_stitch_tests {
                 fallback: FallbackPolicy::ExactBackend,
             },
         );
-        let mut active = crate::drivers::query::servers::http::build_active_physical_plan(
+        let mut active = crate::drivers::query::servers::http::validate_and_build_runtime_plan(
             crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 summary_catalog: plan.summary_catalog,
                 collector_plans: plan.collector_plans,
@@ -2902,8 +2904,8 @@ mod range_stitch_tests {
         )
         .unwrap();
         active.envelope.expiry_unix_ms = None;
-        let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
-        let hot = HotReloadStreamingConfig::from_active(active.clone());
+        let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(active);
+        let hot = StreamingConfigHandle::from_active_physical_plan(active.clone());
         let engine = ASAPQueryEngine::new(15).with_active_physical_plan(active);
         let error = engine
             .execute_metricsql_at(&identity, 1_000)

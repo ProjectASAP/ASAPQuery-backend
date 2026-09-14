@@ -742,7 +742,7 @@ mod tests {
     }
     use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata, SketchSampleState,
+        AccuracyBound, Capability, SketchAlgorithm, SketchSampleState, SummarySeriesMetadata,
     };
 
     fn register_hll(idx: &SketchStore, sid: u64, service: &str, items: &[&str]) {
@@ -755,7 +755,7 @@ mod tests {
         let cfg = SketchConfig::Hll { precision: 14 };
         let mut group_by_keys = std::collections::BTreeSet::new();
         group_by_keys.insert("service".to_string());
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid,
             metric_name: "unique_users".to_string(),
             group_by_keys,
@@ -797,7 +797,7 @@ mod tests {
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
@@ -1023,7 +1023,7 @@ mod tests {
     fn exact_agg_outcome_reports_window_end_coverage() {
         let idx = SketchStore::new();
         idx.register(
-            crate::storage_engines::sketch_db::index::SketchInstanceMetadata {
+            crate::storage_engines::sketch_db::index::SummarySeriesMetadata {
                 sid: 1,
                 metric_name: "bytes_total".to_string(),
                 group_by_keys: std::collections::BTreeSet::new(),
@@ -1071,7 +1071,7 @@ mod tests {
     #[test]
     fn compiled_window_schedules_execute_exact_ranges() {
         use crate::precompute_engine::window_manager::WindowManager;
-        use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+        use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
         for evaluation_secs in [20, 45, 60, 120, 90] {
             for phase_ms in [0, 5_000] {
                 for full in [false, true] {
@@ -1088,16 +1088,18 @@ mod tests {
                     entry["demand"]["fixed_interval_at"] = serde_json::json!({
                         "interval": evaluation_secs * 1_000, "evaluation_phase": phase_ms
                     });
-                    let snapshot: BackendLocalPlanningSnapshot =
+                    let snapshot: BackendLocalPlanningInput =
                         serde_json::from_value(snapshot).unwrap();
-                    let (mut request, env) = snapshot.planning_request().unwrap();
-                    request.queries[0].window_implementations.retain(|c| {
-                        matches!(
-                            c.layout,
-                            asap_types::WindowMaterializationLayout::FullWindow
-                        ) == full
-                    });
-                    let plan = PhysicalCompiler.compile(request, env).unwrap();
+                    let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+                    request.queries[0]
+                        .window_realization_candidates
+                        .retain(|c| {
+                            matches!(
+                                c.layout,
+                                asap_types::WindowMaterializationLayout::FullWindow
+                            ) == full
+                        });
+                    let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
                     let config = &plan.precompute_plan.materializations[0];
                     let manager = WindowManager::with_layout(
                         config.window_size,
@@ -1116,7 +1118,7 @@ mod tests {
                         }
                     }
                     let idx = SketchStore::new();
-                    idx.register(SketchInstanceMetadata {
+                    idx.register(SummarySeriesMetadata {
                         sid: 7,
                         metric_name: "a".into(),
                         group_by_keys: Default::default(),
@@ -1168,7 +1170,7 @@ mod tests {
     // Compile the two readouts, store one pane series, and execute the actual ratio.
     #[test]
     fn compiled_shared_sum_panes_preserve_each_lookback() {
-        use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+        use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
         let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -1177,14 +1179,14 @@ mod tests {
         entry["query"] = serde_json::json!("sum_over_time(a[1m]) / sum_over_time(a[10m])");
         entry["requirements"]["accuracy"]["explicit"] = serde_json::json!("Exact");
         entry["demand"]["fixed_interval_at"]["interval"] = serde_json::json!(60_000);
-        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(snapshot).unwrap();
-        let (request, env) = snapshot.planning_request().unwrap();
-        let plan = PhysicalCompiler.compile(request, env).unwrap();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
+        let (request, env) = snapshot.into_physical_compilation_request().unwrap();
+        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         let config = &plan.precompute_plan.materializations[0];
         let policy = config.policy_fingerprint();
         let idx = SketchStore::new();
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "a".into(),
             group_by_keys: Default::default(),
@@ -1258,7 +1260,7 @@ mod tests {
     fn repeated_multi_pane_reads_exclude_expired_state_and_reject_gaps() {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
@@ -1357,7 +1359,7 @@ mod tests {
     fn exact_query_plan_rate_uses_reset_aware_readout() {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),

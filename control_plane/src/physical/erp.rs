@@ -1457,11 +1457,14 @@ mod tests {
         query["query"] = "distinct_over_time(asap_demo_latency_ms[5s])".into();
         query["requirements"]["accuracy"] = serde_json::json!({"explicit":{"Epsilon":0.05}});
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([query]);
-        let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: crate::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_value(fixture).unwrap();
-        let plan = crate::physical::compiler::tests::quoted_snapshot(snapshot, false)
-            .compile()
-            .unwrap();
+        let plan = crate::physical::compiler::tests::quoted_snapshot(
+            snapshot,
+            crate::physical::compiler::QueryFrontend::PromQl,
+        )
+        .compile_promql()
+        .unwrap();
         let (mut policy, mut observed) = online_population_fixture();
         observed.catalog_generation = plan.summary_catalog.reference().unwrap();
         observed.summary_definition_id =

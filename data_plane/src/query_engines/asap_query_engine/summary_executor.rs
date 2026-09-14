@@ -1390,7 +1390,7 @@ mod tests {
     use super::*;
     use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchInstanceMetadata, SketchSampleState, SketchStore,
+        AccuracyBound, Capability, SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
     use planner_types::post_asap::{SummaryField, SummarySchema};
     use planner_types::pre_asap::{Column, DataType, Schema};
@@ -1536,9 +1536,9 @@ mod tests {
         })
     }
 
-    fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
+    fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Kll { k: 200 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
@@ -1559,9 +1559,9 @@ mod tests {
         }
     }
 
-    fn hll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn hll_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Hll { precision: 10 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1605,9 +1605,9 @@ mod tests {
         sk.to_msgpack().expect("encode HLL msgpack")
     }
 
-    fn cms_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1678,9 +1678,9 @@ mod tests {
         })
     }
 
-    fn cms_with_heap_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn cms_with_heap_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1749,8 +1749,8 @@ mod tests {
 
     // ── ExactAgg (Sum) fixtures ────────────────────────────────────────
 
-    fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
-        SketchInstanceMetadata {
+    fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by

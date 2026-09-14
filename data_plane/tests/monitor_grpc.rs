@@ -22,7 +22,7 @@ use asap_otel_proto::monitor::v1::{
     edge_to_coord, monitor_service_client::MonitorServiceClient, EdgeToCoord, MonitorRegister,
     MonitorReport,
 };
-use data_plane::monitor::{MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
+use data_plane::update_sampling::{MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
 
 async fn start_server(cfgs: Vec<MonitorConfig>) -> String {
     let coord = MonitorCoordinator::new(cfgs);

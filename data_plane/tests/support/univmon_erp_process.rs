@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::physical::{compiler::BackendLocalPlanningSnapshot, erp::ErpShapeObserver};
+use control_plane::physical::{compiler::BackendLocalPlanningInput, erp::ErpShapeObserver};
 use data_plane::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
 use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
 
@@ -126,8 +126,8 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             "minimum_confidence": 0.7, "minimum_confidence_margin": 0.05},
         "runtime": {"allowed_algorithms": ["Hll", "Kll", "UnivMon"], "max_memory_bytes": null}
     });
-    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture.clone()).unwrap();
-    let plan = quote_snapshot_for_test(snapshot).compile().unwrap();
+    let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture.clone()).unwrap();
+    let plan = quote_snapshot_for_test(snapshot).compile_promql().unwrap();
     eprintln!(
         "UNIVMON_PLANNED {}",
         serde_json::json!({"query_plan": plan.query_plan, "materializations": plan.precompute_plan.materializations, "lifecycle_estimates": plan.lifecycle_estimates, "executable_dags": plan.precompute_plan.executable_dags, "observation": observation})
@@ -151,9 +151,9 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             .remove("max_frequency_entropy_absolute_bits_error");
     }
     let missing = quote_snapshot_for_test(
-        serde_json::from_value::<BackendLocalPlanningSnapshot>(missing_entropy).unwrap(),
+        serde_json::from_value::<BackendLocalPlanningInput>(missing_entropy).unwrap(),
     )
-    .compile()
+    .compile_promql()
     .unwrap();
     use control_plane::query_plan::{QueryPlanNode, QueryReadout};
     assert!(missing
@@ -306,9 +306,9 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             plan.summary_catalog.reference().unwrap()
         );
         if key.sketch == "univmon" {
-            let mut live_snapshot: BackendLocalPlanningSnapshot =
+            let mut live_snapshot: BackendLocalPlanningInput =
                 serde_json::from_value(fixture.clone()).unwrap();
-            let policy = live_snapshot.implementation.erp.as_mut().unwrap();
+            let policy = live_snapshot.physical_inputs.erp.as_mut().unwrap();
             policy.observed_shape_source =
                 Some(control_plane::physical::erp::ErpObservedShapeSource {
                     source: key.source.clone(),
@@ -334,7 +334,9 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
                 .unwrap()
                 .invalid_reason
                 .is_none());
-            let replanned = quote_snapshot_for_test(live_snapshot).compile().unwrap();
+            let replanned = quote_snapshot_for_test(live_snapshot)
+                .compile_promql()
+                .unwrap();
             assert!(
                 replanned
                     .precompute_plan

@@ -187,9 +187,9 @@ pub struct PrecomputeMaterialization {
 #[derive(Debug, Clone)]
 pub struct AggregationIdInfo {
     /// `PolicyFingerprint::as_u64()` of the key aggregation's config.
-    pub aggregation_id_for_key: u64,
+    pub key_policy_fingerprint: u64,
     /// `PolicyFingerprint::as_u64()` of the value aggregation's config.
-    pub aggregation_id_for_value: u64,
+    pub value_policy_fingerprint: u64,
     pub aggregation_type_for_key: AggregationType,
     pub aggregation_type_for_value: AggregationType,
 }
@@ -197,7 +197,7 @@ pub struct AggregationIdInfo {
 impl AggregationIdInfo {}
 
 /// Compatibility name for legacy streaming-config and precompute call sites.
-/// New PhysicalPlan code should use [`PrecomputeMaterialization`].
+/// New CompiledPhysicalPlan code should use [`PrecomputeMaterialization`].
 pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {

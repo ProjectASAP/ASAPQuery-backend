@@ -8,7 +8,6 @@ use control_plane::monitor;
 use control_plane::opamp;
 use control_plane::physical;
 use control_plane::pipeline;
-use control_plane::query_parser;
 use control_plane::replan;
 use control_plane::runtime_samples;
 use control_plane::store;
@@ -41,7 +40,6 @@ use physical::deployment_cost::tco;
 use physical::deployment_cost::DeploymentCostPlanner;
 use physical::plan_cache::CachedDeploymentPlanner;
 use pipeline::{Analyzer, QuerySpec};
-use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
 use store::{PlanStore, WorkloadStore};
 use types::AgentCollectorConfig;
@@ -252,7 +250,7 @@ async fn main() {
     //
     // Critical: thread `sketch_family_override` from each registry entry
     // into the QuerySpec's `sketch_type` field — that's what populates
-    // `QueryWorkload::sketch_type_override`, which the typed planner
+    // `RegisteredWorkload::sketch_type_override`, which the typed planner
     // (`bind_workload_typed`) reads to honour MVP §46 entries 5–8 (HLL /
     // CountSketch / CountMinSketch). Without this stitch the workloads
     // round-trip through the analyzer with a None override and the
@@ -283,11 +281,10 @@ async fn main() {
             let role = control_plane::workload::derive_agg_role(entry);
             match analyzer.analyze(spec) {
                 Ok(wl) => {
-                    let wc = types::WorkloadCharacteristics::default();
-                    let plan = planner.plan(&wl, Some(&wc));
-                    let metric_name = wl.metric_name.clone();
+                    let plan = planner.plan(&wl);
+                    let metric_name = wl.metric_name().clone();
                     plan_store.set(&metric_name, role, plan);
-                    workload_store.set(&metric_name, role, wl, wc);
+                    workload_store.set(&metric_name, role, wl);
                 }
                 Err(e) => {
                     warn!(metric = %entry.metric_name, role = %role, error = %e,
@@ -512,7 +509,7 @@ struct PhysicalPlanQueryRequest {
     #[serde(default)]
     group_by: Vec<String>,
     accuracy: types::AccuracyTarget,
-    lifecycle: physical::compiler::LifecyclePlanningInput,
+    lifecycle: physical::compiler::SummaryLifecyclePlanningInputs,
     window_cost_model: physical::compiler::WindowCostModel,
     evaluation_phase_ms: u64,
     #[serde(default)]
@@ -530,7 +527,8 @@ struct CompileAndPublishPhysicalPlanRequest {
     #[serde(default)]
     workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
-    collector_ids: Vec<String>,
+    #[serde(rename = "collector_ids", alias = "target_collector_ids")]
+    target_collector_ids: Vec<String>,
     capability_snapshot_id: String,
     #[serde(default)]
     evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
@@ -559,48 +557,19 @@ fn default_physical_plan_timeout_ms() -> u64 {
     10_000
 }
 
-#[derive(Clone, Copy)]
-enum PhysicalQueryFrontend {
-    PromQl,
-    MetricsQl,
-}
-
-impl PhysicalQueryFrontend {
-    fn parse(
-        self,
-        query: &str,
-        accuracy: types::AccuracyTarget,
-    ) -> Result<planner_types::pre_asap::QueryExpr, String> {
-        match self {
-            Self::PromQl => parse_query_expr_canonical(query, accuracy)
-                .map_err(|e| format!("frontend.promql: {e}")),
-            Self::MetricsQl => parse_query_expr_canonical(query, accuracy)
-                .map_err(|e| format!("victoriametrics.promql_subset: {e}")),
-        }
-    }
-    fn compile(
-        self,
-        request: physical::compiler::PlanningRequest,
-        environment: physical::compiler::DeploymentEnvironment,
-    ) -> Result<physical::compiler::PhysicalPlan, physical::compiler::CompileError> {
-        match self {
-            Self::PromQl => physical::compiler::PhysicalCompiler.compile(request, environment),
-            Self::MetricsQl => {
-                physical::compiler::PhysicalCompiler.compile_metricsql(request, environment)
-            }
-        }
-    }
-}
+use physical::compiler::QueryFrontend;
 
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
-    cost_comparison: Option<physical::workload_cost::WorkloadCostComparison>,
-    logical_selection: Vec<serde_json::Value>,
+    cost_comparison: Option<physical::workload_cost::CandidatePlanSelectionReport>,
+    #[serde(rename = "logical_selection", alias = "planner_selection_trace")]
+    planner_selection_trace: Vec<serde_json::Value>,
     plan_id: u64,
     plan_version: u64,
     status: &'static str,
     generated_at_unix_ms: u64,
-    collector_ids: Vec<String>,
+    #[serde(rename = "collector_ids", alias = "target_collector_ids")]
+    target_collector_ids: Vec<String>,
     lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
 
@@ -610,20 +579,20 @@ async fn handle_compile_and_publish_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> Response {
-    compile_and_publish_physical_plan(st, request, PhysicalQueryFrontend::PromQl).await
+    compile_and_publish_physical_plan(st, request, QueryFrontend::PromQl).await
 }
 
 async fn handle_compile_and_publish_metricsql_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> Response {
-    compile_and_publish_physical_plan(st, request, PhysicalQueryFrontend::MetricsQl).await
+    compile_and_publish_physical_plan(st, request, QueryFrontend::MetricsQl).await
 }
 
 async fn compile_and_publish_physical_plan(
     st: AppState,
     mut request: CompileAndPublishPhysicalPlanRequest,
-    frontend: PhysicalQueryFrontend,
+    frontend: QueryFrontend,
 ) -> Response {
     // Serialize typed activations so an older response cannot overwrite the
     // catalog recorded after a newer backend activation.
@@ -635,7 +604,7 @@ async fn compile_and_publish_physical_plan(
         let catalog = active_catalog.clone();
         erp.resolve_population_data_descriptor(catalog.as_deref());
     }
-    let (bundle, collector_ids, apply_timeout, adaptation_evidence, _) =
+    let (bundle, target_collector_ids, apply_timeout, adaptation_evidence, _) =
         match compile_physical_plan_request(request, false, frontend) {
             Ok((Some(bundle), ids, timeout, adaptation, manifests)) => {
                 (bundle, ids, timeout, adaptation, manifests)
@@ -668,7 +637,7 @@ async fn compile_and_publish_physical_plan(
         )
             .into_response();
     }
-    let publication = match bundle.publication() {
+    let publication = match bundle.to_publication_artifact() {
         Ok(publication) => publication,
         Err(error) => {
             return (
@@ -736,12 +705,12 @@ async fn compile_and_publish_physical_plan(
 
     Json(CompileAndPublishPhysicalPlanResponse {
         cost_comparison: bundle.cost_comparison,
-        logical_selection: bundle.logical_selection,
+        planner_selection_trace: bundle.planner_selection_trace,
         plan_id: bundle.envelope.plan_id,
         plan_version: bundle.envelope.plan_version,
         status: "active",
         generated_at_unix_ms: bundle.envelope.generated_at_unix_ms,
-        collector_ids,
+        target_collector_ids,
         lifecycle_estimates: bundle.lifecycle_estimates,
     })
     .into_response()
@@ -812,16 +781,16 @@ async fn publish_clickhouse_plan(
 fn compile_physical_plan_request(
     request: CompileAndPublishPhysicalPlanRequest,
     manifests_only: bool,
-    frontend: PhysicalQueryFrontend,
+    frontend: QueryFrontend,
 ) -> Result<
     (
-        Option<physical::compiler::PhysicalPlan>,
+        Option<physical::compiler::CompiledPhysicalPlan>,
         Vec<String>,
         Duration,
         Vec<physical::compiler::RuntimeAdaptationEvidence>,
         (
             Vec<physical::workload_cost::WorkloadCostManifest>,
-            Vec<physical::workload_cost::AlternativeCost>,
+            Vec<physical::workload_cost::CandidatePlanEvaluation>,
             Vec<serde_json::Value>,
         ),
     ),
@@ -829,9 +798,9 @@ fn compile_physical_plan_request(
 > {
     if request.queries.is_empty()
         || (request.target == physical::compiler::PhysicalDeploymentTarget::DistributedCollectors
-            && request.collector_ids.is_empty())
+            && request.target_collector_ids.is_empty())
         || (request.target == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite
-            && !request.collector_ids.is_empty())
+            && !request.target_collector_ids.is_empty())
     {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -913,23 +882,23 @@ fn compile_physical_plan_request(
                 ..Default::default()
             },
         });
-        queries.push(physical::compiler::PlanningQuery {
+        queries.push(physical::compiler::QueryCompilationInput {
             query_id: query.query_id,
             query_string: query.query_string,
-            post_asap,
-            source: planner_types::pre_asap::Source::TimeSeries {
+            selected_plan_root: post_asap,
+            legacy_query_source: planner_types::pre_asap::Source::TimeSeries {
                 metric: query.metric,
             },
-            window_secs: query.window_secs,
-            group_by: query.group_by,
-            accuracy: query.accuracy,
-            lifecycle: query.lifecycle,
-            window_implementations: Vec::new(),
-            runtime_policy: query.runtime_policy,
+            query_lookback_seconds: query.window_secs,
+            group_by_labels: query.group_by,
+            accuracy_target: query.accuracy,
+            summary_lifecycle_inputs: query.lifecycle,
+            window_realization_candidates: Vec::new(),
+            materialization_runtime_policy: query.runtime_policy,
         });
     }
 
-    let logical_selection = match physical::compiler::select_workload_roots_with_trace(
+    let planner_selection_trace = match physical::compiler::select_logical_roots_with_trace(
         &mut queries,
         canonical_roots,
         &request.evidence,
@@ -944,8 +913,8 @@ fn compile_physical_plan_request(
         physical::compiler::prepare_window_implementations(query, &model, request.target, 0)
             .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
     }
-    let planning_request = physical::compiler::PlanningRequest {
-        logical_selection,
+    let compilation_request = physical::compiler::PhysicalCompilationRequest {
+        planner_selection_trace,
         query_workload: Some(planner_types::workload::QueryWorkload {
             language: planner_types::workload::QueryLanguage::PromQL,
             query_batch: None,
@@ -953,20 +922,20 @@ fn compile_physical_plan_request(
             data_workload: None,
         }),
         queries,
-        hybrid_execution: request.target
+        allow_mixed_summary_and_exact_execution: request.target
             == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite,
-        materialization_policy: None,
-        evidence: request.evidence,
+        enabled_materialization_keys: None,
+        topk_membership_evidence_by_query_id: request.evidence,
         exact_composition_costs: request.exact_composition_costs,
         erp: request.erp,
         planner_revision: request.planner_revision,
         source_sample_interval_ms: None,
-        query_staleness_margin_ms: 0,
+        query_retention_margin_ms: 0,
         retained_summary_memory_budget_bytes: None,
     };
-    let environment = physical::compiler::DeploymentEnvironment {
+    let environment = physical::compiler::PhysicalDeploymentContext {
         target: request.target,
-        collector_ids: request.collector_ids.clone(),
+        target_collector_ids: request.target_collector_ids.clone(),
         capability_snapshot_id: request.capability_snapshot_id,
         observed_at_unix_ms: now,
         max_evidence_age_ms: request.max_evidence_age_ms,
@@ -975,13 +944,15 @@ fn compile_physical_plan_request(
         expiry_unix_ms: request.expiry_unix_ms,
         backend_compat: request.backend_compat,
     };
-    let candidates = physical::workload_cost::with_exact_alternative(planning_request.clone())
-        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
-    let logical_selection = planning_request.logical_selection.clone();
-    let (manifests, alternatives) = physical::workload_cost::prepare_manifests(
+    let candidates = physical::workload_cost::enumerate_exact_and_materialized_candidates(
+        compilation_request.clone(),
+    )
+    .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
+    let planner_selection_trace = compilation_request.planner_selection_trace.clone();
+    let (manifests, alternatives) = physical::workload_cost::compile_candidates_for_pricing(
         candidates.clone(),
         environment.clone(),
-        matches!(frontend, PhysicalQueryFrontend::MetricsQl),
+        frontend,
     );
     let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
     // Quote preparation enumerates feasible bindings; it does not select the
@@ -991,27 +962,33 @@ fn compile_physical_plan_request(
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 serde_json::json!({"status": "all_infeasible", "alternatives": alternatives,
-                    "logical_selection": planning_request.logical_selection}),
+                    "logical_selection": compilation_request.planner_selection_trace}),
             ));
         }
         return Ok((
             None,
-            request.collector_ids,
+            request.target_collector_ids,
             apply_timeout,
             request.runtime_adaptation_evidence,
-            (manifests, alternatives, logical_selection),
+            (manifests, alternatives, planner_selection_trace),
         ));
     }
     let compiled = match request.workload_cost_evidence {
         Some(evidence) => match frontend {
-            PhysicalQueryFrontend::PromQl => {
-                physical::workload_cost::select(candidates, environment, &evidence)
-            }
-            PhysicalQueryFrontend::MetricsQl => {
-                physical::workload_cost::select_metricsql(candidates, environment, &evidence)
+            QueryFrontend::PromQl => physical::workload_cost::select_lowest_cost_candidate(
+                candidates,
+                environment,
+                &evidence,
+            ),
+            QueryFrontend::MetricsQl => {
+                physical::workload_cost::select_lowest_cost_metricsql_candidate(
+                    candidates,
+                    environment,
+                    &evidence,
+                )
             }
         },
-        None => frontend.compile(planning_request, environment),
+        None => frontend.compile(compilation_request, environment),
     };
     let bundle = match compiled {
         Ok(bundle) => bundle,
@@ -1022,10 +999,10 @@ fn compile_physical_plan_request(
     };
     Ok((
         Some(bundle),
-        request.collector_ids,
+        request.target_collector_ids,
         apply_timeout,
         request.runtime_adaptation_evidence,
-        (manifests, alternatives, logical_selection),
+        (manifests, alternatives, planner_selection_trace),
     ))
 }
 
@@ -1033,13 +1010,13 @@ fn compile_physical_plan_request(
 async fn handle_workload_cost_manifests(
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> impl IntoResponse {
-    workload_cost_manifests(request, PhysicalQueryFrontend::PromQl)
+    workload_cost_manifests(request, QueryFrontend::PromQl)
 }
 
 async fn handle_metricsql_workload_cost_manifests(
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> impl IntoResponse {
-    workload_cost_manifests(request, PhysicalQueryFrontend::MetricsQl)
+    workload_cost_manifests(request, QueryFrontend::MetricsQl)
 }
 
 fn physical_compile_failure((status, report): (StatusCode, serde_json::Value)) -> Response {
@@ -1051,7 +1028,7 @@ fn physical_compile_failure((status, report): (StatusCode, serde_json::Value)) -
 
 fn workload_cost_manifests(
     request: CompileAndPublishPhysicalPlanRequest,
-    frontend: PhysicalQueryFrontend,
+    frontend: QueryFrontend,
 ) -> Response {
     if request.workload_cost_evidence.is_some() {
         return (
@@ -1062,9 +1039,9 @@ fn workload_cost_manifests(
     }
     let explain = request.explain;
     match compile_physical_plan_request(request, true, frontend) {
-        Ok((_, _, _, _, (manifests, alternatives, logical_selection))) => {
+        Ok((_, _, _, _, (manifests, alternatives, planner_selection_trace))) => {
             if explain {
-                Json(serde_json::json!({"manifests": manifests, "alternatives": alternatives, "logical_selection": logical_selection}))
+                Json(serde_json::json!({"manifests": manifests, "alternatives": alternatives, "logical_selection": planner_selection_trace}))
                     .into_response()
             } else {
                 Json(manifests).into_response()
@@ -1077,35 +1054,19 @@ fn workload_cost_manifests(
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) -> impl IntoResponse {
-    let wc = spec.workload.clone();
-    let query_string = spec.query_string.clone();
     let workload = match st.analyzer.analyze(spec) {
         Ok(w) => w,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     };
 
-    let plan = st.planner.plan(&workload, Some(&wc));
+    let query_string = Some(workload.entry().query.0);
+
+    let plan = st.planner.plan(&workload);
 
     // Derive deployment configs from the bound query. Keep its Rc-backed DAG
     // scoped before any await so the handler future remains Send.
     let stage_configs = {
-        let mut bound_physical: Option<control_plane::physical::post_asap::PhysicalExpr> = None;
-        if let Some(ref qs) = query_string {
-            match parse_query_expr_canonical(qs, workload.accuracy.clone()) {
-                Err(e) => {
-                    warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
-                }
-                Ok(qe) => {
-                    // L4 sketch binding: lower the optimised L3 tree to the
-                    // sketch-bound `PhysicalExpr` IR — the typed L5's input.
-                    bound_physical = control_plane::physical::post_asap::bind_query_expr(
-                        &qe,
-                        workload.accuracy.clone(),
-                    )
-                    .ok();
-                }
-            }
-        }
+        let bound_physical = physical::workload_planner::bind_registered_query(&workload).ok();
 
         let stage_configs: Option<
             std::collections::HashMap<
@@ -1130,13 +1091,13 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // (Quantile vs Sum) would silently overwrite the prior plan.
     let role = {
         let entry = control_plane::workload::WorkloadEntry {
-            metric_name: workload.metric_name.clone(),
+            metric_name: workload.metric_name().clone(),
             query_string: query_string.clone(),
-            accuracy_sla: workload.accuracy_sla,
+            accuracy_sla: 1.0 - workload.error_bound(),
             assign_to_role: String::from("agent"),
-            sketch_family_override: workload.sketch_type_override.clone(),
+            sketch_family_override: workload.deployment.sketch_type_override.clone(),
             target_path: None,
-            grouping_labels: workload.group_by_labels.clone(),
+            grouping_labels: workload.group_by_labels().clone(),
             // Role derivation does not depend on sampling; default 1.0.
             sample_p: 1.0,
             // Role derivation does not depend on the cardinality hint.
@@ -1149,10 +1110,10 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         };
         control_plane::workload::derive_agg_role(&entry)
     };
-    st.store.set(&workload.metric_name, role, plan.clone());
+    st.store.set(workload.metric_name(), role, plan.clone());
     // Persist workload so the replanner can re-run plan() without the original spec.
     st.workload_store
-        .set(&workload.metric_name, role, workload.clone(), wc);
+        .set(workload.metric_name(), role, workload.clone());
 
     // ── Push agent config to agent-role collectors ────────────────────────────
     if let Ok(agent_yaml) = generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint)
@@ -1187,8 +1148,8 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     // `agg.grouping = workload.group_by_labels`
                     // patch on the Backend stage below).
                     edge.metric_to_grouping_labels.insert(
-                        workload.metric_name.clone(),
-                        workload.group_by_labels.clone(),
+                        workload.metric_name().clone(),
+                        workload.group_by_labels().clone(),
                     );
                     // Issue #2: broadcast push — no single agent id
                     // in scope, so emit `$AGENT_ID` placeholder and
@@ -1258,7 +1219,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     //     columns (open-set label naming is
                     //     a Step γ TODO in
                     //     `intent_algebra::column_resolution`).
-                    // `QueryWorkload` carries both unambiguously,
+                    // `RegisteredWorkload` carries both unambiguously,
                     // and every aggregation under one workload
                     // shares them — so the patch is uniform.
                     let item_labels = emit::collect_metric_to_item_label(
@@ -1267,12 +1228,12 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     );
                     for agg in &mut be.aggregations {
                         if agg.metric_name.is_empty() {
-                            agg.metric_name = workload.metric_name.clone();
+                            agg.metric_name = workload.metric_name().clone();
                         }
                         if agg.window_secs == 0 {
-                            agg.window_secs = workload.time_window.as_secs();
+                            agg.window_secs = workload.time_window().as_secs();
                         }
-                        agg.grouping = workload.group_by_labels.clone();
+                        agg.grouping = workload.group_by_labels().clone();
                         agg.item_label = item_labels.get(&agg.metric_name).cloned();
                     }
                     // Option B unification: every typed cumulative
@@ -1289,7 +1250,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     post_typed_backend_for_role(
                         st.backend_client.as_ref(),
                         &st.backend_routing_cache,
-                        &workload.metric_name,
+                        &workload.metric_name(),
                         role,
                         be,
                         &monitors,
@@ -1305,7 +1266,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         }
     } else if physical::stage_split::typed_stage_split_enabled() {
         warn!(
-            metric = %workload.metric_name,
+            metric = %workload.metric_name(),
             "[USE_TYPED_STAGE_SPLIT] split_typed_three_stage returned None; \
              legacy plan output unaffected"
         );
@@ -1318,7 +1279,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             .set_sketch_type(&agent_id, sketch_type.clone())
             .await;
         st.replanner
-            .register_agent(&agent_id, &workload.metric_name, role)
+            .register_agent(&agent_id, &workload.metric_name(), role)
             .await;
     }
 
@@ -1327,7 +1288,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     (
         StatusCode::OK,
         Json(json!({
-            "metric":              workload.metric_name,
+            "metric":              workload.metric_name(),
             "sketch_type":         plan.agent_config.sketch_type.to_string(),
             "mode":                plan.agent_config.mode.to_string(),
             "aggregate_by":        plan.agent_config.aggregate_by,
@@ -1569,7 +1530,7 @@ async fn emit_bootstrap_typed(
     //      stays the source of the edge config.
     let mut chosen: Option<(String, crate::physical::post_asap::PhysicalExpr)> = None;
     'outer: for cand in &candidates {
-        for (_, wl, _) in st.workload_store.get_all_for_metric(cand) {
+        for (_, wl) in st.workload_store.get_all_for_metric(cand) {
             if let Some(expr) = physical::workload_planner::bind_workload_typed(&wl) {
                 chosen = Some((cand.clone(), expr));
                 break 'outer;
@@ -1834,11 +1795,14 @@ mod api_tests {
     // A missing warm implementation must not hide the executable exact quote.
     #[tokio::test]
     async fn cost_manifests_survive_unavailable_warm_candidate() {
-        let snapshot: physical::compiler::BackendLocalPlanningSnapshot = serde_json::from_str(
+        let snapshot: physical::compiler::BackendLocalPlanningInput = serde_json::from_str(
             include_str!("../../docs/examples/asapquery-planning-snapshot.json"),
         )
         .unwrap();
-        let (planning, _) = snapshot.clone().planning_request().unwrap();
+        let (planning, _) = snapshot
+            .clone()
+            .into_physical_compilation_request()
+            .unwrap();
         let query = &planning.queries[0];
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1847,8 +1811,8 @@ mod api_tests {
         let mut request_body = serde_json::json!({
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
-                "metric": "m", "window_secs": 60, "accuracy": query.accuracy,
-                "lifecycle": query.lifecycle, "evaluation_phase_ms": 0, "window_cost_model": snapshot.implementation.window_cost_model
+                "metric": "m", "window_secs": 60, "accuracy": query.accuracy_target,
+                "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": snapshot.physical_inputs.window_cost_model
             }],
             "collector_ids": ["test"], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
@@ -1898,29 +1862,33 @@ mod api_tests {
 
     #[test]
     fn backend_local_typed_request_compiles_without_collectors() {
-        let snapshot: physical::compiler::BackendLocalPlanningSnapshot = serde_json::from_str(
+        let snapshot: physical::compiler::BackendLocalPlanningInput = serde_json::from_str(
             include_str!("../../docs/examples/asapquery-compatibility-demo-snapshot.json"),
         )
         .unwrap();
-        let (planning, _) = snapshot.clone().planning_request().unwrap();
+        let (planning, _) = snapshot
+            .clone()
+            .into_physical_compilation_request()
+            .unwrap();
         let mut query = planning.queries[0].clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        query.lifecycle.evidence_observed_at_unix_ms = now;
-        for implementation in &mut query.window_implementations {
+        query.summary_lifecycle_inputs.evidence_observed_at_unix_ms = now;
+        for implementation in &mut query.window_realization_candidates {
             implementation.cost.observed_at_unix_ms = now;
         }
-        let planner_types::pre_asap::Source::TimeSeries { metric } = &query.source else {
+        let planner_types::pre_asap::Source::TimeSeries { metric } = &query.legacy_query_source
+        else {
             panic!("expected time series fixture");
         };
         let value = serde_json::json!({
             "target": "backend_local_remote_write",
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
-                "metric": metric, "window_secs": query.window_secs, "accuracy": query.accuracy,
-                "lifecycle": query.lifecycle, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_implementations[0].cost }
+                "metric": metric, "window_secs": query.query_lookback_seconds, "accuracy": query.accuracy_target,
+                "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_realization_candidates[0].cost }
             }],
             "collector_ids": [], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
@@ -1929,7 +1897,7 @@ mod api_tests {
         });
         let request = serde_json::from_value(value.clone()).unwrap();
         let (plan, collectors, _, _, _) =
-            compile_physical_plan_request(request, false, PhysicalQueryFrontend::PromQl).unwrap();
+            compile_physical_plan_request(request, false, QueryFrontend::PromQl).unwrap();
         let plan = plan.unwrap();
         assert!(collectors.is_empty());
         assert!(plan.collector_plans.is_empty());
@@ -1943,7 +1911,7 @@ mod api_tests {
         assert!(compile_physical_plan_request(
             serde_json::from_value(distributed).unwrap(),
             false,
-            PhysicalQueryFrontend::PromQl
+            QueryFrontend::PromQl
         )
         .is_err());
     }
@@ -2044,7 +2012,7 @@ mod api_tests {
                 .workload_store
                 .get_all_for_metric("typed_accuracy_metric");
             assert_eq!(stored.len(), 1);
-            assert_eq!(stored[0].1.accuracy, target);
+            assert_eq!(stored[0].1.accuracy(), target);
             let plans = state.store.get_all_for_metric("typed_accuracy_metric");
             assert_eq!(plans.len(), 1);
             if matches!(target, AccuracyTarget::Epsilon(_)) {
@@ -2287,8 +2255,8 @@ mod api_tests {
             data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
-        let wc = types::WorkloadCharacteristics::default();
-        let plan = planner.plan(&wl, Some(&wc));
+
+        let plan = planner.plan(&wl);
         // B2 (metric, role): pre-populate using the same role the
         // on_connect callback's `derive_agg_role(entry)` will compute
         // for this test's workloads.yaml entry (no query_string + no
@@ -2300,12 +2268,7 @@ mod api_tests {
             control_plane::workload::AggRole::Other,
             plan,
         );
-        workload_store.set(
-            "http_latency",
-            control_plane::workload::AggRole::Other,
-            wl,
-            wc,
-        );
+        workload_store.set("http_latency", control_plane::workload::AggRole::Other, wl);
 
         // Build replanner and late-binding cells.
         let replanner_cell: Arc<tokio::sync::RwLock<Option<Arc<Replanner>>>> =
@@ -2432,15 +2395,10 @@ mod api_tests {
             data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).unwrap();
-        let wc = types::WorkloadCharacteristics::default();
-        let plan = planner.plan(&wl, Some(&wc));
+
+        let plan = planner.plan(&wl);
         plan_store.set("metric_a", control_plane::workload::AggRole::Quantile, plan);
-        workload_store.set(
-            "metric_a",
-            control_plane::workload::AggRole::Quantile,
-            wl,
-            wc,
-        );
+        workload_store.set("metric_a", control_plane::workload::AggRole::Quantile, wl);
 
         let replanner = Arc::new(Replanner::new(
             Arc::clone(&planner),
@@ -2697,14 +2655,14 @@ mod api_tests {
             data: types::DataShape::default(),
         };
         let wl = analyzer.analyze(spec).expect("analyze");
-        let wc = types::WorkloadCharacteristics::default();
-        let plan = state.planner.plan(&wl, Some(&wc));
+
+        let plan = state.planner.plan(&wl);
         state
             .store
             .set(metric, control_plane::workload::AggRole::Quantile, plan);
         state
             .workload_store
-            .set(metric, control_plane::workload::AggRole::Quantile, wl, wc);
+            .set(metric, control_plane::workload::AggRole::Quantile, wl);
 
         // 4. Swap in the populated registry.
         state.workload_registry = registry;
@@ -2922,14 +2880,14 @@ mod api_tests {
                 data: types::DataShape::default(),
             };
             let wl = analyzer.analyze(spec).expect("analyze");
-            let wc = types::WorkloadCharacteristics::default();
-            let plan = state.planner.plan(&wl, Some(&wc));
+
+            let plan = state.planner.plan(&wl);
             state
                 .store
                 .set(*m, control_plane::workload::AggRole::Quantile, plan);
             state
                 .workload_store
-                .set(*m, control_plane::workload::AggRole::Quantile, wl, wc);
+                .set(*m, control_plane::workload::AggRole::Quantile, wl);
         }
 
         // 4. Swap in the populated registry.
@@ -3092,12 +3050,11 @@ mod api_tests {
         for entry in registry.entries() {
             let spec = control_plane::workload::query_spec_for_entry(entry);
             if let Ok(wl) = analyzer.analyze(spec) {
-                let wc = types::WorkloadCharacteristics::default();
-                let plan = state.planner.plan(&wl, Some(&wc));
-                let metric_name = wl.metric_name.clone();
+                let plan = state.planner.plan(&wl);
+                let metric_name = wl.metric_name().clone();
                 let role = control_plane::workload::derive_agg_role(entry);
                 state.store.set(&metric_name, role, plan);
-                state.workload_store.set(&metric_name, role, wl, wc);
+                state.workload_store.set(&metric_name, role, wl);
             }
         }
 

@@ -338,7 +338,7 @@ impl MonitorService for MonitorServiceImpl {
 #[cfg(test)]
 mod reconfigure_tests {
     use super::MonitorCoordinator;
-    use crate::monitor::coordinator::MonitorConfig;
+    use crate::update_sampling::coordinator::MonitorConfig;
 
     fn cfg(agg_id: u64, key: &str, tau: f64) -> MonitorConfig {
         MonitorConfig {
