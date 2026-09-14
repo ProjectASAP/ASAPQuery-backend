@@ -76,12 +76,6 @@ use std::collections::HashMap;
 pub struct ASAPQueryEngine {
     #[allow(dead_code)]
     prometheus_scrape_interval: u64,
-    /// Optional `ControlPlaneClient` used to notify the control plane
-    /// when a query hits a capability miss
-    /// (`find_compatible_aggregation` returns `None`). When `None`,
-    /// misses fall through to the §5.2 fallback silently, matching
-    /// pre-PR-G behavior. Set via `with_control_plane_client`.
-    control_plane_client: Option<Arc<dyn crate::drivers::control_plane_client::ControlPlaneClient>>,
     /// ASAP-tier sketch index. When `Some`, the trait's
     /// `execute` adapter classifies the query's metric/group-by against
     /// the index and short-circuits to `EngineError::CapabilityMiss` when
@@ -169,7 +163,6 @@ impl ASAPQueryEngine {
     pub fn new(prometheus_scrape_interval: u64) -> Self {
         Self {
             prometheus_scrape_interval,
-            control_plane_client: None,
             summary_store: None,
             archive_engine: None,
             active_physical_plan: None,
@@ -517,20 +510,6 @@ impl ASAPQueryEngine {
         self
     }
 
-    /// Attach a `ControlPlaneClient` so capability misses fire a
-    /// fire-and-forget notification to the DataCollector controller.
-    /// Builder-style method — takes self by value and returns it so
-    /// construction in `main.rs` chains neatly. Without this call,
-    /// capability misses fall through to the §5.2 fallback silently,
-    /// matching pre-PR-G behavior.
-    pub fn with_control_plane_client(
-        mut self,
-        client: Arc<dyn crate::drivers::control_plane_client::ControlPlaneClient>,
-    ) -> Self {
-        self.control_plane_client = Some(client);
-        self
-    }
-
     /// Build a minimal `QueryRequirements` from a bare PromQL string —
     /// used by the no-sketch-index miss branch in modern `execute()`,
     /// where we don't have a parsed candidate (analysis was skipped)
@@ -722,10 +701,6 @@ impl ASAPQueryEngine {
             Ok(result)
         }).map_err(|reason| {
             if let Some(req) = Self::requirements_from_query_str(query) {
-                crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                    &self.control_plane_client,
-                    &req,
-                );
             }
             crate::query_engines::EngineError::capability_miss(
                 crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
@@ -1067,10 +1042,6 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 Ok((result, t0_ms))
             }).map_err(|reason| {
                     if let Some(req) = Self::requirements_from_query_str(query) {
-                        crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                            &self.control_plane_client,
-                            &req,
-                        );
                     }
                     crate::query_engines::EngineError::capability_miss(
                         crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
@@ -1095,12 +1066,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
 
         // Without a sketch index, notify the control plane directly on a capability
         // miss so the feedback loop also works for this configuration.
-        if let Some(req) = Self::requirements_from_query_str(query) {
-            crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                &self.control_plane_client,
-                &req,
-            );
-        }
+        if let Some(req) = Self::requirements_from_query_str(query) {}
         Err(crate::query_engines::EngineError::capability_miss(
             crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
             format!("ASAPQueryEngine: no sketch index for `{query}` — failing over to archive"),
