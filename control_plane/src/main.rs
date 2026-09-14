@@ -7,7 +7,7 @@ use control_plane::opamp;
 use control_plane::physical;
 use control_plane::query_parser;
 use control_plane::runtime_samples;
-use control_plane::types_v2;
+use control_plane::types;
 
 use axum::{
     extract::State,
