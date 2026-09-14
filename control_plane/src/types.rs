@@ -235,7 +235,6 @@ impl std::fmt::Display for ProcessorMode {
 
 // ── Core types ────────────────────────────────────────────────────────────────
 
-
 // ── Sketch defaults (YAML-configurable) ──────────────────────────────────────
 
 /// Per-sketch-type default parameters.  Loaded from a YAML config file at

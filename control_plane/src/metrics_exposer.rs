@@ -166,7 +166,6 @@ impl MetricsRegistry {
         })
     }
 
-
     /// Walk the store and push the latest sample per key into
     /// the gauge vecs. Called at scrape time, not per-record —
     /// cost scales with (# keys), not (# records).

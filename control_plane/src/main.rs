@@ -743,8 +743,6 @@ fn workload_cost_manifests(
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-
-
 /// Returns the current EMA cost model state — blended benchmark + observed costs
 /// per sketch type.  Useful for diagnosing whether the online cost model has
 /// received sufficient observations to meaningfully influence plan selection.
@@ -1137,7 +1135,6 @@ mod api_tests {
         }
     }
 
-
     /// Test 2: Re-plan pushes config only to agents registered for that metric.
     #[tokio::test]
     async fn replan_pushes_only_to_registered_agent() {
@@ -1394,12 +1391,6 @@ mod api_tests {
         }
     }
 
-
-
-
-
-
-
     // ── MVP §46: planner ↔ 5-sketch emitter stitch (PR #339 ↔ PR #340) ─────────
     //
     // The acceptance contract: register the six contract metrics in the
@@ -1413,8 +1404,4 @@ mod api_tests {
     // EdgeStageConfig.metric_to_family HashMap stays empty and the
     // emitter falls back to single-pipeline DDSketch — none of the
     // assertions below pass.
-
-
-
-
 }

@@ -76,9 +76,4 @@ pub(crate) mod test_support {
             right: Rc::new(QueryExpr::Literal(ScalarValue::Utf8(value.to_string()))),
         })))
     }
-
-
-
-
-
 }

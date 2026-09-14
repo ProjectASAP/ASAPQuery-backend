@@ -11,7 +11,6 @@ use asap_aware_mapping::cost_model::Cost;
 use planner_types::post_asap::SummaryWindowFramework;
 
 pub(crate) trait RealizationProvider {
-
     fn windows(
         &self,
         query: &QueryCompilationInput,
@@ -37,7 +36,6 @@ pub(crate) trait RealizationProvider {
 pub(crate) struct ExistingRealizations;
 
 impl RealizationProvider for ExistingRealizations {
-
     fn windows(
         &self,
         query: &QueryCompilationInput,

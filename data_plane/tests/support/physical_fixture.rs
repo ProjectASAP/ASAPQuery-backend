@@ -9,7 +9,13 @@ use data_plane::{
 use std::{collections::BTreeMap, sync::Arc};
 
 pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
-    artifact_from_materializations(config.materializations_by_policy_fingerprint.values().cloned().collect())
+    artifact_from_materializations(
+        config
+            .materializations_by_policy_fingerprint
+            .values()
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Same as [`artifact`], but from materializations the planner produced
