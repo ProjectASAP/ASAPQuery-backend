@@ -121,15 +121,14 @@ async fn issue_workloads_execute_warm_at_successive_evaluations() {
         "../../../docs/examples/asapquery-planning-snapshot.json"
     ))
     .unwrap();
-    fixture["implementation"]["source_sample_interval_ms"] = 1000.into();
+    fixture["implementation"]["scrape_interval_ms"] = 1000.into();
     fixture["implementation"]["horizon_seconds"] = 3600.into();
     let template = fixture["query_workload"]["repeating_queries"][0].clone();
     fixture["query_workload"]["repeating_queries"] = queries
         .iter()
-        .map(|(query, lookback, cadence)| {
+        .map(|(query, _lookback, cadence)| {
             let mut entry = template.clone();
             entry["query"] = query.clone().into();
-            entry["time_selection"]["lookback"] = (lookback * 1000).into();
             entry["demand"]["fixed_interval_at"]["interval"] = (cadence * 1000).into();
             if !query.contains("quantile") {
                 entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
@@ -359,13 +358,12 @@ async fn temporal_average_overflow_falls_back_after_state_is_warm() {
         "../../../docs/examples/asapquery-planning-snapshot.json"
     ))
     .unwrap();
-    fixture["implementation"]["source_sample_interval_ms"] = 1000.into();
+    fixture["implementation"]["scrape_interval_ms"] = 1000.into();
     let template = fixture["query_workload"]["repeating_queries"][0].clone();
     fixture["query_workload"]["repeating_queries"] = ["avg", "sum", "count"]
         .map(|op| {
             let mut entry = template.clone();
             entry["query"] = format!("{op}_over_time(average_overflow[5s])").into();
-            entry["time_selection"]["lookback"] = 5000.into();
             entry["demand"]["fixed_interval_at"]["interval"] = 1000.into();
             entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
             entry

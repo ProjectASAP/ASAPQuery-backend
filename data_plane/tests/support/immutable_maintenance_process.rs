@@ -31,7 +31,6 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
     entry["query"] = query.into();
     entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
     entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
-    entry["time_selection"]["lookback"] = 60_000.into();
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
     let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
         serde_json::from_value(fixture.clone()).unwrap();

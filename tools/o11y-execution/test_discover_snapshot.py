@@ -25,6 +25,10 @@ class DiscoverSnapshotTests(unittest.TestCase):
             ], check=True)
             snapshot = json.loads(output.read_text())
             self.assertEqual(snapshot["query_workload"]["repeating_queries"][0]["demand"], {"fixed_interval_at": {"interval": 60000, "evaluation_phase": 0}})
+            # Discovery output must obey the same schema as the compiler input.
+            self.assertIsNone(snapshot["query_workload"]["repeating_queries"][0]["time_selection"].get("lookback"))
+            self.assertEqual(snapshot["implementation"]["scrape_interval_ms"], 60_000)
+            self.assertNotIn("source_sample_interval_ms", snapshot["implementation"])
             environment = snapshot["environment"]
             self.assertEqual(environment["activation_unix_ms"], environment["observed_at_unix_ms"])
             provenance = json.loads(output.with_suffix(".provenance.json").read_text())

@@ -89,7 +89,7 @@ pub(super) fn operator(
         max_bytes,
         max_series: 100_000.min((max_bytes / 1024) as usize),
         max_input_lag_ms: request
-            .source_sample_interval_ms
+            .scrape_interval_ms
             .unwrap_or(60_000)
             .saturating_add(request.query_retention_margin_ms)
             .clamp(1, 300_000),

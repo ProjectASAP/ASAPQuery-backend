@@ -26,7 +26,7 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
     ))
     .unwrap();
     snapshot.schema_version = 2;
-    snapshot.physical_inputs.source_sample_interval_ms = Some(60_000);
+    snapshot.physical_inputs.scrape_interval_ms = 60_000;
     let template = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0].clone();
     let mut queries = vec![];
     for q in [0.5, 0.9, 0.95, 0.99] {
