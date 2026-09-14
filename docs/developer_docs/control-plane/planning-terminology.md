@@ -172,3 +172,7 @@ by upstream #712. Shared panes preserve cadence, phase and evaluation alignment.
 Publication includes storage routing derived from the selected physical plan (#713).
 The former `types_v2` definitions now live in `types` (#717). These upstream API
 removals also apply here; wire-name compatibility covers retained naming-only fields.
+
+Upstream #715 removes unused auto/Pareto planning and rollback/diff HTTP routes
+and their auxiliary modules. This integration retains those removals; canonical
+workload registration and replanning continue through the retained interfaces.

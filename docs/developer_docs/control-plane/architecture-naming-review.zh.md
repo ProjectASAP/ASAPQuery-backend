@@ -51,7 +51,7 @@
 | [存储元数据](../../../data_plane/src/storage_engines/sketch_db/index/mod.rs) | `SketchInstanceMetadata` → `SummarySeriesMetadata`；`sketch_index` 字段与变量 → `summary_store`；保留 `SketchStore` 类型 |
 | 其余调用边界 | `types::QueryWorkload` / `LegacyMetricWorkload` 删除，统一到 Planner `QueryWorkload` + `DataWorkload`；`ClickHouseSqlWorkload.sds` → `summary_catalog`；`aggregation_configs` → `materializations_by_policy_fingerprint`；`aggregation_id_for_key/value` → `key_policy_fingerprint/value_policy_fingerprint`；`data_plane::monitor` → `update_sampling` |
 
-主分支集成补充：共享 pane 保留 cadence、phase 与 evaluation alignment；发布的 storage routing 从选中物理计划生成；`types_v2` 已删除，定义合入 `types`。这些上游删除的接口不提供旧字段兼容。下文涉及旧窗口模板和 query 级来源集合的建议仅属历史审查。
+主分支集成补充：共享 pane 保留 cadence、phase 与 evaluation alignment；发布的 storage routing 从选中物理计划生成；`types_v2` 已删除，定义合入 `types`。随后合入 #715（`e25d53b1`），保留未使用的 auto/Pareto 规划、rollback/diff HTTP 接口及辅助模块删除；canonical 注册与重规划仍走保留入口。这些上游删除的接口不提供旧字段兼容。下文涉及旧窗口模板和 query 级来源集合的建议仅属历史审查。
 
 迁移规则：**保留字段的 Rust 名称更新，输出 wire 名称保持原样**；反序列化接受新名称作为 alias。旧公共类型导入及主要入口提供 deprecated 转发，但 Rust struct literal 的旧字段拼写无法通过类型别名兼容，源码消费者需要按表迁移。`None` / 空候选集合、浮点频次、报价身份、候选排序、严格小于的选择规则及计划生命周期均保持原义。
 
