@@ -490,6 +490,71 @@ mod tests {
             other => panic!("expected canonical Aggregate, got {other:?}"),
         }
     }
+    /// PromQL `count(v)` counts SERIES; it is not a distinct-item count.
+    ///
+    /// This mapping has flip-flopped across ASAPPlanner revisions: `ca7546de`
+    /// (and several around it) lowered a bare `count by (d) (...)` to
+    /// `AggIntent::Cardinality`, which binds `Capability::CardinalityApprox`
+    /// and is served by merging HLL registers. For two series holding
+    /// {a,b,c} and {d,e,f} that answers 6 -- the union's distinct cardinality --
+    /// where PromQL's answer is 2, the number of series.
+    ///
+    /// `Cardinality` belongs to the distinct-count idiom only: `distinct_over_time`,
+    /// `COUNT(DISTINCT ...)`, or an explicit `count(distinct_over_time(...))`
+    /// whose INNER node carries the intent. Keeping the two apart is what lets
+    /// `capability_for` route `Count` to a frequency sketch and `Cardinality`
+    /// to HLL, as `runtime_capability`'s own contract states.
+    #[test]
+    fn bare_count_is_series_count_not_distinct_cardinality() {
+        fn intents(query: &str) -> Vec<AggIntent> {
+            fn walk(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
+                match expr {
+                    QueryExpr::Aggregate {
+                        measures, child, ..
+                    } => {
+                        out.extend(measures.iter().cloned());
+                        walk(child, out);
+                    }
+                    QueryExpr::TimeRange { child, .. } => walk(child, out),
+                    _ => {}
+                }
+            }
+            let mut out = vec![];
+            walk(&parse_query_expr_canonical(query, ACC).unwrap(), &mut out);
+            out
+        }
+
+        for query in ["count(unique_users)", "count by (svc) (unique_users)"] {
+            let found = intents(query);
+            assert!(
+                found
+                    .iter()
+                    .all(|intent| !matches!(intent, AggIntent::Cardinality { .. })),
+                "{query} must not carry a Cardinality intent -- that binds HLL and \
+                 answers the union's distinct count instead of the series count; got {found:?}"
+            );
+            assert!(
+                found
+                    .iter()
+                    .any(|intent| matches!(intent, AggIntent::Count { .. })),
+                "{query} must lower to a Count intent, got {found:?}"
+            );
+        }
+
+        // The distinct-count idiom keeps its cardinality intent, on the inner node.
+        for query in [
+            "distinct_over_time(unique_users[5m])",
+            "count(distinct_over_time(unique_users[5m]))",
+        ] {
+            let found = intents(query);
+            assert!(
+                found
+                    .iter()
+                    .any(|intent| matches!(intent, AggIntent::Cardinality { .. })),
+                "{query} is the distinct-count idiom and must keep Cardinality, got {found:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

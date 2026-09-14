@@ -502,6 +502,31 @@ mod tests {
         );
     }
 
+    /// The two intents must never collapse into one capability: an approximate
+    /// `Count` is a `COUNT(*)` point query (frequency sketch), while
+    /// `Cardinality` is `COUNT(DISTINCT ...)` (HLL). Routing `Count` to
+    /// `CardinalityApprox` makes a by-less `count(v)` merge HLL registers and
+    /// answer the union's distinct count instead of the number of series --
+    /// see `query_parser::tests::bare_count_is_series_count_not_distinct_cardinality`
+    /// for the lowering half of this invariant.
+    #[test]
+    fn count_and_cardinality_bind_different_sketch_capabilities() {
+        let approximate = AccuracyTarget::Epsilon(0.01);
+        let count = capability_for(&AggIntent::Count {
+            accuracy: approximate.clone(),
+        });
+        let cardinality = capability_for(&AggIntent::Cardinality {
+            col: None,
+            accuracy: approximate,
+        });
+        assert_eq!(count, Some(Capability::FrequencyEstimate(None)));
+        assert_eq!(cardinality, Some(Capability::CardinalityApprox));
+        assert_ne!(
+            count, cardinality,
+            "count() must not bind the HLL capability that answers COUNT(DISTINCT)"
+        );
+    }
+
     #[test]
     fn capability_for_count_exact_routes_to_archive() {
         // `count_over_time` lowers to `Count{accuracy:Exact}`. The
