@@ -371,44 +371,6 @@ pub struct WorkloadEntry {
     pub repeat_every: Option<String>,
 }
 
-/// Build the planning spec from a declarative registry entry.
-///
-/// Use one conversion for startup and HTTP planning so cadence and sizing agree.
-/// Leave `time_window` empty for query strings: the parser must read the declared
-/// range. Explicit-field entries default to `5m`. Grouping labels and sketch
-/// overrides must reach the planner and the edge configuration.
-pub fn query_spec_for_entry(entry: &WorkloadEntry) -> crate::pipeline::QuerySpec {
-    crate::pipeline::QuerySpec {
-        query_string: entry.query_string.clone(),
-        metric_name: entry.metric_name.clone(),
-        label_filters: Default::default(),
-        group_by_labels: entry.grouping_labels.clone(),
-        aggregations: if entry.query_string.is_some() {
-            vec![]
-        } else {
-            vec!["quantile".into()]
-        },
-        time_window: if entry.query_string.is_some() {
-            String::new()
-        } else {
-            "5m".into()
-        },
-        repeat_every: entry.repeat_every.clone(),
-        accuracy_sla: entry.accuracy_sla,
-        latency_sla: None,
-        sketch_type: entry.sketch_family_override.clone(),
-        workload: crate::types::WorkloadCharacteristics::default(),
-        // design.md alignment: defaults preserve legacy behaviour.
-        id: None,
-        language: None,
-        accuracy: None,
-        dollars: None,
-        deployment_model: None,
-        shape: crate::types::QueryShape::default(),
-        data: crate::types::DataShape::default(),
-    }
-}
-
 /// User-facing continuous-monitoring declaration on a [`WorkloadEntry`]. τ/ε and
 /// the window are authoritative at the coordinator; this is the controller's
 /// source for emitting them. See `crate::emit::monitor`.
@@ -619,62 +581,6 @@ impl WorkloadRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The declared cadence is a planning cost input, so it has to survive the
-    /// YAML entry point exactly as it survives `POST /api/v1/plan`.
-    #[test]
-    fn yaml_cadence_reaches_the_planning_workload() {
-        let yaml = r#"
-- metric_name: http_requests_total
-  query_string: "sum by (zone) (rate(http_requests_total[5m]))"
-  accuracy_sla: 0.99
-  repeat_every: 30s
-- metric_name: http_errors_total
-  query_string: "sum by (zone) (rate(http_errors_total[5m]))"
-  accuracy_sla: 0.99
-"#;
-        let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(entries[0].repeat_every.as_deref(), Some("30s"));
-        assert_eq!(entries[1].repeat_every, None);
-
-        let analyzer = crate::pipeline::Analyzer::new();
-        let declared = analyzer.analyze(query_spec_for_entry(&entries[0])).unwrap();
-        assert_eq!(
-            declared.repeat_every(),
-            Some(std::time::Duration::from_secs(30))
-        );
-        // An entry that declares no cadence keeps the historical `None`, so the
-        // cost model falls back to its window-derived flush rate.
-        let undeclared = analyzer.analyze(query_spec_for_entry(&entries[1])).unwrap();
-        assert_eq!(undeclared.repeat_every(), None);
-    }
-
-    /// A cadence the duration parser cannot read is a declaration error, not a
-    /// silently dropped field.
-    #[test]
-    fn unparsable_cadence_fails_the_entry() {
-        let entry = WorkloadEntry {
-            metric_name: "http_requests_total".into(),
-            query_string: Some("sum(http_requests_total)".into()),
-            accuracy_sla: 0.99,
-            assign_to_role: "agent".into(),
-            sketch_family_override: None,
-            target_path: None,
-            grouping_labels: vec![],
-            sample_p: 1.0,
-            distinct_keys_per_window: None,
-            item_label: None,
-            monitor: None,
-            repeat_every: Some("every 30 seconds".into()),
-        };
-        let error = crate::pipeline::Analyzer::new()
-            .analyze(query_spec_for_entry(&entry))
-            .expect_err("unparsable cadence must not plan");
-        assert!(
-            format!("{error:#}").contains("repeat_every"),
-            "unexpected error: {error:#}"
-        );
-    }
 
     /// An unsupported key is planning input the controller cannot honour;
     /// accepting the file would report a cadence / hint that never left the YAML.

@@ -235,8 +235,6 @@ impl std::fmt::Display for ProcessorMode {
 
 // ── Core types ────────────────────────────────────────────────────────────────
 
-pub use crate::registered_workload::RegisteredWorkload;
-
 // ── Sketch defaults (YAML-configurable) ──────────────────────────────────────
 
 /// Per-sketch-type default parameters.  Loaded from a YAML config file at
