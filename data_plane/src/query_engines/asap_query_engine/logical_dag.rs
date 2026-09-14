@@ -182,6 +182,16 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .clone();
         let value = match node {
             QueryPlanNode::Scalar { value } => Value::Scalar(value),
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::CurrentSeries { .. },
+                ..
+            } => {
+                self.stats.summary_readout_evaluations += 1;
+                from_result((self.callback)(
+                    id,
+                    u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
+                )?)?
+            }
             QueryPlanNode::Logical { operator, inputs } => {
                 if matches!(
                     operator,
@@ -239,6 +249,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             | ResidualQueryOperator::CandidateExactSubquery { .. } => {
                 Err(miss("Prometheus exact leaf was not prepared"))
             }
+            ResidualQueryOperator::CurrentSeries { .. } => Err(miss(
+                "current-series leaf must use its installed node identity",
+            )),
             ResidualQueryOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
@@ -539,6 +552,43 @@ fn binary(
     left: Value,
     right: Value,
 ) -> Result<Value, EngineError> {
+    if matches!(
+        operation,
+        BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv
+    ) {
+        let valid = |value: &Value, denominator: bool| match value {
+            Value::Scalar(v) => v.is_finite() && (!denominator || *v != 0.0),
+            Value::Vector(rows) => rows
+                .iter()
+                .all(|(_, v)| v.is_finite() && (!denominator || *v != 0.0)),
+            Value::Matrix(..) => false,
+        };
+        if boolean || !valid(&left, false) || !valid(&right, true) {
+            return Err(miss(
+                "checked division requires finite operands and a nonzero divisor",
+            ));
+        }
+        let result = binary(BinaryOperation::Div, false, left, right)?;
+        let valid_result = |v: &f64| {
+            if operation == BinaryOperation::FiniteDiv {
+                v.is_finite()
+            } else {
+                v.is_normal()
+            }
+        };
+        let normal = match &result {
+            Value::Scalar(v) => valid_result(v),
+            Value::Vector(rows) => rows.iter().all(|(_, v)| valid_result(v)),
+            Value::Matrix(..) => false,
+        };
+        return if normal {
+            Ok(result)
+        } else {
+            Err(miss(
+                "checked division result is outside the declared floating-point domain",
+            ))
+        };
+    }
     let arithmetic = matches!(
         operation,
         BinaryOperation::Add
@@ -735,6 +785,75 @@ mod topk_tests {
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect()
+    }
+
+    // An overflowing sum cannot implement average, but zero/subnormal averages remain valid.
+    #[test]
+    fn finite_division_guards_temporal_average_without_rejecting_zero() {
+        let mut sum = crate::precompute_engine::operators::sum_accumulator::SumAccumulator::new();
+        sum.update(1e308);
+        sum.update(1e308);
+        assert!(binary(
+            BinaryOperation::FiniteDiv,
+            false,
+            Value::Scalar(sum.sum),
+            Value::Scalar(2.0)
+        )
+        .is_err());
+        for (a, b, expected) in [
+            (0.0, 2.0, 0.0),
+            (10.0, 2.0, 5.0),
+            (f64::MIN_POSITIVE, 2.0, f64::MIN_POSITIVE / 2.0),
+        ] {
+            let Value::Scalar(value) = binary(
+                BinaryOperation::FiniteDiv,
+                false,
+                Value::Scalar(a),
+                Value::Scalar(b),
+            )
+            .unwrap() else {
+                panic!("scalar")
+            };
+            assert_eq!(value, expected);
+        }
+        assert!(binary(
+            BinaryOperation::FiniteDiv,
+            false,
+            Value::Scalar(1.0),
+            Value::Scalar(0.0)
+        )
+        .is_err());
+    }
+
+    // A conditional accuracy certificate must fall back rather than return an unbounded ratio.
+    #[test]
+    fn checked_relative_division_enforces_its_execution_domain() {
+        for (a, b) in [
+            (1., 0.),
+            (0., 0.),
+            (1., f64::INFINITY),
+            (f64::NAN, 2.),
+            (f64::MAX, f64::MIN_POSITIVE),
+            (f64::MIN_POSITIVE, f64::MAX),
+        ] {
+            assert!(binary(
+                BinaryOperation::CheckedDiv,
+                false,
+                Value::Scalar(a),
+                Value::Scalar(b)
+            )
+            .is_err());
+        }
+        let Value::Scalar(value) = binary(
+            BinaryOperation::CheckedDiv,
+            false,
+            Value::Scalar(5.),
+            Value::Scalar(10.),
+        )
+        .unwrap() else {
+            panic!("scalar");
+        };
+        assert_eq!(value, 0.5);
     }
 
     #[test]

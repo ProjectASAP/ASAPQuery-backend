@@ -314,11 +314,12 @@ where
             } if measures.len() == 1 => {
                 use planner_types::pre_asap::AggIntent;
                 let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => residual::Aggregation::Sum,
-                    AggIntent::Count { .. } => residual::Aggregation::Count,
-                    AggIntent::Min { .. } => residual::Aggregation::Min,
-                    AggIntent::Max { .. } => residual::Aggregation::Max,
-                    AggIntent::Avg { .. } => residual::Aggregation::Avg,
+                    AggIntent::Sum { .. } => Some(residual::Aggregation::Sum),
+                    AggIntent::Count { .. } => Some(residual::Aggregation::Count),
+                    AggIntent::Min { .. } => Some(residual::Aggregation::Min),
+                    AggIntent::Max { .. } => Some(residual::Aggregation::Max),
+                    AggIntent::Avg { .. } => Some(residual::Aggregation::Avg),
+                    AggIntent::TopK { .. } => None,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported exact value aggregation".into(),
@@ -346,14 +347,23 @@ where
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let grouping = residual::Grouping {
+                    labels,
+                    without: keys.is_without(),
+                };
+                let operator = if let AggIntent::TopK { k, .. } = &measures[0] {
+                    residual::ResidualQueryOperator::TopKSelection {
+                        k: *k as u64,
+                        grouping,
+                    }
+                } else {
+                    residual::ResidualQueryOperator::Aggregate {
+                        operation: operation.expect("aggregate operation"),
+                        grouping,
+                    }
+                };
                 QueryPlanNode::Logical {
-                    operator: residual::ResidualQueryOperator::Aggregate {
-                        operation,
-                        grouping: residual::Grouping {
-                            labels,
-                            without: keys.is_without(),
-                        },
-                    },
+                    operator,
                     inputs: vec![self.lower(child)?],
                 }
             }
@@ -535,7 +545,10 @@ where
                 rhs,
                 operator,
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
-            } if self.logical_source.is_some() => {
+            } if self.logical_source.is_some()
+                || operator.checked_relative_division
+                || operator.checked_finite_division =>
+            {
                 let operator = residual::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,
@@ -811,6 +824,7 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
         SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _) => Some(ExactReadout::Max),
+        SummaryFamilyType::ExactAggregate(ExactKind::Min, _) => Some(ExactReadout::Min),
         _ => None,
     }
 }
@@ -894,7 +908,12 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
                     && matches!(reduction, Reduction::PerEntity)
                     && matches!(
                         kind,
-                        ExactKind::Sum | ExactKind::Count | ExactKind::Increase | ExactKind::Rate
+                        ExactKind::Sum
+                            | ExactKind::Count
+                            | ExactKind::Increase
+                            | ExactKind::Rate
+                            | ExactKind::Min
+                            | ExactKind::MinMax
                     )
             } else {
                 // Raw producer grouping may move through additive reductions,
