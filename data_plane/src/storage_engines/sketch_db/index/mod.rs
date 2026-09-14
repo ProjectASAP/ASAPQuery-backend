@@ -603,6 +603,7 @@ impl Drop for StateMutation<'_> {
 
 #[derive(Default)]
 pub struct SketchStore {
+    pub current_series: std::sync::Mutex<super::current_series::CurrentSeriesStore>,
     /// Held through each state append; completion takes the exclusive guard.
     completed_windows: RwLock<HashMap<u64, u64>>,
     completion_flush_before: std::sync::atomic::AtomicU64,
@@ -1043,6 +1044,24 @@ impl SketchStore {
                 .known_empty(definition, series_id, range)
     }
 
+    /// A closed full-window producer publishes every nonempty exact window.
+    /// Overlapping neighboring snapshots do not establish population in this one.
+    pub(crate) fn full_summary_window_known_empty(
+        &self,
+        definition: SummaryDefinitionId,
+        series_id: u64,
+        range: HalfOpenTimeRange,
+    ) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.active_mutations.load(SeqCst) == 0
+            && self.finite_mutation_revision.load(SeqCst) == self.mutation_revision.load(SeqCst)
+            && self
+                .admission
+                .read()
+                .unwrap()
+                .known_empty_with_layout(definition, series_id, range, true)
+    }
+
     pub(crate) fn summary_update_revision(&self) -> SummaryReadRevision {
         SummaryReadRevision::capture(
             self.admission.read().unwrap().revision(),
@@ -1062,11 +1081,12 @@ impl SketchStore {
         &self,
         definition: SummaryDefinitionId,
         range: HalfOpenTimeRange,
+        full_window: bool,
     ) -> bool {
         self.admission
             .read()
             .unwrap()
-            .has_pending(definition, range)
+            .has_pending(definition, range, full_window)
     }
 
     /// Share the installed metadata snapshot without copying descriptors or state.

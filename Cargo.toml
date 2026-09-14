@@ -18,7 +18,7 @@ version = "0.1.0"
 asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
 
 [workspace.dependencies]
-# Keep Planner frontends, selection, and IR on the same immutable revision.
+# Keep Planner frontends, selection, and IR on the same immutable revision (current-series Planner PR).
 # Alias upstream asap-types because this workspace also defines asap_types.
 planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "029ff2fe041172c94c2d32c90b185bc83c5e8a57" }
 asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "029ff2fe041172c94c2d32c90b185bc83c5e8a57" }

@@ -242,8 +242,11 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                                         let mut labels = key.clone();
                                         if self.language
                                             == control_plane::query_plan::QueryLanguage::MetricsQl
-                                            && *readout
-                                                != control_plane::query_plan::ExactReadout::Max
+                                            && !matches!(
+                                                readout,
+                                                control_plane::query_plan::ExactReadout::Max
+                                                    | control_plane::query_plan::ExactReadout::Min
+                                            )
                                         {
                                             labels.remove("__name__");
                                         }

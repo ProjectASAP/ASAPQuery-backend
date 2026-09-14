@@ -727,7 +727,7 @@ fn has_unsafe_raw_entity_leaf(
                 let preserves_series_state = matches!(
                     family,
                     SummaryFamilyType::ExactAggregate(
-                        ExactKind::Increase | ExactKind::Rate | ExactKind::Max,
+                        ExactKind::Increase | ExactKind::Rate | ExactKind::Min | ExactKind::Max,
                         _
                     )
                 );
@@ -920,6 +920,14 @@ impl PhysicalPlanCompiler {
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
+        if super::maintained_population::supported(&request)
+            && (frontend != QueryFrontend::PromQl
+                || environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite)
+        {
+            return Err(CompileError::Snapshot(
+                "current-series maintenance requires backend-local PromQL deployment".into(),
+            ));
+        }
         if request.allow_mixed_summary_and_exact_execution
             && environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
         {
@@ -1088,7 +1096,9 @@ impl PhysicalPlanCompiler {
                 .collect::<Vec<_>>();
             // An exact native fallback has no maintained state and must not
             // depend on evidence for unused window/state implementations.
-            if selected.is_empty() {
+            if selected.is_empty()
+                && super::maintained_population::operator(&request, query)?.is_none()
+            {
                 continue;
             }
             let executable = planner_types::post_asap::compile_executable_dag_with_node_ids(
@@ -1099,6 +1109,9 @@ impl PhysicalPlanCompiler {
                 reason: format!("invalid executable subDAG: {error}"),
             })?;
             executable_dags[query_index] = Some(executable);
+            if selected.is_empty() {
+                continue;
+            }
             validate_lifecycle_input(&query.query_id, &query.summary_lifecycle_inputs)?;
             if environment.target == PhysicalDeploymentTarget::DistributedCollectors
                 && selected.iter().any(|state| {
@@ -1521,11 +1534,14 @@ impl PhysicalPlanCompiler {
             );
         }
 
-        let plan_id = if request.allow_mixed_summary_and_exact_execution {
+        let plan_id = if request.allow_mixed_summary_and_exact_execution
+            || super::maintained_population::supported(&request)
+        {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
             "typed-local-residual-v3-counter-index".hash(&mut hash);
+            super::maintained_population::supported(&request).hash(&mut hash);
             request.enabled_materialization_keys.hash(&mut hash);
             for query in &request.queries {
                 format!("{:?}", query.selected_plan_root).hash(&mut hash);
@@ -1681,7 +1697,62 @@ impl PhysicalPlanCompiler {
                 } else {
                     false
                 };
-            let mut entry = if request.allow_mixed_summary_and_exact_execution && !native_root {
+            let mut entry = if let Some(operator) =
+                super::maintained_population::operator(&request, query)?
+            {
+                let root = crate::query_plan::QueryNodeId(0);
+                let compiled = executable_dags[query_index]
+                    .as_ref()
+                    .expect("compiled Planner DAG");
+                query_node_bindings.insert((query_index, compiled.dag.root), root);
+                Ok(crate::query_plan::QueryPlanEntry {
+                    language: crate::query_plan::QueryLanguage::PromQl,
+                    query_id: query.query_id.clone(),
+                    canonical_query: canonical.clone(),
+                    fixed_evaluation: None,
+                    root,
+                    nodes: BTreeMap::from([(
+                        root,
+                        crate::query_plan::QueryPlanNode::Logical {
+                            operator,
+                            inputs: vec![],
+                        },
+                    )]),
+                    instant,
+                    fallback: FallbackPolicy::ExactBackend,
+                })
+            } else if !request.allow_mixed_summary_and_exact_execution
+                && executable_dags[query_index].is_none()
+                && !collect_selected_materializations(
+                    &query.selected_plan_root,
+                    request.allow_mixed_summary_and_exact_execution,
+                )
+                .map_err(|reason| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                })?
+                .is_empty()
+            {
+                // The selected state has no supported physical implementation.
+                // Keep native semantics instead of lowering an unbound summary.
+                let root = crate::query_plan::QueryNodeId(0);
+                Ok(crate::query_plan::QueryPlanEntry {
+                    language: crate::query_plan::QueryLanguage::PromQl,
+                    query_id: query.query_id.clone(),
+                    canonical_query: canonical.clone(),
+                    fixed_evaluation: None,
+                    root,
+                    nodes: BTreeMap::from([(
+                        root,
+                        crate::query_plan::QueryPlanNode::ExactFallback {
+                            reason: "selected summary has no supported physical implementation"
+                                .into(),
+                        },
+                    )]),
+                    instant,
+                    fallback: FallbackPolicy::ExactBackend,
+                })
+            } else if request.allow_mixed_summary_and_exact_execution && !native_root {
                 crate::query_plan::compile_bound_composable_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
@@ -1722,10 +1793,6 @@ impl PhysicalPlanCompiler {
                 // backend-local range index leaf.
                 crate::query_plan::residual::finalize_residuals(&mut entry)?;
             }
-            // An exact subtree can absorb guarded arithmetic and prune its
-            // children. Those semantic nodes no longer have local query placements.
-            query_node_bindings
-                .retain(|(index, _), node| *index != query_index || entry.nodes.contains_key(node));
             if frontend == QueryFrontend::MetricsQl {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
@@ -3635,6 +3702,196 @@ pub use select_logical_roots_with_trace as select_workload_roots_with_trace;
 pub(crate) mod tests {
     use super::*;
 
+    /// Multiple current-value quantiles and TopK limits share one maintained population.
+    #[test]
+    fn current_series_quantiles_and_topk_have_a_shared_executable_candidate() {
+        let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        snapshot.schema_version = 2;
+        let template = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0].clone();
+        let queries = [
+            "quantile by (job) (0.5, a)",
+            "quantile by (job) (0.9, a)",
+            "quantile by (job) (0.95, a)",
+            "quantile by (job) (0.99, a)",
+            "topk by (job) (1, a)",
+            "topk by (job) (5, a)",
+        ];
+        snapshot.query_workload.repeating_queries = Some(
+            queries
+                .iter()
+                .map(|q| {
+                    let mut entry = template.clone();
+                    entry.query = planner_types::workload::Query((*q).into());
+                    entry
+                })
+                .collect(),
+        );
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let plans: Vec<_> = super::super::workload_cost::with_exact_alternative(request)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| {
+                PhysicalPlanCompiler
+                    .compile_promql(r, environment.clone())
+                    .ok()
+            })
+            .collect();
+        let plan = plans.iter().find(|plan| plan.query_plan.entries.values().all(|entry|
+            entry.nodes.values().any(|node| matches!(node, crate::query_plan::QueryPlanNode::Logical {
+                operator: crate::query_plan::residual::ResidualQueryOperator::CurrentSeries { .. }, ..
+            })))).expect("no shared current-series candidate");
+        let mut populations = BTreeSet::new();
+        for entry in plan.query_plan.entries.values() {
+            for node in entry.nodes.values() {
+                if let crate::query_plan::QueryPlanNode::Logical {
+                    operator:
+                        crate::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                            population,
+                            ..
+                        },
+                    ..
+                } = node
+                {
+                    assert_eq!(population.max_k, 5);
+                    assert!(population.quantiles);
+                    populations.insert(population.key());
+                }
+            }
+        }
+        assert_eq!(populations.len(), 1);
+        let installed = serde_json::to_string(&plan.precompute_plan.executable_dags).unwrap();
+        assert!(
+            installed.contains("MaintainPopulation"),
+            "shared state must originate in the installed Planner DAG"
+        );
+    }
+
+    // Physical lowering follows selected Planner IR, independent of catalog text.
+    #[test]
+    fn current_series_lowering_uses_selected_ir_not_query_text() {
+        let mut request = request("ir", "quantile(0.5, a)");
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                "quantile(0.5, a)",
+                AccuracyTarget::Exact,
+            )
+            .unwrap(),
+        );
+        let strategy = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+            std::slice::from_ref(&root),
+        );
+        request.queries[0].selected_plan_root = strategy.candidate(&root).unwrap();
+        let before = super::super::maintained_population::operator(&request, &request.queries[0])
+            .unwrap()
+            .unwrap();
+        request.queries[0].query_string = "quantile(0.99, b)".into();
+        let after = super::super::maintained_population::operator(&request, &request.queries[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after);
+        request.queries[0].selected_plan_root =
+            crate::planner_selection::keep_pre_asap(&root).unwrap();
+        assert!(
+            super::super::maintained_population::operator(&request, &request.queries[0])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // A valid table-row DAG cannot be served by remote-write latest-series state.
+    #[test]
+    fn maintained_table_population_requires_a_compatible_executor() {
+        let mut request = request("sql", "quantile(0.5, a)");
+        let mut root = crate::query_parser::parse_query_expr_canonical(
+            "quantile(0.5, a)",
+            AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let planner_types::pre_asap::QueryExpr::Aggregate { child, .. } = &mut root else {
+            unreachable!()
+        };
+        let planner_types::pre_asap::QueryExpr::Scan { source, schema, .. } = Rc::make_mut(child)
+        else {
+            unreachable!()
+        };
+        *source = planner_types::pre_asap::Source::Table {
+            table_ref: "samples".into(),
+        };
+        schema.closed = true;
+        let root = Rc::new(root);
+        let rule = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+            std::slice::from_ref(&root),
+        );
+        let candidate = rule.candidate(&root).unwrap();
+        planner_types::post_asap::compile_executable_dag(&candidate).unwrap();
+        assert!(!super::super::maintained_population::supported_node(
+            &candidate
+        ));
+        request.queries[0].selected_plan_root = candidate;
+        let error = super::super::maintained_population::operator(&request, &request.queries[0])
+            .unwrap_err();
+        assert!(error.to_string().contains("row-update executor"), "{error}");
+    }
+
+    // Compiler preserves the Planner's conditional-average execution guard.
+    #[test]
+    fn temporal_average_lowers_with_finite_division_guard() {
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.target_collector_ids.clear();
+        let request = request("average", "avg_over_time(a[1m])");
+        let plan = PhysicalPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        assert!(
+            plan.query_plan
+                .entries
+                .values()
+                .flat_map(|e| e.nodes.values())
+                .any(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::Logical {
+                        operator: asap_types::query_plan::residual::ResidualQueryOperator::Binary {
+                            operation: asap_types::query_plan::residual::BinaryOperation::FiniteDiv,
+                            ..
+                        },
+                        ..
+                    }
+                )),
+            "{plan:#?}"
+        );
+    }
+
+    // The Planner's minimum state lowers without reconstructing direction from text.
+    #[test]
+    fn minimum_retains_its_typed_direction() {
+        let mut env = environment(10_000);
+        env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        env.target_collector_ids.clear();
+        let mut input = request("minimum", "min_over_time(data[1m])");
+        input.allow_mixed_summary_and_exact_execution = true;
+        let plan = PhysicalPlanCompiler.compile_promql(input, env).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert_eq!(
+            plan.precompute_plan.materializations[0].aggregation_type,
+            asap_types::AggregationType::Min
+        );
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .all(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::ExactReadout {
+                    readout: crate::query_plan::ExactReadout::Min,
+                    ..
+                }
+            ))));
+    }
+
     // Every metric the plan materializes must carry a routing entry, or the
     // backend falls through to its default engine and archive-shape queries
     // miss. Publication passes this document straight to the data plane.
@@ -3747,6 +4004,47 @@ pub(crate) mod tests {
             quotes,
         });
         snapshot
+    }
+
+    // Issue workloads must expose executable maintained candidates under the schema-2 API.
+    #[test]
+    fn issue_701_702_temporal_workloads_have_warm_candidates() {
+        for text in [
+            "avg_over_time(data[5m])",
+            "min_over_time(data[5m])",
+            "quantile_over_time(0.9,data[5m])/quantile_over_time(0.5,data[5m])",
+            "avg_over_time(data[5m])/quantile_over_time(0.5,data[5m])",
+        ] {
+            let mut snapshot = planning_snapshot();
+            let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+            entry.query = Query(text.into());
+            entry.time_selection.lookback = Some(DurationMs(300_000));
+            if !text.contains("quantile") {
+                entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            }
+            let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+            let candidates = super::super::workload_cost::with_exact_alternative(request).unwrap();
+            let mut reasons = vec![];
+            assert!(
+                candidates.into_iter().any(|candidate| {
+                    match PhysicalPlanCompiler.compile_promql(candidate, environment.clone()) {
+                        Ok(plan) => {
+                            !plan.precompute_plan.materializations.is_empty()
+                                && plan
+                                    .query_plan
+                                    .entries
+                                    .values()
+                                    .all(|entry| !entry.materialization_bindings().is_empty())
+                        }
+                        Err(error) => {
+                            reasons.push(error.to_string());
+                            false
+                        }
+                    }
+                }),
+                "no warm candidate for {text}: {reasons:?}"
+            );
+        }
     }
 
     /// Optional counter masks must retain the workload's mandatory sketch bindings.
@@ -5554,6 +5852,8 @@ pub(crate) mod tests {
                 lhs: left.clone(),
                 rhs: right,
                 operator: planner_types::post_asap::BinaryOperator {
+                    checked_relative_division: false,
+                    checked_finite_division: false,
                     kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
                         planner_types::pre_asap::ArithmeticOpKind::Add,
                     ),
@@ -6946,17 +7246,18 @@ pub(crate) mod tests {
     #[test]
     fn multiple_readouts_share_one_precompute_materialization() {
         let mut compilation_request = request("q-p90", "quantile_over_time(0.90, m[1m])");
-        let second = request("q-p99", "quantile_over_time(0.99, m[1m])")
-            .queries
-            .into_iter()
-            .next()
-            .unwrap();
-        compilation_request.queries.push(second);
+        for (id, q) in [("q-p50", 0.5), ("q-p95", 0.95), ("q-p99", 0.99)] {
+            compilation_request.queries.push(
+                request(id, &format!("quantile_over_time({q}, m[1m])"))
+                    .queries
+                    .remove(0),
+            );
+        }
         let bundle = PhysicalPlanCompiler
             .compile_promql(compilation_request, environment(10_000))
             .unwrap();
 
-        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.query_plan.entries.len(), 4);
         assert_eq!(bundle.summary_catalog.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.schemas.len(), 1);

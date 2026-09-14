@@ -251,6 +251,26 @@ pub fn manifest(
         // Typed local scans require retained input and ingest/update work even
         // when no precomputed summary is installed. Deduplicate by source.
         for node in entry.nodes.values() {
+            if let crate::query_plan::QueryPlanNode::Logical {
+                operator:
+                    crate::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                        population, ..
+                    },
+                ..
+            } = node
+            {
+                let key = population.key();
+                for phase in ["build", "update", "residency", "retire"] {
+                    add(
+                        format!("current-series:{key}:{phase}"),
+                        json!({"population": population, "phase": phase}),
+                        "horizon",
+                        1.0,
+                    );
+                }
+                let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: population.metric.clone() }, "location": "backend", "ingest": plan.precompute_plan.ingest});
+                add(format!("source:{source}"), source, "horizon", 1.0);
+            }
             if matches!(
                 node,
                 crate::query_plan::QueryPlanNode::Logical {
@@ -716,6 +736,72 @@ fn select_candidates(
 /// The current executor exposes continuously maintained state and the native
 /// exact backend. Additional Planner-produced forests can use `select_lowest_cost_candidate` directly.
 pub fn enumerate_exact_and_materialized_candidates(
+    request: PhysicalCompilationRequest,
+) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
+    let already_selected = super::maintained_population::supported(&request);
+    let mut alternatives = materialization_alternatives(request)?;
+    if already_selected {
+        return Ok(alternatives);
+    }
+    let roots: Vec<_> = alternatives
+        .last()
+        .expect("exact alternative")
+        .queries
+        .iter()
+        .map(|q| match &q.selected_plan_root.expr {
+            planner_types::post_asap::SummaryExpr::KeepPreAsap(root) => std::rc::Rc::clone(root),
+            _ => unreachable!("native alternative retains canonical roots"),
+        })
+        .collect();
+    let strategy =
+        asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(&roots);
+    let candidates: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            strategy
+                .candidate(root)
+                .filter(|node| super::maintained_population::supported_node(node))
+        })
+        .collect();
+    if candidates.iter().any(Option::is_some) {
+        // Current-series rules are compatible with window summaries in other
+        // workload roots. Preserve each priced temporal alternative and mask.
+        let maintained: Vec<_> = alternatives
+            .iter()
+            .map(|alternative| {
+                let mut candidate = alternative.clone();
+                for (query, selected) in candidate.queries.iter_mut().zip(&candidates) {
+                    if let Some(selected) = selected {
+                        query.selected_plan_root = std::rc::Rc::clone(selected);
+                    }
+                }
+                if candidates.iter().all(Option::is_some) {
+                    candidate.allow_mixed_summary_and_exact_execution = false;
+                    candidate.enabled_materialization_keys = None;
+                }
+                candidate
+            })
+            .collect();
+        for candidate in maintained {
+            if !alternatives.iter().any(|existing| {
+                existing.allow_mixed_summary_and_exact_execution
+                    == candidate.allow_mixed_summary_and_exact_execution
+                    && existing.enabled_materialization_keys
+                        == candidate.enabled_materialization_keys
+                    && existing
+                        .queries
+                        .iter()
+                        .zip(&candidate.queries)
+                        .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
+            }) {
+                alternatives.push(candidate);
+            }
+        }
+    }
+    Ok(alternatives)
+}
+
+fn materialization_alternatives(
     request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
     let mut exact = request.clone();

@@ -342,6 +342,27 @@ pub(super) fn residual_nodes(
 pub(super) fn binary_operator(
     operator: &planner_types::post_asap::BinaryOperator,
 ) -> Result<ResidualQueryOperator, QueryPlanError> {
+    if operator.checked_relative_division || operator.checked_finite_division {
+        if (operator.checked_relative_division && operator.checked_finite_division)
+            || operator.vector_match.is_some()
+            || !matches!(
+                operator.kind,
+                planner_types::pre_asap::BinaryOpKind::Arithmetic(
+                    planner_types::pre_asap::ArithmeticOpKind::Div
+                )
+            )
+        {
+            return Err(invalid("invalid Planner checked division contract"));
+        }
+        return Ok(ResidualQueryOperator::Binary {
+            operation: if operator.checked_finite_division {
+                BinaryOperation::FiniteDiv
+            } else {
+                BinaryOperation::CheckedDiv
+            },
+            return_bool: false,
+        });
+    }
     if operator.vector_match.is_some() {
         return Err(invalid("explicit residual vector matching unsupported"));
     }

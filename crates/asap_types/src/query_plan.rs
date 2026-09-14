@@ -5,6 +5,7 @@
 //! node IDs. Serving executes this graph without reconstructing Planner IR or
 //! searching for compatible materializations.
 
+pub mod current_series;
 pub mod residual;
 
 #[deprecated(note = "Use query_plan::residual")]

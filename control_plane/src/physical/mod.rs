@@ -14,3 +14,5 @@ pub mod summary_catalog;
 pub mod workload_cost;
 
 pub mod publication;
+
+pub(crate) mod maintained_population;

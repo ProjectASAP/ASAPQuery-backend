@@ -256,6 +256,16 @@ impl AdmissionInventory {
         series_id: u64,
         range: HalfOpenTimeRange,
     ) -> bool {
+        self.known_empty_with_layout(definition, series_id, range, false)
+    }
+
+    pub(super) fn known_empty_with_layout(
+        &self,
+        definition: SummaryDefinitionId,
+        series_id: u64,
+        range: HalfOpenTimeRange,
+        full_window: bool,
+    ) -> bool {
         self.finite_input == FiniteInputState::Complete
             && self.published_series.contains_key(&series_id)
             && self.observed_extent.is_some_and(|extent| {
@@ -267,8 +277,12 @@ impl AdmissionInventory {
                 .is_none_or(|floor| range.start_ms >= *floor)
             && !self.windows.iter().any(|(coordinate, state)| {
                 coordinate.summary_definition_id == definition
-                    && coordinate.time_range.start_ms < range.end_ms
-                    && coordinate.time_range.end_ms > range.start_ms
+                    && (if full_window {
+                        coordinate.time_range == range
+                    } else {
+                        coordinate.time_range.start_ms < range.end_ms
+                            && coordinate.time_range.end_ms > range.start_ms
+                    })
                     && state.series_id == Some(series_id)
             })
     }
@@ -285,11 +299,16 @@ impl AdmissionInventory {
         &self,
         definition: SummaryDefinitionId,
         range: HalfOpenTimeRange,
+        full_window: bool,
     ) -> bool {
         self.windows.iter().any(|(coordinate, state)| {
             coordinate.summary_definition_id == definition
-                && coordinate.time_range.start_ms < range.end_ms
-                && coordinate.time_range.end_ms > range.start_ms
+                && (if full_window {
+                    coordinate.time_range == range
+                } else {
+                    coordinate.time_range.start_ms < range.end_ms
+                        && coordinate.time_range.end_ms > range.start_ms
+                })
                 && state.published < state.admitted
         })
     }
@@ -366,9 +385,9 @@ mod tests {
             .admit(&generation, BTreeSet::from([a.clone(), b.clone()]))
             .unwrap();
         inventory.acknowledge(&generation, &a, revision).unwrap();
-        assert!(inventory.has_pending(a.summary_definition_id, a.time_range));
+        assert!(inventory.has_pending(a.summary_definition_id, a.time_range, false));
         inventory.acknowledge(&generation, &b, revision).unwrap();
-        assert!(!inventory.has_pending(a.summary_definition_id, a.time_range));
+        assert!(!inventory.has_pending(a.summary_definition_id, a.time_range, false));
     }
 
     #[test]
@@ -388,7 +407,11 @@ mod tests {
             .acknowledge(&generation, &coordinate, first)
             .unwrap();
         assert_ne!(before, inventory.revision());
-        assert!(inventory.has_pending(coordinate.summary_definition_id, coordinate.time_range));
+        assert!(inventory.has_pending(
+            coordinate.summary_definition_id,
+            coordinate.time_range,
+            false
+        ));
         inventory.retire_completed_before(coordinate.summary_definition_id, 1000);
         assert_eq!(inventory.windows.len(), 1);
         inventory
@@ -445,6 +468,89 @@ mod tests {
         inventory.install(generation(2));
         assert!(inventory.acknowledge(&old, &coordinate, revision).is_err());
         assert!(inventory.admit(&old, BTreeSet::from([coordinate])).is_err());
+    }
+
+    // Unpublished future snapshots cannot block an already-published full window.
+    #[test]
+    fn pending_full_window_checks_only_the_requested_snapshot() {
+        let generation = generation(1);
+        let mut inventory = AdmissionInventory::default();
+        inventory.install(generation.clone());
+        let current = window("a");
+        let mut future = current.clone();
+        future.time_range = HalfOpenTimeRange {
+            start_ms: 500,
+            end_ms: 1500,
+        };
+        let revision = inventory
+            .admit(&generation, BTreeSet::from([current.clone(), future]))
+            .unwrap();
+        assert!(inventory.has_pending(current.summary_definition_id, current.time_range, true));
+        inventory
+            .acknowledge(&generation, &current, revision)
+            .unwrap();
+        assert!(inventory.has_pending(current.summary_definition_id, current.time_range, false));
+        assert!(!inventory.has_pending(current.summary_definition_id, current.time_range, true));
+    }
+
+    // A neighboring full snapshot may overlap an empty query population.
+    #[test]
+    fn full_window_empty_proof_uses_exact_window_identity() {
+        let generation = generation(1);
+        let mut inventory = AdmissionInventory::default();
+        inventory.install(generation.clone());
+        let first = window("a");
+        let mut neighbor = first.clone();
+        neighbor.time_range = HalfOpenTimeRange {
+            start_ms: 500,
+            end_ms: 1500,
+        };
+        let mut other = window("b");
+        other.time_range = HalfOpenTimeRange {
+            start_ms: 1000,
+            end_ms: 2000,
+        };
+        let revision = inventory
+            .admit(
+                &generation,
+                BTreeSet::from([first.clone(), neighbor.clone(), other.clone()]),
+            )
+            .unwrap();
+        for (coordinate, sid) in [(&first, 1), (&neighbor, 1), (&other, 2)] {
+            inventory
+                .record_series(&generation, coordinate, sid)
+                .unwrap();
+            inventory
+                .acknowledge(&generation, coordinate, revision)
+                .unwrap();
+        }
+        assert!(!inventory.known_empty_with_layout(
+            first.summary_definition_id,
+            1,
+            other.time_range,
+            true
+        ));
+        inventory.seal_finite(&generation).unwrap();
+        assert!(!inventory.known_empty(first.summary_definition_id, 1, other.time_range));
+        assert!(inventory.known_empty_with_layout(
+            first.summary_definition_id,
+            1,
+            other.time_range,
+            true
+        ));
+        assert!(!inventory.known_empty_with_layout(
+            first.summary_definition_id,
+            2,
+            other.time_range,
+            true
+        ));
+        inventory.retire_completed_before(first.summary_definition_id, 2000);
+        assert!(!inventory.known_empty_with_layout(
+            first.summary_definition_id,
+            1,
+            other.time_range,
+            true
+        ));
     }
 
     #[test]

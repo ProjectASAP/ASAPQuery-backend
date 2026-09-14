@@ -231,13 +231,6 @@ where
         self.next_id += 1;
         self.seen.insert(identity, id);
         let residual = match (&self.logical_source, &node.expr) {
-            (Some(original), SummaryExpr::BinaryOp { operator, .. })
-                if operator.checked_relative_division || operator.checked_finite_division =>
-            {
-                // Use the original exact subtree when its semantic identity can
-                // be proved; otherwise the explicit fallback below retries the query.
-                residual::selected_residual_nodes(original, node).ok()
-            }
             (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
                 Some(residual::residual_nodes(original, expr)?)
             }
@@ -261,15 +254,6 @@ where
         }
 
         let physical = match &node.expr {
-            // Installed binary nodes cannot represent these guards. In particular,
-            // an overflowing sum/count rewrite must retry the original average.
-            SummaryExpr::BinaryOp { operator, .. }
-                if operator.checked_relative_division || operator.checked_finite_division =>
-            {
-                QueryPlanNode::ExactFallback {
-                    reason: "guarded summary division requires exact execution".into(),
-                }
-            }
             SummaryExpr::RelationalJoin {
                 left,
                 right,
@@ -330,11 +314,12 @@ where
             } if measures.len() == 1 => {
                 use planner_types::pre_asap::AggIntent;
                 let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => residual::Aggregation::Sum,
-                    AggIntent::Count { .. } => residual::Aggregation::Count,
-                    AggIntent::Min { .. } => residual::Aggregation::Min,
-                    AggIntent::Max { .. } => residual::Aggregation::Max,
-                    AggIntent::Avg { .. } => residual::Aggregation::Avg,
+                    AggIntent::Sum { .. } => Some(residual::Aggregation::Sum),
+                    AggIntent::Count { .. } => Some(residual::Aggregation::Count),
+                    AggIntent::Min { .. } => Some(residual::Aggregation::Min),
+                    AggIntent::Max { .. } => Some(residual::Aggregation::Max),
+                    AggIntent::Avg { .. } => Some(residual::Aggregation::Avg),
+                    AggIntent::TopK { .. } => None,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported exact value aggregation".into(),
@@ -362,14 +347,23 @@ where
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let grouping = residual::Grouping {
+                    labels,
+                    without: keys.is_without(),
+                };
+                let operator = if let AggIntent::TopK { k, .. } = &measures[0] {
+                    residual::ResidualQueryOperator::TopKSelection {
+                        k: *k as u64,
+                        grouping,
+                    }
+                } else {
+                    residual::ResidualQueryOperator::Aggregate {
+                        operation: operation.expect("aggregate operation"),
+                        grouping,
+                    }
+                };
                 QueryPlanNode::Logical {
-                    operator: residual::ResidualQueryOperator::Aggregate {
-                        operation,
-                        grouping: residual::Grouping {
-                            labels,
-                            without: keys.is_without(),
-                        },
-                    },
+                    operator,
                     inputs: vec![self.lower(child)?],
                 }
             }
@@ -551,7 +545,10 @@ where
                 rhs,
                 operator,
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
-            } if self.logical_source.is_some() => {
+            } if self.logical_source.is_some()
+                || operator.checked_relative_division
+                || operator.checked_finite_division =>
+            {
                 let operator = residual::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,
@@ -911,7 +908,12 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
                     && matches!(reduction, Reduction::PerEntity)
                     && matches!(
                         kind,
-                        ExactKind::Sum | ExactKind::Count | ExactKind::Increase | ExactKind::Rate
+                        ExactKind::Sum
+                            | ExactKind::Count
+                            | ExactKind::Increase
+                            | ExactKind::Rate
+                            | ExactKind::Min
+                            | ExactKind::Max
                     )
             } else {
                 // Raw producer grouping may move through additive reductions,
@@ -1168,8 +1170,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn guarded_division_falls_back_in_both_query_compilers() {
-        // Neither installed binary representation can retain Planner's division guards.
+    fn guarded_division_retains_checks_in_both_query_compilers() {
+        // Both compilers retain the finite/relative guard supplied by Planner.
         let query = "avg_over_time(m[5m])";
         let canonical = crate::query_parser::parse_query_expr_canonical(
             query,
@@ -1228,26 +1230,25 @@ mod tests {
                     )
                 }
                 .unwrap();
-                if composable && !relative {
-                    let QueryPlanNode::Logical {
-                        operator: residual::LogicalOperator::ExactSubquery { query: exact_query },
-                        ..
-                    } = &entry.nodes[&entry.root]
-                    else {
-                        panic!("expected the original exact average: {:?}", entry.nodes);
-                    };
-                    assert_eq!(exact_query, query);
-                } else {
-                    assert!(
-                        matches!(
-                            entry.nodes[&entry.root],
-                            QueryPlanNode::ExactFallback { .. }
-                        ),
-                        "guard discarded (relative={relative}, composable={composable}): {:?}",
+                let QueryPlanNode::Logical {
+                    operator: residual::ResidualQueryOperator::Binary { operation, .. },
+                    ..
+                } = &entry.nodes[&entry.root]
+                else {
+                    panic!(
+                        "expected guarded division (composable={composable}): {:?}",
                         entry.nodes
                     );
-                }
-                assert!(entry.materialization_bindings().is_empty());
+                };
+                assert_eq!(
+                    *operation,
+                    if relative {
+                        residual::BinaryOperation::CheckedDiv
+                    } else {
+                        residual::BinaryOperation::FiniteDiv
+                    }
+                );
+                assert!(!entry.materialization_bindings().is_empty());
             }
         }
     }
