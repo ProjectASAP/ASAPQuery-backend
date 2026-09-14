@@ -268,99 +268,6 @@ pub(super) fn render(expr: &QueryExpr) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use planner_types::pre_asap::{Column, DataType, Predicate, ProjectItem};
-    use std::rc::Rc;
-    #[test]
-    fn composite_cut_preserves_branch_time_and_positional_projection() {
-        let scan = Rc::new(QueryExpr::Scan {
-            source: Source::Table {
-                table_ref: "db.samples".into(),
-            },
-            schema: Schema::new(vec![
-                Column::new("ts", DataType::Int64, false),
-                Column::new("v", DataType::Float64, false),
-            ]),
-            predicates: vec![Predicate(Rc::new(QueryExpr::Compare {
-                left: Rc::new(QueryExpr::Column(0)),
-                op: CompareOpKind::Lt,
-                right: Rc::new(QueryExpr::Literal(ScalarValue::Int64(-100))),
-            }))],
-        });
-        let project = QueryExpr::Project {
-            cols: vec![ProjectItem {
-                alias: Some("result".into()),
-                expr: QueryExpr::Column(1),
-            }],
-            qualifier: None,
-            child: scan,
-        };
-        let sql = render(&project).unwrap();
-        assert!(sql.contains("`ts` < -100"));
-        assert!(sql.starts_with("SELECT `v` AS `result`"));
-        assert!(!sql.contains("{from:"));
-        assert!(!sql.contains("{to:"));
-    }
-    #[test]
-    fn typed_list_access_renders_native_element_lookup() {
-        let schema = Schema::new(vec![Column::new(
-            "samples",
-            DataType::List {
-                element: Box::new(Column::new("item", DataType::Float64, false)),
-            },
-            false,
-        )]);
-        let expr = QueryExpr::FunctionCall {
-            name: "asap_element_access".into(),
-            args: vec![
-                QueryExpr::Column(0),
-                QueryExpr::Literal(ScalarValue::Int64(-1)),
-            ],
-        };
-        assert_eq!(
-            scalar(&expr, &schema).unwrap(),
-            "arrayElement(`samples`, -1)"
-        );
-    }
-
-    #[test]
-    fn typed_struct_field_renders_native_lookup() {
-        let schema = Schema::new(vec![Column::new(
-            "sample",
-            DataType::Struct {
-                fields: vec![
-                    Column::new("ts", DataType::Int64, false),
-                    Column::new("value", DataType::Float64, true),
-                ],
-            },
-            false,
-        )]);
-        let expr = QueryExpr::FunctionCall {
-            name: "asap_struct_field".into(),
-            args: vec![
-                QueryExpr::Column(0),
-                QueryExpr::Literal(ScalarValue::Utf8("value".into())),
-            ],
-        };
-        assert_eq!(
-            scalar(&expr, &schema).unwrap(),
-            "tupleElement(`sample`, 'value')"
-        );
-    }
-
-    #[test]
-    fn unsupported_scalar_is_not_forwarded_as_arbitrary_native_code() {
-        let schema = Schema::new(vec![]);
-        let expr = QueryExpr::FunctionCall {
-            name: "unreviewedFunction".into(),
-            args: vec![],
-        };
-        assert!(scalar(&expr, &schema).is_err());
-    }
-}
-
-#[cfg(test)]
 mod original_tests {
     use super::*;
     use asap_frontend_sql::{lower_sql_dialect, SqlCatalog};
@@ -468,5 +375,98 @@ mod original_tests {
         )
         .unwrap();
         assert_eq!(rendered, "'a\\\\\\'b\n'");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use planner_types::pre_asap::{Column, DataType, Predicate, ProjectItem};
+    use std::rc::Rc;
+    #[test]
+    fn composite_cut_preserves_branch_time_and_positional_projection() {
+        let scan = Rc::new(QueryExpr::Scan {
+            source: Source::Table {
+                table_ref: "db.samples".into(),
+            },
+            schema: Schema::new(vec![
+                Column::new("ts", DataType::Int64, false),
+                Column::new("v", DataType::Float64, false),
+            ]),
+            predicates: vec![Predicate(Rc::new(QueryExpr::Compare {
+                left: Rc::new(QueryExpr::Column(0)),
+                op: CompareOpKind::Lt,
+                right: Rc::new(QueryExpr::Literal(ScalarValue::Int64(-100))),
+            }))],
+        });
+        let project = QueryExpr::Project {
+            cols: vec![ProjectItem {
+                alias: Some("result".into()),
+                expr: QueryExpr::Column(1),
+            }],
+            qualifier: None,
+            child: scan,
+        };
+        let sql = render(&project).unwrap();
+        assert!(sql.contains("`ts` < -100"));
+        assert!(sql.starts_with("SELECT `v` AS `result`"));
+        assert!(!sql.contains("{from:"));
+        assert!(!sql.contains("{to:"));
+    }
+    #[test]
+    fn typed_list_access_renders_native_element_lookup() {
+        let schema = Schema::new(vec![Column::new(
+            "samples",
+            DataType::List {
+                element: Box::new(Column::new("item", DataType::Float64, false)),
+            },
+            false,
+        )]);
+        let expr = QueryExpr::FunctionCall {
+            name: "asap_element_access".into(),
+            args: vec![
+                QueryExpr::Column(0),
+                QueryExpr::Literal(ScalarValue::Int64(-1)),
+            ],
+        };
+        assert_eq!(
+            scalar(&expr, &schema).unwrap(),
+            "arrayElement(`samples`, -1)"
+        );
+    }
+
+    #[test]
+    fn typed_struct_field_renders_native_lookup() {
+        let schema = Schema::new(vec![Column::new(
+            "sample",
+            DataType::Struct {
+                fields: vec![
+                    Column::new("ts", DataType::Int64, false),
+                    Column::new("value", DataType::Float64, true),
+                ],
+            },
+            false,
+        )]);
+        let expr = QueryExpr::FunctionCall {
+            name: "asap_struct_field".into(),
+            args: vec![
+                QueryExpr::Column(0),
+                QueryExpr::Literal(ScalarValue::Utf8("value".into())),
+            ],
+        };
+        assert_eq!(
+            scalar(&expr, &schema).unwrap(),
+            "tupleElement(`sample`, 'value')"
+        );
+    }
+
+    #[test]
+    fn unsupported_scalar_is_not_forwarded_as_arbitrary_native_code() {
+        let schema = Schema::new(vec![]);
+        let expr = QueryExpr::FunctionCall {
+            name: "unreviewedFunction".into(),
+            args: vec![],
+        };
+        assert!(scalar(&expr, &schema).is_err());
     }
 }

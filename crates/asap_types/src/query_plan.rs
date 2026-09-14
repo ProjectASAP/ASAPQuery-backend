@@ -5,7 +5,11 @@
 //! node IDs. Serving executes this graph without reconstructing Planner IR or
 //! searching for compatible materializations.
 
-pub mod logical;
+pub mod current_series;
+pub mod residual;
+
+#[deprecated(note = "Use query_plan::residual")]
+pub use residual as logical;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -553,7 +557,7 @@ pub enum QueryPlanNode {
         output_schema: planner_types::post_asap::SummarySchema,
     },
     Logical {
-        operator: logical::LogicalOperator,
+        operator: residual::ResidualQueryOperator,
         inputs: Vec<QueryNodeId>,
     },
     Scalar {
@@ -587,7 +591,7 @@ pub enum QueryPlanNode {
     CandidateTopK {
         inputs: [QueryNodeId; 2],
         k: u64,
-        grouping: logical::Grouping,
+        grouping: residual::Grouping,
         completeness: CandidateCompleteness,
     },
     /// An exact subtree evaluated outside ASAP. Its results enter the query DAG
@@ -629,6 +633,7 @@ pub enum ExactReadout {
     Count,
     Increase,
     Rate,
+    Min,
     Max,
 }
 

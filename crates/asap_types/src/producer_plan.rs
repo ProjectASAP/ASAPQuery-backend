@@ -17,7 +17,8 @@ pub struct CollectorMaterialization {
     pub group_by: Vec<String>,
     pub window_secs: u64,
     pub abstract_window_framework: SummaryWindowFramework,
-    pub window_implementation_id: String,
+    #[serde(rename = "window_implementation_id", alias = "window_realization_id")]
+    pub window_realization_id: String,
     pub slide_secs: u64,
     #[serde(
         default,
@@ -161,7 +162,7 @@ pub struct AdaptiveU64Bounds {
 
 /// Guardrails for telemetry-driven runtime adaptation. This is an
 /// authorization contract, not an instruction to mutate the active plan.
-/// Every accepted change becomes a staged successor PhysicalPlan.
+/// Every accepted change becomes a staged successor CompiledPhysicalPlan.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeAdaptationPolicy {

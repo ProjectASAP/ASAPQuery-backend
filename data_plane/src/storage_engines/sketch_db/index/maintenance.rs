@@ -737,13 +737,13 @@ mod tests {
     fn complete_population_keeps_every_sid_and_rejects_missing_live_binding() {
         // Multiple SIDs are inventory entries, never an implicit singleton;
         // removing a live binding cannot hide its retained durable population.
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
         first.aggregation_type = asap_types::AggregationType::Sum;
@@ -848,13 +848,13 @@ mod tests {
     fn cohort_requires_every_durable_source_in_one_catalog_generation() {
         // Neither a missing second window nor a new catalog may yield a
         // partially acquired cohort, even when the first source is complete.
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
         first.aggregation_type = asap_types::AggregationType::Sum;
@@ -1083,10 +1083,10 @@ mod tests {
         entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
         entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_value(fixture).unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let source = plan
             .precompute_plan
@@ -1399,13 +1399,13 @@ mod tests {
     fn committed_recovery_restores_live_seal_and_rejects_additive_derived_writes() {
         // A durable sidecar may survive an I/O error before the caller updates
         // its live seal. Recovery must repair admission, not only return a hit.
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-planning-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let mut source_config = plan.precompute_plan.materializations[0].clone();
         source_config.aggregation_type = asap_types::AggregationType::Sum;

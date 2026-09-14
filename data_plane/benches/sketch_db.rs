@@ -15,7 +15,7 @@
 //! `iter_batched` (criterion-0.5.1 `src/bencher.rs:264-272`) consumes its
 //! input by value, so the per-iteration `Drop` of the setup `SketchStore`
 //! runs inside the timed region. The `SketchStore` Drop scales linearly
-//! with `num_sids` (each `SketchInstanceMetadata` owns a `String`,
+//! with `num_sids` (each `SummarySeriesMetadata` owns a `String`,
 //! `BTreeSet`, `SketchConfig`, `Option<AccuracyBound>` — roughly ~100 ns
 //! to drop apiece). At 10k sids that's ~1 ms of pure drop work per
 //! "append" — i.e. ~1000× the actual `append_sample` cost. See
@@ -38,7 +38,7 @@ use data_plane::storage_engines::sketch_db::data::{
     AccuracyBound, AggKind, AggregationType, Capability, SketchAlgorithm, SketchConfig,
     SketchEncoding,
 };
-use data_plane::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
+use data_plane::storage_engines::sketch_db::index::{SketchStore, SummarySeriesMetadata};
 use data_plane::storage_engines::SketchSampleState;
 
 // ── Payload builders ────────────────────────────────────────────────────────
@@ -109,8 +109,8 @@ fn sketch_meta(
     sid: u64,
     algorithm: SketchAlgorithm,
     config: SketchConfig,
-) -> SketchInstanceMetadata {
-    SketchInstanceMetadata {
+) -> SummarySeriesMetadata {
+    SummarySeriesMetadata {
         sid,
         metric_name: "bench_metric".into(),
         group_by_keys: BTreeSet::new(),
@@ -131,8 +131,8 @@ fn sketch_meta(
     }
 }
 
-fn precompute_meta(sid: u64, metric: &str, agg_type: AggregationType) -> SketchInstanceMetadata {
-    SketchInstanceMetadata {
+fn precompute_meta(sid: u64, metric: &str, agg_type: AggregationType) -> SummarySeriesMetadata {
+    SummarySeriesMetadata {
         sid,
         metric_name: metric.to_string(),
         group_by_keys: BTreeSet::new(),
@@ -424,7 +424,7 @@ fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types
 }
 
 /// `reconcile_from_streaming_config` ran on EVERY ingest batch and, in
-/// the pre-optimization code, deep-cloned every `SketchInstanceMetadata`
+/// the pre-optimization code, deep-cloned every `SummarySeriesMetadata`
 /// in the catalog (`snapshot_instances()`) — the dominant ingest-path
 /// CPU cost in live `perf` profiling (BTreeMap/String clone + malloc
 /// churn). This bench measures one un-gated reconcile against a

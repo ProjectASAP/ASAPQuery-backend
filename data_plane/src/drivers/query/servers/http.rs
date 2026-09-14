@@ -146,10 +146,10 @@ pub struct HttpServer {
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
     query_router: Arc<EngineRouter>,
     /// Sketch storage for runtime diagnostics.
-    sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+    summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
-    hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
+    hot_reload_config: Option<crate::storage_engines::types::StreamingConfigHandle>,
     /// Per-metric storage-backend routing table consulted by the HTTP
     /// instant-query handler at request time. When `Some(..)` and the
     /// query parses, the handler extracts the metric name from the
@@ -191,7 +191,7 @@ pub struct HttpServer {
     /// Serializes multi-document physical-plan publication so two control
     /// plane generations cannot interleave their plan projections and catalog.
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
-    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
     physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
     remote_write: Option<crate::drivers::ingest::PrometheusRemoteWriteReceiver>,
 }
@@ -203,10 +203,10 @@ struct AppState {
     /// See [`HttpServer::query_router`].
     query_router: Arc<EngineRouter>,
     /// Attach sketch storage for HTTP runtime diagnostics.
-    sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+    summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
-    hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
+    hot_reload_config: Option<crate::storage_engines::types::StreamingConfigHandle>,
     /// See [`HttpServer::backend_storage_routing`].
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
     /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
@@ -216,7 +216,7 @@ struct AppState {
     /// See [`HttpServer::probe_cache`].
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
-    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
     physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
     remote_write: Option<crate::drivers::ingest::PrometheusRemoteWriteReceiver>,
 }
@@ -225,7 +225,7 @@ impl HttpServer {
     pub fn new(
         config: HttpServerConfig,
         query_engine: Arc<ASAPQueryEngine>,
-        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
         // Bootstrap the capability router with `ASAPQueryEngine`
         // registered under its canonical query-engine id.
@@ -237,7 +237,7 @@ impl HttpServer {
             adapter_override: None,
             query_engine,
             query_router,
-            sketch_index,
+            summary_store,
             hot_reload_config: None,
             backend_storage_routing: None,
             backfill: None,
@@ -304,13 +304,13 @@ impl HttpServer {
         self
     }
 
-    /// Attach a `HotReloadStreamingConfig` handle so the
+    /// Attach a `StreamingConfigHandle` handle so the
     /// `GET/POST /api/v1/streaming-config` endpoints can read and
     /// swap the currently active config. Without this handle the
     /// endpoints return `503 Service Unavailable`.
     pub fn with_hot_reload_config(
         mut self,
-        handle: crate::storage_engines::types::HotReloadStreamingConfig,
+        handle: crate::storage_engines::types::StreamingConfigHandle,
     ) -> Self {
         self.hot_reload_config = Some(handle);
         self
@@ -318,7 +318,7 @@ impl HttpServer {
 
     pub fn with_active_physical_plan(
         mut self,
-        handle: crate::storage_engines::types::HotReloadActivePhysicalPlan,
+        handle: crate::storage_engines::types::ActivePhysicalPlanHandle,
     ) -> Self {
         self.physical_plan_lifecycle = Some(
             crate::storage_engines::types::PhysicalPlanLifecycle::new(handle.clone()),
@@ -430,7 +430,7 @@ impl HttpServer {
             config: self.config.clone(),
             query_engine: self.query_engine,
             query_router: self.query_router,
-            sketch_index: self.sketch_index,
+            summary_store: self.summary_store,
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
@@ -558,7 +558,7 @@ impl HttpServer {
             config: self.config.clone(),
             query_engine: self.query_engine.clone(),
             query_router: self.query_router.clone(),
-            sketch_index: self.sketch_index.clone(),
+            summary_store: self.summary_store.clone(),
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
@@ -854,13 +854,13 @@ async fn process_query_request(
 /// single-target metrics keep their original semantics — every shape
 /// resolves to the one configured backend.
 fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> StorageBackend {
-    // A non-bootstrap atomic PhysicalPlan owns routing. Every request first
+    // A non-bootstrap atomic CompiledPhysicalPlan owns routing. Every request first
     // enters the ASAP engine, where QueryPlan lookup either executes its
     // compiler-bound DAG or returns an explicit fallback reason. Consulting
     // the legacy shape/SID candidate heuristics here would bypass QueryPlan
     // (and can also discard the request's explicit evaluation timestamp).
     if state.active_physical_plan.as_ref().is_some_and(|active| {
-        let snapshot = active.snapshot();
+        let snapshot = active.active_snapshot();
         snapshot.query_plan.plan_id != 0 && !snapshot.query_plan.entries.is_empty()
     }) {
         debug!(
@@ -906,7 +906,7 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                             crate::storage_engines::types::QueryOperatorShape::RatePostHoc
                                 | crate::storage_engines::types::QueryOperatorShape::Topk
                         )
-                        && metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
+                        && metric_has_exact_agg_sum_sid(&state.summary_store, &metric_name)
                     {
                         debug!(
                             "resolve_metric_storage: overriding {:?} → SketchStore \
@@ -948,8 +948,8 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                             shape,
                             crate::storage_engines::types::QueryOperatorShape::Topk
                         )
-                        && !metric_has_frequency_topk_sid(&state.sketch_index, &metric_name)
-                        && !metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
+                        && !metric_has_frequency_topk_sid(&state.summary_store, &metric_name)
+                        && !metric_has_exact_agg_sum_sid(&state.summary_store, &metric_name)
                     {
                         debug!(
                             "resolve_metric_storage: overriding SketchStore → \
@@ -986,7 +986,7 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                             crate::storage_engines::types::QueryOperatorShape::Sum
                         )
                         && query_is_sum_over_time(&expr)
-                        && metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
+                        && metric_has_exact_agg_sum_sid(&state.summary_store, &metric_name)
                     {
                         debug!(
                             "resolve_metric_storage: overriding SketchStore → \
@@ -2110,7 +2110,7 @@ async fn handle_runtime_info(
     // Delegate to adapter for protocol-specific handling
     state
         .adapter
-        .handle_runtime_info_with_headers(state.sketch_index.clone(), forwarding_headers)
+        .handle_runtime_info_with_headers(state.summary_store.clone(), forwarding_headers)
         .await
 }
 
@@ -2138,6 +2138,15 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let mut buffer = Vec::new();
     prometheus::Encoder::encode(&encoder, &metric_families, &mut buffer)
         .unwrap_or_else(|e| tracing::error!("Failed to encode metrics: {}", e));
+    let (populations, builds) = state
+        .summary_store
+        .current_series
+        .lock()
+        .expect("current-series state poisoned")
+        .stats();
+    buffer.extend_from_slice(format!(
+        "# TYPE asap_current_series_populations gauge\nasap_current_series_populations {populations}\n# TYPE asap_current_series_cache_builds_total counter\nasap_current_series_cache_builds_total {builds}\n"
+    ).as_bytes());
     if let Some(receiver) = state.remote_write.as_ref() {
         use std::sync::atomic::Ordering;
         let stats = receiver.stats();
@@ -2615,7 +2624,7 @@ mod tests {
     use crate::precompute_engine::ingest_handler::{IngestObservability, IngestState};
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::query_engines::ASAPQueryEngine;
-    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
     use prost::Message;
     use reqwest::Client;
     use std::sync::atomic::AtomicU64;
@@ -2715,12 +2724,12 @@ mod tests {
             asap_types::summary_catalog::SummaryCatalog::from_materializations(7, 1, &[]).unwrap(),
         );
         let generation = catalog.reference().unwrap();
-        let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-        sketch_index
+        let summary_store = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+        summary_store
             .install_summary_catalog(Arc::clone(&catalog))
             .unwrap();
-        let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
-            crate::storage_engines::types::ActivePhysicalPlan {
+        let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(
+            crate::storage_engines::types::RuntimePhysicalPlan {
                 envelope: envelope.clone(),
                 summary_catalog: Some(Arc::clone(&catalog)),
                 precompute_plan: PrecomputePlan {
@@ -2750,7 +2759,7 @@ mod tests {
                     },
                     rules: Vec::new(),
                 },
-                runtime_config: streaming_config.clone(),
+                streaming_config: streaming_config.clone(),
                 query_plan: Arc::new(asap_types::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
@@ -2762,7 +2771,7 @@ mod tests {
                 ),
             },
         );
-        let hot_reload = HotReloadStreamingConfig::from_active(active.clone());
+        let hot_reload = StreamingConfigHandle::from_active_physical_plan(active.clone());
         let (sender, _worker) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -2772,7 +2781,7 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(crate::drivers::ingest::SeriesIdResolver::new()),
-            sketch_index: Arc::clone(&sketch_index),
+            summary_store: Arc::clone(&summary_store),
             observability: IngestObservability::default(),
         });
         let receiver =
@@ -2785,7 +2794,7 @@ mod tests {
                 adapter_config,
             },
             Arc::new(ASAPQueryEngine::new(15_000)),
-            sketch_index,
+            summary_store,
         )
         .with_active_physical_plan(active)
         .with_remote_write(receiver.clone());
@@ -2851,9 +2860,7 @@ mod tests {
         );
     }
 
-    async fn setup_test_server_with_hot_reload(
-        hot_reload: Option<HotReloadStreamingConfig>,
-    ) -> u16 {
+    async fn setup_test_server_with_hot_reload(hot_reload: Option<StreamingConfigHandle>) -> u16 {
         let adapter_config = AdapterConfig::prometheus_promql(
             "http://127.0.0.1:9999".to_string(), // Unused for this test
             false,                               // forward_unsupported_queries
@@ -2984,7 +2991,7 @@ mod tests {
     /// the GET snapshot emission.
     #[tokio::test]
     async fn test_streaming_config_hot_reload_round_trip() {
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload.clone())).await;
         let client = Client::new();
 
@@ -3070,13 +3077,13 @@ aggregations:
         let after_body: serde_json::Value = after.json().await.unwrap();
         assert_eq!(after_body["aggregation_count"], 2);
 
-        // The underlying HotReloadStreamingConfig handle (cloned into
+        // The underlying StreamingConfigHandle handle (cloned into
         // the server at setup) also reflects the swap — proving that
         // downstream consumers that re-snapshot would see the new
         // state. PR 5: the map is keyed on fingerprints, so just
         // assert the entry count.
         let direct_snap = hot_reload.snapshot();
-        assert_eq!(direct_snap.aggregation_configs.len(), 2);
+        assert_eq!(direct_snap.materializations_by_policy_fingerprint.len(), 2);
     }
 
     #[tokio::test]
@@ -3107,7 +3114,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_streaming_config_hot_reload_rejects_bad_yaml() {
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
@@ -3132,8 +3139,8 @@ aggregations:
     /// legacy `SchemaRegistry` is gone, so there is no longer a
     /// `schemas` parameter — every reconcile decision is sid-level.
     async fn setup_test_server_with_hot_reload_and_sketch_index(
-        hot_reload: HotReloadStreamingConfig,
-        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        hot_reload: StreamingConfigHandle,
+        summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> u16 {
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
@@ -3145,7 +3152,7 @@ aggregations:
         let streaming_config = Arc::new(StreamingConfig::default());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let server =
-            HttpServer::new(config, query_engine, sketch_index).with_hot_reload_config(hot_reload);
+            HttpServer::new(config, query_engine, summary_store).with_hot_reload_config(hot_reload);
         server
             .start_test_server()
             .await
@@ -3163,10 +3170,10 @@ aggregations:
         group_by: &[&str],
     ) {
         use crate::storage_engines::sketch_db::data::AggKind;
-        use crate::storage_engines::sketch_db::index::SketchInstanceMetadata;
+        use crate::storage_engines::sketch_db::index::SummarySeriesMetadata;
         use std::collections::BTreeSet;
         let group_by_keys: BTreeSet<String> = group_by.iter().map(|s| s.to_string()).collect();
-        store.register(SketchInstanceMetadata {
+        store.register(SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys,
@@ -3196,16 +3203,16 @@ aggregations:
         use crate::storage_engines::sketch_db::index::SketchStore;
         use crate::storage_engines::sketch_db::AggStatus;
 
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let sketch_index = Arc::new(SketchStore::new());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let summary_store = Arc::new(SketchStore::new());
         // Pre-register two Active sids whose signatures match the
         // first config below; only sid 1 will survive the second
         // swap.
-        register_precompute_sid(&sketch_index, 1, "cpu_usage", &["host"]);
-        register_precompute_sid(&sketch_index, 2, "mem_usage", &["host"]);
+        register_precompute_sid(&summary_store, 1, "cpu_usage", &["host"]);
+        register_precompute_sid(&summary_store, 2, "mem_usage", &["host"]);
         let server_port = setup_test_server_with_hot_reload_and_sketch_index(
             hot_reload.clone(),
-            sketch_index.clone(),
+            summary_store.clone(),
         )
         .await;
         let client = Client::new();
@@ -3262,11 +3269,11 @@ aggregations:
             "no sid should retire when every signature still appears in the new config; got {retired_ids:?}",
         );
         assert_eq!(
-            sketch_index.instance(1).unwrap().status(),
+            summary_store.instance(1).unwrap().status(),
             AggStatus::Active
         );
         assert_eq!(
-            sketch_index.instance(2).unwrap().status(),
+            summary_store.instance(2).unwrap().status(),
             AggStatus::Active
         );
 
@@ -3305,11 +3312,11 @@ aggregations:
             .collect::<Vec<_>>();
         assert_eq!(retired, vec![2u64]);
         assert_eq!(
-            sketch_index.instance(1).unwrap().status(),
+            summary_store.instance(1).unwrap().status(),
             AggStatus::Active
         );
         assert_eq!(
-            sketch_index.instance(2).unwrap().status(),
+            summary_store.instance(2).unwrap().status(),
             AggStatus::Retired
         );
     }
@@ -3327,7 +3334,7 @@ aggregations:
         // `PolicyFingerprint::from_config`. The `agg_ids_added` u64
         // in the HTTP response is the fingerprint's `as_u64()` form,
         // NOT the literal `42` the YAML once spelled out.
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
@@ -3378,13 +3385,13 @@ aggregations:
         // handler force-retires it.
         use crate::storage_engines::sketch_db::index::SketchStore;
 
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let sketch_index = Arc::new(SketchStore::new());
-        register_precompute_sid(&sketch_index, 1, "m1", &[]);
-        register_precompute_sid(&sketch_index, 2, "m2", &[]);
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let summary_store = Arc::new(SketchStore::new());
+        register_precompute_sid(&summary_store, 1, "m1", &[]);
+        register_precompute_sid(&summary_store, 2, "m2", &[]);
         let server_port = setup_test_server_with_hot_reload_and_sketch_index(
             hot_reload.clone(),
-            sketch_index.clone(),
+            summary_store.clone(),
         )
         .await;
         let client = Client::new();
@@ -3474,7 +3481,7 @@ aggregations:
         // attached (every `HttpServer` carries one). With no
         // registered sids the endpoint reports an empty array, not
         // a 503.
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
@@ -3500,13 +3507,13 @@ aggregations:
         use crate::storage_engines::sketch_db::index::SketchStore;
         use crate::storage_engines::sketch_db::AggStatus;
 
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let sketch_index = Arc::new(SketchStore::new());
-        register_precompute_sid(&sketch_index, 11, "cpu", &["host"]);
-        register_precompute_sid(&sketch_index, 22, "mem", &["host"]);
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let summary_store = Arc::new(SketchStore::new());
+        register_precompute_sid(&summary_store, 11, "cpu", &["host"]);
+        register_precompute_sid(&summary_store, 22, "mem", &["host"]);
         let server_port = setup_test_server_with_hot_reload_and_sketch_index(
             hot_reload.clone(),
-            sketch_index.clone(),
+            summary_store.clone(),
         )
         .await;
         let client = Client::new();
@@ -3525,7 +3532,7 @@ aggregations:
         assert_eq!(body["schema"]["sid"], 11);
         assert_eq!(body["schema"]["status"], "retired");
         assert_eq!(
-            sketch_index.instance(11).unwrap().status(),
+            summary_store.instance(11).unwrap().status(),
             AggStatus::Retired
         );
 
@@ -3543,7 +3550,7 @@ aggregations:
         assert_eq!(body["schema"]["sid"], 22);
         assert_eq!(body["schema"]["status"], "expired");
         assert_eq!(
-            sketch_index.instance(22).unwrap().status(),
+            summary_store.instance(22).unwrap().status(),
             AggStatus::Expired
         );
 
@@ -3565,11 +3572,11 @@ aggregations:
     async fn test_get_timeline_missing_param_returns_400() {
         use crate::storage_engines::sketch_db::index::SketchStore;
 
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let sketch_index = Arc::new(SketchStore::new());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let summary_store = Arc::new(SketchStore::new());
         let server_port = setup_test_server_with_hot_reload_and_sketch_index(
             hot_reload.clone(),
-            sketch_index.clone(),
+            summary_store.clone(),
         )
         .await;
         let client = Client::new();
@@ -3611,7 +3618,7 @@ aggregations:
         // reads from the sid catalog (always attached) instead of the
         // optional `SchemaRegistry`. Empty catalog → empty segments,
         // not a 503.
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
         let resp = client
@@ -3704,14 +3711,14 @@ aggregations:
             agg_map.insert(fp, cfg);
         }
         let streaming_config = Arc::new(StreamingConfig::new(agg_map));
-        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config.clone());
+        let hot_reload = StreamingConfigHandle::from_arc(streaming_config.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
-        let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+        let summary_store = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
         for marker in active_agg_ids {
             let fp = marker_to_fp[marker];
-            register_precompute_sid(&sketch_index, fp, &format!("metric_{marker}"), &[]);
+            register_precompute_sid(&summary_store, fp, &format!("metric_{marker}"), &[]);
         }
-        let server = HttpServer::new(config, query_engine, sketch_index)
+        let server = HttpServer::new(config, query_engine, summary_store)
             .with_backfill_registry(registry)
             .with_hot_reload_config(hot_reload);
         let port = server
@@ -3863,7 +3870,7 @@ aggregations:
     async fn test_backfill_endpoints_503_without_registry() {
         // Build a server with NO backfill registry attached — every
         // backfill endpoint should 503.
-        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
@@ -4055,7 +4062,7 @@ aggregations:
     /// `QueryEngine`s. The hot-reload `StreamingConfig` is pinned at
     /// `metric_storage_backend` so query dispatch follows the
     /// requested capability axis. Returns the bound port + the
-    /// `HotReloadStreamingConfig` handle so tests can swap the
+    /// `StreamingConfigHandle` handle so tests can swap the
     /// `storage_backend` mid-flight if they need to.
     async fn setup_test_server_with_router(
         metric_storage_backend: StorageBackend,
@@ -4073,7 +4080,7 @@ aggregations:
         let streaming_cfg =
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
@@ -4117,7 +4124,7 @@ aggregations:
         // decisions must come from the per-metric routing table.
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
@@ -5027,7 +5034,7 @@ aggregations:
         crate::query_engines::routing::HotReloadBackendStorageRouting,
     ) {
         use crate::query_engines::routing::HotReloadBackendStorageRouting;
-        use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+        use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
 
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
@@ -5038,7 +5045,7 @@ aggregations:
         };
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let routing_handle = HotReloadBackendStorageRouting::empty();
         let server = HttpServer::new(
@@ -5575,7 +5582,7 @@ aggregations:
         let streaming_cfg =
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
@@ -5880,7 +5887,7 @@ async fn handle_health(State(state): State<AppState>) -> axum::response::Respons
         let Some(active) = state
             .active_physical_plan
             .as_ref()
-            .map(|handle| handle.snapshot())
+            .map(|handle| handle.active_snapshot())
         else {
             return (StatusCode::SERVICE_UNAVAILABLE, "no active PhysicalPlan").into_response();
         };
@@ -5932,11 +5939,11 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
     use axum::response::IntoResponse;
 
     // Per-sid first-seen timestamps are available without I/O.
-    let timestamps = state.sketch_index.earliest_timestamps_per_series_id();
+    let timestamps = state.summary_store.earliest_timestamps_per_series_id();
     let body = serde_json::json!({
         "status": "success",
         "sid_count": timestamps.len(),
-        "approx_resident_bytes": state.sketch_index.approx_resident_bytes(),
+        "approx_resident_bytes": state.summary_store.approx_resident_bytes(),
         "earliest_timestamps_per_series_id": timestamps});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -5958,8 +5965,8 @@ async fn handle_get_streaming_config(State(state): State<AppState>) -> axum::res
     let snap = handle.snapshot();
     let body = serde_json::json!({
         "status": "success",
-        "aggregation_count": snap.aggregation_configs.len(),
-        "aggregation_ids": snap.aggregation_configs.keys().copied().collect::<Vec<_>>(),
+        "aggregation_count": snap.materializations_by_policy_fingerprint.len(),
+        "aggregation_ids": snap.materializations_by_policy_fingerprint.keys().copied().collect::<Vec<_>>(),
         "streaming_config": &*snap});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -6008,9 +6015,17 @@ async fn handle_post_streaming_config(
             }
         };
 
-    let new_ids: HashSet<u64> = new_config.aggregation_configs.keys().copied().collect();
+    let new_ids: HashSet<u64> = new_config
+        .materializations_by_policy_fingerprint
+        .keys()
+        .copied()
+        .collect();
     let old_arc = handle.swap(new_config);
-    let old_ids: HashSet<u64> = old_arc.aggregation_configs.keys().copied().collect();
+    let old_ids: HashSet<u64> = old_arc
+        .materializations_by_policy_fingerprint
+        .keys()
+        .copied()
+        .collect();
     let added: Vec<u64> = new_ids.difference(&old_ids).copied().collect();
     let removed: Vec<u64> = old_ids.difference(&new_ids).copied().collect();
 
@@ -6019,7 +6034,7 @@ async fn handle_post_streaming_config(
             "streaming-config hot-reload removed agg_ids {:?} — any in-flight \
              precompute worker groups for these ids will continue with their \
              construction-time config until they close naturally (phase 1 \
-             limitation; see HotReloadStreamingConfig module doc)",
+             limitation; see StreamingConfigHandle module doc)",
             removed
         );
     }
@@ -6034,7 +6049,7 @@ async fn handle_post_streaming_config(
     // `SketchStore::ingest_precompute_for_agg_config`).
     let snap = handle.snapshot();
     let sid_summary = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
-        state.sketch_index.as_ref(),
+        state.summary_store.as_ref(),
         snap.as_ref(),
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
@@ -6052,10 +6067,10 @@ pub use asap_types::plan_publication::PhysicalPlanInstallRequest;
 
 /// Decode and cross-validate every backend view before it can become visible.
 /// Used by both startup artifact loading and the staged HTTP install path.
-pub fn build_active_physical_plan(
+pub fn validate_and_build_runtime_plan(
     request: PhysicalPlanInstallRequest,
     default_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
-) -> Result<crate::storage_engines::types::ActivePhysicalPlan, String> {
+) -> Result<crate::storage_engines::types::RuntimePhysicalPlan, String> {
     use std::collections::BTreeSet;
     request
         .precompute_plan
@@ -6094,6 +6109,21 @@ pub fn build_active_physical_plan(
                         .into(),
                 );
             }
+            // `full_window_slide_ms` is `#[serde(default)]`, so a publication from an
+            // older controller -- or one replayed from a stored artifact -- arrives as
+            // `None` on a FullWindow materialization. Without this gate the readout
+            // silently takes the overlap-merging path and counts observations twice,
+            // which is exactly what the full-window binding exists to prevent.
+            let full_window_slide_ms = matches!(
+                materialization.window_layout,
+                asap_types::WindowMaterializationLayout::FullWindow
+            )
+            .then_some(materialization.slide_interval.saturating_mul(1_000));
+            if binding.full_window_slide_ms != full_window_slide_ms {
+                return Err(
+                    "query window layout differs from installed precompute definition".into(),
+                );
+            }
         }
     }
     let runtime_materializations = request
@@ -6111,10 +6141,10 @@ pub fn build_active_physical_plan(
     {
         return Err("physical subplans have different plan identity/version".into());
     }
-    let runtime_config =
+    let streaming_config =
         crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
-    let typed_fps: BTreeSet<_> = runtime_config
-        .aggregation_configs
+    let typed_fps: BTreeSet<_> = streaming_config
+        .materializations_by_policy_fingerprint
         .keys()
         .copied()
         .map(asap_types::PolicyFingerprint)
@@ -6130,12 +6160,12 @@ pub fn build_active_physical_plan(
         ),
         None => default_routing,
     };
-    Ok(crate::storage_engines::types::ActivePhysicalPlan {
+    Ok(crate::storage_engines::types::RuntimePhysicalPlan {
         envelope: envelope.clone(),
         summary_catalog: Some(Arc::new(request.summary_catalog)),
         precompute_plan: request.precompute_plan,
         transmission_plan: request.transmission_plan,
-        runtime_config: Arc::new(runtime_config),
+        streaming_config: Arc::new(streaming_config),
         query_plan: Arc::new(request.query_plan),
         storage_routing,
     })
@@ -6168,7 +6198,7 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     };
-    let current = active_handle.snapshot();
+    let current = active_handle.active_snapshot();
     if current.transmission_plan.envelope.plan_id != 0 {
         if let Err(error) = current.transmission_plan.authorize_successor(
             &request.transmission_plan,
@@ -6186,7 +6216,7 @@ async fn handle_post_physical_plan(
         }
     }
     let _guard = state.physical_plan_lock.lock().await;
-    let active = match build_active_physical_plan(request, current.storage_routing.clone()) {
+    let active = match validate_and_build_runtime_plan(request, current.storage_routing.clone()) {
         Ok(active) => active,
         Err(error) => {
             return (
@@ -6273,7 +6303,7 @@ async fn handle_activate_physical_plan(
             .into_response();
     };
     let _guard = state.physical_plan_lock.lock().await;
-    let store = Arc::clone(&state.sketch_index);
+    let store = Arc::clone(&state.summary_store);
     let remote_write = state.remote_write.clone();
     let old = match lifecycle.activate_with_prepare(
         request.plan_id,
@@ -6305,7 +6335,7 @@ async fn handle_activate_physical_plan(
                 .into_response()
         }
     };
-    let activated = active_handle.snapshot();
+    let activated = active_handle.active_snapshot();
     let clickhouse_plan_count = activated
         .query_plan
         .entries
@@ -6319,16 +6349,16 @@ async fn handle_activate_physical_plan(
         tokio::spawn(async move {
             loop {
                 if Arc::strong_count(&old) == 1 {
-                    lifecycle.retire_drained(draining_id, draining_version);
+                    lifecycle.mark_drained_plan_retired(draining_id, draining_version);
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
     }
-    let snap = activated.runtime_config.clone();
+    let snap = activated.streaming_config.clone();
     let retired = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
-        state.sketch_index.as_ref(),
+        state.summary_store.as_ref(),
         snap.as_ref(),
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
@@ -6348,7 +6378,7 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
     let Some(active) = state
         .active_physical_plan
         .as_ref()
-        .map(|handle| handle.snapshot())
+        .map(|handle| handle.active_snapshot())
     else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6377,7 +6407,7 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
         })
         .collect();
     let reporter = std::env::var("HOSTNAME").unwrap_or_else(|_| "asapquery-backend".into());
-    match state.sketch_index.observed_summary_inventory(
+    match state.summary_store.observed_summary_inventory(
         &reporter,
         &reporter,
         &producers,
@@ -6606,12 +6636,12 @@ async fn handle_get_schemas(
     };
 
     let mut entries: Vec<serde_json::Value> = state
-        .sketch_index
+        .summary_store
         .snapshot_instances()
         .iter()
         .filter(|m| allowed.contains(&m.status()))
         .map(|metadata| {
-            let descriptors = state.sketch_index.descriptors_for_series_id(metadata.sid);
+            let descriptors = state.summary_store.descriptors_for_series_id(metadata.sid);
             sid_instance_to_json(metadata, descriptors.as_ref())
         })
         .collect();
@@ -6635,7 +6665,7 @@ fn status_str(s: crate::storage_engines::sketch_db::AggStatus) -> &'static str {
 
 /// Encode sid metadata, including identity, lifecycle timestamps, and status.
 fn sid_instance_to_json(
-    m: &crate::storage_engines::sketch_db::index::SketchInstanceMetadata,
+    m: &crate::storage_engines::sketch_db::index::SummarySeriesMetadata,
     descriptors: Option<&(
         std::sync::Arc<crate::storage_engines::sketch_db::SummaryDescriptor>,
         std::sync::Arc<crate::storage_engines::sketch_db::DataDescriptor>,
@@ -6666,12 +6696,12 @@ async fn handle_post_schema_retire(
     axum::extract::Path(sid): axum::extract::Path<u64>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match state.sketch_index.force_retire(
+    match state.summary_store.force_retire(
         sid,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     ) {
         Some(meta) => {
-            let descriptors = state.sketch_index.descriptors_for_series_id(sid);
+            let descriptors = state.summary_store.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
                 "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
@@ -6695,9 +6725,9 @@ async fn handle_post_schema_expire(
     axum::extract::Path(sid): axum::extract::Path<u64>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match state.sketch_index.force_expire(sid) {
+    match state.summary_store.force_expire(sid) {
         Some(meta) => {
-            let descriptors = state.sketch_index.descriptors_for_series_id(sid);
+            let descriptors = state.summary_store.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
                 "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
@@ -6776,7 +6806,7 @@ async fn handle_get_timeline(
     // content-derived signature id (xxh64 of metric + agg_kind +
     // group_by_keys), stable across restarts.
     let segments = crate::storage_engines::sketch_db::query::timeline::timeline_for_metric(
-        &state.sketch_index,
+        &state.summary_store,
         metric,
         start_ms,
         end_ms,
@@ -6920,7 +6950,7 @@ async fn handle_post_backfill_job(
         // "ingest started at the unix epoch" — backfill can then
         // cover up to wall-clock-now.
         let earliest = state
-            .sketch_index
+            .summary_store
             .snapshot_instances()
             .into_iter()
             .filter(|m| m.metric_name == agg_cfg.metric)
@@ -7134,17 +7164,17 @@ mod logical_provenance_tests {
 
 #[cfg(test)]
 mod catalog_install_tests {
-    use super::{build_active_physical_plan, PhysicalPlanInstallRequest};
+    use super::{validate_and_build_runtime_plan, PhysicalPlanInstallRequest};
     use std::sync::Arc;
 
     fn request() -> PhysicalPlanInstallRequest {
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         PhysicalPlanInstallRequest {
             summary_catalog: plan.summary_catalog,
@@ -7158,8 +7188,8 @@ mod catalog_install_tests {
     }
     fn install(
         request: PhysicalPlanInstallRequest,
-    ) -> Result<crate::storage_engines::types::ActivePhysicalPlan, String> {
-        build_active_physical_plan(
+    ) -> Result<crate::storage_engines::types::RuntimePhysicalPlan, String> {
+        validate_and_build_runtime_plan(
             request,
             Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         )
@@ -7168,8 +7198,8 @@ mod catalog_install_tests {
     #[test]
     fn invalid_clickhouse_entry_cannot_change_active_generation() {
         let active = install(request()).expect("baseline plan installs");
-        let handle = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
-        let before = handle.snapshot();
+        let handle = crate::storage_engines::types::ActivePhysicalPlanHandle::new(active);
+        let before = handle.active_snapshot();
         let mut candidate = request();
         candidate.query_plan.clickhouse_context =
             Some(asap_types::query_plan::ClickHousePlanningContext {
@@ -7207,7 +7237,7 @@ mod catalog_install_tests {
 
         let error = install(candidate).expect_err("invalid SQL binding must fail staging");
         assert!(error.contains("pane origin"), "{error}");
-        let after = handle.snapshot();
+        let after = handle.active_snapshot();
         assert_eq!(after.plan_id(), before.plan_id());
         assert_eq!(after.plan_version(), before.plan_version());
     }
@@ -7242,18 +7272,18 @@ mod catalog_install_tests {
     // A same-version snapshot replacement fails before the active generation changes.
     #[test]
     fn catalog_install_rejects_drift_without_replacing_active_snapshot() {
-        let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
+        let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(
             install(request()).unwrap(),
         );
-        let before = active.snapshot();
+        let before = active.active_snapshot();
         let mut changed = request();
         changed.summary_catalog.plan_version += 1;
         assert!(install(changed).is_err());
-        assert!(Arc::ptr_eq(&before, &active.snapshot()));
+        assert!(Arc::ptr_eq(&before, &active.active_snapshot()));
         let mut changed = request();
         changed.summary_catalog.summary_descriptors.clear();
         assert!(install(changed).is_err());
-        assert!(Arc::ptr_eq(&before, &active.snapshot()));
+        assert!(Arc::ptr_eq(&before, &active.active_snapshot()));
     }
 
     // Physical pane width cannot be replaced by the semantic lookback at install.
@@ -7300,3 +7330,6 @@ mod catalog_install_tests {
         assert!(error.contains("pane origin"), "{error}");
     }
 }
+
+#[deprecated(note = "Use validate_and_build_runtime_plan")]
+pub use validate_and_build_runtime_plan as build_active_physical_plan;

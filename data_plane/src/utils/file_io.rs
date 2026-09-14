@@ -48,12 +48,8 @@ aggregations:
         write!(streaming_temp_file, "{streaming_yaml_content}").unwrap();
 
         let config = read_streaming_config(streaming_temp_file.path().to_str().unwrap()).unwrap();
-        assert!(!config.aggregation_configs.is_empty());
-        let agg = config
-            .get_all_aggregation_configs()
-            .values()
-            .next()
-            .expect("one agg");
+        assert!(!config.materializations_by_policy_fingerprint.is_empty());
+        let agg = config.materializations().values().next().expect("one agg");
         assert_eq!(agg.num_aggregates_to_retain, Some(6));
     }
 }

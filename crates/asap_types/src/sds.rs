@@ -668,7 +668,7 @@ impl FidelityGuarantee {
                 (aggregation_type, self),
                 (A::UnivMon, UnivMonFrequency { .. })
                     | (
-                        A::Sum | A::MultipleSum | A::MinMax | A::MultipleMinMax,
+                        A::Sum | A::MultipleSum | A::Min | A::Max | A::MultipleMin | A::MultipleMax,
                         Exact
                     )
                     | (A::Increase | A::MultipleIncrease, ExactCounter { .. })
@@ -1070,6 +1070,32 @@ fn data_descriptor_id(
         key = format!("data:population-key:canonical-labels-v1|{key}");
     }
     DataDescriptorId(key)
+}
+
+#[cfg(test)]
+mod partition_identity_tests {
+    use super::*;
+    #[test]
+    fn entity_and_global_population_have_distinct_identity() {
+        let legacy = DataDescriptor::new_typed(
+            DataSourceIdentity::TimeSeries { metric: "m".into() },
+            ValueProjectionIdentity::SampleValue,
+            "",
+            Vec::<String>::new(),
+            "v1",
+        );
+        let entity = legacy
+            .clone()
+            .with_partitioning(Some(PopulationPartitioning::PerEntity));
+        let grouped = legacy
+            .clone()
+            .with_partitioning(Some(PopulationPartitioning::Grouped));
+        assert_ne!(entity.id, grouped.id);
+        assert_ne!(entity.id, legacy.id);
+        assert_eq!(legacy.clone().with_partitioning(None).id, legacy.id);
+        entity.validate().unwrap();
+        grouped.validate().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1620,31 +1646,5 @@ mod tests {
             ("w".into(), json!(256)),
             ("d".into(), json!(5))
         ])));
-    }
-}
-
-#[cfg(test)]
-mod partition_identity_tests {
-    use super::*;
-    #[test]
-    fn entity_and_global_population_have_distinct_identity() {
-        let legacy = DataDescriptor::new_typed(
-            DataSourceIdentity::TimeSeries { metric: "m".into() },
-            ValueProjectionIdentity::SampleValue,
-            "",
-            Vec::<String>::new(),
-            "v1",
-        );
-        let entity = legacy
-            .clone()
-            .with_partitioning(Some(PopulationPartitioning::PerEntity));
-        let grouped = legacy
-            .clone()
-            .with_partitioning(Some(PopulationPartitioning::Grouped));
-        assert_ne!(entity.id, grouped.id);
-        assert_ne!(entity.id, legacy.id);
-        assert_eq!(legacy.clone().with_partitioning(None).id, legacy.id);
-        entity.validate().unwrap();
-        grouped.validate().unwrap();
     }
 }

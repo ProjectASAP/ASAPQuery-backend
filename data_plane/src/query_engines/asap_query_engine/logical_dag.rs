@@ -4,8 +4,8 @@ use crate::query_engines::{
     EngineError,
 };
 use crate::storage_engines::types::KeyByLabelValues;
-use asap_types::query_plan::logical::{
-    Aggregation, BinaryOperation, Grouping, LogicalOperator, TemporalOperation,
+use asap_types::query_plan::residual::{
+    Aggregation, BinaryOperation, Grouping, ResidualQueryOperator, TemporalOperation,
 };
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use std::collections::{BTreeMap, BTreeSet};
@@ -182,12 +182,22 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .clone();
         let value = match node {
             QueryPlanNode::Scalar { value } => Value::Scalar(value),
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::CurrentSeries { .. },
+                ..
+            } => {
+                self.stats.summary_readout_evaluations += 1;
+                from_result((self.callback)(
+                    id,
+                    u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
+                )?)?
+            }
             QueryPlanNode::Logical { operator, inputs } => {
                 if matches!(
                     operator,
-                    LogicalOperator::Scan { .. }
-                        | LogicalOperator::ExactSubquery { .. }
-                        | LogicalOperator::CandidateExactSubquery { .. }
+                    ResidualQueryOperator::Scan { .. }
+                        | ResidualQueryOperator::ExactSubquery { .. }
+                        | ResidualQueryOperator::CandidateExactSubquery { .. }
                 ) {
                     return Err(miss(
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
@@ -224,7 +234,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
     }
     fn logical(
         &mut self,
-        operator: LogicalOperator,
+        operator: ResidualQueryOperator,
         inputs: &[QueryNodeId],
         at: i64,
     ) -> Result<Value, EngineError> {
@@ -235,14 +245,17 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
-            LogicalOperator::ExactSubquery { .. }
-            | LogicalOperator::CandidateExactSubquery { .. } => {
+            ResidualQueryOperator::ExactSubquery { .. }
+            | ResidualQueryOperator::CandidateExactSubquery { .. } => {
                 Err(miss("Prometheus exact leaf was not prepared"))
             }
-            LogicalOperator::Scan { .. } => {
+            ResidualQueryOperator::CurrentSeries { .. } => Err(miss(
+                "current-series leaf must use its installed node identity",
+            )),
+            ResidualQueryOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
-            LogicalOperator::UnaryNegate => match self.eval(input(0)?, at)? {
+            ResidualQueryOperator::UnaryNegate => match self.eval(input(0)?, at)? {
                 Value::Scalar(value) => Ok(Value::Scalar(-value)),
                 Value::Vector(values) => Ok(Value::Vector(
                     values
@@ -252,7 +265,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 )),
                 _ => Err(miss("cannot negate range vector")),
             },
-            LogicalOperator::VectorToScalar => {
+            ResidualQueryOperator::VectorToScalar => {
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Scalar(if values.len() == 1 {
                     values[0].1
@@ -260,18 +273,18 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                     f64::NAN
                 }))
             }
-            LogicalOperator::Aggregate {
+            ResidualQueryOperator::Aggregate {
                 operation,
                 grouping,
             } => {
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Vector(aggregate(operation, &grouping, values)))
             }
-            LogicalOperator::TopKSelection { k, grouping } => {
+            ResidualQueryOperator::TopKSelection { k, grouping } => {
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Vector(topk_selection(k, &grouping, values)))
             }
-            LogicalOperator::Binary {
+            ResidualQueryOperator::Binary {
                 operation,
                 return_bool,
             } => {
@@ -279,7 +292,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 let right = self.eval(input(1)?, at)?;
                 binary(operation, return_bool, left, right)
             }
-            LogicalOperator::Temporal { operation } => {
+            ResidualQueryOperator::Temporal { operation } => {
                 let Value::Matrix(values, start, end) = self.eval(input(0)?, at)? else {
                     return Err(miss("temporal operator requires range vector"));
                 };
@@ -340,7 +353,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         .collect(),
                 ))
             }
-            LogicalOperator::Sort { descending } => {
+            ResidualQueryOperator::Sort { descending } => {
                 let mut values = vector(self.eval(input(0)?, at)?)?;
                 values.sort_by(|a, b| {
                     if a.1.is_nan() && b.1.is_nan() {
@@ -357,7 +370,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 });
                 Ok(Value::Vector(values))
             }
-            LogicalOperator::HistogramQuantile => {
+            ResidualQueryOperator::HistogramQuantile => {
                 let Value::Scalar(quantile) = self.eval(input(0)?, at)? else {
                     return Err(miss("quantile requires scalar"));
                 };
@@ -374,7 +387,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         .collect(),
                 ))
             }
-            LogicalOperator::Subquery {
+            ResidualQueryOperator::Subquery {
                 range_ms,
                 step_ms,
                 offset_ms,
@@ -539,6 +552,43 @@ fn binary(
     left: Value,
     right: Value,
 ) -> Result<Value, EngineError> {
+    if matches!(
+        operation,
+        BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv
+    ) {
+        let valid = |value: &Value, denominator: bool| match value {
+            Value::Scalar(v) => v.is_finite() && (!denominator || *v != 0.0),
+            Value::Vector(rows) => rows
+                .iter()
+                .all(|(_, v)| v.is_finite() && (!denominator || *v != 0.0)),
+            Value::Matrix(..) => false,
+        };
+        if boolean || !valid(&left, false) || !valid(&right, true) {
+            return Err(miss(
+                "checked division requires finite operands and a nonzero divisor",
+            ));
+        }
+        let result = binary(BinaryOperation::Div, false, left, right)?;
+        let valid_result = |v: &f64| {
+            if operation == BinaryOperation::FiniteDiv {
+                v.is_finite()
+            } else {
+                v.is_normal()
+            }
+        };
+        let normal = match &result {
+            Value::Scalar(v) => valid_result(v),
+            Value::Vector(rows) => rows.iter().all(|(_, v)| valid_result(v)),
+            Value::Matrix(..) => false,
+        };
+        return if normal {
+            Ok(result)
+        } else {
+            Err(miss(
+                "checked division result is outside the declared floating-point domain",
+            ))
+        };
+    }
     let arithmetic = matches!(
         operation,
         BinaryOperation::Add
@@ -737,6 +787,75 @@ mod topk_tests {
             .collect()
     }
 
+    // An overflowing sum cannot implement average, but zero/subnormal averages remain valid.
+    #[test]
+    fn finite_division_guards_temporal_average_without_rejecting_zero() {
+        let mut sum = crate::precompute_engine::operators::sum_accumulator::SumAccumulator::new();
+        sum.update(1e308);
+        sum.update(1e308);
+        assert!(binary(
+            BinaryOperation::FiniteDiv,
+            false,
+            Value::Scalar(sum.sum),
+            Value::Scalar(2.0)
+        )
+        .is_err());
+        for (a, b, expected) in [
+            (0.0, 2.0, 0.0),
+            (10.0, 2.0, 5.0),
+            (f64::MIN_POSITIVE, 2.0, f64::MIN_POSITIVE / 2.0),
+        ] {
+            let Value::Scalar(value) = binary(
+                BinaryOperation::FiniteDiv,
+                false,
+                Value::Scalar(a),
+                Value::Scalar(b),
+            )
+            .unwrap() else {
+                panic!("scalar")
+            };
+            assert_eq!(value, expected);
+        }
+        assert!(binary(
+            BinaryOperation::FiniteDiv,
+            false,
+            Value::Scalar(1.0),
+            Value::Scalar(0.0)
+        )
+        .is_err());
+    }
+
+    // A conditional accuracy certificate must fall back rather than return an unbounded ratio.
+    #[test]
+    fn checked_relative_division_enforces_its_execution_domain() {
+        for (a, b) in [
+            (1., 0.),
+            (0., 0.),
+            (1., f64::INFINITY),
+            (f64::NAN, 2.),
+            (f64::MAX, f64::MIN_POSITIVE),
+            (f64::MIN_POSITIVE, f64::MAX),
+        ] {
+            assert!(binary(
+                BinaryOperation::CheckedDiv,
+                false,
+                Value::Scalar(a),
+                Value::Scalar(b)
+            )
+            .is_err());
+        }
+        let Value::Scalar(value) = binary(
+            BinaryOperation::CheckedDiv,
+            false,
+            Value::Scalar(5.),
+            Value::Scalar(10.),
+        )
+        .unwrap() else {
+            panic!("scalar");
+        };
+        assert_eq!(value, 0.5);
+    }
+
     #[test]
     fn topk_selects_by_sample_value_and_preserves_series_labels() {
         let values = vec![
@@ -804,7 +923,7 @@ mod topk_tests {
 
     #[test]
     fn installed_topk_combines_with_prometheus_exact_child() {
-        let mut entry = control_plane::query_plan::logical::compile_logical(
+        let mut entry = control_plane::query_plan::residual::compile_logical(
             "hybrid-topk".into(),
             "topk(2, m)".into(),
             InstantExecution {
@@ -815,7 +934,7 @@ mod topk_tests {
             FallbackPolicy::ExactBackend,
         )
         .unwrap();
-        control_plane::query_plan::logical::finalize_residuals(&mut entry).unwrap();
+        control_plane::query_plan::residual::finalize_residuals(&mut entry).unwrap();
         let leaf = entry
             .nodes
             .iter()
@@ -823,7 +942,7 @@ mod topk_tests {
                 matches!(
                     node,
                     QueryPlanNode::Logical {
-                        operator: LogicalOperator::ExactSubquery { .. },
+                        operator: ResidualQueryOperator::ExactSubquery { .. },
                         ..
                     }
                 )
@@ -890,7 +1009,7 @@ mod topk_tests {
                         (
                             QueryNodeId(0),
                             QueryPlanNode::Logical {
-                                operator: LogicalOperator::ExactSubquery {
+                                operator: ResidualQueryOperator::ExactSubquery {
                                     query: "m[1s]".into(),
                                 },
                                 inputs: vec![],
@@ -899,7 +1018,7 @@ mod topk_tests {
                         (
                             QueryNodeId(1),
                             QueryPlanNode::Logical {
-                                operator: LogicalOperator::Temporal { operation },
+                                operator: ResidualQueryOperator::Temporal { operation },
                                 inputs: vec![QueryNodeId(0)],
                             },
                         ),
@@ -974,7 +1093,7 @@ mod topk_tests {
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: LogicalOperator::TopKSelection {
+                        operator: ResidualQueryOperator::TopKSelection {
                             k: 2,
                             grouping: Grouping {
                                 labels: vec![],

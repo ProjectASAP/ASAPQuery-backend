@@ -9,7 +9,7 @@ use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
-    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput,
+    AggregateCore, KeyByLabelValues, PrecomputedOutput, StreamingConfigHandle,
 };
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
@@ -162,7 +162,7 @@ pub struct Worker {
     /// Hot-reload handle — workers read config directly from ArcSwap
     /// instead of holding a local copy. All components see the same
     /// config at the same time.
-    hot_reload: HotReloadStreamingConfig,
+    hot_reload: StreamingConfigHandle,
     /// Allowed lateness in ms.
     allowed_lateness_ms: i64,
     /// When true, skip aggregation and pass raw samples through.
@@ -199,7 +199,7 @@ impl Worker {
         id: usize,
         receiver: mpsc::Receiver<WorkerMessage>,
         output_sink: Arc<dyn OutputSink>,
-        hot_reload: HotReloadStreamingConfig,
+        hot_reload: StreamingConfigHandle,
         runtime_config: WorkerRuntimeConfig,
         group_count: Arc<AtomicUsize>,
         worker_watermark: Arc<AtomicI64>,
@@ -415,7 +415,7 @@ impl Worker {
     /// hot-reload snapshot the first time we see this sid; `group_key` is
     /// remembered on the `GroupState` for emit-time label rendering.
     ///
-    /// Reads config directly from the `HotReloadStreamingConfig`
+    /// Reads config directly from the `StreamingConfigHandle`
     /// ArcSwap handle, so new policies from a config swap are visible
     /// immediately — no message passing, no delay.
     /// Returns None if `policy_fp` has no matching config (e.g. arrived
@@ -1899,15 +1899,15 @@ mod tests {
         )
     }
 
-    /// Build a fresh `HotReloadStreamingConfig` from a map of agg_id
+    /// Build a fresh `StreamingConfigHandle` from a map of agg_id
     /// → AggregationConfig. Worker::new takes this handle instead of
     /// the old `HashMap<u64, Arc<AggregationConfig>>`. Tests use this
     /// helper instead of constructing the handle inline at every
     /// callsite.
     fn make_hot_reload(
         configs: HashMap<u64, AggregationConfig>,
-    ) -> crate::storage_engines::types::HotReloadStreamingConfig {
-        crate::storage_engines::types::HotReloadStreamingConfig::new(
+    ) -> crate::storage_engines::types::StreamingConfigHandle {
+        crate::storage_engines::types::StreamingConfigHandle::new(
             crate::storage_engines::types::StreamingConfig::new(configs),
         )
     }
@@ -2704,13 +2704,13 @@ aggregations:
 
         // PR 5: the streaming-config key is the policy fingerprint.
         let agg_id = *streaming_config
-            .get_all_aggregation_configs()
+            .materializations()
             .keys()
             .next()
             .expect("one agg");
         assert!(streaming_config.contains(agg_id));
 
-        let agg_configs = streaming_config.get_all_aggregation_configs().clone();
+        let agg_configs = streaming_config.materializations().clone();
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 

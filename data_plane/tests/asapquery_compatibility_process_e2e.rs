@@ -28,31 +28,40 @@ mod durable_summary_process;
 #[path = "support/immutable_maintenance_process.rs"]
 mod immutable_maintenance_process;
 
+#[path = "support/current_series_process.rs"]
+mod current_series_process;
+
+#[path = "support/issue_701_702_process.rs"]
+mod issue_701_702_process;
+
 // Test-only quotes preserve the fixture's local candidate without a production bypass.
 fn quote_snapshot_for_test(
-    snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot,
-) -> control_plane::physical::compiler::BackendLocalPlanningSnapshot {
+    snapshot: control_plane::physical::compiler::BackendLocalPlanningInput,
+) -> control_plane::physical::compiler::BackendLocalPlanningInput {
     quote_snapshot_for_frontend_test(snapshot, false)
 }
 
 fn quote_snapshot_for_frontend_test(
-    mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot,
+    mut snapshot: control_plane::physical::compiler::BackendLocalPlanningInput,
     metricsql: bool,
-) -> control_plane::physical::compiler::BackendLocalPlanningSnapshot {
+) -> control_plane::physical::compiler::BackendLocalPlanningInput {
     use control_plane::physical::{
-        compiler::{PhysicalCompiler, BACKEND_REVISION, PLANNER_REVISION},
+        compiler::{PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION},
         workload_cost::{self, WorkloadCostEvidence, WorkloadQuote},
     };
-    let (request, environment) = snapshot.clone().planning_request().unwrap();
+    let (request, environment) = snapshot
+        .clone()
+        .into_physical_compilation_request()
+        .unwrap();
     let mut preferred = true;
-    let quotes = workload_cost::with_exact_alternative(request)
+    let quotes = workload_cost::enumerate_exact_and_materialized_candidates(request)
         .unwrap()
         .into_iter()
         .filter_map(|candidate| {
             let plan = if metricsql {
-                PhysicalCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                PhysicalPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
             } else {
-                PhysicalCompiler.compile(candidate.clone(), environment.clone())
+                PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone())
             }
             .ok()?;
             let unit_cost = if preferred { 1.0 } else { 1e12 };
@@ -204,7 +213,7 @@ fn is_warm(response: &Value) -> bool {
 #[tokio::test]
 #[ignore = "requires ASAPCollector CollectorPlan schema compatibility; run explicitly after Collector is updated"]
 async fn erp_measured_kll_collector_to_query_oracle() {
-    use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
     let artifact: Value = serde_json::from_str(include_str!(
         "../../control_plane/tests/fixtures/erp-kll-measured.json"
@@ -226,10 +235,10 @@ async fn erp_measured_kll_collector_to_query_oracle() {
         "byte_second_weight": 1e-9, "mode": "hybrid",
         "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
     });
-    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
-    let (mut request, mut environment) = snapshot.planning_request().unwrap();
-    request.hybrid_execution = false;
-    request.queries[0].group_by = vec!["service".into()];
+    let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+    let (mut request, mut environment) = snapshot.into_physical_compilation_request().unwrap();
+    request.allow_mixed_summary_and_exact_execution = false;
+    request.queries[0].group_by_labels = vec!["service".into()];
     let lifecycle_entry = &mut request
         .query_workload
         .as_mut()
@@ -240,8 +249,10 @@ async fn erp_measured_kll_collector_to_query_oracle() {
     lifecycle_entry.time_selection.scope = planner_types::workload::QueryTimeScope::Unknown;
     environment.target =
         control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
-    environment.collector_ids = vec!["erp-collector".into()];
-    let plan = PhysicalCompiler.compile(request, environment).unwrap();
+    environment.target_collector_ids = vec!["erp-collector".into()];
+    let plan = PhysicalPlanCompiler
+        .compile_promql(request, environment)
+        .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.precompute_plan.materializations[0].parameters["k"], 32);
     let collector = serde_json::to_value(&plan.collector_plans[0]).unwrap();
@@ -486,7 +497,7 @@ async fn registered_temporal_topk_count_sketch_heap() {
 }
 
 async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlgorithm) {
-    use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
     use planner_types::post_asap::{CompositionOperator, SketchQuery, SummaryFamilyType};
     const QUERY: &str = "topk(3, count_over_time(top_endpoint_qps[5s]))";
     struct Evidence;
@@ -525,17 +536,19 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
             "source": "deterministic-count-ranking-fixture"
         }
     });
-    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
-    let (mut request, environment) = snapshot.planning_request().unwrap();
+    let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+    let (mut request, environment) = snapshot.into_physical_compilation_request().unwrap();
     let query = &mut request.queries[0];
-    let expr =
-        control_plane::query_parser::parse_query_expr_canonical(QUERY, query.accuracy.clone())
-            .unwrap();
+    let expr = control_plane::query_parser::parse_query_expr_canonical(
+        QUERY,
+        query.accuracy_target.clone(),
+    )
+    .unwrap();
     let model = control_plane::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
-        query.accuracy.clone(),
+        query.accuracy_target.clone(),
         algorithm.clone(),
     );
-    query.post_asap = control_plane::planner_selection::select_summary_with_evidence(
+    query.selected_plan_root = control_plane::planner_selection::select_summary_with_evidence(
         &expr,
         &model,
         &asap_aware_mapping::DefaultAccuracyModel,
@@ -543,7 +556,9 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         &Evidence,
     )
     .unwrap();
-    let plan = PhysicalCompiler.compile(request, environment).unwrap();
+    let plan = PhysicalPlanCompiler
+        .compile_promql(request, environment)
+        .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     use data_plane::storage_engines::types::AggregationType;
     let expected_type = match algorithm {
@@ -783,7 +798,7 @@ async fn run_shared_dashboard(multi_pane: bool) {
             })
             .collect(),
     );
-    let mut typed: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+    let mut typed: control_plane::physical::compiler::BackendLocalPlanningInput =
         serde_json::from_value(snapshot.clone()).unwrap();
     if multi_pane {
         for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
@@ -793,15 +808,18 @@ async fn run_shared_dashboard(multi_pane: bool) {
             };
         }
     }
-    let (request, environment) = typed.clone().planning_request().unwrap();
+    let (request, environment) = typed.clone().into_physical_compilation_request().unwrap();
     let candidates =
-        control_plane::physical::workload_cost::with_exact_alternative(request).unwrap();
+        control_plane::physical::workload_cost::enumerate_exact_and_materialized_candidates(
+            request,
+        )
+        .unwrap();
     let quotes = candidates
         .into_iter()
         .enumerate()
         .map(|(index, candidate)| {
-            let plan = control_plane::physical::compiler::PhysicalCompiler
-                .compile(candidate.clone(), environment.clone())
+            let plan = control_plane::physical::compiler::PhysicalPlanCompiler
+                .compile_promql(candidate.clone(), environment.clone())
                 .unwrap();
             let manifest =
                 control_plane::physical::workload_cost::manifest(&plan, &candidate.queries)
@@ -818,7 +836,7 @@ async fn run_shared_dashboard(multi_pane: bool) {
             }
         })
         .collect();
-    typed.snapshot_version = 2;
+    typed.schema_version = 2;
     typed.workload_cost_evidence = Some(
         control_plane::physical::workload_cost::WorkloadCostEvidence {
             backend_revision: control_plane::physical::compiler::BACKEND_REVISION.into(),
@@ -831,13 +849,13 @@ async fn run_shared_dashboard(multi_pane: bool) {
         },
     );
     snapshot = serde_json::to_value(&typed).unwrap();
-    let plan = typed.compile().unwrap();
+    let plan = typed.compile_promql().unwrap();
     assert!(plan.cost_comparison.is_some());
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
     if multi_pane {
         assert!(plan.lifecycle_estimates[0]
-            .window_implementation_id
+            .window_realization_id
             .contains("pane"));
         for entry in plan.query_plan.entries.values() {
             assert_eq!(entry.instant.lookback_ms, 10_000);
@@ -1185,10 +1203,13 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
 
     let backend_port = unused_port();
     let output_dir = tempfile::tempdir().expect("backend output directory");
-    let fixture = serde_json::from_str(include_str!(
-        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
-    ))
-    .unwrap();
+    let mut fixture: control_plane::physical::compiler::BackendLocalPlanningInput =
+        serde_json::from_str(include_str!(
+            "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+    // These range checks read older evaluations after finite drain.
+    fixture.physical_inputs.query_retention_margin_ms = 60_000;
     let priced = quote_snapshot_for_test(fixture);
     let snapshot = output_dir.path().join("snapshot.json");
     std::fs::write(&snapshot, serde_json::to_vec(&priced).unwrap()).unwrap();
@@ -1638,9 +1659,9 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    let planned_snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+    let planned_snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
         serde_json::from_str(&std::fs::read_to_string(&snapshot).unwrap()).unwrap();
-    let planned = planned_snapshot.compile().unwrap();
+    let planned = planned_snapshot.compile_promql().unwrap();
     // Every selected state must be serving; the Planner may share or separate
     // physical populations, so compare identities rather than a frozen count.
     let expected = planned
@@ -1671,7 +1692,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "collector_plans": invalid.collector_plans, "precompute_plan": invalid.precompute_plan,
         "transmission_plan": invalid.transmission_plan,
         "query_plan": invalid.query_plan, "storage_routing": null, "adaptation_evidence": []});
-    let built = data_plane::drivers::query::servers::http::build_active_physical_plan(
+    let built = data_plane::drivers::query::servers::http::validate_and_build_runtime_plan(
         serde_json::from_value(artifact.clone()).unwrap(),
         std::sync::Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
     );

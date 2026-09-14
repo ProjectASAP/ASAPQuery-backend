@@ -795,7 +795,7 @@ pub struct SidStoreData<K: Eq + std::hash::Hash + Clone, P> {
     /// `0` means "never written" / freshly (re)hydrated. Drives idle-sid
     /// eviction: a sid with no writes for the idle threshold whose state
     /// is fully durable on disk can have this whole `SidStoreData` dropped
-    /// from memory while its queryable `SketchInstanceMetadata` is kept
+    /// from memory while its queryable `SummarySeriesMetadata` is kept
     /// (the series stays answerable from the disk tier and rehydrates on
     /// the next write). Updated under the per-sid write lock the append
     /// path already holds, so it costs nothing extra on the hot path.

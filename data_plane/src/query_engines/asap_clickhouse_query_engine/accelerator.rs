@@ -23,7 +23,7 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 
 pub struct CatalogClickHouseAccelerator {
     pub store: Arc<SketchStore>,
-    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
     exact_backend: Option<Arc<dyn ClickHouseExactBackend>>,
 }
 
@@ -38,7 +38,7 @@ impl CatalogClickHouseAccelerator {
 
     pub fn with_active_physical_plan(
         store: Arc<SketchStore>,
-        active: crate::storage_engines::types::HotReloadActivePhysicalPlan,
+        active: crate::storage_engines::types::ActivePhysicalPlanHandle,
     ) -> Self {
         let mut accelerator = Self::empty(store);
         accelerator.active_physical_plan = Some(active);
@@ -51,7 +51,7 @@ impl CatalogClickHouseAccelerator {
     /// nodes unexecutable.
     pub fn with_active_physical_plan_and_exact_backend(
         store: Arc<SketchStore>,
-        active: crate::storage_engines::types::HotReloadActivePhysicalPlan,
+        active: crate::storage_engines::types::ActivePhysicalPlanHandle,
         exact_backend: Arc<dyn ClickHouseExactBackend>,
     ) -> Self {
         Self::with_active_physical_plan(store, active).with_exact_backend(exact_backend)
@@ -168,7 +168,11 @@ fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat
 #[async_trait]
 impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
     async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome {
-        let Some(physical) = self.active_physical_plan.as_ref().map(|h| h.snapshot()) else {
+        let Some(physical) = self
+            .active_physical_plan
+            .as_ref()
+            .map(|h| h.active_snapshot())
+        else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
@@ -228,7 +232,7 @@ impl CatalogClickHouseAccelerator {
     async fn execute_bound(
         &self,
         request: &ClickHouseQueryRequest,
-        physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
         runtime_range: Option<(u64, u64)>,
     ) -> ClickHouseAccelerationOutcome {
@@ -359,7 +363,7 @@ mod tests {
 
     use crate::{
         precompute_engine::operators::SumAccumulator,
-        storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
+        storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata},
     };
     use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
@@ -733,7 +737,7 @@ mod tests {
             .install_summary_catalog(Arc::new(sds.clone()))
             .unwrap();
         if seed {
-            store.register(SketchInstanceMetadata {
+            store.register(SummarySeriesMetadata {
                 sid: 7,
                 metric_name: "requests".into(),
                 group_by_keys: BTreeSet::new(),
@@ -779,14 +783,14 @@ mod tests {
         )
         .unwrap();
         precompute.summary_catalog = Some(sds.reference().unwrap());
-        let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
+        let mut transmission = control_plane::physical::compiler::build_transmission_plan(
             envelope.clone(),
             &precompute,
             &BTreeMap::new(),
         )
         .unwrap();
         transmission.summary_catalog = Some(sds.reference().unwrap());
-        let active = crate::drivers::query::servers::http::build_active_physical_plan(
+        let active = crate::drivers::query::servers::http::validate_and_build_runtime_plan(
             crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 summary_catalog: sds,
                 collector_plans: vec![],
@@ -801,7 +805,7 @@ mod tests {
         .unwrap();
         let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan(
             store,
-            crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active),
+            crate::storage_engines::types::ActivePhysicalPlanHandle::new(active),
         );
         let request = ClickHouseQueryRequest {
             method: Method::GET,
@@ -883,7 +887,7 @@ mod tests {
         let (accelerator, mut request) =
             fixture_with_sql(1_000, Arc::new(SketchStore::new()), true, true).await;
         let active = accelerator.active_physical_plan.as_ref().unwrap();
-        let mut snapshot = active.snapshot().as_ref().clone();
+        let mut snapshot = active.active_snapshot().as_ref().clone();
         let context = snapshot.query_plan.clickhouse_context.as_ref().unwrap();
         let second_sql =
             "SELECT sum(value) FROM requests WHERE timestamp >= 1000 AND timestamp < 2000";
@@ -950,7 +954,7 @@ mod tests {
         let (accelerator, mut request) =
             fixture_with_sql(1_000, Arc::new(SketchStore::new()), true, true).await;
         let active = accelerator.active_physical_plan.as_ref().unwrap();
-        let mut snapshot = active.snapshot().as_ref().clone();
+        let mut snapshot = active.active_snapshot().as_ref().clone();
         let context = snapshot.query_plan.clickhouse_context.as_ref().unwrap();
         let (fixed, _, _) = control_plane::clickhouse::bind_clickhouse_sql(
             &request.sql,
@@ -1040,7 +1044,7 @@ mod tests {
         cfg.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
             name: "value".into(),
         });
-        let hot = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(Arc::new(
+        let hot = crate::storage_engines::types::StreamingConfigHandle::from_arc(Arc::new(
             crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
                 cfg.policy_fp_u64(),
                 cfg.clone(),
@@ -1141,7 +1145,7 @@ mod tests {
             .active_physical_plan
             .as_ref()
             .unwrap()
-            .snapshot();
+            .active_snapshot();
         let entry = mixed_summary_external_entry(
             physical.query_plan.entries.values().next().unwrap().clone(),
         );
@@ -1187,7 +1191,7 @@ mod tests {
             .active_physical_plan
             .as_ref()
             .unwrap()
-            .snapshot();
+            .active_snapshot();
         let mut query_plan = physical.query_plan.as_ref().clone();
         let key = query_plan.entries.keys().next().unwrap().clone();
         let entry = mixed_summary_external_entry(query_plan.entries[&key].clone());
@@ -1200,7 +1204,7 @@ mod tests {
         ));
         let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan_and_exact_backend(
             accelerator.store.clone(),
-            crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active),
+            crate::storage_engines::types::ActivePhysicalPlanHandle::new(active),
             exact_backend.clone(),
         );
         let ClickHouseAccelerationOutcome::Accelerated(response) =

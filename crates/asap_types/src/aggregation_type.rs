@@ -15,12 +15,14 @@ pub enum AggregationType {
     // ---------- single-population (non-keyed) ----------
     Sum,
     Increase,
-    MinMax,
+    Min,
+    Max,
     DatasketchesKLL,
     // ---------- multi-population (keyed) ----------
     MultipleSum,
     MultipleIncrease,
-    MultipleMinMax,
+    MultipleMin,
+    MultipleMax,
     HydraKLL,
     CountMinSketch,
     CountMinSketchWithHeap,
@@ -40,11 +42,13 @@ impl AggregationType {
         match self {
             AggregationType::Sum => "Sum",
             AggregationType::Increase => "Increase",
-            AggregationType::MinMax => "MinMax",
+            AggregationType::Min => "Min",
+            AggregationType::Max => "Max",
             AggregationType::DatasketchesKLL => "DatasketchesKLL",
             AggregationType::MultipleSum => "MultipleSum",
             AggregationType::MultipleIncrease => "MultipleIncrease",
-            AggregationType::MultipleMinMax => "MultipleMinMax",
+            AggregationType::MultipleMin => "MultipleMin",
+            AggregationType::MultipleMax => "MultipleMax",
             AggregationType::HydraKLL => "HydraKLL",
             AggregationType::CountMinSketch => "CountMinSketch",
             AggregationType::CountMinSketchWithHeap => "CountMinSketchWithHeap",
@@ -65,7 +69,8 @@ impl AggregationType {
             AggregationType::MultipleSubpopulation
                 | AggregationType::MultipleSum
                 | AggregationType::MultipleIncrease
-                | AggregationType::MultipleMinMax
+                | AggregationType::MultipleMin
+                | AggregationType::MultipleMax
                 | AggregationType::CountMinSketch
                 | AggregationType::CountMinSketchWithHeap
                 | AggregationType::CountSketch
@@ -89,11 +94,13 @@ impl FromStr for AggregationType {
             // Canonical names
             "Sum" => Ok(AggregationType::Sum),
             "Increase" => Ok(AggregationType::Increase),
-            "MinMax" => Ok(AggregationType::MinMax),
+            "Min" => Ok(AggregationType::Min),
+            "Max" => Ok(AggregationType::Max),
             "DatasketchesKLL" => Ok(AggregationType::DatasketchesKLL),
             "MultipleSum" => Ok(AggregationType::MultipleSum),
             "MultipleIncrease" => Ok(AggregationType::MultipleIncrease),
-            "MultipleMinMax" => Ok(AggregationType::MultipleMinMax),
+            "MultipleMin" => Ok(AggregationType::MultipleMin),
+            "MultipleMax" => Ok(AggregationType::MultipleMax),
             "HydraKLL" => Ok(AggregationType::HydraKLL),
             "CountMinSketch" => Ok(AggregationType::CountMinSketch),
             "CountMinSketchWithHeap" => Ok(AggregationType::CountMinSketchWithHeap),
@@ -109,7 +116,8 @@ impl FromStr for AggregationType {
             "IncreaseAccumulator" | "IncreaseAggregator" | "increase" => {
                 Ok(AggregationType::Increase)
             }
-            "MinMaxAccumulator" | "MinMaxAggregator" | "min_max" => Ok(AggregationType::MinMax),
+            "MinAccumulator" | "MinAggregator" | "min" => Ok(AggregationType::Min),
+            "MaxAccumulator" | "MaxAggregator" | "max" => Ok(AggregationType::Max),
             "DatasketchesKLLAccumulator" | "KLL" | "kll" | "datasketches_kll" => {
                 Ok(AggregationType::DatasketchesKLL)
             }
@@ -117,7 +125,8 @@ impl FromStr for AggregationType {
             "MultipleIncreaseAccumulator" | "multiple_increase" => {
                 Ok(AggregationType::MultipleIncrease)
             }
-            "MultipleMinMaxAccumulator" | "multiple_min_max" => Ok(AggregationType::MultipleMinMax),
+            "MultipleMinAccumulator" | "multiple_min" => Ok(AggregationType::MultipleMin),
+            "MultipleMaxAccumulator" | "multiple_max" => Ok(AggregationType::MultipleMax),
             "HydraKllSketchAccumulator" | "hydra_kll" => Ok(AggregationType::HydraKLL),
             "CountMinSketchAccumulator" | "CMS" | "cms" | "count_min_sketch" => {
                 Ok(AggregationType::CountMinSketch)
@@ -127,6 +136,21 @@ impl FromStr for AggregationType {
                 Ok(AggregationType::CountSketch)
             }
             "CountSketchWithHeapAccumulator" => Ok(AggregationType::CountSketchWithHeap),
+            // Retired names. `MinMax` used to be one accumulator whose
+            // direction rode alongside in `aggregationSubType`; the two
+            // directions are separate types now, so there is no safe
+            // direction to guess here -- resolving a min workload as a
+            // max one is silently wrong, not merely imprecise.
+            "MinMax"
+            | "MinMaxAccumulator"
+            | "MinMaxAggregator"
+            | "min_max"
+            | "MultipleMinMax"
+            | "MultipleMinMaxAccumulator"
+            | "multiple_min_max" => Err(format!(
+                "Retired aggregation type: '{s}' -- min and max are separate types now, \
+                 use 'Min'/'Max' (or 'MultipleMin'/'MultipleMax')"
+            )),
             _ => Err(format!("Unknown aggregation type: '{s}'")),
         }
     }

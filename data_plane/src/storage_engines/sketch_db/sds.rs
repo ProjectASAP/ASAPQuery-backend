@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
 
 use super::data::{AggKind, SketchConfig};
-use super::index::SketchInstanceMetadata;
+use super::index::SummarySeriesMetadata;
 #[cfg(test)]
 use crate::storage_engines::types::AggregationType;
 pub use asap_types::sds::{
@@ -81,7 +81,7 @@ fn legacy_summary(kind: &AggKind) -> SummaryDescriptor {
 /// copied into every pane row.
 #[derive(Debug, Clone)]
 pub struct SdsBinding {
-    pub metadata: Arc<SketchInstanceMetadata>,
+    pub metadata: Arc<SummarySeriesMetadata>,
     pub summary_descriptor: Arc<SummaryDescriptor>,
     pub data_descriptor: Arc<DataDescriptor>,
     /// Immutable provenance of this physical series lifetime, shared with
@@ -90,7 +90,7 @@ pub struct SdsBinding {
 }
 
 impl std::ops::Deref for SdsBinding {
-    type Target = SketchInstanceMetadata;
+    type Target = SummarySeriesMetadata;
 
     fn deref(&self) -> &Self::Target {
         &self.metadata
@@ -148,7 +148,7 @@ impl SummaryDescriptorRegistry {
         self.authoritative_catalog.read().unwrap().clone()
     }
 
-    pub fn bind(&self, metadata: SketchInstanceMetadata) -> Result<SdsBinding, String> {
+    pub fn bind(&self, metadata: SummarySeriesMetadata) -> Result<SdsBinding, String> {
         let authoritative = self.authoritative_snapshot();
         let configured = if let Some((catalog, _)) = authoritative.as_ref() {
             if metadata.policy_fp.is_unset() {
@@ -301,8 +301,8 @@ mod tests {
         filter: &str,
         agg_type: AggregationType,
         policy: u64,
-    ) -> SketchInstanceMetadata {
-        SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.into(),
             group_by_keys: BTreeSet::from(["job".into()]),
@@ -357,7 +357,7 @@ mod tests {
             .bind(metadata(1, "cpu", "", AggregationType::Sum, 7))
             .unwrap();
         let b = registry
-            .bind(metadata(2, "cpu", "", AggregationType::MinMax, 7))
+            .bind(metadata(2, "cpu", "", AggregationType::Max, 7))
             .unwrap();
 
         assert!(!Arc::ptr_eq(&a.summary_descriptor, &b.summary_descriptor));
@@ -407,13 +407,7 @@ mod tests {
         registry.install_catalog(Arc::new(catalog)).unwrap();
 
         let binding = registry
-            .bind(metadata(
-                1,
-                "wrong-local-copy",
-                "",
-                AggregationType::MinMax,
-                7,
-            ))
+            .bind(metadata(1, "wrong-local-copy", "", AggregationType::Max, 7))
             .unwrap();
         assert_eq!(binding.summary_descriptor.as_ref(), &summary);
         assert_eq!(binding.data_descriptor.as_ref(), &data);

@@ -8,7 +8,12 @@ fn invalid(message: impl Into<String>) -> QueryPlanError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LogicalOperator {
+pub enum ResidualQueryOperator {
+    /// Readout over a bounded current-value population maintained at ingest.
+    CurrentSeries {
+        population: super::current_series::SeriesPopulation,
+        readout: super::current_series::SeriesReadout,
+    },
     /// A maximal exact scalar/vector subtree evaluated by Prometheus.
     ExactSubquery {
         query: String,
@@ -93,6 +98,10 @@ pub enum BinaryOperation {
     Sub,
     Mul,
     Div,
+    /// Division with the Planner relative-value certificate domain checks.
+    CheckedDiv,
+    /// Division for conditional exact rewrites: finite inputs and finite output.
+    FiniteDiv,
     Mod,
     Pow,
     Equal,
@@ -114,10 +123,30 @@ pub enum TemporalOperation {
     Count,
 }
 
-impl LogicalOperator {
+impl ResidualQueryOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
+        if let Self::CurrentSeries {
+            population,
+            readout,
+        } = self
+        {
+            population.validate()?;
+            match readout {
+                super::current_series::SeriesReadout::Quantile { q }
+                    if !q.is_finite() || !population.quantiles =>
+                {
+                    return Err(invalid(
+                        "quantile readout requires finite q and a quantile population",
+                    ))
+                }
+                super::current_series::SeriesReadout::TopK { k } if *k > population.max_k => {
+                    return Err(invalid("TopK readout exceeds shared population capacity"))
+                }
+                _ => {}
+            }
+        }
         let expected = match self {
-            Self::Scan { .. } | Self::ExactSubquery { .. } => 0,
+            Self::Scan { .. } | Self::ExactSubquery { .. } | Self::CurrentSeries { .. } => 0,
             Self::CandidateExactSubquery { .. } => 1,
             Self::Binary { .. } | Self::HistogramQuantile => 2,
             _ => 1,
@@ -153,3 +182,7 @@ impl LogicalOperator {
         Ok(())
     }
 }
+
+// Compatibility imports; new callers use the domain names above.
+#[deprecated(note = "Use ResidualQueryOperator")]
+pub use ResidualQueryOperator as LogicalOperator;

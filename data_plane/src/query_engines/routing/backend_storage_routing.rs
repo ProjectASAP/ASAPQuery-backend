@@ -802,7 +802,7 @@ pub fn routing_table_hash(table: &BackendStorageRouting) -> String {
 // ---------------------------------------------------------------------------
 
 /// Per-tenant atomic-swap wrapper around `BackendStorageRouting`,
-/// mirroring [`crate::storage_engines::types::HotReloadStreamingConfig`]. Lets the
+/// mirroring [`crate::storage_engines::types::StreamingConfigHandle`]. Lets the
 /// `POST /api/v1/storage_routing` HTTP handler swap one tenant's table
 /// at runtime without restarting the backend or touching any other
 /// tenant's table. Cloneable; clones share the underlying `ArcSwap` so
@@ -851,7 +851,7 @@ pub struct HotReloadBackendStorageRouting {
     /// once and pick the tenant's `Arc<BackendStorageRouting>`.
     inner:
         std::sync::Arc<arc_swap::ArcSwap<HashMap<String, std::sync::Arc<BackendStorageRouting>>>>,
-    active: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    active: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
 }
 
 impl HotReloadBackendStorageRouting {
@@ -892,8 +892,8 @@ impl HotReloadBackendStorageRouting {
         }
     }
 
-    pub fn from_active(active: crate::storage_engines::types::HotReloadActivePhysicalPlan) -> Self {
-        let initial = active.snapshot().storage_routing.clone();
+    pub fn from_active(active: crate::storage_engines::types::ActivePhysicalPlanHandle) -> Self {
+        let initial = active.active_snapshot().storage_routing.clone();
         let mut map = HashMap::new();
         map.insert(initial.tenant().to_string(), initial);
         Self {
@@ -919,7 +919,7 @@ impl HotReloadBackendStorageRouting {
     /// caller's lifetime; concurrent swaps don't invalidate it.
     pub fn snapshot_for_tenant(&self, tenant: &str) -> std::sync::Arc<BackendStorageRouting> {
         if let Some(active) = &self.active {
-            let routing = active.snapshot().storage_routing.clone();
+            let routing = active.active_snapshot().storage_routing.clone();
             if routing.tenant() == tenant || tenant == DEFAULT_TENANT {
                 return routing;
             }

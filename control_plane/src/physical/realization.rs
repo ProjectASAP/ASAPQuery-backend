@@ -3,40 +3,32 @@
 //! Providers may validate and price physical implementations, never rewrite
 //! selected logical roots or infer a pane width from a query's slide.
 use super::compiler::{
-    CompileError, DeploymentEnvironment, PhysicalCompiler, PhysicalPlan, PlanningQuery,
-    PlanningRequest,
+    CompileError, CompiledPhysicalPlan, PhysicalCompilationRequest, PhysicalDeploymentContext,
+    PhysicalPlanCompiler, QueryCompilationInput,
 };
 use super::workload_cost::{PricedComponents, WorkloadCostEvidence, WorkloadCostManifest};
 use asap_aware_mapping::cost_model::Cost;
 use planner_types::post_asap::SummaryWindowFramework;
 
 pub(crate) trait RealizationProvider {
-    fn stages(
-        &self,
-        expression: &super::post_asap::PhysicalExpr,
-        topology: super::colored_dag::Topology,
-    ) -> anyhow::Result<
-        std::collections::HashMap<super::colored_dag::StageId, super::colored_dag::StageConfig>,
-    >;
-
     fn windows(
         &self,
-        query: &PlanningQuery,
-        environment: &DeploymentEnvironment,
+        query: &QueryCompilationInput,
+        environment: &PhysicalDeploymentContext,
     ) -> Result<Vec<(String, SummaryWindowFramework, Cost)>, CompileError>;
 
     fn compile(
         &self,
-        request: PlanningRequest,
-        environment: DeploymentEnvironment,
-        metricsql: bool,
-    ) -> Result<PhysicalPlan, CompileError>;
+        request: PhysicalCompilationRequest,
+        environment: PhysicalDeploymentContext,
+        frontend: super::compiler::QueryFrontend,
+    ) -> Result<CompiledPhysicalPlan, CompileError>;
 
     fn price(
         &self,
         evidence: &WorkloadCostEvidence,
         manifest: &WorkloadCostManifest,
-    ) -> Result<PricedComponents, (&'static str, String)>;
+    ) -> Result<PricedComponents, (super::workload_cost::CandidateEvaluationStatus, String)>;
 }
 
 /// Only the currently implemented deployment paths. Capability validation
@@ -44,36 +36,24 @@ pub(crate) trait RealizationProvider {
 pub(crate) struct ExistingRealizations;
 
 impl RealizationProvider for ExistingRealizations {
-    fn stages(
-        &self,
-        expression: &super::post_asap::PhysicalExpr,
-        topology: super::colored_dag::Topology,
-    ) -> anyhow::Result<
-        std::collections::HashMap<super::colored_dag::StageId, super::colored_dag::StageConfig>,
-    > {
-        use super::colored_dag::{Emitter, StageAllocator, ThreeStageEmitter};
-        let dag = StageAllocator.allocate(expression, topology)?;
-        Ok(ThreeStageEmitter.emit_per_stage(&dag)?)
-    }
-
     fn windows(
         &self,
-        query: &PlanningQuery,
-        environment: &DeploymentEnvironment,
+        query: &QueryCompilationInput,
+        environment: &PhysicalDeploymentContext,
     ) -> Result<Vec<(String, SummaryWindowFramework, Cost)>, CompileError> {
         super::compiler::validate_window_implementations(query, environment)
     }
 
     fn compile(
         &self,
-        request: PlanningRequest,
-        environment: DeploymentEnvironment,
-        metricsql: bool,
-    ) -> Result<PhysicalPlan, CompileError> {
-        if metricsql {
-            PhysicalCompiler.compile_metricsql(request, environment)
+        request: PhysicalCompilationRequest,
+        environment: PhysicalDeploymentContext,
+        frontend: super::compiler::QueryFrontend,
+    ) -> Result<CompiledPhysicalPlan, CompileError> {
+        if frontend == super::compiler::QueryFrontend::MetricsQl {
+            PhysicalPlanCompiler.compile_metricsql(request, environment)
         } else {
-            PhysicalCompiler.compile(request, environment)
+            PhysicalPlanCompiler.compile_promql(request, environment)
         }
     }
 
@@ -81,7 +61,7 @@ impl RealizationProvider for ExistingRealizations {
         &self,
         evidence: &WorkloadCostEvidence,
         manifest: &WorkloadCostManifest,
-    ) -> Result<PricedComponents, (&'static str, String)> {
+    ) -> Result<PricedComponents, (super::workload_cost::CandidateEvaluationStatus, String)> {
         evidence.price(manifest)
     }
 }

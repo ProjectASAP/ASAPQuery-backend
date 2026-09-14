@@ -13,10 +13,10 @@ pub mod summary_executor;
 
 pub use crate::storage_engines::sketch_db::query as asap_tier;
 
+pub use engine::ASAPQueryEngine;
+
 #[cfg(test)]
 pub mod tests;
-
-pub use engine::ASAPQueryEngine;
 
 #[cfg(test)]
 mod test_plan;

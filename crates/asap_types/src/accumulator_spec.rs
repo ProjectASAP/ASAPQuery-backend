@@ -41,11 +41,13 @@
 //!
 //! Backend-specific execution details remain deliberately separate:
 //!
-//! - **Min/max direction.** Planner's `ExactParams::MinMax` carries no fields —
-//!   upstream doesn't model a direction axis. `accumulator_factory.rs`
-//!   keeps reading `AggregationConfig::aggregation_sub_type` directly
-//!   for this one bit (`eq_ignore_ascii_case("max")`), exactly as it did
-//!   before this refactor.
+//! - **Min/max direction.** Direction is part of the family now, not a
+//!   string riding alongside it: `AggregationType::{Min, Max}` (and the
+//!   keyed `{MultipleMin, MultipleMax}`) map to `ExactKind::Min` and
+//!   `ExactKind::Max` respectively — upstream still spells its
+//!   maximum accumulator `MinMax`, but it is a maximum. Nothing reads
+//!   `AggregationConfig::aggregation_sub_type` for the direction any
+//!   more, so a min state can no longer content-address onto a max one.
 //! - **HydraKLL's `(row, col)` tiling.** `SketchParams::Kll` carries
 //!   only `k` — upstream has no concept of the CMS-like grid-of-KLL-cells
 //!   layout `HydraKllSketchAccumulator` uses to parallelize a keyed KLL
@@ -233,8 +235,12 @@ impl AggregationConfig {
                 SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
                 false,
             ),
-            MinMax => (
-                SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+            Min => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min),
+                false,
+            ),
+            Max => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Max, ExactParams::Max),
                 false,
             ),
             DatasketchesKLL => (
@@ -254,8 +260,12 @@ impl AggregationConfig {
                 SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
                 true,
             ),
-            MultipleMinMax => (
-                SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+            MultipleMin => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min),
+                true,
+            ),
+            MultipleMax => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Max, ExactParams::Max),
                 true,
             ),
             HydraKLL => {
@@ -390,8 +400,12 @@ impl AggregationConfig {
                     SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                     false,
                 ),
-                "Min" | "min" | "Max" | "max" => (
-                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                "Min" | "min" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min),
+                    false,
+                ),
+                "Max" | "max" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Max, ExactParams::Max),
                     false,
                 ),
                 "Increase" | "increase" => (
@@ -418,8 +432,12 @@ impl AggregationConfig {
                     SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                     true,
                 ),
-                "Min" | "min" | "Max" | "max" => (
-                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                "Min" | "min" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min),
+                    true,
+                ),
+                "Max" | "max" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Max, ExactParams::Max),
                     true,
                 ),
                 "Increase" | "increase" => (

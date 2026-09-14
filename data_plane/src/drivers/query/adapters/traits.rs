@@ -150,16 +150,16 @@ pub trait HttpProtocolAdapter: Send + Sync {
     /// optionally forward to fallback backend for additional info.
     async fn handle_runtime_info(
         &self,
-        sketch_index: std::sync::Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        summary_store: std::sync::Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Result<Json<Value>, StatusCode>;
 
     async fn handle_runtime_info_with_headers(
         &self,
-        sketch_index: std::sync::Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        summary_store: std::sync::Arc<crate::storage_engines::sketch_db::index::SketchStore>,
         headers: HashMap<String, String>,
     ) -> Result<Json<Value>, StatusCode> {
         // Adapters may override this to forward request headers.
         let _ = headers;
-        self.handle_runtime_info(sketch_index).await
+        self.handle_runtime_info(summary_store).await
     }
 }

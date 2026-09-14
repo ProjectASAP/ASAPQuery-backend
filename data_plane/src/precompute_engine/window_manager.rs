@@ -64,6 +64,9 @@ impl WindowManager {
     pub fn stored_bucket_starts(&self, timestamp_ms: i64) -> Vec<i64> {
         if self.stores_full_windows {
             self.window_starts_containing(timestamp_ms)
+                .into_iter()
+                .filter(|start| *start >= 0)
+                .collect()
         } else {
             vec![self.pane_start_for(timestamp_ms)]
         }
@@ -193,6 +196,18 @@ impl WindowManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Storage timestamps are unsigned: never admit windows the sink cannot publish.
+    #[test]
+    fn full_window_storage_starts_stay_in_the_storage_time_domain() {
+        let manager = WindowManager::with_layout(
+            5,
+            1,
+            Some(0),
+            &asap_types::WindowMaterializationLayout::FullWindow,
+        );
+        assert_eq!(manager.stored_bucket_starts(999), vec![0]);
+    }
 
     #[test]
     fn stored_bucket_assignment_distinguishes_full_windows_from_base_panes() {

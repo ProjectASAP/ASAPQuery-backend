@@ -92,10 +92,12 @@ fn derive_sketch_only(config: &AggregationConfig) -> AccuracyProfile {
         // here too before its retirement.)
         AggregationType::Sum
         | AggregationType::Increase
-        | AggregationType::MinMax
+        | AggregationType::Min
+        | AggregationType::Max
         | AggregationType::MultipleSum
         | AggregationType::MultipleIncrease
-        | AggregationType::MultipleMinMax => AccuracyProfile::exact(),
+        | AggregationType::MultipleMin
+        | AggregationType::MultipleMax => AccuracyProfile::exact(),
 
         AggregationType::CountMinSketch => {
             let (rows, cols) = cms_params(config);
@@ -532,7 +534,11 @@ mod tests {
 
     #[test]
     fn min_max_increase_are_exact() {
-        for t in [AggregationType::MinMax, AggregationType::Increase] {
+        for t in [
+            AggregationType::Min,
+            AggregationType::Max,
+            AggregationType::Increase,
+        ] {
             let p = derive(&base_config(t, HashMap::new()));
             assert_eq!(p.kind, AccuracyKind::Exact);
         }

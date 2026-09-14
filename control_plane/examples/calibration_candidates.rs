@@ -1,6 +1,6 @@
 //! Export every bindable candidate for isolated measurement, without selecting a winner.
 use control_plane::physical::{
-    compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler},
+    compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler},
     workload_cost,
 };
 use planner_types::post_asap::{SummaryExpr, SummaryNode};
@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, rc::Rc};
 
 // Planner IR does not implement Serialize. Preserve actual DAG identity and
 // typed variant/edges; leaf metadata uses explicitly labelled Debug encoding.
-fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) -> Value {
+fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilationInput]) -> Value {
     fn visit(
         node: &Rc<SummaryNode>,
         seen: &mut BTreeMap<usize, usize>,
@@ -118,7 +118,7 @@ fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) 
     }
     let mut seen = BTreeMap::new();
     let mut nodes = BTreeMap::new();
-    let roots:Vec<_>=queries.iter().map(|q|json!({"query_id":q.query_id,"original_promql":q.query_string,"root":visit(&q.post_asap,&mut seen,&mut nodes)})).collect();
+    let roots:Vec<_>=queries.iter().map(|q|json!({"query_id":q.query_id,"original_promql":q.query_string,"root":visit(&q.selected_plan_root,&mut seen,&mut nodes)})).collect();
     json!({"encoding":"structured_graph_with_debug_metadata_v1","scope":"actual candidate Planner post-ASAP input before physical binding; not reconstructed from installed nodes","roots":roots,"nodes":nodes})
 }
 
@@ -127,26 +127,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: calibration_candidates SNAPSHOT.json [--metricsql]")?;
     let metricsql = std::env::args().skip(2).any(|arg| arg == "--metricsql");
-    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
-    let (request, environment) = snapshot.planning_request()?;
+    let snapshot: BackendLocalPlanningInput = serde_json::from_slice(&std::fs::read(path)?)?;
+    let (request, environment) = snapshot.into_physical_compilation_request()?;
     let mut results = Vec::new();
-    for (index, candidate) in workload_cost::with_exact_alternative(request)?
+    for (index, candidate) in workload_cost::enumerate_exact_and_materialized_candidates(request)?
         .into_iter()
         .enumerate()
     {
         let queries = candidate.queries.clone();
-        let materialization_policy = candidate.materialization_policy.clone();
+        let enabled_materialization_keys = candidate.enabled_materialization_keys.clone();
         let planner_selected_queries = planner_forest(&queries);
         let compiled = if metricsql {
-            PhysicalCompiler.compile_metricsql(candidate, environment.clone())
+            PhysicalPlanCompiler.compile_metricsql(candidate, environment.clone())
         } else {
-            PhysicalCompiler.compile(candidate, environment.clone())
+            PhysicalPlanCompiler.compile_promql(candidate, environment.clone())
         };
         let plan = match compiled {
             Ok(plan) => plan,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "materialization_policy": materialization_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "materialization_policy": enabled_materialization_keys, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
@@ -155,14 +155,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(manifest) => manifest,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "materialization_policy": materialization_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "materialization_policy": enabled_materialization_keys, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
         };
         results.push(json!({
             "candidate_index": index,
-            "materialization_policy": materialization_policy,
+            "materialization_policy": enabled_materialization_keys,
             "planner_selected_queries": planner_selected_queries,
             "manifest": manifest,
             "lifecycle_estimates": plan.lifecycle_estimates,

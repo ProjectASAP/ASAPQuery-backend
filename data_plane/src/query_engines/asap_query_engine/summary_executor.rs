@@ -43,7 +43,7 @@
 //!
 //! `find_candidates`/`fetch_state`/`merge_states` ALSO recognize
 //! `AggKind::ExactAgg` sids for `ExactKind::{Sum, Increase}` (see
-//! `exact_agg_kind_match`'s doc for why `MinMax`/`Count`/`Rate` aren't
+//! `exact_agg_kind_match`'s doc for why `Min`/`Max`/`Count`/`Rate` aren't
 //! matched) — one sid is one aggregation, read out directly, with no
 //! special-casing of exact-vs-approximate at the `find_candidates`/merge
 //! level. But `readout`/`SketchQuery` NEVER see these: `asap_aware_mapping::bind`
@@ -71,7 +71,8 @@ use planner_types::post_asap::{
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 
 use crate::precompute_engine::operators::increase_accumulator::IncreaseAccumulator;
-use crate::precompute_engine::operators::min_max_accumulator::MinMaxAccumulator;
+use crate::precompute_engine::operators::max_accumulator::MaxAccumulator;
+use crate::precompute_engine::operators::min_accumulator::MinAccumulator;
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
@@ -194,7 +195,7 @@ impl GroupState {
     /// module's doc for why `readout()`/`SketchQuery` never see these).
     ///
     /// `None` for a `Sketch` state, a group with no windows in range, or
-    /// a merge/query failure. `AggregationType::MinMax` (and any other
+    /// a merge/query failure. `AggregationType::Min`/`Max` (and any other
     /// type `exact_agg_kind_match` doesn't match) can't reach a
     /// `GroupState::ExactAgg` via `find_candidates` in the first place —
     /// the fallback arm here is defensive, not a real path.
@@ -253,8 +254,12 @@ impl GroupState {
                 AggregationType::Increase | AggregationType::MultipleIncrease,
             ) => asap_types::Statistic::Rate,
             (
+                asap_types::query_plan::ExactReadout::Min,
+                AggregationType::Min | AggregationType::MultipleMin,
+            ) => asap_types::Statistic::Min,
+            (
                 asap_types::query_plan::ExactReadout::Max,
-                AggregationType::MinMax | AggregationType::MultipleMinMax,
+                AggregationType::Max | AggregationType::MultipleMax,
             ) => asap_types::Statistic::Max,
             _ => return None,
         };
@@ -283,7 +288,24 @@ impl GroupState {
         }
         if matches!(
             agg_type,
-            AggregationType::MinMax | AggregationType::MultipleMinMax
+            AggregationType::Min | AggregationType::MultipleMin
+        ) && readout == asap_types::query_plan::ExactReadout::Min
+        {
+            return entries
+                .iter()
+                .flat_map(|windows| windows.values())
+                .map(|acc| {
+                    acc.as_any()
+                        .downcast_ref::<MinAccumulator>()
+                        .map(|a| a.value)
+                })
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .reduce(f64::min);
+        }
+        if matches!(
+            agg_type,
+            AggregationType::Max | AggregationType::MultipleMax
         ) && readout == asap_types::query_plan::ExactReadout::Max
         {
             return entries
@@ -291,7 +313,7 @@ impl GroupState {
                 .flat_map(|windows| windows.values())
                 .map(|acc| {
                     acc.as_any()
-                        .downcast_ref::<MinMaxAccumulator>()
+                        .downcast_ref::<MaxAccumulator>()
                         .map(|a| a.value)
                 })
                 .collect::<Option<Vec<_>>>()?
@@ -439,10 +461,11 @@ impl QueryExecutionContext<'_> {
                 SummaryExecutorError::Unsupported("query end exceeds signed event time")
             })?,
         };
-        if self
-            .index
-            .has_pending_summary_updates(binding.materialization, query_range)
-        {
+        if self.index.has_pending_summary_updates(
+            binding.materialization,
+            query_range,
+            binding.full_window_slide_ms.is_some(),
+        ) {
             return Err(SummaryExecutorError::Unsupported(
                 "materialization population has unpublished input",
             ));
@@ -538,6 +561,19 @@ impl QueryExecutionContext<'_> {
                         // They overlap the answer and must never be merged into it.
                         series.samples.retain(|end, _| *end == self.t1_ms as i64);
                         if series.samples.is_empty() {
+                            // A series that reported nothing in this window has no
+                            // full-window snapshot. The generic `known_empty` skip at
+                            // the top of the loop is layout-blind and lets such a sid
+                            // through; when the layout-aware check proves it empty,
+                            // skip it rather than discarding the sids already
+                            // accumulated and dropping the query to the exact path.
+                            if self.index.full_summary_window_known_empty(
+                                binding.materialization,
+                                sid,
+                                query_range,
+                            ) {
+                                continue;
+                            }
                             return Err(SummaryExecutorError::NoCandidates);
                         }
                     }
@@ -572,18 +608,26 @@ impl QueryExecutionContext<'_> {
                             ));
                         }
                     }
-                    if binding.full_window_slide_ms.is_none()
-                        && matches!(
-                            agg_type,
-                            AggregationType::MinMax | AggregationType::MultipleMinMax
-                        )
-                    {
-                        if let Some(series) = self.index.query_rollup_range(
+                    if let Some((reduction, is_min)) = match agg_type {
+                        AggregationType::Min | AggregationType::MultipleMin => Some((
+                            crate::storage_engines::sketch_db::index::RollupReduction::Min,
+                            true,
+                        )),
+                        AggregationType::Max | AggregationType::MultipleMax => Some((
                             crate::storage_engines::sketch_db::index::RollupReduction::Max,
-                            sid,
-                            self.t0_ms,
-                            self.t1_ms,
-                        ) {
+                            false,
+                        )),
+                        _ => None,
+                    } {
+                        if let Some(series) = binding
+                            .full_window_slide_ms
+                            .is_none()
+                            .then(|| {
+                                self.index
+                                    .query_rollup_range(reduction, sid, self.t0_ms, self.t1_ms)
+                            })
+                            .flatten()
+                        {
                             for (labels, value) in series {
                                 let key = match &binding.output_grouping {
                                     PhysicalGrouping::PerEntity => labels,
@@ -591,12 +635,15 @@ impl QueryExecutionContext<'_> {
                                         project_group_key(keys, &labels)
                                     }
                                 };
-                                let accumulator =
-                                    MinMaxAccumulator::with_value(value, "max".to_string());
+                                let accumulator: Arc<dyn AggregateCore> = if is_min {
+                                    Arc::new(MinAccumulator::with_value(value))
+                                } else {
+                                    Arc::new(MaxAccumulator::with_value(value))
+                                };
                                 by_group.entry(key).or_default().push(GroupState::ExactAgg {
                                     entries: vec![Rc::new(BTreeMap::from([(
                                         self.t1_ms as i64,
-                                        Arc::new(accumulator) as Arc<dyn AggregateCore>,
+                                        accumulator,
                                     )]))],
                                     agg_type,
                                 });
@@ -1212,10 +1259,14 @@ fn summary_family_matches_sketch(
 /// -> ExactKind::Increase` — confirmed against that module's own
 /// dispatch table rather than invented here).
 ///
-/// `ExactKind::Count`/`Rate`/`MinMax` are not matched by this legacy
-/// family-discovery path because their final operation is ambiguous from the
-/// stored accumulator alone. Installed QueryPlans carry an explicit
-/// `ExactReadout`, and `read_bound_materialization` serves those forms safely.
+/// `ExactKind::Count`/`Rate`/`Min`/`Max` are not matched by this legacy
+/// family-discovery path. For `Count`/`Rate` the final operation is ambiguous
+/// from the stored accumulator alone. `Min`/`Max` were excluded for a reason
+/// that no longer holds -- direction used to be unrecoverable once a summary
+/// reached `AggKind::ExactAgg`, and is now the family itself -- but admitting
+/// them here widens candidate discovery beyond the family split and is left
+/// as follow-up. Installed QueryPlans carry an explicit `ExactReadout`, and
+/// `read_bound_materialization` serves those forms safely.
 fn summary_family_matches_exact(family: &SummaryFamilyType, agg_type: AggregationType) -> bool {
     matches!(
         (family, agg_type),
@@ -1390,7 +1441,7 @@ mod tests {
     use super::*;
     use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchInstanceMetadata, SketchSampleState, SketchStore,
+        AccuracyBound, Capability, SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
     use planner_types::post_asap::{SummaryField, SummarySchema};
     use planner_types::pre_asap::{Column, DataType, Schema};
@@ -1536,9 +1587,9 @@ mod tests {
         })
     }
 
-    fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
+    fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Kll { k: 200 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
@@ -1559,9 +1610,9 @@ mod tests {
         }
     }
 
-    fn hll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn hll_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Hll { precision: 10 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1605,9 +1656,9 @@ mod tests {
         sk.to_msgpack().expect("encode HLL msgpack")
     }
 
-    fn cms_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1678,9 +1729,9 @@ mod tests {
         })
     }
 
-    fn cms_with_heap_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn cms_with_heap_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1749,8 +1800,8 @@ mod tests {
 
     // ── ExactAgg (Sum) fixtures ────────────────────────────────────────
 
-    fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
-        SketchInstanceMetadata {
+    fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
@@ -3219,26 +3270,26 @@ mod tests {
     }
 
     #[test]
-    fn minmax_exactagg_sid_is_not_matched() {
-        // `ExactKind::MinMax` is deliberately NOT matched against
-        // ExactAgg sids (see `exact_agg_kind_match`'s doc: no direction
-        // info survives to `AggKind::ExactAgg`) -- must fail over as
-        // NoCandidates, not silently guess a direction.
+    fn max_exactagg_sid_is_not_matched() {
+        // `ExactKind::Max` is deliberately NOT matched against ExactAgg
+        // sids by the legacy family-discovery path (see
+        // `summary_family_matches_exact`'s doc) -- must fail over as
+        // NoCandidates rather than widen discovery here.
         let idx = SketchStore::new();
         let sid = 1u64;
         let mut meta = sum_exact_agg_meta(sid, "latency_max_ms", &[]);
         meta.agg_kind = crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
-            agg_type: asap_types::AggregationType::MinMax,
+            agg_type: asap_types::AggregationType::Max,
             parameters_canonical: String::new(),
             spatial_filter_canonical: String::new(),
         };
-        meta.capability = Some(Capability::ExactAgg(asap_types::AggregationType::MinMax));
+        meta.capability = Some(Capability::ExactAgg(asap_types::AggregationType::Max));
         idx.register(meta);
         idx.append_precompute(
             sid,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::MinMaxAccumulator::new_min()),
+            Box::new(crate::precompute_engine::operators::MaxAccumulator::new()),
         );
 
         let child = scan_node("latency_max_ms", None);
@@ -3246,8 +3297,8 @@ mod tests {
             expr: SummaryExpr::SummaryAgg {
                 child,
                 family: SummaryFamilyType::ExactAggregate(
-                    planner_types::post_asap::ExactKind::MinMax,
-                    planner_types::post_asap::ExactParams::MinMax,
+                    planner_types::post_asap::ExactKind::Max,
+                    planner_types::post_asap::ExactParams::Max,
                 ),
                 input: planner_types::post_asap::SummaryUpdate {
                     item: None,

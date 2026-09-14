@@ -55,8 +55,10 @@ impl ResolvedMaterialization<'_> {
                     | AggregationType::MultipleSum
                     | AggregationType::Increase
                     | AggregationType::MultipleIncrease
-                    | AggregationType::MinMax
-                    | AggregationType::MultipleMinMax,
+                    | AggregationType::Min
+                    | AggregationType::Max
+                    | AggregationType::MultipleMin
+                    | AggregationType::MultipleMax,
                 ..
             }
         )
@@ -80,10 +82,11 @@ impl ResolvedMaterialization<'_> {
                 ExactReadout::Increase | ExactReadout::Rate => {
                     matches!(aggregation_type, Increase | MultipleIncrease)
                 }
-                ExactReadout::Max => {
-                    matches!(aggregation_type, MinMax | MultipleMinMax)
-                        && aggregation_sub_type.eq_ignore_ascii_case("max")
-                }
+                // Direction is the family now -- no `aggregation_sub_type`
+                // cross-check, and a minimum summary can no longer be
+                // offered up for a maximum readout.
+                ExactReadout::Min => matches!(aggregation_type, Min | MultipleMin),
+                ExactReadout::Max => matches!(aggregation_type, Max | MultipleMax),
             },
             QueryPlanNode::SummaryEstimate { query, .. } => match query {
                 QueryReadout::Quantile { q } => {
@@ -184,18 +187,18 @@ mod tests {
     use super::*;
     use asap_types::summary_catalog::SummaryCatalog;
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-    use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
+    use control_plane::physical::compiler::BackendLocalPlanningInput;
 
-    fn fixture() -> control_plane::physical::compiler::PhysicalPlan {
+    fn fixture() -> control_plane::physical::compiler::CompiledPhysicalPlan {
         let mut value: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap();
         value["query_workload"]["repeating_queries"][0]["query"] =
             "sum(sum_over_time(m[1m]))".into();
-        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(value).unwrap();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(value).unwrap();
         crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap()
     }
 

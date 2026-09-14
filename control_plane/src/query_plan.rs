@@ -2,12 +2,15 @@
 //! Serving consumes asap_types::query_plan; compilation stays in this component.
 
 mod clickhouse_exact;
-pub mod logical;
+pub mod residual;
+
 pub use asap_types::query_plan::*;
 #[cfg(test)]
 use asap_types::PolicyFingerprint;
 use planner_types::post_asap::{SummaryExpr, SummaryFamilyType, SummaryNode};
 use planner_types::pre_asap::Reduction;
+#[deprecated(note = "Use query_plan::residual")]
+pub use residual as logical;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -131,7 +134,7 @@ where
         instant,
         fallback,
     };
-    logical::finalize_residuals(&mut entry)?;
+    residual::finalize_residuals(&mut entry)?;
     Ok(entry)
 }
 
@@ -229,16 +232,16 @@ where
         self.seen.insert(identity, id);
         let residual = match (&self.logical_source, &node.expr) {
             (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
-                Some(logical::residual_nodes(original, expr)?)
+                Some(residual::residual_nodes(original, expr)?)
             }
             (Some(original), SummaryExpr::SummaryAgg { child, .. })
                 if matches!(child.expr, SummaryExpr::KeepPreAsap(_))
                     && !matches!(
-                        crate::physical::compiler::materialization_leaf_contract(node),
+                        crate::physical::compiler::raw_materialization_input_contract(node),
                         Ok((_, Some(_), _))
                     ) =>
             {
-                Some(logical::selected_residual_nodes(original, node)?)
+                Some(residual::selected_residual_nodes(original, node)?)
             }
             _ => None,
         };
@@ -311,11 +314,12 @@ where
             } if measures.len() == 1 => {
                 use planner_types::pre_asap::AggIntent;
                 let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => logical::Aggregation::Sum,
-                    AggIntent::Count { .. } => logical::Aggregation::Count,
-                    AggIntent::Min { .. } => logical::Aggregation::Min,
-                    AggIntent::Max { .. } => logical::Aggregation::Max,
-                    AggIntent::Avg { .. } => logical::Aggregation::Avg,
+                    AggIntent::Sum { .. } => Some(residual::Aggregation::Sum),
+                    AggIntent::Count { .. } => Some(residual::Aggregation::Count),
+                    AggIntent::Min { .. } => Some(residual::Aggregation::Min),
+                    AggIntent::Max { .. } => Some(residual::Aggregation::Max),
+                    AggIntent::Avg { .. } => Some(residual::Aggregation::Avg),
+                    AggIntent::TopK { .. } => None,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported exact value aggregation".into(),
@@ -343,14 +347,23 @@ where
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let grouping = residual::Grouping {
+                    labels,
+                    without: keys.is_without(),
+                };
+                let operator = if let AggIntent::TopK { k, .. } = &measures[0] {
+                    residual::ResidualQueryOperator::TopKSelection {
+                        k: *k as u64,
+                        grouping,
+                    }
+                } else {
+                    residual::ResidualQueryOperator::Aggregate {
+                        operation: operation.expect("aggregate operation"),
+                        grouping,
+                    }
+                };
                 QueryPlanNode::Logical {
-                    operator: logical::LogicalOperator::Aggregate {
-                        operation,
-                        grouping: logical::Grouping {
-                            labels,
-                            without: keys.is_without(),
-                        },
-                    },
+                    operator,
                     inputs: vec![self.lower(child)?],
                 }
             }
@@ -408,11 +421,11 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 QueryPlanNode::Logical {
-                    operator: logical::LogicalOperator::TopKSelection {
+                    operator: residual::ResidualQueryOperator::TopKSelection {
                         k: u64::try_from(*n).map_err(|_| {
                             QueryPlanError::Invalid("TopK limit exceeds u64".into())
                         })?,
-                        grouping: logical::Grouping {
+                        grouping: residual::Grouping {
                             labels,
                             without: partition_by.is_without(),
                         },
@@ -425,7 +438,7 @@ where
                 operation: planner_types::post_asap::ValueOperation::Sort { keys, .. },
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
             } if keys.len() == 1 => QueryPlanNode::Logical {
-                operator: logical::LogicalOperator::Sort {
+                operator: residual::ResidualQueryOperator::Sort {
                     descending: !keys[0].ascending,
                 },
                 inputs: vec![self.lower(child)?],
@@ -520,7 +533,7 @@ where
                     k: u64::try_from(*k).map_err(|_| {
                         QueryPlanError::Invalid("CandidateTopK k exceeds u64".into())
                     })?,
-                    grouping: logical::Grouping {
+                    grouping: residual::Grouping {
                         labels,
                         without: grouping.is_without(),
                     },
@@ -532,8 +545,11 @@ where
                 rhs,
                 operator,
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
-            } if self.logical_source.is_some() => {
-                let operator = logical::binary_operator(operator)?;
+            } if self.logical_source.is_some()
+                || operator.checked_relative_division
+                || operator.checked_finite_division =>
+            {
+                let operator = residual::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,
                     inputs: vec![self.lower(lhs)?, self.lower(rhs)?],
@@ -553,7 +569,7 @@ where
                     planner_types::post_asap::ExactKind::Sum
                         | planner_types::post_asap::ExactKind::Count
                 ) {
-                    let operator = logical::selected_aggregate_operator(
+                    let operator = residual::selected_aggregate_operator(
                         self.logical_source.as_deref().unwrap(),
                         node,
                     )?;
@@ -568,8 +584,8 @@ where
                     return Ok(id);
                 }
                 let operation = match kind {
-                    planner_types::post_asap::ExactKind::Sum => logical::Aggregation::Sum,
-                    planner_types::post_asap::ExactKind::Count => logical::Aggregation::Count,
+                    planner_types::post_asap::ExactKind::Sum => residual::Aggregation::Sum,
+                    planner_types::post_asap::ExactKind::Count => residual::Aggregation::Count,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported aggregation over selected summary values".into(),
@@ -596,9 +612,9 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 QueryPlanNode::Logical {
-                    operator: logical::LogicalOperator::Aggregate {
+                    operator: residual::ResidualQueryOperator::Aggregate {
                         operation,
-                        grouping: logical::Grouping {
+                        grouping: residual::Grouping {
                             labels,
                             without: keys.is_without(),
                         },
@@ -734,7 +750,7 @@ where
                         Err(error) => {
                             if let Some(original) = &self.logical_source {
                                 let (root, nodes) =
-                                    logical::selected_residual_nodes(original, node)?;
+                                    residual::selected_residual_nodes(original, node)?;
                                 return self.graft(id, root, nodes);
                             }
                             return Err(error);
@@ -807,7 +823,8 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
         SummaryFamilyType::ExactAggregate(ExactKind::Count, _) => Some(ExactReadout::Count),
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
-        SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _) => Some(ExactReadout::Max),
+        SummaryFamilyType::ExactAggregate(ExactKind::Min, _) => Some(ExactReadout::Min),
+        SummaryFamilyType::ExactAggregate(ExactKind::Max, _) => Some(ExactReadout::Max),
         _ => None,
     }
 }
@@ -891,7 +908,12 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
                     && matches!(reduction, Reduction::PerEntity)
                     && matches!(
                         kind,
-                        ExactKind::Sum | ExactKind::Count | ExactKind::Increase | ExactKind::Rate
+                        ExactKind::Sum
+                            | ExactKind::Count
+                            | ExactKind::Increase
+                            | ExactKind::Rate
+                            | ExactKind::Min
+                            | ExactKind::Max
                     )
             } else {
                 // Raw producer grouping may move through additive reductions,
@@ -968,187 +990,6 @@ fn physical_grouping(
         })
         .collect::<Result<_, _>>()?;
     Ok(PhysicalGrouping::Reduce(names))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonical_identity_ignores_formatting() {
-        assert_eq!(
-            canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
-            canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
-        );
-    }
-
-    #[test]
-    fn language_tag_preserves_query_entry_serde() {
-        let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
-            query_id: "q".into(),
-            canonical_query: canonical_promql("up").unwrap(),
-            fixed_evaluation: None,
-            root: QueryNodeId(0),
-            nodes: BTreeMap::from([(
-                QueryNodeId(0),
-                QueryPlanNode::ExactFallback {
-                    reason: "fixture".into(),
-                },
-            )]),
-            instant: InstantExecution {
-                lookback_ms: 1,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::ExactBackend,
-        };
-        let before = serde_json::to_value(&entry).unwrap();
-        assert_eq!(before, serde_json::to_value(&entry).unwrap());
-        assert!(before.get("canonical_query").is_some());
-        assert!(before.get("executable").is_none());
-    }
-
-    #[test]
-    fn language_catalog_keys_keep_equal_query_text_distinct() {
-        let base = QueryPlanEntry {
-            language: QueryLanguage::PromQl,
-            query_id: "prom".into(),
-            canonical_query: "shared".into(),
-            fixed_evaluation: None,
-            root: QueryNodeId(0),
-            nodes: BTreeMap::from([(
-                QueryNodeId(0),
-                QueryPlanNode::ExactFallback {
-                    reason: "fixture".into(),
-                },
-            )]),
-            instant: InstantExecution {
-                lookback_ms: 1,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::ExactBackend,
-        };
-        let mut metricsql = base.clone();
-        metricsql.language = QueryLanguage::MetricsQl;
-        metricsql.query_id = "metrics".into();
-        let mut clickhouse = base.clone();
-        clickhouse.language = QueryLanguage::ClickHouseSql;
-        clickhouse.query_id = "sql".into();
-        clickhouse.fixed_evaluation = Some(FixedEvaluationRange {
-            start_ms: 1,
-            end_ms: 2,
-            cumulative: true,
-        });
-        let plan = QueryPlan {
-            plan_id: 0,
-            plan_version: 0,
-            clickhouse_context: Some(ClickHousePlanningContext {
-                window_templates: Default::default(),
-                tables: Default::default(),
-                accuracy: planner_types::types::AccuracyTarget::Exact,
-            }),
-            entries: [base, metricsql, clickhouse]
-                .into_iter()
-                .map(|entry| (QueryPlan::catalog_key(entry.language, "shared"), entry))
-                .collect(),
-        };
-
-        assert_eq!(plan.entries.len(), 3);
-        assert_eq!(
-            plan.lookup_canonical(QueryLanguage::PromQl, "shared")
-                .unwrap()
-                .query_id,
-            "prom"
-        );
-        assert_eq!(
-            plan.lookup_canonical(QueryLanguage::MetricsQl, "shared")
-                .unwrap()
-                .query_id,
-            "metrics"
-        );
-        assert_eq!(plan.lookup_clickhouse("shared").unwrap().query_id, "sql");
-    }
-
-    #[test]
-    fn graph_validation_rejects_cycles() {
-        let mut nodes = BTreeMap::new();
-        nodes.insert(
-            QueryNodeId(0),
-            QueryPlanNode::SummaryMerge {
-                inputs: vec![QueryNodeId(0)],
-            },
-        );
-        let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
-            query_id: "q".into(),
-            canonical_query: "up".into(),
-            fixed_evaluation: None,
-            root: QueryNodeId(0),
-            nodes,
-            instant: InstantExecution {
-                lookback_ms: 0,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::Reject,
-        };
-        assert!(entry
-            .validate(&BTreeSet::new())
-            .unwrap_err()
-            .to_string()
-            .contains("cycle"));
-    }
-
-    #[test]
-    fn candidate_topk_rejects_invalid_completeness_contract() {
-        let leaf = QueryPlanNode::ExactFallback {
-            reason: "prepared".into(),
-        };
-        let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
-            query_id: "q".into(),
-            canonical_query: "topk(2, rate(m[5m]))".into(),
-            fixed_evaluation: None,
-            root: QueryNodeId(2),
-            nodes: BTreeMap::from([
-                (QueryNodeId(0), leaf.clone()),
-                (QueryNodeId(1), leaf),
-                (
-                    QueryNodeId(2),
-                    QueryPlanNode::CandidateTopK {
-                        inputs: [QueryNodeId(0), QueryNodeId(1)],
-                        k: 2,
-                        grouping: logical::Grouping {
-                            labels: vec![],
-                            without: false,
-                        },
-                        completeness: CandidateCompleteness::Certified {
-                            guarantee: planner_types::post_asap::ResultGuarantee {
-                                metric: planner_types::post_asap::ErrorMetric::Frequency,
-                                bound: planner_types::post_asap::BoundExpr::Unknown {
-                                    statistic: "membership margin".into(),
-                                },
-                                failure_probability:
-                                    planner_types::post_asap::ProbabilityExpr::Unknown {
-                                        statistic: "membership confidence".into(),
-                                    },
-                                provenance: vec![],
-                            },
-                        },
-                    },
-                ),
-            ]),
-            instant: InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::ExactBackend,
-        };
-        assert!(entry.validate(&BTreeSet::new()).is_err());
-    }
 }
 
 #[cfg(test)]
@@ -1321,5 +1162,270 @@ mod catalog_binding_tests {
         as_rate_plan(counter_plan)
             .validate_against_catalog(&counter_catalog)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guarded_division_retains_checks_in_both_query_compilers() {
+        // Both compilers retain the finite/relative guard supplied by Planner.
+        let query = "avg_over_time(m[5m])";
+        let canonical = crate::query_parser::parse_query_expr_canonical(
+            query,
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let root = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let SummaryExpr::BinaryOp { operator, .. } = &root.expr else {
+            panic!("expected the Planner's average rewrite");
+        };
+        assert!(operator.checked_finite_division);
+        for relative in [false, true] {
+            let mut guarded = root.as_ref().clone();
+            let SummaryExpr::BinaryOp { operator, .. } = &mut guarded.expr else {
+                unreachable!();
+            };
+            operator.checked_finite_division = !relative;
+            operator.checked_relative_division = relative;
+            let guarded = Rc::new(guarded);
+            for composable in [false, true] {
+                let instant = InstantExecution {
+                    lookback_ms: 300_000,
+                    full_history: false,
+                    cumulative_readout: false,
+                };
+                let bind = |_: &Rc<SummaryNode>, _: &SummaryFamilyType| {
+                    Ok(MaterializationBinding {
+                        full_window_slide_ms: None,
+                        materialization: PolicyFingerprint(7).into(),
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 300_000,
+                        pane_origin_ms: Some(0),
+                        readout_lookback_ms: Some(300_000),
+                        item_labels: Vec::new(),
+                    })
+                };
+                let entry = if composable {
+                    compile_bound_composable_mapped(
+                        "guarded".into(),
+                        query.into(),
+                        &guarded,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        bind,
+                        |_, _| {},
+                    )
+                } else {
+                    compile_bound_mapped(
+                        "guarded".into(),
+                        query.into(),
+                        &guarded,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        bind,
+                        |_, _| {},
+                    )
+                }
+                .unwrap();
+                let QueryPlanNode::Logical {
+                    operator: residual::ResidualQueryOperator::Binary { operation, .. },
+                    ..
+                } = &entry.nodes[&entry.root]
+                else {
+                    panic!(
+                        "expected guarded division (composable={composable}): {:?}",
+                        entry.nodes
+                    );
+                };
+                assert_eq!(
+                    *operation,
+                    if relative {
+                        residual::BinaryOperation::CheckedDiv
+                    } else {
+                        residual::BinaryOperation::FiniteDiv
+                    }
+                );
+                assert!(!entry.materialization_bindings().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_identity_ignores_formatting() {
+        assert_eq!(
+            canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
+            canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
+        );
+    }
+
+    #[test]
+    fn language_tag_preserves_query_entry_serde() {
+        let entry = QueryPlanEntry {
+            language: crate::query_plan::QueryLanguage::PromQl,
+            query_id: "q".into(),
+            canonical_query: canonical_promql("up").unwrap(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([(
+                QueryNodeId(0),
+                QueryPlanNode::ExactFallback {
+                    reason: "fixture".into(),
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 1,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let before = serde_json::to_value(&entry).unwrap();
+        assert_eq!(before, serde_json::to_value(&entry).unwrap());
+        assert!(before.get("canonical_query").is_some());
+        assert!(before.get("executable").is_none());
+    }
+
+    #[test]
+    fn language_catalog_keys_keep_equal_query_text_distinct() {
+        let base = QueryPlanEntry {
+            language: QueryLanguage::PromQl,
+            query_id: "prom".into(),
+            canonical_query: "shared".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([(
+                QueryNodeId(0),
+                QueryPlanNode::ExactFallback {
+                    reason: "fixture".into(),
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 1,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let mut metricsql = base.clone();
+        metricsql.language = QueryLanguage::MetricsQl;
+        metricsql.query_id = "metrics".into();
+        let mut clickhouse = base.clone();
+        clickhouse.language = QueryLanguage::ClickHouseSql;
+        clickhouse.query_id = "sql".into();
+        clickhouse.fixed_evaluation = Some(FixedEvaluationRange {
+            start_ms: 1,
+            end_ms: 2,
+            cumulative: true,
+        });
+        let plan = QueryPlan {
+            plan_id: 0,
+            plan_version: 0,
+            clickhouse_context: Some(ClickHousePlanningContext {
+                window_templates: Default::default(),
+                tables: Default::default(),
+                accuracy: planner_types::types::AccuracyTarget::Exact,
+            }),
+            entries: [base, metricsql, clickhouse]
+                .into_iter()
+                .map(|entry| (QueryPlan::catalog_key(entry.language, "shared"), entry))
+                .collect(),
+        };
+
+        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(
+            plan.lookup_canonical(QueryLanguage::PromQl, "shared")
+                .unwrap()
+                .query_id,
+            "prom"
+        );
+        assert_eq!(
+            plan.lookup_canonical(QueryLanguage::MetricsQl, "shared")
+                .unwrap()
+                .query_id,
+            "metrics"
+        );
+        assert_eq!(plan.lookup_clickhouse("shared").unwrap().query_id, "sql");
+    }
+
+    #[test]
+    fn graph_validation_rejects_cycles() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            QueryNodeId(0),
+            QueryPlanNode::SummaryMerge {
+                inputs: vec![QueryNodeId(0)],
+            },
+        );
+        let entry = QueryPlanEntry {
+            language: crate::query_plan::QueryLanguage::PromQl,
+            query_id: "q".into(),
+            canonical_query: "up".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes,
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::Reject,
+        };
+        assert!(entry
+            .validate(&BTreeSet::new())
+            .unwrap_err()
+            .to_string()
+            .contains("cycle"));
+    }
+
+    #[test]
+    fn candidate_topk_rejects_invalid_completeness_contract() {
+        let leaf = QueryPlanNode::ExactFallback {
+            reason: "prepared".into(),
+        };
+        let entry = QueryPlanEntry {
+            language: crate::query_plan::QueryLanguage::PromQl,
+            query_id: "q".into(),
+            canonical_query: "topk(2, rate(m[5m]))".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(2),
+            nodes: BTreeMap::from([
+                (QueryNodeId(0), leaf.clone()),
+                (QueryNodeId(1), leaf),
+                (
+                    QueryNodeId(2),
+                    QueryPlanNode::CandidateTopK {
+                        inputs: [QueryNodeId(0), QueryNodeId(1)],
+                        k: 2,
+                        grouping: residual::Grouping {
+                            labels: vec![],
+                            without: false,
+                        },
+                        completeness: CandidateCompleteness::Certified {
+                            guarantee: planner_types::post_asap::ResultGuarantee {
+                                metric: planner_types::post_asap::ErrorMetric::Frequency,
+                                bound: planner_types::post_asap::BoundExpr::Unknown {
+                                    statistic: "membership margin".into(),
+                                },
+                                failure_probability:
+                                    planner_types::post_asap::ProbabilityExpr::Unknown {
+                                        statistic: "membership confidence".into(),
+                                    },
+                                provenance: vec![],
+                            },
+                        },
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        assert!(entry.validate(&BTreeSet::new()).is_err());
     }
 }

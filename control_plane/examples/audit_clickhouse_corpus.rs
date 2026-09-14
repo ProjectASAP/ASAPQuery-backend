@@ -26,7 +26,7 @@ struct Row {
 
 fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
     let mut materialization = PrecomputeMaterialization::new(
-        AggregationType::MinMax,
+        AggregationType::Max,
         String::new(),
         std::collections::HashMap::from([("variant".into(), json!(2))]),
         KeyByLabelNames::new(vec!["labels".into()]),
@@ -56,7 +56,7 @@ fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
     let mut precompute_plan =
         PrecomputePlan::build_backend_local(envelope.clone(), vec![materialization.clone()])
             .unwrap();
-    let mut transmission_plan = control_plane::physical::compiler::compile_transmission_plan(
+    let mut transmission_plan = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute_plan,
         &Default::default(),
@@ -72,7 +72,7 @@ fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
     precompute_plan.summary_catalog = Some(reference.clone());
     transmission_plan.summary_catalog = Some(reference);
     ClickHouseSqlWorkload {
-        sds,
+        summary_catalog: sds,
         precompute_plan,
         transmission_plan,
         tables: std::collections::HashMap::from([("raw_samples".into(), schema.clone())]),

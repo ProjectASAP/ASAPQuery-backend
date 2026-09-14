@@ -850,104 +850,6 @@ pub fn canonical_attrs_fingerprint(attrs: &[(&str, &str)]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Stand-in canonical `AggKind` string. Tests don't care about the
-    /// specific encoding — the resolver only uses the value for key
-    /// equality. Production callers compute this via
-    /// `AggKind::canonical_string()`.
-    const TEST_AGG: &str = "sketch:DDSketch:D:0.01";
-
-    #[test]
-    fn versioned_population_routing_separates_delimiter_collisions() {
-        use asap_types::PopulationKeyEncoding::{CanonicalLabelsV1, LegacyDelimited};
-        let a = [("a", "b;c=d")];
-        let b = [("a", "b"), ("c", "d")];
-        assert_eq!(
-            population_attrs_fingerprint(LegacyDelimited, &a).unwrap(),
-            "a=b;c=d;"
-        );
-        assert_eq!(
-            population_attrs_fingerprint(LegacyDelimited, &a),
-            population_attrs_fingerprint(LegacyDelimited, &b)
-        );
-        let ka = population_attrs_fingerprint(CanonicalLabelsV1, &a).unwrap();
-        let kb = population_attrs_fingerprint(CanonicalLabelsV1, &b).unwrap();
-        assert_ne!(ka, kb);
-        assert_eq!(
-            kb,
-            population_attrs_fingerprint(CanonicalLabelsV1, &[("c", "d"), ("a", "b")]).unwrap()
-        );
-        let resolver = SeriesIdResolver::new();
-        assert_ne!(
-            resolver.resolve("m", &ka, TEST_AGG),
-            resolver.resolve("m", &kb, TEST_AGG)
-        );
-        assert!(
-            population_attrs_fingerprint(CanonicalLabelsV1, &[("a", "1"), ("a", "2")]).is_err()
-        );
-    }
-
-    #[test]
-    fn idempotent_same_input_same_sid() {
-        let r = SeriesIdResolver::new();
-        let sid1 = r.resolve("http_requests_total", "zone=z0;", TEST_AGG);
-        let sid2 = r.resolve("http_requests_total", "zone=z0;", TEST_AGG);
-        assert_eq!(sid1, sid2, "same input must produce same sid");
-    }
-
-    #[test]
-    fn distinct_inputs_distinct_sids() {
-        let r = SeriesIdResolver::new();
-        let s_z0 = r.resolve("metric_a", "zone=z0;", TEST_AGG);
-        let s_z1 = r.resolve("metric_a", "zone=z1;", TEST_AGG);
-        assert_ne!(s_z0, s_z1);
-    }
-
-    #[test]
-    fn distinct_metrics_same_attrs_distinct_sids() {
-        let r = SeriesIdResolver::new();
-        let s_a = r.resolve("metric_a", "zone=z0;", TEST_AGG);
-        let s_b = r.resolve("metric_b", "zone=z0;", TEST_AGG);
-        assert_ne!(s_a, s_b);
-    }
-
-    #[test]
-    fn distinct_agg_kinds_same_series_distinct_sids() {
-        // Two aggregations over the same (metric, attrs) tuple — e.g.
-        // a DDSketch and a Sum on `http_latency_ms{zone=z0}` — get
-        // SEPARATE sids. This is the core property of Interpretation B:
-        // sid identity is `(metric, attrs, agg_kind)`.
-        let r = SeriesIdResolver::new();
-        let s_dd = r.resolve("http_latency_ms", "zone=z0;", "sketch:DDSketch:D:0.01");
-        let s_sum = r.resolve("http_latency_ms", "zone=z0;", "precompute:Sum:");
-        assert_ne!(
-            s_dd, s_sum,
-            "different agg_kinds over the same series must mint distinct sids",
-        );
-    }
-
-    #[test]
-    fn fingerprint_sorts_keys() {
-        let f1 = canonical_attrs_fingerprint(&[("zone", "z0"), ("rack", "r00")]);
-        let f2 = canonical_attrs_fingerprint(&[("rack", "r00"), ("zone", "z0")]);
-        assert_eq!(f1, f2, "fingerprint must be order-independent");
-        assert_eq!(f1, "rack=r00;zone=z0;");
-    }
-
-    #[test]
-    fn lookup_returns_existing_without_mint() {
-        let r = SeriesIdResolver::new();
-        let sid = r.resolve("m", "k=v;", TEST_AGG);
-        assert_eq!(r.lookup("m", "k=v;", TEST_AGG), Some(sid));
-        assert_eq!(r.lookup("m", "k=v2;", TEST_AGG), None);
-        // Same (metric, attrs) but different agg_kind is a miss.
-        assert_eq!(r.lookup("m", "k=v;", "precompute:Sum:"), None);
-    }
-}
-
-#[cfg(test)]
 mod persistence_tests {
     use super::*;
     use tempfile::TempDir;
@@ -1288,5 +1190,103 @@ mod persistence_tests {
         assert_eq!(r.lookup("m", "k=v;", TEST_AGG), None);
         let sid2 = r.resolve("m", "k=v;", TEST_AGG);
         assert_ne!(sid, sid2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stand-in canonical `AggKind` string. Tests don't care about the
+    /// specific encoding — the resolver only uses the value for key
+    /// equality. Production callers compute this via
+    /// `AggKind::canonical_string()`.
+    const TEST_AGG: &str = "sketch:DDSketch:D:0.01";
+
+    #[test]
+    fn versioned_population_routing_separates_delimiter_collisions() {
+        use asap_types::PopulationKeyEncoding::{CanonicalLabelsV1, LegacyDelimited};
+        let a = [("a", "b;c=d")];
+        let b = [("a", "b"), ("c", "d")];
+        assert_eq!(
+            population_attrs_fingerprint(LegacyDelimited, &a).unwrap(),
+            "a=b;c=d;"
+        );
+        assert_eq!(
+            population_attrs_fingerprint(LegacyDelimited, &a),
+            population_attrs_fingerprint(LegacyDelimited, &b)
+        );
+        let ka = population_attrs_fingerprint(CanonicalLabelsV1, &a).unwrap();
+        let kb = population_attrs_fingerprint(CanonicalLabelsV1, &b).unwrap();
+        assert_ne!(ka, kb);
+        assert_eq!(
+            kb,
+            population_attrs_fingerprint(CanonicalLabelsV1, &[("c", "d"), ("a", "b")]).unwrap()
+        );
+        let resolver = SeriesIdResolver::new();
+        assert_ne!(
+            resolver.resolve("m", &ka, TEST_AGG),
+            resolver.resolve("m", &kb, TEST_AGG)
+        );
+        assert!(
+            population_attrs_fingerprint(CanonicalLabelsV1, &[("a", "1"), ("a", "2")]).is_err()
+        );
+    }
+
+    #[test]
+    fn idempotent_same_input_same_sid() {
+        let r = SeriesIdResolver::new();
+        let sid1 = r.resolve("http_requests_total", "zone=z0;", TEST_AGG);
+        let sid2 = r.resolve("http_requests_total", "zone=z0;", TEST_AGG);
+        assert_eq!(sid1, sid2, "same input must produce same sid");
+    }
+
+    #[test]
+    fn distinct_inputs_distinct_sids() {
+        let r = SeriesIdResolver::new();
+        let s_z0 = r.resolve("metric_a", "zone=z0;", TEST_AGG);
+        let s_z1 = r.resolve("metric_a", "zone=z1;", TEST_AGG);
+        assert_ne!(s_z0, s_z1);
+    }
+
+    #[test]
+    fn distinct_metrics_same_attrs_distinct_sids() {
+        let r = SeriesIdResolver::new();
+        let s_a = r.resolve("metric_a", "zone=z0;", TEST_AGG);
+        let s_b = r.resolve("metric_b", "zone=z0;", TEST_AGG);
+        assert_ne!(s_a, s_b);
+    }
+
+    #[test]
+    fn distinct_agg_kinds_same_series_distinct_sids() {
+        // Two aggregations over the same (metric, attrs) tuple — e.g.
+        // a DDSketch and a Sum on `http_latency_ms{zone=z0}` — get
+        // SEPARATE sids. This is the core property of Interpretation B:
+        // sid identity is `(metric, attrs, agg_kind)`.
+        let r = SeriesIdResolver::new();
+        let s_dd = r.resolve("http_latency_ms", "zone=z0;", "sketch:DDSketch:D:0.01");
+        let s_sum = r.resolve("http_latency_ms", "zone=z0;", "precompute:Sum:");
+        assert_ne!(
+            s_dd, s_sum,
+            "different agg_kinds over the same series must mint distinct sids",
+        );
+    }
+
+    #[test]
+    fn fingerprint_sorts_keys() {
+        let f1 = canonical_attrs_fingerprint(&[("zone", "z0"), ("rack", "r00")]);
+        let f2 = canonical_attrs_fingerprint(&[("rack", "r00"), ("zone", "z0")]);
+        assert_eq!(f1, f2, "fingerprint must be order-independent");
+        assert_eq!(f1, "rack=r00;zone=z0;");
+    }
+
+    #[test]
+    fn lookup_returns_existing_without_mint() {
+        let r = SeriesIdResolver::new();
+        let sid = r.resolve("m", "k=v;", TEST_AGG);
+        assert_eq!(r.lookup("m", "k=v;", TEST_AGG), Some(sid));
+        assert_eq!(r.lookup("m", "k=v2;", TEST_AGG), None);
+        // Same (metric, attrs) but different agg_kind is a miss.
+        assert_eq!(r.lookup("m", "k=v;", "precompute:Sum:"), None);
     }
 }

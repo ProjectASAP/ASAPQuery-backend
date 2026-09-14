@@ -1,5 +1,5 @@
 //! Discovery output must be accepted by the production snapshot planner.
-use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
+use control_plane::physical::compiler::BackendLocalPlanningInput;
 use std::{fs, path::PathBuf, process::Command};
 
 struct TempDirectory(PathBuf);
@@ -43,12 +43,16 @@ fn discovered_snapshot_plans_with_observed_cadence_and_promql_history() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let snapshot: BackendLocalPlanningSnapshot =
+    let snapshot: BackendLocalPlanningInput =
         serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
-    assert_eq!(snapshot.implementation.scrape_interval_ms, 60_000);
-    let (request, _) = snapshot.clone().planning_request().unwrap();
-    assert_eq!(request.queries[0].window_secs, 3660);
-    let roundtrip: BackendLocalPlanningSnapshot =
+    assert_eq!(snapshot.physical_inputs.scrape_interval_ms, 60_000);
+    let (request, _) = snapshot
+        .clone()
+        .into_physical_compilation_request()
+        .unwrap();
+    assert_eq!(request.scrape_interval_ms, Some(60_000));
+    assert_eq!(request.queries[0].query_lookback_seconds, 3660);
+    let roundtrip: BackendLocalPlanningInput =
         serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
     assert_eq!(snapshot, roundtrip);
 }
