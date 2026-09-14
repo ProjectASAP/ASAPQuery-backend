@@ -108,7 +108,7 @@ fn invalid_raw_snapshots_are_rejected() {
             .collect(),
         samples: vec![(1.0, 2.0), (1.0, 3.0)],
     };
-    assert!(execute(&plan, &[series.clone()], 2.0, 300.0).is_err());
+    assert!(execute(&plan, std::slice::from_ref(&series), 2.0, 300.0).is_err());
     let unique = RawSeries {
         samples: vec![(1.0, 2.0)],
         ..series

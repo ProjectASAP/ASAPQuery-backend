@@ -20,6 +20,8 @@ Run date: 2026-09-13.
 | Native executor regression tests | 5/5 passed, including the 105-case corpus |
 | Planner frontend regression/conformance/lowering/equivalence tests | 162/162 passed |
 | Python comparator/coverage tests | 8/8 passed |
+| Backend query parser regression tests | 7/7 passed |
+| Targeted Clippy (`-D warnings`) and Cargo format check | Passed |
 
 All 14 aggregation operators and 25 range-vector functions in the pinned catalog
 have an executable exact binding. This measures float-sample function coverage,
