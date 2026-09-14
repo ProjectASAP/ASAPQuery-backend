@@ -139,6 +139,10 @@ per-materialization state and observed coverage through
 
 Snapshot schema version `2` accepts fixed-interval repeating PromQL queries
 with `implementation.scrape_interval_ms` and fresh ingestion-rate evidence.
-Range selectors derive their own lookback; rangeless instant-vector queries use
-the scrape interval. Unsupported snapshot semantics fail startup rather than
-silently inventing cost or placement evidence.
+Range selectors derive their own lookback; each rangeless source uses the
+scrape interval for backend-local planning. This default window is distinct
+from Prometheus's instant-selector lookback delta and does not configure it.
+Omit `time_selection.lookback` or set it to `null`. Ranges and offsets must be
+whole seconds; unsupported fractional durations fail startup instead of
+silently shortening the window. Unsupported snapshot semantics fail startup
+rather than silently inventing cost or placement evidence.

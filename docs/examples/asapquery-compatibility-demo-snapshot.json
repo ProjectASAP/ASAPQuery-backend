@@ -9,21 +9,21 @@
         "demand": { "fixed_interval_at": { "interval": 1000, "evaluation_phase": 0 } },
         "requirements": { "accuracy": "implicit_exact", "response_latency": "unspecified" },
         "predictability": { "predictable": { "known_at": null } },
-        "time_selection": { "scope": "real_time", "as_of": null }
+        "time_selection": { "scope": "real_time", "lookback": null, "as_of": null }
       },
       {
         "query": "increase(asap_demo_counter_total[5s])",
         "demand": { "fixed_interval_at": { "interval": 1000, "evaluation_phase": 0 } },
         "requirements": { "accuracy": "implicit_exact", "response_latency": "unspecified" },
         "predictability": { "predictable": { "known_at": null } },
-        "time_selection": { "scope": "real_time", "as_of": null }
+        "time_selection": { "scope": "real_time", "lookback": null, "as_of": null }
       },
       {
         "query": "sum(sum_over_time(asap_demo_gauge[5s]))",
         "demand": { "fixed_interval_at": { "interval": 1000, "evaluation_phase": 0 } },
         "requirements": { "accuracy": "implicit_exact", "response_latency": "unspecified" },
         "predictability": { "predictable": { "known_at": null } },
-        "time_selection": { "scope": "real_time", "as_of": null }
+        "time_selection": { "scope": "real_time", "lookback": null, "as_of": null }
       },
       {
         "query": "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
@@ -33,7 +33,7 @@
           "response_latency": "unspecified"
         },
         "predictability": { "predictable": { "known_at": null } },
-        "time_selection": { "scope": "real_time", "as_of": null }
+        "time_selection": { "scope": "real_time", "lookback": null, "as_of": null }
       },
       {
         "query": "topk(1, sum_over_time(asap_demo_gauge[5s]))",
@@ -43,7 +43,7 @@
           "response_latency": "unspecified"
         },
         "predictability": { "predictable": { "known_at": null } },
-        "time_selection": { "scope": "real_time", "as_of": null }
+        "time_selection": { "scope": "real_time", "lookback": null, "as_of": null }
       },
       {
         "query": "topk(1, count_over_time(asap_demo_gauge[5s]))",
@@ -53,7 +53,7 @@
           "response_latency": "unspecified"
         },
         "predictability": { "predictable": { "known_at": null } },
-        "time_selection": { "scope": "real_time", "as_of": null }
+        "time_selection": { "scope": "real_time", "lookback": null, "as_of": null }
       }
     ],
     "data_workload": {

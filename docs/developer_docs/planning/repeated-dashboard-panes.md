@@ -26,10 +26,24 @@ counts. Layout changes never inherit another layout's measured scalar cost.
 Workload-versus-exact deployment evidence is still required by snapshot version 2.
 
 Temporal requirements are derived from PromQL. A range selector supplies its
-own readout window; a rangeless instant-vector expression uses required
-`implementation.scrape_interval_ms`. Snapshot `time_selection.lookback` is
-rejected because it duplicates and can conflict with query semantics. A
-subquery or positive offset extends only the furthest lookback: evaluated at
+own readout window; each rangeless source uses required
+`implementation.scrape_interval_ms` before enclosing offsets and subqueries
+are added. Branches, including concatenations, contribute their maximum history.
+For example, with a 5-second cadence, `sum(a offset 1h)` needs 3605 seconds,
+and `avg_over_time((sum(a))[6h:])` needs 21605 seconds. A ranged source keeps
+its explicit window even when it is shorter than the scrape cadence.
+
+This is the backend-local cadence-based planning contract, not Prometheus's
+[instant-selector lookback delta](https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness)
+(which defaults to five minutes and governs selection of the latest non-stale sample). Scrape cadence does not configure
+that Prometheus setting or provide its staleness semantics.
+
+Non-null snapshot `time_selection.lookback` is rejected because it duplicates
+and can conflict with query semantics; omission and `null` are accepted.
+The backend stores window widths in seconds, so fractional-second ranges and
+offsets are rejected explicitly rather than rounded down.
+
+A subquery or positive offset extends only the furthest lookback: evaluated at
 `t`, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`, not a continuous
 61-minute interval.
 

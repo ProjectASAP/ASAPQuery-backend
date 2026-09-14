@@ -18,6 +18,7 @@
         "predictability": { "predictable": { "known_at": null } },
         "time_selection": {
           "scope": "real_time",
+          "lookback": null,
           "as_of": null
         }
       }

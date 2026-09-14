@@ -237,7 +237,8 @@ pub struct BackendLocalImplementation {
     pub horizon_seconds: f64,
     pub window_cost_model: WindowCostModel,
     /// Prometheus source scrape cadence. Rangeless instant-vector expressions
-    /// use this as their derived readout window.
+    /// use this as their derived readout window. This backend-local planning
+    /// default is distinct from Prometheus instant-selector lookback delta.
     pub scrape_interval_ms: u64,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub query_staleness_margin_ms: u64,
@@ -600,11 +601,11 @@ impl BackendLocalPlanningSnapshot {
                 }
             };
             if self.implementation.scrape_interval_ms == 0
-                || self.implementation.scrape_interval_ms % 1_000 != 0
+                || !self.implementation.scrape_interval_ms.is_multiple_of(1_000)
             {
-                return Err(CompileError::Snapshot(format!(
-                    "scrape_interval_ms must be a positive whole number of seconds"
-                )));
+                return Err(CompileError::Snapshot(
+                    "scrape_interval_ms must be a positive whole number of seconds".into(),
+                ));
             }
             let accuracy = entry.requirements.accuracy.target();
             let query_string = entry.query.0;
@@ -612,7 +613,8 @@ impl BackendLocalPlanningSnapshot {
                 crate::query_parser::parse_query_expr_canonical(&query_string, accuracy.clone())
                     .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             let lookback_ms =
-                query_history_window_ms(&parsed).unwrap_or(self.implementation.scrape_interval_ms);
+                query_history_window_ms(&parsed, self.implementation.scrape_interval_ms)
+                    .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             let metadata = crate::query_parser::qe_to_parsed_query(&parsed);
             let source_metrics = super::workload_cost::exact_source_metrics(&parsed)?;
             let source_hint = source_metrics.iter().next().cloned().ok_or_else(|| {
@@ -2402,22 +2404,51 @@ pub(super) fn derived_window_cost(
 /// history; a positive offset moves that history further back. The result is a
 /// lower-bound horizon, not a claim that the entire interval is read. For
 /// example, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
-fn query_history_window_ms(expr: &QueryExpr) -> Option<u64> {
-    fn duration_ms(duration: std::time::Duration) -> u64 {
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<u64, CompileError> {
+    fn duration_ms(duration: std::time::Duration) -> Result<u64, CompileError> {
+        if duration.subsec_nanos() != 0 {
+            return Err(CompileError::Snapshot(
+                "PromQL ranges must be a whole number of seconds in the backend-local profile"
+                    .into(),
+            ));
+        }
+        u64::try_from(duration.as_millis())
+            .map_err(|_| CompileError::Snapshot("PromQL range exceeds supported history".into()))
     }
 
-    fn visit(expr: &QueryExpr, preceding_history_ms: u64) -> u64 {
+    fn add(left: u64, right: u64) -> Result<u64, CompileError> {
+        left.checked_add(right).ok_or_else(|| {
+            CompileError::Snapshot("PromQL history exceeds supported duration".into())
+        })
+    }
+
+    fn visit(
+        expr: &QueryExpr,
+        scrape_interval_ms: u64,
+        in_range: bool,
+    ) -> Result<u64, CompileError> {
         match expr {
-            QueryExpr::PromqlSubquery { range, child, .. }
-            | QueryExpr::TimeRange { range, child } => visit(
-                child,
-                preceding_history_ms.saturating_add(duration_ms(*range)),
+            // A subquery evaluates instant expressions at earlier timestamps;
+            // those leaves still need their own default readout window.
+            QueryExpr::PromqlSubquery { range, child, .. } => add(
+                duration_ms(*range)?,
+                visit(child, scrape_interval_ms, false)?,
             ),
-            QueryExpr::TimeShift { shift, child } => visit(
-                child,
-                preceding_history_ms.saturating_add(shift.offset_ms.max(0) as u64),
+            QueryExpr::TimeRange { range, child } => add(
+                duration_ms(*range)?,
+                visit(child, scrape_interval_ms, true)?,
             ),
+            QueryExpr::TimeShift { shift, child } => {
+                if !shift.offset_ms.unsigned_abs().is_multiple_of(1_000) {
+                    return Err(CompileError::Snapshot(
+                        "PromQL offsets must be a whole number of seconds in the backend-local profile".into(),
+                    ));
+                }
+                add(
+                    shift.offset_ms.max(0) as u64,
+                    visit(child, scrape_interval_ms, in_range)?,
+                )
+            }
             QueryExpr::PromqlScalarBridge(child)
             | QueryExpr::PromqlVectorFromScalar(child)
             | QueryExpr::PromqlScalarFromVector(child)
@@ -2428,22 +2459,28 @@ fn query_history_window_ms(expr: &QueryExpr) -> Option<u64> {
             | QueryExpr::Aggregate { child, .. }
             | QueryExpr::Dedup { child, .. }
             | QueryExpr::Sort { child, .. }
-            | QueryExpr::Limit { child, .. } => visit(child, preceding_history_ms),
+            | QueryExpr::Limit { child, .. } => visit(child, scrape_interval_ms, in_range),
             QueryExpr::BinaryOp {
                 lhs: left,
                 rhs: right,
                 ..
             }
             | QueryExpr::Join { left, right, .. }
-            | QueryExpr::SetOp { left, right, .. } => {
-                visit(left, preceding_history_ms).max(visit(right, preceding_history_ms))
-            }
-            _ => preceding_history_ms,
+            | QueryExpr::SetOp { left, right, .. } => Ok(visit(
+                left,
+                scrape_interval_ms,
+                in_range,
+            )?
+            .max(visit(right, scrape_interval_ms, in_range)?)),
+            QueryExpr::Concat { children, .. } => children.iter().try_fold(0, |history, child| {
+                Ok(history.max(visit(child, scrape_interval_ms, in_range)?))
+            }),
+            QueryExpr::Scan { .. } if !in_range => Ok(scrape_interval_ms),
+            _ => Ok(0),
         }
     }
 
-    let history_ms = visit(expr, 0);
-    (history_ms != 0).then_some(history_ms)
+    visit(expr, scrape_interval_ms, false)
 }
 
 /// Every distinct range-selector window in `expr`, as seconds.
@@ -5627,6 +5664,47 @@ pub(crate) mod tests {
         snapshot.planning_request().unwrap().0.queries[0].window_secs
     }
 
+    // Every concatenated histogram result contributes its source history.
+    #[test]
+    fn derived_history_visits_concat_branches() {
+        assert_eq!(derived_query_window_secs(
+            "histogram_quantiles(rate(request_duration_seconds_bucket[5m]), \"quantile\", 0.5, 0.9)"
+        ), 300);
+    }
+
+    // A short ranged sibling must not suppress a raw selector's default window.
+    #[test]
+    fn derived_history_applies_cadence_at_each_rangeless_source() {
+        assert_eq!(
+            derived_query_window_secs("sum(a) + sum(sum_over_time(b[1s]))"),
+            5
+        );
+        assert_eq!(derived_query_window_secs("sum(a offset 1h)"), 3605);
+        assert_eq!(derived_query_window_secs("sum_over_time(a[1s])"), 1);
+    }
+
+    // The seconds-based backend must fail explicitly instead of shrinking history.
+    #[test]
+    fn derived_history_rejects_fractional_seconds() {
+        for query in [
+            "sum_over_time(a[1500ms])",
+            "sum_over_time(a[500ms])",
+            "sum_over_time(a[1500ms] offset 500ms)",
+            "sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))",
+            "avg_over_time((sum(a))[1500ms:])",
+            "sum(a offset 500ms)",
+        ] {
+            let mut snapshot = planning_snapshot();
+            snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+                Query(query.into());
+            let error = snapshot.planning_request().expect_err(query).to_string();
+            assert!(
+                error.contains("whole number of seconds"),
+                "{query}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn snapshot_rejects_manual_lookback() {
         let mut wire = serde_json::to_value(planning_snapshot()).unwrap();
@@ -5642,7 +5720,7 @@ pub(crate) mod tests {
     fn subquery_range_derives_the_query_window() {
         assert_eq!(
             derived_query_window_secs("avg_over_time((sum(a))[6h:])"),
-            6 * 60 * 60
+            6 * 60 * 60 + 5
         );
     }
 
