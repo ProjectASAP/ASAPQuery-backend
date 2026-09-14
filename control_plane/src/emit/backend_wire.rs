@@ -93,29 +93,10 @@ pub fn storage_routing_document(
         "metrics": metrics_json,
     })
 }
-
-/// same as [`emit_backend_storage_routing`] but also
-/// emits `thanos_query` engine entries for Mode 3 metrics.
-///
-/// Mode-3 metrics have NO `BackendStageConfig` entry (the backend doesn't
-/// own the storage; Prometheus does). They surface here as plain metric
-/// names paired with a single `thanos_query` target. The backend's
-/// HTTP query handler consults the routing table at request time and
-/// HTTP-forwards Mode-3 queries to
-/// `${ASAP_PROMETHEUS_QUERY_URL:-http://prometheus:9090}/api/v1/query`.
-///
-/// Phase ε.2 implements the `thanos_query` engine on the backend
-/// (the HTTP forwarder); Phase ε.1 only commits the routing wire shape.
-///
-/// `mode3_metrics` is the list of metric names the planner routed to
-/// Prometheus archive this cycle. Each yields a single-target row with
-/// `engine: thanos_query` and no shape filter (Prom answers
-
 // ── Internals ─────────────────────────────────────────────────────────────────
 
-/// Build the JSON `metrics:` entry for one (metric, BackendStageConfig)
-/// pair — picks per-shape targets from the L4 sketch families the plan
-/// landed at the backend.
+/// Build the JSON `metrics:` entry for one metric — picks per-shape targets
+/// from the summary families the plan landed at the backend.
 ///
 /// Returns a JSON object of shape:
 /// ```text
