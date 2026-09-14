@@ -307,6 +307,13 @@ where
         self.next_id += 1;
         self.seen.insert(identity, id);
         let residual = match (&self.logical_source, &node.expr) {
+            (Some(original), SummaryExpr::BinaryOp { operator, .. })
+                if operator.checked_relative_division || operator.checked_finite_division =>
+            {
+                // Use the original exact subtree when its semantic identity can
+                // be proved; otherwise the explicit fallback below retries the query.
+                logical::selected_residual_nodes(original, node).ok()
+            }
             (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
                 Some(logical::residual_nodes(original, expr)?)
             }
@@ -330,6 +337,15 @@ where
         }
 
         let physical = match &node.expr {
+            // Installed binary nodes cannot represent these guards. In particular,
+            // an overflowing sum/count rewrite must retry the original average.
+            SummaryExpr::BinaryOp { operator, .. }
+                if operator.checked_relative_division || operator.checked_finite_division =>
+            {
+                QueryPlanNode::ExactFallback {
+                    reason: "guarded summary division requires exact execution".into(),
+                }
+            }
             SummaryExpr::RelationalJoin {
                 left,
                 right,
@@ -1053,6 +1069,84 @@ fn physical_grouping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_division_falls_back_in_both_query_compilers() {
+        // Neither installed binary representation can retain Planner's division guards.
+        let query = "avg_over_time(m[5m])";
+        let roots = crate::asap_tier_implement::implement_promql_for_asap_tier(query).unwrap();
+        let root = &roots[0];
+        let SummaryExpr::BinaryOp { operator, .. } = &root.expr else {
+            panic!("expected the Planner's average rewrite");
+        };
+        assert!(operator.checked_finite_division);
+        for relative in [false, true] {
+            let mut guarded = root.as_ref().clone();
+            let SummaryExpr::BinaryOp { operator, .. } = &mut guarded.expr else {
+                unreachable!();
+            };
+            operator.checked_finite_division = !relative;
+            operator.checked_relative_division = relative;
+            let guarded = Rc::new(guarded);
+            for composable in [false, true] {
+                let instant = InstantExecution {
+                    lookback_ms: 300_000,
+                    full_history: false,
+                    cumulative_readout: false,
+                };
+                let bind = |_: &Rc<SummaryNode>, _: &SummaryFamilyType| {
+                    Ok(MaterializationBinding {
+                        materialization: PolicyFingerprint(7).into(),
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 300_000,
+                        pane_origin_ms: Some(0),
+                        readout_lookback_ms: Some(300_000),
+                        item_labels: Vec::new(),
+                    })
+                };
+                let entry = if composable {
+                    compile_bound_composable(
+                        "guarded".into(),
+                        query.into(),
+                        &guarded,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        bind,
+                    )
+                } else {
+                    compile_bound(
+                        "guarded".into(),
+                        query.into(),
+                        &guarded,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        bind,
+                    )
+                }
+                .unwrap();
+                if composable && !relative {
+                    let QueryPlanNode::Logical {
+                        operator: logical::LogicalOperator::ExactSubquery { query: exact_query },
+                        ..
+                    } = &entry.nodes[&entry.root]
+                    else {
+                        panic!("expected the original exact average: {:?}", entry.nodes);
+                    };
+                    assert_eq!(exact_query, query);
+                } else {
+                    assert!(
+                        matches!(
+                            entry.nodes[&entry.root],
+                            QueryPlanNode::ExactFallback { .. }
+                        ),
+                        "guard discarded (relative={relative}, composable={composable}): {:?}",
+                        entry.nodes
+                    );
+                }
+                assert!(entry.materialization_bindings().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn canonical_identity_ignores_formatting() {

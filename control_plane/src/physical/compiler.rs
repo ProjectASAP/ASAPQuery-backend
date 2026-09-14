@@ -1690,6 +1690,10 @@ impl PhysicalCompiler {
                 // backend-local range index leaf.
                 crate::query_plan::logical::finalize_residuals(&mut entry)?;
             }
+            // An exact subtree can absorb guarded arithmetic and prune its
+            // children. Those semantic nodes no longer have local query placements.
+            query_node_bindings
+                .retain(|(index, _), node| *index != query_index || entry.nodes.contains_key(node));
             if metricsql {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
