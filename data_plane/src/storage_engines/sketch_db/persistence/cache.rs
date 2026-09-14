@@ -75,8 +75,3 @@ impl PartCache {
         self.inner.as_ref().map(|c| c.entry_count()).unwrap_or(0)
     }
 }
-
-/// Convenience helper: given a disk_path, return the parts root.
-pub fn parts_root_of(disk_path: &Path) -> std::path::PathBuf {
-    disk_path.join("parts")
-}

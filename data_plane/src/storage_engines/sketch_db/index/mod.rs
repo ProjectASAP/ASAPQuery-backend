@@ -1,7 +1,7 @@
 //! Sketch index — Phase 5 of the controller-into-backend refactor (2026-05).
 //!
 //! Two-level index:
-//! - `instances`: sid → SketchInstanceMetadata (one entry per logical
+//! - `instances`: sid → SummarySeriesMetadata (one entry per logical
 //!   sketch instance — its metric name, group-by KEY set, capability,
 //!   sketch_type, sketch_config, accuracy bound).
 //! - `series`: sid → per-sid storage (`SidStoreData`) carrying the
@@ -14,7 +14,7 @@
 //! exist when an agent registers a pre-merge identity that the gateway
 //! folds into a different (post-merge) identity before backend ever sees
 //! the sketch payload. Query path treats ghost sids as ASAP-tier MISS
-//! and falls through to Thanos archive (Phase 6).
+//! and falls through to Thanos archive.
 //!
 //! See design doc §4.6 ("OTLP metadata model + backend store layout") at
 //! `docs/design_docs/series-identity.md`.
@@ -37,10 +37,6 @@ use crate::storage_engines::sketch_db::sds::{
     DataDescriptor, SdsBinding, SummaryDescriptor, SummaryDescriptorRegistry,
 };
 
-// Phase-5 reorg: payload taxonomy + sid hashing + accuracy moved to
-// `sketch_db::data`. Re-exported here so existing call sites
-// (`crate::storage_engines::sketch_db::index::*`) keep compiling
-// during the reorg.
 pub use crate::storage_engines::sketch_db::data::{
     canonical_parameters, AccuracyBound, AggKind, AggPayload, AggregationType, Capability,
     SketchAlgorithm, SketchConfig, SketchEncoding, SketchSampleState, SketchTimeSeries,
@@ -193,22 +189,13 @@ fn build_attrs_fp_and_label_map(
     Ok((attrs_fp, label_values_map))
 }
 
-/// Metadata for one logical sketch instance, keyed by `series_id`.
-/// Populated at ingest time when a sketch DataPoint with a fresh sid
-/// arrives (or `(metric, attrs)` produces a fresh sid via the
-/// SeriesIdResolver). Subsequent emits of the same sid append to the
-/// associated `SidStoreData` without re-touching this metadata.
+/// Metadata for one logical sketch instance, keyed by sid. Ingest registers it
+/// on first sight; later writes append to the associated per-sid storage.
 ///
-/// **Lifecycle fields** (Phase 5 M1): mirror `AggSchema`'s
-/// `Active → Retired → Expired` state machine so the sid-keyed path
-/// has the same write-side barrier semantics as the agg_id-keyed path.
-/// `status()` is derived from `retired_at_ms` + `expires_at_ms` and
-/// the wall clock — never stored directly. M2 cuts the ingest barrier
-/// over from `SchemaRegistry::is_writable(agg_id)` to
-/// `SketchStore::is_writable(sid)`; until then both registries run
-/// side by side.
+/// Lifecycle status is derived from retirement and expiry timestamps plus the
+/// wall clock. Only active instances accept writes.
 #[derive(Debug, Clone)]
-pub struct SketchInstanceMetadata {
+pub struct SummarySeriesMetadata {
     pub sid: u64,
     pub metric_name: String,
     /// The group-by KEY set — `dp.attributes.keys()` after the agent's
@@ -252,7 +239,7 @@ pub struct SketchInstanceMetadata {
     pub policy_fp: PolicyFingerprint,
 }
 
-impl SketchInstanceMetadata {
+impl SummarySeriesMetadata {
     /// Compute the current `AggStatus` against the wall clock.
     /// Mirrors `AggSchema::status` — purely a function of timestamps.
     pub fn status(&self) -> AggStatus {
@@ -264,10 +251,7 @@ impl SketchInstanceMetadata {
         }
     }
 
-    /// Whether this sid accepts writes. Equivalent to
-    /// `status() == AggStatus::Active`. Phase 5 ingest barrier
-    /// (M2 cutover) will call this in place of
-    /// `SchemaRegistry::is_writable(agg_id)`.
+    /// Whether this sid accepts writes: `status() == AggStatus::Active`.
     pub fn is_writable(&self) -> bool {
         matches!(self.status(), AggStatus::Active)
     }
@@ -295,19 +279,7 @@ impl SketchInstanceMetadata {
             AggKind::ExactAgg { .. } => None,
         }
     }
-
-    /// Sketch-config accessor mirroring [`Self::sketch_algorithm`].
-    pub fn sketch_config(&self) -> Option<&SketchConfig> {
-        match &self.agg_kind {
-            AggKind::Sketch { config, .. } => Some(config),
-            AggKind::ExactAgg { .. } => None,
-        }
-    }
 }
-
-// `SketchSampleState`, `SketchEncoding`, `SketchTimeSeries`, and
-// `AggPayload` moved to `sketch_db::data` in the Phase-5 reorg; they're
-// re-exported at the top of this file for backwards compatibility.
 
 /// Per-sid storage value — wraps `SidStoreData` in an `RwLock` so the
 /// outer DashMap stays read-mostly and per-sid writes don't block one
@@ -580,13 +552,9 @@ impl From<&asap_types::producer_plan::SummaryFrameIdentity> for IncompleteSummar
     }
 }
 
-/// Two-level sketch index. Replaces the legacy `aggregation_id`-keyed
-/// SimpleStore lookup once Phase 5 wiring lands at the streaming engine
-/// ingest path and the query path.
-///
-/// `instances` is keyed under a `RwLock<HashMap>` because the registration
-/// rate is low (one write per first-seen sid) and reads dominate;
-/// `series` is a `DashMap` because per-sid writes happen on every DP.
+/// Two-level sketch index. Metadata uses `RwLock<HashMap>` for infrequent
+/// registration and frequent reads; per-sid data uses `DashMap` for writes on
+/// every datapoint.
 #[derive(Clone, Copy)]
 pub(crate) struct SummaryReadRevision {
     admission: u64,
@@ -657,7 +625,7 @@ pub struct SketchStore {
     /// per-attribute-set CMS (only the bucket total is meaningful).
     /// Kept as a decoupled side-table so recording item_label does not
     /// change sid identity (`AggKind` canonical string) or churn the many
-    /// `SketchInstanceMetadata` / `AggKind::Sketch` literals.
+    /// `SummarySeriesMetadata` / `AggKind::Sketch` literals.
     item_labels: RwLock<HashMap<u64, String>>,
     /// sid → per-sid columnar storage. Empty `SidStoreData` (or absent
     /// key) for ghost sids — query path detects this and falls through
@@ -672,7 +640,7 @@ pub struct SketchStore {
     /// Reverse index: `policy_fp → {sids}`. Lets the query path resolve
     /// "which sids belong to this policy?" in O(1) without walking
     /// `instances`. Maintained by [`Self::register`] /
-    /// [`Self::remove_instance`] / [`Self::remove_instances_for_agg_config`].
+    /// [`Self::remove_instance`].
     /// Entries with `PolicyFingerprint::UNSET` are NOT recorded (the
     /// sentinel means "no source config"); legacy callers that mint
     /// sids without a fingerprint reach those sids through
@@ -847,14 +815,14 @@ impl SketchStore {
     /// absent from `policy_to_series_ids` / `metric_to_series_ids` (the pre-fix race
     /// where the two indexes were written under separate sequential
     /// locks). See the index-field doc comments for the full invariant.
-    pub fn register(&self, meta: SketchInstanceMetadata) {
+    pub fn register(&self, meta: SummarySeriesMetadata) {
         let mut instances = self.instances.write().unwrap();
         self.register_with_instances(meta, &mut instances);
     }
 
     fn register_with_instances(
         &self,
-        meta: SketchInstanceMetadata,
+        meta: SummarySeriesMetadata,
         instances: &mut HashMap<u64, SdsBinding>,
     ) -> bool {
         let sid = meta.sid;
@@ -1122,14 +1090,6 @@ impl SketchStore {
         }
     }
 
-    /// The per-item attribute name recorded for `sid`, if any. `Some`
-    /// means the sketch hashes that label's VALUE (so `estimate(value)`
-    /// is meaningful); `None` means per-attribute-set keying (only the
-    /// bucket total is meaningful — keyed selectors must safe-miss).
-    pub fn item_label_for(&self, sid: u64) -> Option<String> {
-        self.item_labels.read().unwrap().get(&sid).cloned()
-    }
-
     /// Resolve a policy fingerprint to the set of sids it has minted.
     /// Returns an empty vector when no sid is bound to the fingerprint
     /// (e.g. fresh policy with no ingest activity yet) or when the
@@ -1170,6 +1130,7 @@ impl SketchStore {
             .is_some_and(|generation| binding.catalog_generation.as_deref() == Some(generation))
     }
 
+    #[cfg(test)]
     /// Live policy count — number of distinct fingerprints with at
     /// least one sid. Useful for telemetry / `/runtime` introspection
     /// (mirrors the legacy "active aggregation count" metric).
@@ -1179,7 +1140,7 @@ impl SketchStore {
 
     /// Look up the metadata for a sid (cloned because callers usually
     /// release the index lock before working with it).
-    pub fn instance(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
+    pub fn instance(&self, sid: u64) -> Option<Arc<SummarySeriesMetadata>> {
         self.instances
             .read()
             .unwrap()
@@ -1200,6 +1161,7 @@ impl SketchStore {
         ))
     }
 
+    #[cfg(test)]
     pub fn descriptor_counts(&self) -> (usize, usize) {
         (
             self.descriptors.summary_count(),
@@ -1391,7 +1353,7 @@ impl SketchStore {
     /// (which would deadlock) and should stay allocation-light — extract
     /// the small data you need (a `Capability` clone, a `bool`) and act
     /// after this returns.
-    pub fn with_instance<R, F: FnOnce(&SketchInstanceMetadata) -> R>(
+    pub fn with_instance<R, F: FnOnce(&SummarySeriesMetadata) -> R>(
         &self,
         sid: u64,
         f: F,
@@ -1401,7 +1363,7 @@ impl SketchStore {
     }
 
     /// Append a window's sketch state under `sid`. Caller is responsible
-    /// for ensuring the corresponding `SketchInstanceMetadata` was
+    /// for ensuring the corresponding `SummarySeriesMetadata` was
     /// registered (or the sketch arrives orphan and the caller chooses
     /// to drop / reject / register-on-the-fly).
     ///
@@ -2449,6 +2411,7 @@ impl SketchStore {
         self.series.len()
     }
 
+    #[cfg(test)]
     /// Total count of in-memory SEALED epochs across all sids — i.e.
     /// epochs sealed (pending flush) but not yet evicted to disk. `0`
     /// once the flusher has drained everything. Used by tests and
@@ -2489,7 +2452,7 @@ impl SketchStore {
     /// `SidStoreData` (epoch columns + intern-table label cache + the
     /// `series` slot) for every sketch sid that has gone write-idle past
     /// `idle_threshold_ms` AND whose state is fully durable on disk, while
-    /// KEEPING its [`SketchInstanceMetadata`] in `instances`.
+    /// KEEPING its [`SummarySeriesMetadata`] in `instances`.
     ///
     /// Why keep the metadata: the query path's disk union
     /// ([`Self::query_range`] → `union_disk_parts_into`) needs
@@ -2572,7 +2535,7 @@ impl SketchStore {
         // 1. SeriesId bindings, compatibility metadata, and shared SDS descriptors.
         if let Ok(insts) = self.instances.read() {
             for m in insts.values() {
-                total += std::mem::size_of::<SketchInstanceMetadata>();
+                total += std::mem::size_of::<SummarySeriesMetadata>();
                 total += m.metric_name.len();
                 for k in &m.group_by_keys {
                     total += k.len() + std::mem::size_of::<String>();
@@ -2612,7 +2575,7 @@ impl SketchStore {
     /// Snapshot shared metadata handles without holding the registry lock
     /// across user code. This is O(N) pointer cloning and does not copy
     /// descriptor strings, label sets, or aggregation configuration.
-    pub fn snapshot_instances(&self) -> Vec<Arc<SketchInstanceMetadata>> {
+    pub fn snapshot_instances(&self) -> Vec<Arc<SummarySeriesMetadata>> {
         match self.instances.read() {
             Ok(map) => map
                 .values()
@@ -2622,11 +2585,7 @@ impl SketchStore {
         }
     }
 
-    // ── Phase 5 M1: lifecycle-status surface ─────────────────────────
-    //
-    // Mirror the `SchemaRegistry` lifecycle methods so the ingest /
-    // eviction paths can cut over from `agg_id` to `sid` in M2. Until
-    // M2 lands, both registries run side by side.
+    // Sid lifecycle transitions and status lookup.
 
     /// Whether `sid` accepts writes. Equivalent to
     /// `status(sid) == AggStatus::Active`. Returns `false` for
@@ -2670,7 +2629,7 @@ impl SketchStore {
     /// allocation-light. Callers that need to mutate or call user code
     /// should collect the cheap data they need (e.g. `Vec<u64>` of
     /// sids) here, then act after this returns.
-    pub fn for_each_instance<F: FnMut(u64, &SketchInstanceMetadata)>(&self, mut f: F) {
+    pub fn for_each_instance<F: FnMut(u64, &SummarySeriesMetadata)>(&self, mut f: F) {
         if let Ok(map) = self.instances.read() {
             for (sid, meta) in map.iter() {
                 f(*sid, meta);
@@ -2681,7 +2640,7 @@ impl SketchStore {
     /// Iterate (clones) all instance metadata matching `status`.
     /// Used by the eviction service to enumerate `Expired` sids
     /// without holding a long read lock.
-    pub fn list_by_status(&self, status: AggStatus) -> Vec<Arc<SketchInstanceMetadata>> {
+    pub fn list_by_status(&self, status: AggStatus) -> Vec<Arc<SummarySeriesMetadata>> {
         let map = match self.instances.read() {
             Ok(m) => m,
             Err(_) => return Vec::new(),
@@ -2752,7 +2711,7 @@ impl SketchStore {
         &self,
         sid: u64,
         retention: Duration,
-    ) -> Option<Arc<SketchInstanceMetadata>> {
+    ) -> Option<Arc<SummarySeriesMetadata>> {
         let _mutation = self.begin_state_mutation();
         let mut map = self.instances.write().ok()?;
         let instance = map.get_mut(&sid)?;
@@ -2771,7 +2730,7 @@ impl SketchStore {
     /// state, or `None` if the sid is unknown. Intended for
     /// operator / debug-endpoint use so eviction can be observed in
     /// e2e tests without waiting out retirement retention.
-    pub fn force_expire(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
+    pub fn force_expire(&self, sid: u64) -> Option<Arc<SummarySeriesMetadata>> {
         let _mutation = self.begin_state_mutation();
         let mut map = self.instances.write().ok()?;
         let instance = map.get_mut(&sid)?;
@@ -2880,7 +2839,7 @@ impl SketchStore {
     /// `series` DashMap is touched after the index guards are released
     /// (it is independently keyed and not part of the metadata-index
     /// invariant).
-    pub fn remove_instance(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
+    pub fn remove_instance(&self, sid: u64) -> Option<Arc<SummarySeriesMetadata>> {
         let _mutation = self.begin_state_mutation();
         let removed = {
             // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
@@ -2954,12 +2913,8 @@ impl SketchStore {
 }
 
 impl SketchStore {
-    /// Phase 5 M2.3.6g — runtime-info / diagnostic helper. Returns the
-    /// per-sid `first_seen_unix_ms` for every registered sid. The
-    /// legacy `Store::get_earliest_timestamp_per_aggregation_id` returned
-    /// an analogous `agg_id → ts` map; this is the SketchStore
-    /// equivalent. HTTP server's `/api/v1/status/runtimeinfo` adapter
-    /// surfaces it under the JSON field `earliest_timestamp_per_sid`.
+    /// Return first-seen timestamps per sid for runtime diagnostics. The HTTP
+    /// adapter exposes this as `earliest_timestamp_per_sid`.
     pub fn earliest_timestamps_per_series_id(&self) -> std::collections::HashMap<u64, u64> {
         let g = self.instances.read().unwrap();
         g.iter()
@@ -3072,7 +3027,7 @@ impl SketchStore {
                 // state was reachable only through the legacy precompute
                 // query path; capability-matching couldn't see it.
                 if !self.register_with_instances(
-                    SketchInstanceMetadata {
+                    SummarySeriesMetadata {
                         sid,
                         metric_name: agg_cfg.metric.clone(),
                         group_by_keys,
@@ -3207,51 +3162,6 @@ impl SketchStore {
             ),
         };
         accepted.then_some(sid)
-    }
-
-    /// Phase 5 M2.3.6d — eviction-side helper. Removes every sid in the
-    /// index whose metadata was registered against `agg_cfg`, i.e.
-    /// shares the same metric, agg_type, parameters canonicalization,
-    /// and grouping-keys set the `SketchStoreSink` used at write time.
-    /// Returns how many sids were removed. Used by
-    /// `SchemaEvictionService` to drop a retired schema's residual sid
-    /// state.
-    pub fn remove_instances_for_agg_config(
-        &self,
-        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
-    ) -> usize {
-        let target_metric = agg_cfg.metric.as_str();
-        let target_agg_type = agg_cfg.aggregation_type;
-        let target_params = canonical_parameters(&agg_cfg.parameters);
-        let target_group_keys: BTreeSet<String> = agg_cfg.grouping_labels.iter().cloned().collect();
-
-        // Collect the matching sids under a short read lock; then call
-        // `remove_instance` per sid (which takes its own write lock).
-        let to_remove: Vec<u64> = {
-            let g = self.instances.read().unwrap();
-            g.iter()
-                .filter(|(_, m)| {
-                    if m.metric_name != target_metric {
-                        return false;
-                    }
-                    if m.group_by_keys != target_group_keys {
-                        return false;
-                    }
-                    matches!(
-                        &m.agg_kind,
-                        AggKind::ExactAgg { agg_type, parameters_canonical, .. }
-                            if *agg_type == target_agg_type
-                                && parameters_canonical == &target_params
-                    )
-                })
-                .map(|(sid, _)| *sid)
-                .collect()
-        };
-        let count = to_remove.len();
-        for sid in to_remove {
-            self.remove_instance(sid);
-        }
-        count
     }
 }
 
@@ -3463,7 +3373,7 @@ impl SketchStore {
             };
             let capability = rec.capability();
             let accuracy = rec.accuracy();
-            self.register(SketchInstanceMetadata {
+            self.register(SummarySeriesMetadata {
                 sid: rec.sid,
                 metric_name: rec.metric_name,
                 group_by_keys: rec.group_by_keys.into_iter().collect(),
@@ -3510,13 +3420,8 @@ impl SketchStore {
     }
 }
 
-// ── Phase 5 M2.3.6b — EpochSource impl ──────────────────────────────────────
-//
-// Lets the existing persistence flusher (`store/persistence/flusher.rs`)
-// drive `SketchStore` instead of `SketchStorePerKey`. The `agg_id: u64`
-// field on `SealedEpochRef` / `EpochSnapshot` carries a `sid` here —
-// the trait keeps the historical name so the flusher / manifest /
-// part-writer stay untouched.
+// Persistence epoch interface. The `agg_id` field on epoch references carries
+// a sid in this store; persistence readers and writers must interpret it so.
 impl crate::storage_engines::sketch_db::index::persistence::EpochSource for SketchStore {
     fn flush_before_ms(&self) -> Option<u64> {
         let cutoff = self
@@ -3696,6 +3601,22 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
     }
 }
 
+// Compatibility imports; new callers use the domain names above.
+#[deprecated(note = "Use SummarySeriesMetadata")]
+pub use SummarySeriesMetadata as SketchInstanceMetadata;
+
+// 2026-05 reorg: generic epoch-partitioned columnar storage lives
+// alongside the store that uses it.
+mod admission;
+mod maintenance;
+pub(crate) use maintenance::{CompleteRawMaintenanceCohort, FrozenExactWindows};
+pub mod epoch_columnar;
+
+// `persistence` moved up to `sketch_db::persistence`. Re-exported here
+// so legacy `crate::storage_engines::sketch_db::index::persistence::*`
+// paths continue working without consumer changes.
+pub use crate::storage_engines::sketch_db::persistence;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3723,18 +3644,18 @@ mod tests {
         assert_eq!(gapped.query(0, 90_000), None);
     }
 
-    fn meta(sid: u64) -> SketchInstanceMetadata {
+    fn meta(sid: u64) -> SummarySeriesMetadata {
         meta_with_policy(sid, asap_types::PolicyFingerprint::UNSET)
     }
 
     fn meta_with_policy(
         sid: u64,
         policy_fp: asap_types::PolicyFingerprint,
-    ) -> SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: "m".into(),
             group_by_keys: BTreeSet::new(),
@@ -3803,13 +3724,13 @@ mod tests {
 
     #[test]
     fn observed_inventory_uses_installed_catalog_and_real_store_entries() {
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let store = SketchStore::new();
@@ -3878,13 +3799,13 @@ mod tests {
 
     #[test]
     fn registered_series_without_payload_is_not_a_summary_instance() {
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let store = SketchStore::new();
@@ -4663,7 +4584,7 @@ mod tests {
 
     /// Metadata with a chosen metric name + group-by key set, so the
     /// secondary-index tests can register several metrics/keys.
-    fn meta_metric_keys(sid: u64, metric: &str, keys: &[&str]) -> SketchInstanceMetadata {
+    fn meta_metric_keys(sid: u64, metric: &str, keys: &[&str]) -> SummarySeriesMetadata {
         let mut m = meta(sid);
         m.metric_name = metric.to_string();
         m.group_by_keys = keys.iter().map(|k| k.to_string()).collect();
@@ -4782,7 +4703,7 @@ mod tests {
     /// Metadata with a single group-by key `host`, so the disk read-back
     /// path can rebuild the `{host: <v>}` label map from the stored
     /// values vector.
-    fn meta_with_host_key(sid: u64) -> SketchInstanceMetadata {
+    fn meta_with_host_key(sid: u64) -> SummarySeriesMetadata {
         let mut m = meta(sid);
         m.group_by_keys = ["host".to_string()].into_iter().collect();
         m
@@ -5038,13 +4959,13 @@ mod tests {
         use crate::storage_engines::sketch_db::index::persistence::metadata::{
             SidMetaRecord, SidMetadataStore,
         };
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let metadata = meta_with_policy(507, fingerprint);
@@ -5081,13 +5002,13 @@ mod tests {
     #[test]
     fn catalog_reactivation_uses_new_physical_series_without_old_disk_payload() {
         use crate::drivers::ingest::series_resolver::SeriesIdResolver;
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let definition = fingerprint.into();
@@ -5182,13 +5103,13 @@ mod tests {
     fn completed_windows_reject_late_updates_after_restart() {
         // Completion is a storage admission rule, including legacy producers,
         // and survives restart without allowing a correction into consumed state.
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
@@ -5270,13 +5191,13 @@ mod tests {
     fn finite_completion_flushes_payload_before_persisting_immutability() {
         // With neither memory pressure nor a hot-tier deadline, completion must
         // explicitly flush its payload before persisting a non-replayable window.
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
@@ -5380,13 +5301,13 @@ mod tests {
 
     #[test]
     fn durable_lifecycle_is_not_resurrected_by_restart_or_a_stale_flush() {
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
@@ -5464,13 +5385,13 @@ mod tests {
 
     #[test]
     fn observed_inventory_includes_durable_instances_after_restart() {
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
-            .compile()
+            .compile_promql()
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let definition_id = SummaryDefinitionId::from(fingerprint);
@@ -5544,9 +5465,9 @@ mod tests {
     // they FAIL ("No result"); with the metadata-sidecar fix they pass
     // because recovery re-registers the disk-resident sids.
 
-    fn meta_kll_host(sid: u64) -> SketchInstanceMetadata {
+    fn meta_kll_host(sid: u64) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Kll { k: 200 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: "http_latency".into(),
             group_by_keys: ["host".to_string()].into_iter().collect(),
@@ -6144,15 +6065,3 @@ mod tests {
         assert_eq!(idx.series.len(), 2);
     }
 }
-
-// 2026-05 reorg: generic epoch-partitioned columnar storage lives
-// alongside the store that uses it.
-mod admission;
-mod maintenance;
-pub(crate) use maintenance::{CompleteRawMaintenanceCohort, FrozenExactWindows};
-pub mod epoch_columnar;
-
-// `persistence` moved up to `sketch_db::persistence`. Re-exported here
-// so legacy `crate::storage_engines::sketch_db::index::persistence::*`
-// paths continue working without consumer changes.
-pub use crate::storage_engines::sketch_db::persistence;

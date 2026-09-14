@@ -18,7 +18,7 @@
 //! carry the same key or registrations are rejected as unconfigured. Empty
 //! (default) = ungrouped.
 
-use data_plane::monitor::{MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
+use data_plane::update_sampling::{MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
 
 /// The edge_id the Go e2edriver connects as (asap-precompute-go/monitor/
 /// grpcclient/cmd/e2edriver/main.go: `monitor.NewEngine("e2e-edge", ...)`).

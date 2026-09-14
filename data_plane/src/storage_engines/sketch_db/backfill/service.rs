@@ -58,7 +58,7 @@ use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
 use crate::storage_engines::sketch_db::backfill::{
     BackfillRegistry, BackfillSource, BackfillStatus,
 };
-use crate::storage_engines::types::HotReloadStreamingConfig;
+use crate::storage_engines::types::StreamingConfigHandle;
 
 /// Given a `BackfillSource`, return a reader that can read raw
 /// samples from it. Used by the service to pick a concrete reader
@@ -98,13 +98,12 @@ impl Default for BackfillServiceConfig {
 /// the loop gracefully.
 pub struct BackfillService {
     registry: Arc<BackfillRegistry>,
-    /// Phase 5 M2.3.6g — replayed batches land in `SketchStore` only;
-    /// the legacy `Arc<dyn Store>` field is gone.
-    sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
+    /// Destination for rebuilt windows.
+    summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Shared sid mint authority — wired alongside `sketch_index` so
     /// backfilled precompute sids share the namespace with live ingest.
     series_resolver: Option<Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>>,
-    config_source: HotReloadStreamingConfig,
+    config_source: StreamingConfigHandle,
     reader_factory: ReaderFactory,
     service_config: BackfillServiceConfig,
 }
@@ -112,13 +111,13 @@ pub struct BackfillService {
 impl BackfillService {
     pub fn new(
         registry: Arc<BackfillRegistry>,
-        config_source: HotReloadStreamingConfig,
+        config_source: StreamingConfigHandle,
         reader_factory: ReaderFactory,
         service_config: BackfillServiceConfig,
     ) -> Self {
         Self {
             registry,
-            sketch_index: None,
+            summary_store: None,
             series_resolver: None,
             config_source,
             reader_factory,
@@ -130,9 +129,9 @@ impl BackfillService {
     /// there. Builder-style; safe to omit (legacy tests).
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
-        self.sketch_index = Some(sketch_index);
+        self.summary_store = Some(summary_store);
         self
     }
 
@@ -246,7 +245,7 @@ impl BackfillService {
                 self.registry.clone(),
                 job.job_id,
             );
-            if let Some(idx) = self.sketch_index.as_ref() {
+            if let Some(idx) = self.summary_store.as_ref() {
                 processor = processor.with_sketch_index(idx.clone());
             }
             if let Some(resolver) = self.series_resolver.as_ref() {
@@ -318,16 +317,9 @@ pub fn noop_reader_factory() -> ReaderFactory {
     })
 }
 
-/// Production-ready `ReaderFactory` covering the source variants
-/// whose readers ship in-tree as of Phase 5h:
-///
-/// * [`BackfillSource::Prometheus`] — routed to
-///   [`super::prometheus_reader::PrometheusReader`].
-///
-/// Other variants return a clear
-/// "not yet implemented" error, which the worker surfaces on
-/// `BackfillJob::error_message` so the control plane / operator sees
-/// exactly which reader is missing.
+/// Default reader factory for Prometheus sources. ClickHouse requires a
+/// deployment reader factory; unsupported sources fail with an error visible
+/// on the backfill job.
 pub fn default_reader_factory() -> ReaderFactory {
     Arc::new(|source, _materialization| match source {
         BackfillSource::Prometheus { url } => {
@@ -413,7 +405,7 @@ mod tests {
         let mut cfg = sum_config(1, "latency");
         cfg.table_name = Some("expected_table".into());
         let agg_fp = cfg.policy_fp_u64();
-        let hot = HotReloadStreamingConfig::from_arc(streaming_with(cfg));
+        let hot = StreamingConfigHandle::from_arc(streaming_with(cfg));
         let registry = Arc::new(BackfillRegistry::new());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let called = calls.clone();
@@ -449,7 +441,7 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         // Factory returns a fresh mock reader per call — seeded with a
@@ -496,7 +488,7 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         let service = BackfillService::new(
@@ -530,7 +522,7 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         // Factory records the order in which it's invoked.
@@ -592,7 +584,7 @@ mod tests {
     async fn service_shutdown_stops_the_loop() {
         let cfg = sum_config(1, "m");
         let streaming = streaming_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         let service = BackfillService::new(

@@ -892,6 +892,7 @@ impl AccumulatorUpdater for HydraKllAccumulatorUpdater {
 // Config helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// Return `true` if `config` produces a keyed (MultipleSubpopulation) updater,
 /// without allocating an updater object.
 ///
@@ -914,17 +915,10 @@ pub fn config_is_keyed(config: &AggregationConfig) -> bool {
     )
 }
 
-/// Top-k ranking quantity for the `*WithHeap` configs.
+/// Top-k ranking quantity, selected by `weight_mode` or its alias `topk_weight`.
 ///
-/// Selected by `parameters["weight_mode"]` (or alias `topk_weight`):
-///   * `"value"` / `"sum"` → [`TopkWeight::Value`] (Σ value per key).
-///   * `"count"` / `"frequency"` / `"freq"` → [`TopkWeight::Count`].
-///
-/// DEFAULT is `Value` (value-weighted). The heap variants previously
-/// routed to the heap-LESS `CmsAccumulatorUpdater` (top-k unanswerable —
-/// recall 0), so there is no count-weighted heap caller to regress;
-/// value-weighting is the semantics `topk(sum_by_key(value))` needs, and
-/// genuine frequency-top-k callers opt in with `weight_mode: count`.
+/// * `value` / `sum`: sum values per key (default).
+/// * `count` / `frequency` / `freq`: count occurrences per key.
 fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
     match config.sample_update_rule() {
         asap_types::SampleUpdateRule::Count => TopkWeight::Count,
@@ -1105,10 +1099,7 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
         }
 
-        // Bare CountSketch: real median-of-signed-rows estimator, via the
-        // dedicated `CountSketchAccumulatorUpdater` (previously conflated
-        // with `CmsAccumulatorUpdater`'s CMS min-math — see that struct's
-        // doc).
+        // CountSketch uses the median-of-signed-rows estimator.
         (SummaryFamilyType::Sketch(kind, _), _)
             if kind.algorithm() == &SketchAlgorithm::CountSketch =>
         {
@@ -1137,9 +1128,7 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             ))
         }
 
-        // Heap-bearing top-k variant, real CountSketch math (previously
-        // conflated with `CmsHeapAccumulatorUpdater`'s CMS-with-heap — see
-        // `CountSketchWithHeapAccumulatorUpdater`'s doc).
+        // Heap-bearing CountSketch retains CountSketch estimation semantics.
         (SummaryFamilyType::Sketch(kind, _), _)
             if kind.algorithm() == &SketchAlgorithm::CountSketchWithHeap =>
         {

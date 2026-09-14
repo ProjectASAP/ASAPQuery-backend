@@ -204,7 +204,7 @@ impl PrometheusRemoteWriteReceiver {
         let generation = self
             .inner
             .ingest
-            .physical_plan_snapshot()
+            .active_physical_plan_snapshot()
             .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
             .ok_or("finite completion requires a catalog generation")?;
         self.inner.ingest.router.drain().await?;
@@ -213,7 +213,7 @@ impl PrometheusRemoteWriteReceiver {
             if self
                 .inner
                 .ingest
-                .sketch_index
+                .summary_store
                 .seal_finite_summary_input(&generation)?
             {
                 break;
@@ -228,13 +228,13 @@ impl PrometheusRemoteWriteReceiver {
         let plan = self
             .inner
             .ingest
-            .physical_plan_snapshot()
+            .active_physical_plan_snapshot()
             .ok_or("finite maintenance requires an installed physical plan")?;
         if plan.precompute_plan.summary_catalog.as_ref() != Some(&generation) {
             return Err("finite maintenance generation changed during drain".into());
         }
         crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
-            &self.inner.ingest.sketch_index,
+            &self.inner.ingest.summary_store,
             &self.inner.ingest.series_resolver,
             &plan.precompute_plan,
         )?;
@@ -291,7 +291,7 @@ impl PrometheusRemoteWriteReceiver {
         let physical_plan = self
             .inner
             .ingest
-            .physical_plan_snapshot()
+            .active_physical_plan_snapshot()
             .ok_or(RemoteWriteError::InactivePhysicalPlan)?;
         if physical_plan.precompute_plan.envelope.plan_id == 0
             || !matches!(
@@ -452,7 +452,7 @@ impl PrometheusRemoteWriteReceiver {
                 let revision = self
                     .inner
                     .ingest
-                    .sketch_index
+                    .summary_store
                     .admit_summary_updates(&generation, coordinates)?;
                 Ok(Some(Arc::new(
                     crate::storage_engines::types::SummaryInputRevision {
@@ -660,7 +660,7 @@ fn canonicalize_labels(
 fn route_messages(
     samples: &[CanonicalSample],
     ingest: &Arc<IngestState>,
-    physical_plan: &crate::storage_engines::types::ActivePhysicalPlan,
+    physical_plan: &crate::storage_engines::types::RuntimePhysicalPlan,
 ) -> Result<Vec<WorkerMessage>, RemoteWriteError> {
     type Bucket = (
         u64,
@@ -668,14 +668,14 @@ fn route_messages(
         Arc<crate::precompute_engine::group_key::GroupKey>,
     );
     type RoutedSample = (String, i64, f64);
-    let snapshot = physical_plan.runtime_config.clone();
+    let snapshot = physical_plan.streaming_config.clone();
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
-        ingest.sketch_index.as_ref(),
+        ingest.summary_store.as_ref(),
         &snapshot,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
     let configs = snapshot
-        .get_all_aggregation_configs()
+        .materializations()
         .values()
         .filter(|config| config.derived_input.is_none())
         .filter_map(|config| {
@@ -769,11 +769,11 @@ fn route_messages(
             let sid = ingest
                 .series_resolver
                 .resolve_with_reactivation(&config.metric, attrs_fp, &materialization_kind, |sid| {
-                    ingest.sketch_index.validate_routed_catalog_generation(
+                    ingest.summary_store.validate_routed_catalog_generation(
                         physical_plan.precompute_plan.summary_catalog.as_ref(),
                     )?;
                     let activation = ingest
-                        .sketch_index
+                        .summary_store
                         .authorize_series_reactivation(sid, policy_fp.into())?;
                     if let Some(generation) = &activation {
                         if physical_plan.precompute_plan.summary_catalog.as_ref()
@@ -930,8 +930,8 @@ mod tests {
     use crate::precompute_engine::ingest_handler::IngestObservability;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::types::{
-        ActivePhysicalPlan, BackendStorageRouting, HotReloadActivePhysicalPlan,
-        HotReloadStreamingConfig, StreamingConfig,
+        ActivePhysicalPlanHandle, BackendStorageRouting, RuntimePhysicalPlan, StreamingConfig,
+        StreamingConfigHandle,
     };
     use tokio::sync::mpsc;
 
@@ -941,7 +941,7 @@ mod tests {
             .unwrap()
     }
 
-    fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
+    fn physical_config(streaming: StreamingConfig) -> StreamingConfigHandle {
         use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
             IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
@@ -958,7 +958,7 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         let configs = streaming
-            .aggregation_configs
+            .materializations_by_policy_fingerprint
             .values()
             .cloned()
             .collect::<Vec<_>>();
@@ -973,7 +973,7 @@ mod tests {
             plan_version: reference.plan_version,
             snapshot_sha256: reference.snapshot_sha256,
         };
-        let active = ActivePhysicalPlan {
+        let active = RuntimePhysicalPlan {
             envelope: envelope.clone(),
             summary_catalog: Some(catalog),
             precompute_plan: PrecomputePlan {
@@ -990,7 +990,11 @@ mod tests {
                 schemas: Vec::new(),
                 producers: Vec::new(),
                 executable_dags: Default::default(),
-                materializations: streaming.aggregation_configs.values().cloned().collect(),
+                materializations: streaming
+                    .materializations_by_policy_fingerprint
+                    .values()
+                    .cloned()
+                    .collect(),
             },
             transmission_plan: TransmissionPlan {
                 summary_catalog: None,
@@ -1003,11 +1007,11 @@ mod tests {
                 },
                 rules: Vec::new(),
             },
-            runtime_config: Arc::new(streaming),
+            streaming_config: Arc::new(streaming),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
-        HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))
+        StreamingConfigHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(active))
     }
 
     fn receiver(config: PrometheusRemoteWriteConfig) -> PrometheusRemoteWriteReceiver {
@@ -1020,7 +1024,7 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            summary_store: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
         PrometheusRemoteWriteReceiver::new(config, ingest)
@@ -1066,14 +1070,14 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            summary_store: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
         ingest
-            .sketch_index
+            .summary_store
             .install_summary_catalog(
                 ingest
-                    .physical_plan_snapshot()
+                    .active_physical_plan_snapshot()
                     .unwrap()
                     .summary_catalog
                     .as_ref()
@@ -1090,7 +1094,7 @@ mod tests {
     #[test]
     fn canonical_routing_preserves_group_labels_without_series_text_roundtrip() {
         let (base, _worker) = configured_receiver();
-        let snapshot = base.inner.ingest.physical_plan_snapshot().unwrap();
+        let snapshot = base.inner.ingest.active_physical_plan_snapshot().unwrap();
         let mut config = snapshot.precompute_plan.materializations[0].clone();
         config.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
         config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
@@ -1098,7 +1102,7 @@ mod tests {
             config.policy_fp_u64(),
             config.clone(),
         )])));
-        let physical = hot.physical_plan_snapshot().unwrap();
+        let physical = hot.active_physical_plan_snapshot().unwrap();
         // A direct routing fixture; public installation remains intentionally gated.
         let (sender, _worker) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
@@ -1109,11 +1113,11 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            summary_store: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
         ingest
-            .sketch_index
+            .summary_store
             .install_summary_catalog(physical.summary_catalog.as_ref().unwrap().clone())
             .unwrap();
         let value = "a;z=\"x,y\\q";
@@ -1214,7 +1218,7 @@ mod tests {
             (pooled_kll_fp.0, pooled_kll),
         ]));
         let hot_reload = physical_config(streaming);
-        let physical_plan = hot_reload.physical_plan_snapshot().unwrap();
+        let physical_plan = hot_reload.active_physical_plan_snapshot().unwrap();
         let (sender, _worker) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -1224,11 +1228,11 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            summary_store: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
         ingest
-            .sketch_index
+            .summary_store
             .install_summary_catalog(physical_plan.summary_catalog.as_ref().unwrap().clone())
             .unwrap();
         let request = WriteRequest {
@@ -1373,11 +1377,11 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: HotReloadStreamingConfig::new(StreamingConfig::default()),
+            hot_reload_config: StreamingConfigHandle::new(StreamingConfig::default()),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            summary_store: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
         let receiver = PrometheusRemoteWriteReceiver::new(Default::default(), ingest);
@@ -1575,7 +1579,7 @@ mod tests {
         let second = queued.recv().await.unwrap();
         let ingest = &receiver.inner.ingest;
         let sink = Arc::new(SketchStoreSink::new(
-            ingest.sketch_index.clone(),
+            ingest.summary_store.clone(),
             ingest.hot_reload_config.clone(),
             ingest.series_resolver.clone(),
         ));
@@ -1609,11 +1613,12 @@ mod tests {
         let policy = *ingest
             .hot_reload_config
             .snapshot()
-            .aggregation_configs
+            .materializations_by_policy_fingerprint
             .keys()
             .next()
             .unwrap();
         let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
             materialization: asap_types::PolicyFingerprint(policy).into(),
             output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
             item_labels: vec![],
@@ -1622,7 +1627,7 @@ mod tests {
             readout_lookback_ms: None,
         };
         let context = QueryExecutionContext {
-            index: &ingest.sketch_index,
+            index: &ingest.summary_store,
             t0_ms: 0,
             t1_ms: 60_000,
             is_cumulative: true,

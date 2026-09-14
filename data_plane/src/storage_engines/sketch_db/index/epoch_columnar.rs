@@ -1,37 +1,12 @@
-//! Epoch-partitioned columnar storage — generic payload type.
+//! Epoch-partitioned columnar storage with a generic payload type.
 //!
-//! Lifted from `sketch_store::common` (legacy SketchStore index)
-//! with the payload column type made generic so the new SketchStore
-//! (Phase 5) can reuse the legacy's six storage optimizations
-//! (`INDEX_DESIGN.md`) without dragging in `Arc<dyn AggregateCore>`
-//! dynamic dispatch.
+//! Parallel window, label-id, and payload columns let range scans inspect only
+//! window metadata. Indexes store offsets rather than cloning payloads; the
+//! window index is built lazily and invalidated on insert. Monotonic ingestion
+//! skips redundant probes, and rotation preallocates epoch buffers.
 //!
-//! # Optimizations carried over from legacy
-//!
-//! | Opt | What |
-//! |-----|------|
-//! | 1 | Lazy `window_to_ids` index — built on first exact query, invalidated cheaply on insert |
-//! | 2 | Offset-based index — stores `u32` column offsets, not payload clones |
-//! | 3 | Monotonic ingest fast path — skip `HashSet` probe for consecutive same-window inserts |
-//! | 4 | Batch metadata hoisting — caller responsibility (the OTLP receive path groups DPs by sid) |
-//! | 5 | Columnar storage — three parallel arrays; range scan touches only `windows_col` |
-//! | 6 | Pre-allocated epoch buffers on rotation |
-//!
-//! # Differences from legacy
-//!
-//! - **Generic payload type**: `MutableEpoch<P>` instead of
-//!   `Vec<Arc<dyn AggregateCore>>`. The new SketchStore stores
-//!   `SketchSampleState` directly (typed bytes + encoding tag) — no
-//!   dyn dispatch, no Arc cloning, payload moves into the column.
-//! - **Series-values keyed via `LabelValuesId = u32`** (renamed from
-//!   legacy `MetricID = u32`). The intern table maps the per-series
-//!   group-by VALUES vector to a compact ID, since the SketchStore's
-//!   sid already captures the metric identity at the level above.
-//!
-//! See INDEX_DESIGN.md in `sketch_store/` for the full complexity
-//! analysis (Insert O(1), range query O(M) mutable / O(log N + k)
-//! sealed, etc.) — those bounds carry over verbatim because the
-//! algorithmic structure is unchanged.
+//! Label-value vectors are interned as `LabelValuesId`; the owning sid already
+//! identifies the metric. Callers can hoist shared metadata when batching writes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -719,28 +694,6 @@ impl<P> SealedEpoch<P> {
         }
     }
 
-    /// Count of distinct time windows in this sealed epoch — O(N)
-    /// scan (entries are sorted, so consecutive dupes are adjacent).
-    pub fn distinct_window_count(&self) -> usize {
-        let mut count = 0usize;
-        let mut last: Option<TimestampRange> = None;
-        for (w, _, _) in &self.entries {
-            if last != Some(*w) {
-                count += 1;
-                last = Some(*w);
-            }
-        }
-        count
-    }
-
-    /// Sorted-deduplicated windows. Used by the legacy SketchStore to
-    /// surface the windows that were dropped on epoch eviction.
-    pub fn unique_windows(&self) -> Vec<TimestampRange> {
-        let mut windows: Vec<TimestampRange> = self.entries.iter().map(|(w, _, _)| *w).collect();
-        windows.dedup();
-        windows
-    }
-
     /// Remove all entries whose window is in `windows`. O(N) scan;
     /// preserves sortedness since `retain` keeps relative order.
     pub fn remove_windows(&mut self, windows: &[TimestampRange]) {
@@ -842,7 +795,7 @@ pub struct SidStoreData<K: Eq + std::hash::Hash + Clone, P> {
     /// `0` means "never written" / freshly (re)hydrated. Drives idle-sid
     /// eviction: a sid with no writes for the idle threshold whose state
     /// is fully durable on disk can have this whole `SidStoreData` dropped
-    /// from memory while its queryable `SketchInstanceMetadata` is kept
+    /// from memory while its queryable `SummarySeriesMetadata` is kept
     /// (the series stays answerable from the disk tier and rehydrates on
     /// the next write). Updated under the per-sid write lock the append
     /// path already holds, so it costs nothing extra on the hot path.

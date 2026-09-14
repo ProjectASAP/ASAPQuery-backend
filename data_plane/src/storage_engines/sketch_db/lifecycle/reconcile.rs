@@ -1,35 +1,10 @@
-//! Sid-level reconcile against a fresh `StreamingConfig` snapshot —
-//! schema retirement #4.
+//! Reconcile sid lifecycle against a streaming configuration snapshot.
 //!
-//! Mirrors the "retire orphans" half of the legacy
-//! [`SchemaRegistry::reconcile`](crate::storage_engines::sketch_db::schema::SchemaRegistry::reconcile)
-//! but reads / writes the sid catalog directly. The "add new ids"
-//! half is implicit in the sid model: sids are minted lazily by the
-//! ingest path on first write (see
-//! `SketchStore::ingest_precompute_for_agg_config` and the modified-OTLP
-//! sketch path), so there is nothing to pre-register up front.
+//! Retire precompute instances whose content signature is absent from the
+//! configuration. New sids are registered lazily by ingestion.
 //!
-//! ## Signature comparison
-//!
-//! Each sid carries a content signature `(metric_name, agg_kind,
-//! group_by_keys)` derived from the agg-config + attrs at ingest time.
-//! Each agg-config in the new `StreamingConfig` likewise canonicalizes
-//! to a signature. A sid is "orphaned" when its signature does not
-//! match any agg-config in the new config — at that point ingest can
-//! no longer route to it, and it must be retired so the eviction
-//! sweep can later drop it.
-//!
-//! Sketch-typed agg-configs are not yet covered: the
-//! `AggregationConfig` shape doesn't carry a `SketchAlgorithm` /
-//! `SketchConfig` natively (control plane pushes them through a parallel
-//! capability-routing channel). For now the reconciler treats every
-//! agg-config as a precompute signature; sketch sids never compare
-//! equal so they're never retired by this path. That matches the
-//! pre-retirement behavior: `SchemaRegistry::reconcile` only retired
-//! agg_ids in its own registry, which mirrored the
-//! `StreamingConfig.aggregation_configs` map (also precompute-only).
-//! Sketch lifecycle stays driven by the control plane's eviction RPC
-//! until M3 unifies the two.
+//! Sketch sids use different signatures from the precompute configuration and
+//! are excluded from this reconciliation; their lifecycle is managed separately.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -96,7 +71,7 @@ pub fn reconcile_from_streaming_config(
     // First pass: find orphaned Active sids without cloning the
     // catalog. `reconcile_from_streaming_config` runs on every ingest
     // batch, and the old `snapshot_instances()` here deep-cloned every
-    // `SketchInstanceMetadata` (String + BTreeSet<String> + AggKind)
+    // `SummarySeriesMetadata` (String + BTreeSet<String> + AggKind)
     // on each call — the dominant ingest-path CPU cost in profiling
     // (BTreeMap/String clone + malloc churn). We only need to read each
     // instance's signature under the read lock; collect just the cheap
@@ -203,7 +178,7 @@ fn signature_from_agg_config(cfg: &AggregationConfig) -> Vec<u8> {
 
 fn build_live_signature_set(config: &StreamingConfig) -> HashSet<Vec<u8>> {
     config
-        .get_all_aggregation_configs()
+        .materializations()
         .values()
         .map(signature_from_agg_config)
         .collect()
@@ -295,7 +270,7 @@ mod tests {
     use asap_types::KeyByLabelNames;
 
     use crate::storage_engines::sketch_db::data::AggKind;
-    use crate::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
+    use crate::storage_engines::sketch_db::index::{SketchStore, SummarySeriesMetadata};
 
     fn agg_config(
         metric: &str,
@@ -326,9 +301,9 @@ mod tests {
         metric: &str,
         agg_type: AggregationType,
         group_by: Vec<&str>,
-    ) -> SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys,
@@ -432,9 +407,9 @@ mod tests {
         kind: crate::storage_engines::sketch_db::data::SketchAlgorithm,
         config: crate::storage_engines::sketch_db::data::SketchConfig,
         group_by: Vec<&str>,
-    ) -> SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys,

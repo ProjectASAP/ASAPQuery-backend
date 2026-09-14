@@ -27,7 +27,7 @@
 //! "cheap, but call at swap time not per query, if it shows up in
 //! profiles" note `StreamingConfig::policy_registry`'s own doc comment
 //! already flags — is a further, larger change (it means threading a
-//! cached derived value through `HotReloadStreamingConfig`'s swap path)
+//! cached derived value through `StreamingConfigHandle`'s swap path)
 //! and is not done by this type on its own.
 
 use std::collections::{BTreeSet, HashMap};

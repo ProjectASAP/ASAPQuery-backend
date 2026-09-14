@@ -245,14 +245,6 @@ impl OpampServer {
         }
     }
 
-    /// Broadcasts a config to every connected agent regardless of role.
-    pub async fn push_all(&self, cfg: RemoteConfig) {
-        let ids: Vec<String> = self.agents.read().await.keys().cloned().collect();
-        for id in ids {
-            self.push(&id, cfg.clone()).await;
-        }
-    }
-
     /// Broadcasts a config only to agents matching the given role.
     pub async fn push_to_role(&self, role: AgentRole, cfg: RemoteConfig) {
         let ids: Vec<String> = self
@@ -773,7 +765,7 @@ mod tests {
         assert_eq!(AgentRole::from_header("BACKEND"), AgentRole::Backend);
     }
 
-    /// Phase C: `Gateway` is a recognised role and round-trips through
+    /// `Gateway` is a recognised role and round-trips through
     /// the OpAMP `X-Agent-Role` header parser. This locks in the wire
     /// vocabulary that the typed L5 stage_split path relies on when it
     /// calls `push_to_role(AgentRole::Gateway, ...)` and expects to
@@ -793,7 +785,7 @@ mod tests {
         assert_ne!(AgentRole::Gateway, AgentRole::Backend);
     }
 
-    /// Phase C: a gateway-role client connecting via WebSocket appears
+    /// a gateway-role client connecting via WebSocket appears
     /// in `connected_agents_with_roles` tagged as `Gateway`. Together
     /// with the from_header test above this proves the role plumbs
     /// through the connect path that `push_to_role` selects on.
@@ -1026,7 +1018,7 @@ mod tests {
                 window_secs: 60,
                 abstract_window_framework:
                     planner_types::post_asap::SummaryWindowFramework::Tumbling,
-                window_implementation_id: "collector-tumbling-v1".into(),
+                window_realization_id: "collector-tumbling-v1".into(),
                 slide_secs: 60,
                 pane_origin_ms: Some(0),
                 window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },

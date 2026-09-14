@@ -1,25 +1,9 @@
-//! Count Sketch accumulator — wraps `asap_sketchlib::CountSketch`.
+//! CountSketch accumulator backed by `asap_sketchlib::CountSketch`.
 //!
-//! This is the concrete accumulator reached from the modified-OTLP
-//! `Metric.data = CountSketch{…}` hot path (PR C-CountSketch). Its
-//! inner matrix is the same shape as `CountMinSketchAccumulator`'s
-//! but with signed counts and no per-row heap tracking.
-//!
-//! Minimum viable surface:
-//!   - `AggregateCore` impl for precompute-engine worker merge
-//!   - `SerializableToSink` impl for store write-out
-//!   - `from_sketchlib_proto_bytes(buf)` — decoder for the modified
-//!     OTLP `CountSketchDataPoint.sketch` bytes (prost-encoded
-//!     `asap_sketchlib::proto::sketchlib::CountSketchState`). Mirrors
-//!     the CountMin decoder in PR B.
-//!
-//! Per-key point queries go through `query_key`/`MultipleSubpopulationAggregate`,
-//! which delegate to `asap_sketchlib::CountSketch::estimate` (the real,
-//! hash-spec-compatible median-of-signed-rows estimator) — this used to
-//! be a hand-rolled, non-compatible hash (fixed alongside the raw-metric
-//! ingest dispatch bug, see `accumulator_factory.rs`). Top-k heap
-//! tracking (a distinct capability from a bare median estimate) is a
-//! separate concern — see `count_sketch_with_heap_accumulator.rs`.
+//! Supports worker merge, persistence serialization, and modified-OTLP proto
+//! decoding. Per-key queries delegate to sketchlib's median-of-signed-rows
+//! estimator so query and ingest use the same hash specification. Top-k
+//! requires the separate heap-bearing accumulator.
 
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
@@ -379,11 +363,7 @@ mod tests {
 
     #[test]
     fn test_query_key_uses_real_sketchlib_estimator() {
-        // Regression: query_key/MultipleSubpopulationAggregate used to go
-        // through a hand-rolled DefaultHasher-based estimator that did NOT
-        // use the sketchlib hash spec (its own doc admitted this). Fixed
-        // to delegate to `asap_sketchlib::CountSketch::estimate` directly
-        // -- prove `query_key` and `.inner.estimate(..)` now agree exactly.
+        // `query_key` must match sketchlib's estimator and hash specification.
         let mut cs = CountSketchAccumulator::new(4, 1000);
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
         cs.inner.update(&key.to_semicolon_str(), 10.0);

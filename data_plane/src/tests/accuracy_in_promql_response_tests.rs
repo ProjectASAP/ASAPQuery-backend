@@ -19,7 +19,7 @@ use serde_json::Value;
 fn hll_profile() -> AccuracyProfile {
     AccuracyProfile {
         epsilon: 0.008125,
-        delta: 0.0,
+        delta: None,
         kind: AccuracyKind::RelativeCardinality,
     }
 }
@@ -39,7 +39,7 @@ fn prometheus_response_carries_accuracy_top_level_and_infos_mirror() {
     let accuracy = &json["accuracy"];
     assert!(!accuracy.is_null(), "accuracy field should be present");
     assert_eq!(accuracy["epsilon"], 0.008125);
-    assert_eq!(accuracy["delta"], 0.0);
+    assert!(accuracy["delta"].is_null());
     assert_eq!(accuracy["kind"], "relative_cardinality");
     assert!(
         accuracy
@@ -55,7 +55,7 @@ fn prometheus_response_carries_accuracy_top_level_and_infos_mirror() {
     let line = infos[0].as_str().unwrap();
     assert!(
         line.contains("ε=0.008125")
-            && line.contains("δ=0")
+            && line.contains("δ=unknown")
             && line.contains("relative_cardinality"),
         "infos summary must include ε, δ, kind: got {line}"
     );
@@ -86,7 +86,7 @@ fn prometheus_response_per_segment_contains_all_segments_with_worst_case_top() {
             range_ms: [1_000, 2_000],
             profile: AccuracyProfile {
                 epsilon: 0.01,
-                delta: 0.0,
+                delta: Some(0.0),
                 kind: AccuracyKind::RelativeQuantile,
             },
         },
@@ -95,7 +95,7 @@ fn prometheus_response_per_segment_contains_all_segments_with_worst_case_top() {
             range_ms: [2_000, 3_000],
             profile: AccuracyProfile {
                 epsilon: 0.05,
-                delta: 0.01,
+                delta: Some(0.01),
                 kind: AccuracyKind::RankQuantile,
             },
         },
@@ -104,7 +104,7 @@ fn prometheus_response_per_segment_contains_all_segments_with_worst_case_top() {
     // Worst-case envelope = (max ε=0.05, max δ=0.01, first
     // non-Exact kind wins for `kind`).
     assert_eq!(envelope.profile.epsilon, 0.05);
-    assert_eq!(envelope.profile.delta, 0.01);
+    assert_eq!(envelope.profile.delta, Some(0.01));
     assert_eq!(envelope.profile.kind, AccuracyKind::RelativeQuantile);
 
     let resp = PrometheusResponse::success(serde_json::json!({

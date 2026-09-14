@@ -34,7 +34,7 @@ def update(snapshot, measurements, sample_count):
     cpu = sum(phase(p) for p in ("install", "ingest_and_build", "residency", "retirement"))
     impl = snapshot["implementation"]
     impl["lifecycle_costs"] = costs
-    impl["implementation_cost"].update(model_version="measured-inclusive-coarse-cpu-only-v1", cpu_cost=cpu,
+    impl["window_cost_model"]["cost"].update(model_version="measured-inclusive-coarse-cpu-only-v1", cpu_cost=cpu,
         weighted_cost=cpu, peak_memory_bytes=int(max(nonnegative(r["resources"]["peak_memory_bytes"], "peak memory") for r in rows)),
         storage_bytes=int(max(nonnegative(r["resources"]["storage_bytes"], "storage") for r in rows)),
         network_bytes=0, source_scan_bytes=0)

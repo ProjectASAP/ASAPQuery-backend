@@ -37,7 +37,7 @@
 //!
 //! Every network / parse failure is mapped to a
 //! [`RawSampleReaderError`] variant. The backfill worker
-//! (Phase 5c) stringifies the error into
+//! stringifies the error into
 //! `BackfillJob::error_message` and marks the job `Failed`, so a
 //! broken Prometheus URL fails loud instead of quietly looping.
 
@@ -78,24 +78,6 @@ impl PrometheusReader {
             step: DEFAULT_STEP,
             http: reqwest::Client::new(),
         }
-    }
-
-    /// Override the evaluation step. Prometheus returns one
-    /// `(ts, value)` point every `step` within the query window,
-    /// so setting `step` below the scrape interval wastes
-    /// bandwidth and setting it above drops samples.
-    pub fn with_step(mut self, step: Duration) -> Self {
-        self.step = step;
-        self
-    }
-
-    /// Override the HTTP client timeout. Defaults to none.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        self
     }
 
     fn url(&self) -> String {
@@ -331,79 +313,6 @@ impl<'de> Deserialize<'de> for MatrixPoint {
             timestamp: ts,
             value,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[test]
-    fn build_promql_bare_metric_when_no_filters() {
-        let f = LabelFilter::for_metric("latency");
-        assert_eq!(build_promql(&f), "latency");
-    }
-
-    #[test]
-    fn build_promql_stable_ordering() {
-        let f = LabelFilter::for_metric("m")
-            .with_label("b", "2")
-            .with_label("a", "1");
-        // Sorted by key regardless of insertion order.
-        assert_eq!(build_promql(&f), r#"m{a="1",b="2"}"#);
-    }
-
-    #[test]
-    fn build_promql_escapes_quotes_and_backslashes() {
-        let f = LabelFilter::for_metric("m").with_label("k", r#"val"with\slash"#);
-        assert_eq!(build_promql(&f), r#"m{k="val\"with\\slash"}"#);
-    }
-
-    #[test]
-    fn render_series_key_uses_name_and_sorts_labels() {
-        let mut metric = HashMap::new();
-        metric.insert("__name__".to_string(), "latency".to_string());
-        metric.insert("svc".to_string(), "a".to_string());
-        metric.insert("env".to_string(), "prod".to_string());
-        assert_eq!(
-            render_series_key("fallback", &metric),
-            r#"latency{env="prod",svc="a"}"#
-        );
-    }
-
-    #[test]
-    fn render_series_key_handles_bare_metric() {
-        let mut metric = HashMap::new();
-        metric.insert("__name__".to_string(), "lone".to_string());
-        assert_eq!(render_series_key("fallback", &metric), "lone");
-    }
-
-    #[test]
-    fn render_series_key_falls_back_to_default_when_no_name() {
-        let metric: HashMap<String, String> = HashMap::new();
-        assert_eq!(render_series_key("fallback", &metric), "fallback");
-    }
-
-    #[test]
-    fn fractional_seconds_round_trip() {
-        assert_eq!(ms_to_fractional_seconds(0), "0.000");
-        assert_eq!(ms_to_fractional_seconds(1_234_567), "1234.567");
-        assert_eq!(fractional_seconds_to_ms(1.5), 1500);
-        assert_eq!(fractional_seconds_to_ms(0.0), 0);
-    }
-
-    #[tokio::test]
-    async fn read_samples_inverted_range_returns_invalid_range() {
-        let r = PrometheusReader::new("http://unused");
-        let err = r
-            .read_samples(100, 50, &LabelFilter::for_metric("m"))
-            .await
-            .unwrap_err();
-        match err {
-            RawSampleReaderError::InvalidRange { .. } => {}
-            other => panic!("expected InvalidRange, got {other}"),
-        }
     }
 }
 
@@ -686,5 +595,78 @@ mod integration_tests {
             other => panic!("expected Decode, got {other}"),
         }
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn build_promql_bare_metric_when_no_filters() {
+        let f = LabelFilter::for_metric("latency");
+        assert_eq!(build_promql(&f), "latency");
+    }
+
+    #[test]
+    fn build_promql_stable_ordering() {
+        let f = LabelFilter::for_metric("m")
+            .with_label("b", "2")
+            .with_label("a", "1");
+        // Sorted by key regardless of insertion order.
+        assert_eq!(build_promql(&f), r#"m{a="1",b="2"}"#);
+    }
+
+    #[test]
+    fn build_promql_escapes_quotes_and_backslashes() {
+        let f = LabelFilter::for_metric("m").with_label("k", r#"val"with\slash"#);
+        assert_eq!(build_promql(&f), r#"m{k="val\"with\\slash"}"#);
+    }
+
+    #[test]
+    fn render_series_key_uses_name_and_sorts_labels() {
+        let mut metric = HashMap::new();
+        metric.insert("__name__".to_string(), "latency".to_string());
+        metric.insert("svc".to_string(), "a".to_string());
+        metric.insert("env".to_string(), "prod".to_string());
+        assert_eq!(
+            render_series_key("fallback", &metric),
+            r#"latency{env="prod",svc="a"}"#
+        );
+    }
+
+    #[test]
+    fn render_series_key_handles_bare_metric() {
+        let mut metric = HashMap::new();
+        metric.insert("__name__".to_string(), "lone".to_string());
+        assert_eq!(render_series_key("fallback", &metric), "lone");
+    }
+
+    #[test]
+    fn render_series_key_falls_back_to_default_when_no_name() {
+        let metric: HashMap<String, String> = HashMap::new();
+        assert_eq!(render_series_key("fallback", &metric), "fallback");
+    }
+
+    #[test]
+    fn fractional_seconds_round_trip() {
+        assert_eq!(ms_to_fractional_seconds(0), "0.000");
+        assert_eq!(ms_to_fractional_seconds(1_234_567), "1234.567");
+        assert_eq!(fractional_seconds_to_ms(1.5), 1500);
+        assert_eq!(fractional_seconds_to_ms(0.0), 0);
+    }
+
+    #[tokio::test]
+    async fn read_samples_inverted_range_returns_invalid_range() {
+        let r = PrometheusReader::new("http://unused");
+        let err = r
+            .read_samples(100, 50, &LabelFilter::for_metric("m"))
+            .await
+            .unwrap_err();
+        match err {
+            RawSampleReaderError::InvalidRange { .. } => {}
+            other => panic!("expected InvalidRange, got {other}"),
+        }
     }
 }

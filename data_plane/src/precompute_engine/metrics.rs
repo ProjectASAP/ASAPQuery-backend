@@ -33,6 +33,7 @@ pub struct ThroughputTotals {
 }
 
 impl ThroughputTotals {
+    #[cfg(test)]
     pub fn since(self, previous: Self) -> Self {
         Self {
             accepted_samples: self
@@ -48,6 +49,7 @@ impl ThroughputTotals {
     }
 }
 
+#[cfg(test)]
 pub fn throughput_totals() -> ThroughputTotals {
     ThroughputTotals {
         accepted_samples: ACCEPTED_SAMPLES_TOTAL.get(),

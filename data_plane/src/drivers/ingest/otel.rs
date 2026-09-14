@@ -229,7 +229,7 @@ impl MetricsService for MetricsServiceImpl {
             // refresh stale entries and pick up brand-new ones from this
             // field without a separate `ResolveSeriesIDs` round-trip.
             series_assignments: outcome.series_assignments,
-            // Phase 4 — backend signals senders to evict cached sids here
+            // backend signals senders to evict cached sids here
             // when this Export carried a sid the resolver does not
             // recognize (sid-cache divergence — e.g. after a backend
             // restart without persistence, or when the sender's sid
@@ -629,10 +629,10 @@ fn resolve_bucket_sid_for_agg_config(
         &agg_kind_canonical,
         |sid| {
             ingest_state
-                .sketch_index
+                .summary_store
                 .validate_routed_catalog_generation(captured_generation)?;
             let activation = ingest_state
-                .sketch_index
+                .summary_store
                 .authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
             if activation
                 .as_deref()
@@ -656,29 +656,21 @@ async fn route_otlp_to_precompute(
 
     // Snapshot the latest agg_configs from the hot-reload handle so
     // new aggregations are visible without restart.
-    let physical_plan_snapshot = ingest_state.physical_plan_snapshot();
-    let catalog_generation = physical_plan_snapshot
+    let active_physical_plan_snapshot = ingest_state.active_physical_plan_snapshot();
+    let catalog_generation = active_physical_plan_snapshot
         .as_ref()
         .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
         .map(Arc::new);
-    let snap = physical_plan_snapshot
+    let snap = active_physical_plan_snapshot
         .as_ref()
-        .map(|plan| plan.runtime_config.clone())
+        .map(|plan| plan.streaming_config.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
-    let agg_configs = snap.get_all_aggregation_configs();
-    // Schema retirement #5 — the agg_id-keyed `SchemaRegistry` is
-    // gone; sid-level lifecycle now lives on `SketchStore`. Reconcile
-    // against the current streaming config so newly-added /
-    // newly-retired sids transition immediately. The §6.3 ingest
-    // barrier is enforced at the sid level inside
-    // `SketchStore::ingest_precompute_for_agg_config`.
-    //
-    // Gated on the config `Arc` identity: the streaming config only
-    // changes on a (rare) control-plane swap, so in steady state this
-    // collapses to a single relaxed atomic load and skips the full
-    // catalog scan — the dominant ingest-path CPU cost in profiling.
+    let agg_configs = snap.materializations();
+    // Reconcile sid lifecycle using the current streaming-config snapshot.
+    // The store enforces the write barrier for retired and expired instances.
+    // A config-Arc identity check skips catalog scans while the config is unchanged.
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
-        ingest_state.sketch_index.as_ref(),
+        ingest_state.summary_store.as_ref(),
         &snap,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
@@ -700,14 +692,8 @@ async fn route_otlp_to_precompute(
     let mut by_bucket: HashMap<u64, (BucketTuple, Vec<SampleTuple>)> = HashMap::new();
     let mut raw_matched = 0usize;
     let mut raw_unmatched = 0usize;
-    // Schema retirement #3 (plan step #3) dropped the agg_id-keyed
-    // `schemas.is_writable` ingest barrier. The §6.3 contract still
-    // holds: `SketchStore::ingest_precompute_for_agg_config` rejects
-    // writes targeting retired/expired sids at the sid-level
-    // (per-sid `is_writable`). The retained empty map below feeds
-    // `flush_barrier_drops` so the counter / log shape doesn't
-    // change for /metrics consumers; once schema/ is fully retired
-    // the counter moves to sid-level wiring.
+    // The store enforces the sid-level write barrier. This empty map preserves
+    // the barrier-log interface without duplicating that check.
     let raw_barrier_drops: HashMap<u64, u64> = HashMap::new();
 
     for point in points {
@@ -925,16 +911,16 @@ async fn route_modified_otlp_sketches_to_precompute(
     // Load the generation exactly once. Deriving both the runtime config and
     // transmission contract from this Arc prevents an activation between two
     // independent ArcSwap loads from producing a torn ingest view.
-    let physical_plan_snapshot = ingest_state.physical_plan_snapshot();
-    let snap = physical_plan_snapshot
+    let active_physical_plan_snapshot = ingest_state.active_physical_plan_snapshot();
+    let snap = active_physical_plan_snapshot
         .as_ref()
-        .map(|plan| plan.runtime_config.clone())
+        .map(|plan| plan.streaming_config.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
-    let catalog_generation = physical_plan_snapshot
+    let catalog_generation = active_physical_plan_snapshot
         .as_ref()
         .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
         .map(Arc::new);
-    let active_physical_plan = physical_plan_snapshot.filter(|plan| plan.plan_id() != 0);
+    let active_physical_plan = active_physical_plan_snapshot.filter(|plan| plan.plan_id() != 0);
     let lineage_batch_guard = active_physical_plan
         .as_ref()
         .map(|_| ingest_state.observability.frame_lineage.lock_batch());
@@ -945,13 +931,10 @@ async fn route_modified_otlp_sketches_to_precompute(
         // the batch was accepted, while a contract error applies none of it.
         preflight_summary_frames(request, ingest_state, active)?;
     }
-    let agg_configs = snap.get_all_aggregation_configs();
-    // Schema retirement #5 — agg_id-keyed registry retired; sid-level
-    // reconcile is the only path going forward. See the raw-OTLP
-    // routine above for the full rationale (incl. the config-Arc gate
-    // that skips the catalog scan when the config is unchanged).
+    let agg_configs = snap.materializations();
+    // Reconcile sid lifecycle only when the configuration snapshot changes.
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
-        ingest_state.sketch_index.as_ref(),
+        ingest_state.summary_store.as_ref(),
         &snap,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
@@ -976,7 +959,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     // Schema-keyed barrier dropped (see `raw_barrier_drops` above);
     // sid-level barrier in `SketchStore` carries §6.3 going forward.
     let barrier_drops: HashMap<u64, u64> = HashMap::new();
-    // Phase 4 — sids the receiver did not recognize this Export. Returned
+    // sids the receiver did not recognize this Export. Returned
     // to the caller so the gRPC / HTTP handler can stamp them into
     // `ExportMetricsServiceResponse.unknown_series_ids`. Senders evict
     // these sids and re-emit with attributes; backend re-resolves and
@@ -1119,7 +1102,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                 // Canonicalize the metric name once per metric: strip the
                 // agent-side sketch-family suffix (`_kll`, `_hll`, …) so
                 // the whole ingest pipeline — sid resolution, series-key
-                // snapshot cache, `SketchInstanceMetadata.metric_name`,
+                // snapshot cache, `SummarySeriesMetadata.metric_name`,
                 // `derive_sketch_policy_fp`, and the legacy precompute
                 // router match below — keys on the RAW metric name that
                 // the controller's streaming-config and the query
@@ -1238,7 +1221,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // because `fp=""` is a perfectly good mint/lookup key.
                     let resolved_sid: Option<u64> = if dp.series_id != 0 && attrs_pairs.is_empty() {
                         let sid = dp.series_id;
-                        if ingest_state.sketch_index.instance(sid).is_some() {
+                        if ingest_state.summary_store.instance(sid).is_some() {
                             Some(sid)
                         } else {
                             unknown_sids.push(sid);
@@ -1288,12 +1271,12 @@ async fn route_modified_otlp_sketches_to_precompute(
                             &agg_kind_canonical,
                             |sid| {
                                 ingest_state
-                                    .sketch_index
+                                    .summary_store
                                     .validate_routed_catalog_generation(
                                         catalog_generation.as_deref(),
                                     )?;
                                 let activation = ingest_state
-                                    .sketch_index
+                                    .summary_store
                                     .authorize_series_reactivation(sid, definition)?;
                                 if activation.as_deref().is_some_and(|generation| {
                                     Some(generation) != catalog_generation.as_deref()
@@ -1347,7 +1330,7 @@ async fn route_modified_otlp_sketches_to_precompute(
 
                     if let Some(frame) = frame_identity.as_ref() {
                         let observed_policy = ingest_state
-                            .sketch_index
+                            .summary_store
                             .instance(sid)
                             .map(|metadata| metadata.policy_fp)
                             .unwrap_or_else(|| {
@@ -1366,7 +1349,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                     }
 
-                    // Phase 5 — register a `SketchInstanceMetadata` on
+                    // register a `SummarySeriesMetadata` on
                     // first sight of `sid` and append this DP's sketch
                     // state to the per-sid columnar storage. The instance
                     // is keyed by sid, so subsequent DPs on the same sid
@@ -1376,11 +1359,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // and its key set IS the group-by KEY set.
                     {
                         use crate::storage_engines::sketch_db::index::{
-                            AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata,
+                            AccuracyBound, Capability, SketchAlgorithm, SummarySeriesMetadata,
                         };
                         use std::collections::BTreeSet;
 
-                        if ingest_state.sketch_index.instance(sid).is_none() {
+                        if ingest_state.summary_store.instance(sid).is_none() {
                             let algorithm = sketch_algorithm_for(&dp);
                             let cap = match algorithm {
                                 SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
@@ -1443,7 +1426,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             let item_label_for_sid: Option<String> = {
                                 snap.get_aggregation_config(policy_fp.as_u64())
                                     .or_else(|| {
-                                        snap.get_all_aggregation_configs()
+                                        snap.materializations()
                                             .values()
                                             .find(|c| c.metric == canonical_name)
                                     })
@@ -1452,7 +1435,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     .filter(|s| !s.is_empty())
                                     .map(|s| s.to_string())
                             };
-                            ingest_state.sketch_index.register(SketchInstanceMetadata {
+                            ingest_state.summary_store.register(SummarySeriesMetadata {
                                 sid,
                                 metric_name: canonical_name.clone(),
                                 group_by_keys,
@@ -1470,9 +1453,9 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 policy_fp,
                             });
                             if let Some(label) = &item_label_for_sid {
-                                ingest_state.sketch_index.set_item_label(sid, label);
+                                ingest_state.summary_store.set_item_label(sid, label);
                             }
-                        } else if let Some(existing) = ingest_state.sketch_index.instance(sid) {
+                        } else if let Some(existing) = ingest_state.summary_store.instance(sid) {
                             // P1-4 (a) — one-way capability UPGRADE. The sid
                             // was first registered from a non-heap frame
                             // (PROTO, a delta, or a heap-LESS MSGPACK), so it
@@ -1512,7 +1495,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 // in place (same sid → same policy/metric
                                 // index slots), so this is an atomic swap to
                                 // the stronger capability.
-                                ingest_state.sketch_index.register(upgraded);
+                                ingest_state.summary_store.register(upgraded);
                                 debug!(
                                     "OTLP sketch sid {} upgraded {:?} -> FrequencyTopk({:?}) \
                                      on heap-bearing frame (metric={}, encoding={})",
@@ -1723,7 +1706,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     == asap_types::producer_plan::SummaryFrameKind::Full
                                 {
                                     ingest_state
-                                        .sketch_index
+                                        .summary_store
                                         .clear_summary_lineage_incomplete(sid, frame);
                                 }
                             }
@@ -1743,7 +1726,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             }
                             Err(error) => {
                                 ingest_state
-                                    .sketch_index
+                                    .summary_store
                                     .mark_summary_lineage_incomplete(sid, frame);
                                 warn!(
                                     plan_id = frame.plan_id,
@@ -1775,7 +1758,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     );
                     let encoding =
                         encoding_to_handle(dp.encoding).unwrap_or(SketchEncoding::ProtoFull);
-                    if !ingest_state.sketch_index.append_sample(
+                    if !ingest_state.summary_store.append_sample(
                         sid,
                         label_values,
                         window,
@@ -2075,7 +2058,7 @@ fn derive_sketch_policy_fp(
 /// keyed on the *bare* metric `request_size_bytes`) and the query
 /// analyzer (`control_plane::asap_tier_analysis`, which lifts the bare
 /// metric name out of the PromQL selector) speak the bare name. With
-/// the suffix left on, `SketchInstanceMetadata.metric_name` is the
+/// the suffix left on, `SummarySeriesMetadata.metric_name` is the
 /// suffixed form, so `SketchIndex::instances_matching(bare, …)` and
 /// `find_matching_policies` / `find_policy_by_content` (all of which
 /// compare `metric_name` for equality) never match — every warm sketch
@@ -2228,17 +2211,17 @@ struct ModifiedOtlpSketchDp {
     time_unix_nano: u64,
     sketch: Vec<u8>,
     encoding: i32,
-    /// Phase 4 — sender-supplied series_id, 0 when unset / first emit.
+    /// sender-supplied series_id, 0 when unset / first emit.
     /// Backend's resolver mints a fresh sid when this is 0 with attrs
     /// populated; pushes the sid into `unknown_series_ids` when this is
     /// non-zero with empty attrs and the resolver doesn't recognize it.
     series_id: u64,
-    /// Phase 5 — DataPoint-level start of the sketch window. Combined
+    /// DataPoint-level start of the sketch window. Combined
     /// with `time_unix_nano` to form the `(start_ms, end_ms)` window
     /// the SketchStore's columnar storage keys on.
     start_time_unix_nano: u64,
-    /// Phase 5 — sketch-instance configuration lifted off the parent
-    /// container. Drives `SketchInstanceMetadata.sketch_config` and the
+    /// sketch-instance configuration lifted off the parent
+    /// container. Drives `SummarySeriesMetadata.sketch_config` and the
     /// derived `AccuracyBound`.
     container_config: crate::storage_engines::sketch_db::index::SketchConfig,
 }
@@ -2250,7 +2233,7 @@ struct ModifiedOtlpSketchDp {
 fn preflight_summary_frames(
     request: &ExportMetricsServiceRequest,
     ingest_state: &IngestState,
-    active: &crate::storage_engines::types::ActivePhysicalPlan,
+    active: &crate::storage_engines::types::RuntimePhysicalPlan,
 ) -> Result<(), String> {
     use asap_otel_proto::tonic::metrics::v1::metric::Data;
 
@@ -2258,7 +2241,7 @@ fn preflight_summary_frames(
         metric_name: &str,
         mut dp: ModifiedOtlpSketchDp,
         ingest_state: &IngestState,
-        active: &crate::storage_engines::types::ActivePhysicalPlan,
+        active: &crate::storage_engines::types::RuntimePhysicalPlan,
     ) -> Result<asap_types::producer_plan::SummaryFrameIdentity, String> {
         let canonical_name = canonical_sketch_metric_name(metric_name, dp.algorithm.clone());
         let frame =
@@ -2353,7 +2336,7 @@ fn preflight_summary_frames(
         // schema. Either route must agree with the declared materialization.
         let observed = if dp.series_id != 0 && dp.attrs.is_empty() {
             ingest_state
-                .sketch_index
+                .summary_store
                 .instance(dp.series_id)
                 .map(|metadata| metadata.policy_fp)
                 .ok_or_else(|| {
@@ -3249,7 +3232,7 @@ mod canonical_metric_name_tests {
     //! strip of the agent's `_<family>` suffix (ASAPCollector
     //! `asapedgeprocessor` sets `MetricSuffix: "_" + family`). Without
     //! it, warm-tier sketch queries against the raw metric name
-    //! capability-miss because `SketchInstanceMetadata.metric_name` and
+    //! capability-miss because `SummarySeriesMetadata.metric_name` and
     //! the controller's streaming-config policy `metric` never line up.
     use super::*;
 
@@ -3631,7 +3614,7 @@ mod dispatcher_tests {
     }
 }
 
-/// Phase 4 — sid-resolution gate tests. Construct an OTLP DDSketch
+/// sid-resolution gate tests. Construct an OTLP DDSketch
 /// Export with one DataPoint per scenario, run it through
 /// `route_modified_otlp_sketches_to_precompute`, and assert on the
 /// returned `unknown_series_ids` plus the SeriesIdResolver / SketchStore
@@ -3642,7 +3625,7 @@ mod sid_resolution_tests {
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::sketch_db::index::SketchStore;
-    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -3656,7 +3639,7 @@ mod sid_resolution_tests {
         let (tx, mut rx) = mpsc::channel(1024);
         let router = SeriesRouter::new(vec![tx]);
         let streaming = StreamingConfig::new(std::collections::HashMap::new());
-        let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
+        let hot_reload = StreamingConfigHandle::new(streaming.clone());
         let state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
@@ -3665,7 +3648,7 @@ mod sid_resolution_tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(SeriesIdResolver::new()),
-            sketch_index: Arc::new(SketchStore::new()),
+            summary_store: Arc::new(SketchStore::new()),
             observability: crate::precompute_engine::ingest_handler::IngestObservability::default(),
         });
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -3741,11 +3724,11 @@ mod sid_resolution_tests {
             "resolver mints a non-zero sid (zero is reserved on the wire)"
         );
         assert_eq!(
-            state.sketch_index.instance_count(),
+            state.summary_store.instance_count(),
             1,
             "SketchStore registered one instance under the resolver-minted sid"
         );
-        assert!(state.sketch_index.instance(assigned.series_id).is_some());
+        assert!(state.summary_store.instance(assigned.series_id).is_some());
 
         drop(state);
         let _ = drain.await;
@@ -3777,7 +3760,7 @@ mod sid_resolution_tests {
             outcome.series_assignments.is_empty(),
             "no assignment when attrs are missing"
         );
-        assert_eq!(state.sketch_index.instance_count(), 0);
+        assert_eq!(state.summary_store.instance_count(), 0);
 
         drop(state);
         let _ = drain.await;
@@ -3806,7 +3789,7 @@ mod sid_resolution_tests {
         .expect("seed ingest succeeds");
         let assigned_sid = seed_outcome.series_assignments[0].series_id;
         assert!(
-            state.sketch_index.instance(assigned_sid).is_some(),
+            state.summary_store.instance(assigned_sid).is_some(),
             "seed registers the resolver-minted sid"
         );
 
@@ -3846,7 +3829,7 @@ mod sid_resolution_tests {
         );
         // The assigned sid stays registered — the second DP routed to
         // it via the resolver's cache hit.
-        assert!(state.sketch_index.instance(assigned_sid).is_some());
+        assert!(state.summary_store.instance(assigned_sid).is_some());
 
         drop(state);
         let _ = drain.await;
@@ -4087,7 +4070,7 @@ mod sid_resolution_tests {
             "no fresh assignment when sender already had a valid binding"
         );
         // Both DPs landed against the same sid — no proliferation.
-        assert_eq!(state.sketch_index.instance_count(), 1);
+        assert_eq!(state.summary_store.instance_count(), 1);
 
         drop(state);
         let _ = drain.await;
@@ -4427,7 +4410,7 @@ mod sid_resolution_tests {
             .await
             .expect("ingest succeeds");
         let sid = out1.series_assignments[0].series_id;
-        let meta1 = state.sketch_index.instance(sid).expect("sid registered");
+        let meta1 = state.summary_store.instance(sid).expect("sid registered");
         assert_eq!(
             meta1.capability,
             Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
@@ -4458,7 +4441,7 @@ mod sid_resolution_tests {
             .expect("ingest succeeds");
 
         let meta2 = state
-            .sketch_index
+            .summary_store
             .instance(sid)
             .expect("sid still registered");
         assert_eq!(
@@ -4470,7 +4453,7 @@ mod sid_resolution_tests {
         );
         // Still one instance — the upgrade is an in-place overwrite, not a
         // new sid.
-        assert_eq!(state.sketch_index.instance_count(), 1);
+        assert_eq!(state.summary_store.instance_count(), 1);
 
         // ── Frame 3: a later heap-LESS frame must NOT downgrade. ──
         let plain2 = asap_sketchlib::CountMinSketch::new(ROWS as usize, COLS as usize);
@@ -4488,7 +4471,7 @@ mod sid_resolution_tests {
             .await
             .expect("ingest succeeds");
         let meta3 = state
-            .sketch_index
+            .summary_store
             .instance(sid)
             .expect("sid still registered");
         assert_eq!(
@@ -4549,11 +4532,11 @@ mod sid_resolution_tests {
             "no unknown sids — the DP was ingestable, not dropped"
         );
         assert_eq!(
-            state.sketch_index.instance_count(),
+            state.summary_store.instance_count(),
             1,
             "SketchStore registered the global-aggregation instance"
         );
-        assert!(state.sketch_index.instance(assigned.series_id).is_some());
+        assert!(state.summary_store.instance(assigned.series_id).is_some());
 
         drop(state);
         let _ = drain.await;
@@ -4574,7 +4557,7 @@ mod sid_bucketing_tests {
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
     use crate::storage_engines::sketch_db::index::SketchStore;
-    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -4694,7 +4677,7 @@ mod sid_bucketing_tests {
         let mut configs = HashMap::new();
         configs.insert(cfg.policy_fp_u64(), cfg.clone());
         let streaming = StreamingConfig::new(configs);
-        let hot_reload = HotReloadStreamingConfig::new(streaming);
+        let hot_reload = StreamingConfigHandle::new(streaming);
 
         let resolver = Arc::new(SeriesIdResolver::new());
         let state = Arc::new(IngestState {
@@ -4705,7 +4688,7 @@ mod sid_bucketing_tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: resolver.clone(),
-            sketch_index: Arc::new(SketchStore::new()),
+            summary_store: Arc::new(SketchStore::new()),
             observability: crate::precompute_engine::ingest_handler::IngestObservability::default(),
         });
 

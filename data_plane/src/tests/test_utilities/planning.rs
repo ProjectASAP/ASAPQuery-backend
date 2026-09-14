@@ -1,25 +1,28 @@
 //! Synthetic complete quotes for deployment fixtures; never used in production.
 use control_plane::physical::compiler::{
-    BackendLocalPlanningSnapshot, PhysicalCompiler, BACKEND_REVISION, PLANNER_REVISION,
+    BackendLocalPlanningInput, PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
 };
 
 pub(crate) fn quoted_snapshot(
-    mut snapshot: BackendLocalPlanningSnapshot,
+    mut snapshot: BackendLocalPlanningInput,
     metricsql: bool,
-) -> BackendLocalPlanningSnapshot {
+) -> BackendLocalPlanningInput {
     use control_plane::physical::workload_cost::{
-        manifest, with_exact_alternative, WorkloadCostEvidence, WorkloadQuote,
+        enumerate_exact_and_materialized_candidates, manifest, WorkloadCostEvidence, WorkloadQuote,
     };
-    let (request, environment) = snapshot.clone().planning_request().unwrap();
-    let quotes = with_exact_alternative(request)
+    let (request, environment) = snapshot
+        .clone()
+        .into_physical_compilation_request()
+        .unwrap();
+    let quotes = enumerate_exact_and_materialized_candidates(request)
         .unwrap()
         .into_iter()
         .enumerate()
         .filter_map(|(index, candidate)| {
             let plan = if metricsql {
-                PhysicalCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                PhysicalPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
             } else {
-                PhysicalCompiler.compile(candidate.clone(), environment.clone())
+                PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone())
             }
             .ok()?;
             let manifest = manifest(&plan, &candidate.queries).unwrap();

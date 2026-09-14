@@ -25,21 +25,21 @@
 )]
 
 pub mod drivers;
-pub mod monitor;
+pub mod update_sampling;
+
+#[deprecated(note = "Use update_sampling")]
+pub use update_sampling as monitor;
 pub mod precompute_engine;
 pub mod query_engines;
 pub mod storage_engines;
 
-#[cfg(test)]
-pub mod tests;
 pub mod utils;
 
 // Re-export commonly used types to avoid glob import conflicts
 pub use storage_engines::types::{
-    AccumulatorFactory, AggregateCore, AggregationConfig, KeyByLabelValues, Measurement,
-    MergeableAccumulator, MultipleSubpopulationAggregate, MultipleSubpopulationAggregateFactory,
-    PrecomputedOutput, SerializableToSink, SingleSubpopulationAggregate,
-    SingleSubpopulationAggregateFactory,
+    AggregateCore, AggregationConfig, KeyByLabelValues, Measurement, MergeableAccumulator,
+    MultipleSubpopulationAggregate, PrecomputedOutput, SerializableToSink,
+    SingleSubpopulationAggregate,
 };
 
 pub use precompute_engine::operators::{
@@ -62,3 +62,6 @@ pub use precompute_engine::PrecomputeEngine;
 pub use utils::read_streaming_config;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[cfg(test)]
+pub mod tests;

@@ -1,7 +1,7 @@
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::ingest_handler::IngestObservability;
 use crate::storage_engines::sketch_db::index::SketchStore;
-use crate::storage_engines::types::hot_reload_config::HotReloadStreamingConfig;
+use crate::storage_engines::types::hot_reload_config::StreamingConfigHandle;
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,13 +14,6 @@ use tracing::{debug_span, warn};
 /// count observable even before the handle is threaded through, so a
 /// /metrics scrape never silently loses policy-miss drops.
 static GLOBAL_DROPPED_POLICY_MISS: AtomicU64 = AtomicU64::new(0);
-
-/// Read the process-global output-sink policy-miss drop count. Exposed
-/// so the /metrics surface can fold it in for sinks not yet wired to an
-/// `IngestObservability`.
-pub fn global_dropped_policy_miss() -> u64 {
-    GLOBAL_DROPPED_POLICY_MISS.load(Ordering::Relaxed)
-}
 
 /// Trait for emitting completed window outputs.
 pub trait OutputSink: Send + Sync {
@@ -52,23 +45,14 @@ fn consume_in_order<T>(items: Vec<T>, mut persist: impl FnMut(&T) -> bool) -> us
     failed
 }
 
-/// Phase 5 M2.3.6 — successor to the M2.3.4 `DualWriteSink`. Writes
-/// precomputes to `SketchStore` only; the legacy `SketchStore`
-/// agg_id-keyed write path is retired.
+/// Write completed precompute windows to the sid-keyed sketch store.
 ///
-/// Reads already prefer `SketchStore` (M2.3.5b's engine cut-over),
-/// so the legacy store no longer receives traffic from either side.
-/// Once the data-plane crate's `Store` trait and `stores/sketch_db/store/*`
-/// modules are deleted (subsequent M2.3.6 sub-PRs), `SketchStore`
-/// will be renamed to `SketchStore` and this type can collapse into
-/// the previously-existing `StoreOutputSink` shape.
-///
-/// Per-batch overhead: one streaming-config snapshot read + per-row
-/// agg-id lookup and sid hash. Completed accumulators are consumed in order,
-/// so a catch-up batch releases each pane as soon as it is serialized.
+/// Read one streaming-config snapshot per batch and resolve each policy through
+/// its fingerprint. Consume accumulators in order so catch-up batches release
+/// each pane as soon as it is serialized.
 pub struct SketchStoreSink {
-    sketch_index: Arc<SketchStore>,
-    hot_reload: HotReloadStreamingConfig,
+    summary_store: Arc<SketchStore>,
+    hot_reload: StreamingConfigHandle,
     /// Single shared resolver across the ingest + precompute paths. Under
     /// the registry-allocated sid model (PR-1..3), this is the canonical
     /// mint authority — precompute sids share the same `next_sid` counter
@@ -88,18 +72,19 @@ pub struct SketchStoreSink {
 
 impl SketchStoreSink {
     pub fn new(
-        sketch_index: Arc<SketchStore>,
-        hot_reload: HotReloadStreamingConfig,
+        summary_store: Arc<SketchStore>,
+        hot_reload: StreamingConfigHandle,
         series_resolver: Arc<SeriesIdResolver>,
     ) -> Self {
         Self {
-            sketch_index,
+            summary_store,
             hot_reload,
             series_resolver,
             observability: None,
         }
     }
 
+    #[cfg(test)]
     /// CQ-6 — attach a shared `IngestObservability` so this sink's
     /// policy-miss drops increment the same counter the ingest path
     /// reports. Builder-style (returns `self`) so the `new()` signature
@@ -170,7 +155,7 @@ impl SketchStoreSink {
                             crate::precompute_engine::metrics::record_materialized_outputs(1)
                         });
                 }
-                self.sketch_index
+                self.summary_store
                     .validate_routed_catalog_generation(output.catalog_generation.as_deref())
                     .ok()?;
                 writer
@@ -178,11 +163,11 @@ impl SketchStoreSink {
                         |metric, fp, ak| {
                             resolver
                                 .resolve_with_reactivation(metric, fp, ak, |sid| {
-                                    self.sketch_index.validate_routed_catalog_generation(
+                                    self.summary_store.validate_routed_catalog_generation(
                                         output.catalog_generation.as_deref(),
                                     )?;
                                     let activation =
-                                        self.sketch_index.authorize_series_reactivation(
+                                        self.summary_store.authorize_series_reactivation(
                                             sid,
                                             output.policy_fp.into(),
                                         )?;
@@ -227,7 +212,7 @@ impl SketchStoreSink {
                 time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
                 group_values,
             };
-            if let Err(error) = self.sketch_index.publish_admitted_summary_update(
+            if let Err(error) = self.summary_store.publish_admitted_summary_update(
                 &revision.generation,
                 &coordinate,
                 revision.first_revision,
@@ -245,7 +230,7 @@ impl SketchStoreSink {
             }
             true
         } else {
-            self.sketch_index
+            self.summary_store
                 .publish_unadmitted_summary_update(persist)
                 .is_some()
         }
@@ -441,11 +426,11 @@ mod tests {
         let mut configs = HashMap::new();
         configs.insert(agg_id, cfg);
         let streaming = StreamingConfig::new(configs);
-        let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
+        let hot_reload = StreamingConfigHandle::new(streaming.clone());
 
-        let sketch_index = Arc::new(SketchStore::new());
+        let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             hot_reload,
             Arc::new(SeriesIdResolver::new()),
         );
@@ -458,16 +443,16 @@ mod tests {
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
 
         assert_eq!(
-            sketch_index.instance_count(),
+            summary_store.instance_count(),
             1,
             "SketchStore should have one precompute instance"
         );
-        let instances = sketch_index
+        let instances = summary_store
             .list_by_status(crate::storage_engines::sketch_db::lifecycle::AggStatus::Active);
         assert_eq!(instances.len(), 1);
         let meta = instances[0].clone();
         let sid = meta.sid;
-        assert_eq!(sketch_index.classify(sid), SeriesLookup::Hit);
+        assert_eq!(summary_store.classify(sid), SeriesLookup::Hit);
         assert!(
             matches!(
                 meta.agg_kind,
@@ -509,10 +494,7 @@ mod tests {
             Arc::new(SeriesIdResolver::open(temporary.path().join("resolver.wal")).unwrap());
         let sink = SketchStoreSink::new(
             store.clone(),
-            HotReloadStreamingConfig::new(StreamingConfig::new(HashMap::from([(
-                fingerprint.0,
-                cfg,
-            )]))),
+            StreamingConfigHandle::new(StreamingConfig::new(HashMap::from([(fingerprint.0, cfg)]))),
             resolver,
         );
         let original_generation = Arc::new(catalog.reference().unwrap());
@@ -592,10 +574,10 @@ mod tests {
             .insert("alpha".into(), serde_json::json!(0.01));
         let policy_fp = cfg.policy_fp_u64();
         let hot_reload =
-            HotReloadStreamingConfig::new(StreamingConfig::new(HashMap::from([(policy_fp, cfg)])));
-        let sketch_index = Arc::new(SketchStore::new());
+            StreamingConfigHandle::new(StreamingConfig::new(HashMap::from([(policy_fp, cfg)])));
+        let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             hot_reload,
             Arc::new(SeriesIdResolver::new()),
         );
@@ -608,7 +590,7 @@ mod tests {
         )])
         .expect("emit sketch");
 
-        let meta = sketch_index
+        let meta = summary_store
             .list_by_status(crate::storage_engines::sketch_db::lifecycle::AggStatus::Active)
             .into_iter()
             .next()
@@ -620,8 +602,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(sketch_index.query_range(meta.sid, 1_000, 2_000).len(), 1);
-        assert!(sketch_index
+        assert_eq!(summary_store.query_range(meta.sid, 1_000, 2_000).len(), 1);
+        assert!(summary_store
             .query_exact_agg_range(meta.sid, 1_000, 2_000)
             .is_empty());
     }
@@ -631,10 +613,10 @@ mod tests {
         // Streaming config does NOT contain agg_id=99 — the sink
         // reports a recoverable error rather than acknowledging a lost write.
         let streaming = StreamingConfig::new(HashMap::new());
-        let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
-        let sketch_index = Arc::new(SketchStore::new());
+        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             hot_reload,
             Arc::new(SeriesIdResolver::new()),
         );
@@ -643,7 +625,7 @@ mod tests {
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
         sink.emit_batch(vec![(output, acc)])
             .expect_err("unpersisted output must not be acknowledged");
-        assert_eq!(sketch_index.instance_count(), 0);
+        assert_eq!(summary_store.instance_count(), 0);
     }
 
     /// CQ-6 — a registry-miss (policy_fp not in the running streaming
@@ -652,11 +634,11 @@ mod tests {
     #[test]
     fn sink_increments_policy_miss_counter_on_registry_miss() {
         let streaming = StreamingConfig::new(HashMap::new());
-        let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
-        let sketch_index = Arc::new(SketchStore::new());
+        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let summary_store = Arc::new(SketchStore::new());
         let obs = Arc::new(IngestObservability::new());
         let sink = SketchStoreSink::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             hot_reload,
             Arc::new(SeriesIdResolver::new()),
         )
@@ -669,7 +651,7 @@ mod tests {
             .expect_err("unpersisted output must not be acknowledged");
 
         assert_eq!(
-            sketch_index.instance_count(),
+            summary_store.instance_count(),
             0,
             "no write on registry miss"
         );

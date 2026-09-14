@@ -5,7 +5,10 @@
 //! node IDs. Serving executes this graph without reconstructing Planner IR or
 //! searching for compatible materializations.
 
-pub mod logical;
+pub mod residual;
+
+#[deprecated(note = "Use query_plan::residual")]
+pub use residual as logical;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -121,6 +124,17 @@ impl QueryPlan {
                 if binding.window_ms == 0 {
                     return Err(QueryPlanError::Invalid(
                         "zero physical pane duration".into(),
+                    ));
+                }
+                if binding.full_window_slide_ms.is_some()
+                    != matches!(
+                        identity.window_layout,
+                        crate::WindowMaterializationLayout::FullWindow
+                    )
+                    || binding.full_window_slide_ms == Some(0)
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "query storage layout differs from catalog definition".into(),
                     ));
                 }
                 if binding.pane_origin_ms != identity.pane_origin_ms {
@@ -299,46 +313,6 @@ pub struct InstantExecution {
 }
 
 impl QueryPlanEntry {
-    /// Replace an explicit planner fallback cut with a typed external-exact leaf.
-    /// The control plane chooses the cut; serving only executes the published DAG.
-    pub fn bind_external_exact_leaf(
-        &mut self,
-        node_id: QueryNodeId,
-        request: ExternalExactRequest,
-    ) -> Result<(), QueryPlanError> {
-        if request.language != self.language {
-            return Err(QueryPlanError::Invalid(
-                "external exact language differs from its query plan".into(),
-            ));
-        }
-        if !request.input_contracts.is_empty() {
-            return Err(QueryPlanError::Invalid(
-                "leaf binding cannot declare DAG input contracts".into(),
-            ));
-        }
-        match self.nodes.get(&node_id) {
-            Some(QueryPlanNode::ExactFallback { .. }) => {}
-            Some(_) => {
-                return Err(QueryPlanError::Invalid(
-                    "external exact binding must replace a planner fallback cut".into(),
-                ))
-            }
-            None => {
-                return Err(QueryPlanError::Invalid(
-                    "external exact cut node is absent".into(),
-                ))
-            }
-        }
-        self.nodes.insert(
-            node_id,
-            QueryPlanNode::ExternalExact {
-                request,
-                inputs: Vec::new(),
-            },
-        );
-        Ok(())
-    }
-
     /// Materializations this executable DAG reads, in stable node order.
     /// Serving uses this set for readiness accounting; it never performs a
     /// catalog candidate search to reconstruct dependencies.
@@ -464,6 +438,10 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
+    /// Complete-window storage advances independently of its stored extent.
+    /// None denotes disjoint pane storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_window_slide_ms: Option<u64>,
     pub materialization: SummaryDefinitionId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
@@ -482,6 +460,33 @@ pub struct MaterializationBinding {
     /// Semantic query lookback, independent of the physical pane duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readout_lookback_ms: Option<u64>,
+}
+
+impl MaterializationBinding {
+    /// Both range boundaries must identify complete stored state. Full windows
+    /// use a start grid; their end grid is displaced by the window width.
+    pub fn covers_range(&self, start_ms: u64, end_ms: u64) -> bool {
+        let Some(origin) = self.pane_origin_ms else {
+            return false;
+        };
+        if self.window_ms == 0 || end_ms <= start_ms {
+            return false;
+        }
+        let start = i128::from(start_ms) - i128::from(origin);
+        match self.full_window_slide_ms {
+            Some(slide) => {
+                slide != 0
+                    && end_ms - start_ms == self.window_ms
+                    && start.rem_euclid(i128::from(slide)) == 0
+            }
+            None => {
+                start.rem_euclid(i128::from(self.window_ms)) == 0
+                    && (i128::from(end_ms) - i128::from(origin))
+                        .rem_euclid(i128::from(self.window_ms))
+                        == 0
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -551,7 +556,7 @@ pub enum QueryPlanNode {
         output_schema: planner_types::post_asap::SummarySchema,
     },
     Logical {
-        operator: logical::LogicalOperator,
+        operator: residual::ResidualQueryOperator,
         inputs: Vec<QueryNodeId>,
     },
     Scalar {
@@ -585,7 +590,7 @@ pub enum QueryPlanNode {
     CandidateTopK {
         inputs: [QueryNodeId; 2],
         k: u64,
-        grouping: logical::Grouping,
+        grouping: residual::Grouping,
         completeness: CandidateCompleteness,
     },
     /// An exact subtree evaluated outside ASAP. Its results enter the query DAG

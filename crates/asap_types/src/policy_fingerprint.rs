@@ -64,13 +64,8 @@ use crate::aggregation_config::AggregationConfig;
 pub struct PolicyFingerprint(pub u64);
 
 impl PolicyFingerprint {
-    /// Sentinel "unset / legacy" fingerprint produced by
-    /// `PolicyFingerprint::default()`. PR 5 retired the
-    /// `aggregation_id` field on `AggregationConfig`, so there's no
-    /// legacy id to fall back to anymore — production sinks now treat
-    /// `UNSET` as a control-plane bug worth surfacing. Callers should
-    /// always populate `policy_fp` via [`Self::from_config`] at
-    /// construction.
+    /// Unset sentinel returned by `Default`. Sinks cannot resolve an unset policy;
+    /// construct valid fingerprints with [`Self::from_config`].
     pub const UNSET: PolicyFingerprint = PolicyFingerprint(0);
 
     /// True when this fingerprint is the [`Self::UNSET`] sentinel.

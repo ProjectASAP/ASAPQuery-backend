@@ -1,37 +1,9 @@
-//! `ControlPlaneCostModel` — plugs control_plane's own sketch-family
-//! selection + parameter-sizing policy into
-//! `asap_aware_mapping::bind::implement_tree_in_with` via the two `CostModel`
-//! extension points (`rank_candidates` for family choice, `size_params`
-//! for parameter sizing — the latter added by ASAPController PR #146
-//! specifically to support this migration).
+//! Deployment family selection and parameter sizing for ASAPPlanner binding.
 //!
-//! Ports the decisions previously made by the `bind_kll_quantile` /
-//! `bind_ddsketch_quantile` / `bind_hll_cardinality` / `bind_cms_count` /
-//! `bind_cms_topk` `Rule`s verbatim — same accuracy-bound citations, same
-//! priority order, same recall-tier logic — just re-homed behind the
-//! `CostModel` trait instead of a bespoke `Rule` dispatcher, so the L3→L4
-//! walk itself (schema derivation, `col`/`by` computation, DAG
-//! construction) can be `asap_aware_mapping::bind`'s rather than a forked copy.
-//!
-//! `AggIntent::Extension` (control_plane's `Frequency` point-query) used
-//! to be one of two shapes `implement_tree_in_with` couldn't realize even
-//! with this `CostModel` plugged in — `boundary::implementation_for_with`
-//! now consults [`ControlPlaneCostModel::realize_extension`]/
-//! [`readout_extension`](CostModel::readout_extension) for it instead of
-//! hardcoding `PassThrough` (ASAPController#150).
-//!
-//! One shape remains genuinely unreachable via this `CostModel`, because
-//! the decision of *whether* to call into `rank_candidates`/`size_params`
-//! at all is made upstream, before the `CostModel` is ever consulted:
-//!
-//! - `AggIntent::TopK { accuracy: AccuracyTarget::Exact, .. }` — routes to
-//!   `exact_realization`, which has no accumulator form for `TopK` and
-//!   returns `PassThrough`, so `implement_tree_in_with` falls through to
-//!   its own `Logical` fallback for this shape unchanged. There is no
-//!   local pre-pass binding it: the `BindCountSketchOnTopK` rule that
-//!   once did was deleted (see `lower.rs`'s module doc) — this is a
-//!   genuine, still-open `asap-plan` coverage gap (ASAPController#151),
-//!   not something this deployment routes around locally.
+//! `rank_candidates` chooses a family; `size_params` sets its parameters.
+//! Frequency extensions use `realize_extension` and `readout_extension`.
+//! Exact TopK falls back to logical execution upstream because it has no
+//! exact accumulator realization; these cost-model hooks cannot bind it.
 
 #![allow(dead_code)]
 
@@ -55,7 +27,7 @@ use planner_types::pre_asap::expr_ir::ColumnRef;
 use crate::physical::deployment_cost::wire::WireCostTable;
 use crate::physical::erp::{ErpParameterDecision, ErpPlanningInput};
 use crate::planner_selection::FREQUENCY_EXT_KIND;
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
 use serde::{Deserialize, Serialize};
 
@@ -327,17 +299,6 @@ impl ControlPlaneCostModel {
         self.window_framework_costs = costs
             .into_iter()
             .map(|(id, framework, cost)| (Some(id), framework, cost))
-            .collect();
-        self
-    }
-
-    pub fn with_window_framework_costs(
-        mut self,
-        costs: Vec<(SummaryWindowFramework, Cost)>,
-    ) -> Self {
-        self.window_framework_costs = costs
-            .into_iter()
-            .map(|(framework, cost)| (None, framework, cost))
             .collect();
         self
     }
@@ -849,99 +810,6 @@ impl CostModel for ForcedFamilyCostModel {
     // `ForcedFamilyCostModel`, already knowing its family pick from the
     // capability matrix) would still decline pending #150 even after
     // `ControlPlaneCostModel` itself learned to realize it.
-    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
-        self.inner.realize_extension(ext_kind, payload)
-    }
-
-    fn readout_extension(
-        &self,
-        ext_kind: &str,
-        payload: &serde_json::Value,
-        col: &ColumnRef,
-    ) -> SketchQuery {
-        self.inner.readout_extension(ext_kind, payload, col)
-    }
-}
-
-/// A `CostModel` that forces both the family AND the exact parameters
-/// for whichever intent it's asked to rank/size, falling back to an
-/// inner accuracy-driven [`ControlPlaneCostModel`] when nothing was
-/// observed for the candidates on offer.
-///
-/// This is the seam `data_plane`'s live-serving re-binding path
-/// (`post_asap_planner.rs`) needs: planning already decided a family + params
-/// for a metric (that decision is what's actually registered in the
-/// `SketchStore`), so serving-time re-parsing the same query must
-/// reproduce EXACTLY that plan, not size a fresh one from a guessed
-/// accuracy target (`ForcedFamilyCostModel` above forces the family but
-/// still re-derives params from `eps`/`delta` — the wrong tool here,
-/// since re-deriving is exactly what caused the mismatch this type
-/// exists to avoid; see `control_plane/docs/design-target-architecture.md`'s
-/// "planning vs serving" split). `observed` is `None` whenever this
-/// query's metric has no registered sid at all — `rank_candidates`/
-/// `size_params` then fall back to the accuracy-driven default, which
-/// won't match anything registered either way, so the outcome
-/// (`find_candidates` finds nothing) is unchanged.
-///
-/// **Legacy metadata fallback:**
-/// `post_asap_planner.rs` prefers reading planning's decision directly off an
-/// installed SummaryCatalog materializations (no reconstruction needed
-/// there — `Materialization.kind`/`.params` already ARE the pair
-/// `observed` needs). This type's caller
-/// (`observed_family_for_metric`, the `SketchStore`-metadata
-/// reconstruction) is the fallback for deployments without a catalog snapshot
-/// installed yet, or for metrics a partial/stale plan doesn't cover.
-pub struct ObservedFamilyCostModel {
-    inner: ControlPlaneCostModel,
-    observed: Option<(SketchAlgorithm, SketchParams)>,
-}
-
-impl ObservedFamilyCostModel {
-    pub fn new(
-        workload_accuracy: AccuracyTarget,
-        observed: Option<(SketchAlgorithm, SketchParams)>,
-    ) -> Self {
-        Self {
-            inner: ControlPlaneCostModel::new(workload_accuracy),
-            observed,
-        }
-    }
-}
-
-impl CostModel for ObservedFamilyCostModel {
-    fn rank_candidates(
-        &self,
-        intent: &AggIntent,
-        candidates: &[SketchAlgorithm],
-    ) -> Vec<SketchAlgorithm> {
-        match &self.observed {
-            Some((kind, _)) if candidates.contains(kind) => {
-                let mut ranked = self.inner.rank_candidates(intent, candidates);
-                let pos = ranked
-                    .iter()
-                    .position(|candidate| candidate == kind)
-                    .expect("observed candidate was present before ranking");
-                let observed = ranked.remove(pos);
-                ranked.insert(0, observed);
-                ranked
-            }
-            _ => self.inner.rank_candidates(intent, candidates),
-        }
-    }
-
-    fn size_params(
-        &self,
-        kind: SketchAlgorithm,
-        intent: &AggIntent,
-        eps: f64,
-        delta: f64,
-    ) -> SketchParams {
-        match &self.observed {
-            Some((okind, oparams)) if *okind == kind => oparams.clone(),
-            _ => self.inner.size_params(kind, intent, eps, delta),
-        }
-    }
-
     fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
         self.inner.realize_extension(ext_kind, payload)
     }

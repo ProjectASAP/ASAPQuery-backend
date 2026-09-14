@@ -82,19 +82,21 @@
     "evidence_observed_at_unix_ms": 9500,
     "evidence_valid_for_ms": 60000,
     "horizon_seconds": 300.0,
-    "window_implementation_id": "backend-tumbling-v1",
-    "implementation_cost": {
-      "model_version": "compat-cost-v1",
-      "workload_fingerprint": "asapquery-compatibility-demo",
-      "observed_at_unix_ms": 9500,
-      "valid_for_ms": 60000,
-      "horizon_seconds": 300.0,
-      "cpu_cost": 1.0,
-      "peak_memory_bytes": 4096,
-      "network_bytes": 0,
-      "storage_bytes": 2048,
-      "source_scan_bytes": 0,
-      "weighted_cost": 1.0
+    "window_cost_model": {
+      "implementation_id": "backend-tumbling-v1",
+      "cost": {
+        "model_version": "compat-cost-v1",
+        "workload_fingerprint": "asapquery-compatibility-demo",
+        "observed_at_unix_ms": 9500,
+        "valid_for_ms": 60000,
+        "horizon_seconds": 300.0,
+        "cpu_cost": 1.0,
+        "peak_memory_bytes": 4096,
+        "network_bytes": 0,
+        "storage_bytes": 2048,
+        "source_scan_bytes": 0,
+        "weighted_cost": 1.0
+      }
     },
     "topk_evidence": {
       "topk(1, sum_over_time(asap_demo_gauge[5s]))": {

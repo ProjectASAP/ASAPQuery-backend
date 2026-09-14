@@ -22,7 +22,7 @@
 //!
 //! Two `AggregationConfig`s that produce the same `PolicyFingerprint`
 //! ARE the same policy. The registry treats this as a *deduplication*
-//! invariant — if two distinct entries in the source `aggregation_configs`
+//! invariant — if two distinct entries in the source `materializations_by_policy_fingerprint`
 //! map produce the same fingerprint, the later one wins (last-write
 //! semantics). In practice the source should never contain duplicates;
 //! if it does, that's a control-plane bug worth surfacing in telemetry
@@ -55,6 +55,7 @@ impl PolicyRegistry {
         Self { policies }
     }
 
+    #[cfg(test)]
     /// Construct + report the count of duplicate fingerprints (entries
     /// where the source contained two configs producing the same
     /// fingerprint and the later one displaced the earlier). Zero in

@@ -67,21 +67,13 @@ pub struct EngineCapabilities {
     /// `compatible_storage_backends(...)` for an ordered list of
     /// `StorageBackend`s and looks each up via this field.
     pub storage_backend: StorageBackend,
-    /// Memory budget (in bytes) the engine is willing to buffer for
-    /// streaming-aggregate queries. Used by the cost-aware dispatcher
-    /// when several engines are eligible for the same query (today it's
-    /// purely informational; the Phase-6 cost model will consume it).
+    /// Informational memory budget for streaming aggregation. The router does
+    /// not currently use it to rank eligible engines.
     pub supports_streams_above_bytes: usize,
 }
 
-/// The Phase-5 dispatch boundary. Concrete engines implement this trait so
-/// the [`EngineRouter`] can hold them as `Arc<dyn QueryEngine>` rather
-/// than case-on-concrete.
-///
-/// `execute` takes the query as `&str` (matching `GorillaQueryEngine`'s
-/// existing surface) and returns a wire-ready [`QueryResult`]. Internal
-/// engine signatures (e.g. `ASAPQueryEngine::handle_query`'s `Option<...>`)
-/// are translated by the impl so callers can program against the trait.
+/// Dispatch interface for engines held as `Arc<dyn QueryEngine>`.
+/// Queries arrive as strings and results use the shared `QueryResult` shape.
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
     /// Answer `query` against this engine's storage tier.
@@ -753,7 +745,7 @@ mod tests {
         );
     }
 
-    /// Phase ε.2: a routing-table entry with
+    /// a routing-table entry with
     /// `metric_storage = StorageBackend::PrometheusRemote` must
     /// dispatch to the engine registered under `prometheus_remote`.
     /// Mirrors the gorilla-archive single-backend dispatch test;
@@ -785,7 +777,7 @@ mod tests {
         );
     }
 
-    /// Phase ε.2: when `ASAP_PROMETHEUS_QUERY_URL` is unset the
+    /// when `ASAP_PROMETHEUS_QUERY_URL` is unset the
     /// `prometheus_remote` engine is not registered, and a routing
     /// entry that targets it must surface a clear
     /// `NoEngineRegistered` error rather than silently falling

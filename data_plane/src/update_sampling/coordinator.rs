@@ -47,7 +47,7 @@ pub use asap_types::MonitorFunctional as Functional;
 pub struct MonitorConfig {
     pub agg_id: u64,
     pub key: Vec<u8>,
-    /// No longer consulted (alerting retired) — see the module doc comment.
+    /// Accepted for wire compatibility; unused by sampling.
     pub tau: f64,
     /// The ε-floor tolerance feeding [`epsilon_sample_floor`].
     pub epsilon: f64,
@@ -72,13 +72,8 @@ impl Default for MonitorConfig {
 /// this coordinator no longer makes alerting decisions (see module docs).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    /// Send this ONE edge its freshly-computed coordinated-sampling grant, in
-    /// direct response to its rate report. `sample_p` is the whole-sketch
-    /// ε-floor for the edge's own just-reported rate — independent of every
-    /// other edge, so (unlike the retired countdown) this never needs to
-    /// re-grant the rest of the edge set. `local_slack` is always 0: kept on
-    /// the wire message for `SlackGrant` compatibility, but carries no
-    /// meaning post-retirement — the edge no longer gates anything on it.
+    /// Grant the reporting edge its ε-floor sample probability, independently of
+    /// other edges. `local_slack` remains zero for wire compatibility.
     Grant {
         edge_id: String,
         round: u64,
@@ -121,6 +116,7 @@ impl Monitor {
     pub fn round(&self) -> u64 {
         self.round
     }
+    #[cfg(test)]
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
@@ -157,11 +153,9 @@ impl Monitor {
         false // stale epoch
     }
 
-    /// Register (or refresh) an edge for the epoch it reports as
-    /// `window_start_ms`. Adds the edge to the membership set. No grant is
-    /// returned here — an edge is safely unsampled (p=1) until its first rate
-    /// report, and unlike the retired countdown, a new registration doesn't
-    /// need to perturb any other edge's already-granted `p`.
+    /// Register or refresh an edge in its reported epoch. Registration returns no
+    /// grant: the edge remains unsampled (p=1) until its first rate report and
+    /// does not affect other edges' grants.
     pub fn on_register(
         &mut self,
         edge_id: &str,
@@ -255,9 +249,8 @@ mod tests {
 
     #[test]
     fn registration_grants_nothing() {
-        // Unlike the retired countdown, registering does not perturb any
-        // edge's grant — an edge stays unsampled (p=1, the edge-side default)
-        // until it actually reports a rate.
+        // Registration leaves grants unchanged; the new edge remains unsampled
+        // until its first rate report.
         let mut m = Monitor::new(cfg(0.05));
         let a = m.on_register("e1", 60_000, 0);
         assert!(a.is_empty());
@@ -275,9 +268,7 @@ mod tests {
 
     #[test]
     fn report_grants_only_the_reporting_edge() {
-        // Unlike the retired countdown (which re-broadcast to every edge on
-        // any report, since slack depended on the full edge set), a report
-        // now answers ONLY the reporting edge — the sampling law is per-edge.
+        // A rate report grants only the reporting edge; sampling is per-edge.
         let mut m = Monitor::new(cfg(0.05));
         m.on_register("e1", 60_000, 0);
         m.on_register("e2", 60_000, 0);
@@ -298,11 +289,8 @@ mod tests {
 
     #[test]
     fn single_edge_is_sampled_like_any_other() {
-        // The retired countdown special-cased "<2 edges ⇒ p=1" purely to keep
-        // its alert-fire safety proof correct under sampling noise. With
-        // alerting gone, a lone high-rate edge is sampled exactly like it
-        // would be in a larger edge set — the ε-floor law never depended on
-        // edge count.
+        // A lone high-rate edge is sampled by the same law as a larger edge set;
+        // the ε-floor is independent of edge count.
         let mut m = Monitor::new(cfg(0.05));
         m.on_register("e1", 60_000, 0);
         let a = m.on_report("e1", 0, 100_000.0);

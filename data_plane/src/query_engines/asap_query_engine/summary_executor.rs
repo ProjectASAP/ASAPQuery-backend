@@ -427,28 +427,19 @@ impl SummaryValue {
     }
 }
 
+#[cfg(test)]
 fn validate_binding_phase(
     binding: &asap_types::query_plan::MaterializationBinding,
     evaluation_ms: u64,
 ) -> Result<(), SummaryExecutorError> {
-    if i64::try_from(binding.window_ms).is_err() {
-        return Err(SummaryExecutorError::Unsupported(
-            "materialized pane width exceeds runtime timestamp range",
-        ));
+    let start = evaluation_ms.checked_sub(binding.readout_lookback_ms.unwrap_or(binding.window_ms));
+    if start.is_some_and(|start| binding.covers_range(start, evaluation_ms)) {
+        Ok(())
+    } else {
+        Err(SummaryExecutorError::Unsupported(
+            "query range does not match materialized window boundaries",
+        ))
     }
-    planner_types::post_asap::validate_pane_coverage(
-        &planner_types::post_asap::PanePhaseBinding {
-            pane_width_ms: binding.window_ms,
-            pane_origin_ms: binding.pane_origin_ms,
-        },
-        i64::try_from(evaluation_ms).ok(),
-        &planner_types::post_asap::BoundaryCoverage::PaneAligned,
-    )
-    .map_err(|_| {
-        SummaryExecutorError::Unsupported(
-            "query evaluation phase does not match materialized pane origin",
-        )
-    })
 }
 
 impl QueryExecutionContext<'_> {
@@ -478,7 +469,11 @@ impl QueryExecutionContext<'_> {
                 "materialization population has unpublished input",
             ));
         }
-        validate_binding_phase(binding, self.t1_ms)?;
+        if !binding.covers_range(self.t0_ms, self.t1_ms) {
+            return Err(SummaryExecutorError::Unsupported(
+                "query range does not match materialized window boundaries",
+            ));
+        }
 
         enum Candidate {
             Sketch(DeltaSketchKind),
@@ -551,7 +546,7 @@ impl QueryExecutionContext<'_> {
             matched_metadata += 1;
             match candidate {
                 Candidate::Sketch(kind) => {
-                    let Some(series) = self
+                    let Some(mut series) = self
                         .index
                         .query_range(sid, self.t0_ms, self.t1_ms)
                         .into_iter()
@@ -560,6 +555,14 @@ impl QueryExecutionContext<'_> {
                         check_panes(Vec::new())?;
                         continue;
                     };
+                    if binding.full_window_slide_ms.is_some() {
+                        // Overlap lookup also returns neighboring complete windows.
+                        // They overlap the answer and must never be merged into it.
+                        series.samples.retain(|end, _| *end == self.t1_ms as i64);
+                        if series.samples.is_empty() {
+                            return Err(SummaryExecutorError::NoCandidates);
+                        }
+                    }
                     check_panes(series.samples.keys().copied().collect())?;
                     let key = match &binding.output_grouping {
                         PhysicalGrouping::PerEntity => series.series_label_values.clone(),
@@ -602,9 +605,14 @@ impl QueryExecutionContext<'_> {
                         )),
                         _ => None,
                     } {
-                        if let Some(series) = self
-                            .index
-                            .query_rollup_range(reduction, sid, self.t0_ms, self.t1_ms)
+                        if let Some(series) = binding
+                            .full_window_slide_ms
+                            .is_none()
+                            .then(|| {
+                                self.index
+                                    .query_rollup_range(reduction, sid, self.t0_ms, self.t1_ms)
+                            })
+                            .flatten()
                         {
                             for (labels, value) in series {
                                 let key = match &binding.output_grouping {
@@ -1278,42 +1286,14 @@ fn project_group_key(
         .collect()
 }
 
-/// Group-key construction for `find_candidates`, shared by both the
-/// `Sketch` and `ExactAgg` branches -- driven directly by the post-ASAP IR's
-/// `Reduction` (ASAPController#163/#164/#165), not inferred from whether
-/// `by` happens to be empty.
+/// Construct group keys from the explicit post-ASAP reduction, for both
+/// sketches and exact accumulators.
 ///
-/// This replaces the old family-specific split (`sketch_group_key` vs.
-/// `project_group_key` used bare): before `Reduction` existed on
-/// `SummaryAgg`, an empty `by: Vec<ColumnId>` was genuinely ambiguous --
-/// it could mean either "no explicit grouping was even resolvable" (a
-/// bare per-series range function like `quantile_over_time(0.99,
-/// http_latency_ms[10s])`, where the post-ASAP plan has no reference to any
-/// label column at all) or "a real cross-series reduction with zero
-/// grouping columns" (`count(hll_metric)`, `sum(...)`-shaped). Those two
-/// cases need OPPOSITE group-key behavior and the old `by: &[ColumnId]`
-/// signature could not tell them apart -- `sketch_group_key`'s heuristic
-/// (treat empty `by` as "keep every series distinct" for the Sketch
-/// family only) fixed the first case but could not fix the second, since
-/// by the time `find_candidates` saw a bare `[]`, the distinction was
-/// already lost.
+/// * `PerEntity` preserves the full sid label map and keeps entities distinct.
+/// * `Reduce(by)` projects onto the requested keys. Empty keys produce `{}`
+///   for every candidate, merging all candidates into one group.
 ///
-/// `Reduction` restores it directly:
-/// - `PerEntity`: no grouping concept at all -- use the sid's own FULL
-///   label map, matching the legacy `sketch_reducer.rs::evaluate_core`
-///   path's behavior exactly (it passes `series_label_values` straight
-///   through, unconditionally), so distinct series always stay distinct
-///   rows. Applies uniformly to both families now (previously
-///   `ExactAgg`'s `project_group_key` had no equivalent, since `Sum`/
-///   `Increase`-shaped exact aggregations only ever reach an unqualified
-///   PromQL aggregation operator, which is never `PerEntity`).
-/// - `Reduce(by)`: a genuine reduction. Project onto `by_names` as
-///   before -- when `by_names` is empty this naturally returns the SAME
-///   `{}` key for every matching candidate, correctly merging them into
-///   one group (the fix for the `count(hll_metric)`-style case the old
-///   `by: &[ColumnId]` signature couldn't resolve). When non-empty, an
-///   explicit grouping was resolvable from the query (e.g. `quantile by
-///   (zone) (...)`), so project onto it as requested.
+/// An empty column list alone cannot distinguish these two semantics.
 fn resolve_group_key(
     reduction: &Reduction,
     by_names: &[String],
@@ -1410,7 +1390,7 @@ fn find_metric(node: &SummaryNode) -> Option<String> {
 
 /// Walk a canonical `QueryExpr` down to its first `Scan {
 /// source: Source::TimeSeries { metric }, .. }` to recover the target
-/// metric name. Shared with `post_asap_planner.rs`'s observed-family lookup
+/// metric name.
 /// (serving time must know which metric to check the `SketchStore`
 /// against BEFORE binding — see that module's docs).
 pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
@@ -1447,7 +1427,7 @@ mod tests {
     use super::*;
     use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchInstanceMetadata, SketchSampleState, SketchStore,
+        AccuracyBound, Capability, SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
     use planner_types::post_asap::{SummaryField, SummarySchema};
     use planner_types::pre_asap::{Column, DataType, Schema};
@@ -1456,6 +1436,7 @@ mod tests {
     #[test]
     fn pane_only_reads_require_the_planned_evaluation_phase() {
         let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
             item_labels: Vec::new(),
             materialization: asap_types::PolicyFingerprint(7).into(),
             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
@@ -1467,6 +1448,7 @@ mod tests {
         assert!(validate_binding_phase(&binding, 68_000).is_err());
 
         let legacy = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
             item_labels: Vec::new(),
             pane_origin_ms: None,
             ..binding
@@ -1591,9 +1573,9 @@ mod tests {
         })
     }
 
-    fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
+    fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Kll { k: 200 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
@@ -1614,9 +1596,9 @@ mod tests {
         }
     }
 
-    fn hll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn hll_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Hll { precision: 10 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1660,9 +1642,9 @@ mod tests {
         sk.to_msgpack().expect("encode HLL msgpack")
     }
 
-    fn cms_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1733,9 +1715,9 @@ mod tests {
         })
     }
 
-    fn cms_with_heap_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+    fn cms_with_heap_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
-        SketchInstanceMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
@@ -1804,8 +1786,8 @@ mod tests {
 
     // ── ExactAgg (Sum) fixtures ────────────────────────────────────────
 
-    fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
-        SketchInstanceMetadata {
+    fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
@@ -1858,6 +1840,57 @@ mod tests {
     const T0: u64 = 1_000_000;
     const T1: u64 = 2_000_000;
 
+    // Neighboring overlapping complete windows are not additional answer panes.
+    #[test]
+    fn full_window_sketch_read_excludes_neighboring_windows() {
+        use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
+        let index = SketchStore::new();
+        let fp = asap_types::PolicyFingerprint(703);
+        let mut metadata = kll_meta(1, "m", &[]);
+        metadata.policy_fp = fp;
+        index.register(metadata);
+        for (start, values) in [
+            (0, vec![1_000.0, 2_000.0, 3_000.0]),
+            (20_000, vec![10.0, 20.0, 30.0]),
+            (40_000, vec![1_000.0, 2_000.0, 3_000.0]),
+        ] {
+            index.append_sample(
+                1,
+                BTreeMap::new(),
+                (start, start + 60_000),
+                SketchSampleState {
+                    bytes: encode_kll_items_proto(200, &values),
+                    encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+                },
+            );
+        }
+        let context = QueryExecutionContext {
+            index: &index,
+            t0_ms: 20_000,
+            t1_ms: 80_000,
+            is_cumulative: true,
+            allowed_materializations: Some(BTreeSet::from([fp])),
+        };
+        let binding = MaterializationBinding {
+            full_window_slide_ms: Some(20_000),
+            materialization: fp.into(),
+            output_grouping: PhysicalGrouping::PerEntity,
+            item_labels: vec![],
+            window_ms: 60_000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: Some(60_000),
+        };
+        let states = context.read_bound_materialization(&binding).unwrap();
+        let SummaryValue::Points(points, coverage) = context
+            .readout_bound(&states[0].1, &SketchQuery::Quantile { q: 0.5 })
+            .unwrap()
+        else {
+            panic!("expected points");
+        };
+        assert_eq!(points, vec![(80_000, 20.0)]);
+        assert_eq!(coverage, Some((80_000, 80_000)));
+    }
+
     /// One installed frequency summary merges panes before all four readouts.
     #[test]
     fn bound_univmon_merges_panes_for_four_readouts() {
@@ -1905,6 +1938,7 @@ mod tests {
             allowed_materializations: Some(BTreeSet::from([fp])),
         };
         let binding = MaterializationBinding {
+            full_window_slide_ms: None,
             materialization: fp.into(),
             output_grouping: PhysicalGrouping::PerEntity,
             item_labels: vec![],

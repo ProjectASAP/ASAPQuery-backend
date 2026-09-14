@@ -147,7 +147,7 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     let Some(qs) = entry.query_string.as_ref() else {
         return AggRole::Other;
     };
-    let accuracy = crate::types_v2::accuracy_target_from_legacy_accuracy_sla(entry.accuracy_sla);
+    let accuracy = crate::types::accuracy_target_from_legacy_accuracy_sla(entry.accuracy_sla);
     let Ok(expr) = crate::query_parser::parse_query_expr_canonical(qs, accuracy) else {
         return AggRole::Other;
     };
@@ -237,7 +237,7 @@ pub struct WorkloadEntry {
     /// Optional explicit sketch family override. When set, the planner pins
     /// this family for the metric (modulo `(sketch, statistic)` validity
     /// by ASAPPlanner's legal candidate enumeration). Threaded
-    /// into `QueryWorkload::sketch_type_override` by the registry pre-pop
+    /// into `RegisteredWorkload::sketch_type_override` by the registry pre-pop
     /// path so the typed L4 binding (`bind_workload_typed`) honours it.
     ///
     /// MVP-§46 contract entries 5–8 in `deploy/configs/mvp-workload.yaml`
@@ -264,12 +264,12 @@ pub struct WorkloadEntry {
     /// http_requests_total_latency_ms[30s])` carries no `by (...)`
     /// clause, so the PromQL parser surfaces an EMPTY group_by_labels.
     /// Without a declarative field the analyzer ends up with an empty
-    /// `QueryWorkload.group_by_labels` → an empty `keep_keys` list →
+    /// `RegisteredWorkload.group_by_labels` → an empty `keep_keys` list →
     /// the agent strips ALL attrs and mints a single sid per metric
     /// (instead of one per `(metric, zone)`), defeating the streaming-
     /// config contract.
     ///
-    /// Threaded into `QueryWorkload::group_by_labels` by the registry
+    /// Threaded into `RegisteredWorkload::group_by_labels` by the registry
     /// pre-pop loop in `main`, so it merges with any `by (...)` keys
     /// the PromQL parser surfaces. Empty / missing ⇒ same behaviour as
     /// pre-B3 (no allowlist injected).
@@ -363,68 +363,12 @@ pub struct WorkloadEntry {
     /// to reach the planner with *different* flush periods — the startup path
     /// hardcoded `None`. Threaded into `QuerySpec::repeat_every` by the
     /// registry pre-pop loop in `main`, which the analyzer parses into
-    /// [`crate::types::QueryWorkload::repeat_every`].
+    /// [`crate::types::RegisteredWorkload::repeat_every`].
     ///
     /// `None` / missing ⇒ unchanged behaviour (the cost model falls back to
     /// its window-derived flush rate).
     #[serde(default)]
     pub repeat_every: Option<String>,
-}
-
-/// Build the planning [`crate::pipeline::QuerySpec`] a declarative registry
-/// entry describes.
-///
-/// **Why this exists**: the YAML → planner conversion used to be an inline
-/// struct literal, hand-copied into the controller's startup pre-population
-/// loop and into the test helpers that claim to mimic it. Every field added to
-/// [`WorkloadEntry`] then had to be re-threaded in each copy, and
-/// `repeat_every` is the field that proves the cost: the HTTP
-/// `POST /api/v1/plan` path carried the declared cadence into
-/// [`crate::types::QueryWorkload::repeat_every`] while the startup path pinned
-/// `None`, so the same declaration was costed with two different batch-mode
-/// flush periods depending on which entry point registered it.
-///
-/// Field notes preserved from the original loop:
-/// * MVP blocker B4 — `time_window` is left EMPTY when the entry carries a
-///   `query_string` so the analyzer parses the matrix-selector `[range]`
-///   instead of a hardcoded `5m` overriding what the operator wrote. Entries
-///   without a query string keep the historical `5m` default, because the
-///   parser has nothing to read and the analyzer errors out without one.
-/// * MVP blocker B3 — `grouping_labels` is threaded into `group_by_labels`.
-///   The analyzer merges it with any `by (...)` keys the PromQL parser
-///   surfaces, which `collect_metric_to_grouping_labels` drops into
-///   `EdgeStageConfig::metric_to_grouping_labels` so the agent's
-///   `keep_keys(datapoint.attributes, [...])` OTTL processor strips wire attrs
-///   down to this list BEFORE sketching.
-/// * `sketch_family_override` is threaded into `QuerySpec::sketch_type`, which
-///   populates `QueryWorkload::sketch_type_override` — what `bind_workload_typed`
-///   reads to honour the MVP §46 HLL / CountSketch / CountMinSketch pins.
-pub fn query_spec_for_entry(entry: &WorkloadEntry) -> crate::pipeline::QuerySpec {
-    crate::pipeline::QuerySpec {
-        query_string: entry.query_string.clone(),
-        metric_name: entry.metric_name.clone(),
-        label_filters: Default::default(),
-        group_by_labels: entry.grouping_labels.clone(),
-        aggregations: vec!["quantile".into()],
-        time_window: if entry.query_string.is_some() {
-            String::new()
-        } else {
-            "5m".into()
-        },
-        repeat_every: entry.repeat_every.clone(),
-        accuracy_sla: entry.accuracy_sla,
-        latency_sla: None,
-        sketch_type: entry.sketch_family_override.clone(),
-        workload: crate::types::WorkloadCharacteristics::default(),
-        // design.md alignment: defaults preserve legacy behaviour.
-        id: None,
-        language: None,
-        accuracy: None,
-        dollars: None,
-        deployment_model: None,
-        shape: crate::types_v2::QueryShape::default(),
-        data: crate::types_v2::DataShape::default(),
-    }
 }
 
 /// User-facing continuous-monitoring declaration on a [`WorkloadEntry`]. τ/ε and
@@ -615,6 +559,7 @@ impl WorkloadRegistry {
         &self.entries
     }
 
+    #[cfg(test)]
     /// Returns workload entries assigned to a given role.
     pub fn for_role(&self, role: &str) -> Vec<&WorkloadEntry> {
         self.entries
@@ -636,62 +581,6 @@ impl WorkloadRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The declared cadence is a planning cost input, so it has to survive the
-    /// YAML entry point exactly as it survives `POST /api/v1/plan`.
-    #[test]
-    fn yaml_cadence_reaches_the_planning_workload() {
-        let yaml = r#"
-- metric_name: http_requests_total
-  query_string: "sum by (zone) (rate(http_requests_total[5m]))"
-  accuracy_sla: 0.99
-  repeat_every: 30s
-- metric_name: http_errors_total
-  query_string: "sum by (zone) (rate(http_errors_total[5m]))"
-  accuracy_sla: 0.99
-"#;
-        let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(entries[0].repeat_every.as_deref(), Some("30s"));
-        assert_eq!(entries[1].repeat_every, None);
-
-        let analyzer = crate::pipeline::Analyzer::new();
-        let declared = analyzer.analyze(query_spec_for_entry(&entries[0])).unwrap();
-        assert_eq!(
-            declared.repeat_every,
-            Some(std::time::Duration::from_secs(30))
-        );
-        // An entry that declares no cadence keeps the historical `None`, so the
-        // cost model falls back to its window-derived flush rate.
-        let undeclared = analyzer.analyze(query_spec_for_entry(&entries[1])).unwrap();
-        assert_eq!(undeclared.repeat_every, None);
-    }
-
-    /// A cadence the duration parser cannot read is a declaration error, not a
-    /// silently dropped field.
-    #[test]
-    fn unparsable_cadence_fails_the_entry() {
-        let entry = WorkloadEntry {
-            metric_name: "http_requests_total".into(),
-            query_string: Some("sum(http_requests_total)".into()),
-            accuracy_sla: 0.99,
-            assign_to_role: "agent".into(),
-            sketch_family_override: None,
-            target_path: None,
-            grouping_labels: vec![],
-            sample_p: 1.0,
-            distinct_keys_per_window: None,
-            item_label: None,
-            monitor: None,
-            repeat_every: Some("every 30 seconds".into()),
-        };
-        let error = crate::pipeline::Analyzer::new()
-            .analyze(query_spec_for_entry(&entry))
-            .expect_err("unparsable cadence must not plan");
-        assert!(
-            format!("{error:#}").contains("repeat_every"),
-            "unexpected error: {error:#}"
-        );
-    }
 
     /// An unsupported key is planning input the controller cannot honour;
     /// accepting the file would report a cadence / hint that never left the YAML.
@@ -1067,16 +956,8 @@ mod tests {
 
     #[test]
     fn agg_role_classic_bucket_histogram_quantile_is_other() {
-        // L1 adoption (design-target-architecture.md Part B), accepted
-        // behavior change: the retired local parser unconditionally
-        // substituted `histogram_quantile(...)` with a sketchable
-        // `Quantile` intent. `lower_promql` instead detects the classic
-        // `_bucket` + `rate(...)` shape and produces the real,
-        // exact-only `AggIntent::HistogramQuantile`, which `capability_for`
-        // has no sketch-family mapping for (see
-        // `asap_tier_analysis::analyze_histogram_quantile_partially_answerable_via_inner_composition`).
-        // `derive_agg_role`'s wildcard arm correctly routes it to `Other`
-        // rather than misclassifying it as a sketch-routable `Quantile`.
+        // Classic `_bucket` + `rate(...)` histogram quantiles lower to the
+        // exact-only `HistogramQuantile` intent, classified here as `Other`.
         assert_eq!(
             derive_agg_role(&entry(
                 "m",

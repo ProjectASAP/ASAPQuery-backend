@@ -1,22 +1,6 @@
-//! Formerly `promql_utilities::query_logics::enums::AggregationType` — moved
-//! here as the final step of retiring the `promql_utilities` crate (see
-//! `scratchpad/artifacts/retirement-plan.html` / the earlier Stage 1-3 work
-//! that already moved `Statistic`/`KeyByLabelNames`/`QueryResultType` out of
-//! it for the same reason). By the time this moved, `promql_utilities` held
-//! nothing but this one type — `asap_types` is its real center of gravity
-//! (`compatible_agg_types`, `AggregationConfig`, `PolicyFingerprint`,
-//! `capability_matching`), and is the shared foundation both
-//! `control_plane`'s ecosystem and `data_plane` can depend on without a
-//! cycle, so there was no longer a reason for a separate crate.
-//!
-//! Note: this is representation **D** in
-//! `scratchpad/artifacts/enum-unification-plan.md` — the data-plane's own
-//! `AggregationType` + `String` sub-type + untyped params bag, conflating
-//! sketch/accumulator identity with a keyed/unkeyed axis. Step 5 of that
-//! plan introduced `AccumulatorSpec` as a typed, unconflated replacement
-//! (additive so far, not yet fully replacing this type) — this move is
-//! purely about which crate `AggregationType` lives in, not a change to
-//! its shape or semantics.
+//! Shared aggregation vocabulary for configuration and accumulator dispatch.
+//! The wire shape combines aggregation type, subtype, and parameters.
+//! `AccumulatorSpec` provides a typed representation at conversion boundaries.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -93,30 +77,6 @@ impl AggregationType {
                 | AggregationType::CountSketchWithHeap
                 | AggregationType::HydraKLL
         )
-    }
-
-    /// Returns `true` if this type needs a paired key aggregation (SetAggregator / DeltaSetAggregator).
-    pub fn is_multi_population_value_type(self) -> bool {
-        matches!(
-            self,
-            AggregationType::MultipleSum
-                | AggregationType::MultipleMin
-                | AggregationType::MultipleMax
-                | AggregationType::MultipleIncrease
-                | AggregationType::CountMinSketch
-                | AggregationType::CountMinSketchWithHeap
-                | AggregationType::CountSketch
-                | AggregationType::CountSketchWithHeap
-        )
-    }
-
-    /// Returns `true` if this is a key-tracking aggregation type.
-    /// Retained as a stable predicate for downstream callers; the
-    /// historical `SetAggregator` / `DeltaSetAggregator` set-tracking
-    /// family has been retired (no `AggregationType` is key-tracking
-    /// today).
-    pub fn is_key_agg_type(self) -> bool {
-        false
     }
 }
 

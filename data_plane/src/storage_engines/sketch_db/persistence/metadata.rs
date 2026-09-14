@@ -6,7 +6,7 @@
 //! `agg_id`), the label *values* (`KeyByLabelValues`), the
 //! `sketch_type_name`, the encoding tag, the time bounds, and the
 //! opaque sketch bytes. They do NOT carry the pieces of
-//! [`SketchInstanceMetadata`](crate::storage_engines::sketch_db::index::SketchInstanceMetadata)
+//! [`SummarySeriesMetadata`](crate::storage_engines::sketch_db::index::SummarySeriesMetadata)
 //! that the QUERY path needs to find and serve a series:
 //!
 //! * `metric_name` — the analyzer's

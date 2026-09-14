@@ -44,10 +44,6 @@
 //! - [`AggregationType`] — the agg-type enum that
 //!   `AggKind::ExactAgg` carries.
 
-// `xxhash_rust::xxh64` import retired alongside `compute_sid` (PR-4).
-// Sid minting is now registry-allocated via `SeriesIdResolver` — no
-// content-addressed hash is computed at this layer.
-
 // ── Capability re-exports ────────────────────────────────────────────────────
 //
 // Step 2a consolidated all capability state into
@@ -67,7 +63,7 @@ pub use asap_types::AggregationType;
 /// Sketch-instance configuration carried per-Metric on the OTLP wire
 /// (Phase 2 lifted these from per-DP up to the parent sketch container).
 /// Backend reads the relevant variant at ingest time and stores it in
-/// `SketchInstanceMetadata.agg_kind`.
+/// `SummarySeriesMetadata.agg_kind`.
 #[derive(Debug, Clone)]
 pub enum SketchConfig {
     UnivMon {
@@ -122,16 +118,8 @@ pub enum AggKind {
         /// the policy has no spatial filter.
         spatial_filter_canonical: String,
     },
-    /// Exact aggregation state — Sum, Count, Avg, Rate, MinMax,
-    /// SetAggregator, etc. Payload at storage layer is whatever the
-    /// per-accumulator serializer produces.
-    ///
-    /// Variant name history: previously `AggKind::Precompute` — the
-    /// rename to `ExactAgg` (PR `refactor/sid-identity-spatial-filter-and-rename`)
-    /// reflects that `precompute_engine/` is the *engine* that
-    /// produces both sketch and exact-aggregation outputs, while this
-    /// variant names what the *payload* is. The two had been
-    /// confusingly conflated.
+    /// Exact accumulator state. Payload bytes come from the corresponding
+    /// accumulator serializer.
     ExactAgg {
         agg_type: AggregationType,
         /// Stable canonical encoding of the agg's
@@ -413,16 +401,6 @@ fn sketch_config_canonical(cfg: &SketchConfig) -> String {
         SketchConfig::CountMin { rows, cols } => format!("M:{rows}:{cols}"),
     }
 }
-
-// ── sid hash ────────────────────────────────────────────────────────────────
-//
-// `compute_sid` was retired alongside `compute_sketch_sid` (PR-3) and
-// the precompute ingest migration (PR-4). All sid minting now flows
-// through `SeriesIdResolver` — one registry-allocated u64 per
-// `(metric, attrs_fingerprint, agg_kind_canonical)` triple, shared
-// across the OTel sketch ingest path and the precompute output path.
-// See `AggKind::canonical_string` for the agg-kind canonicalization
-// that replaces the byte-layout this hash used to produce.
 
 // ── Accuracy ────────────────────────────────────────────────────────────────
 

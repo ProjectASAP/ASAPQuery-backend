@@ -1,67 +1,16 @@
-//! `BackfillWindowProcessor` — the Phase 5e implementation of
-//! [`WindowProcessor`] that actually rebuilds sketches and writes
-//! them into the store.
+//! Rebuild window accumulators from a raw sample reader and write them to storage.
 //!
-//! Implements §10 (refreshable view maintenance) of the sketch DB
-//! design ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
-//! Reads raw samples from a [`RawSampleReader`] (Phase 5b), groups
-//! them by the agg's `grouping_labels` just like live ingest does,
-//! and writes per-(group, window) precomputes to the store.
+//! Backfill runs in its own worker, separate from live ingestion and active panes.
+//! It shares the pure accumulator factory with live ingest and records written
+//! windows in the backfill registry for coverage lookup.
 //!
-//! ## Separation from live ingest
+//! Jobs created through `BackfillRegistry::create_checked` end at or before the
+//! materialization's creation time, keeping replay ranges disjoint from live
+//! ingestion.
 //!
-//! The user's Phase 5e direction was: "backfill should be a wholly
-//! separate path; workers / results / data should carry distinct
-//! identification; prefer isolation even at the cost of some
-//! duplication." The code structure honours this:
-//!
-//! * **Separate worker**: processor runs inside a `BackfillWorker`
-//!   (Phase 5c), which is in turn driven by a `BackfillService`
-//!   tokio task that is NOT part of the `PrecomputeEngine`.
-//! * **Separate output path**: writes go straight to the
-//!   `Store::insert_precomputed_output_batch` call without passing
-//!   through `OutputSink`/`PrecomputeEngine`/`WindowManager`. The
-//!   live worker does the same call at the end of its chain, but
-//!   the backfill path gets there through its own code.
-//! * **Distinct identification**: after every successful batch
-//!   write the processor calls
-//!   `BackfillRegistry::record_window_written(job_id, agg_id,
-//!   window_range)`. Phase 5f's coverage tracker will consult this
-//!   list to distinguish `Backfilled { job_id }` from `Missing`
-//!   without needing a provenance field on the on-disk precompute
-//!   format.
-//! * **Shared primitives (deliberately)**: the pure
-//!   `create_accumulator_updater` factory is reused (via
-//!   [`super::backfill_window_builder::build_backfilled_accumulator`]).
-//!   See that module's doc for why.
-//!
-//! ## Time-disjoint invariant
-//!
-//! The processor never checks `is_writable(agg_id)` or locks
-//! against live writes on the same `(agg_id, window)` — the
-//! [`BackfillRegistry::create_checked`] constructor already
-//! enforces that the backfill range ends at-or-before the agg's
-//! `created_at_ms`. Live ingest owns `[created_at, ∞)`; backfill
-//! owns `[0, created_at)`. Disjoint by construction.
-//!
-//! ## Determinism (§10.5)
-//!
-//! For deployments where live ingest goes through Prometheus
-//! remote write (backend-native sketch construction), the
-//! backfilled sketch is **bit-identical** to what live would have
-//! produced from the same samples in the same order, because both
-//! paths call `create_accumulator_updater` + `update_single` /
-//! `update_keyed` in ingest order. The live-vs-backfill parity
-//! test in this file locks that invariant.
-//!
-//! For deployments where live goes through the DataCollector
-//! OTLP path (DC builds the sketch via sketchlib-go and the
-//! backend only deserialises), bit-identicalness requires the
-//! Go-side sketchlib and the Rust-side sketch-core to produce
-//! identical output for the same input. That cross-language
-//! audit is tracked as separate work; today, backfill in such
-//! deployments is "approximately equivalent within sketch error
-//! bounds ε".
+//! For backend-native construction, the same samples in the same order use the
+//! same factory and update operations as live ingest. Cross-language collector
+//! construction requires separate parity verification.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,7 +21,7 @@ use tracing::debug;
 use crate::drivers::ingest::population_attrs_fingerprint;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
+use crate::storage_engines::types::{AggregateCore, KeyByLabelValues, StreamingConfigHandle};
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
 
@@ -177,13 +126,10 @@ pub struct BackfillWindowProcessor {
     /// `StreamingConfig` at each window to find the
     /// `AggregationConfig` for `agg_id`. The snapshot is cheap
     /// (Arc refcount bump) so we don't optimise further.
-    config: HotReloadStreamingConfig,
-    /// Phase 5 M2.3.6g — replayed batches land here. The legacy
-    /// `Arc<dyn Store>` field is gone; SketchStore is the only
-    /// destination. Optional so tests that don't observe write
-    /// effects can skip attaching one (the processor becomes a
-    /// registry-only logger in that case).
-    sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
+    config: StreamingConfigHandle,
+    /// Destination for rebuilt windows. Tests may omit it to record registry
+    /// provenance without storing payloads.
+    summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Shared sid mint authority. Same `SeriesIdResolver` the OTel
     /// ingest path uses, so backfilled precompute sids land in the
     /// same unified namespace as live precompute / sketch sids. Only
@@ -202,13 +148,13 @@ pub struct BackfillWindowProcessor {
 
 impl BackfillWindowProcessor {
     pub fn new(
-        config: HotReloadStreamingConfig,
+        config: StreamingConfigHandle,
         registry: Arc<BackfillRegistry>,
         job_id: u64,
     ) -> Self {
         Self {
             config,
-            sketch_index: None,
+            summary_store: None,
             series_resolver: None,
             registry,
             job_id,
@@ -220,10 +166,10 @@ impl BackfillWindowProcessor {
     /// so existing call sites opt in with one chained call.
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
-        self.catalog_generation = sketch_index.active_catalog_generation();
-        self.sketch_index = Some(sketch_index);
+        self.catalog_generation = summary_store.active_catalog_generation();
+        self.summary_store = Some(summary_store);
         self
     }
 
@@ -303,7 +249,7 @@ impl WindowProcessor for BackfillWindowProcessor {
                     r.as_ref(),
                     &config,
                     &sample.labels,
-                    self.sketch_index.as_deref(),
+                    self.summary_store.as_deref(),
                     self.catalog_generation.as_deref(),
                 )?,
                 None => fallback_bucket_id(&group_key),
@@ -366,14 +312,9 @@ impl WindowProcessor for BackfillWindowProcessor {
             batch.push((sid, output, accumulator));
         }
 
-        // Phase 5 M2.3.6g — replayed batches land in SketchStore only.
-        // No legacy SketchStore write path remains. When no
-        // sketch_index is attached (tests), the writes are simply
-        // dropped — the registry still records the (agg_id, range)
-        // provenance below. When sketch_index is attached but no
-        // resolver was provided, the precompute write is skipped
-        // with a warn — sid minting requires the shared resolver.
-        if let Some(idx) = self.sketch_index.as_ref() {
+        // Tests without a sketch index record provenance only. Writes with an index
+        // require the shared sid resolver; otherwise log a warning and skip them.
+        if let Some(idx) = self.summary_store.as_ref() {
             match self.series_resolver.as_ref() {
                 Some(_resolver) => {
                     // B7.7 — sid is pre-resolved per bucket above; hand
@@ -471,7 +412,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -515,7 +456,7 @@ mod tests {
     async fn unknown_agg_id_fails_cleanly() {
         let cfg = sum_config(1, "m", vec![]);
         let streaming = streaming_config_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             999,
@@ -538,7 +479,7 @@ mod tests {
         let cfg = sum_config(1, "m", vec![]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -559,7 +500,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -622,25 +563,8 @@ mod tests {
         // every expected write.
     }
 
-    /// ## The parity test (§10.5 determinism invariant)
-    ///
-    /// This is the test that locks the "backfill produces the same
-    /// sketch as live" claim from the module doc. For the raw-ingest
-    /// path (sketch-core-native construction), a backfilled
-    /// accumulator MUST serialise to exactly the same bytes as a
-    /// live-built accumulator fed the same samples in the same order.
-    ///
-    /// The test builds two SumAccumulators from the same sample
-    /// sequence (one via the live path's `create_accumulator_updater`
-    /// plus `update_single`, and one via the backfill path's
-    /// `build_backfilled_accumulator`) and asserts their
-    /// `serialize_to_bytes()` outputs are byte-identical.
-    ///
-    /// A similar CMS parity test would be ideal; it's skipped here
-    /// because `CountMinSketchAccumulator::new` in sketch-core takes
-    /// more params than we exercise elsewhere and would require
-    /// deeper wiring. If Phase 5e needs stronger coverage, add a
-    /// CMS-specific parity test — it'll follow the exact same shape.
+    /// Sum accumulators built by live and backfill paths must serialize identically
+    /// when given the same ordered samples.
     #[test]
     fn backfill_builds_bit_identical_sum_accumulator_to_live() {
         use crate::precompute_engine::accumulator_factory::create_accumulator_updater;
@@ -851,7 +775,7 @@ mod tests {
     ///
     /// Drives `process_window` end-to-end with samples spanning two
     /// distinct `svc` values × two samples each. Asserts:
-    ///   - exactly two `SketchInstanceMetadata` entries land in the
+    ///   - exactly two `SummarySeriesMetadata` entries land in the
     ///     `SketchStore` (one per distinct sid bucket)
     ///   - their sids equal what the shared `SeriesIdResolver` would
     ///     mint for the same `(metric, grouping-values, agg_kind)`
@@ -868,16 +792,16 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let hot = StreamingConfigHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
-        let sketch_index = Arc::new(SketchStore::new());
+        let summary_store = Arc::new(SketchStore::new());
         let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
             1,
             1,
             &[cfg.clone()],
         )
         .unwrap();
-        sketch_index
+        summary_store
             .install_summary_catalog(Arc::new(catalog))
             .unwrap();
         let resolver = Arc::new(SeriesIdResolver::new());
@@ -890,7 +814,7 @@ mod tests {
         );
 
         let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id)
-            .with_sketch_index(sketch_index.clone())
+            .with_sketch_index(summary_store.clone())
             .with_series_resolver(resolver.clone());
 
         // Two distinct svc values × two samples each. Same window
@@ -925,7 +849,7 @@ mod tests {
 
         // Two distinct sids landed in the index.
         assert_eq!(
-            sketch_index.instance_count(),
+            summary_store.instance_count(),
             2,
             "one sid per distinct svc bucket"
         );
@@ -939,8 +863,8 @@ mod tests {
         let sid_b =
             resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}", None, None).unwrap();
         assert_ne!(sid_a, sid_b, "distinct svc values mint distinct sids");
-        assert_eq!(sketch_index.classify(sid_a), SeriesLookup::Hit);
-        assert_eq!(sketch_index.classify(sid_b), SeriesLookup::Hit);
+        assert_eq!(summary_store.classify(sid_a), SeriesLookup::Hit);
+        assert_eq!(summary_store.classify(sid_b), SeriesLookup::Hit);
 
         // Provenance was recorded once per window (not once per
         // bucket) — same shape as the pre-rekey path.

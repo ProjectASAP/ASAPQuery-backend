@@ -1,6 +1,6 @@
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, Measurement, MergeableAccumulator, SerializableToSink,
-    SingleSubpopulationAggregate, SingleSubpopulationAggregateFactory,
+    SingleSubpopulationAggregate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -485,46 +485,6 @@ impl IncreaseAccumulator {
             factor /= (range_end - range_start) as f64 / 1000.0;
         }
         Ok(self.total_increase * factor)
-    }
-}
-
-pub struct IncreaseAccumulatorFactory;
-
-impl SingleSubpopulationAggregateFactory for IncreaseAccumulatorFactory {
-    fn merge_accumulators(
-        &self,
-        accumulators: Vec<Box<dyn SingleSubpopulationAggregate>>,
-    ) -> Result<Box<dyn SingleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let mut concrete_accumulators = Vec::new();
-
-        for acc in accumulators {
-            if let Some(concrete) = acc.as_any().downcast_ref::<IncreaseAccumulator>() {
-                concrete_accumulators.push(concrete.clone());
-            } else {
-                return Err("Type mismatch in merge operation".into());
-            }
-        }
-
-        if concrete_accumulators.is_empty() {
-            return Err("No accumulators to merge".into());
-        }
-
-        let merged =
-            <IncreaseAccumulator as MergeableAccumulator<IncreaseAccumulator>>::merge_accumulators(
-                concrete_accumulators,
-            )
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{e}").into() })?;
-        Ok(Box::new(merged))
-    }
-
-    fn create_default(&self) -> Box<dyn SingleSubpopulationAggregate> {
-        Box::new(IncreaseAccumulator::new(
-            Measurement::new(0.0),
-            0,
-            Measurement::new(0.0),
-            0,
-        ))
     }
 }
 

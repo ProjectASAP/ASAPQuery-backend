@@ -1,6 +1,6 @@
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
-    SingleSubpopulationAggregate, SingleSubpopulationAggregateFactory,
+    SingleSubpopulationAggregate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -204,39 +204,6 @@ impl SingleSubpopulationAggregate for SumAccumulator {
 
     fn clone_boxed(&self) -> Box<dyn SingleSubpopulationAggregate> {
         Box::new(self.clone())
-    }
-}
-
-// Factory implementation for merging
-pub struct SumAccumulatorFactory;
-
-impl SingleSubpopulationAggregateFactory for SumAccumulatorFactory {
-    fn merge_accumulators(
-        &self,
-        accumulators: Vec<Box<dyn SingleSubpopulationAggregate>>,
-    ) -> Result<Box<dyn SingleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let mut total_sum = 0.0;
-        let mut observation_count = Some(0u64);
-
-        for acc in accumulators {
-            if acc.type_name() != "SumAccumulator" {
-                return Err("Cannot merge different accumulator types".into());
-            }
-            let sum_value = acc.query(Statistic::Sum, None)?;
-            total_sum += sum_value;
-            observation_count =
-                observation_count.and_then(|total| total.checked_add(acc.aux_stats().count?));
-        }
-
-        Ok(Box::new(SumAccumulator {
-            sum: total_sum,
-            observation_count,
-        }))
-    }
-
-    fn create_default(&self) -> Box<dyn SingleSubpopulationAggregate> {
-        Box::new(SumAccumulator::new())
     }
 }
 

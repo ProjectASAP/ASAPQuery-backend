@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(test)]
+use tracing::warn;
 
 /// Classification of an HTTP push failure used by the retry layer in
 /// [`crate::emit::backend_push`]. Transient errors are safe to retry
@@ -167,14 +169,9 @@ impl BackendClient {
         }
     }
 
-    /// Phase C (MVP v6) variant of [`Self::push_streaming_config`]
-    /// that POSTs `application/json`. The typed L5
-    /// `emit_backend_streaming_config_json` emitter produces a `serde_json::Value`
-    /// rather than a YAML document, and the ASAPQuery-backend's
-    /// `/api/v1/streaming-config` endpoint accepts both content types
-    /// (PR #297 / Phase B documents the JSON shape). Same 2xx-or-error
-    /// contract as the YAML variant; same fire-and-forget semantics
-    /// at the call site.
+    #[cfg(test)]
+    /// Post streaming configuration as `application/json`. The backend accepts
+    /// both JSON and YAML; a non-2xx response is an error for the caller to log.
     pub async fn post_streaming_config_json(&self, json: String) -> Result<()> {
         debug!(
             endpoint = %self.endpoint,
@@ -203,6 +200,7 @@ impl BackendClient {
         }
     }
 
+    #[cfg(test)]
     /// Typed sibling of [`Self::post_streaming_config_json`] for the
     /// retry layer. Returns the same `Ok(())` on 2xx, but on failure
     /// classifies the underlying cause as [`BackendPostError::Transient`]
@@ -245,57 +243,10 @@ impl BackendClient {
         }
     }
 
-    /// Typed sibling of [`Self::post_storage_routing_json`] for the
-    /// retry layer. Identical contract to
-    /// [`Self::post_streaming_config_json_typed`].
-    pub async fn post_storage_routing_json_typed(
-        &self,
-        json: String,
-    ) -> std::result::Result<(), BackendPostError> {
-        let url = derive_storage_routing_url(&self.endpoint);
-        debug!(
-            endpoint = %url,
-            json_bytes = json.len(),
-            "posting storage-routing JSON to ASAPQuery-backend (typed)"
-        );
-        let resp = self
-            .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(json)
-            .send()
-            .await
-            .map_err(classify_reqwest_error)?;
-
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(classify_http_status(
-                status,
-                body,
-                "storage-routing JSON POST",
-            ))
-        }
-    }
-
-    /// Phase α (MVP) sibling of [`Self::post_streaming_config_json`]:
-    /// POSTs the control-plane-emitted `BackendStorageRouting` JSON
-    /// document to the backend's `POST /api/v1/storage_routing`
-    /// endpoint. The backend hot-loads the routing table and the next
-    /// instant query consults the new table.
-    ///
-    /// Endpoint resolution: the field [`Self::endpoint`] is the
-    /// control plane's configured streaming-config endpoint (e.g.
-    /// `http://backend.svc:8088/api/v1/streaming-config`). We rewrite
-    /// the path component from `/api/v1/streaming-config` to
-    /// `/api/v1/storage_routing` so operators only configure one
-    /// `CONTROL_PLANE_BACKEND_ENDPOINT` env var and both pushes land
-    /// at the same backend host. URLs that don't end in
-    /// `/api/v1/streaming-config` are passed through unchanged
-    /// (a test-mode escape hatch — the unit test below builds a
-    /// mock URL ending in `/storage_routing` directly).
+    #[cfg(test)]
+    /// Post backend storage-routing JSON. Derive the URL by replacing the
+    /// `/api/v1/streaming-config` suffix with `/api/v1/storage_routing`; URLs
+    /// without that suffix are used verbatim.
     pub async fn post_storage_routing_json(&self, json: String) -> Result<()> {
         let url = derive_storage_routing_url(&self.endpoint);
         debug!(
@@ -428,6 +379,7 @@ fn derive_physical_plan_url(endpoint: &str) -> String {
 /// end with `/api/v1/streaming-config` (or `/api/v1/streaming_config` —
 /// either spelling is supported) pass through unchanged so tests can
 /// inject a mock-server URL directly.
+#[cfg(test)]
 fn derive_storage_routing_url(endpoint: &str) -> String {
     const STREAMING_PATH_DASH: &str = "/api/v1/streaming-config";
     const STREAMING_PATH_UNDERSCORE: &str = "/api/v1/streaming_config";
@@ -441,6 +393,7 @@ fn derive_storage_routing_url(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
+#[cfg(test)]
 /// Fire-and-forget convenience helper used by the replanner. Logs
 /// errors at WARN and never propagates them — the replanner should
 /// never fail an entire replan because the backend was temporarily
@@ -533,7 +486,7 @@ mod tests {
         push_or_log(&client, "cpu_usage", "content".to_string()).await;
     }
 
-    /// Phase C: the JSON variant POSTs the body verbatim, returns
+    /// the JSON variant POSTs the body verbatim, returns
     /// `Ok(())` on a 2xx, and surfaces non-2xx as `Err`. Mock backend
     /// captures the body so we can verify it round-trips.
     #[tokio::test]
@@ -553,7 +506,7 @@ mod tests {
         assert_eq!(received[0], json);
     }
 
-    /// Phase C: non-2xx from the backend surfaces as an error so the
+    /// non-2xx from the backend surfaces as an error so the
     /// caller (handle_plan) can log + move on.
     #[tokio::test]
     async fn json_post_non_2xx_is_error() {
@@ -567,7 +520,7 @@ mod tests {
         assert!(msg.contains("400"), "error msg should mention 400: {msg}");
     }
 
-    /// Phase α: storage-routing-URL derivation rewrites the path
+    /// storage-routing-URL derivation rewrites the path
     /// component when the configured endpoint ends in
     /// `/api/v1/streaming-config`, leaving everything else untouched.
     #[test]
@@ -596,16 +549,18 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_publication_posts_canonical_document_without_legacy_bytes() {
-        let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
-            serde_json::from_str(include_str!(
-                "../../docs/examples/asapquery-planning-snapshot.json"
-            ))
-            .unwrap();
-        let publication = crate::physical::compiler::tests::quoted_snapshot(snapshot, false)
-            .compile()
-            .unwrap()
-            .publication()
-            .unwrap();
+        let snapshot: crate::physical::compiler::BackendLocalPlanningInput = serde_json::from_str(
+            include_str!("../../docs/examples/asapquery-planning-snapshot.json"),
+        )
+        .unwrap();
+        let publication = crate::physical::compiler::tests::quoted_snapshot(
+            snapshot,
+            crate::physical::compiler::QueryFrontend::PromQl,
+        )
+        .compile_promql()
+        .unwrap()
+        .to_publication_artifact()
+        .unwrap();
         let hits: StdArc<Mutex<Vec<serde_json::Value>>> = StdArc::new(Mutex::new(Vec::new()));
         let route_hits = hits.clone();
         let app = Router::new().route(
@@ -648,7 +603,7 @@ mod tests {
         server.abort();
     }
 
-    /// Phase α: full happy path. A mock backend hosts the storage
+    /// full happy path. A mock backend hosts the storage
     /// routing endpoint; the client POSTs the control-plane-emitted JSON
     /// and the body round-trips verbatim. Mirrors `json_post_round_trips_body`.
     async fn start_mock_routing_backend(

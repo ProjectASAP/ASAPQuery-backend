@@ -20,9 +20,10 @@
 #![allow(dead_code)]
 
 use crate::physical::post_asap::matcher::sketch_family_satisfied;
-use crate::types_v2::AccuracyTarget;
+use crate::types::AccuracyTarget;
 use asap_types::AggregationType;
 pub use planner_types::post_asap::SketchAlgorithm;
+#[cfg(test)]
 use planner_types::pre_asap::AggIntent;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
@@ -89,54 +90,18 @@ pub enum Capability {
     ExactAgg(AggregationType),
 }
 
-/// PromQL outer-function flavour carried on each `ASAPTierCandidate` so
-/// the engine can distinguish `rate(metric[r])` / `irate(...)` from
-/// `sum_over_time(metric[r])` / `sum(metric)` / bare selector WITHOUT
-/// re-parsing the raw PromQL string.
+/// PromQL counter-function shape carried to execution without reparsing.
+/// The inner counter function wins for composed expressions.
 ///
-/// Background: until the Phase 2 semantic retarget (ASAPController
-/// alignment), the lowerer collapsed every `AggFunc` in
-/// `{Sum, Rate, Increase, Delta}` onto a single `AggIntent::Sum`, which
-/// `capability_for` then mapped to `Capability::ExactAgg(Sum)` for all
-/// of them — erasing the rate-vs-plain distinction the engine needs to
-/// decide between the plain ExactAgg reducer and the rate-divisor
-/// reducer (`evaluate_exact_agg_rate`). `OuterFn` was introduced to
-/// carry that distinction back (replacing an earlier raw-string
-/// `query_contains_rate_call` re-parse). `rate`/`increase` now bind
-/// their own `AggIntent::Rate`/`AggIntent::Increase` (matching
-/// `asap_aware_mapping::boundary::implementation_for`'s `SummaryKind::Rate`/
-/// `Increase` — ASAPController models Rate as a distinct summary
-/// family), both mapping to `Capability::ExactAgg(AggregationType::Increase)`;
-/// only `sum`/`sum by (...)`/bare selectors and `sum_over_time` still
-/// bind `AggIntent::Sum` → `ExactAgg(Sum)`. `OuterFn` still carries the
-/// PromQL-function-shape distinction `Capability` doesn't encode (e.g.
-/// which divisor/accumulation strategy `evaluate_exact_agg_rate` uses),
-/// but the sid-matching predicate is no longer purely `ExactAgg(Sum)`
-/// -- see `Capability::is_satisfied_by`'s `sum_satisfies_increase` for
-/// how a Sum-registered sid still answers an `ExactAgg(Increase)`
-/// required capability.
+/// Counter state contains per-window deltas:
 ///
-/// The walker that populates this lives in `asap_tier_analysis.rs`
-/// (`trace_from_promql`) — it picks the most-specific counter-function
-/// flavour found anywhere in the expression tree (inner-function wins
-/// for composed shapes like `sum by (...) (rate(...))`).
+/// * Plain sum accumulates stored deltas.
+/// * Rate sums deltas over the range and divides by covered seconds.
+/// * Increase sums deltas over the range.
+/// * Sum-over-time requires archive execution because cumulative samples
+///   cannot be reconstructed from delta state alone.
 ///
-/// ## Counter-function taxonomy (issue #301)
-///
-/// Post-#299 the agent streams per-window DELTAS for counters. The four
-/// PromQL counter idioms have genuinely different semantics over those
-/// deltas. Before #301 the engine only distinguished `Rate` from
-/// everything else, so `sum`, `sum_over_time`, `increase`, and
-/// instant-sum all hit the same reducer path and returned the same
-/// (wrong) number. This enum carries the function distinction the
-/// engine needs to dispatch correctly:
-///
-/// | Variant       | PromQL                       | `required_capability`  | Engine dispatch                                   |
-/// |---------------|------------------------------|-------------------------|----------------------------------------------------|
-/// | `Plain`       | `sum(c)` / `sum by (..) (c)` | `ExactAgg(Sum)`         | accumulate ALL windows → cumulative-since-storage |
-/// | `Rate`        | `rate(c[r])` / `irate(c[r])` | `ExactAgg(Increase)`    | Σ deltas in `[t-r,t]` ÷ min(r, coverage)          |
-/// | `Increase`    | `increase(c[r])`             | `ExactAgg(Increase)`    | Σ deltas in `[t-r,t]` (one cumulative number)     |
-/// | `SumOverTime` | `sum_over_time(c[r])`        | `ExactAgg(Sum)`         | capability-miss → archive (can't reconstruct)     |
+/// Rate and Increase require the Increase capability; plain sum requires Sum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OuterFn {
     /// No range-style counter function in the expression — bare selector,
@@ -402,6 +367,7 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
 
 // ── AggIntent → Capability bridge ────────────────────────────────────────────
 
+#[cfg(test)]
 /// Map a semantic [`AggIntent`] to the ASAP-tier [`Capability`] that can
 /// answer it. Returns `None` for intents that have no ASAP-tier sketch
 /// (Sum / Min / Max / Avg / Rate / Increase / every archive-only intent
@@ -702,17 +668,8 @@ mod tests {
 
     #[test]
     fn is_satisfied_by_concrete_kind_matches_same_family() {
-        // Intentional broadening vs. this module's pre-`sketch_family_satisfied`
-        // behavior: a concrete required handle used to need an EXACT
-        // available match (only `Any` unlocked family-level matching).
-        // Delegating to `sketch_family_satisfied` makes family membership
-        // the only thing that matters, matching enum-unification-plan.md §5's
-        // table ("Kll or DDSketch | the other one | yes ... either
-        // answers a quantile requirement not pinned to a concrete kind") —
-        // that rule isn't conditioned on whether the requirement happened
-        // to spell out `Any` or a concrete kind. Harmless in practice:
-        // `capability_for` never emits a concrete `QuantileApprox` handle
-        // (always `Any`), so this path is exercised only defensively.
+        // Quantile capability matching accepts either KLL or DDSketch, including
+        // when the required handle names a concrete family.
         let required = Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch));
         let indexed_dd = Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch));
         let indexed_kll = Capability::QuantileApprox(Some(SketchAlgorithm::Kll));

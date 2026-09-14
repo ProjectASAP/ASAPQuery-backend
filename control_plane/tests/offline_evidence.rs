@@ -9,7 +9,7 @@ use control_plane::{
         PostAsapPlan,
     },
     query_parser::parse_query_expr_canonical,
-    types_v2::AccuracyTarget,
+    types::AccuracyTarget,
 };
 use planner_types::{
     post_asap::{SketchAlgorithm, SketchParams, SummaryExpr, SummaryFamilyType, SummaryNode},
@@ -364,7 +364,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
         schema: child.schema.clone(),
         guarantee: None,
     });
-    let plan = control_plane::query_plan::compile_bound(
+    let plan = control_plane::query_plan::compile_bound_mapped(
         "test".into(),
         "left / right".into(),
         &root,
@@ -375,6 +375,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
         },
         FallbackPolicy::Reject,
         |_, _| panic!("unsupported binary plan must not bind a materialization"),
+        |_, _| {},
     )
     .unwrap();
     assert!(

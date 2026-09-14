@@ -13,10 +13,10 @@ pub mod deployment_expr;
 pub mod lower;
 pub mod matcher;
 
-#[cfg(test)]
-mod tests;
-
 // Re-exports — `crate::physical::post_asap::*` for downstream callers.
 pub use deployment_expr::{PhysicalExpr, PostAsapPlan};
 pub use lower::{bind_query_expr, bind_query_expr_with_cost_model, BindingError};
 pub use matcher::SummaryFamilyMatcher;
+
+#[cfg(test)]
+mod tests;

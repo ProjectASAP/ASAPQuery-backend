@@ -1,49 +1,11 @@
-//! `SchemaEvictionService` — background task that drops
-//! `AggStatus::Expired` schemas' data and removes them from the
-//! registry.
+//! Remove expired sid instances and their stored data on a periodic sweep.
 //!
-//! Implements the §6.2 "scheduled for deletion by the time-TTL
-//! sweep" semantics the lifecycle enum promises. Sits alongside
-//! the SketchStore's age-based `persistence_delete_older_than`
-//! retention — the two are independent:
+//! Lifecycle retention is separate from age-based data retention. Configure
+//! `persistence_delete_older_than > retirement_retention` so whole-instance
+//! eviction can precede age-based record removal.
 //!
-//! * **Schema retention** (this module): lifecycle-driven. When a
-//!   schema is removed from `StreamingConfig` it transitions
-//!   `Active → Retired → Expired`; when `expires_at_ms` passes we
-//!   drop its `agg_id`.
-//! * **Data retention** (SketchStore): age-driven. Records
-//!   older than `persistence_delete_older_than` get swept up
-//!   regardless of schema.
-//!
-//! ## Ordering guideline
-//!
-//! The user's design rule is: `persistence_delete_older_than >
-//! retirement_retention`. That way data-retention never beats
-//! schema-eviction to the punch on an Expired schema's records —
-//! schema-eviction takes them out cleanly in one bulk drop
-//! (O(1)-ish per the `drop_agg_id` contract) before data-retention
-//! would wade in record-by-record. `SchemaEvictionService` logs a
-//! `warn!` at startup if the ordering is inverted.
-//!
-//! ## What the service does on each tick
-//!
-//! 1. Snapshot the schema registry: collect every `AggStatus::Expired`
-//!    schema.
-//! 2. For each Expired schema's `agg_id`:
-//!    - Cancel any `Running` backfill job targeting that agg_id
-//!      (they're writing to data about to be dropped — wasted work).
-//!    - Call `store.drop_agg_id(agg_id)` to evict the windows.
-//!    - `schema_registry.remove_schema(agg_id)` to drop the registry
-//!      entry so it won't be re-evicted next tick.
-//! 3. Log an audit line per eviction with `agg_id`, metric,
-//!    `retired_at_ms`, windows evicted.
-//!
-//! ## Dry-run
-//!
-//! `--schema-eviction-dry-run` sets `dry_run: true`. Every step
-//! above runs through the discovery + logging, but `drop_agg_id`
-//! and `remove_schema` are skipped. Use this to validate a new
-//! retention value before letting it delete anything.
+//! Dry-run logs discovered instances without removing them. Backfill jobs are
+//! policy-keyed, so this sid-level sweep does not cancel those jobs.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,9 +18,7 @@ use crate::storage_engines::sketch_db::backfill::BackfillRegistry;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::lifecycle::{AggStatus, DEFAULT_RETIREMENT_RETENTION};
 
-/// Configuration for the eviction loop. Separate from
-/// `SchemaRegistry`'s `retirement_retention` because the service
-/// owns the poll schedule, not the data model.
+/// Eviction schedule and dry-run configuration.
 #[derive(Clone, Debug)]
 pub struct SchemaEvictionConfig {
     /// How often to scan for Expired schemas. Coarse (default 5 min)
@@ -78,42 +38,27 @@ impl Default for SchemaEvictionConfig {
     }
 }
 
-/// Long-running tokio task that drops `Expired` sids' data.
-///
-/// Post-schema-retirement: the sweep is sid-driven. `SchemaRegistry`
-/// is gone; this service iterates the sid catalog directly and
-/// removes any sid whose status has progressed past `Retired`.
-/// `BackfillRegistry` is retained so future sid↔backfill wiring can
-/// reattach (today the sweep no longer cancels in-flight backfills
-/// because backfill jobs remain agg_id-keyed; a follow-up will
-/// rekey them on sid and restore the cancel step).
+/// Background task that removes expired instances from the sid catalog.
+/// The backfill registry is retained but is not consulted for cancellation.
 pub struct SchemaEvictionService {
     backfill: Arc<BackfillRegistry>,
-    sketch_index: Arc<SketchStore>,
+    summary_store: Arc<SketchStore>,
     retirement_retention: Duration,
     config: SchemaEvictionConfig,
 }
 
 impl SchemaEvictionService {
     pub fn new(
-        sketch_index: Arc<SketchStore>,
+        summary_store: Arc<SketchStore>,
         backfill: Arc<BackfillRegistry>,
         config: SchemaEvictionConfig,
     ) -> Self {
         Self {
             backfill,
-            sketch_index,
+            summary_store,
             retirement_retention: DEFAULT_RETIREMENT_RETENTION,
             config,
         }
-    }
-
-    /// Override the retirement-retention duration. Tests use this to
-    /// drive lifecycle transitions deterministically without waiting
-    /// out the 24-hour default.
-    pub fn with_retirement_retention(mut self, retention: Duration) -> Self {
-        self.retirement_retention = retention;
-        self
     }
 
     /// Spawn as a tokio task. Returns a handle whose `shutdown`
@@ -154,7 +99,7 @@ impl SchemaEvictionService {
     /// the service deterministically without spinning up a tokio
     /// runtime + polling loop.
     pub fn run_once(&self) {
-        let expired = self.sketch_index.list_by_status(AggStatus::Expired);
+        let expired = self.summary_store.list_by_status(AggStatus::Expired);
         if expired.is_empty() {
             return;
         }
@@ -183,7 +128,7 @@ impl SchemaEvictionService {
                 );
                 continue;
             }
-            let removed = self.sketch_index.remove_instance(sid).is_some();
+            let removed = self.summary_store.remove_instance(sid).is_some();
             info!(
                 sid,
                 %metric,
@@ -301,7 +246,7 @@ mod tests {
     }
 
     fn write_one(
-        sketch_index: &SketchStore,
+        summary_store: &SketchStore,
         streaming_config: &StreamingConfig,
         agg_id: u64,
         ts: u64,
@@ -325,7 +270,7 @@ mod tests {
             static RESOLVER: Arc<SeriesIdResolver> = Arc::new(SeriesIdResolver::new());
         }
         let resolver = RESOLVER.with(|r| r.clone());
-        sketch_index
+        summary_store
             .ingest_precompute_for_agg_config(
                 |m, fp, ak| resolver.resolve(m, fp, ak),
                 agg_cfg,
@@ -340,21 +285,21 @@ mod tests {
     /// sids stay `Active`.
     fn fixture_with_expired_metric_1() -> (Arc<BackfillRegistry>, Arc<SketchStore>) {
         let (initial, id_to_fp) = make_streaming_config(&[1, 2]);
-        let sketch_index = Arc::new(SketchStore::new());
-        let sid_a = write_one(&sketch_index, &initial, id_to_fp[&1], 100);
-        let _ = write_one(&sketch_index, &initial, id_to_fp[&1], 200);
-        let _ = write_one(&sketch_index, &initial, id_to_fp[&2], 300);
+        let summary_store = Arc::new(SketchStore::new());
+        let sid_a = write_one(&summary_store, &initial, id_to_fp[&1], 100);
+        let _ = write_one(&summary_store, &initial, id_to_fp[&1], 200);
+        let _ = write_one(&summary_store, &initial, id_to_fp[&2], 300);
         // Both metric_1 writes share the same agg-signature → one
         // sid; mark it Expired directly. metric_2's sid stays Active.
-        sketch_index.force_expire(sid_a);
+        summary_store.force_expire(sid_a);
 
-        (Arc::new(BackfillRegistry::new()), sketch_index)
+        (Arc::new(BackfillRegistry::new()), summary_store)
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_drops_expired_sid() {
-        let (backfill, sketch_index) = fixture_with_expired_metric_1();
-        let before_metric_2: usize = sketch_index
+        let (backfill, summary_store) = fixture_with_expired_metric_1();
+        let before_metric_2: usize = summary_store
             .list_by_status(AggStatus::Active)
             .into_iter()
             .filter(|m| m.metric_name == "metric_2")
@@ -362,7 +307,7 @@ mod tests {
         assert!(before_metric_2 >= 1, "fixture seeded metric_2 sid");
 
         let svc = SchemaEvictionService::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             backfill,
             SchemaEvictionConfig {
                 poll_interval: Duration::from_secs(60),
@@ -373,16 +318,16 @@ mod tests {
 
         // metric_1's expired sid is gone; metric_2's active sid
         // remains.
-        let metric_1_remaining = sketch_index
+        let metric_1_remaining = summary_store
             .list_by_status(AggStatus::Active)
             .into_iter()
-            .chain(sketch_index.list_by_status(AggStatus::Retired))
-            .chain(sketch_index.list_by_status(AggStatus::Expired))
+            .chain(summary_store.list_by_status(AggStatus::Retired))
+            .chain(summary_store.list_by_status(AggStatus::Expired))
             .filter(|m| m.metric_name == "metric_1")
             .count();
         assert_eq!(metric_1_remaining, 0, "expired sid must be removed");
         assert!(
-            sketch_index
+            summary_store
                 .list_by_status(AggStatus::Active)
                 .iter()
                 .any(|m| m.metric_name == "metric_2"),
@@ -394,19 +339,19 @@ mod tests {
     async fn run_once_is_noop_without_expired_sids() {
         let (initial, id_to_fp) = make_streaming_config(&[1]);
         let backfill = Arc::new(BackfillRegistry::new());
-        let sketch_index = Arc::new(SketchStore::new());
-        let _ = write_one(&sketch_index, &initial, id_to_fp[&1], 100);
-        let before = sketch_index.instance_count();
+        let summary_store = Arc::new(SketchStore::new());
+        let _ = write_one(&summary_store, &initial, id_to_fp[&1], 100);
+        let before = summary_store.instance_count();
 
         let svc = SchemaEvictionService::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             backfill,
             SchemaEvictionConfig::default(),
         );
         svc.run_once();
 
         assert_eq!(
-            sketch_index.instance_count(),
+            summary_store.instance_count(),
             before,
             "no expired sids — SketchStore untouched"
         );
@@ -414,10 +359,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dry_run_logs_but_does_not_drop() {
-        let (backfill, sketch_index) = fixture_with_expired_metric_1();
-        let before = sketch_index.instance_count();
+        let (backfill, summary_store) = fixture_with_expired_metric_1();
+        let before = summary_store.instance_count();
         let svc = SchemaEvictionService::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             backfill,
             SchemaEvictionConfig {
                 poll_interval: Duration::from_secs(60),
@@ -427,7 +372,7 @@ mod tests {
         svc.run_once();
 
         // Dry-run: every sid stays.
-        assert_eq!(sketch_index.instance_count(), before);
+        assert_eq!(summary_store.instance_count(), before);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::{
     AdapterConfig, AdapterError, HttpProtocolAdapter, ParsedQueryRequest, ParsedRangeQueryRequest,
-    PrometheusHttpAdapter, QueryExecutionResult, QueryRequestAdapter, QueryResponseAdapter,
+    PrometheusHttpAdapter, QueryExecutionResult,
 };
 use asap_types::KeyByLabelNames;
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ impl VictoriaMetricsHttpAdapter {
 }
 
 #[async_trait]
-impl QueryRequestAdapter for VictoriaMetricsHttpAdapter {
+impl HttpProtocolAdapter for VictoriaMetricsHttpAdapter {
     async fn parse_get_request(
         &self,
         params: Query<HashMap<String, String>>,
@@ -67,10 +67,7 @@ impl QueryRequestAdapter for VictoriaMetricsHttpAdapter {
     fn get_range_query_endpoint(&self) -> &'static str {
         "/api/v1/query_range"
     }
-}
 
-#[async_trait]
-impl QueryResponseAdapter for VictoriaMetricsHttpAdapter {
     async fn format_success_response(
         &self,
         result: &QueryExecutionResult,
@@ -92,10 +89,7 @@ impl QueryResponseAdapter for VictoriaMetricsHttpAdapter {
     async fn format_unsupported_query_response(&self) -> Result<Response, StatusCode> {
         self.wire.format_unsupported_query_response().await
     }
-}
 
-#[async_trait]
-impl HttpProtocolAdapter for VictoriaMetricsHttpAdapter {
     fn query_language(&self) -> asap_types::QueryLanguage {
         asap_types::QueryLanguage::MetricsQl
     }

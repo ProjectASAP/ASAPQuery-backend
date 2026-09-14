@@ -268,6 +268,117 @@ pub(super) fn render(expr: &QueryExpr) -> Result<String, String> {
 }
 
 #[cfg(test)]
+mod original_tests {
+    use super::*;
+    use asap_frontend_sql::{lower_sql_dialect, SqlCatalog};
+    use planner_types::{
+        pre_asap::{Column, DataType},
+        types::AccuracyTarget,
+        workload::SqlDialect,
+    };
+    #[tokio::test]
+    async fn original_exact_shapes_retain_native_aggregates_and_bounds() {
+        let catalog = SqlCatalog::new().with_table(
+            "raw_samples",
+            Schema::new(vec![
+                Column::new("metric", DataType::Utf8, false),
+                Column::new("ts_ms", DataType::Int64, false),
+                Column::new("value", DataType::Float64, false),
+                Column::new(
+                    "labels",
+                    DataType::Map {
+                        key: Box::new(DataType::Utf8),
+                        value: Box::new(DataType::Utf8),
+                        value_nullable: false,
+                    },
+                    false,
+                ),
+            ]),
+        );
+        for sql in [
+            include_str!("../../tests/fixtures/sql_exact_cuts/q07.sql"),
+            include_str!("../../tests/fixtures/sql_exact_cuts/q09.sql"),
+            include_str!("../../tests/fixtures/sql_exact_cuts/q12.sql"),
+            include_str!("../../tests/fixtures/sql_exact_cuts/q27.sql"),
+        ] {
+            let canonical = lower_sql_dialect(
+                sql,
+                &catalog,
+                SqlDialect::ClickhouseSQL,
+                AccuracyTarget::Exact,
+            )
+            .await
+            .unwrap();
+            let rendered = render(&canonical).unwrap();
+            assert!(rendered.contains("1788891296000"));
+            assert!(rendered.contains("`ts_ms`"));
+            assert!(!rendered.contains("{from:"));
+            if sql.contains("sum(value)") && sql.contains("argMax") {
+                use crate::physical::post_asap::{PhysicalExpr, PostAsapPlan};
+                use crate::query_plan::{
+                    FallbackPolicy, FixedEvaluationRange, InstantExecution, QueryPlanError,
+                    QueryPlanNode,
+                };
+                let planned =
+                    crate::clickhouse::plan_clickhouse_sql(sql, &catalog, AccuracyTarget::Exact)
+                        .await
+                        .unwrap();
+                let PhysicalExpr::Committed(PostAsapPlan::Summary(root)) = planned.physical else {
+                    panic!("missing selected SQL DAG")
+                };
+                let entry = crate::query_plan::compile_bound_relational_mapped(
+                    "test".into(),
+                    planned.canonical_sql,
+                    &root,
+                    FixedEvaluationRange {
+                        start_ms: 1788890996000,
+                        end_ms: 1788891296000,
+                        cumulative: false,
+                    },
+                    InstantExecution {
+                        lookback_ms: 300000,
+                        full_history: false,
+                        cumulative_readout: false,
+                    },
+                    FallbackPolicy::ExactBackend,
+                    |_, _| Err(QueryPlanError::Invalid("unexpected summary binding".into())),
+                    |_, _| {},
+                )
+                .unwrap();
+                assert!(
+                    !entry
+                        .nodes
+                        .values()
+                        .any(|node| matches!(node, QueryPlanNode::Logical { .. })),
+                    "SQL must not acquire PromQL operators"
+                );
+                assert!(entry.nodes.values().any(|node| match node {
+                    QueryPlanNode::Relational { operation, .. } => matches!(
+                        serde_json::from_value::<planner_types::post_asap::ValueOperation>(
+                            operation.clone()
+                        )
+                        .unwrap(),
+                        planner_types::post_asap::ValueOperation::Exact(
+                            planner_types::post_asap::ExactOperation::Aggregate { .. }
+                        )
+                    ),
+                    _ => false,
+                }));
+            }
+        }
+    }
+    #[test]
+    fn literal_quotes_and_backslashes_are_escaped_independently() {
+        let rendered = scalar(
+            &QueryExpr::Literal(ScalarValue::Utf8("a\\'b\n".into())),
+            &Schema::new(vec![]),
+        )
+        .unwrap();
+        assert_eq!(rendered, "'a\\\\\\'b\n'");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use planner_types::pre_asap::{Column, DataType, Predicate, ProjectItem};
@@ -357,115 +468,5 @@ mod tests {
             args: vec![],
         };
         assert!(scalar(&expr, &schema).is_err());
-    }
-}
-
-#[cfg(test)]
-mod original_tests {
-    use super::*;
-    use asap_frontend_sql::{lower_sql_dialect, SqlCatalog};
-    use planner_types::{
-        pre_asap::{Column, DataType},
-        types::AccuracyTarget,
-        workload::SqlDialect,
-    };
-    #[tokio::test]
-    async fn original_exact_shapes_retain_native_aggregates_and_bounds() {
-        let catalog = SqlCatalog::new().with_table(
-            "raw_samples",
-            Schema::new(vec![
-                Column::new("metric", DataType::Utf8, false),
-                Column::new("ts_ms", DataType::Int64, false),
-                Column::new("value", DataType::Float64, false),
-                Column::new(
-                    "labels",
-                    DataType::Map {
-                        key: Box::new(DataType::Utf8),
-                        value: Box::new(DataType::Utf8),
-                        value_nullable: false,
-                    },
-                    false,
-                ),
-            ]),
-        );
-        for sql in [
-            include_str!("../../tests/fixtures/sql_exact_cuts/q07.sql"),
-            include_str!("../../tests/fixtures/sql_exact_cuts/q09.sql"),
-            include_str!("../../tests/fixtures/sql_exact_cuts/q12.sql"),
-            include_str!("../../tests/fixtures/sql_exact_cuts/q27.sql"),
-        ] {
-            let canonical = lower_sql_dialect(
-                sql,
-                &catalog,
-                SqlDialect::ClickhouseSQL,
-                AccuracyTarget::Exact,
-            )
-            .await
-            .unwrap();
-            let rendered = render(&canonical).unwrap();
-            assert!(rendered.contains("1788891296000"));
-            assert!(rendered.contains("`ts_ms`"));
-            assert!(!rendered.contains("{from:"));
-            if sql.contains("sum(value)") && sql.contains("argMax") {
-                use crate::physical::post_asap::{PhysicalExpr, PostAsapPlan};
-                use crate::query_plan::{
-                    FallbackPolicy, FixedEvaluationRange, InstantExecution, QueryPlanError,
-                    QueryPlanNode,
-                };
-                let planned =
-                    crate::clickhouse::plan_clickhouse_sql(sql, &catalog, AccuracyTarget::Exact)
-                        .await
-                        .unwrap();
-                let PhysicalExpr::Committed(PostAsapPlan::Summary(root)) = planned.physical else {
-                    panic!("missing selected SQL DAG")
-                };
-                let entry = crate::query_plan::compile_bound_relational(
-                    "test".into(),
-                    planned.canonical_sql,
-                    &root,
-                    FixedEvaluationRange {
-                        start_ms: 1788890996000,
-                        end_ms: 1788891296000,
-                        cumulative: false,
-                    },
-                    InstantExecution {
-                        lookback_ms: 300000,
-                        full_history: false,
-                        cumulative_readout: false,
-                    },
-                    FallbackPolicy::ExactBackend,
-                    |_, _| Err(QueryPlanError::Invalid("unexpected summary binding".into())),
-                )
-                .unwrap();
-                assert!(
-                    !entry
-                        .nodes
-                        .values()
-                        .any(|node| matches!(node, QueryPlanNode::Logical { .. })),
-                    "SQL must not acquire PromQL operators"
-                );
-                assert!(entry.nodes.values().any(|node| match node {
-                    QueryPlanNode::Relational { operation, .. } => matches!(
-                        serde_json::from_value::<planner_types::post_asap::ValueOperation>(
-                            operation.clone()
-                        )
-                        .unwrap(),
-                        planner_types::post_asap::ValueOperation::Exact(
-                            planner_types::post_asap::ExactOperation::Aggregate { .. }
-                        )
-                    ),
-                    _ => false,
-                }));
-            }
-        }
-    }
-    #[test]
-    fn literal_quotes_and_backslashes_are_escaped_independently() {
-        let rendered = scalar(
-            &QueryExpr::Literal(ScalarValue::Utf8("a\\'b\n".into())),
-            &Schema::new(vec![]),
-        )
-        .unwrap();
-        assert_eq!(rendered, "'a\\\\\\'b\n'");
     }
 }

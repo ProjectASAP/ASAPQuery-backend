@@ -1,15 +1,3 @@
-// Phase 9 (controller-into-backend refactor):
-// The `controller` crate is now a path-dep of this binary
-// (`../controller` in `asap-query-engine/Cargo.toml`). It is NOT yet
-// started in-process here; the in-process OpAMP server + capability-map
-// exposure are a follow-up that will land after Phase 4 (centralized
-// series_id resolver). For now we only verify that the crate compiles
-// inside this workspace and is importable from `main.rs`.
-//
-// When that follow-up lands, the OpAMP WS endpoint (port 4320) and the
-// RuntimeSamples gRPC endpoint (port 4321) will be served from inside
-// this same backend process — there is no longer a separate
-// `asap-controller` container in `mvp-multinode/run_demo.sh`.
 use clap::{Parser, ValueEnum};
 use std::fs;
 use std::sync::Arc;
@@ -63,7 +51,7 @@ struct Args {
 
     /// Versioned canonical QueryWorkload + DataWorkload and backend-local
     /// implementation evidence. The ASAPQuery profile invokes the pinned
-    /// Planner and PhysicalCompiler at startup when this is supplied.
+    /// Planner and PhysicalPlanCompiler at startup when this is supplied.
     #[arg(long)]
     planning_snapshot: Option<std::path::PathBuf>,
 
@@ -162,20 +150,6 @@ struct Args {
     /// Prometheus server URL
     #[arg(long, default_value = "http://localhost:9090")]
     prometheus_server: String,
-
-    /// Control-plane endpoint for capability-miss notifications
-    /// (PR G). When set, `ASAPQueryEngine` fires a fire-and-forget
-    /// POST to this URL every time a query can't find a compatible
-    /// stored aggregation, so the control plane can generate a new
-    /// sketch plan. When unset (default), capability misses fall
-    /// through to the §5.2 fallback silently.
-    /// Example: `http://control-plane.svc:8080/api/v1/plan`
-    ///
-    /// Falls back to the `ASAP_CONTROL_PLANE_URL` env var when the
-    /// flag is not passed — `deploy/docker-compose/base.yml` sets
-    /// the env var so the MVP demo doesn't need a per-arg overlay.
-    #[arg(long, env = "ASAP_CONTROL_PLANE_URL")]
-    control_plane_endpoint: Option<String>,
 
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
@@ -288,11 +262,8 @@ struct Args {
     #[arg(long, default_value = "10000")]
     precompute_channel_buffer_size: usize,
 
-    /// Optional path where the schema registry persists per-`agg_id`
-    /// lifecycle state (created_at / retired_at / expires_at) across
-    /// restarts (sketch DB Phase 2c). When unset, the registry is
-    /// memory-only and the §7 schema timeline loses all pre-restart
-    /// history.
+    /// Compatibility option for schema persistence. Sid lifecycle persistence is
+    /// managed by the sketch store.
     #[arg(long)]
     schema_persist_path: Option<std::path::PathBuf>,
 
@@ -452,9 +423,6 @@ fn validate_profile(args: &Args) -> Result<()> {
     if args.backend_storage_routing.is_some() {
         excluded.push("--backend-storage-routing");
     }
-    if args.control_plane_endpoint.is_some() {
-        excluded.push("--control-plane-endpoint");
-    }
     if !excluded.is_empty() {
         return Err(format!(
             "--profile asapquery excludes distributed/durable components: {}",
@@ -539,7 +507,7 @@ async fn main() -> Result<()> {
 
     let startup_artifact = if let Some(path) = args.planning_snapshot.as_ref() {
         let bytes = fs::read(path)?;
-        let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_slice(&bytes).map_err(|error| {
                 format!(
                     "failed to decode planning snapshot {}: {error}",
@@ -549,12 +517,14 @@ async fn main() -> Result<()> {
         let runtime_memory_budget = u64::try_from(args.persistence_memory_limit_mb)
             .unwrap_or(u64::MAX)
             .saturating_mul(1024 * 1024);
-        snapshot.implementation.max_retained_summary_bytes = snapshot
-            .implementation
-            .max_retained_summary_bytes
+        snapshot
+            .physical_inputs
+            .retained_summary_memory_budget_bytes = snapshot
+            .physical_inputs
+            .retained_summary_memory_budget_bytes
             .min(runtime_memory_budget);
         let plan = snapshot
-            .compile()
+            .compile_promql()
             .map_err(|error| format!("startup planning failed for {}: {error}", path.display()))?;
         if let Some(comparison) = &plan.cost_comparison {
             info!(
@@ -585,7 +555,7 @@ async fn main() -> Result<()> {
         None
     };
     let startup_physical_plan = if let Some(artifact) = startup_artifact {
-        let active = data_plane::drivers::query::servers::http::build_active_physical_plan(
+        let active = data_plane::drivers::query::servers::http::validate_and_build_runtime_plan(
             artifact,
             Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
         )
@@ -616,7 +586,7 @@ async fn main() -> Result<()> {
         None
     };
     let streaming_config = match startup_physical_plan.as_ref() {
-        Some(active) => active.runtime_config.clone(),
+        Some(active) => active.streaming_config.clone(),
         None => Arc::new(read_streaming_config(
             args.streaming_config
                 .as_deref()
@@ -625,23 +595,12 @@ async fn main() -> Result<()> {
     };
     info!(
         "Loaded streaming config with {} entries",
-        streaming_config.get_all_aggregation_configs().len()
+        streaming_config.materializations().len()
     );
     info!("Streaming config: {:?}", streaming_config);
 
-    // Wrap the streaming config in a hot-reload handle so the HTTP
-    // server's `/api/v1/streaming-config` endpoints can swap it at
-    // runtime (PR E phase 1). Existing consumers downstream
-    // (ASAPQueryEngine, PrecomputeEngine, Store) still take their
-    // startup snapshot; hot-reload currently only affects the
-    // control-plane GET/POST endpoint. Phase 2 will extend the swap
-    // to query execution and ingest routing.
+    // Share a hot-reload handle with HTTP configuration endpoints and consumers.
 
-    // M2.3.6g — the legacy `SketchStore` construction is gone.
-    // Production data lives in `SketchStore` (allocated below); the
-    // single persistence flusher behind it is set up in the
-    // `--persistence-enabled` block lower in main.rs via
-    // `SketchStore::start_persistence`.
     let cleanup_policy = args.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
     let _ = (cleanup_policy, args.lock_strategy); // Both still parsed for backwards-compat CLI; no runtime effect.
@@ -674,24 +633,18 @@ async fn main() -> Result<()> {
     } else {
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new())
     };
-    let sketch_index = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
+    let summary_store = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
     if let Some(catalog) = startup_physical_plan
         .as_ref()
         .and_then(|plan| plan.summary_catalog.as_ref())
     {
-        sketch_index
+        summary_store
             .install_summary_catalog(Arc::clone(catalog))
             .map_err(std::io::Error::other)?;
     }
 
-    // M2.3.6c — also start a persistence layer behind the SketchStore
-    // when --persistence-enabled. SketchStore is now where all
-    // precompute + sketch writes land (M2.3.6a), so flushing it to
-    // disk is what makes Phase 5 ASAP-tier state survive restarts.
-    // The legacy `SketchStore::with_persistence_per_key` flusher
-    // constructed above is now a no-op (its source has no writes) —
-    // it stays in place until subsequent M2.3.6 sub-PRs delete the
-    // legacy SketchStore wholesale.
+    // Enable persistence for the shared sketch store so precompute and sketch
+    // state survive restarts.
     let _sketch_index_persistence = if args.persistence_enabled {
         use data_plane::storage_engines::sketch_db::index::persistence::SketchStorePersistenceConfig;
         let disk_path = args
@@ -733,7 +686,7 @@ async fn main() -> Result<()> {
             index_persistence_dir
         );
         Some(
-            sketch_index
+            summary_store
                 .start_persistence(cfg)
                 .expect("SketchStore::start_persistence failed"),
         )
@@ -765,7 +718,7 @@ async fn main() -> Result<()> {
         schemas: Vec::new(),
         producers: Vec::new(),
         materializations: streaming_config
-            .aggregation_configs
+            .materializations_by_policy_fingerprint
             .values()
             .cloned()
             .collect(),
@@ -784,12 +737,12 @@ async fn main() -> Result<()> {
         rules: Vec::new(),
     };
     let initial_active_plan = startup_physical_plan.unwrap_or_else(|| {
-        data_plane::storage_engines::types::ActivePhysicalPlan {
+        data_plane::storage_engines::types::RuntimePhysicalPlan {
             envelope: initial_precompute_plan.envelope.clone(),
             summary_catalog: None,
             precompute_plan: initial_precompute_plan,
             transmission_plan: initial_transmission_plan,
-            runtime_config: streaming_config.clone(),
+            streaming_config: streaming_config.clone(),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
@@ -797,45 +750,23 @@ async fn main() -> Result<()> {
         }
     });
     let active_physical_plan =
-        data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(initial_active_plan);
+        data_plane::storage_engines::types::ActivePhysicalPlanHandle::new(initial_active_plan);
     let hot_reload_config =
-        data_plane::storage_engines::types::HotReloadStreamingConfig::from_active(
+        data_plane::storage_engines::types::StreamingConfigHandle::from_active_physical_plan(
             active_physical_plan.clone(),
         );
 
     // Query execution reads generation-consistent runtime configuration from
-    // the ActivePhysicalPlan installed below.
-    let engine = {
-        let mut engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
-            // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
-            // SketchStore to the query engine so SeriesLookup classification
-            // drives the Phase 6 archive failover via
-            // EngineError::CapabilityMiss when the ASAP tier is empty
-            // / ghost / unknown.
-            .with_sketch_index(sketch_index.clone())
-            .with_active_physical_plan(active_physical_plan.clone())
-            .with_exact_subquery_endpoint(args.prometheus_server.clone())
-            .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
-        if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
-            info!(
-                "Capability-miss notifications enabled → {}",
-                control_plane_endpoint
-            );
-            let client: Arc<dyn data_plane::drivers::control_plane_client::ControlPlaneClient> =
-                Arc::new(
-                    data_plane::drivers::control_plane_client::HttpControlPlaneClient::new(
-                        control_plane_endpoint.clone(),
-                    ),
-                );
-            engine = engine.with_control_plane_client(client);
-        } else {
-            info!(
-                "Capability-miss notifications disabled \
-                 (pass --control-plane-endpoint=<url> to enable)"
-            );
-        }
-        engine
-    };
+    // the RuntimePhysicalPlan installed below.
+    // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier SummaryStore to the
+    // query engine so SeriesLookup classification drives the Phase 6 archive
+    // failover via EngineError::CapabilityMiss when the ASAP tier is empty /
+    // ghost / unknown.
+    let engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
+        .with_sketch_index(summary_store.clone())
+        .with_active_physical_plan(active_physical_plan.clone())
+        .with_exact_subquery_endpoint(args.prometheus_server.clone())
+        .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
 
     // Setup precompute engine. Backend ingest is OTLP-only — the
     // precompute engine no longer hosts an HTTP listener of its own; the
@@ -866,7 +797,7 @@ async fn main() -> Result<()> {
         // below is for the eviction service + diagnostic plumbing
         // until subsequent M2.3.6 sub-PRs delete those too.
         let output_sink = Arc::new(SketchStoreSink::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             hot_reload_config.clone(),
             series_resolver.clone(),
         ));
@@ -875,12 +806,12 @@ async fn main() -> Result<()> {
             hot_reload_config.clone(),
             output_sink,
             series_resolver.clone(),
-            sketch_index.clone(),
+            summary_store.clone(),
         );
         if let Some(endpoint) = args.erp_runtime_samples_endpoint.clone() {
             let generation = engine
                 .ingest_state()
-                .physical_plan_snapshot()
+                .active_physical_plan_snapshot()
                 .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
                 .ok_or_else(|| {
                     std::io::Error::other("ERP observation requires an installed catalog")
@@ -895,10 +826,8 @@ async fn main() -> Result<()> {
         let ingest_state = engine.ingest_state();
         info!("Starting precompute engine (ingest adapters share its bounded worker queues)");
 
-        // Spawn periodic memory diagnostics logger — M2.3.6g routes
-        // through SketchStore now that SketchStore no longer holds
-        // production data.
-        let diag_index = sketch_index.clone();
+        // Log memory diagnostics for the shared sketch store.
+        let diag_index = summary_store.clone();
         tokio::spawn(async move {
             spawn_memory_diagnostics(diag_index, Some(worker_diagnostics)).await;
         });
@@ -911,9 +840,7 @@ async fn main() -> Result<()> {
         (Some(handle), Some(ingest_state))
     };
 
-    // Schema retirement #5 — agg_id-keyed `SchemaRegistry` is gone.
-    // Both ingest and query observe the §7 timeline at the sid level
-    // via the shared `SketchStore` (already passed in above).
+    // Sid lifecycle is owned by the shared sketch store.
     let engine = Arc::new(engine);
 
     // Idle-sid eviction sweep (memory reclaim) — opt-in via
@@ -921,7 +848,7 @@ async fn main() -> Result<()> {
     // write-idle, fully-flushed sketch sids while keeping their queryable
     // metadata, bounding resident registry memory under series churn.
     if args.idle_sid_evict_secs > 0 {
-        let evict_index = sketch_index.clone();
+        let evict_index = summary_store.clone();
         let idle_ms = args.idle_sid_evict_secs.saturating_mul(1000);
         // Sweep a few times per idle horizon, clamped to a sane cadence.
         let sweep = std::time::Duration::from_secs(args.idle_sid_evict_secs.clamp(10, 60));
@@ -995,7 +922,7 @@ async fn main() -> Result<()> {
     // sample_p grant. Global-threshold alerting is retired (see
     // data_plane::monitor module docs) — this coordinator never fires one.
     let monitor_handle = if args.enable_monitor_coordinator {
-        use data_plane::monitor::{
+        use data_plane::update_sampling::{
             Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl,
         };
         let specs: Vec<MonitorConfig> = streaming_config
@@ -1099,24 +1026,17 @@ async fn main() -> Result<()> {
         adapter_config,
     };
 
-    // The legacy in-backend query tracker / LocalPlannerClient was
-    // removed in Phase γ (deletion of `asap-planner-rs`). The
-    // ASAPCollector controller is now the sole emitter of streaming
-    // configs / `BackendStorageRouting`; the backend is a pure
-    // executor that consumes plans pushed via
-    // `POST /api/v1/streaming-config` and `POST /api/v1/storage_routing`.
+    // The backend consumes streaming configuration and storage routing pushed
+    // by the control plane through their HTTP endpoints.
 
-    // Schema retirement #5 — the HTTP server no longer takes a
-    // `SchemaRegistry`. `POST /api/v1/streaming-config` drives
-    // lifecycle transitions at the sid level via the shared
-    // `SketchStore` (already passed in below).
-    let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
+    // HTTP endpoints inspect lifecycle metadata in the shared sketch store.
+    let mut server = HttpServer::new(http_config, engine, summary_store.clone())
         .with_active_physical_plan(active_physical_plan.clone())
         .with_probe_cache(probe_cache.clone());
     if args.profile == RuntimeProfile::Distributed {
         // Legacy partial-document endpoints remain available to distributed
         // deployments. The compatibility profile deliberately exposes only
-        // the atomic PhysicalPlan stage/activate lifecycle.
+        // the atomic CompiledPhysicalPlan stage/activate lifecycle.
         server = server.with_hot_reload_config(hot_reload_config.clone());
     }
 
@@ -1145,7 +1065,7 @@ async fn main() -> Result<()> {
     // every PromQL query instead of bypassing the EngineRouter when
     // the streaming-config single axis defaults to `SketchStore`.
     //
-    // Phase α (MVP): even when no static YAML is loaded, install an
+    // even when no static YAML is loaded, install an
     // empty hot-reload handle so the control plane's first
     // `POST /api/v1/storage_routing` push lands without first-call 503
     // lossage. Operators can still hand-author the YAML for
@@ -1178,14 +1098,14 @@ async fn main() -> Result<()> {
         );
         data_plane::storage_engines::types::BackendStorageRouting::empty()
     };
-    if active_physical_plan.snapshot().plan_id() == 0 {
-        let current = active_physical_plan.snapshot();
-        active_physical_plan.swap(data_plane::storage_engines::types::ActivePhysicalPlan {
+    if active_physical_plan.active_snapshot().plan_id() == 0 {
+        let current = active_physical_plan.active_snapshot();
+        active_physical_plan.swap(data_plane::storage_engines::types::RuntimePhysicalPlan {
             envelope: current.envelope.clone(),
             summary_catalog: current.summary_catalog.clone(),
             precompute_plan: current.precompute_plan.clone(),
             transmission_plan: current.transmission_plan.clone(),
-            runtime_config: current.runtime_config.clone(),
+            streaming_config: current.streaming_config.clone(),
             query_plan: current.query_plan.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });
@@ -1196,26 +1116,9 @@ async fn main() -> Result<()> {
         ),
     );
 
-    // Phase-5/6 + Step-2.3: register the Thanos query engine on the
-    // capability router. Path A2 is the only archive path now: when
-    // `ASAP_THANOS_QUERY_URL` is set, the backend forwards
-    // archive-tier PromQL queries to a `thanos-query` sidecar via the
-    // [`ThanosQueryEngine`], registered under the single public id
-    // `thanos_query`.
-    //
-    // The superseded legacy in-process `GorillaQueryEngine` /
-    // `GorillaS3Store` leg (which read the custom GORILLA1 container
-    // format from per-hour chunks on S3 / MinIO) has been deleted now
-    // that Path A2 is verified end-to-end (agents emit XOR-chunk
-    // fragments → backend gorilla-merger → TSDB blocks → S3 →
-    // thanos-query).
-    //
-    // When `ASAP_THANOS_QUERY_URL` is not configured the binary
-    // registers a `NoDataArchiveEngine` stub under `thanos_query`
-    // so cold queries succeed with an empty result instead of
-    // surfacing as `503 NoEngineRegistered`. Operators that want the
-    // original fail-loud behaviour can opt back in by setting
-    // `ASAP_REQUIRE_ARCHIVE_ENGINE=1`.
+    // Register the Thanos forwarder when `ASAP_THANOS_QUERY_URL` is configured.
+    // Otherwise use an empty-result archive stub unless
+    // `ASAP_REQUIRE_ARCHIVE_ENGINE=1` requests fail-loud behavior.
     let mut archive_registered = false;
     match data_plane::query_engines::thanos_query_engine::thanos_engine_from_env() {
         Ok(Some(thanos)) => {
@@ -1266,16 +1169,9 @@ async fn main() -> Result<()> {
     if args.persistence_delete_older_than_secs > 0 {
         server = server.with_data_retention_ms(args.persistence_delete_older_than_secs * 1000);
     }
-    // Backfill registry (sketch DB §10). A single `Arc` lives in
-    // `main` so the HTTP endpoints (Phase 5d) can inspect / cancel
-    // jobs and the upcoming worker pool (Phase 5e) can drain them.
-    // Jobs stay `Queued` until 5e wires the worker — intentional
-    // shadow-mode behaviour that lets operators validate the
-    // control plane's REFRESH dispatch logic before workers exist.
-    // Phase 5g: when `--backfill-persist-path` is set, the registry
-    // loads prior job records from disk and rewrites the file on
-    // every state transition. When unset, the registry is
-    // memory-only and restart wipes job history.
+    // Share the backfill registry between HTTP endpoints and the worker.
+    // `--backfill-persist-path` enables recovery and atomic persistence of job
+    // transitions; without it, job history is memory-only.
     let backfill_registry = Arc::new(match args.backfill_persist_path.as_ref() {
         Some(path) => {
             data_plane::storage_engines::sketch_db::BackfillRegistry::load_or_new(path.clone())
@@ -1284,22 +1180,13 @@ async fn main() -> Result<()> {
     });
     server = server.with_backfill_registry(backfill_registry.clone());
 
-    // Phase 5e: spawn the backfill drain service if requested. When
-    // enabled with `--enable-backfill-worker`, the service picks
-    // up queued jobs and runs them through a
-    // `BackfillWindowProcessor` (real sketch rebuild + store
-    // writes). Without a reader factory configured (Phase 5h), all
-    // production `BackfillSource` variants fail fast with a clear
-    // "no reader" error — still a step up from the old shadow
-    // mode, since the control plane now gets signal that its REFRESH
-    // dispatch was received but not executable.
+    // Start the backfill worker when enabled. Each source needs a reader factory;
+    // unsupported sources fail the job with a missing-reader error.
     let backfill_service_handle = if let (true, Some(_ingest_state)) = (
         args.enable_backfill_worker,
         precompute_ingest_state.as_ref(),
     ) {
-        // Schema retirement #5 — `BackfillService::new` no longer
-        // takes a `SchemaRegistry`; it consults sid-level lifecycle on
-        // `SketchStore` instead.
+        // Backfill uses the shared streaming-config snapshot and sketch store.
         let reader_factory = match args.clickhouse_backfill_table.as_ref() {
             Some(table) => data_plane::storage_engines::sketch_db::clickhouse_reader_factory(
                 data_plane::storage_engines::sketch_db::ClickHouseReaderConfig {
@@ -1322,11 +1209,8 @@ async fn main() -> Result<()> {
             reader_factory,
             data_plane::storage_engines::sketch_db::BackfillServiceConfig::default(),
         )
-        // M2.3.6e — replayed batches land in SketchStore (the only
-        // destination after the M2.3.6g store retirement). Resolver
-        // is the same shared mint authority as live ingest, so
-        // backfilled precompute sids share the OTel namespace.
-        .with_sketch_index(sketch_index.clone())
+        // Backfill and live ingest share the same sid resolver and sketch store.
+        .with_sketch_index(summary_store.clone())
         .with_series_resolver(series_resolver.clone());
         info!(
             "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/OtherSketch fail fast)"
@@ -1341,7 +1225,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Phase 5: schema eviction service. On every poll interval,
+    // schema eviction service. On every poll interval,
     // scans the schema registry for `Expired` schemas, cancels any
     // in-flight backfills targeting them, and drops the agg_id's
     // data from the store. Complements the age-based data retention
@@ -1358,15 +1242,13 @@ async fn main() -> Result<()> {
                 args.persistence_delete_older_than_secs,
             ))
         };
-        // Schema retirement #5 — retention check now uses the
-        // package-level default; per-registry retention overrides are
-        // gone with the agg_id-keyed `SchemaRegistry`.
+        // Compare data retention against the configured retirement retention.
         data_plane::storage_engines::sketch_db::warn_if_retention_inverted(
             data_retention_opt,
             data_plane::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
         );
         let svc = data_plane::storage_engines::sketch_db::SchemaEvictionService::new(
-            sketch_index.clone(),
+            summary_store.clone(),
             backfill_registry.clone(),
             data_plane::storage_engines::sketch_db::SchemaEvictionConfig {
                 poll_interval: std::time::Duration::from_secs(args.schema_eviction_poll_secs),
@@ -1411,7 +1293,7 @@ async fn main() -> Result<()> {
         );
         let accelerator = Arc::new(
             data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan_and_exact_backend(
-                sketch_index.clone(),
+                summary_store.clone(),
                 active_physical_plan.clone(),
                 fallback.clone(),
             ),
@@ -1501,7 +1383,7 @@ fn process_resident_bytes() -> usize {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    sketch_index: Arc<data_plane::storage_engines::sketch_db::index::SketchStore>,
+    summary_store: Arc<data_plane::storage_engines::sketch_db::index::SketchStore>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
     use data_plane::storage_engines::sketch_db::index::persistence::EpochSource;
@@ -1511,10 +1393,9 @@ async fn spawn_memory_diagnostics(
     loop {
         interval.tick().await;
 
-        // 1. SketchStore diagnostics (M2.3.6g — replaces the
-        //    pre-M2.3 per-agg_id SketchStore::diagnostic_info).
-        let instance_count = sketch_index.instance_count();
-        let series_count = sketch_index.series_len();
+        // Per-sid sketch-store diagnostics.
+        let instance_count = summary_store.instance_count();
+        let series_count = summary_store.series_len();
         // `approx_memory_bytes` is the flusher's EVICTABLE-payload gauge:
         // it counts only live sketch payloads (current_epoch + sealed), so
         // it correctly reads ~0 once everything has been flushed to disk.
@@ -1522,8 +1403,8 @@ async fn spawn_memory_diagnostics(
         // per-sid registry + intern caches stay resident and are not
         // flushable. Report evictable payload, structural overhead, their
         // total store estimate, and process RSS ground truth separately.
-        let payload_bytes = sketch_index.approx_memory_bytes();
-        let resident_bytes = sketch_index.approx_resident_bytes();
+        let payload_bytes = summary_store.approx_memory_bytes();
+        let resident_bytes = summary_store.approx_resident_bytes();
         let structural_bytes = resident_bytes.saturating_sub(payload_bytes);
         let rss_bytes = process_resident_bytes();
         info!(

@@ -1,49 +1,19 @@
-//! Sid-level `timeline_for_metric` — schema retirement #1.
+//! Build a metric timeline from sid metadata.
 //!
-//! Produces the same `Vec<TimelineSegment>` shape as
-//! [`SchemaRegistry::timeline_for_metric`](crate::storage_engines::sketch_db::schema::SchemaRegistry::timeline_for_metric)
-//! but reads exclusively from the sid catalog
-//! ([`SketchStore::instances`](crate::storage_engines::sketch_db::index::SketchStore)).
-//! Lets the schema retirement remove the `SchemaRegistry`-keyed
-//! historical timeline without losing the cross-reconfigure query
-//! routing primitive.
+//! Group instances by `(agg_kind, group_by_keys)`, then fold first-seen and
+//! retirement timestamps. A group stays active if any member is active. Sort
+//! groups by start time and clip each segment to the next start, retirement,
+//! and requested time range.
 //!
-//! ## Algorithm
-//!
-//! 1. Snapshot all `SketchInstanceMetadata` for `metric` from the
-//!    sid catalog.
-//! 2. Group by content signature: `(agg_kind, group_by_keys)`. Each
-//!    group corresponds to one logical agg-config (multiple sids of
-//!    the same config share this signature; they differ only in
-//!    attrs values).
-//! 3. For each group, fold the per-sid lifecycle fields into one
-//!    per-group representative:
-//!    - `start_ms` = `min(first_seen_unix_ms)` across the group
-//!    - `retired_at_ms` = `Some(min(retired_at_ms))` iff every sid
-//!      in the group is retired, else `None`
-//!    - `status` = same fold (group is Active if any sid is Active;
-//!      Retired if all retired and none expired; Expired otherwise)
-//! 4. Apply the same segmenting logic as `SchemaRegistry`:
-//!    sort by start_ms, compute `own_end` = `min(next.start_ms,
-//!    self.retired_at_ms, u64::MAX)`, clip to `[t1_ms, t2_ms]`.
-//!
-//! ## `agg_id` field — what we put in it
-//!
-//! `TimelineSegment.agg_id: u64` made sense when timelines were
-//! produced from a `SchemaRegistry` of agg-configs. In the sid model
-//! we don't have a single agg_id per config — we have an
-//! agg-signature (the content tuple `(metric, agg_kind, group_by_keys)`).
-//! For schema-retirement back-compat with HTTP consumers, we surface
-//! a deterministic 64-bit hash of the signature in that field — same
-//! kind of stable-across-restarts content-derived id that PR #151
-//! used for `compute_agg_config_id`.
+//! `TimelineSegment.agg_id` carries a deterministic hash of the metric and
+//! content signature, rather than an individual sid.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use xxhash_rust::xxh64::xxh64;
 
 use crate::storage_engines::sketch_db::data::{AggKind, SketchAlgorithm, SketchConfig};
-use crate::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
+use crate::storage_engines::sketch_db::index::{SketchStore, SummarySeriesMetadata};
 use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 
 /// A single `(agg_id, clipped_range)` segment returned by
@@ -159,7 +129,7 @@ struct SignatureKey {
     encoded: Vec<u8>,
 }
 
-fn signature_key(meta: &SketchInstanceMetadata) -> SignatureKey {
+fn signature_key(meta: &SummarySeriesMetadata) -> SignatureKey {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(meta.metric_name.as_bytes());
     buf.push(0);
@@ -198,7 +168,7 @@ impl Default for AggSignatureGroup {
 }
 
 impl AggSignatureGroup {
-    fn fold_in(&mut self, meta: &SketchInstanceMetadata) {
+    fn fold_in(&mut self, meta: &SummarySeriesMetadata) {
         // Stable signature id: xxh64 over the same canonical encoding
         // `signature_key` uses. Computed lazily on first fold-in;
         // every sid in the group produces the same hash.
@@ -327,8 +297,8 @@ mod tests {
         first_seen: i64,
         retired: Option<u64>,
         expires: Option<u64>,
-    ) -> SketchInstanceMetadata {
-        SketchInstanceMetadata {
+    ) -> SummarySeriesMetadata {
+        SummarySeriesMetadata {
             sid,
             metric_name: metric.into(),
             group_by_keys: BTreeSet::new(),

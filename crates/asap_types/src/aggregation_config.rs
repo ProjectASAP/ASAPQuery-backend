@@ -41,10 +41,8 @@ impl WindowMaterializationLayout {
     }
 
     pub fn validate(&self, window_secs: u64, slide_secs: u64) -> Result<(), String> {
-        if window_secs == 0 || slide_secs == 0 || slide_secs > window_secs {
-            return Err(
-                "window and slide must be positive and slide must not exceed window".into(),
-            );
+        if window_secs == 0 || slide_secs == 0 {
+            return Err("window and slide must be positive".into());
         }
         match self {
             Self::Pane { pane_secs } => {
@@ -89,17 +87,8 @@ impl WindowMaterializationLayout {
     }
 }
 
-/// Per-aggregation policy carried in the streaming config.
-///
-/// **PR 5 (merged-sid-identity refactor)** retired the
-/// controller-allocated `aggregation_id: u64` field. Identity is now
-/// content-addressed via [`PolicyFingerprint`] — derive on demand with
-/// [`PolicyFingerprint::from_config(&cfg)`].
-///
-/// The YAML wire shape no longer carries `aggregationId` (the
-/// controller stopped emitting it in M2.2; this PR makes the backend
-/// stop reading it). Existing fixtures that still spell out
-/// `aggregationId: N` parse cleanly — the field is silently dropped.
+/// Per-aggregation policy with content-derived [`PolicyFingerprint`] identity.
+/// An `aggregationId` field in input YAML is ignored for compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputeMaterialization {
     pub aggregation_type: AggregationType,
@@ -198,24 +187,17 @@ pub struct PrecomputeMaterialization {
 #[derive(Debug, Clone)]
 pub struct AggregationIdInfo {
     /// `PolicyFingerprint::as_u64()` of the key aggregation's config.
-    pub aggregation_id_for_key: u64,
+    pub key_policy_fingerprint: u64,
     /// `PolicyFingerprint::as_u64()` of the value aggregation's config.
-    pub aggregation_id_for_value: u64,
+    pub value_policy_fingerprint: u64,
     pub aggregation_type_for_key: AggregationType,
     pub aggregation_type_for_value: AggregationType,
 }
 
-impl AggregationIdInfo {
-    pub fn policy_fp_for_key(&self) -> PolicyFingerprint {
-        PolicyFingerprint(self.aggregation_id_for_key)
-    }
-    pub fn policy_fp_for_value(&self) -> PolicyFingerprint {
-        PolicyFingerprint(self.aggregation_id_for_value)
-    }
-}
+impl AggregationIdInfo {}
 
 /// Compatibility name for legacy streaming-config and precompute call sites.
-/// New PhysicalPlan code should use [`PrecomputeMaterialization`].
+/// New CompiledPhysicalPlan code should use [`PrecomputeMaterialization`].
 pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {
@@ -361,11 +343,6 @@ impl PrecomputeMaterialization {
     /// addressed identity, NOT a controller-allocated counter id.
     pub fn policy_fp_u64(&self) -> u64 {
         self.policy_fingerprint().as_u64()
-    }
-
-    pub fn with_original_yaml(mut self, yaml: String) -> Self {
-        self.original_yaml = yaml;
-        self
     }
 
     pub fn deserialize_from_json(

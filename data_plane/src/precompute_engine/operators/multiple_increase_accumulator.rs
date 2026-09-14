@@ -23,10 +23,6 @@ impl MultipleIncreaseAccumulator {
         }
     }
 
-    pub fn new_with_increases(increases: HashMap<KeyByLabelValues, IncreaseAccumulator>) -> Self {
-        Self { increases }
-    }
-
     pub fn update(&mut self, key: KeyByLabelValues, accumulator: IncreaseAccumulator) {
         self.increases.insert(key, accumulator);
     }

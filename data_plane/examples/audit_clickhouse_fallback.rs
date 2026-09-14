@@ -7,14 +7,14 @@ use control_plane::{
     query_plan::{ClickHousePlanningContext, QueryPlan},
 };
 use data_plane::{
-    drivers::query::servers::http::{build_active_physical_plan, PhysicalPlanInstallRequest},
+    drivers::query::servers::http::{validate_and_build_runtime_plan, PhysicalPlanInstallRequest},
     query_engines::asap_clickhouse_query_engine::{
         accelerator::CatalogClickHouseAccelerator, ClickHouseAccelerationOutcome,
         ClickHouseAccelerator, ClickHouseHttpFallback, ClickHouseHttpServer,
     },
     storage_engines::{
         sketch_db::index::SketchStore,
-        types::{BackendStorageRouting, HotReloadActivePhysicalPlan},
+        types::{ActivePhysicalPlanHandle, BackendStorageRouting},
     },
 };
 use planner_types::{
@@ -74,7 +74,7 @@ async fn main() {
     let mut precompute_plan =
         PrecomputePlan::build_backend_local(envelope.clone(), vec![]).unwrap();
     precompute_plan.summary_catalog = Some(reference.clone());
-    let mut transmission_plan = control_plane::physical::compiler::compile_transmission_plan(
+    let mut transmission_plan = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute_plan,
         &BTreeMap::new(),
@@ -91,7 +91,7 @@ async fn main() {
         }),
         entries: BTreeMap::new(),
     };
-    let active = build_active_physical_plan(
+    let active = validate_and_build_runtime_plan(
         PhysicalPlanInstallRequest {
             summary_catalog: catalog,
             collector_plans: vec![],
@@ -112,7 +112,7 @@ async fn main() {
     ));
     let accelerator = Arc::new(CatalogClickHouseAccelerator::with_active_physical_plan(
         Arc::new(SketchStore::new()),
-        HotReloadActivePhysicalPlan::new(active),
+        ActivePhysicalPlanHandle::new(active),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

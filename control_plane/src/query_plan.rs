@@ -2,41 +2,19 @@
 //! Serving consumes asap_types::query_plan; compilation stays in this component.
 
 mod clickhouse_exact;
-pub mod logical;
+pub mod residual;
+
 pub use asap_types::query_plan::*;
 #[cfg(test)]
 use asap_types::PolicyFingerprint;
 use planner_types::post_asap::{SummaryExpr, SummaryFamilyType, SummaryNode};
 use planner_types::pre_asap::Reduction;
+#[deprecated(note = "Use query_plan::residual")]
+pub use residual as logical;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::rc::Rc;
-
-pub fn compile_bound<F>(
-    query_id: String,
-    canonical_query: String,
-    root: &Rc<SummaryNode>,
-    instant: InstantExecution,
-    fallback: FallbackPolicy,
-    bind: F,
-) -> Result<QueryPlanEntry, QueryPlanError>
-where
-    F: FnMut(
-        &Rc<SummaryNode>,
-        &SummaryFamilyType,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
-{
-    compile_bound_mapped(
-        query_id,
-        canonical_query,
-        root,
-        instant,
-        fallback,
-        bind,
-        |_, _| {},
-    )
-}
 
 pub fn compile_bound_mapped<F, G>(
     query_id: String,
@@ -74,33 +52,6 @@ where
         instant,
         fallback,
     })
-}
-
-pub fn compile_bound_relational<F>(
-    query_id: String,
-    canonical_query: String,
-    root: &Rc<SummaryNode>,
-    fixed_evaluation: FixedEvaluationRange,
-    instant: InstantExecution,
-    fallback: FallbackPolicy,
-    bind: F,
-) -> Result<QueryPlanEntry, QueryPlanError>
-where
-    F: FnMut(
-        &Rc<SummaryNode>,
-        &SummaryFamilyType,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
-{
-    compile_bound_relational_mapped(
-        query_id,
-        canonical_query,
-        root,
-        fixed_evaluation,
-        instant,
-        fallback,
-        bind,
-        |_, _| {},
-    )
 }
 
 /// Preserve Planner-to-runtime node identities for installed SQL DAGs.
@@ -143,33 +94,6 @@ where
     })
 }
 
-/// Compile selected summary nodes and verified native residuals into one DAG.
-/// This is a distinct physical alternative; native execution remains available.
-pub fn compile_bound_composable<F>(
-    query_id: String,
-    canonical_query: String,
-    root: &Rc<SummaryNode>,
-    instant: InstantExecution,
-    fallback: FallbackPolicy,
-    bind: F,
-) -> Result<QueryPlanEntry, QueryPlanError>
-where
-    F: FnMut(
-        &Rc<SummaryNode>,
-        &SummaryFamilyType,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
-{
-    compile_bound_composable_mapped(
-        query_id,
-        canonical_query,
-        root,
-        instant,
-        fallback,
-        bind,
-        |_, _| {},
-    )
-}
-
 /// Compile a composable query while exposing the stable mapping from
 /// Planner semantic nodes to installed query nodes. The control-plane
 /// physical compiler uses this to persist backend placement without
@@ -210,7 +134,7 @@ where
         instant,
         fallback,
     };
-    logical::finalize_residuals(&mut entry)?;
+    residual::finalize_residuals(&mut entry)?;
     Ok(entry)
 }
 
@@ -312,19 +236,19 @@ where
             {
                 // Use the original exact subtree when its semantic identity can
                 // be proved; otherwise the explicit fallback below retries the query.
-                logical::selected_residual_nodes(original, node).ok()
+                residual::selected_residual_nodes(original, node).ok()
             }
             (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
-                Some(logical::residual_nodes(original, expr)?)
+                Some(residual::residual_nodes(original, expr)?)
             }
             (Some(original), SummaryExpr::SummaryAgg { child, .. })
                 if matches!(child.expr, SummaryExpr::KeepPreAsap(_))
                     && !matches!(
-                        crate::physical::compiler::materialization_leaf_contract(node),
+                        crate::physical::compiler::raw_materialization_input_contract(node),
                         Ok((_, Some(_), _))
                     ) =>
             {
-                Some(logical::selected_residual_nodes(original, node)?)
+                Some(residual::selected_residual_nodes(original, node)?)
             }
             _ => None,
         };
@@ -406,11 +330,11 @@ where
             } if measures.len() == 1 => {
                 use planner_types::pre_asap::AggIntent;
                 let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => logical::Aggregation::Sum,
-                    AggIntent::Count { .. } => logical::Aggregation::Count,
-                    AggIntent::Min { .. } => logical::Aggregation::Min,
-                    AggIntent::Max { .. } => logical::Aggregation::Max,
-                    AggIntent::Avg { .. } => logical::Aggregation::Avg,
+                    AggIntent::Sum { .. } => residual::Aggregation::Sum,
+                    AggIntent::Count { .. } => residual::Aggregation::Count,
+                    AggIntent::Min { .. } => residual::Aggregation::Min,
+                    AggIntent::Max { .. } => residual::Aggregation::Max,
+                    AggIntent::Avg { .. } => residual::Aggregation::Avg,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported exact value aggregation".into(),
@@ -439,9 +363,9 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 QueryPlanNode::Logical {
-                    operator: logical::LogicalOperator::Aggregate {
+                    operator: residual::ResidualQueryOperator::Aggregate {
                         operation,
-                        grouping: logical::Grouping {
+                        grouping: residual::Grouping {
                             labels,
                             without: keys.is_without(),
                         },
@@ -503,11 +427,11 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 QueryPlanNode::Logical {
-                    operator: logical::LogicalOperator::TopKSelection {
+                    operator: residual::ResidualQueryOperator::TopKSelection {
                         k: u64::try_from(*n).map_err(|_| {
                             QueryPlanError::Invalid("TopK limit exceeds u64".into())
                         })?,
-                        grouping: logical::Grouping {
+                        grouping: residual::Grouping {
                             labels,
                             without: partition_by.is_without(),
                         },
@@ -520,7 +444,7 @@ where
                 operation: planner_types::post_asap::ValueOperation::Sort { keys, .. },
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
             } if keys.len() == 1 => QueryPlanNode::Logical {
-                operator: logical::LogicalOperator::Sort {
+                operator: residual::ResidualQueryOperator::Sort {
                     descending: !keys[0].ascending,
                 },
                 inputs: vec![self.lower(child)?],
@@ -615,7 +539,7 @@ where
                     k: u64::try_from(*k).map_err(|_| {
                         QueryPlanError::Invalid("CandidateTopK k exceeds u64".into())
                     })?,
-                    grouping: logical::Grouping {
+                    grouping: residual::Grouping {
                         labels,
                         without: grouping.is_without(),
                     },
@@ -628,7 +552,7 @@ where
                 operator,
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
             } if self.logical_source.is_some() => {
-                let operator = logical::binary_operator(operator)?;
+                let operator = residual::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,
                     inputs: vec![self.lower(lhs)?, self.lower(rhs)?],
@@ -648,7 +572,7 @@ where
                     planner_types::post_asap::ExactKind::Sum
                         | planner_types::post_asap::ExactKind::Count
                 ) {
-                    let operator = logical::selected_aggregate_operator(
+                    let operator = residual::selected_aggregate_operator(
                         self.logical_source.as_deref().unwrap(),
                         node,
                     )?;
@@ -663,8 +587,8 @@ where
                     return Ok(id);
                 }
                 let operation = match kind {
-                    planner_types::post_asap::ExactKind::Sum => logical::Aggregation::Sum,
-                    planner_types::post_asap::ExactKind::Count => logical::Aggregation::Count,
+                    planner_types::post_asap::ExactKind::Sum => residual::Aggregation::Sum,
+                    planner_types::post_asap::ExactKind::Count => residual::Aggregation::Count,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported aggregation over selected summary values".into(),
@@ -691,9 +615,9 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 QueryPlanNode::Logical {
-                    operator: logical::LogicalOperator::Aggregate {
+                    operator: residual::ResidualQueryOperator::Aggregate {
                         operation,
-                        grouping: logical::Grouping {
+                        grouping: residual::Grouping {
                             labels,
                             without: keys.is_without(),
                         },
@@ -829,7 +753,7 @@ where
                         Err(error) => {
                             if let Some(original) = &self.logical_source {
                                 let (root, nodes) =
-                                    logical::selected_residual_nodes(original, node)?;
+                                    residual::selected_residual_nodes(original, node)?;
                                 return self.graft(id, root, nodes);
                             }
                             return Err(error);
@@ -1067,6 +991,179 @@ fn physical_grouping(
 }
 
 #[cfg(test)]
+mod catalog_binding_tests {
+    use super::*;
+    use crate::physical::summary_catalog::SummaryCatalog;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+
+    fn fixture() -> (QueryPlan, SummaryCatalog) {
+        let mut config = PrecomputeMaterialization::new(
+            AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["job".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            10,
+            10,
+            WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        config.pane_origin_ms = Some(0);
+        let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
+        let entry = QueryPlanEntry {
+            language: crate::query_plan::QueryLanguage::PromQl,
+            query_id: "q".into(),
+            canonical_query: "sum_over_time(m[1m])".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(1),
+            nodes: BTreeMap::from([(
+                QueryNodeId(1),
+                QueryPlanNode::ReadMaterialization {
+                    binding: MaterializationBinding {
+                        full_window_slide_ms: None,
+                        item_labels: Vec::new(),
+                        materialization: config.policy_fingerprint().into(),
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 10_000,
+                        pane_origin_ms: Some(0),
+                        readout_lookback_ms: Some(60_000),
+                    },
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 60_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        (
+            QueryPlan {
+                plan_id: 7,
+                plan_version: 2,
+                clickhouse_context: None,
+                entries: BTreeMap::from([(entry.canonical_query.clone(), entry)]),
+            },
+            catalog,
+        )
+    }
+    fn binding(plan: &mut QueryPlan) -> &mut MaterializationBinding {
+        let QueryPlanNode::ReadMaterialization { binding } = plan
+            .entries
+            .values_mut()
+            .next()
+            .unwrap()
+            .nodes
+            .values_mut()
+            .next()
+            .unwrap()
+        else {
+            panic!("fixture")
+        };
+        binding
+    }
+
+    // One pane ID is compatible with a longer semantic readout window.
+    #[test]
+    fn catalog_binding_round_trip_preserves_pane_and_readout_windows() {
+        let (plan, catalog) = fixture();
+        let wire = serde_json::to_vec(&plan).unwrap();
+        let mut decoded: QueryPlan = serde_json::from_slice(&wire).unwrap();
+        decoded.validate_against_catalog(&catalog).unwrap();
+        assert_eq!(
+            decoded
+                .lookup("sum_over_time(m[1m])")
+                .unwrap()
+                .canonical_query,
+            "sum_over_time(m[1m])"
+        );
+        assert!(String::from_utf8(wire).unwrap().contains("canonical_query"));
+        assert_eq!(binding(&mut decoded).window_ms, 10_000);
+        assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
+    }
+
+    // The catalog owns source and grouping; the binding owns only its stable ID.
+    #[test]
+    fn catalog_binding_rejects_source_grouping_and_identity_drift() {
+        let (plan, catalog) = fixture();
+        let mut broken = plan.clone();
+        binding(&mut broken).materialization = PolicyFingerprint(123).into();
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan.clone();
+        broken.plan_version += 1;
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan;
+        binding(&mut broken).window_ms = 0;
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+    }
+
+    // Catalog descriptor corruption must fail even if the materialization exists.
+    #[test]
+    fn catalog_binding_rejects_broken_descriptor_reference() {
+        let (plan, mut catalog) = fixture();
+        catalog.summary_descriptors.clear();
+        assert!(plan.validate_against_catalog(&catalog).is_err());
+    }
+
+    #[test]
+    fn counter_readout_requires_counter_sds_fidelity() {
+        fn as_rate_plan(mut plan: QueryPlan) -> QueryPlan {
+            let entry = plan.entries.values_mut().next().unwrap();
+            let read = entry.root;
+            let root = QueryNodeId(2);
+            entry.root = root;
+            entry.nodes.insert(
+                root,
+                QueryPlanNode::ExactReadout {
+                    input: read,
+                    readout: ExactReadout::Rate,
+                },
+            );
+            plan
+        }
+
+        let (sum_plan, sum_catalog) = fixture();
+        assert!(as_rate_plan(sum_plan)
+            .validate_against_catalog(&sum_catalog)
+            .unwrap_err()
+            .to_string()
+            .contains("exact counter SDS"));
+
+        let mut counter = PrecomputeMaterialization::new(
+            AggregationType::Increase,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["job".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            10,
+            10,
+            WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        counter.pane_origin_ms = Some(0);
+        let counter_catalog =
+            SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
+        let (mut counter_plan, _) = fixture();
+        binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
+        as_rate_plan(counter_plan)
+            .validate_against_catalog(&counter_catalog)
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1074,8 +1171,12 @@ mod tests {
     fn guarded_division_falls_back_in_both_query_compilers() {
         // Neither installed binary representation can retain Planner's division guards.
         let query = "avg_over_time(m[5m])";
-        let roots = crate::asap_tier_implement::implement_promql_for_asap_tier(query).unwrap();
-        let root = &roots[0];
+        let canonical = crate::query_parser::parse_query_expr_canonical(
+            query,
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let root = crate::planner_selection::select_summary_default(&canonical).unwrap();
         let SummaryExpr::BinaryOp { operator, .. } = &root.expr else {
             panic!("expected the Planner's average rewrite");
         };
@@ -1096,6 +1197,7 @@ mod tests {
                 };
                 let bind = |_: &Rc<SummaryNode>, _: &SummaryFamilyType| {
                     Ok(MaterializationBinding {
+                        full_window_slide_ms: None,
                         materialization: PolicyFingerprint(7).into(),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
@@ -1105,28 +1207,30 @@ mod tests {
                     })
                 };
                 let entry = if composable {
-                    compile_bound_composable(
+                    compile_bound_composable_mapped(
                         "guarded".into(),
                         query.into(),
                         &guarded,
                         instant,
                         FallbackPolicy::ExactBackend,
                         bind,
+                        |_, _| {},
                     )
                 } else {
-                    compile_bound(
+                    compile_bound_mapped(
                         "guarded".into(),
                         query.into(),
                         &guarded,
                         instant,
                         FallbackPolicy::ExactBackend,
                         bind,
+                        |_, _| {},
                     )
                 }
                 .unwrap();
                 if composable && !relative {
                     let QueryPlanNode::Logical {
-                        operator: logical::LogicalOperator::ExactSubquery { query: exact_query },
+                        operator: residual::LogicalOperator::ExactSubquery { query: exact_query },
                         ..
                     } = &entry.nodes[&entry.root]
                     else {
@@ -1294,7 +1398,7 @@ mod tests {
                     QueryPlanNode::CandidateTopK {
                         inputs: [QueryNodeId(0), QueryNodeId(1)],
                         k: 2,
-                        grouping: logical::Grouping {
+                        grouping: residual::Grouping {
                             labels: vec![],
                             without: false,
                         },
@@ -1322,177 +1426,5 @@ mod tests {
             fallback: FallbackPolicy::ExactBackend,
         };
         assert!(entry.validate(&BTreeSet::new()).is_err());
-    }
-}
-
-#[cfg(test)]
-mod catalog_binding_tests {
-    use super::*;
-    use crate::physical::summary_catalog::SummaryCatalog;
-    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-
-    fn fixture() -> (QueryPlan, SummaryCatalog) {
-        let mut config = PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            Default::default(),
-            KeyByLabelNames::new(vec!["job".into()]),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            10,
-            10,
-            WindowKind::Tumbling,
-            String::new(),
-            "m".into(),
-            None,
-            None,
-            None,
-        );
-        config.pane_origin_ms = Some(0);
-        let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
-        let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
-            query_id: "q".into(),
-            canonical_query: "sum_over_time(m[1m])".into(),
-            fixed_evaluation: None,
-            root: QueryNodeId(1),
-            nodes: BTreeMap::from([(
-                QueryNodeId(1),
-                QueryPlanNode::ReadMaterialization {
-                    binding: MaterializationBinding {
-                        item_labels: Vec::new(),
-                        materialization: config.policy_fingerprint().into(),
-                        output_grouping: PhysicalGrouping::PerEntity,
-                        window_ms: 10_000,
-                        pane_origin_ms: Some(0),
-                        readout_lookback_ms: Some(60_000),
-                    },
-                },
-            )]),
-            instant: InstantExecution {
-                lookback_ms: 60_000,
-                full_history: false,
-                cumulative_readout: true,
-            },
-            fallback: FallbackPolicy::ExactBackend,
-        };
-        (
-            QueryPlan {
-                plan_id: 7,
-                plan_version: 2,
-                clickhouse_context: None,
-                entries: BTreeMap::from([(entry.canonical_query.clone(), entry)]),
-            },
-            catalog,
-        )
-    }
-    fn binding(plan: &mut QueryPlan) -> &mut MaterializationBinding {
-        let QueryPlanNode::ReadMaterialization { binding } = plan
-            .entries
-            .values_mut()
-            .next()
-            .unwrap()
-            .nodes
-            .values_mut()
-            .next()
-            .unwrap()
-        else {
-            panic!("fixture")
-        };
-        binding
-    }
-
-    // One pane ID is compatible with a longer semantic readout window.
-    #[test]
-    fn catalog_binding_round_trip_preserves_pane_and_readout_windows() {
-        let (plan, catalog) = fixture();
-        let wire = serde_json::to_vec(&plan).unwrap();
-        let mut decoded: QueryPlan = serde_json::from_slice(&wire).unwrap();
-        decoded.validate_against_catalog(&catalog).unwrap();
-        assert_eq!(
-            decoded
-                .lookup("sum_over_time(m[1m])")
-                .unwrap()
-                .canonical_query,
-            "sum_over_time(m[1m])"
-        );
-        assert!(String::from_utf8(wire).unwrap().contains("canonical_query"));
-        assert_eq!(binding(&mut decoded).window_ms, 10_000);
-        assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
-    }
-
-    // The catalog owns source and grouping; the binding owns only its stable ID.
-    #[test]
-    fn catalog_binding_rejects_source_grouping_and_identity_drift() {
-        let (plan, catalog) = fixture();
-        let mut broken = plan.clone();
-        binding(&mut broken).materialization = PolicyFingerprint(123).into();
-        assert!(broken.validate_against_catalog(&catalog).is_err());
-        let mut broken = plan.clone();
-        broken.plan_version += 1;
-        assert!(broken.validate_against_catalog(&catalog).is_err());
-        let mut broken = plan;
-        binding(&mut broken).window_ms = 0;
-        assert!(broken.validate_against_catalog(&catalog).is_err());
-    }
-
-    // Catalog descriptor corruption must fail even if the materialization exists.
-    #[test]
-    fn catalog_binding_rejects_broken_descriptor_reference() {
-        let (plan, mut catalog) = fixture();
-        catalog.summary_descriptors.clear();
-        assert!(plan.validate_against_catalog(&catalog).is_err());
-    }
-
-    #[test]
-    fn counter_readout_requires_counter_sds_fidelity() {
-        fn as_rate_plan(mut plan: QueryPlan) -> QueryPlan {
-            let entry = plan.entries.values_mut().next().unwrap();
-            let read = entry.root;
-            let root = QueryNodeId(2);
-            entry.root = root;
-            entry.nodes.insert(
-                root,
-                QueryPlanNode::ExactReadout {
-                    input: read,
-                    readout: ExactReadout::Rate,
-                },
-            );
-            plan
-        }
-
-        let (sum_plan, sum_catalog) = fixture();
-        assert!(as_rate_plan(sum_plan)
-            .validate_against_catalog(&sum_catalog)
-            .unwrap_err()
-            .to_string()
-            .contains("exact counter SDS"));
-
-        let mut counter = PrecomputeMaterialization::new(
-            AggregationType::Increase,
-            String::new(),
-            Default::default(),
-            KeyByLabelNames::new(vec!["job".into()]),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            10,
-            10,
-            WindowKind::Tumbling,
-            String::new(),
-            "m".into(),
-            None,
-            None,
-            None,
-        );
-        counter.pane_origin_ms = Some(0);
-        let counter_catalog =
-            SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
-        let (mut counter_plan, _) = fixture();
-        binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
-        as_rate_plan(counter_plan)
-            .validate_against_catalog(&counter_catalog)
-            .unwrap();
     }
 }

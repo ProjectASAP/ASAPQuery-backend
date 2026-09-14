@@ -1,19 +1,21 @@
-//! `SummaryNode` lowering + execution + conversion into `ASAPTierResult`'s
-//! `(series, coverage)` shape — the core `live_serve.rs` (the serving
-//! cutover) calls into.
+//! Execute installed query DAGs and project their values and coverage.
 
 use std::collections::BTreeMap;
 
 use crate::utils::arithmetic::evaluate_float64_arithmetic as arithmetic;
 
-use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
 use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
-use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
-use crate::query_engines::asap_query_engine::post_asap_planner::{
-    execution_hints, plan_promql_to_post_asap, LoweringSkip,
-};
+/// A planned warm query cannot be served; callers may route to an exact backend.
+#[derive(Debug)]
+pub enum LoweringSkip {
+    Disabled,
+    QueryNotPlanned(String),
+    InvalidQueryPlan(String),
+    MaterializationNotReady(String),
+    ExecuteFailed(String),
+}
 use crate::query_engines::asap_query_engine::summary_executor::{
     GroupState, QueryExecutionContext, SummaryExecutorError, SummaryValue,
 };
@@ -23,65 +25,17 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 /// where `samples` is `(window_end_unix_ms, value)`.
 pub type SeriesRows = Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>;
 
-/// The result of lowering + executing a query through
-/// `SummaryExecutor`, converted into the same shape `ASAPTierResult`
-/// uses, regardless of whether the answer came from the sketch
-/// (`ExecOutcome::Value`) or `ExactAgg` (`ExecOutcome::State`) side —
-/// callers that only care about "did this answer the query, and is it
-/// safe to trust" don't need to know which.
-/// NOTE — this used to carry an `ambiguous_merge_risk` flag, and
-/// `live_serve.rs` used it to DECLINE to serve an ambiguous shape.
-/// That gate is now removed, because the ambiguity it guarded against no
-/// longer exists.
+/// Summary execution result projected into `ASAPTierResult`, for both sketch
+/// values and exact accumulator states.
 ///
-/// It existed because an empty `by: Vec<ColumnId>` was indistinguishable
-/// between "no grouping concept applies" (the group split is correct) and
-/// "an aggregation operator asked to reduce everything" (the groups
-/// should have been merged) — exactly
-/// [ASAPController#163](https://github.com/ProjectASAP/ASAPController/issues/163).
-/// Unable to tell which, the safe move was to fall back to the legacy
-/// path whenever an empty `by` produced >1 group.
-///
-/// ASAPController#165 removed that ambiguity at the source by making the
-/// reduction kind explicit (`Reduction::{PerEntity, Reduce(GroupKeys)}`),
-/// and `summary_executor.rs::resolve_group_key` now acts on it directly.
-/// Both branches are resolved correctly BEFORE reaching here:
-///
-/// * `PerEntity` — the multi-group split is definitionally right (one row
-///   per entity, never merged), so it was never a "risk" to begin with.
-/// * `Reduce([])` — every candidate shares one group key, so the outcome
-///   has exactly ONE group and the old `values.len() > 1` trigger cannot
-///   fire at all.
-///
-/// The flag would therefore be unconditionally `false` today; keeping it
-/// would mean keeping a heuristic that can only ever misfire (declining
-/// correct `PerEntity` answers) now that the real signal is available.
+/// Grouping is resolved before this projection: `PerEntity` preserves each
+/// entity, while `Reduce([])` merges every candidate into a single group.
 pub struct PostAsapReadoutOutcome {
     pub series: SeriesRows,
     pub coverage: Option<(u64, u64)>,
 }
 
-/// Ask ASAPPlanner for the post-ASAP representation of `query`, execute it
-/// against `index` over `[t0_ms, t1_ms]`, and
-/// convert the result into `PostAsapReadoutOutcome`. `Err` covers every reason
-/// this couldn't produce a trustworthy answer — see `LoweringSkip`'s
-/// variants; every one of them means "fall back to the legacy path,"
-/// never "the legacy path is wrong."
-pub fn execute_post_asap_readout(
-    index: &SketchStore,
-    query: &str,
-    t0_ms: u64,
-    t1_ms: u64,
-    is_cumulative: bool,
-    accuracy: AccuracyTarget,
-) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let node = plan_promql_to_post_asap(index, query, accuracy.clone())?;
-    execute_planned_post_asap(index, &node, query, accuracy, t0_ms, t1_ms, is_cumulative)
-}
-
-/// Execute an already-bound QueryPlan entry.  This is the production serving
-/// path: no PromQL lowering, planner cost model, observed-family lookup, or
-/// Installed QueryPlan materialization resolution occurs before this legacy test helper.
+/// Execute the materializations and readouts bound in an installed QueryPlan entry.
 pub fn execute_query_plan_readout(
     index: &SketchStore,
     entry: &asap_types::query_plan::QueryPlanEntry,
@@ -632,80 +586,6 @@ fn execute_physical_query_payload(
     result
 }
 
-/// Plan and execute an instant query without consulting the legacy candidate
-/// analyzer. Lookback and cumulative-vs-per-window behavior come from the
-/// post-ASAP DAG itself.
-pub fn execute_post_asap_instant(
-    index: &SketchStore,
-    query: &str,
-    now_ms: u64,
-    accuracy: AccuracyTarget,
-) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
-    const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
-    let node = plan_promql_to_post_asap(index, query, accuracy.clone())?;
-    let hints = execution_hints(&node);
-    let t0_ms = if hints.full_history {
-        0
-    } else {
-        now_ms.saturating_sub(hints.lookback_ms.unwrap_or(DEFAULT_LOOKBACK_MS))
-    };
-    let outcome = execute_planned_post_asap(
-        index,
-        &node,
-        query,
-        accuracy,
-        t0_ms,
-        now_ms,
-        hints.cumulative_readout,
-    )?;
-    Ok((outcome, t0_ms))
-}
-
-fn execute_planned_post_asap(
-    index: &SketchStore,
-    node: &planner_types::post_asap::SummaryNode,
-    query: &str,
-    accuracy: AccuracyTarget,
-    t0_ms: u64,
-    t1_ms: u64,
-    is_cumulative: bool,
-) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let _ = (query, accuracy);
-    let allowed_materializations = None;
-    let ctx = QueryExecutionContext {
-        index,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-        allowed_materializations,
-    };
-
-    match execute(node, &ctx) {
-        Ok(ExecOutcome::Value(values)) => {
-            let mut coverage: Option<(u64, u64)> = None;
-            let mut series = Vec::new();
-            for (group_key, value) in &values {
-                fold_coverage(&mut coverage, value.coverage());
-                series.extend(summary_value_to_series(group_key, value));
-            }
-            Ok(PostAsapReadoutOutcome { series, coverage })
-        }
-        Ok(ExecOutcome::State(groups)) => {
-            let mut coverage: Option<(u64, u64)> = None;
-            let mut series = Vec::new();
-            for (group_key, state, _family) in &groups {
-                fold_coverage(&mut coverage, state.exact_coverage());
-                let Some(value) = state.exact_value(&None) else {
-                    continue;
-                };
-                series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
-            }
-            Ok(PostAsapReadoutOutcome { series, coverage })
-        }
-        Err(e) => Err(LoweringSkip::ExecuteFailed(format!("{e:?}"))),
-    }
-}
-
 /// `SummaryValue::Points`/`TopK` -> `ASAPTierResult.series`'s row shape.
 /// `TopK`'s ranked-list-per-timestamp shape is pivoted into one row per
 /// item (each row = the group's label map plus an `item` label, one point
@@ -750,6 +630,8 @@ pub(crate) fn fold_coverage(coverage: &mut Option<(u64, u64)>, next: Option<(u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_engines::asap_query_engine::test_plan;
+    use asap_types::query_plan::{ExactReadout, PhysicalGrouping, QueryReadout};
     use planner_types::pre_asap::ArithmeticOpKind;
 
     fn exact_points(metric: &str, service: &str, value: f64) -> PhysicalQueryOutput {
@@ -860,12 +742,8 @@ mod tests {
     }
     use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata, SketchSampleState,
+        AccuracyBound, Capability, SketchAlgorithm, SketchSampleState, SummarySeriesMetadata,
     };
-
-    fn accuracy() -> AccuracyTarget {
-        AccuracyTarget::Epsilon(0.01)
-    }
 
     fn register_hll(idx: &SketchStore, sid: u64, service: &str, items: &[&str]) {
         // precision 14 -- what `ControlPlaneCostModel` actually picks for
@@ -877,7 +755,7 @@ mod tests {
         let cfg = SketchConfig::Hll { precision: 14 };
         let mut group_by_keys = std::collections::BTreeSet::new();
         group_by_keys.insert("service".to_string());
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid,
             metric_name: "unique_users".to_string(),
             group_by_keys,
@@ -919,7 +797,7 @@ mod tests {
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
@@ -1000,6 +878,7 @@ mod tests {
                     QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: MaterializationBinding {
+                            full_window_slide_ms: None,
                             materialization: config.policy_fingerprint().into(),
                             output_grouping: PhysicalGrouping::PerEntity,
                             item_labels: vec![],
@@ -1041,82 +920,89 @@ mod tests {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "api", &["a", "b"]);
         register_hll(&idx, 2, "worker", &["b", "c"]);
-        let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy())
-            .expect("compile-stage fixture");
-        let canonical = asap_types::query_plan::canonical_promql("count(unique_users)").unwrap();
-        let entry = control_plane::query_plan::compile_bound(
-            "q-cardinality".into(),
-            canonical,
-            &node,
-            asap_types::query_plan::InstantExecution {
-                lookback_ms: 60_000,
-                full_history: false,
-                cumulative_readout: true,
+        let config = crate::query_engines::asap_query_engine::test_plan::materialization(
+            "unique_users",
+            "HLL",
+            serde_json::json!({"precision": 14}),
+            &["service"],
+            1000,
+        );
+        let entry = crate::query_engines::asap_query_engine::test_plan::entry(
+            "count(distinct_over_time(unique_users[1m]))",
+            &config,
+            asap_types::query_plan::PhysicalGrouping::PerEntity,
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: asap_types::query_plan::QueryReadout::Cardinality,
             },
-            asap_types::query_plan::FallbackPolicy::ExactBackend,
-            |_node, _family| {
-                Ok(asap_types::query_plan::MaterializationBinding {
-                    item_labels: Vec::new(),
-                    materialization: asap_types::PolicyFingerprint(123).into(),
-                    output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
-                    window_ms: 60_000,
-                    pane_origin_ms: Some(2_000),
-                    readout_lookback_ms: Some(60_000),
-                })
-            },
-        )
-        .unwrap();
+        );
+        crate::query_engines::asap_query_engine::test_plan::install(
+            &idx,
+            &[(config, vec![1])],
+            vec![entry.clone()],
+        );
         let result = execute_query_plan_readout(&idx, &entry, 1_000, 2_000, true)
             .expect("execute formal QueryPlan");
-        assert!(!result.series.is_empty());
+        assert_eq!(result.series.len(), 1, "unbound policy must not contribute");
+        assert_eq!(
+            result.series[0].0.get("service").map(String::as_str),
+            Some("api")
+        );
+        assert!((result.series[0].1[0].1 - 2.0).abs() < 0.1);
     }
 
     #[test]
     fn bare_range_function_keeps_one_series_per_entity() {
         let idx = ddsketch_fixture();
-        let outcome = execute_post_asap_readout(
-            &idx,
-            "quantile_over_time(0.99, latency_ms[1m])",
-            1_000,
-            2_000,
-            true,
-            accuracy(),
-        )
-        .expect("should execute");
+        let config = test_plan::materialization(
+            "latency_ms",
+            "DDSketch",
+            serde_json::json!({"alpha": 0.01}),
+            &[],
+            1000,
+        );
+        let entry = test_plan::entry(
+            "quantile_over_time(0.99, latency_ms[1s])",
+            &config,
+            PhysicalGrouping::PerEntity,
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Quantile { q: 0.99 },
+            },
+        );
+        test_plan::install(&idx, &[(config, vec![1])], vec![entry.clone()]);
+        let outcome = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
         assert_eq!(outcome.series.len(), 1);
     }
 
     #[test]
     fn global_merge_shape_now_merges_instead_of_being_declined() {
-        // The exact ASAPController#163 shape: two HLL sids, no explicit
-        // by(), an aggregation-operator query. This test previously
-        // asserted `ambiguous_merge_risk == true` and TWO unmerged series
-        // -- i.e. it pinned the old workaround, where an empty `by` left
-        // `find_candidates` unable to tell "reduce everything" apart from
-        // "no grouping concept," so `live_serve` declined to serve the
-        // shape at all.
-        //
-        // With `Reduction` (ASAPController#165) that ambiguity is gone:
-        // the outer aggregator is a genuine reduction, so it lowers to
-        // `Reduce([])` and `resolve_group_key` gives every candidate the
-        // SAME group key -- the two sids MERGE into one answer, which is
-        // what the query actually asked for. No gate, no fallback.
-        //
-        // The distinct-count idiom is `count(distinct_over_time(v[w]))`;
-        // bare `count(v)` is a row count upstream and an HLL sid rightly
-        // cannot serve it.
+        // An ungrouped count reduces two HLL sids into one answer. `Reduce([])`
+        // assigns both candidates the same group key so their states merge.
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let outcome = execute_post_asap_readout(
-            &idx,
+        let config = test_plan::materialization(
+            "unique_users",
+            "HLL",
+            serde_json::json!({"precision": 14}),
+            &["service"],
+            1000,
+        );
+        let entry = test_plan::entry(
             "count(distinct_over_time(unique_users[1m]))",
-            1_000,
-            2_000,
-            true,
-            accuracy(),
-        )
-        .expect("should execute");
+            &config,
+            PhysicalGrouping::Reduce(vec![]),
+            1000,
+            QueryPlanNode::SummaryEstimate {
+                input: QueryNodeId(0),
+                query: QueryReadout::Cardinality,
+            },
+        );
+        test_plan::install(&idx, &[(config, vec![1, 2])], vec![entry.clone()]);
+        let outcome = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
         assert_eq!(
             outcome.series.len(),
             1,
@@ -1137,7 +1023,7 @@ mod tests {
     fn exact_agg_outcome_reports_window_end_coverage() {
         let idx = SketchStore::new();
         idx.register(
-            crate::storage_engines::sketch_db::index::SketchInstanceMetadata {
+            crate::storage_engines::sketch_db::index::SummarySeriesMetadata {
                 sid: 1,
                 metric_name: "bytes_total".to_string(),
                 group_by_keys: std::collections::BTreeSet::new(),
@@ -1160,9 +1046,20 @@ mod tests {
             (1_000, 2_000),
             Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
         );
-        let outcome =
-            execute_post_asap_readout(&idx, "sum(bytes_total)", 1_000, 2_000, true, accuracy())
-                .expect("should execute");
+        let config =
+            test_plan::materialization("bytes_total", "Sum", serde_json::json!({}), &[], 1000);
+        let entry = test_plan::entry(
+            "sum(bytes_total)",
+            &config,
+            PhysicalGrouping::Reduce(vec![]),
+            1000,
+            QueryPlanNode::ExactReadout {
+                input: QueryNodeId(0),
+                readout: ExactReadout::Sum,
+            },
+        );
+        test_plan::install(&idx, &[(config, vec![1])], vec![entry.clone()]);
+        let outcome = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
         // Window-end-only coverage: a single window (1_000, 2_000) is
         // keyed by its end (2_000) alone, so both bounds equal 2_000 --
         // same semantics as `SummaryValue::coverage()`, reconfirmed for
@@ -1170,10 +1067,110 @@ mod tests {
         assert_eq!(outcome.coverage, Some((2_000, 2_000)));
     }
 
+    // Exercise the compiled plan and runtime bucket assignment against raw integer samples.
+    #[test]
+    fn compiled_window_schedules_execute_exact_ranges() {
+        use crate::precompute_engine::window_manager::WindowManager;
+        use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+        for evaluation_secs in [20, 45, 60, 120, 90] {
+            for phase_ms in [0, 5_000] {
+                for full in [false, true] {
+                    if full && evaluation_secs == 60 {
+                        continue;
+                    }
+                    let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
+                        "../../../../docs/examples/asapquery-planning-snapshot.json"
+                    ))
+                    .unwrap();
+                    let entry = &mut snapshot["query_workload"]["repeating_queries"][0];
+                    entry["query"] = serde_json::json!("sum_over_time(a[1m])");
+                    entry["requirements"]["accuracy"]["explicit"] = serde_json::json!("Exact");
+                    entry["demand"]["fixed_interval_at"] = serde_json::json!({
+                        "interval": evaluation_secs * 1_000, "evaluation_phase": phase_ms
+                    });
+                    let snapshot: BackendLocalPlanningInput =
+                        serde_json::from_value(snapshot).unwrap();
+                    let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+                    request.queries[0]
+                        .window_realization_candidates
+                        .retain(|c| {
+                            matches!(
+                                c.layout,
+                                asap_types::WindowMaterializationLayout::FullWindow
+                            ) == full
+                        });
+                    let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+                    let config = &plan.precompute_plan.materializations[0];
+                    let manager = WindowManager::with_layout(
+                        config.window_size,
+                        config.slide_interval,
+                        config.pane_origin_ms,
+                        &config.window_layout,
+                    );
+                    let mut buckets = BTreeMap::<(u64, u64), f64>::new();
+                    for second in 1..=800 {
+                        for start in manager.stored_bucket_starts(second * 1_000 - 1) {
+                            let (_, end) = manager.stored_bucket_bounds(start);
+                            if start >= 0 && end <= 800_000 {
+                                *buckets.entry((start as u64, end as u64)).or_default() +=
+                                    second as f64;
+                            }
+                        }
+                    }
+                    let idx = SketchStore::new();
+                    idx.register(SummarySeriesMetadata {
+                        sid: 7,
+                        metric_name: "a".into(),
+                        group_by_keys: Default::default(),
+                        capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
+                        agg_kind: AggKind::ExactAgg {
+                            agg_type: asap_types::AggregationType::Sum,
+                            parameters_canonical: String::new(),
+                            spatial_filter_canonical: String::new(),
+                        },
+                        accuracy: None,
+                        first_seen_unix_ms: 0,
+                        retired_at_ms: None,
+                        expires_at_ms: None,
+                        policy_fp: config.policy_fingerprint(),
+                    });
+                    for (bounds, sum) in buckets {
+                        idx.append_precompute(
+                            7,
+                            BTreeMap::new(),
+                            bounds,
+                            Box::new(
+                                crate::precompute_engine::operators::SumAccumulator::with_sum(sum),
+                            ),
+                        );
+                    }
+                    let entry = plan.query_plan.entries.values().next().unwrap();
+                    for tick in 3..6 {
+                        let end = phase_ms + evaluation_secs * 1_000 * tick;
+                        let (outcome, _) = super::super::live_serve::serve_instant_from_query_plan(
+                            &idx, entry, end,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("E={evaluation_secs} phase={phase_ms} full={full}: {error:?}")
+                        });
+                        let expected = ((end / 1_000 - 59)..=end / 1_000).sum::<u64>() as f64;
+                        assert_eq!(outcome.series[0].1.last().unwrap().1, expected);
+                        assert!(super::super::live_serve::serve_instant_from_query_plan(
+                            &idx,
+                            entry,
+                            end + 1
+                        )
+                        .is_err());
+                    }
+                }
+            }
+        }
+    }
+
     // Compile the two readouts, store one pane series, and execute the actual ratio.
     #[test]
     fn compiled_shared_sum_panes_preserve_each_lookback() {
-        use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+        use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
         let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -1182,14 +1179,14 @@ mod tests {
         entry["query"] = serde_json::json!("sum_over_time(a[1m]) / sum_over_time(a[10m])");
         entry["requirements"]["accuracy"]["explicit"] = serde_json::json!("Exact");
         entry["demand"]["fixed_interval_at"]["interval"] = serde_json::json!(60_000);
-        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(snapshot).unwrap();
-        let (request, env) = snapshot.planning_request().unwrap();
-        let plan = PhysicalCompiler.compile(request, env).unwrap();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
+        let (request, env) = snapshot.into_physical_compilation_request().unwrap();
+        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         let config = &plan.precompute_plan.materializations[0];
         let policy = config.policy_fingerprint();
         let idx = SketchStore::new();
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "a".into(),
             group_by_keys: Default::default(),
@@ -1263,7 +1260,7 @@ mod tests {
     fn repeated_multi_pane_reads_exclude_expired_state_and_reject_gaps() {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
@@ -1311,6 +1308,7 @@ mod tests {
                     asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: asap_types::query_plan::MaterializationBinding {
+                            full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
@@ -1361,7 +1359,7 @@ mod tests {
     fn exact_query_plan_rate_uses_reset_aware_readout() {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
-        idx.register(SketchInstanceMetadata {
+        idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
@@ -1407,6 +1405,7 @@ mod tests {
                     asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: asap_types::query_plan::MaterializationBinding {
+                            full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,

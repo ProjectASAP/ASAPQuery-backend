@@ -72,6 +72,7 @@ pub async fn plan_clickhouse_sql(
     })
 }
 
+#[cfg(test)]
 pub async fn canonicalize_clickhouse_sql(
     sql: &str,
     catalog: &SqlCatalog,
@@ -204,7 +205,8 @@ pub use asap_frontend_sql::SqlCatalog as ClickHouseSqlCatalog;
 
 #[derive(Debug, Deserialize)]
 pub struct ClickHouseSqlWorkload {
-    pub sds: SummaryCatalog,
+    #[serde(rename = "sds", alias = "summary_catalog")]
+    pub summary_catalog: SummaryCatalog,
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
     pub tables: HashMap<String, planner_types::pre_asap::Schema>,
@@ -259,9 +261,14 @@ pub async fn compile_automatic_clickhouse_workload(
             let config = materialize_selected_sql(node, family, query)
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
             let binding = MaterializationBinding {
+                full_window_slide_ms: matches!(
+                    config.window_layout,
+                    asap_types::WindowMaterializationLayout::FullWindow
+                )
+                .then_some(config.slide_interval.saturating_mul(1_000)),
                 materialization: config.policy_fingerprint().into(),
                 output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
-                window_ms: config.slide_interval * 1000,
+                window_ms: config.stored_window_ms(),
                 pane_origin_ms: config.pane_origin_ms,
                 readout_lookback_ms: Some(query.end_ms - query.start_ms),
                 item_labels: config.aggregated_labels.labels.clone(),
@@ -295,7 +302,7 @@ pub async fn compile_automatic_clickhouse_workload(
             .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?,
     );
     precompute.executable_dags = installed_dags;
-    let mut transmission = crate::physical::compiler::compile_transmission_plan(
+    let mut transmission = crate::physical::compiler::build_transmission_plan(
         request.envelope.clone(),
         &precompute,
         &std::collections::BTreeMap::new(),
@@ -329,7 +336,7 @@ fn materialize_selected_sql(
     family: &planner_types::post_asap::SummaryFamilyType,
     query: &ClickHouseSqlWorkloadEntry,
 ) -> Result<asap_types::PrecomputeMaterialization, String> {
-    use crate::physical::colored_dag::emitter::{AggregationInput, BackendAggregation};
+    use crate::physical::backend_stage::{AggregationInput, BackendAggregation};
     use planner_types::{post_asap::SummaryExpr, pre_asap::Reduction};
     let SummaryExpr::SummaryAgg {
         reduction: Reduction::Reduce(keys),
@@ -404,7 +411,7 @@ pub async fn compile_clickhouse_workload(
 ) -> Result<crate::physical::publication::PhysicalPlanPublication, ClickHousePlanningError> {
     request
         .precompute_plan
-        .validate_against_catalog(&request.sds)
+        .validate_against_catalog(&request.summary_catalog)
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     request
         .transmission_plan
@@ -435,13 +442,13 @@ pub async fn compile_clickhouse_workload(
     let mut precompute_plan = request.precompute_plan.clone();
     precompute_plan.executable_dags = installed_dags;
     let publication = crate::physical::publication::PhysicalPlanPublication {
-        summary_catalog: request.sds.clone(),
+        summary_catalog: request.summary_catalog.clone(),
         precompute_plan,
         collector_plans: Vec::new(),
         transmission_plan: request.transmission_plan.clone(),
         query_plan: QueryPlan {
-            plan_id: request.sds.plan_id,
-            plan_version: request.sds.plan_version,
+            plan_id: request.summary_catalog.plan_id,
+            plan_version: request.summary_catalog.plan_version,
             clickhouse_context: Some(ClickHousePlanningContext {
                 window_templates,
                 tables: request.tables.clone(),
@@ -599,9 +606,14 @@ fn bind_selected_node(
         ));
     }
     Ok(MaterializationBinding {
+        full_window_slide_ms: matches!(
+            selected.window_layout,
+            asap_types::WindowMaterializationLayout::FullWindow
+        )
+        .then_some(selected.slide_interval.saturating_mul(1_000)),
         materialization: selected.policy_fingerprint().into(),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),
-        window_ms: selected.slide_interval.saturating_mul(1000),
+        window_ms: selected.stored_window_ms(),
         pane_origin_ms: selected.pane_origin_ms,
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
         item_labels: selected.aggregated_labels.labels.clone(),
@@ -1394,7 +1406,7 @@ mod tests {
         let mut precompute =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
         precompute.summary_catalog = Some(sds.reference().unwrap());
-        let mut transmission = crate::physical::compiler::compile_transmission_plan(
+        let mut transmission = crate::physical::compiler::build_transmission_plan(
             envelope,
             &precompute,
             &std::collections::BTreeMap::new(),
@@ -1412,7 +1424,7 @@ mod tests {
             )
         };
         let mut request = ClickHouseSqlWorkload {
-            sds,
+            summary_catalog: sds,
             precompute_plan: precompute,
             transmission_plan: transmission,
             tables: HashMap::from([
@@ -1442,7 +1454,7 @@ mod tests {
         let simple_sql =
             "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000";
         let simple = compile_clickhouse_workload(&ClickHouseSqlWorkload {
-            sds: request.sds.clone(),
+            summary_catalog: request.summary_catalog.clone(),
             precompute_plan: request.precompute_plan.clone(),
             transmission_plan: request.transmission_plan.clone(),
             tables: request.tables.clone(),
@@ -1487,7 +1499,7 @@ mod tests {
         ]
         };
         let multiple = compile_clickhouse_workload(&ClickHouseSqlWorkload {
-            sds: request.sds.clone(),
+            summary_catalog: request.summary_catalog.clone(),
             precompute_plan: request.precompute_plan.clone(),
             transmission_plan: request.transmission_plan.clone(),
             tables: request.tables.clone(),
@@ -1700,18 +1712,21 @@ mod tests {
                 value: planner_types::pre_asap::ScalarValue::Utf8("requests".into()),
             }],
         });
-        request.sds = SummaryCatalog::from_materializations(71, 1, &[config.clone()]).unwrap();
+        request.summary_catalog =
+            SummaryCatalog::from_materializations(71, 1, &[config.clone()]).unwrap();
         let envelope = request.precompute_plan.envelope.clone();
         request.precompute_plan =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
-        request.precompute_plan.summary_catalog = Some(request.sds.reference().unwrap());
-        request.transmission_plan = crate::physical::compiler::compile_transmission_plan(
+        request.precompute_plan.summary_catalog =
+            Some(request.summary_catalog.reference().unwrap());
+        request.transmission_plan = crate::physical::compiler::build_transmission_plan(
             envelope,
             &request.precompute_plan,
             &std::collections::BTreeMap::new(),
         )
         .unwrap();
-        request.transmission_plan.summary_catalog = Some(request.sds.reference().unwrap());
+        request.transmission_plan.summary_catalog =
+            Some(request.summary_catalog.reference().unwrap());
         assert!(compile_clickhouse_workload(&request).await.is_ok());
     }
 }

@@ -8,7 +8,7 @@
 The compiler consumes ASAPPlanner types pinned to the revision exposed as
 `physical::compiler::PLANNER_REVISION`, selects
 from Planner's legal candidate space with backend-owned cost and evidence
-inputs, and emits one `PhysicalPlan`. The plan contains one SummaryCatalog plus
+inputs, and emits one `CompiledPhysicalPlan`. The plan contains one SummaryCatalog plus
 CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan projections
 compiled from the same decision
 for every target collector. Legacy
@@ -28,14 +28,14 @@ compiler never invents a framework or assigns it an optimistic zero cost.
 The control plane has three public layers:
 
 ```text
-PlanningRequest + DataWorkload + concrete implementation evidence
+PhysicalCompilationRequest + DataWorkload + concrete implementation evidence
       |                                      ^
       | abstract candidates                  | complete physical costs
       v                                      |
-ASAPPlanner selection <---------- PhysicalCompiler
+ASAPPlanner selection <---------- PhysicalPlanCompiler
       |
       v
-PhysicalCompiler -------> PhysicalPlan
+PhysicalPlanCompiler -------> CompiledPhysicalPlan
                             |       |       |      |
                             v       v       v      v
                       Collector  Precompute Backend Query
@@ -48,7 +48,7 @@ PhysicalCompiler -------> PhysicalPlan
 - **Physical compiler** enumerates concrete window/pane/state-layout,
   placement, transport, and runtime implementations without changing the
   Planner-owned abstract framework.
-- **PhysicalPlan** is the only output passed to publication. Its SummaryCatalog,
+- **CompiledPhysicalPlan** is the only output passed to publication. Its SummaryCatalog,
   CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan are created together and share identities.
 
 Logical query parsing, summary alternatives, guarantees, and candidate search
@@ -59,13 +59,13 @@ remain public ASAPPlanner interfaces. Runtime publication is documented in
 
 ### Planning request
 
-`PlanningRequest` is backend-owned request context around Planner's canonical
+`PhysicalCompilationRequest` is backend-owned request context around Planner's canonical
 per-query IR:
 
 ```rust
-pub struct PlanningRequest {
-    pub queries: Vec<PlanningQuery>,
-    pub evidence: HashMap<String, TopKMembershipEvidence>,
+pub struct PhysicalCompilationRequest {
+    pub queries: Vec<QueryCompilationInput>,
+    pub topk_membership_evidence_by_query_id: HashMap<String, TopKMembershipEvidence>,
     pub planner_revision: String,
 }
 ```
@@ -74,13 +74,13 @@ Input definitions:
 
 | Field | Definition |
 | --- | --- |
-| `queries` | Canonical `QueryExpr`, source, grouping labels, accuracy, stable query ID, `DataWorkload`, and executor-feasible `window_implementations`. |
-| `evidence` | Optional typed TopK membership certificates keyed by query ID. |
+| `queries` | Selected Planner DAG roots, query identities, source metadata, grouping labels, accuracy targets, lifecycle inputs, and executor-feasible `window_realization_candidates`. |
+| `topk_membership_evidence_by_query_id` | Optional typed TopK membership certificates keyed by query ID. |
 | `planner_revision` | Immutable Planner build/revision used for reproducibility. |
 
 TopK evidence is accepted only when its selected lower bound is strictly above
 the excluded upper bound, its failure probability is valid, its source is
-non-empty, and its observation is fresh under `DeploymentEnvironment`.
+non-empty, and its observation is fresh under `PhysicalDeploymentContext`.
 
 ```rust
 pub struct TopKMembershipEvidence {
@@ -95,7 +95,13 @@ pub struct TopKMembershipEvidence {
 Why this interface exists: it prevents adapters, protocols, and physical
 planning from each implementing their own query-to-summary mapping.
 
-Each `WindowImplementationCandidate` carries a backend-owned implementation
+Snapshot and HTTP adapters provide the same `WindowCostModel`. After logical
+selection, one generator enumerates layouts allowed by each state's maintenance
+requirements and deployment target, then derives or matches layout-specific costs.
+See [repeated window planning](../planning/repeated-dashboard-panes.md) for inputs,
+migration and cadence examples.
+
+Each internally generated `WindowRealizationCandidate` carries a backend-owned implementation
 identity, its Planner `SummaryWindowFramework`, concrete window/pane/state
 layout, and versioned workload-specific CPU, peak-memory, network, storage,
 scan, and calibrated weighted-cost evidence. The compiler collapses several
@@ -106,18 +112,18 @@ identity. Physical identities never enter post-ASAP IR.
 ### Physical compiler
 
 ```rust
-impl PhysicalCompiler {
-    pub fn compile(
+impl PhysicalPlanCompiler {
+    pub fn compile_promql(
         &self,
-        request: PlanningRequest,
-        environment: DeploymentEnvironment,
-    ) -> Result<PhysicalPlan, CompileError>;
+        request: PhysicalCompilationRequest,
+        environment: PhysicalDeploymentContext,
+    ) -> Result<CompiledPhysicalPlan, CompileError>;
 }
 ```
 
 ```rust
-pub struct DeploymentEnvironment {
-    pub collector_ids: Vec<String>,
+pub struct PhysicalDeploymentContext {
+    pub target_collector_ids: Vec<String>,
     pub capability_snapshot_id: String,
     pub observed_at_unix_ms: u64,
     pub max_evidence_age_ms: u64,
@@ -127,7 +133,7 @@ pub struct DeploymentEnvironment {
     pub backend_compat: String,
 }
 
-pub struct PhysicalPlan {
+pub struct CompiledPhysicalPlan {
     pub envelope: PlanEnvelope,
     pub summary_catalog: SummaryCatalog,
     pub collector_plans: Vec<CollectorPlan>, // complete per-target projections
@@ -141,7 +147,7 @@ Supporting public types:
 
 | Type | Definition |
 | --- | --- |
-| `DeploymentEnvironment` | Target collector IDs, capability snapshot identity, planning time, and evidence freshness policy. |
+| `PhysicalDeploymentContext` | Target collector IDs, capability snapshot identity, planning time, and evidence freshness policy. |
 | `PlanEnvelope` | Shared deterministic `plan_id`, generation time, capability snapshot, and Planner revision. |
 | `CollectorPlan` | Serializable execution projection consumed by ASAPCollector. |
 | `PrecomputePlan` | Authoritative materialization, ingest, state-schema, and producer contract consumed directly by the backend runtime. |
@@ -331,8 +337,8 @@ identity.
 
 ### Add a deployment topology
 
-1. Add a public `DeploymentTopology` variant and its required target fields.
-2. Teach `PhysicalCompiler::compile` how selected operators can be placed on it.
+1. Add a public `PhysicalDeploymentTarget` variant and its required target fields.
+2. Teach `PhysicalPlanCompiler::compile_promql` how selected operators can be placed on it.
 3. Reject plans requiring an unavailable stage/capability.
 4. Verify the output contains one complete CollectorPlan for every producer and
    one SummaryCatalog and matching QueryPlan referencing all produced materializations.

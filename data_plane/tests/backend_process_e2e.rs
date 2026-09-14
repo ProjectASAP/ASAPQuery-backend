@@ -484,9 +484,9 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
             "window_secs": 1,
             "group_by": ["service"],
             "accuracy": {"Epsilon": 0.01},
-            "window_implementations": [{
-                "implementation_id": "collector-tumbling-v1", "framework": "tumbling",
-                "window_secs": 1, "slide_secs": 1, "layout": {"kind": "pane", "pane_secs": 1},
+            "evaluation_phase_ms": 0,
+            "window_cost_model": {
+                "implementation_id": "collector-tumbling-v1",
                 "cost": {
                     "model_version": "process-e2e-v1", "workload_fingerprint": "shared-quantiles",
                     "observed_at_unix_ms": observed_at_ms, "valid_for_ms": 60000,
@@ -494,7 +494,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                     "peak_memory_bytes": 4096, "network_bytes": 1024, "storage_bytes": 2048,
                     "source_scan_bytes": 0
                 }
-            }],
+            },
             "lifecycle": {
                 "evaluation_interval_ms": 1000,
                 "ingestion_rate_per_second": 100.0,

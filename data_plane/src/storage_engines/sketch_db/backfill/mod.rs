@@ -1,52 +1,9 @@
-//! `BackfillJob` lifecycle types + in-memory `BackfillRegistry`.
+//! Backfill job lifecycle, registry, readers, and rebuild workers.
 //!
-//! Implements §10 (refreshable view maintenance / backfill path) of the
-//! future storage scope ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
-//!
-//! ## Why this exists
-//!
-//! The sketch tier's §8 incremental maintenance can't fill data from
-//! BEFORE an `agg_id` was created. When a reconfigure introduces a new
-//! agg_id — say the operator widens a CMS from 256 to 2048, or swaps
-//! in KLL200 on top of a metric that previously had only CMS — the new
-//! agg has zero history. Queries spanning the reconfigure boundary
-//! either see a data cliff (which the §7 schema timeline surfaces
-//! honestly via `Partial` results + `warnings`) or have to fall
-//! back to the exact DB.
-//!
-//! Backfill closes that gap: a `BackfillJob` reads raw samples from
-//! the exact DB for a `(agg_id, time_range)` window, rebuilds the
-//! sketch deterministically (§10.5), and writes it into the store
-//! tagged as `origin = Backfilled { job_id }`. After the job
-//! completes, the new agg_id's timeline segment covers the historical
-//! range too.
-//!
-//! ## Phase 5a scope (what this file covers)
-//!
-//! Pure data types + a thread-safe registry:
-//!
-//! * `BackfillJob` struct with lifecycle fields (`status`,
-//!   `windows_done` / `windows_total`, `started_at_ms`,
-//!   `completed_at_ms`, `error_message`).
-//! * `BackfillSource` enum (the four variants from §10.2) plus the
-//!   `OtherSketch { source_agg_id }` intra-tier case.
-//! * `BackfillStatus` enum with the full state machine (Queued →
-//!   Running → Complete / Failed / Cancelled).
-//! * `Coverage` enum (Complete / BackfillInProgress / Missing).
-//! * `BackfillRegistry` — monotonic `job_id` allocation + thread-safe
-//!   create / get / list / update_status / cancel, entirely
-//!   in-memory.
-//!
-//! ## Out of scope for 5a (future phases)
-//!
-//! * `RawSampleReader` trait and concrete readers (§10.2) — Phase 5b.
-//! * `BackfillWorkerPool` draining the registry — Phase 5c.
-//! * HTTP `POST /api/v1/db/backfill` + `GET /api/v1/db/backfill/jobs`
-//!   endpoints — Phase 5d.
-//! * Deterministic sketch rebuild (§10.5) — Phase 5e.
-//! * Coverage lookup by the query path (§7.3) — Phase 5f.
-//! * On-disk persistence of job records across restart — Phase 5g
-//!   (analogous to schema persistence in Phase 2c).
+//! Backfill reconstructs windows preceding a materialization's live ingestion
+//! from source samples. Jobs progress from Queued to Running and then Complete,
+//! Failed, or Cancelled. The registry tracks written windows for coverage lookup
+//! and optionally persists job records across restarts.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -105,7 +62,7 @@ pub enum BackfillSource {
 ///
 /// Complete / Failed / Cancelled are terminal. The registry keeps
 /// terminal jobs visible for a tunable retention so operators and
-/// the HTTP list endpoint (Phase 5d) can see recent history.
+/// the HTTP list endpoint can see recent history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackfillStatus {
     /// Accepted by the registry, waiting for a worker. Registry's
@@ -229,7 +186,7 @@ pub enum Coverage {
 ///   Complete / Failed / Cancelled, further transitions are
 ///   rejected with `false` return.
 ///
-/// ## Persistence (Phase 5g)
+/// ## Persistence
 ///
 /// Opt-in via [`Self::with_persistence`] or the
 /// [`Self::load_or_new`] constructor. When set, the registry
@@ -837,6 +794,7 @@ impl BackfillRegistry {
         Coverage::Missing
     }
 
+    #[cfg(test)]
     /// Remove any terminal job older than `older_than_ms`. Used by
     /// the eventual retention sweep; returns the number of jobs
     /// evicted. Non-terminal jobs are never evicted.
@@ -904,6 +862,29 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+// 2026-05 reorg: backfill-* and the two BackfillSource impls moved
+// into this folder as submodules.
+pub mod clickhouse_reader;
+pub mod processor;
+pub mod prometheus_reader;
+pub mod raw_sample_reader;
+pub mod service;
+pub mod window_builder;
+pub mod worker;
+
+pub use clickhouse_reader::{clickhouse_reader_factory, ClickHouseReader, ClickHouseReaderConfig};
+pub use processor::BackfillWindowProcessor;
+pub use prometheus_reader::PrometheusReader;
+pub use raw_sample_reader::{
+    LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
+};
+pub use service::{
+    default_reader_factory, noop_reader_factory, BackfillService, BackfillServiceConfig,
+    BackfillServiceHandle, ReaderFactory,
+};
+pub use window_builder::build_backfilled_accumulator;
+pub use worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};
 
 #[cfg(test)]
 mod tests {
@@ -1151,7 +1132,7 @@ mod tests {
         assert!(BackfillStatus::Cancelled.is_terminal());
     }
 
-    // ─── Phase 5g: persistence tests ───────────────────────────────
+    // ─── persistence tests ───────────────────────────────
 
     #[test]
     fn persistence_roundtrip_preserves_job_state() {
@@ -1295,7 +1276,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    // ─── Phase 5f: coverage() tests ─────────────────────────────
+    // ─── coverage() tests ─────────────────────────────
 
     #[test]
     fn range_covered_by_empty_ranges_is_false() {
@@ -1447,26 +1428,3 @@ mod tests {
         assert_eq!(r.coverage(1, (50, 10)), Coverage::Complete);
     }
 }
-
-// 2026-05 reorg: backfill-* and the two BackfillSource impls moved
-// into this folder as submodules.
-pub mod clickhouse_reader;
-pub mod processor;
-pub mod prometheus_reader;
-pub mod raw_sample_reader;
-pub mod service;
-pub mod window_builder;
-pub mod worker;
-
-pub use clickhouse_reader::{clickhouse_reader_factory, ClickHouseReader, ClickHouseReaderConfig};
-pub use processor::BackfillWindowProcessor;
-pub use prometheus_reader::PrometheusReader;
-pub use raw_sample_reader::{
-    LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
-};
-pub use service::{
-    default_reader_factory, noop_reader_factory, BackfillService, BackfillServiceConfig,
-    BackfillServiceHandle, ReaderFactory,
-};
-pub use window_builder::build_backfilled_accumulator;
-pub use worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};

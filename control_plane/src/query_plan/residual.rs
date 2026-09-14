@@ -8,7 +8,7 @@ use promql_parser::{
 };
 use std::collections::BTreeMap;
 
-pub use asap_types::query_plan::logical::*;
+pub use asap_types::query_plan::residual::*;
 
 /// Stable identity of a Planner-authorized materializable DAG leaf. This is a
 /// workload-selection key, not another physical materialization definition.
@@ -54,7 +54,7 @@ impl Lower {
     }
     fn operation(
         &mut self,
-        operator: LogicalOperator,
+        operator: ResidualQueryOperator,
         inputs: Vec<QueryNodeId>,
     ) -> Result<QueryNodeId, QueryPlanError> {
         operator.validate(inputs.len())?;
@@ -84,7 +84,7 @@ impl Lower {
             })
             .collect();
         self.operation(
-            LogicalOperator::Scan {
+            ResidualQueryOperator::Scan {
                 metric: s.name.clone(),
                 matchers,
                 range_ms,
@@ -101,7 +101,7 @@ impl Lower {
             Expr::Paren(p) => self.lower(&p.expr),
             Expr::Unary(u) => {
                 let input = self.lower(&u.expr)?;
-                self.operation(LogicalOperator::UnaryNegate, vec![input])
+                self.operation(ResidualQueryOperator::UnaryNegate, vec![input])
             }
             Expr::VectorSelector(s) => self.scan(s, None),
             Expr::MatrixSelector(s) => self.scan(&s.vs, Some(millis(s.range)?)),
@@ -111,7 +111,7 @@ impl Lower {
                 }
                 let input = self.lower(&s.expr)?;
                 self.operation(
-                    LogicalOperator::Subquery {
+                    ResidualQueryOperator::Subquery {
                         range_ms: millis(s.range)?,
                         // Prometheus uses its configured default evaluation
                         // interval when `[range:]` omits the resolution. The
@@ -163,7 +163,7 @@ impl Lower {
                             self.nodes = nodes_before;
                             self.seen = seen_before;
                             self.operation(
-                                LogicalOperator::ExactSubquery {
+                                ResidualQueryOperator::ExactSubquery {
                                     query: a.expr.to_string(),
                                 },
                                 vec![],
@@ -171,7 +171,7 @@ impl Lower {
                         }
                     };
                     return self.operation(
-                        LogicalOperator::TopKSelection {
+                        ResidualQueryOperator::TopKSelection {
                             k: u64::try_from(k).unwrap_or(0),
                             grouping,
                         },
@@ -191,7 +191,7 @@ impl Lower {
                 };
                 let input = self.lower(&a.expr)?;
                 self.operation(
-                    LogicalOperator::Aggregate {
+                    ResidualQueryOperator::Aggregate {
                         operation,
                         grouping,
                     },
@@ -200,11 +200,11 @@ impl Lower {
             }
             Expr::Call(c) => {
                 let operator = match c.func.name {
-                    "scalar" => LogicalOperator::VectorToScalar,
-                    "histogram_quantile" => LogicalOperator::HistogramQuantile,
-                    "sort" => LogicalOperator::Sort { descending: false },
-                    "sort_desc" => LogicalOperator::Sort { descending: true },
-                    name => LogicalOperator::Temporal {
+                    "scalar" => ResidualQueryOperator::VectorToScalar,
+                    "histogram_quantile" => ResidualQueryOperator::HistogramQuantile,
+                    "sort" => ResidualQueryOperator::Sort { descending: false },
+                    "sort_desc" => ResidualQueryOperator::Sort { descending: true },
+                    name => ResidualQueryOperator::Temporal {
                         operation: match name {
                             "rate" => TemporalOperation::Rate,
                             "increase" => TemporalOperation::Increase,
@@ -251,7 +251,7 @@ impl Lower {
                 };
                 let inputs = vec![self.lower(&b.lhs)?, self.lower(&b.rhs)?];
                 self.operation(
-                    LogicalOperator::Binary {
+                    ResidualQueryOperator::Binary {
                         operation,
                         return_bool: b.return_bool(),
                     },
@@ -341,7 +341,7 @@ pub(super) fn residual_nodes(
 
 pub(super) fn binary_operator(
     operator: &planner_types::post_asap::BinaryOperator,
-) -> Result<LogicalOperator, QueryPlanError> {
+) -> Result<ResidualQueryOperator, QueryPlanError> {
     if operator.vector_match.is_some() {
         return Err(invalid("explicit residual vector matching unsupported"));
     }
@@ -364,172 +364,10 @@ pub(super) fn binary_operator(
             )))
         }
     };
-    Ok(LogicalOperator::Binary {
+    Ok(ResidualQueryOperator::Binary {
         operation,
         return_bool: false,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn instant() -> InstantExecution {
-        InstantExecution {
-            lookback_ms: 300_000,
-            full_history: false,
-            cumulative_readout: false,
-        }
-    }
-
-    #[test]
-    fn complete_o11y_corpus_lowers_to_serialized_operations() {
-        // Every original workload occurrence must compile to an executable typed graph.
-        let corpus: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/o11y_queries.json")).unwrap();
-        for row in corpus["queries"].as_array().unwrap() {
-            let query = row["query"].as_str().unwrap();
-            let entry = crate::query_plan::logical::compile_logical(
-                row["id"].as_str().unwrap().into(),
-                query.into(),
-                instant(),
-                FallbackPolicy::Reject,
-            )
-            .unwrap_or_else(|error| panic!("{query}: {error}"));
-            let encoded = serde_json::to_string(&entry).unwrap();
-            let restored: QueryPlanEntry = serde_json::from_str(&encoded).unwrap();
-            restored.validate(&Default::default()).unwrap();
-            assert!(!restored
-                .nodes
-                .values()
-                .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })));
-        }
-    }
-    #[test]
-    fn residual_mapping_preserves_filters_and_rejects_different_sources() {
-        // Physical lowering must prove correspondence with the Planner-kept semantic subtree.
-        let query = "sum(rate(requests_total{job=\"api\"}[5m]))";
-        let residual = crate::query_parser::parse_query_expr_canonical(
-            query,
-            planner_types::types::AccuracyTarget::Exact,
-        )
-        .unwrap();
-        let (_, nodes) = residual_nodes(query, &residual).unwrap();
-        assert!(nodes.values().any(|node| matches!(node, QueryPlanNode::Logical { operator: LogicalOperator::Scan { matchers, .. }, .. } if matchers.iter().any(|m| m.name == "job" && m.value == "api"))));
-        assert!(residual_nodes("sum(rate(other_total[5m]))", &residual).is_err());
-    }
-    #[test]
-    fn repeated_subexpressions_share_node_identity() {
-        // Serialized edges must retain CSE rather than duplicating raw work.
-        let entry = crate::query_plan::logical::compile_logical(
-            "q".into(),
-            "sum(up) / sum(up)".into(),
-            instant(),
-            FallbackPolicy::Reject,
-        )
-        .unwrap();
-        let QueryPlanNode::Logical { inputs, .. } = &entry.nodes[&entry.root] else {
-            panic!("binary expected")
-        };
-        assert_eq!(inputs[0], inputs[1]);
-    }
-    #[test]
-    fn malformed_operator_arity_is_rejected_at_installation() {
-        // A serialized graph cannot bypass the operation's input contract.
-        assert!(LogicalOperator::HistogramQuantile.validate(1).is_err());
-        assert!(LogicalOperator::Subquery {
-            range_ms: 60_000,
-            step_ms: 0,
-            offset_ms: 0
-        }
-        .validate(1)
-        .is_err());
-    }
-
-    #[test]
-    fn real_topk_queries_lower_to_value_selection() {
-        for (query, k) in [
-            (
-                "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
-                2,
-            ),
-            (
-                "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
-                2,
-            ),
-            ("topk(2, max_over_time(backend_retry_backlog_depth[6h]))", 2),
-            (
-                "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
-                1,
-            ),
-            (
-                "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
-                3,
-            ),
-        ] {
-            let entry = crate::query_plan::logical::compile_logical(
-                "topk".into(),
-                query.into(),
-                instant(),
-                FallbackPolicy::Reject,
-            )
-            .unwrap_or_else(|error| panic!("{query}: {error}"));
-            assert!(matches!(
-                entry.nodes[&entry.root],
-                QueryPlanNode::Logical {
-                    operator: LogicalOperator::TopKSelection { k: actual, .. },
-                    ..
-                } if actual == k
-            ));
-        }
-    }
-
-    #[test]
-    fn topk_keeps_unsupported_child_as_exact_leaf() {
-        let entry = crate::query_plan::logical::compile_logical(
-            "topk-subquery".into(),
-            "topk(3, label_replace(memory_bytes, \"dst\", \"$1\", \"src\", \"(.*)\"))".into(),
-            instant(),
-            FallbackPolicy::Reject,
-        )
-        .unwrap();
-        assert!(matches!(
-            entry.nodes[&entry.root],
-            QueryPlanNode::Logical {
-                operator: LogicalOperator::TopKSelection { k: 3, .. },
-                ..
-            }
-        ));
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            QueryPlanNode::Logical {
-                operator: LogicalOperator::ExactSubquery { .. },
-                ..
-            }
-        )));
-    }
-
-    #[test]
-    fn topk_preserves_by_and_without_partitioning() {
-        for (query, labels, without) in [
-            ("topk by (cluster) (2, m)", vec!["cluster"], false),
-            ("topk without (pod) (2, m)", vec!["pod"], true),
-        ] {
-            let entry = crate::query_plan::logical::compile_logical(
-                "topk-group".into(),
-                query.into(),
-                instant(),
-                FallbackPolicy::Reject,
-            )
-            .unwrap();
-            assert!(matches!(
-                &entry.nodes[&entry.root],
-                QueryPlanNode::Logical {
-                    operator: LogicalOperator::TopKSelection { grouping, .. },
-                    ..
-                } if grouping.labels == labels && grouping.without == without
-            ));
-        }
-    }
 }
 
 /// Prove a physical-native substitute represents exactly the selected summary leaf.
@@ -604,11 +442,11 @@ pub(crate) fn selected_residual_nodes(
 pub(super) fn selected_aggregate_operator(
     original: &str,
     selected: &planner_types::post_asap::SummaryNode,
-) -> Result<LogicalOperator, QueryPlanError> {
+) -> Result<ResidualQueryOperator, QueryPlanError> {
     let (root, nodes) = selected_residual_nodes(original, selected)?;
     match nodes.get(&root) {
         Some(QueryPlanNode::Logical {
-            operator: operator @ LogicalOperator::Aggregate { .. },
+            operator: operator @ ResidualQueryOperator::Aggregate { .. },
             ..
         }) => Ok(operator.clone()),
         _ => Err(invalid(
@@ -632,7 +470,7 @@ mod hybrid_tests {
         .unwrap();
         let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
         let entry =
-            crate::query_plan::compile_bound_composable(
+            crate::query_plan::compile_bound_composable_mapped(
                 "hybrid".into(),
                 query.into(),
                 &selected,
@@ -644,9 +482,10 @@ mod hybrid_tests {
                 FallbackPolicy::Reject,
                 |node, _| {
                     let (_, _, spatial_filter) =
-                        crate::physical::compiler::materialization_leaf_contract(node)
+                        crate::physical::compiler::raw_materialization_input_contract(node)
                             .map_err(QueryPlanError::Invalid)?;
                     Ok(MaterializationBinding {
+                        full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: asap_types::PolicyFingerprint(
                             if spatial_filter.is_empty() { 7 } else { 8 },
@@ -658,27 +497,28 @@ mod hybrid_tests {
                         readout_lookback_ms: Some(300_000),
                     })
                 },
+                |_, _| {},
             )
             .unwrap();
         assert_eq!(entry.materialization_bindings().len(), 2);
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
-                operator: LogicalOperator::ExactSubquery { .. },
+                operator: ResidualQueryOperator::ExactSubquery { .. },
                 ..
             }
         )));
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
-                operator: LogicalOperator::Scan { .. },
+                operator: ResidualQueryOperator::Scan { .. },
                 ..
             }
         )));
         assert!(matches!(
             entry.nodes[&entry.root],
             QueryPlanNode::Logical {
-                operator: LogicalOperator::Binary { .. },
+                operator: ResidualQueryOperator::Binary { .. },
                 ..
             }
         ));
@@ -712,7 +552,7 @@ mod hybrid_tests {
 #[cfg(test)]
 mod planner_workload_tests {
     use super::*;
-    use crate::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+    use crate::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
 
     fn lookback(expr: &Expr) -> u64 {
         match expr {
@@ -727,7 +567,7 @@ mod planner_workload_tests {
         }
     }
 
-    fn compile_one(query: &str) -> crate::physical::compiler::PhysicalPlan {
+    fn compile_one(query: &str) -> crate::physical::compiler::CompiledPhysicalPlan {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -738,12 +578,12 @@ mod planner_workload_tests {
         let window = lookback(&parser::parse(query).unwrap());
         entry["time_selection"]["lookback"] = (if window == 0 { 300_000 } else { window }).into();
         fixture["query_workload"]["repeating_queries"] = vec![entry].into();
-        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
         let (request, environment) = snapshot
-            .planning_request()
+            .into_physical_compilation_request()
             .unwrap_or_else(|error| panic!("{query}: {error}"));
-        PhysicalCompiler
-            .compile(request, environment)
+        PhysicalPlanCompiler
+            .compile_promql(request, environment)
             .unwrap_or_else(|error| panic!("{query}: {error}"))
     }
 
@@ -762,7 +602,7 @@ mod planner_workload_tests {
                 matches!(
                     entry.nodes[&entry.root],
                     QueryPlanNode::Logical {
-                        operator: LogicalOperator::TopKSelection { .. },
+                        operator: ResidualQueryOperator::TopKSelection { .. },
                         ..
                     }
                 ),
@@ -790,7 +630,7 @@ mod planner_workload_tests {
             assert!(matches!(
                 entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: LogicalOperator::TopKSelection { .. },
+                    operator: ResidualQueryOperator::TopKSelection { .. },
                     ..
                 }
             ));
@@ -828,10 +668,12 @@ mod planner_workload_tests {
             entries.push(entry);
         }
         fixture["query_workload"]["repeating_queries"] = entries.into();
-        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
-        let (request, environment) = snapshot.planning_request().unwrap();
-        assert!(request.hybrid_execution);
-        let plan = PhysicalCompiler.compile(request, environment).unwrap();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        assert!(request.allow_mixed_summary_and_exact_execution);
+        let plan = PhysicalPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
         assert_eq!(plan.query_plan.entries.len(), 24);
         assert!(plan.query_plan.entries.values().all(|entry| !entry
             .nodes
@@ -852,7 +694,7 @@ mod planner_workload_tests {
         let operator = selected_aggregate_operator(query, &selected).unwrap();
         assert!(matches!(
             operator,
-            LogicalOperator::Aggregate {
+            ResidualQueryOperator::Aggregate {
                 operation: Aggregation::Max,
                 ..
             }
@@ -882,7 +724,7 @@ mod planner_workload_tests {
             assert!(matches!(
                 nodes[&root],
                 QueryPlanNode::Logical {
-                    operator: LogicalOperator::Aggregate {
+                    operator: ResidualQueryOperator::Aggregate {
                         operation: Aggregation::Min,
                         ..
                     },
@@ -913,7 +755,7 @@ pub(crate) fn selected_range_max_materialization(
     let (root, nodes) = selected_residual_nodes(original, node)?;
     let Some(QueryPlanNode::Logical {
         operator:
-            LogicalOperator::Temporal {
+            ResidualQueryOperator::Temporal {
                 operation: TemporalOperation::Max,
             },
         inputs,
@@ -926,7 +768,7 @@ pub(crate) fn selected_range_max_materialization(
     }
     let Some(QueryPlanNode::Logical {
         operator:
-            LogicalOperator::Scan {
+            ResidualQueryOperator::Scan {
                 metric: Some(metric),
                 matchers,
                 range_ms: Some(range_ms),
@@ -1027,7 +869,7 @@ fn counter_contract(
     nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
 ) -> Option<MaterializationCandidateIdentity> {
     let QueryPlanNode::Logical {
-        operator: LogicalOperator::Temporal { operation },
+        operator: ResidualQueryOperator::Temporal { operation },
         inputs,
     } = nodes.get(&root)?
     else {
@@ -1042,7 +884,7 @@ fn counter_contract(
     }
     let QueryPlanNode::Logical {
         operator:
-            LogicalOperator::Scan {
+            ResidualQueryOperator::Scan {
                 metric: Some(metric),
                 matchers,
                 range_ms: Some(range_ms),
@@ -1102,7 +944,7 @@ pub fn finalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanErr
     assign_retention(entry)
 }
 
-pub fn materialization_candidate_keys(
+pub fn eligible_materialization_keys(
     original: &str,
     selected: &std::rc::Rc<planner_types::post_asap::SummaryNode>,
 ) -> Result<std::collections::BTreeSet<String>, QueryPlanError> {
@@ -1168,7 +1010,7 @@ fn expression_shape(
         .get(&id)
         .ok_or_else(|| invalid("missing expression node"))?;
     if let QueryPlanNode::Logical {
-        operator: LogicalOperator::ExactSubquery { query },
+        operator: ResidualQueryOperator::ExactSubquery { query },
         ..
     } = node
     {
@@ -1245,7 +1087,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         ) || matches!(
             node,
             QueryPlanNode::Logical {
-                operator: LogicalOperator::TopKSelection { .. },
+                operator: ResidualQueryOperator::TopKSelection { .. },
                 ..
             }
         );
@@ -1253,9 +1095,9 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         if let QueryPlanNode::Logical { operator, .. } = node {
             exact = matches!(
                 operator,
-                LogicalOperator::Scan { .. }
-                    | LogicalOperator::ExactSubquery { .. }
-                    | LogicalOperator::CandidateExactSubquery { .. }
+                ResidualQueryOperator::Scan { .. }
+                    | ResidualQueryOperator::ExactSubquery { .. }
+                    | ResidualQueryOperator::CandidateExactSubquery { .. }
             );
         }
         for child in node.inputs() {
@@ -1270,8 +1112,8 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         if matches!(
             entry.nodes.get(&id),
             Some(QueryPlanNode::Logical {
-                operator: LogicalOperator::ExactSubquery { .. }
-                    | LogicalOperator::CandidateExactSubquery { .. },
+                operator: ResidualQueryOperator::ExactSubquery { .. }
+                    | ResidualQueryOperator::CandidateExactSubquery { .. },
                 ..
             })
         ) {
@@ -1284,7 +1126,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
                     entry.nodes.insert(
                         id,
                         QueryPlanNode::Logical {
-                            operator: LogicalOperator::ExactSubquery {
+                            operator: ResidualQueryOperator::ExactSubquery {
                                 query: query.clone(),
                             },
                             inputs: vec![],
@@ -1301,7 +1143,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         matches!(
             node,
             QueryPlanNode::Logical {
-                operator: LogicalOperator::Scan { .. },
+                operator: ResidualQueryOperator::Scan { .. },
                 ..
             }
         )
@@ -1327,7 +1169,7 @@ fn assign_retention(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
             .ok_or_else(|| invalid("missing index ancestor"))?;
         let mut child_depth = depth;
         if let QueryPlanNode::Logical { operator, .. } = node {
-            if let LogicalOperator::Subquery {
+            if let ResidualQueryOperator::Subquery {
                 range_ms,
                 offset_ms,
                 ..
@@ -1390,10 +1232,177 @@ mod remote_boundary_regressions {
         .unwrap();
         let selected = crate::planner_selection::select_summary_default(&parsed).unwrap();
         assert_eq!(
-            materialization_candidate_keys(query, &selected)
+            eligible_materialization_keys(query, &selected)
                 .unwrap()
                 .len(),
             2
         );
+    }
+}
+
+#[deprecated(note = "Use eligible_materialization_keys")]
+pub use eligible_materialization_keys as materialization_candidate_keys;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn instant() -> InstantExecution {
+        InstantExecution {
+            lookback_ms: 300_000,
+            full_history: false,
+            cumulative_readout: false,
+        }
+    }
+
+    #[test]
+    fn complete_o11y_corpus_lowers_to_serialized_operations() {
+        // Every original workload occurrence must compile to an executable typed graph.
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/o11y_queries.json")).unwrap();
+        for row in corpus["queries"].as_array().unwrap() {
+            let query = row["query"].as_str().unwrap();
+            let entry = crate::query_plan::residual::compile_logical(
+                row["id"].as_str().unwrap().into(),
+                query.into(),
+                instant(),
+                FallbackPolicy::Reject,
+            )
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
+            let encoded = serde_json::to_string(&entry).unwrap();
+            let restored: QueryPlanEntry = serde_json::from_str(&encoded).unwrap();
+            restored.validate(&Default::default()).unwrap();
+            assert!(!restored
+                .nodes
+                .values()
+                .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })));
+        }
+    }
+    #[test]
+    fn residual_mapping_preserves_filters_and_rejects_different_sources() {
+        // Physical lowering must prove correspondence with the Planner-kept semantic subtree.
+        let query = "sum(rate(requests_total{job=\"api\"}[5m]))";
+        let residual = crate::query_parser::parse_query_expr_canonical(
+            query,
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let (_, nodes) = residual_nodes(query, &residual).unwrap();
+        assert!(nodes.values().any(|node| matches!(node, QueryPlanNode::Logical { operator: ResidualQueryOperator::Scan { matchers, .. }, .. } if matchers.iter().any(|m| m.name == "job" && m.value == "api"))));
+        assert!(residual_nodes("sum(rate(other_total[5m]))", &residual).is_err());
+    }
+    #[test]
+    fn repeated_subexpressions_share_node_identity() {
+        // Serialized edges must retain CSE rather than duplicating raw work.
+        let entry = crate::query_plan::residual::compile_logical(
+            "q".into(),
+            "sum(up) / sum(up)".into(),
+            instant(),
+            FallbackPolicy::Reject,
+        )
+        .unwrap();
+        let QueryPlanNode::Logical { inputs, .. } = &entry.nodes[&entry.root] else {
+            panic!("binary expected")
+        };
+        assert_eq!(inputs[0], inputs[1]);
+    }
+    #[test]
+    fn malformed_operator_arity_is_rejected_at_installation() {
+        // A serialized graph cannot bypass the operation's input contract.
+        assert!(ResidualQueryOperator::HistogramQuantile
+            .validate(1)
+            .is_err());
+        assert!(ResidualQueryOperator::Subquery {
+            range_ms: 60_000,
+            step_ms: 0,
+            offset_ms: 0
+        }
+        .validate(1)
+        .is_err());
+    }
+
+    #[test]
+    fn real_topk_queries_lower_to_value_selection() {
+        for (query, k) in [
+            (
+                "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
+                2,
+            ),
+            (
+                "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
+                2,
+            ),
+            ("topk(2, max_over_time(backend_retry_backlog_depth[6h]))", 2),
+            (
+                "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+                1,
+            ),
+            (
+                "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+                3,
+            ),
+        ] {
+            let entry = crate::query_plan::residual::compile_logical(
+                "topk".into(),
+                query.into(),
+                instant(),
+                FallbackPolicy::Reject,
+            )
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
+            assert!(matches!(
+                entry.nodes[&entry.root],
+                QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::TopKSelection { k: actual, .. },
+                    ..
+                } if actual == k
+            ));
+        }
+    }
+
+    #[test]
+    fn topk_keeps_unsupported_child_as_exact_leaf() {
+        let entry = crate::query_plan::residual::compile_logical(
+            "topk-subquery".into(),
+            "topk(3, label_replace(memory_bytes, \"dst\", \"$1\", \"src\", \"(.*)\"))".into(),
+            instant(),
+            FallbackPolicy::Reject,
+        )
+        .unwrap();
+        assert!(matches!(
+            entry.nodes[&entry.root],
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::TopKSelection { k: 3, .. },
+                ..
+            }
+        ));
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::ExactSubquery { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn topk_preserves_by_and_without_partitioning() {
+        for (query, labels, without) in [
+            ("topk by (cluster) (2, m)", vec!["cluster"], false),
+            ("topk without (pod) (2, m)", vec!["pod"], true),
+        ] {
+            let entry = crate::query_plan::residual::compile_logical(
+                "topk-group".into(),
+                query.into(),
+                instant(),
+                FallbackPolicy::Reject,
+            )
+            .unwrap();
+            assert!(matches!(
+                &entry.nodes[&entry.root],
+                QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::TopKSelection { grouping, .. },
+                    ..
+                } if grouping.labels == labels && grouping.without == without
+            ));
+        }
     }
 }

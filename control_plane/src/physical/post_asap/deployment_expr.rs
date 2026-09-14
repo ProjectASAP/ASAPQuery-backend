@@ -1,40 +1,9 @@
-//! Backend deployment wrappers around the canonical post-ASAP plan.
+//! Deployment wrappers around ASAPPlanner's canonical post-ASAP summary IR.
 //!
-//! Step B of the plan-shaped-serving migration retires this crate's own
-//! `PhysicalExpr`-as-L4-algebra (the old `Logical` / `SketchAgg` /
-//! `SketchEstimate` / `SketchMerge` / `ExactAgg` variants) in favor of
-//! ASAPPlanner's canonical post-ASAP IR, `planner_types::post_asap::{SummaryExpr, SummaryNode}`
-//! — the same move Step 3 of the enum-unification made for
-//! `SketchAlgorithm → SketchAlgorithm`, one layer up. `implement_promql_for_asap_tier`
-//! (`asap_tier_implement.rs`, Step A) already builds `Rc<SummaryNode>` trees via
-//! `asap_aware_mapping::bind::implement_tree_in_with`; this module gives the rest of
-//! the crate (optimizer, physical, emit) the same IR shape.
-//!
-//! Two things `planner_types::post_asap::SummaryNode` genuinely doesn't have, kept here:
-//!
-//! - **`LetBinding` / `Ref`** — named fan-in sharing (SQL
-//!   `WITH name AS (expr) ...` / a `SketchAgg` shared by two `SketchEstimate`
-//!   readouts). `SummaryNode`'s own DAG sharing is structural (multiple `Rc`
-//!   references to the same node), not named — but the rule-firing walk in
-//!   this crate discovers sharing incrementally, per-node, so it still needs
-//!   a name to thread a bound value across sibling calls. This is a
-//!   deployment-specific mechanism, not a fact about the sketch algebra
-//!   itself, hence the backend-local [`PostAsapPlan`] wrapper.
-//! - **`RawAtEdgeSketchAtBackend` / `RawAtEdgePrometheusArchive`** — Phase
-//!   ε.1's placement decisions (where the sketch gets built, not what it
-//!   is). Genuinely L5. `physical::deployment_cost::wire` once named the same three
-//!   modes as `BindMode` with a `select_bind_mode` chooser, but that
-//!   selector was never wired to a caller (`bind_query_expr` always
-//!   produces `Committed`) and was removed in the 2026-07 retirement
-//!   pass — these two variants remain structurally unreachable in
-//!   production today, kept only because `physical/colored_dag/{allocator,emitter}.rs`
-//!   already pattern-match on them.
-//!
-//! `SketchAgg` / `SketchEstimate` / `SketchMerge` / `Logical` / `ExactAgg`
-//! don't get their own variants anymore — `planner_types::post_asap::SummaryExpr`
-//! already unifies all of them (including "exact accumulator" and "sketch"
-//! as the same `SummaryAgg` node, with or without a wrapping
-//! `SummaryEstimate`) inside a single `PostAsapPlan::Summary(Rc<SummaryNode>)`.
+//! [`PostAsapPlan`] adds named `LetBinding` / `Ref` sharing for sibling walks.
+//! [`PhysicalExpr`] adds edge/backend/archive placement. The lowerer produces
+//! `Committed`; the stage allocator and emitter also handle explicit raw
+//! placements supplied by callers.
 
 #![allow(dead_code)]
 
@@ -42,8 +11,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryNode};
-
-use crate::types_v2::BindingName;
 
 /// Backend-local wrapper around the Planner-owned post-ASAP tree.
 ///
@@ -62,7 +29,7 @@ pub enum PostAsapPlan {
     /// shared by two `SummaryEstimate` parents reading different quantiles.
     LetBinding {
         /// Binding name; must be unique within the surrounding scope.
-        name: BindingName,
+        name: String,
         /// Bound sub-expression.
         expr: Rc<PostAsapPlan>,
         /// In-scope sub-tree — references the binding via `Ref`.
@@ -73,7 +40,7 @@ pub enum PostAsapPlan {
     /// follows the surrounding `LetBinding` chain).
     Ref {
         /// Bound name.
-        name: BindingName,
+        name: String,
     },
 }
 
@@ -199,7 +166,7 @@ mod tests {
             measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
-                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+                accuracy: crate::types::AccuracyTarget::Epsilon(0.01),
             }],
             output_names: Vec::new(),
             having: None,

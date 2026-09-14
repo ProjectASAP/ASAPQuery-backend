@@ -136,26 +136,8 @@ impl FromStr for CleanupPolicy {
     }
 }
 
-/// Window lifecycle/flush semantics for streaming aggregations.
-///
-/// Formerly a local `WindowType` (`Tumbling`/`Sliding`) enum, retired in
-/// favor of a re-export of `asap_ir::intent_algebra::query_expr::WindowKind`
-/// (ASAPController PR #143 added `Copy`/`Default`/`Hash`/`Display`/
-/// `FromStr` and `#[serde(rename_all = "snake_case")]` upstream
-/// specifically so that re-export could replace the old local type
-/// without touching any call site's behavior).
-///
-/// **Vendored back as a local type** (ASAPPlanner pin migration, see
-/// `control_plane/docs/design-asapplanner-pin-migration.md`): ASAPPlanner
-/// deleted `QueryExpr::Window` outright ("no producer exists" — issue
-/// #181/#192) and with it every trace of a window-lifecycle `WindowKind`
-/// concept; ASAPPlanner's own scope (a batch query-workload planner, not
-/// a streaming execution engine) has no use for tumbling/sliding/session
-/// flush semantics. This workspace's streaming aggregation config still
-/// does, so the type moves back to being owned here — same shape as the
-/// old re-export (`Tumbling` default, lowercase `Display`/`FromStr`
-/// round-trip, same wire format), so none of this repo's ~145 call sites
-/// needed to change.
+/// Window lifecycle and flush semantics owned by streaming configuration.
+/// Tumbling is the default; wire names are lowercase.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]

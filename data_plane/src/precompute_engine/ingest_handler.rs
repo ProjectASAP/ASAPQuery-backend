@@ -1,6 +1,6 @@
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::HotReloadStreamingConfig;
+use crate::storage_engines::types::StreamingConfigHandle;
 use asap_types::aggregation_config::AggregationConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,50 +121,28 @@ pub struct IngestState {
     /// Hot-reloadable streaming config. On each ingest batch, the
     /// router snapshots the latest config to derive agg_configs.
     /// This replaces the old frozen `Vec<Arc<AggregationConfig>>`.
-    pub hot_reload_config: HotReloadStreamingConfig,
+    pub hot_reload_config: StreamingConfigHandle,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
-    /// Per-series snapshot cache for delta-sketch reconstitution
-    /// (paper §6.2 B3 / B4). On arrival of a full `ENCODING_PROTO`
-    /// / `ENCODING_MSGPACK` frame the ingest path stores a clone of
-    /// the decoded accumulator keyed by the metric's series_key. On
-    /// arrival of a subsequent `ENCODING_PROTO_DELTA` frame it looks
-    /// up the cached base, clones it, applies the delta via
-    /// `apply_modified_otlp_delta_bytes`, and updates the cache so
-    /// the next delta composes correctly.
+    /// Per-series reconstructed sketch bases, keyed by series identity. Full frames
+    /// replace the base; delta frames update it. Window boundaries reset the base.
+    /// DashMap allows independent series to update concurrently.
     ///
-    /// DashMap chosen over `Mutex<HashMap>` so concurrent OTLP
-    /// receiver tasks don't serialize on cache access — each
-    /// series_key is an independent shard.
-    ///
-    /// Growth is bounded by the active series set in the running
-    /// streaming config; no explicit eviction yet. A cold-store
-    /// follow-up will add TTL-based eviction keyed by last-seen
-    /// timestamp so long-running deployments don't leak memory
-    /// on retired series.
-    ///
-    /// The value is a [`SnapshotCacheEntry`] — the reconstructed base
-    /// plus the window start it belongs to — so the delta-apply path can
-    /// rotate (reset) the base at a per-series window boundary.
-    ///
-    /// RES-1 — growth is now bounded by [`IngestState::note_window_and_sweep`],
-    /// which opportunistically evicts entries whose `window_start` lags
-    /// more than `IngestObservability::snapshot_max_window_lag_nanos`
-    /// behind the newest observed window. Called on every cached-base
-    /// insert from the OTLP ingest path.
+    /// [`IngestState::note_window_and_sweep`] bounds growth by evicting bases whose
+    /// window start falls behind the newest observed window by the configured lag.
     pub sketch_snapshots: dashmap::DashMap<String, SnapshotCacheEntry>,
-    /// Phase 4 — centralized series_id resolver. Shared across the OTLP
+    /// centralized series_id resolver. Shared across the OTLP
     /// receive path (sid resolution + `unknown_series_ids` population) and
     /// the `ResolveSeriesIDs` RPC (eager batch resolution from the agent's
     /// exporter). Holding it on `IngestState` lets every ingest source
     /// reach the same idempotent compute-or-mint cache.
     pub series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
-    /// Phase 5 — two-level sketch ASAP tier (instance metadata +
+    /// two-level sketch ASAP tier (instance metadata +
     /// per-sid columnar state). Populated by the OTLP ingest path on
     /// every modified-OTLP first-class sketch DataPoint; queried by
     /// the `ASAPQueryEngine` query path (ASAP-tier hit / ghost / unknown
     /// classification drives the Phase 6 archive failover).
-    pub sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+    pub summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     /// CQ-6 / RES-1 — per-reason silent-drop counters plus the
     /// `sketch_snapshots` eviction configuration. Grouped into one
     /// `Default`-constructible field so the counters can live on
@@ -185,10 +163,17 @@ impl IngestState {
         self.hot_reload_config.snapshot()
     }
 
+    pub fn active_physical_plan_snapshot(
+        &self,
+    ) -> Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>> {
+        self.hot_reload_config.active_physical_plan_snapshot()
+    }
+
+    #[deprecated(note = "use active_physical_plan_snapshot")]
     pub fn physical_plan_snapshot(
         &self,
-    ) -> Option<Arc<crate::storage_engines::types::ActivePhysicalPlan>> {
-        self.hot_reload_config.physical_plan_snapshot()
+    ) -> Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>> {
+        self.active_physical_plan_snapshot()
     }
 
     /// RES-1 — record that a per-series snapshot base for `window_start`
@@ -353,7 +338,7 @@ mod tests {
         map.insert(agg_id, make_config(agg_id, metric));
         let streaming = StreamingConfig::new(map);
         let hot_reload =
-            crate::storage_engines::types::HotReloadStreamingConfig::new(streaming.clone());
+            crate::storage_engines::types::StreamingConfigHandle::new(streaming.clone());
 
         let state = Arc::new(IngestState {
             router,
@@ -365,7 +350,7 @@ mod tests {
             series_resolver: Arc::new(
                 crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
             ),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            summary_store: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
 

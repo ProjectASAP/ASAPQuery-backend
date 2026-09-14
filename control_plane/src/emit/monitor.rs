@@ -17,6 +17,7 @@
 //! `ASAPCollector/docs/continuous-monitoring-tumbling-cost-analysis.md`.
 
 pub use asap_types::MonitorFunctional as Functional;
+#[cfg(test)]
 use serde_yaml::{Mapping, Value};
 
 /// One monitored standing-query intent: "alert when the global Σ of `metric`'s
@@ -53,6 +54,7 @@ pub fn agg_id_for_metric(metric: &str) -> u64 {
     h
 }
 
+#[cfg(test)]
 /// Render the edge `threshold:` YAML mapping for the fused asap_edge processor's
 /// per-metric entry. Omits `key`/`coeffs` when not applicable to the functional.
 pub fn edge_threshold_block(intent: &MonitorIntent) -> Value {

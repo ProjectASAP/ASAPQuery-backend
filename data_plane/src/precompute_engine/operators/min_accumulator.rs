@@ -1,6 +1,6 @@
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
-    SingleSubpopulationAggregate, SingleSubpopulationAggregateFactory,
+    SingleSubpopulationAggregate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -174,27 +174,6 @@ impl SingleSubpopulationAggregate for MinAccumulator {
 
     fn clone_boxed(&self) -> Box<dyn SingleSubpopulationAggregate> {
         Box::new(self.clone())
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MinAccumulatorFactory;
-
-impl SingleSubpopulationAggregateFactory for MinAccumulatorFactory {
-    fn merge_accumulators(
-        &self,
-        accumulators: Vec<Box<dyn SingleSubpopulationAggregate>>,
-    ) -> Result<Box<dyn SingleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let mut result = f64::INFINITY;
-        for acc in accumulators {
-            result = result.min(acc.query(Statistic::Min, None)?);
-        }
-        Ok(Box::new(MinAccumulator::with_value(result)))
-    }
-
-    fn create_default(&self) -> Box<dyn SingleSubpopulationAggregate> {
-        Box::new(MinAccumulator::new())
     }
 }
 

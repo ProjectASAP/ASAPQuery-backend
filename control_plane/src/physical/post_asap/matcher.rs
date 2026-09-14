@@ -103,11 +103,8 @@ pub fn sketch_family_satisfied(required: &SketchAlgorithm, available: &SketchAlg
     req_family.satisfied_by(have_family)
 }
 
-/// The family a [`SketchAlgorithm`] belongs to, for [`SummaryFamilyMatcher`].
-/// Total now (every `SketchAlgorithm` variant is an approximate-sketch family
-/// by construction, post ASAPPlanner#218's split — the exact-accumulator
-/// kinds this used to also cover live in `ExactKind` now, a distinct type
-/// this function never sees).
+/// Return the family of a [`SketchAlgorithm`] for [`SummaryFamilyMatcher`].
+/// Every variant is a sketch; exact accumulators use a separate type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SummaryFamily {
     Universal,

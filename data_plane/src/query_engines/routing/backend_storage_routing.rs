@@ -1,97 +1,12 @@
-//! Per-metric storage-backend routing table consulted by the HTTP query
-//! handler at request time.
+//! Per-metric routing with optional query-shape filters.
 //!
-//! ## Why this exists
+//! YAML accepts single targets under `metrics` and target lists under `routes`.
+//! For metrics listed in both, `routes` wins. Missing metrics use the configured
+//! default, which defaults to `SketchStore`. JSON configuration is also accepted
+//! through [`BackendStorageRouting::from_json_payload`].
 //!
-//! Phase-5 (PR #87) wired the `EngineRouter` into the HTTP query handler,
-//! but the per-metric `StorageBackend` axis was sourced from
-//! `StreamingConfig::storage_backend()` — a single field that applies to
-//! the entire streaming config. In production deploys (the
-//! `precompute_engine` binary loading `backend-streaming.yaml`) the
-//! field decodes via `Self::new(...)` which always defaults to
-//! `SketchStore`, so the handler always took the
-//! `ASAPQueryEngine`-direct-dispatch branch and the `EngineRouter` was
-//! effectively bypassed for every query — the `data_source:
-//! thanos_query` info-line never landed on cold-archive responses
-//! even when the chunks were on disk in MinIO.
-//!
-//! The fix lives **outside** the streaming pipeline: the streaming
-//! engine on the OTLP-ingest path never sees Gorilla data (the
-//! `gorillas3processor` writes chunks directly to S3), so there is
-//! nothing for `StreamingConfig::from_yaml_data` to learn. What we
-//! actually need is a tiny standalone routing table — one entry per
-//! metric whose storage backend differs from the default — that the
-//! HTTP handler consults to pick the right engine for each query.
-//!
-//! ## v7: dual-routing per metric
-//!
-//! v6.1 surfaced an architectural gap: routing one metric to one engine
-//! forces an exclusive trade-off between criterion ④ (ASAP-tier
-//! accuracy) and criterion ⑤ (cold-fallback). Every quantile/sum-by
-//! query on `http_requests_total` had to go to either the ASAP tier
-//! (so the accuracy reducer could compute relative error) or the
-//! archive (so the `data_source: thanos_query` info-line landed on
-//! the cold-fallback probe). v7 closes this by letting one metric have
-//! multiple targets, each with an optional query-shape filter; the
-//! HTTP handler inspects the parsed PromQL and picks the matching
-//! target. Predictable / planned queries (quantile, sum_over_time)
-//! land on the ASAP tier; ad-hoc / post-hoc queries
-//! (count, topk, rate-post-hoc) route to the cold archive.
-//!
-//! ## Schema
-//!
-//! Two compatible shapes are accepted. The single-target form is
-//! preserved verbatim from v6.1 so existing deploys keep working
-//! unchanged:
-//!
-//! ```yaml
-//! # v6.1 form (single-target):
-//! default: sketch_store
-//! metrics:
-//!   audit_events: gorilla_object_store
-//! ```
-//!
-//! ```yaml
-//! # v7 form (multi-target with query-shape selection):
-//! default: sketch_store
-//! routes:
-//!   - metric: http_requests_total
-//!     targets:
-//!       - backend: sketch_store
-//!         # default — predictable / planned queries land here
-//!       - backend: gorilla_object_store
-//!         applies_to_query_shape: [count, topk, rate_post_hoc]
-//!   - metric: http_freshness_probe_warm
-//!     targets:
-//!       - backend: sketch_store
-//!   - metric: http_freshness_probe_archive
-//!     targets:
-//!       - backend: gorilla_object_store
-//! ```
-//!
-//! The two shapes can be mixed in the same YAML — metrics under
-//! `metrics:` keep the old single-target semantics; metrics under
-//! `routes:` use the new list-of-targets semantics. A metric listed
-//! in BOTH wins from `routes:` (multi-target overrides single-target).
-//!
-//! Valid `StorageBackend` values mirror the snake-cased serde tags on
-//! `crate::storage_engines::types::StorageBackend`: `sketch_store`,
-//! `gorilla_object_store`, `double_write`, `prometheus_remote`. (Step-1
-//! of the JSONL deprecation refactor removed the `cold_jsonl_fallback` tag.)
-//!
-//! Loaded once at backend startup (CLI flag `--backend-storage-routing`
-//! on `precompute_engine`) and stored in `AppState`. Lookup is
-//! O(metric-name-hash); a query that doesn't match any entry falls back
-//! to `default` (which itself falls back to `SketchStore`).
-//!
-//! ## Out of scope
-//!
-//! * Hot reload — the control plane's plan-push is the long-term answer
-//!   for per-metric routing; this YAML layer is the bridge that
-//!   unblocks issue #46 criteria ④/⑤/⑥ until the plan-push lands.
-//! * Per-`(metric, statistic, accuracy)` granularity — `StorageBackend`
-//!   already encodes the `DoubleWrite` axis the cost-aware dispatcher
-//!   uses to pick warm-vs-archive per query.
+//! The HTTP layer snapshots the hot-reload routing handle per request so each
+//! query sees one consistent table during concurrent configuration updates.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -109,21 +24,8 @@ use crate::storage_engines::types::{
 // Query-shape taxonomy
 // ---------------------------------------------------------------------------
 
-/// A coarse-grained classification of an incoming PromQL query. The
-/// HTTP handler extracts this from the parsed AST and consults the
-/// routing table's `applies_to_query_shape` filters to pick a target.
-///
-/// The shapes intentionally mirror the v7 spec's
-/// `[count, topk, rate_post_hoc]` enumeration — each is a PromQL
-/// shape the cold-archive engine answers natively, and which the
-/// ASAP-tier sketch path either can't serve at all (count over an
-/// approximate sketch is misleading) or serves with worse precision
-/// than the archive (rate post-hoc).
-///
-/// Phase α (control-plane-emitted routing tables) adds `HistogramQuantile`
-/// / `Delta` / `Deriv` / `Absent` — these are PromQL shapes no ASAP-tier
-/// sketch can serve and the control plane's emitter reliably routes them
-/// to the archive.
+/// Coarse PromQL shape used to match a routing target's
+/// `applies_to_query_shape` filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryOperatorShape {
@@ -445,6 +347,7 @@ impl BackendStorageRouting {
         }
     }
 
+    #[cfg(test)]
     /// Return a copy of this routing table re-scoped to `tenant`.
     /// Used by tests / per-tenant hot-reload to retag a table built
     /// from a tenant-agnostic JSON / YAML payload.
@@ -533,7 +436,7 @@ impl BackendStorageRouting {
         Ok(routing)
     }
 
-    /// Phase α (MVP): parse a control-plane-emitted JSON document into a
+    /// parse a control-plane-emitted JSON document into a
     /// fresh routing table. The schema mirrors
     /// `control_plane/src/emit/stage_config.rs::emit_backend_storage_routing`:
     ///
@@ -895,11 +798,11 @@ pub fn routing_table_hash(table: &BackendStorageRouting) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Phase α: HotReloadBackendStorageRouting — atomic-swap wrapper
+// HotReloadBackendStorageRouting — atomic-swap wrapper
 // ---------------------------------------------------------------------------
 
 /// Per-tenant atomic-swap wrapper around `BackendStorageRouting`,
-/// mirroring [`crate::storage_engines::types::HotReloadStreamingConfig`]. Lets the
+/// mirroring [`crate::storage_engines::types::StreamingConfigHandle`]. Lets the
 /// `POST /api/v1/storage_routing` HTTP handler swap one tenant's table
 /// at runtime without restarting the backend or touching any other
 /// tenant's table. Cloneable; clones share the underlying `ArcSwap` so
@@ -948,7 +851,7 @@ pub struct HotReloadBackendStorageRouting {
     /// once and pick the tenant's `Arc<BackendStorageRouting>`.
     inner:
         std::sync::Arc<arc_swap::ArcSwap<HashMap<String, std::sync::Arc<BackendStorageRouting>>>>,
-    active: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    active: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
 }
 
 impl HotReloadBackendStorageRouting {
@@ -989,8 +892,8 @@ impl HotReloadBackendStorageRouting {
         }
     }
 
-    pub fn from_active(active: crate::storage_engines::types::HotReloadActivePhysicalPlan) -> Self {
-        let initial = active.snapshot().storage_routing.clone();
+    pub fn from_active(active: crate::storage_engines::types::ActivePhysicalPlanHandle) -> Self {
+        let initial = active.active_snapshot().storage_routing.clone();
         let mut map = HashMap::new();
         map.insert(initial.tenant().to_string(), initial);
         Self {
@@ -1016,7 +919,7 @@ impl HotReloadBackendStorageRouting {
     /// caller's lifetime; concurrent swaps don't invalidate it.
     pub fn snapshot_for_tenant(&self, tenant: &str) -> std::sync::Arc<BackendStorageRouting> {
         if let Some(active) = &self.active {
-            let routing = active.snapshot().storage_routing.clone();
+            let routing = active.active_snapshot().storage_routing.clone();
             if routing.tenant() == tenant || tenant == DEFAULT_TENANT {
                 return routing;
             }
@@ -1397,7 +1300,7 @@ routes:
         assert_eq!(classify_query_shape(&e), QueryOperatorShape::Other);
     }
 
-    // ── Phase α: from_json_payload + replace + hot-reload tests ────────
+    // ── from_json_payload + replace + hot-reload tests ────────
 
     fn fixture_json() -> serde_json::Value {
         serde_json::json!({
@@ -1565,7 +1468,7 @@ routes:
         assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaObjectStore);
     }
 
-    /// Phase ε.2: the control plane's Mode 3
+    /// the control plane's Mode 3
     /// (`RawAtEdgePrometheusArchive`) emits `engine: prometheus_remote`
     /// in the routing JSON for metrics whose raw data is shipped to
     /// Prometheus's native OTLP receiver. The backend's parser must

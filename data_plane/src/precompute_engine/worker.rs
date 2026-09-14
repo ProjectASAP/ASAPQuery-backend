@@ -9,7 +9,7 @@ use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
-    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput,
+    AggregateCore, KeyByLabelValues, PrecomputedOutput, StreamingConfigHandle,
 };
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
@@ -162,7 +162,7 @@ pub struct Worker {
     /// Hot-reload handle — workers read config directly from ArcSwap
     /// instead of holding a local copy. All components see the same
     /// config at the same time.
-    hot_reload: HotReloadStreamingConfig,
+    hot_reload: StreamingConfigHandle,
     /// Allowed lateness in ms.
     allowed_lateness_ms: i64,
     /// When true, skip aggregation and pass raw samples through.
@@ -199,7 +199,7 @@ impl Worker {
         id: usize,
         receiver: mpsc::Receiver<WorkerMessage>,
         output_sink: Arc<dyn OutputSink>,
-        hot_reload: HotReloadStreamingConfig,
+        hot_reload: StreamingConfigHandle,
         runtime_config: WorkerRuntimeConfig,
         group_count: Arc<AtomicUsize>,
         worker_watermark: Arc<AtomicI64>,
@@ -415,7 +415,7 @@ impl Worker {
     /// hot-reload snapshot the first time we see this sid; `group_key` is
     /// remembered on the `GroupState` for emit-time label rendering.
     ///
-    /// Reads config directly from the `HotReloadStreamingConfig`
+    /// Reads config directly from the `StreamingConfigHandle`
     /// ArcSwap handle, so new policies from a config swap are visible
     /// immediately — no message passing, no delay.
     /// Returns None if `policy_fp` has no matching config (e.g. arrived
@@ -929,15 +929,8 @@ impl Worker {
             Vec::with_capacity(samples.len());
 
         for (ts, val) in samples {
-            // Raw-mode path does not carry an `AggregationConfig` for
-            // the source aggregation (synthetic agg_id, no source
-            // config). After the PR-6 follow-up retired
-            // `PrecomputedOutput.aggregation_id`, the sink's fallback
-            // branch is gone — outputs carrying `PolicyFingerprint::UNSET`
-            // are dropped at the sink with a warn. Raw-mode is
-            // dev/test-only today (default `raw_mode_aggregation_id=0`),
-            // so this path effectively writes nothing in production;
-            // wiring raw mode to a real policy is a separate concern.
+            // Raw-mode outputs have no source policy. The sink drops
+            // `PolicyFingerprint::UNSET` outputs with a warning.
             let output =
                 PrecomputedOutput::new(ts as u64, ts as u64, None, PolicyFingerprint::UNSET);
             let _ = self.raw_mode_aggregation_id;
@@ -1342,6 +1335,7 @@ fn precomputed_output_for_group(
     output
 }
 
+#[cfg(test)]
 /// Extract the metric name from a series key like `"metric_name{key1=\"val1\"}"`.
 pub fn extract_metric_name(series_key: &str) -> &str {
     match series_key.find('{') {
@@ -1350,6 +1344,7 @@ pub fn extract_metric_name(series_key: &str) -> &str {
     }
 }
 
+#[cfg(test)]
 /// Extract grouping label values from a series key string based on the
 /// aggregation config's `grouping_labels`.
 ///
@@ -1904,15 +1899,15 @@ mod tests {
         )
     }
 
-    /// Build a fresh `HotReloadStreamingConfig` from a map of agg_id
+    /// Build a fresh `StreamingConfigHandle` from a map of agg_id
     /// → AggregationConfig. Worker::new takes this handle instead of
     /// the old `HashMap<u64, Arc<AggregationConfig>>`. Tests use this
     /// helper instead of constructing the handle inline at every
     /// callsite.
     fn make_hot_reload(
         configs: HashMap<u64, AggregationConfig>,
-    ) -> crate::storage_engines::types::HotReloadStreamingConfig {
-        crate::storage_engines::types::HotReloadStreamingConfig::new(
+    ) -> crate::storage_engines::types::StreamingConfigHandle {
+        crate::storage_engines::types::StreamingConfigHandle::new(
             crate::storage_engines::types::StreamingConfig::new(configs),
         )
     }
@@ -2709,13 +2704,13 @@ aggregations:
 
         // PR 5: the streaming-config key is the policy fingerprint.
         let agg_id = *streaming_config
-            .get_all_aggregation_configs()
+            .materializations()
             .keys()
             .next()
             .expect("one agg");
         assert!(streaming_config.contains(agg_id));
 
-        let agg_configs = streaming_config.get_all_aggregation_configs().clone();
+        let agg_configs = streaming_config.materializations().clone();
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
@@ -3280,12 +3275,6 @@ aggregations:
             "all 10 first-batch sketches must merge into the persisted output (3 values × 10)"
         );
     }
-
-    // M2.3.6g — `test_sketch_ingest_persists_and_query_returns_non_empty`
-    // deleted: it exercised the retired SketchStore + StoreOutputSink
-    // pair end-to-end. The SketchStoreSink path (M2.3.4+) is covered
-    // by its own dedicated tests in `output_sink::tests` and by
-    // `engine::e2e_feedback_loop_tests`.
 
     /// Pin the agent-emit-shape vs. backend-grouping-config invariant from
     /// hypothesis (A) of the sweep diagnostic. The agent emits one sketch

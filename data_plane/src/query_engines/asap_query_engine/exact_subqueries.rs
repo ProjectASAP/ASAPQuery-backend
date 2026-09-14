@@ -2,8 +2,8 @@
 use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
 use crate::query_engines::EngineError;
 use asap_types::query_plan::{
-    logical::LogicalOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage, QueryNodeId,
-    QueryPlanEntry, QueryPlanNode,
+    logical::ResidualQueryOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage,
+    QueryNodeId, QueryPlanEntry, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -17,7 +17,7 @@ fn miss(message: impl Into<String>) -> EngineError {
 /// Traverse only the installed graph, including epoch-aligned nested subquery grids.
 #[derive(Debug, Clone)]
 enum ExactLeaf {
-    Legacy(LogicalOperator),
+    Legacy(ResidualQueryOperator),
     External(ExternalExactRequest),
 }
 
@@ -47,14 +47,14 @@ fn leaves(
             .ok_or_else(|| miss("missing installed node"))?;
         match node {
             QueryPlanNode::Logical { operator, inputs } => match operator {
-                LogicalOperator::Scan { .. } => {
+                ResidualQueryOperator::Scan { .. } => {
                     return Err(miss("local raw Scan is forbidden in deployed plans"))
                 }
-                LogicalOperator::ExactSubquery { .. }
-                | LogicalOperator::CandidateExactSubquery { .. } => {
+                ResidualQueryOperator::ExactSubquery { .. }
+                | ResidualQueryOperator::CandidateExactSubquery { .. } => {
                     result.insert((id, at), ExactLeaf::Legacy(operator.clone()));
                 }
-                LogicalOperator::Subquery {
+                ResidualQueryOperator::Subquery {
                     range_ms,
                     step_ms,
                     offset_ms,
@@ -116,7 +116,7 @@ pub(super) fn external_dependencies(
             );
         } else if matches!(
             leaf,
-            ExactLeaf::Legacy(LogicalOperator::CandidateExactSubquery { .. })
+            ExactLeaf::Legacy(ResidualQueryOperator::CandidateExactSubquery { .. })
         ) {
             let input = *entry.nodes[&id]
                 .inputs()
@@ -298,10 +298,13 @@ pub(super) async fn prepare_external(
     for ((id, at), leaf) in leaves(entry, times)? {
         u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
         let (language, query, candidate_input) = match &leaf {
-            ExactLeaf::Legacy(LogicalOperator::ExactSubquery { query }) => {
+            ExactLeaf::Legacy(ResidualQueryOperator::ExactSubquery { query }) => {
                 (QueryLanguage::PromQl, query.clone(), None)
             }
-            ExactLeaf::Legacy(LogicalOperator::CandidateExactSubquery { query, item_label }) => (
+            ExactLeaf::Legacy(ResidualQueryOperator::CandidateExactSubquery {
+                query,
+                item_label,
+            }) => (
                 QueryLanguage::PromQl,
                 query.clone(),
                 Some((entry.nodes[&id].inputs()[0], item_label.as_str())),
@@ -751,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn exact_leaf_calls_prometheus_and_combines_with_prepared_summary() {
         // A successful exact branch remains an intermediate, not a whole-root fallback.
-        use asap_types::query_plan::logical::BinaryOperation;
+        use asap_types::query_plan::residual::BinaryOperation;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -771,7 +774,7 @@ mod tests {
             (
                 QueryNodeId(0),
                 QueryPlanNode::Logical {
-                    operator: LogicalOperator::Binary {
+                    operator: ResidualQueryOperator::Binary {
                         operation: BinaryOperation::Div,
                         return_bool: false,
                     },
@@ -785,7 +788,7 @@ mod tests {
             (
                 QueryNodeId(2),
                 QueryPlanNode::Logical {
-                    operator: LogicalOperator::ExactSubquery { query: "b".into() },
+                    operator: ResidualQueryOperator::ExactSubquery { query: "b".into() },
                     inputs: vec![],
                 },
             ),
@@ -827,7 +830,7 @@ mod tests {
         repeated.nodes.insert(
             QueryNodeId(1),
             QueryPlanNode::Logical {
-                operator: LogicalOperator::ExactSubquery { query: "b".into() },
+                operator: ResidualQueryOperator::ExactSubquery { query: "b".into() },
                 inputs: vec![],
             },
         );
@@ -863,7 +866,7 @@ mod tests {
         use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
         use crate::storage_engines::sketch_db::{
             data::AggKind,
-            index::{Capability, SketchInstanceMetadata},
+            index::{Capability, SummarySeriesMetadata},
         };
         use crate::storage_engines::types::{KeyByLabelValues, Measurement};
         use asap_types::query_plan::{
@@ -877,7 +880,7 @@ mod tests {
         const AT: u64 = 300_000;
         const MATERIALIZATION: asap_types::PolicyFingerprint = asap_types::PolicyFingerprint(9001);
         let store = crate::storage_engines::sketch_db::index::SketchStore::new();
-        store.register(SketchInstanceMetadata {
+        store.register(SummarySeriesMetadata {
             sid: 41,
             metric_name: "http_requests_total".into(),
             group_by_keys: std::collections::BTreeSet::from(["job".into()]),
@@ -909,7 +912,7 @@ mod tests {
             (
                 QueryNodeId(0),
                 QueryPlanNode::Logical {
-                    operator: LogicalOperator::Binary {
+                    operator: ResidualQueryOperator::Binary {
                         operation: BinaryOperation::Div,
                         return_bool: false,
                     },
@@ -919,7 +922,7 @@ mod tests {
             (
                 QueryNodeId(1),
                 QueryPlanNode::Logical {
-                    operator: LogicalOperator::ExactSubquery {
+                    operator: ResidualQueryOperator::ExactSubquery {
                         query: exact_query.into(),
                     },
                     inputs: vec![],
@@ -936,6 +939,7 @@ mod tests {
                 QueryNodeId(3),
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
+                        full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: MATERIALIZATION.into(),
                         output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
@@ -1034,7 +1038,7 @@ mod tests {
         let entry = entry(BTreeMap::from([(
             QueryNodeId(0),
             QueryPlanNode::Logical {
-                operator: LogicalOperator::Scan {
+                operator: ResidualQueryOperator::Scan {
                     metric: Some("m".into()),
                     matchers: vec![],
                     range_ms: None,
