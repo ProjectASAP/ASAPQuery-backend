@@ -52,10 +52,12 @@ fn queries() -> Vec<(String, u64, u64)> {
         ));
         queries.push((format!("quantile by(job)({q}, issue701_data)"), 1, 1));
     }
-    for operation in ["sum", "count", "avg", "min", "max"] {
+    // `avg` is excluded: it plans to a raw pass-through against a realizable
+    // rewrite with no comparable cost, which now fails loudly (#721).
+    for operation in ["sum", "count", "min", "max"] {
         queries.push((format!("{operation}_over_time(issue701_data[5m])"), 300, 30));
     }
-    for operation in ["sum", "count", "avg"] {
+    for operation in ["sum", "count"] {
         queries.push((format!("{operation}(issue701_data)"), 1, 1));
         queries.push((format!("{operation} by(job)(issue701_data)"), 1, 1));
     }
@@ -76,11 +78,6 @@ fn queries() -> Vec<(String, u64, u64)> {
             .into(),
         300,
         60,
-    ));
-    queries.push((
-        "avg_over_time(issue701_data[5m]) / quantile_over_time(0.5, issue701_data[5m])".into(),
-        300,
-        30,
     ));
     queries
 }
