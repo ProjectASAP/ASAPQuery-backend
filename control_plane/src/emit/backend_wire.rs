@@ -230,7 +230,9 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
             match kind {
                 ExactKind::Sum => "Sum",
                 ExactKind::Count => "Count",
-                ExactKind::MinMax => "MinMax",
+                // Typed `Min` shares the MinMax accumulator on the wire; the
+                // readout direction is carried by the aggregation sub-type.
+                ExactKind::MinMax | ExactKind::Min => "MinMax",
                 ExactKind::Increase => "Increase",
                 ExactKind::Rate => "Rate",
                 ExactKind::IRate => "IRate",
@@ -284,13 +286,20 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
         clamp_window_secs(Some(agg.window_secs)).expect("clamp_window_secs preserves Some");
     json!({
         "aggregationType": aggregation_type,
-        "aggregationSubType": if matches!(
-            &agg.family,
+        // `MinMax` and the typed `Min` share one accumulator on the wire, so the
+        // readout direction has to travel in the sub-type or the backend cannot
+        // tell which end of the window the query wants.
+        "aggregationSubType": match &agg.family {
             planner_types::post_asap::SummaryFamilyType::ExactAggregate(
                 planner_types::post_asap::ExactKind::MinMax,
-                _
-            )
-        ) { "max" } else { "" },
+                _,
+            ) => "max",
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Min,
+                _,
+            ) => "min",
+            _ => "",
+        },
         "metric": agg.metric_name,
         "labels": {
             "grouping": agg.grouping,

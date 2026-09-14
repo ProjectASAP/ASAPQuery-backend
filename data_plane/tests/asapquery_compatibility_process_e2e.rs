@@ -28,6 +28,12 @@ mod durable_summary_process;
 #[path = "support/immutable_maintenance_process.rs"]
 mod immutable_maintenance_process;
 
+#[path = "support/current_series_process.rs"]
+mod current_series_process;
+
+#[path = "support/issue_701_702_process.rs"]
+mod issue_701_702_process;
+
 // Test-only quotes preserve the fixture's local candidate without a production bypass.
 fn quote_snapshot_for_test(
     snapshot: control_plane::physical::compiler::BackendLocalPlanningInput,
@@ -1200,10 +1206,13 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
 
     let backend_port = unused_port();
     let output_dir = tempfile::tempdir().expect("backend output directory");
-    let fixture = serde_json::from_str(include_str!(
-        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
-    ))
-    .unwrap();
+    let mut fixture: control_plane::physical::compiler::BackendLocalPlanningInput =
+        serde_json::from_str(include_str!(
+            "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+    // These range checks read older evaluations after finite drain.
+    fixture.physical_inputs.query_retention_margin_ms = 60_000;
     let priced = quote_snapshot_for_test(fixture);
     let snapshot = output_dir.path().join("snapshot.json");
     std::fs::write(&snapshot, serde_json::to_vec(&priced).unwrap()).unwrap();

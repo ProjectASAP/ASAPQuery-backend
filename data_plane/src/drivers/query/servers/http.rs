@@ -2138,6 +2138,15 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let mut buffer = Vec::new();
     prometheus::Encoder::encode(&encoder, &metric_families, &mut buffer)
         .unwrap_or_else(|e| tracing::error!("Failed to encode metrics: {}", e));
+    let (populations, builds) = state
+        .summary_store
+        .current_series
+        .lock()
+        .expect("current-series state poisoned")
+        .stats();
+    buffer.extend_from_slice(format!(
+        "# TYPE asap_current_series_populations gauge\nasap_current_series_populations {populations}\n# TYPE asap_current_series_cache_builds_total counter\nasap_current_series_cache_builds_total {builds}\n"
+    ).as_bytes());
     if let Some(receiver) = state.remote_write.as_ref() {
         use std::sync::atomic::Ordering;
         let stats = receiver.stats();
@@ -6098,6 +6107,21 @@ pub fn validate_and_build_runtime_plan(
                 return Err(
                     "query physical pane origin differs from installed precompute definition"
                         .into(),
+                );
+            }
+            // `full_window_slide_ms` is `#[serde(default)]`, so a publication from an
+            // older controller -- or one replayed from a stored artifact -- arrives as
+            // `None` on a FullWindow materialization. Without this gate the readout
+            // silently takes the overlap-merging path and counts observations twice,
+            // which is exactly what the full-window binding exists to prevent.
+            let full_window_slide_ms = matches!(
+                materialization.window_layout,
+                asap_types::WindowMaterializationLayout::FullWindow
+            )
+            .then_some(materialization.slide_interval.saturating_mul(1_000));
+            if binding.full_window_slide_ms != full_window_slide_ms {
+                return Err(
+                    "query window layout differs from installed precompute definition".into(),
                 );
             }
         }

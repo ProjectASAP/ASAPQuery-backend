@@ -256,6 +256,10 @@ impl GroupState {
                 asap_types::query_plan::ExactReadout::Max,
                 AggregationType::MinMax | AggregationType::MultipleMinMax,
             ) => asap_types::Statistic::Max,
+            (
+                asap_types::query_plan::ExactReadout::Min,
+                AggregationType::MinMax | AggregationType::MultipleMinMax,
+            ) => asap_types::Statistic::Min,
             _ => return None,
         };
 
@@ -284,8 +288,10 @@ impl GroupState {
         if matches!(
             agg_type,
             AggregationType::MinMax | AggregationType::MultipleMinMax
-        ) && readout == asap_types::query_plan::ExactReadout::Max
-        {
+        ) && matches!(
+            readout,
+            asap_types::query_plan::ExactReadout::Max | asap_types::query_plan::ExactReadout::Min
+        ) {
             return entries
                 .iter()
                 .flat_map(|windows| windows.values())
@@ -296,7 +302,11 @@ impl GroupState {
                 })
                 .collect::<Option<Vec<_>>>()?
                 .into_iter()
-                .reduce(f64::max);
+                .reduce(if readout == asap_types::query_plan::ExactReadout::Min {
+                    f64::min
+                } else {
+                    f64::max
+                });
         }
         let mut merged: Option<Box<dyn AggregateCore>> = None;
         for windows in entries {
@@ -439,10 +449,11 @@ impl QueryExecutionContext<'_> {
                 SummaryExecutorError::Unsupported("query end exceeds signed event time")
             })?,
         };
-        if self
-            .index
-            .has_pending_summary_updates(binding.materialization, query_range)
-        {
+        if self.index.has_pending_summary_updates(
+            binding.materialization,
+            query_range,
+            binding.full_window_slide_ms.is_some(),
+        ) {
             return Err(SummaryExecutorError::Unsupported(
                 "materialization population has unpublished input",
             ));
@@ -538,6 +549,19 @@ impl QueryExecutionContext<'_> {
                         // They overlap the answer and must never be merged into it.
                         series.samples.retain(|end, _| *end == self.t1_ms as i64);
                         if series.samples.is_empty() {
+                            // A series that reported nothing in this window has no
+                            // full-window snapshot. The generic `known_empty` skip at
+                            // the top of the loop is layout-blind and lets such a sid
+                            // through; when the layout-aware check proves it empty,
+                            // skip it rather than discarding the sids already
+                            // accumulated and dropping the query to the exact path.
+                            if self.index.full_summary_window_known_empty(
+                                binding.materialization,
+                                sid,
+                                query_range,
+                            ) {
+                                continue;
+                            }
                             return Err(SummaryExecutorError::NoCandidates);
                         }
                     }

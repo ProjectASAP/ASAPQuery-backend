@@ -190,6 +190,7 @@ mod tests {
             ExactKind::Sum => ExactParams::Sum,
             ExactKind::Count => ExactParams::Count,
             ExactKind::MinMax => ExactParams::MinMax,
+            ExactKind::Min => ExactParams::Min,
             ExactKind::Increase => ExactParams::Increase,
             ExactKind::Rate => ExactParams::Rate,
             ExactKind::IRate => ExactParams::IRate,

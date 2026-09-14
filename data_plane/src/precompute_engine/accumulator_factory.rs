@@ -1061,10 +1061,12 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         // to `ExactKind::MinMax` for an exact "Min"/"min"/"Max"/"max"
         // match, so re-deriving via `eq_ignore_ascii_case("max")` here
         // reproduces the same true/false split for that path too.
-        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _), false) => Box::new(
-            MinMaxAccumulatorUpdater::new(config.aggregation_sub_type.eq_ignore_ascii_case("max")),
-        ),
-        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _), true) => {
+        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax | ExactKind::Min, _), false) => {
+            Box::new(MinMaxAccumulatorUpdater::new(
+                config.aggregation_sub_type.eq_ignore_ascii_case("max"),
+            ))
+        }
+        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax | ExactKind::Min, _), true) => {
             Box::new(MultipleMinMaxAccumulatorUpdater::new(
                 config.aggregation_sub_type.eq_ignore_ascii_case("max"),
             ))
