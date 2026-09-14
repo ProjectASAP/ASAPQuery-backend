@@ -92,7 +92,7 @@ fn reconstruct_exact_agg(
     bytes: &[u8],
 ) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
     use crate::precompute_engine::operators::{
-        IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator,
+        IncreaseAccumulator, MaxAccumulator, MinAccumulator, MultipleIncreaseAccumulator,
         MultipleSumAccumulator, SumAccumulator,
     };
     use crate::storage_engines::types::AggregateCore;
@@ -103,7 +103,10 @@ fn reconstruct_exact_agg(
         "IncreaseAccumulator" => IncreaseAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "MinMaxAccumulator" => MinMaxAccumulator::deserialize_from_bytes(bytes)
+        "MinAccumulator" => MinAccumulator::deserialize_from_bytes(bytes)
+            .ok()
+            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
+        "MaxAccumulator" => MaxAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
         "MultipleSumAccumulator" => MultipleSumAccumulator::deserialize_from_bytes(bytes)
@@ -112,9 +115,8 @@ fn reconstruct_exact_agg(
         "MultipleIncreaseAccumulator" => MultipleIncreaseAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        // `MultipleMinMaxAccumulator` needs an external `sub_type`
-        // (min/max) not recorded in the part, and the sketch-backed
-        // accumulator forms have no generic byte factory — both are left
+        // The keyed `MultipleMin`/`MultipleMax` forms and the
+        // sketch-backed accumulators have no generic byte factory — left
         // to the deferred exact-agg/sketch precompute read-back work (see
         // PR follow-up note). They are still served from memory; only the
         // evicted-to-disk portion is skipped for these types.
@@ -208,7 +210,7 @@ pub struct SummarySeriesMetadata {
     /// M2.3 — the canonical "what kind of aggregation lives at this
     /// sid" descriptor. Replaces the M2-era `sketch_kind` +
     /// `sketch_config` field pair so a single registry can host both
-    /// sketches and partial-accumulator (Sum/Count/Avg/Rate/MinMax)
+    /// sketches and partial-accumulator (Sum/Count/Avg/Rate/Min/Max)
     /// state.
     pub agg_kind: AggKind,
     /// Approximate accuracy bound — `Some` for sketch-backed sids,
@@ -432,12 +434,14 @@ impl ReductionRollupSeries {
 /// belong here rather than as additional top-level `SketchStore` fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RollupReduction {
+    Min,
     Max,
 }
 
 impl RollupReduction {
     fn combine(self, left: f64, right: f64) -> f64 {
         match self {
+            Self::Min => left.min(right),
             Self::Max => left.max(right),
         }
     }
@@ -1450,7 +1454,7 @@ impl SketchStore {
         data
     }
 
-    /// Append a window's exact-aggregation (Sum/Count/Avg/Rate/MinMax)
+    /// Append a window's exact-aggregation (Sum/Count/Avg/Rate/Min/Max)
     /// state under `sid`. Mirror of [`Self::append_sample`] for the
     /// exact-agg branch — Phase 5 M2.3.3.
     ///
@@ -1498,11 +1502,21 @@ impl SketchStore {
             return false;
         }
         let _mutation = self.begin_state_mutation();
-        let max_value = payload
+        // Extremum state feeds the derived rollup series that serves
+        // `min_over_time` / `max_over_time` without walking every pane.
+        // Both directions are their own accumulator type, so the reduction
+        // follows from the payload's type rather than from a `sub_type`
+        // string that had to agree with it.
+        let rollup_value = payload
             .as_any()
-            .downcast_ref::<crate::precompute_engine::operators::MinMaxAccumulator>()
-            .filter(|acc| acc.sub_type == "max")
-            .map(|acc| acc.value);
+            .downcast_ref::<crate::precompute_engine::operators::MinAccumulator>()
+            .map(|acc| (RollupReduction::Min, acc.value))
+            .or_else(|| {
+                payload
+                    .as_any()
+                    .downcast_ref::<crate::precompute_engine::operators::MaxAccumulator>()
+                    .map(|acc| (RollupReduction::Max, acc.value))
+            });
         let store = self
             .series
             .entry(sid)
@@ -1517,9 +1531,11 @@ impl SketchStore {
         guard.last_write_unix_ms = now_ms();
         let retention_horizon_ms = guard.retention_horizon_ms;
         drop(guard);
-        if let Some(value) = max_value.filter(|_| self.persistence_read.read().unwrap().is_none()) {
+        if let Some((reduction, value)) =
+            rollup_value.filter(|_| self.persistence_read.read().unwrap().is_none())
+        {
             self.rollups.append(
-                RollupReduction::Max,
+                reduction,
                 sid,
                 series_label_values,
                 window,

@@ -1,8 +1,9 @@
 use crate::precompute_engine::operators::{
     CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
     CountSketchWithHeapAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
-    HydraKllSketchAccumulator, IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator,
-    MultipleMinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
+    HydraKllSketchAccumulator, IncreaseAccumulator, MaxAccumulator, MinAccumulator,
+    MultipleIncreaseAccumulator, MultipleMaxAccumulator, MultipleMinAccumulator,
+    MultipleSumAccumulator, SumAccumulator,
 };
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, Measurement,
@@ -148,54 +149,50 @@ impl AccumulatorUpdater for SumAccumulatorUpdater {
 }
 
 // ---------------------------------------------------------------------------
-// MinMaxAccumulatorUpdater
+// MinAccumulatorUpdater / MaxAccumulatorUpdater
 // ---------------------------------------------------------------------------
 
-pub struct MinMaxAccumulatorUpdater {
-    acc: MinMaxAccumulator,
-    is_max: bool,
-}
-
-impl MinMaxAccumulatorUpdater {
-    pub fn new(is_max: bool) -> Self {
-        Self {
-            acc: if is_max {
-                MinMaxAccumulator::new_max()
-            } else {
-                MinMaxAccumulator::new_min()
-            },
-            is_max,
+macro_rules! extremum_updater {
+    ($updater:ident, $acc:ty) => {
+        #[derive(Default)]
+        pub struct $updater {
+            acc: $acc,
         }
-    }
+
+        impl $updater {
+            pub fn new() -> Self {
+                Self::default()
+            }
+        }
+
+        impl AccumulatorUpdater for $updater {
+            fn update_single(&mut self, value: f64, _timestamp_ms: i64) {
+                self.acc.update(value);
+            }
+
+            fn update_keyed(&mut self, _key: &KeyByLabelValues, value: f64, timestamp_ms: i64) {
+                self.update_single(value, timestamp_ms);
+            }
+
+            impl_clone_accumulator_methods!(acc);
+
+            fn reset(&mut self) {
+                self.acc = <$acc>::new();
+            }
+
+            fn is_keyed(&self) -> bool {
+                false
+            }
+
+            fn memory_usage_bytes(&self) -> usize {
+                std::mem::size_of::<$acc>()
+            }
+        }
+    };
 }
 
-impl AccumulatorUpdater for MinMaxAccumulatorUpdater {
-    fn update_single(&mut self, value: f64, _timestamp_ms: i64) {
-        self.acc.update(value);
-    }
-
-    fn update_keyed(&mut self, _key: &KeyByLabelValues, value: f64, timestamp_ms: i64) {
-        self.update_single(value, timestamp_ms);
-    }
-
-    impl_clone_accumulator_methods!(acc);
-
-    fn reset(&mut self) {
-        self.acc = if self.is_max {
-            MinMaxAccumulator::new_max()
-        } else {
-            MinMaxAccumulator::new_min()
-        };
-    }
-
-    fn is_keyed(&self) -> bool {
-        false
-    }
-
-    fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of::<MinMaxAccumulator>()
-    }
-}
+extremum_updater!(MinAccumulatorUpdater, MinAccumulator);
+extremum_updater!(MaxAccumulatorUpdater, MaxAccumulator);
 
 // ---------------------------------------------------------------------------
 // IncreaseAccumulatorUpdater
@@ -432,58 +429,54 @@ impl AccumulatorUpdater for MultipleSumAccumulatorUpdater {
 }
 
 // ---------------------------------------------------------------------------
-// MultipleMinMaxAccumulatorUpdater
+// MultipleMinAccumulatorUpdater / MultipleMaxAccumulatorUpdater
 // ---------------------------------------------------------------------------
 
-pub struct MultipleMinMaxAccumulatorUpdater {
-    acc: MultipleMinMaxAccumulator,
-    is_max: bool,
-}
-
-impl MultipleMinMaxAccumulatorUpdater {
-    pub fn new(is_max: bool) -> Self {
-        Self {
-            acc: if is_max {
-                MultipleMinMaxAccumulator::new_max()
-            } else {
-                MultipleMinMaxAccumulator::new_min()
-            },
-            is_max,
+macro_rules! multiple_extremum_updater {
+    ($updater:ident, $acc:ty) => {
+        #[derive(Default)]
+        pub struct $updater {
+            acc: $acc,
         }
-    }
+
+        impl $updater {
+            pub fn new() -> Self {
+                Self::default()
+            }
+        }
+
+        impl AccumulatorUpdater for $updater {
+            fn update_single(&mut self, _value: f64, _timestamp_ms: i64) {
+                debug_assert!(
+                    false,
+                    "update_single called on keyed updater; use update_keyed"
+                );
+            }
+
+            fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
+                self.acc.update(key.clone(), value);
+            }
+
+            impl_clone_accumulator_methods!(acc);
+
+            fn reset(&mut self) {
+                self.acc = <$acc>::new();
+            }
+
+            fn is_keyed(&self) -> bool {
+                true
+            }
+
+            fn memory_usage_bytes(&self) -> usize {
+                std::mem::size_of::<$acc>()
+                    + self.acc.values.len() * (std::mem::size_of::<KeyByLabelValues>() + 8)
+            }
+        }
+    };
 }
 
-impl AccumulatorUpdater for MultipleMinMaxAccumulatorUpdater {
-    fn update_single(&mut self, _value: f64, _timestamp_ms: i64) {
-        debug_assert!(
-            false,
-            "update_single called on keyed updater; use update_keyed"
-        );
-    }
-
-    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
-        self.acc.update(key.clone(), value);
-    }
-
-    impl_clone_accumulator_methods!(acc);
-
-    fn reset(&mut self) {
-        self.acc = if self.is_max {
-            MultipleMinMaxAccumulator::new_max()
-        } else {
-            MultipleMinMaxAccumulator::new_min()
-        };
-    }
-
-    fn is_keyed(&self) -> bool {
-        true
-    }
-
-    fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of::<MultipleMinMaxAccumulator>()
-            + self.acc.values.len() * (std::mem::size_of::<KeyByLabelValues>() + 8)
-    }
-}
+multiple_extremum_updater!(MultipleMinAccumulatorUpdater, MultipleMinAccumulator);
+multiple_extremum_updater!(MultipleMaxAccumulatorUpdater, MultipleMaxAccumulator);
 
 // ---------------------------------------------------------------------------
 // MultipleIncreaseAccumulatorUpdater
@@ -912,7 +905,8 @@ pub fn config_is_keyed(config: &AggregationConfig) -> bool {
         AggregationType::MultipleSubpopulation
             | AggregationType::MultipleSum
             | AggregationType::MultipleIncrease
-            | AggregationType::MultipleMinMax
+            | AggregationType::MultipleMin
+            | AggregationType::MultipleMax
             | AggregationType::CountMinSketch
             | AggregationType::CountMinSketchWithHeap
             | AggregationType::CountSketch
@@ -1053,23 +1047,22 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             Box::new(MultipleSumAccumulatorUpdater::new())
         }
 
-        // Min/max direction isn't part of `ExactParams::MinMax`
-        // (upstream models no direction axis) — read straight off
-        // `aggregation_sub_type`, exactly as the pre-Step-5 dispatch did
-        // for the direct `AggregationType::MinMax`/`MultipleMinMax`
-        // arms. `accumulator_spec()` only resolves a wrapper's sub_type
-        // to `ExactKind::MinMax` for an exact "Min"/"min"/"Max"/"max"
-        // match, so re-deriving via `eq_ignore_ascii_case("max")` here
-        // reproduces the same true/false split for that path too.
-        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax | ExactKind::Min, _), false) => {
-            Box::new(MinMaxAccumulatorUpdater::new(
-                config.aggregation_sub_type.eq_ignore_ascii_case("max"),
-            ))
+        // Direction comes off the family itself now. It used to be read
+        // back out of `aggregation_sub_type` because Planner had one
+        // `MinMax` accumulator for both directions, which meant a config
+        // whose sub_type was lost or misspelled silently built the wrong
+        // extremum.
+        (SummaryFamilyType::ExactAggregate(ExactKind::Min, _), false) => {
+            Box::new(MinAccumulatorUpdater::new())
         }
-        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax | ExactKind::Min, _), true) => {
-            Box::new(MultipleMinMaxAccumulatorUpdater::new(
-                config.aggregation_sub_type.eq_ignore_ascii_case("max"),
-            ))
+        (SummaryFamilyType::ExactAggregate(ExactKind::Min, _), true) => {
+            Box::new(MultipleMinAccumulatorUpdater::new())
+        }
+        (SummaryFamilyType::ExactAggregate(ExactKind::Max, _), false) => {
+            Box::new(MaxAccumulatorUpdater::new())
+        }
+        (SummaryFamilyType::ExactAggregate(ExactKind::Max, _), true) => {
+            Box::new(MultipleMaxAccumulatorUpdater::new())
         }
 
         (SummaryFamilyType::ExactAggregate(ExactKind::Increase, _), false) => {
@@ -1337,13 +1330,13 @@ mod tests {
 
     #[test]
     fn test_minmax_updater() {
-        let mut updater = MinMaxAccumulatorUpdater::new(true);
+        let mut updater = MaxAccumulatorUpdater::new();
         updater.update_single(5.0, 1000);
         updater.update_single(3.0, 2000);
         updater.update_single(7.0, 3000);
 
         let acc = updater.take_accumulator();
-        assert_eq!(acc.type_name(), "MinMaxAccumulator");
+        assert_eq!(acc.type_name(), "MaxAccumulator");
     }
 
     #[test]
@@ -1479,7 +1472,7 @@ mod tests {
             ""
         )));
         assert!(config_is_keyed(&make_config(
-            AggregationType::MultipleMinMax,
+            AggregationType::MultipleMax,
             ""
         )));
         assert!(config_is_keyed(&make_config(

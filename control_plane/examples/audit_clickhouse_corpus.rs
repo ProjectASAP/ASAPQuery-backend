@@ -26,7 +26,7 @@ struct Row {
 
 fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
     let mut materialization = PrecomputeMaterialization::new(
-        AggregationType::MinMax,
+        AggregationType::Max,
         String::new(),
         std::collections::HashMap::from([("variant".into(), json!(2))]),
         KeyByLabelNames::new(vec!["labels".into()]),

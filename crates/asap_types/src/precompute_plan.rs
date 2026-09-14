@@ -177,8 +177,13 @@ pub enum StateFamilyContract {
 pub enum ExactStateKind {
     Sum,
     Count,
-    MinMax,
+    /// Exact minimum. Distinct state from [`ExactStateKind::Max`] -- a
+    /// stored minimum cannot answer a maximum query, so the two must
+    /// never share a content address.
     Min,
+    /// Exact maximum. Planner still spells this `ExactKind::Max` for
+    /// historical reasons; it is a maximum accumulator.
+    Max,
     Increase,
     Rate,
     IRate,
@@ -194,7 +199,7 @@ impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
                 kind: match kind {
                     ExactKind::Sum => ExactStateKind::Sum,
                     ExactKind::Count => ExactStateKind::Count,
-                    ExactKind::MinMax => ExactStateKind::MinMax,
+                    ExactKind::Max => ExactStateKind::Max,
                     ExactKind::Min => ExactStateKind::Min,
                     ExactKind::Increase => ExactStateKind::Increase,
                     ExactKind::Rate => ExactStateKind::Rate,

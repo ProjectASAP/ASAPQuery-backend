@@ -189,8 +189,8 @@ mod tests {
         match kind {
             ExactKind::Sum => ExactParams::Sum,
             ExactKind::Count => ExactParams::Count,
-            ExactKind::MinMax => ExactParams::MinMax,
             ExactKind::Min => ExactParams::Min,
+            ExactKind::Max => ExactParams::Max,
             ExactKind::Increase => ExactParams::Increase,
             ExactKind::Rate => ExactParams::Rate,
             ExactKind::IRate => ExactParams::IRate,
@@ -285,10 +285,7 @@ mod tests {
     fn exact_accumulator_requires_the_exact_same_kind() {
         let m = SummaryFamilyMatcher;
         assert!(m.is_satisfied_by(&accumulator(ExactKind::Sum), &accumulator(ExactKind::Sum)));
-        assert!(!m.is_satisfied_by(
-            &accumulator(ExactKind::Sum),
-            &accumulator(ExactKind::MinMax)
-        ));
+        assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &accumulator(ExactKind::Max)));
         assert!(!m.is_satisfied_by(
             &accumulator(ExactKind::Increase),
             &accumulator(ExactKind::Rate)

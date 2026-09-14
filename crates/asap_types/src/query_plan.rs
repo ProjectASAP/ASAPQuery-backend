@@ -633,8 +633,8 @@ pub enum ExactReadout {
     Count,
     Increase,
     Rate,
-    Max,
     Min,
+    Max,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

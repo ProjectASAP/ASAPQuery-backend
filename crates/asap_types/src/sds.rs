@@ -668,7 +668,7 @@ impl FidelityGuarantee {
                 (aggregation_type, self),
                 (A::UnivMon, UnivMonFrequency { .. })
                     | (
-                        A::Sum | A::MultipleSum | A::MinMax | A::MultipleMinMax,
+                        A::Sum | A::MultipleSum | A::Min | A::Max | A::MultipleMin | A::MultipleMax,
                         Exact
                     )
                     | (A::Increase | A::MultipleIncrease, ExactCounter { .. })

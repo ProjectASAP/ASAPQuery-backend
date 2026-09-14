@@ -357,7 +357,7 @@ mod tests {
             .bind(metadata(1, "cpu", "", AggregationType::Sum, 7))
             .unwrap();
         let b = registry
-            .bind(metadata(2, "cpu", "", AggregationType::MinMax, 7))
+            .bind(metadata(2, "cpu", "", AggregationType::Max, 7))
             .unwrap();
 
         assert!(!Arc::ptr_eq(&a.summary_descriptor, &b.summary_descriptor));
@@ -407,13 +407,7 @@ mod tests {
         registry.install_catalog(Arc::new(catalog)).unwrap();
 
         let binding = registry
-            .bind(metadata(
-                1,
-                "wrong-local-copy",
-                "",
-                AggregationType::MinMax,
-                7,
-            ))
+            .bind(metadata(1, "wrong-local-copy", "", AggregationType::Max, 7))
             .unwrap();
         assert_eq!(binding.summary_descriptor.as_ref(), &summary);
         assert_eq!(binding.data_descriptor.as_ref(), &data);

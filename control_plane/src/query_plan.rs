@@ -823,8 +823,8 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
         SummaryFamilyType::ExactAggregate(ExactKind::Count, _) => Some(ExactReadout::Count),
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
-        SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _) => Some(ExactReadout::Max),
         SummaryFamilyType::ExactAggregate(ExactKind::Min, _) => Some(ExactReadout::Min),
+        SummaryFamilyType::ExactAggregate(ExactKind::Max, _) => Some(ExactReadout::Max),
         _ => None,
     }
 }
@@ -913,7 +913,7 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
                             | ExactKind::Increase
                             | ExactKind::Rate
                             | ExactKind::Min
-                            | ExactKind::MinMax
+                            | ExactKind::Max
                     )
             } else {
                 // Raw producer grouping may move through additive reductions,
@@ -1168,6 +1168,90 @@ mod catalog_binding_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_division_retains_checks_in_both_query_compilers() {
+        // Both compilers retain the finite/relative guard supplied by Planner.
+        let query = "avg_over_time(m[5m])";
+        let canonical = crate::query_parser::parse_query_expr_canonical(
+            query,
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let root = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let SummaryExpr::BinaryOp { operator, .. } = &root.expr else {
+            panic!("expected the Planner's average rewrite");
+        };
+        assert!(operator.checked_finite_division);
+        for relative in [false, true] {
+            let mut guarded = root.as_ref().clone();
+            let SummaryExpr::BinaryOp { operator, .. } = &mut guarded.expr else {
+                unreachable!();
+            };
+            operator.checked_finite_division = !relative;
+            operator.checked_relative_division = relative;
+            let guarded = Rc::new(guarded);
+            for composable in [false, true] {
+                let instant = InstantExecution {
+                    lookback_ms: 300_000,
+                    full_history: false,
+                    cumulative_readout: false,
+                };
+                let bind = |_: &Rc<SummaryNode>, _: &SummaryFamilyType| {
+                    Ok(MaterializationBinding {
+                        full_window_slide_ms: None,
+                        materialization: PolicyFingerprint(7).into(),
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 300_000,
+                        pane_origin_ms: Some(0),
+                        readout_lookback_ms: Some(300_000),
+                        item_labels: Vec::new(),
+                    })
+                };
+                let entry = if composable {
+                    compile_bound_composable_mapped(
+                        "guarded".into(),
+                        query.into(),
+                        &guarded,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        bind,
+                        |_, _| {},
+                    )
+                } else {
+                    compile_bound_mapped(
+                        "guarded".into(),
+                        query.into(),
+                        &guarded,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        bind,
+                        |_, _| {},
+                    )
+                }
+                .unwrap();
+                let QueryPlanNode::Logical {
+                    operator: residual::ResidualQueryOperator::Binary { operation, .. },
+                    ..
+                } = &entry.nodes[&entry.root]
+                else {
+                    panic!(
+                        "expected guarded division (composable={composable}): {:?}",
+                        entry.nodes
+                    );
+                };
+                assert_eq!(
+                    *operation,
+                    if relative {
+                        residual::BinaryOperation::CheckedDiv
+                    } else {
+                        residual::BinaryOperation::FiniteDiv
+                    }
+                );
+                assert!(!entry.materialization_bindings().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn canonical_identity_ignores_formatting() {

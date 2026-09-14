@@ -931,7 +931,7 @@ mod tests {
             1000,
         );
         let entry = crate::query_engines::asap_query_engine::test_plan::entry(
-            "count(unique_users)",
+            "count(distinct_over_time(unique_users[1m]))",
             &config,
             asap_types::query_plan::PhysicalGrouping::PerEntity,
             1000,
@@ -995,7 +995,7 @@ mod tests {
             1000,
         );
         let entry = test_plan::entry(
-            "count(unique_users)",
+            "count(distinct_over_time(unique_users[1m]))",
             &config,
             PhysicalGrouping::Reduce(vec![]),
             1000,
@@ -1009,8 +1009,8 @@ mod tests {
         assert_eq!(
             outcome.series.len(),
             1,
-            "a by-less count() is a full reduction -- both HLL sids must merge into ONE \
-             series, not stay split (and not be declined), got {:?}",
+            "a by-less distinct count is a full reduction -- both HLL sids must merge into \
+             ONE series, not stay split (and not be declined), got {:?}",
             outcome.series
         );
         // Disjoint item sets {a,b,c} + {d,e,f} -> merged cardinality ~6.

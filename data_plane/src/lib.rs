@@ -43,7 +43,7 @@ pub use storage_engines::types::{
 };
 
 pub use precompute_engine::operators::{
-    IncreaseAccumulator, MinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
+    IncreaseAccumulator, MaxAccumulator, MinAccumulator, MultipleSumAccumulator, SumAccumulator,
 };
 
 pub use storage_engines::StoreResult;

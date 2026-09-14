@@ -55,8 +55,10 @@ impl ResolvedMaterialization<'_> {
                     | AggregationType::MultipleSum
                     | AggregationType::Increase
                     | AggregationType::MultipleIncrease
-                    | AggregationType::MinMax
-                    | AggregationType::MultipleMinMax,
+                    | AggregationType::Min
+                    | AggregationType::Max
+                    | AggregationType::MultipleMin
+                    | AggregationType::MultipleMax,
                 ..
             }
         )
@@ -80,14 +82,11 @@ impl ResolvedMaterialization<'_> {
                 ExactReadout::Increase | ExactReadout::Rate => {
                     matches!(aggregation_type, Increase | MultipleIncrease)
                 }
-                ExactReadout::Min => {
-                    matches!(aggregation_type, MinMax | MultipleMinMax)
-                        && aggregation_sub_type.eq_ignore_ascii_case("min")
-                }
-                ExactReadout::Max => {
-                    matches!(aggregation_type, MinMax | MultipleMinMax)
-                        && aggregation_sub_type.eq_ignore_ascii_case("max")
-                }
+                // Direction is the family now -- no `aggregation_sub_type`
+                // cross-check, and a minimum summary can no longer be
+                // offered up for a maximum readout.
+                ExactReadout::Min => matches!(aggregation_type, Min | MultipleMin),
+                ExactReadout::Max => matches!(aggregation_type, Max | MultipleMax),
             },
             QueryPlanNode::SummaryEstimate { query, .. } => match query {
                 QueryReadout::Quantile { q } => {

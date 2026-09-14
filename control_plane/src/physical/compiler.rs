@@ -727,7 +727,7 @@ fn has_unsafe_raw_entity_leaf(
                 let preserves_series_state = matches!(
                     family,
                     SummaryFamilyType::ExactAggregate(
-                        ExactKind::Increase | ExactKind::Rate | ExactKind::MinMax | ExactKind::Min,
+                        ExactKind::Increase | ExactKind::Rate | ExactKind::Min | ExactKind::Max,
                         _
                     )
                 );
@@ -1063,7 +1063,7 @@ impl PhysicalPlanCompiler {
                         && (!matches!(
                             state.family,
                             SummaryFamilyType::ExactAggregate(
-                                planner_types::post_asap::ExactKind::MinMax,
+                                planner_types::post_asap::ExactKind::Max,
                                 _
                             )
                         ) || crate::query_plan::residual::selected_range_max_materialization(
@@ -2694,10 +2694,12 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
         A::DDSketch => 64 * 1024,
         A::Sum
         | A::Increase
-        | A::MinMax
+        | A::Min
+        | A::Max
         | A::MultipleSum
         | A::MultipleIncrease
-        | A::MultipleMinMax
+        | A::MultipleMin
+        | A::MultipleMax
         | A::SingleSubpopulation
         | A::MultipleSubpopulation => 256,
     }
@@ -2715,7 +2717,7 @@ fn retained_partition_count(
     if materialization.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
         || matches!(
             materialization.aggregation_type,
-            A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
+            A::Increase | A::MultipleIncrease | A::Min | A::Max | A::MultipleMin | A::MultipleMax
         )
         || !materialization.grouping_labels.names().is_empty()
     {
@@ -3874,8 +3876,8 @@ pub(crate) mod tests {
         let plan = PhysicalPlanCompiler.compile_promql(input, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         assert_eq!(
-            plan.precompute_plan.materializations[0].aggregation_sub_type,
-            "min"
+            plan.precompute_plan.materializations[0].aggregation_type,
+            asap_types::AggregationType::Min
         );
         assert!(plan
             .query_plan
