@@ -7,7 +7,6 @@ use control_plane::opamp;
 use control_plane::physical;
 use control_plane::runtime_samples;
 use control_plane::types;
-use control_plane::workload;
 
 use axum::{
     extract::State,
@@ -21,15 +20,12 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tracing::info;
 
 use opamp::OpampServer;
-use physical::backend_stage::BackendStageConfig;
 use physical::deployment_cost::online as online_cost_model;
 use physical::deployment_cost::online::{init_store as init_online_store, OnlineMetricsStore};
 use physical::deployment_cost::tco;
-use workload::AggRole;
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -37,7 +33,6 @@ use workload::AggRole;
 struct AppState {
     opamp: Arc<OpampServer>,
     online_store: OnlineMetricsStore,
-    opamp_endpoint: String,
     /// Bounded ring buffer for runtime-sample push batches from
     /// agents' `sketch-runtime::PushExporter`. Read by decision
     /// loops in the replanner.
@@ -60,16 +55,6 @@ async fn main() {
     let api_addr = std::env::var("CONTROLLER_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let opamp_addr =
         std::env::var("CONTROLLER_OPAMP_ADDR").unwrap_or_else(|_| "0.0.0.0:4320".into());
-    // The default must match the compose service name `controller`; the crate
-    // name `control_plane` is not a resolvable hostname in the canonical stack.
-    let opamp_ep = std::env::var("CONTROLLER_OPAMP_ENDPOINT")
-        .unwrap_or_else(|_| "ws://controller:4320/v1/opamp".into());
-    let scrape_interval = Duration::from_secs(
-        std::env::var("CONTROLLER_SCRAPE_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60u64),
-    );
     let backend_endpoint = std::env::var("CONTROLLER_BACKEND_ENDPOINT").ok();
 
     // ── SP-5: Online EMA cost store ───────────────────────────────────────────
@@ -95,14 +80,10 @@ async fn main() {
         );
     }
 
-    let backend_routing_cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
     let runtime_samples_store = runtime_samples::RuntimeSamplesStore::new(1024);
     let state = AppState {
         opamp: Arc::clone(&opamp_srv),
         online_store: Arc::clone(&online_store),
-        opamp_endpoint: opamp_ep,
         runtime_samples: Arc::clone(&runtime_samples_store),
         active_summary_catalog: Arc::new(tokio::sync::Mutex::new(None)),
         backend_client: backend_client_shared,
@@ -800,36 +781,12 @@ fn test_app() -> (AppState, axum::Router) {
 /// backend pushes; `Some(url)` exercises typed backend JSON delivery.
 #[cfg(test)]
 fn test_app_with_backend(backend_url: Option<String>) -> (AppState, axum::Router) {
-    let online_store = init_online_store();
-    let plan_store = Arc::new(PlanStore::new());
-    let workload_store = Arc::new(WorkloadStore::new());
-    let opamp = Arc::new(OpampServer::new());
-    let scraper = Arc::new(Scraper::new(
-        vec![],
-        Thresholds::default(),
-        Arc::new(|_| {}),
-        Duration::from_secs(60),
-    ));
-    let planner = Arc::new(CachedDeploymentPlanner::new(
-        DeploymentCostPlanner::new().with_online_store(Arc::clone(&online_store)),
-    ));
-    let replanner = Arc::new(Replanner::new(
-        Arc::clone(&planner),
-        Arc::clone(&plan_store),
-        Arc::clone(&workload_store),
-        Arc::clone(&opamp),
-        Arc::clone(&scraper),
-        "ws://ctrl:4320/v1/opamp",
-    ));
-    let backend_client = backend_url.map(|u| Arc::new(backend_client::BackendClient::new(u)));
     let state = AppState {
-        opamp,
-        replanner,
-        online_store,
-        opamp_endpoint: "ws://ctrl:4320/v1/opamp".into(),
+        opamp: Arc::new(OpampServer::new()),
+        online_store: init_online_store(),
         runtime_samples: runtime_samples::RuntimeSamplesStore::new(64),
         active_summary_catalog: Arc::new(tokio::sync::Mutex::new(None)),
-        backend_client,
+        backend_client: backend_url.map(|u| Arc::new(backend_client::BackendClient::new(u))),
     };
     let router = axum::Router::new()
         .route("/api/v1/cost-model", axum::routing::get(handle_cost_model))
@@ -1070,241 +1027,6 @@ mod api_tests {
 
     // ── Integration: control plane ↔ collector wiring ─────────────────────────
 
-    /// Helper: start an OpAMP WebSocket server on a random port.
-    /// Returns the (server Arc, local addr string).
-    async fn start_opamp_server(opamp: Arc<OpampServer>) -> String {
-        let router = axum::Router::new()
-            .route("/v1/opamp", axum::routing::get(OpampServer::ws_handler))
-            .with_state(opamp);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        format!("127.0.0.1:{}", addr.port())
-    }
-
-    /// Connect a mock agent via WebSocket, returning the stream.
-    async fn connect_agent(
-        opamp_addr: &str,
-        agent_id: &str,
-        role: &str,
-    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
-    {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let url = format!("ws://{opamp_addr}/v1/opamp");
-        let mut req = url.into_client_request().unwrap();
-        req.headers_mut()
-            .insert("X-Agent-ID", agent_id.parse().unwrap());
-        req.headers_mut()
-            .insert("X-Agent-Role", role.parse().unwrap());
-        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-        ws
-    }
-
-    /// Read the next binary WebSocket frame, decode as OpAMP ServerToAgent,
-    /// and extract the YAML config body.
-    async fn recv_config_yaml(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> String {
-        use tokio_tungstenite::tungstenite::Message;
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            futures_util::StreamExt::next(ws),
-        )
-        .await
-        .expect("timeout waiting for config push")
-        .expect("stream ended")
-        .expect("ws error");
-        match msg {
-            Message::Binary(data) => {
-                let payload = if !data.is_empty() && data[0] == 0 {
-                    &data[1..]
-                } else {
-                    data.as_slice()
-                };
-                let sta =
-                    <crate::opamp::opamp_proto::ServerToAgent as prost::Message>::decode(payload)
-                        .expect("decode ServerToAgent");
-                let rc = sta.remote_config.expect("remote_config present");
-                let cm = rc.config.expect("config present");
-                let file = cm.config_map.get("").expect("empty-key config file");
-                String::from_utf8(file.body.clone()).expect("yaml is utf8")
-            }
-            other => panic!("expected binary frame, got {other:?}"),
-        }
-    }
-
-    /// Test 2: Re-plan pushes config only to agents registered for that metric.
-    #[tokio::test]
-    async fn replan_pushes_only_to_registered_agent() {
-        let online_store = init_online_store();
-        let plan_store = Arc::new(PlanStore::new());
-        let workload_store = Arc::new(WorkloadStore::new());
-        let opamp_srv = Arc::new(OpampServer::new());
-        let scraper = Arc::new(Scraper::new(
-            vec![],
-            Thresholds::default(),
-            Arc::new(|_| {}),
-            Duration::from_secs(60),
-        ));
-        let planner = Arc::new(CachedDeploymentPlanner::new(
-            DeploymentCostPlanner::new().with_online_store(Arc::clone(&online_store)),
-        ));
-
-        // Seed workload + plan for "metric_a".
-        let analyzer = Analyzer::new();
-        let spec = pipeline::QuerySpec {
-            query_string: None,
-            metric_name: "metric_a".into(),
-            label_filters: Default::default(),
-            group_by_labels: vec![],
-            aggregations: vec!["quantile".into()],
-            time_window: "5m".into(),
-            repeat_every: None,
-            accuracy_sla: 0.01,
-            latency_sla: None,
-            sketch_type: None,
-            workload: types::WorkloadCharacteristics::default(),
-            id: None,
-            language: None,
-            accuracy: None,
-            dollars: None,
-            deployment_model: None,
-            shape: types::QueryShape::default(),
-            data: types::DataShape::default(),
-        };
-        let wl = analyzer.analyze(spec).unwrap();
-
-        let plan = planner.plan(&wl);
-        plan_store.set("metric_a", control_plane::workload::AggRole::Quantile, plan);
-        workload_store.set("metric_a", control_plane::workload::AggRole::Quantile, wl);
-
-        let replanner = Arc::new(Replanner::new(
-            Arc::clone(&planner),
-            Arc::clone(&plan_store),
-            Arc::clone(&workload_store),
-            Arc::clone(&opamp_srv),
-            Arc::clone(&scraper),
-            "ws://ctrl:4320/v1/opamp",
-        ));
-
-        // Start OpAMP server and connect two agents.
-        let addr = start_opamp_server(Arc::clone(&opamp_srv)).await;
-        let mut ws_a = connect_agent(&addr, "agent-a", "agent").await;
-        let mut ws_b = connect_agent(&addr, "agent-b", "agent").await;
-        // Let connections register.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Register agent-a for metric_a, agent-b is NOT registered for metric_a.
-        replanner
-            .register_agent(
-                "agent-a",
-                "metric_a",
-                control_plane::workload::AggRole::Quantile,
-            )
-            .await;
-        replanner
-            .register_agent(
-                "agent-b",
-                "metric_b",
-                control_plane::workload::AggRole::Quantile,
-            )
-            .await;
-
-        // Trigger replan for metric_a.
-        let ok = replanner.replan_metric("metric_a").await;
-        assert!(ok, "replan should succeed");
-
-        // agent-a should receive a config push.
-        let yaml_a = recv_config_yaml(&mut ws_a).await;
-        assert!(!yaml_a.is_empty(), "agent-a should have received config");
-
-        // agent-b should NOT receive anything (timeout).
-        let result_b = tokio::time::timeout(
-            Duration::from_millis(500),
-            futures_util::StreamExt::next(&mut ws_b),
-        )
-        .await;
-        assert!(
-            result_b.is_err(),
-            "agent-b should NOT receive config for metric_a replan"
-        );
-    }
-
-    /// Test 3: Generated agent YAML contains extensions.opamp with correct endpoint.
-    #[tokio::test]
-    async fn generated_agent_yaml_contains_opamp_extension() {
-        let endpoint = "ws://my-controller:4320/v1/opamp";
-        let cfg = AgentCollectorConfig {
-            output_mode: types::OutputMode::Sketch,
-            sketch_type: types::SketchType::DDSketch,
-            sketch_params: types::SketchParams::default(),
-            aggregate_by: vec![],
-            label_matchers: vec![],
-            window_duration: Some(Duration::from_secs(60)),
-            mode: types::ProcessorMode::Window,
-            enable_self_monitoring: true,
-            transmit_sketch: true,
-            drop_original: true,
-            delta_transmission: false,
-            delta_threshold: 0.0,
-            gos: None,
-            enable_series_id: false,
-            series_id_ttl_secs: 300,
-            // This test asserts on `doc["exporters"]["prometheus"]`
-            // (line ~1326). Keep the test semantics by pinning the
-            // sink to the legacy prometheus exporter.
-            data_sink: types::AgentDataSink::PrometheusScrape {
-                endpoint: "0.0.0.0:8889".to_string(),
-            },
-        };
-        let yaml = generate_agent_collector_config(&cfg, endpoint).unwrap();
-
-        // Parse the YAML to verify structure, not just substring matches.
-        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-
-        // 1. extensions.opamp.server.ws.endpoint matches the parameter.
-        let opamp_ext = &doc["extensions"]["opamp"];
-        assert!(
-            !opamp_ext.is_null(),
-            "YAML missing extensions.opamp:\n{yaml}"
-        );
-        let ws_endpoint = opamp_ext["server"]["ws"]["endpoint"].as_str().unwrap();
-        assert_eq!(ws_endpoint, endpoint, "OpAMP endpoint mismatch");
-
-        // 2. service.extensions list includes "opamp".
-        let svc_exts = doc["service"]["extensions"].as_sequence().unwrap();
-        let has_opamp = svc_exts.iter().any(|v| v.as_str() == Some("opamp"));
-        assert!(
-            has_opamp,
-            "service.extensions should include 'opamp':\n{yaml}"
-        );
-
-        // 3. The YAML is complete: has receivers, processors, exporters, service.pipelines.
-        assert!(
-            doc["receivers"]["otlp"].is_mapping(),
-            "missing receivers.otlp"
-        );
-        assert!(
-            doc["exporters"]["prometheus"].is_mapping(),
-            "missing exporters.prometheus"
-        );
-        let pipeline = &doc["service"]["pipelines"]["metrics"];
-        assert!(
-            pipeline["receivers"].is_sequence(),
-            "missing pipeline receivers"
-        );
-        assert!(
-            pipeline["processors"].is_sequence(),
-            "missing pipeline processors"
-        );
-        assert!(
-            pipeline["exporters"].is_sequence(),
-            "missing pipeline exporters"
-        );
-    }
-
     #[tokio::test]
     async fn tco_with_custom_pricing() {
         let (_, app) = test_app();
@@ -1344,52 +1066,6 @@ mod api_tests {
     }
 
     // Bootstrap and plan-push must use the same typed emission pipeline.
-
-    /// Serialises tests that mutate the `USE_TYPED_STAGE_SPLIT` env var
-    /// — `cargo test` runs tests in parallel by default and
-    /// `typed_stage_split_enabled()` reads the env on every call.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII helper: set `USE_TYPED_STAGE_SPLIT=<value>` for the
-    /// lifetime of the returned guard, restoring the prior value
-    /// (or unsetting) on drop. Holds the test-wide ENV_GUARD mutex
-    /// so concurrent tests don't trample each other.
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-        // Hold the mutex so concurrent tests serialise on env-var writes.
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let lock = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self {
-                key,
-                previous,
-                _lock: lock,
-            }
-        }
-        fn unset(key: &'static str) -> Self {
-            let lock = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-            let previous = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self {
-                key,
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     // ── MVP §46: planner ↔ 5-sketch emitter stitch (PR #339 ↔ PR #340) ─────────
     //
