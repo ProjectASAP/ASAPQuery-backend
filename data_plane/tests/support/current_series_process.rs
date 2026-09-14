@@ -37,7 +37,12 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         queries.push(format!("topk({k}, a)"));
         queries.push(format!("topk by (job) ({k}, a)"));
     }
-    for operation in ["sum", "count", "avg"] {
+    // `avg` has no summary realization, so its root offers a raw pass-through
+    // and a realizable sum/count rewrite with no comparable cost between them.
+    // Planning now fails loudly on that rather than resolving it from strategy
+    // registration order (#721); the behaviour is asserted in
+    // `control_plane::planner_selection`'s cost-unavailable regression tests.
+    for operation in ["sum", "count"] {
         queries.push(format!("{operation}(a)"));
         queries.push(format!("{operation} by (job) (a)"));
     }
@@ -252,7 +257,7 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
             "{body}"
         );
     }
-    for operation in ["sum", "count", "avg"] {
+    for operation in ["sum", "count"] {
         for text in [
             format!("{operation}(a)"),
             format!("{operation} by (job) (a)"),
@@ -314,7 +319,7 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
             &body,
         )
         .await;
-        for operation in ["sum", "count", "avg"] {
+        for operation in ["sum", "count"] {
             for text in [
                 format!("{operation}(a)"),
                 format!("{operation} by (job) (a)"),
