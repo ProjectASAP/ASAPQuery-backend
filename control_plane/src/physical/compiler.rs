@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::physical::colored_dag::emitter::{AggregationInput, BackendAggregation};
+use crate::physical::backend_stage::{AggregationInput, BackendAggregation};
 use crate::physical::post_asap::cost_model::{ControlPlaneCostModel, ExactCompositionCostEvidence};
 use crate::query_plan::{
     canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
@@ -1897,8 +1897,8 @@ impl PhysicalPlanCompiler {
                 })?;
         }
         query_plan.validate_against_catalog(&summary_catalog)?;
-        let storage_routing = crate::emit::stage_config::storage_routing_document(
-            crate::emit::stage_config::DEFAULT_TENANT,
+        let storage_routing = crate::emit::backend_wire::storage_routing_document(
+            crate::emit::backend_wire::DEFAULT_TENANT,
             &routed_algorithms.into_iter().collect::<Vec<_>>(),
         );
         Ok(CompiledPhysicalPlan {
@@ -3116,7 +3116,7 @@ pub(crate) fn aggregation_config_for_materialization(
     language: asap_types::QueryLanguage,
 ) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
     use anyhow::Context as _;
-    let mut json = crate::emit::stage_config::build_backend_aggregation_json(aggregation);
+    let mut json = crate::emit::backend_wire::build_backend_aggregation_json(aggregation);
     // The selected physical duration is authoritative. The legacy edge emitter's
     // 5..60 second clamp must not silently change a backend materialization.
     json["windowSize"] = serde_json::json!(aggregation.window_secs);

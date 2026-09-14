@@ -21,8 +21,78 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::physical::deployment_cost::{benchmark_table_pub, SketchCosts};
 use crate::types::SketchType;
+
+// ── Benchmark-derived cost table ─────────────────────────────────────────────
+//
+// Source: e2e benchmark results (2026-03-15), 1000 series x 1000 Hz row.
+// Units: bandwidth bytes/series/sec, CPU us/sample, memory bytes/sketch.
+// These are the priors the EMA smooths towards until enough runtime samples
+// arrive from the agents.
+
+#[derive(Debug, Clone, Copy)]
+pub struct SketchCosts {
+    pub bytes_per_series_per_sec: f64,
+    pub cpu_micros_per_sample: f64,
+    pub base_memory_bytes: f64,
+    pub relative_error_at_default: f64,
+}
+
+/// Public accessor used by `apply_delta_decision` to retrieve the cost table.
+pub fn benchmark_table_pub() -> HashMap<SketchType, SketchCosts> {
+    benchmark_table()
+}
+
+fn benchmark_table() -> HashMap<SketchType, SketchCosts> {
+    [
+        (
+            SketchType::DDSketch,
+            SketchCosts {
+                bytes_per_series_per_sec: 120.0,
+                cpu_micros_per_sample: 0.8,
+                base_memory_bytes: 4_096.0,
+                relative_error_at_default: 0.01,
+            },
+        ),
+        (
+            SketchType::KLL,
+            SketchCosts {
+                bytes_per_series_per_sec: 80.0,
+                cpu_micros_per_sample: 0.5,
+                base_memory_bytes: 2_048.0,
+                relative_error_at_default: 0.02,
+            },
+        ),
+        (
+            SketchType::HLL,
+            SketchCosts {
+                bytes_per_series_per_sec: 40.0,
+                cpu_micros_per_sample: 0.3,
+                base_memory_bytes: 16_384.0, // precision=14 → 16 KB
+                relative_error_at_default: 0.008,
+            },
+        ),
+        (
+            SketchType::CountSketch,
+            SketchCosts {
+                bytes_per_series_per_sec: 200.0,
+                cpu_micros_per_sample: 1.2,
+                base_memory_bytes: 40_960.0,
+                relative_error_at_default: 0.01,
+            },
+        ),
+        (
+            SketchType::CountMinSketch,
+            SketchCosts {
+                bytes_per_series_per_sec: 200.0,
+                cpu_micros_per_sample: 1.0,
+                base_memory_bytes: 40_960.0,
+                relative_error_at_default: 0.01,
+            },
+        ),
+    ]
+    .into()
+}
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 

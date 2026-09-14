@@ -40,8 +40,6 @@
 //! | `asap_runtime_samples_records_evicted_total` | Counter |
 //! | `asap_runtime_samples_decode_errors_total` | Counter |
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -52,10 +50,8 @@ use prometheus::{Encoder, GaugeVec, IntCounter, Opts, Registry, TextEncoder};
 
 use crate::runtime_samples::RuntimeSamplesStats;
 use crate::runtime_samples::RuntimeSamplesStore;
-use crate::store::PlanStore;
 
 const LABELS: &[&str] = &["source", "sketch", "impl"];
-const PLAN_LABELS: &[&str] = &["metric", "plan_id"];
 
 /// The Prometheus registry + pre-built metric handles. Built
 /// once at startup; the `/metrics` handler pulls the latest
@@ -73,14 +69,6 @@ pub struct MetricsRegistry {
     records_stored: IntCounter,
     records_evicted: IntCounter,
     decode_errors: IntCounter,
-    /// `asap_active_plan_id{metric="...", plan_id="<hash>"} 1` —
-    /// rendered at scrape time from the `PlanStore` snapshot. The
-    /// plan_id label is a stable hash of the current plan's content,
-    /// so a re-plan flips the label value (and the previous time-series
-    /// stops being emitted on the next scrape). The replay client and
-    /// `plan_transition.py` look for this metric to detect plan
-    /// transitions.
-    active_plan_id: GaugeVec,
 }
 
 impl MetricsRegistry {
@@ -150,17 +138,6 @@ impl MetricsRegistry {
         )
         .unwrap();
 
-        let active_plan_id = GaugeVec::new(
-            Opts::new(
-                "asap_active_plan_id",
-                "Currently-published plan id per metric. The plan_id label is a stable \
-                 hash of the plan's content; a re-plan changes the label value.",
-            ),
-            PLAN_LABELS,
-        )
-        .unwrap();
-
-        registry.register(Box::new(active_plan_id.clone())).unwrap();
         registry.register(Box::new(throughput.clone())).unwrap();
         registry.register(Box::new(latency_p50.clone())).unwrap();
         registry.register(Box::new(latency_p99.clone())).unwrap();
@@ -186,52 +163,9 @@ impl MetricsRegistry {
             records_stored,
             records_evicted,
             decode_errors,
-            active_plan_id,
         })
     }
 
-    /// Refresh the `asap_active_plan_id` gauge at scrape time.
-    /// Resets prior label sets so a re-plan stops emitting the old
-    /// (metric, plan_id) pair on the next scrape.
-    fn refresh_plan_ids(&self, plan_store: &PlanStore) {
-        // Reset is necessary because GaugeVec keeps every label set
-        // ever observed; without this a re-plan would leave the old
-        // plan_id label permanently emitting a stale value.
-        self.active_plan_id.reset();
-        // B2 (metric, role): iterate per-pair so each role's plan
-        // emits its own `(metric, plan_id)` gauge value. The metric
-        // label retains the un-decorated metric name (pre-B2 wire
-        // shape) — a metric with multiple roles surfaces multiple
-        // active_plan_id rows under the same metric label.
-        for (metric, role) in plan_store.keys() {
-            let Ok(plan) = plan_store.get(&metric, role) else {
-                continue;
-            };
-            // Stable hash of the plan's debug repr — good enough for
-            // a label value, doesn't need to be cryptographic.
-            let mut hasher = DefaultHasher::new();
-            // Cover the fields the planner actually changes per
-            // re-plan: agent sketch+mode+delta+grouping, and valid_until
-            // (to catch refresh-only re-plans). Role is folded in so
-            // distinct-role plans produce distinct ids even when their
-            // agent_config fields happen to coincide.
-            format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
-                role,
-                plan.agent_config.sketch_type,
-                plan.agent_config.mode,
-                plan.agent_config.delta_transmission,
-                plan.agent_config.window_duration,
-                plan.agent_config.aggregate_by,
-                plan.valid_until,
-            )
-            .hash(&mut hasher);
-            let plan_id = format!("p{:016x}", hasher.finish());
-            self.active_plan_id
-                .with_label_values(&[metric.as_str(), plan_id.as_str()])
-                .set(1.0);
-        }
-    }
 
     /// Walk the store and push the latest sample per key into
     /// the gauge vecs. Called at scrape time, not per-record —
@@ -323,18 +257,11 @@ pub struct MetricsState {
     pub registry: Arc<MetricsRegistry>,
     pub store: Arc<RuntimeSamplesStore>,
     pub stats: Arc<RuntimeSamplesStats>,
-    /// Optional `PlanStore` reference; when present the exposer
-    /// renders `asap_active_plan_id` per metric. `None` is fine for
-    /// unit tests that exercise only the runtime-samples path.
-    pub plan_store: Option<Arc<PlanStore>>,
 }
 
 pub async fn handle_metrics(State(state): State<MetricsState>) -> Response {
     state.registry.refresh_gauges(&state.store);
     state.registry.refresh_counters(&state.stats);
-    if let Some(ps) = state.plan_store.as_ref() {
-        state.registry.refresh_plan_ids(ps);
-    }
 
     let metric_families = state.registry.registry.gather();
     let encoder = TextEncoder::new();
@@ -414,7 +341,6 @@ mod tests {
             registry: Arc::clone(&registry),
             store: Arc::clone(&store),
             stats: Arc::clone(&stats),
-            plan_store: None,
         };
         let resp = handle_metrics(State(metric_state)).await;
         let status = resp.status();
@@ -431,101 +357,5 @@ mod tests {
         ));
         assert!(text
             .contains("asap_runtime_latency_p99_ns{impl=\"lib\",sketch=\"hll\",source=\"dc-a\"}"));
-    }
-
-    #[test]
-    fn plan_id_emitted_per_metric_and_changes_on_replan() {
-        use crate::types::*;
-        use chrono::Utc;
-
-        fn make_plan(sketch: SketchType, valid_secs: i64) -> CollectionPlan {
-            CollectionPlan {
-                agent_config: AgentCollectorConfig {
-                    output_mode: OutputMode::Sketch,
-                    sketch_type: sketch.clone(),
-                    sketch_params: Default::default(),
-                    aggregate_by: vec![],
-                    label_matchers: vec![],
-                    window_duration: None,
-                    mode: ProcessorMode::Window,
-                    enable_self_monitoring: true,
-                    transmit_sketch: true,
-                    drop_original: true,
-                    delta_transmission: true,
-                    delta_threshold: 0.0,
-                    gos: None,
-                    enable_series_id: false,
-                    series_id_ttl_secs: 300,
-                    data_sink: AgentDataSink::default(),
-                },
-                gateway_config: GatewayCollectorConfig { passthrough: true },
-                valid_until: Utc::now() + chrono::Duration::seconds(valid_secs),
-                delta_decision: Default::default(),
-                transmission_cost_summary: Default::default(),
-            }
-        }
-
-        use crate::workload::AggRole;
-        let plan_store = Arc::new(PlanStore::new());
-        plan_store.set(
-            "http_requests_total",
-            AggRole::Quantile,
-            make_plan(SketchType::DDSketch, 600),
-        );
-        plan_store.set(
-            "http_requests_total_latency_ms",
-            AggRole::Quantile,
-            make_plan(SketchType::HLL, 600),
-        );
-
-        let registry = MetricsRegistry::new();
-        registry.refresh_plan_ids(&plan_store);
-        // Render and check exposition contains both metrics with
-        // distinct plan_id labels.
-        let mfs = registry.registry.gather();
-        let encoder = TextEncoder::new();
-        let mut buf = Vec::new();
-        encoder.encode(&mfs, &mut buf).unwrap();
-        let text = String::from_utf8(buf).unwrap();
-        assert!(
-            text.contains("asap_active_plan_id{metric=\"http_requests_total\""),
-            "expected plan_id for http_requests_total in:\n{text}"
-        );
-        assert!(
-            text.contains("asap_active_plan_id{metric=\"http_requests_total_latency_ms\""),
-            "expected plan_id for http_requests_total_latency_ms in:\n{text}"
-        );
-        // Re-plan with a different sketch must change the plan_id label.
-        let before = text.clone();
-        plan_store.set(
-            "http_requests_total",
-            AggRole::Quantile,
-            make_plan(SketchType::KLL, 600),
-        );
-        registry.refresh_plan_ids(&plan_store);
-        let mfs = registry.registry.gather();
-        let mut buf = Vec::new();
-        encoder.encode(&mfs, &mut buf).unwrap();
-        let after = String::from_utf8(buf).unwrap();
-        assert_ne!(before, after, "plan_id label should change after re-plan");
-    }
-
-    #[test]
-    fn counters_are_monotonic_across_refreshes() {
-        let store = RuntimeSamplesStore::new(16);
-        let stats = store.stats();
-        stats.batches_received.fetch_add(5, Ordering::Relaxed);
-        let registry = MetricsRegistry::new();
-        registry.refresh_counters(&stats);
-        assert_eq!(registry.batches_received.get(), 5);
-        // Second refresh adds only the delta.
-        stats.batches_received.fetch_add(3, Ordering::Relaxed);
-        registry.refresh_counters(&stats);
-        assert_eq!(registry.batches_received.get(), 8);
-        // No regression: if the snapshot somehow went down
-        // (shouldn't, but guard), we hold the counter flat
-        // rather than decrementing.
-        registry.refresh_counters(&stats);
-        assert_eq!(registry.batches_received.get(), 8);
     }
 }

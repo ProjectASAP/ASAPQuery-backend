@@ -4,11 +4,19 @@
 use control_plane::{physical::compiler::*, query_plan::*};
 use data_plane::{
     drivers::query::servers::http::PhysicalPlanInstallRequest,
-    storage_engines::types::{BackendStorageRouting, RuntimePhysicalPlan, StreamingConfig},
+    storage_engines::types::{ActivePhysicalPlan, BackendStorageRouting, StreamingConfig},
 };
 use std::{collections::BTreeMap, sync::Arc};
 
 pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
+    artifact_from_materializations(config.materializations_by_policy_fingerprint.values().cloned().collect())
+}
+
+/// Same as [`artifact`], but from materializations the planner produced
+/// directly — no legacy `StreamingConfig` document in between.
+pub fn artifact_from_materializations(
+    mut configs: Vec<asap_types::PrecomputeMaterialization>,
+) -> PhysicalPlanInstallRequest {
     let envelope = PlanEnvelope {
         plan_id: 1,
         plan_version: 1,
@@ -19,14 +27,9 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
         planner_revision: PLANNER_REVISION.into(),
         capability_snapshot_id: "transport-fixture".into(),
     };
-    let mut configs = config
-        .materializations_by_policy_fingerprint
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    // Installed physical plans always carry an explicit pane phase. The YAML
-    // inputs in these transport fixtures predate that contract, so bind them
-    // to the Unix epoch grid before deriving catalog identities and bindings.
+    // Installed physical plans always carry an explicit pane phase. Inputs that
+    // predate that contract bind to the Unix epoch grid before deriving catalog
+    // identities and bindings.
     for config in &mut configs {
         config.pane_origin_ms.get_or_insert(0);
     }
@@ -37,7 +40,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), configs, &["fixture".into()]).unwrap();
     precompute.summary_catalog = Some(catalog.reference().unwrap());
-    let mut transmission = control_plane::physical::compiler::build_transmission_plan(
+    let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
         envelope,
         &precompute,
         &BTreeMap::new(),
@@ -158,8 +161,8 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
 }
 
 #[allow(dead_code)]
-pub fn bootstrap() -> RuntimePhysicalPlan {
-    let mut plan = data_plane::drivers::query::servers::http::validate_and_build_runtime_plan(
+pub fn bootstrap() -> ActivePhysicalPlan {
+    let mut plan = data_plane::drivers::query::servers::http::build_active_physical_plan(
         artifact(&StreamingConfig::default()),
         Arc::new(BackendStorageRouting::empty()),
     )
