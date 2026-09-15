@@ -20,3 +20,5 @@ pub mod result {
 pub mod sds_resolver {
     pub use asap_types::sds::{DataDescriptorId, SummaryDescriptorId};
 }
+
+pub mod exact_promql;
