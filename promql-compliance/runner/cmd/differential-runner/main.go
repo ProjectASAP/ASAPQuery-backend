@@ -47,7 +47,7 @@ func main() {
 		if query.Range != nil {
 			left, leftErr := refTarget.Range(ctx, query.Expr, *query.Range, base)
 			right, rightErr := testTarget.Range(ctx, query.Expr, *query.Range, base)
-			if leftErr != nil || rightErr != nil || runner.CompareResponses(left, right) != nil {
+			if leftErr != nil || rightErr != nil || runner.CompareResponses(left, right, query.EffectiveTolerance(suite.ComparisonDefaults)) != nil {
 				fmt.Fprintf(os.Stderr, "FAIL %s range: reference=%v test=%v\n", query.Name, leftErr, rightErr)
 				failed = true
 			}
@@ -56,7 +56,7 @@ func main() {
 			when := base.Add(time.Duration(at * float64(time.Second)))
 			left, leftErr := refTarget.Instant(ctx, query.Expr, when)
 			right, rightErr := testTarget.Instant(ctx, query.Expr, when)
-			if leftErr != nil || rightErr != nil || runner.CompareResponses(left, right) != nil {
+			if leftErr != nil || rightErr != nil || runner.CompareResponses(left, right, query.EffectiveTolerance(suite.ComparisonDefaults)) != nil {
 				fmt.Fprintf(os.Stderr, "FAIL %s at %.0fs: reference=%v test=%v\n", query.Name, at, leftErr, rightErr)
 				failed = true
 			}
