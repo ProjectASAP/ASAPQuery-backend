@@ -37,10 +37,21 @@ func main() {
 	if err := runner.PushRemoteWrite(ctx, body, *reference, *test); err != nil {
 		fatal(err)
 	}
+	if err := runner.Drain(ctx, *test); err != nil {
+		fatal(err)
+	}
 	base := time.UnixMilli(*baseMillis)
 	refTarget, testTarget := runner.HTTPQueryTarget{BaseURL: *reference}, runner.HTTPQueryTarget{BaseURL: *test}
 	failed := false
 	for _, query := range suite.Queries {
+		if query.Range != nil {
+			left, leftErr := refTarget.Range(ctx, query.Expr, *query.Range, base)
+			right, rightErr := testTarget.Range(ctx, query.Expr, *query.Range, base)
+			if leftErr != nil || rightErr != nil || runner.CompareResponses(left, right) != nil {
+				fmt.Fprintf(os.Stderr, "FAIL %s range: reference=%v test=%v\n", query.Name, leftErr, rightErr)
+				failed = true
+			}
+		}
 		for _, at := range query.InstantOffsetsSeconds {
 			when := base.Add(time.Duration(at * float64(time.Second)))
 			left, leftErr := refTarget.Instant(ctx, query.Expr, when)
