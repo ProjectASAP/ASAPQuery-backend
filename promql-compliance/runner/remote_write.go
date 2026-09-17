@@ -72,3 +72,20 @@ func PushRemoteWrite(ctx context.Context, body []byte, targets ...string) error 
 	}
 	return nil
 }
+
+// Drain closes finite backend input so comparisons never race precompute work.
+func Drain(ctx context.Context, target string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(target, "/")+"/api/v1/precompute/drain", nil)
+	if err != nil {
+		return err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode/100 != 2 {
+		return fmt.Errorf("drain %s: %s", target, response.Status)
+	}
+	return nil
+}
