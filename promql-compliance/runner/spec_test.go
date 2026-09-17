@@ -38,6 +38,19 @@ queries:
 	}
 }
 
+func TestLoadSuiteRejectsRemovedExpectErrorField(t *testing.T) {
+	_, err := LoadSuite([]byte(`name: invalid
+queries:
+  - name: request-rate
+    expr: rate(http_requests_total[5m])
+    instant_offsets_seconds: [300]
+    expect_error: true
+`))
+	if err == nil {
+		t.Fatal("LoadSuite accepted the removed expect_error field")
+	}
+}
+
 func TestLoadDatasetRejectsDuplicateSeriesAndUnorderedSamples(t *testing.T) {
 	_, err := LoadDataset([]byte(`name: invalid
 series:

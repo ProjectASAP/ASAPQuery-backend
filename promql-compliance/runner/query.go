@@ -49,8 +49,5 @@ func (target HTTPQueryTarget) request(ctx context.Context, path string, query ur
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		return QueryResponse{}, err
 	}
-	if response.StatusCode/100 != 2 || body.Status != "success" {
-		return body, fmt.Errorf("query %s: %s", endpoint, body.Error)
-	}
 	return body, nil
 }
