@@ -23,7 +23,18 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	}
 	args := l.args()
 	args = append(args, "up", "-d", "--build")
-	output, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	command := exec.CommandContext(ctx, "docker", args...)
+	root, err := repositoryRoot()
+	if err != nil {
+		return err
+	}
+	sibling := filepath.Dir(root)
+	command.Env = append(os.Environ(),
+		"ASAP_PRECOMPUTE_RS_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-precompute-rs"),
+		"ASAP_SKETCHLIB_CONTEXT="+filepath.Join(sibling, "asap_sketchlib"),
+		"ASAP_GORILLA_RUST_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-gorilla-rust"),
+	)
+	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("start Compose: %w: %s", err, output)
 	}

@@ -9,6 +9,10 @@ services:
     build:
       context: ..
       dockerfile: control_plane/Dockerfile
+      additional_contexts:
+        asap-precompute-rs: ${ASAP_PRECOMPUTE_RS_CONTEXT}
+        asap-sketchlib: ${ASAP_SKETCHLIB_CONTEXT}
+        asap-gorilla-rust: ${ASAP_GORILLA_RUST_CONTEXT}
     environment:
       CONTROLLER_BACKEND_ENDPOINT: http://data-plane:9091/api/v1/physical-plan
     ports: ["${CONTROL_PLANE_PORT:-18080}:8080"]
@@ -16,5 +20,9 @@ services:
     build:
       context: ..
       dockerfile: data_plane/Dockerfile
+      additional_contexts:
+        asap-precompute-rs: ${ASAP_PRECOMPUTE_RS_CONTEXT}
+        asap-sketchlib: ${ASAP_SKETCHLIB_CONTEXT}
+        asap-gorilla-rust: ${ASAP_GORILLA_RUST_CONTEXT}
     command: ["--profile", "asapquery", "--http-port", "9091", "--output-dir", "/tmp/asap"]
     ports: ["${BACKEND_PORT:-19091}:9091"]
