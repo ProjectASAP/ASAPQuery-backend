@@ -1,189 +1,115 @@
 # Summary Catalog and Self-Describing Summary Architecture
 
-This design defines three logical layers for summary producers and consumers.
+## Audience and relationship to physical plans
 
-| Layer | Describes | Changes when |
+Audience: architects and developers. This document owns SDS identity, metadata,
+state compatibility, and lifecycle semantics. The
+[Planner and physical-plan architecture](asapplanner-integration.md) owns
+compilation, the four runtime projections, transmission policy, and publication.
+The target model below is distinct from the implementation notes that follow.
+Those notes describe bounded paths and do not establish support for every target
+lifecycle, distributed recovery mode, or completeness proof.
+
+SDS describes what a summary represents and which concrete state is available.
+QueryPlan describes how to answer a query using it. TransmissionPlan describes
+how authorized producers deliver state updates. A sketch envelope is one payload
+carrier; it is not the SDS catalog or a physical execution plan.
+
+## Semantic model and authority
+
+| Layer | Meaning | Changes when |
 | --- | --- | --- |
-| **Summary Descriptor** | Summary operator and fidelity guarantees | Algorithm, configuration or guarantee contract changes |
-| **Data Descriptor** | Summarized source and population | Source binding or population definition changes |
-| **Summary Instance** | Instance metadata and summary state | A concrete materialization is created or updated |
+| Summary Descriptor | Operator, parameters, fidelity and compatible state representation | Operator/configuration or guarantee contract changes |
+| Data Descriptor | Source, population, grouping and observation semantics | Input meaning or population changes |
+| Summary Definition | Stable logical materialization referencing descriptors | The semantic definition changes |
+| Summary Instance | Concrete extent/group, provenance, status and state reference | State is materialized, updated or retired |
 
-Separating these layers lets many materialized instances reuse the same operator
-configuration and data scope. A new time interval creates a new instance without
-copying or redefining either descriptor.
+The control plane owns the desired `SummaryCatalog`. It is constructed from the
+selected semantic definitions and common physical compilation decisions before
+projecting CollectorPlan, PrecomputePlan, TransmissionPlan and QueryPlan. Plans
+reference the same immutable catalog snapshot. They do not independently define
+summary meaning, and PrecomputePlan is not the catalog's semantic authority.
 
-## Proposed ownership
+During migration, installed DTOs may repeat parameters, population or window
+fields required by existing consumers. These must agree with the catalog and be
+mechanically derived from the common bindings. A target artifact may include a
+self-contained catalog subset; it must be verifiable against its publication.
+Resolve references at installation rather than through per-update remote lookups.
 
-The descriptor vocabulary is a shared contract in `asap_types`. The control
-plane owns the authoritative `SummaryCatalog`; Collector and backend receive the
-same immutable catalog snapshot. Planner reasons about operators, fidelity,
-source and population semantics, while runtime components bind catalog identities
-to producers and stored instances.
+The observed `ObservedSummaryInventory` reports actual instances and their
+readiness. It is not desired state and contains no encoded payloads. Planner may
+use this scoped availability evidence without reading sketch bytes. Runtime
+reconciliation creates, recovers, retires and expires state according to the
+installed contracts; metadata declarations alone do not execute those actions.
 
-| Layer | Responsibility |
+## Identity and state references
+
+Keep these identities distinct:
+
+| Identity | Scope and purpose |
 | --- | --- |
-| Summary Descriptor | Shared semantic definition used by Planner and backend |
-| Data Descriptor | Shared source/population definition; backend resolves concrete runtime bindings |
-| Summary Instance | Backend owns metadata, state, updates, storage and retirement |
+| Semantic node ID | Node within the selected Planner DAG; physical bindings retain provenance |
+| SummaryDescriptorId / DataDescriptorId | Immutable semantic descriptor content |
+| SummaryDefinitionId | Logical materialization; currently backed by a typed policy fingerprint |
+| SummaryInstanceId | Concrete materialized instance identity |
+| Producer / partition / epoch | Source contribution and restart lifetime |
+| SeriesId | Backend physical storage lifetime, not a descriptor or plan identity |
+| CatalogGeneration | Catalog publication reference, including digest and plan version |
+| Publication identity | Exact installed plan content, including execution and transmission choices |
+| Sequence / checkpoint | Update history and applicable delta base within a declared stream scope |
 
-Planner may observe instance availability, covered time ranges and descriptor
-references as planning evidence. It does not need the encoded summary state.
-SDS describes summaries; an installed QueryPlan specifies how to execute a query
-using them. The current backend fields are an incremental implementation of this
-model. They must converge on the identities and invariants below rather than add
-operator-specific stores beside `SketchStore`.
+Current descriptor IDs use versioned canonical semantic strings. Changing their
+encoding must preserve semantic identity and explicitly address collisions.
+A new interval/group creates an instance without redefining its descriptors.
+Moving a producer or changing transmission cadence need not change its semantic
+definition, but requires an authorized publication transition. Changed sampling
+or observation semantics require guarantee and state-compatibility validation.
+A catalog digest alone cannot identify every change to the four physical plans.
 
-## Target semantic model
-
-The target model has descriptor registries plus pane instances. Descriptor IDs
-are derived from canonical semantic content; display names and runtime SIDs are
-not descriptor identities. `SummaryDescriptorId` and `DataDescriptorId` currently
-contain versioned canonical semantic strings. `SummaryDefinitionId` is a distinct
-typed policy fingerprint, and `CatalogGeneration` identifies a publication using
-its digest and plan version. A physical `SeriesId` identifies one storage lifetime
-of a definition/group; it is neither a descriptor ID nor a pane instance ID.
-Changing descriptor encoding to a hash must preserve content identity and handle
-collisions explicitly.
+The target instance metadata contract is:
 
 ```rust
-struct SummaryDescriptor {
-    id: SummaryDescriptorId,
-    operator: SummaryOperator,
-    fidelity: Vec<FidelityGuarantee>,
-    state_schema: StateSchema,
-}
-
-struct DataDescriptor {
-    id: DataDescriptorId,
-    source: MetricSource,
-    population: PopulationDefinition,
-    observation_semantics: ObservationSemantics,
-}
-
 struct SummaryInstance {
-    id: SummaryInstanceId,
+    instance_id: SummaryInstanceId,
     summary_definition_id: SummaryDefinitionId,
     summary_descriptor_id: SummaryDescriptorId,
     data_descriptor_id: DataDescriptorId,
-    interval: HalfOpenInterval,
-    group_values: BTreeMap<String, String>,
-    completeness: Completeness,
+    time_range: HalfOpenTimeRange,
+    group_values: GroupValues,
     catalog_generation: CatalogGeneration,
     placement: SummaryPlacement,
     state_reference: SummaryStateReference,
     status: SummaryInstanceStatus,
-    lifecycle: Persistent | Ephemeral(EphemeralLease),
+    completeness: InstanceCompleteness,
+    lifecycle: InstanceLifecycle,
 }
 ```
 
-The instance contract contains no payload bytes. `SummaryStateReference` is an
-opaque storage-engine locator with state-schema version, generation, sequence
-and optional checksum. `ObservedSummaryInventory` is a versioned data-plane
-report keyed by `SummaryInstanceId`; it is observed state and never part of the
-desired catalog snapshot.
+This is a conceptual shape, not a new wire DTO. `SummaryStateReference` is an
+opaque storage locator with schema version, generation, sequence and optional
+checksum. SummaryStore owns the referenced payload. Concrete frame identity
+additionally records the producer stream and checkpoint context required by its
+TransmissionPlan; an instance reference alone does not authorize delta application.
 
-## Authoritative SummaryCatalog and execution plans
+Sketch libraries own payload schemas, decoding/reconstruction and supported state
+operations. Runtime contracts own catalog, plan and frame metadata. Transport
+adapters map these contracts into OTLP or another supported carrier without
+redefining sketch payload schemas. Full-state replacement, replay, and delta-base
+rules are specified in the [integration design](asapplanner-integration.md#identity-and-update-application).
+Matching bytes or descriptor IDs alone never proves safe merging or complete data.
 
-The control-plane `SummaryCatalog` is the metadata authority. It stores immutable
-Summary and Data Descriptors plus stable materialization identities. It does not
-store pane payloads, watermarks, completeness, or observed availability; those
-are data-plane instance/runtime metadata.
+## Desired state and observed lifecycle
 
-The control plane reconciles two explicitly separate views:
+Persistent desired materializations come from control-plane planning. A runtime
+fast path may create only an authorized ephemeral instance with a finite lease,
+report it, and await promotion or expiry. It cannot silently make that instance
+persistent desired state.
 
-- **Desired SummaryCatalog:** persistent materializations selected through
-  workload feedback and Planner decisions.
-- **Observed Summary Inventory:** instances actually building or stored,
-  including placement, time coverage, state reference, status and generation.
-
-Reconciliation creates missing desired materializations, updates instances from
-old catalog generations, recovers failed or missing payloads, and retires then
-garbage-collects materializations removed from desired state. A data-plane fast
-path may create only an ephemeral instance with a finite lease and must report
-it immediately. A matching desired materialization promotes it; otherwise it
-expires and is collected. The data plane cannot promote an ephemeral instance
-or create persistent desired state by itself.
-
-```text
-                       ASAPPlanner post-ASAP DAG
-                                  |
-                                  v
-                    Control-plane SummaryCatalog
-       SummaryDescriptor + DataDescriptor + SummaryDefinitionIdentity
-                                  |
-              catalog references | shared snapshot
-          +-----------------------+-----------------------+
-          |                       |                       |
-          v                       v                       v
-    CollectorPlan           PrecomputePlan           QueryPlan DAG
- producer placement,       backend-ingest build,     readout, combine,
- input routing, build       update and lifecycle     Prometheus fallback
-          |                       |
-          +-----------+-----------+
-                      v
-              TransmissionPlan (when remote producers exist)
-        full/delta/checkpoint transport, sequence and encoding
-                      |
-                      v
-        Backend/Collector catalog replicas and SummaryStore
-             pane instances, completeness and lineage
-```
-
-All four execution plans carry catalog references and use catalog materialization
-IDs for cross-plan identity. During the compatibility migration, producer and
-precompute DTOs still repeat fields needed by existing runtimes, including
-operator parameters, source/filter/grouping, window, and state schema. Install
-validation requires those fields to agree exactly with the catalog; they are not
-independent semantic definitions. New interfaces should resolve them from the
-catalog, allowing the copied fields to be removed as consumers migrate.
-
-| Component | Responsibility |
-| --- | --- |
-| `SummaryCatalog` | Canonical descriptor definitions, stable IDs and catalog schema/version |
-| `CollectorPlan` | Collector placement, input routing, producer identity and collector-side build operations |
-| `PrecomputePlan` | Backend-ingest placement, window updates, retention and lifecycle |
-| `TransmissionPlan` | Optional producer-to-backend full state, delta, checkpoint, sequence and encoding contract |
-| `QueryPlan` | Materialization references, readout, DAG composition and exact Prometheus boundaries |
-| SummaryStore (`SketchStore` today) | Instance state, concrete intervals/groups, completeness, lineage and rebuildable rollups |
-
-The former `BackendPlan` has been removed. `SummaryCatalog` owns materialization
-metadata, `PrecomputePlan` owns update/placement/lifecycle, `QueryPlan` owns
-readout and fallback routing, and the common deployment envelope carries their
-shared plan identity. Consumers atomically install one catalog snapshot with
-the plans that reference it.
-
-`asap_types::executable_plan` owns the installed semantic-DAG representation,
-physical node bindings, and `QueryNodeId`. Its `OwnedPostAsapDag` is a Send/Sync
-representation for shared runtime snapshots; it is not Planner's
-`PostAsapDagDocument` envelope. The owned representation preserves semantic
-node IDs and typed operator tags while serializing Planner payloads that contain
-process-local `Rc` pointers. The control plane constructs it and checks its
-bindings against QueryPlan; precompute execution consumes the shared contract.
-`PrecomputePlan`, its envelope, ingest, producer, state schema, and catalog
-consistency checks live in `asap_types::precompute_plan`. The compiler chooses
-materializations and placement; data-plane installation uses the shared
-contract. `asap_types::query_plan` owns QueryPlan, materialization bindings,
-logical operator DTOs, and activation validation. The control plane reexports
-those types for existing callers and owns the `compile_bound*` and
-`logical::compile_logical` functions; Planner traversal and AST lowering do not
-move into the shared contract. Data-plane engines import the shared types
-directly. No wrapper plan or second wire definition is introduced.
-
-`asap_types::producer_plan` owns the installed collector and transmission
-contracts, frame identities, runtime policy bounds and their validation. The
-control plane allocates sampling/GOS budgets and constructs transmission rules
-through `sampling_policy_from_accuracy_budget`, `gos_policy_from_accuracy_budget`
-and `compile_transmission_plan`. Producers and the data plane import the shared
-contracts directly; compilation is not a runtime dependency of those contracts.
-
-The implemented ownership split is:
-
-1. Move the SDS catalog contract into `asap_types`.
-2. Make the control plane own the authoritative `SummaryCatalog`.
-3. Make `PrecomputePlan` reference catalog descriptors and own update, placement and lifecycle.
-4. Make `QueryPlan::MaterializationBinding` reference catalog/materialization IDs directly.
-5. Distribute the same catalog snapshot to Collector and backend.
-6. `BackendPlan`, its protobuf and install endpoint, and duplicate validation are removed.
+Reconciliation compares desired definitions with observed placement, extent,
+state references, status and completeness. Catalog and plan activation authorize
+execution; they do not establish source completeness, durability, or query
+readiness. State reuse across generations requires explicit compatibility, and
+retired physical lifetimes remain fenced from late updates.
 
 ## Implemented backend representation
 
@@ -229,11 +155,12 @@ and timestamp projection. Its Float64 ingest boundary rejects integer constants
 outside the exactly representable range. This contract enables literal inputs;
 query lowering must still establish each aggregate's null and row semantics.
 
-The durable `sid_metadata.json` format is versioned independently. Version 2
-contains `summary_descriptors`, `data_descriptors`, and `bindings` tables. A
-binding stores only both descriptor IDs plus SID-local timestamps. Version-1
-flat SID records remain readable and are rewritten in normalized version-2 form
-on the next metadata update.
+The durable `sid_metadata.json` format is versioned independently of the wire
+contracts. Descriptor tables and bindings avoid repeating semantic definitions;
+later metadata revisions also preserve definition identity and catalog provenance.
+Legacy records are interpreted by versioned recovery code and must not acquire
+authoritative catalog bindings without validation. See
+[completeness and recovery](continuous-summary-completeness.md).
 
 An ingest record is never an SDS instance. Raw samples can be transient inputs to
 the precompute engine, but the backend does not retain them as a second exact
@@ -335,8 +262,9 @@ an arbitrary executable program attached to a summary.
 
 ## 3. Summary Instance
 
-A Summary Instance combines **instance metadata** with **the actual summary
-state**, referencing one Summary Descriptor and one Data Descriptor.
+A Summary Instance describes a concrete materialization and references its
+stored state, one Summary Descriptor and one Data Descriptor. The metadata DTO
+and inventory never embed the encoded payload.
 
 | Field | Type | Definition |
 | --- | --- | --- |
@@ -344,7 +272,7 @@ state**, referencing one Summary Descriptor and one Data Descriptor.
 | `summary_descriptor_id` | `QualifiedId` | Referenced operator/fidelity descriptor |
 | `data_descriptor_id` | `QualifiedId` | Referenced source/population descriptor |
 | `metadata` | `InstanceMetadata` | Concrete extent, population binding, completeness and provenance |
-| `state` | `SummaryState` | Materialized state encoded according to the Summary Descriptor |
+| `state_reference` | `SummaryStateReference` | Opaque locator for separately stored state and its schema/provenance |
 
 `InstanceMetadata` contains the concrete time range or dataset extent, any group
 values needed by the population rule, completeness (`Complete`, `Partial` or
@@ -352,10 +280,10 @@ values needed by the population rule, completeness (`Complete`, `Partial` or
 evidence. Time ranges specify their clock, units and interval boundaries.
 Completeness is separate from mathematical approximation error.
 
-`SummaryState` is the state itself, not a quantile readout or other query result.
-If a transport carries a delta, it must identify its base instance/version and
-the descriptor's supported apply operation; it cannot be interpreted as a full
-state without that context.
+The referenced payload is maintained state, not a quantile readout or other
+query result. A transported delta identifies its authorized producer stream and
+base checkpoint as well as the supported apply operation. A descriptor or instance
+ID alone is insufficient to interpret it as a full state.
 
 ## Shared-descriptor example
 
@@ -389,22 +317,22 @@ instances:
     summary_descriptor_id: example:kll-200-v1
     data_descriptor_id: example:login-cpu-v1
     metadata: {time_range: "[0,10)", clock: example:seconds}
-    state: S0
+    state_reference: {store: example-store, key: S0, state_schema_version: 1}
   - instance_id: example:login-cpu-1
     summary_descriptor_id: example:kll-200-v1
     data_descriptor_id: example:login-cpu-v1
     metadata: {time_range: "[10,20)", clock: example:seconds}
-    state: S1
+    state_reference: {store: example-store, key: S1, state_schema_version: 1}
   - instance_id: example:login-cpu-2
     summary_descriptor_id: example:kll-200-v1
     data_descriptor_id: example:login-cpu-v1
     metadata: {time_range: "[20,30)", clock: example:seconds}
-    state: S2
+    state_reference: {store: example-store, key: S2, state_schema_version: 1}
 ```
 
-`S0`, `S1` and `S2` denote separate encoded KLL states. The example omits concrete
-payload bytes and producer evidence; it makes no completeness or numerical error
-claim. Descriptor references must resolve within the supplied context or a
+`S0`, `S1` and `S2` are opaque keys for separately stored KLL states. This
+conceptual example omits full state-reference provenance and producer evidence;
+it is not an installable DTO and makes no completeness or numerical error claim. Descriptor references must resolve within the supplied context or a
 durably retained descriptor registry.
 
 Changing `k` creates a new Summary Descriptor. Changing the source or population
