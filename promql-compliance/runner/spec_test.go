@@ -2,6 +2,22 @@ package runner
 
 import "testing"
 
+func TestCheckedInFixturesMeetStrictContracts(t *testing.T) {
+	for _, path := range []string{
+		"../datasets/single-rate.yaml", "../datasets/sparse-checkout.yaml",
+		"../datasets/aggregations.yaml", "../datasets/aggregations-dense-cadence.yaml",
+	} {
+		if _, err := LoadDatasetFile(path); err != nil {
+			t.Fatalf("LoadDatasetFile(%q): %v", path, err)
+		}
+	}
+	for _, path := range []string{"../suites/temporal.yaml", "../suites/aggregations.yaml"} {
+		if _, err := LoadSuiteFile(path); err != nil {
+			t.Fatalf("LoadSuiteFile(%q): %v", path, err)
+		}
+	}
+}
+
 func TestLoadSuiteRequiresExplicitEvaluationAndCarriesTolerance(t *testing.T) {
 	suite, err := LoadSuite([]byte(`name: temporal
 comparison_defaults:
