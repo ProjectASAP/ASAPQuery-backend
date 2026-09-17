@@ -18,8 +18,13 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
         let id = materialization.policy_fingerprint();
         let node = materialization_node(id.as_u64());
         let label = format!(
-            "materialization\n{}\nmetric={}\nwindow={}s / {}s",
-            id, materialization.metric, materialization.window_size, materialization.slide_interval,
+            "materialization\n{}\nmetric={}\nwindow_type={}\nwindow={}s / {}s\nlayout={:?}",
+            id,
+            materialization.metric,
+            materialization.window_type,
+            materialization.window_size,
+            materialization.slide_interval,
+            materialization.window_layout,
         );
         emit_node(&mut dot, &node, &label, "shape=component");
     }
@@ -187,6 +192,8 @@ mod tests {
         assert!(dot.contains("cluster_query_"), "{dot}");
         assert!(dot.contains("style=dashed"), "{dot}");
         assert!(dot.contains("ReadMaterialization"), "{dot}");
+        assert!(dot.contains("window_type="), "{dot}");
+        assert!(dot.contains("layout="), "{dot}");
     }
 
     #[test]
