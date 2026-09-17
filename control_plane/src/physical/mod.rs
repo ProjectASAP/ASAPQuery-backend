@@ -13,6 +13,7 @@ pub mod sketch_catalog;
 pub mod summary_catalog;
 pub mod workload_cost;
 
+pub mod plan_dot;
 pub mod publication;
 
 pub(crate) mod maintained_population;
