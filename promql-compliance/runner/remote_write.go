@@ -1,8 +1,13 @@
 package runner
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
@@ -42,4 +47,28 @@ func DecodeRemoteWrite(body []byte) (*prompb.WriteRequest, error) {
 		return nil, fmt.Errorf("unmarshal Remote Write: %w", err)
 	}
 	return request, nil
+}
+
+// PushRemoteWrite sends an already encoded body unchanged to every target.
+func PushRemoteWrite(ctx context.Context, body []byte, targets ...string) error {
+	for _, target := range targets {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(target, "/")+"/api/v1/write", bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("build Remote Write request: %w", err)
+		}
+		request.Header.Set("Content-Type", "application/x-protobuf")
+		request.Header.Set("Content-Encoding", "snappy")
+		request.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return fmt.Errorf("push Remote Write to %s: %w", target, err)
+		}
+		if response.StatusCode/100 != 2 {
+			message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+			response.Body.Close()
+			return fmt.Errorf("push Remote Write to %s: %s: %s", target, response.Status, message)
+		}
+		response.Body.Close()
+	}
+	return nil
 }
