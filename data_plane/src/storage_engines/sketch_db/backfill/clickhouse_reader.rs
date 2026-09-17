@@ -129,7 +129,9 @@ impl ClickHouseReader {
                             ScalarValue::Int64(_) => "Int64",
                             ScalarValue::Float64(_) => "Float64",
                             ScalarValue::Boolean(_) => "Bool",
-                            ScalarValue::Null => unreachable!("validated table literal"),
+                            ScalarValue::Null | ScalarValue::Interval { .. } => {
+                                unreachable!("validated table literal")
+                            }
                         };
                         format!(
                             "{} {operator} {{population_{index}:{kind}}}",
@@ -302,7 +304,9 @@ impl RawSampleReader for ClickHouseReader {
                     ScalarValue::Int64(value) => value.to_string(),
                     ScalarValue::Float64(value) => value.to_string(),
                     ScalarValue::Boolean(value) => value.to_string(),
-                    ScalarValue::Null => unreachable!("validated table literal"),
+                    ScalarValue::Null | ScalarValue::Interval { .. } => {
+                        unreachable!("validated table literal")
+                    }
                 };
                 request = request.query(&[(format!("param_population_{index}"), value)]);
             }
