@@ -37,6 +37,9 @@ impl TablePopulation {
             {
                 return Err("table population requires a finite non-null literal".into());
             }
+            if matches!(predicate.value, ScalarValue::Interval { .. }) {
+                return Err("table population interval literals are unsupported".into());
+            }
         }
         Ok(())
     }

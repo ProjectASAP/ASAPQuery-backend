@@ -10,7 +10,7 @@ use arrow::{
         ArrayRef, BooleanArray, Float64Array, Int64Array, MapArray, NullArray, StringArray,
         StructArray, TimestampMillisecondArray,
     },
-    datatypes::{DataType as ArrowDataType, Field, Schema},
+    datatypes::{DataType as ArrowDataType, Field, IntervalUnit, Schema},
     record_batch::RecordBatch,
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone};
@@ -61,6 +61,9 @@ fn json_cell(
         ))
     };
     match dtype {
+        DataType::Date | DataType::Interval => Err(ClickHouseRelationalError::Unsupported(
+            format!("{dtype:?} values"),
+        )),
         DataType::Null if value.is_null() => Ok(Cell::Null),
         DataType::Null => Err(invalid()),
         DataType::List { element } => {
@@ -330,6 +333,7 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
         return false;
     }
     match expected {
+        DataType::Date | DataType::Interval => false,
         DataType::Null => actual == "Nothing",
         DataType::List { element } => {
             !nullable
@@ -578,6 +582,11 @@ fn eval(
             ScalarValue::Utf8(value) => Cell::Utf8(value.clone()),
             ScalarValue::Boolean(value) => Cell::Bool(*value),
             ScalarValue::Null => Cell::Null,
+            ScalarValue::Interval { .. } => {
+                return Err(ClickHouseRelationalError::Unsupported(
+                    "interval literals".into(),
+                ))
+            }
         }),
         QueryExpr::Compare { left, op, right } => {
             let left = eval(left, row, schema)?;
@@ -955,6 +964,9 @@ fn cell_cmp(left: &Cell, right: &Cell) -> Option<Ordering> {
 
 fn arrow_type(dtype: &DataType) -> ArrowDataType {
     match dtype {
+        // Declared only; json_cell and build_array reject these values.
+        DataType::Date => ArrowDataType::Date32,
+        DataType::Interval => ArrowDataType::Interval(IntervalUnit::MonthDayNano),
         DataType::Null => ArrowDataType::Null,
         DataType::List { element } => ArrowDataType::List(Arc::new(Field::new(
             &element.name,
@@ -1030,6 +1042,11 @@ fn build_array(
             return Err(ClickHouseRelationalError::Unsupported(
                 "collection value transport".into(),
             ))
+        }
+        DataType::Date | DataType::Interval => {
+            return Err(ClickHouseRelationalError::Unsupported(format!(
+                "{dtype:?} value transport"
+            )))
         }
         DataType::Int64 => Arc::new(Int64Array::from(values!(Int64))) as ArrayRef,
         DataType::Float64 => Arc::new(Float64Array::from(values!(Float64))) as ArrayRef,
