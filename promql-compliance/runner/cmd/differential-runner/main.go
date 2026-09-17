@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ProjectASAP/ASAPQuery-backend/promql-compliance/runner"
@@ -16,6 +18,7 @@ func main() {
 	reference := flag.String("reference-url", "", "Prometheus URL")
 	test := flag.String("test-url", "", "backend URL")
 	baseMillis := flag.Int64("base-time-ms", time.Now().Add(-30*time.Minute).UnixMilli(), "fixture base time")
+	reportPath := flag.String("output", "differential-report.json", "JSON report path")
 	flag.Parse()
 	if *datasetPath == "" || *suitePath == "" || *reference == "" || *test == "" {
 		flag.Usage()
@@ -42,27 +45,23 @@ func main() {
 	}
 	base := time.UnixMilli(*baseMillis)
 	refTarget, testTarget := runner.HTTPQueryTarget{BaseURL: *reference}, runner.HTTPQueryTarget{BaseURL: *test}
-	failed := false
-	for _, query := range suite.Queries {
-		if query.Range != nil {
-			left, leftErr := refTarget.Range(ctx, query.Expr, *query.Range, base)
-			right, rightErr := testTarget.Range(ctx, query.Expr, *query.Range, base)
-			if leftErr != nil || rightErr != nil || runner.CompareResponses(left, right, query.EffectiveTolerance(suite.ComparisonDefaults)) != nil {
-				fmt.Fprintf(os.Stderr, "FAIL %s range: reference=%v test=%v\n", query.Name, leftErr, rightErr)
-				failed = true
-			}
-		}
-		for _, at := range query.InstantOffsetsSeconds {
-			when := base.Add(time.Duration(at * float64(time.Second)))
-			left, leftErr := refTarget.Instant(ctx, query.Expr, when)
-			right, rightErr := testTarget.Instant(ctx, query.Expr, when)
-			if leftErr != nil || rightErr != nil || runner.CompareResponses(left, right, query.EffectiveTolerance(suite.ComparisonDefaults)) != nil {
-				fmt.Fprintf(os.Stderr, "FAIL %s at %.0fs: reference=%v test=%v\n", query.Name, at, leftErr, rightErr)
-				failed = true
-			}
-		}
+	report := runner.CompareSuite(ctx, refTarget, testTarget, suite, dataset.Name, base)
+	if err := os.MkdirAll(filepath.Dir(*reportPath), 0o755); err != nil && filepath.Dir(*reportPath) != "." {
+		fatal(err)
 	}
-	if failed {
+	file, err := os.Create(*reportPath)
+	if err != nil {
+		fatal(err)
+	}
+	if err := json.NewEncoder(file).Encode(report); err != nil {
+		_ = file.Close()
+		fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("dataset=%s suite=%s passed=%t report=%s\n", report.Dataset, report.Suite, report.Passed, *reportPath)
+	if !report.Passed {
 		os.Exit(1)
 	}
 }
