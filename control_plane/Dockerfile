@@ -27,11 +27,26 @@ RUN apt-get update && \
 # Same sibling-checkout layout as data_plane/Dockerfile so workspace path-deps
 # resolve during the build.
 COPY . ASAPQuery-backend
+# hadolint ignore=DL3022
 COPY --from=asap-precompute-rs . ASAPCollector/asap-precompute-rs
+# hadolint ignore=DL3022
 COPY --from=asap-sketchlib     . asap_sketchlib
+# hadolint ignore=DL3022
 COPY --from=asap-gorilla-rust  . ASAPCollector/asap-gorilla-rust
 
-RUN cd ASAPQuery-backend && cargo build --release --bin control_plane
+# See data_plane/Dockerfile: resolve private sibling dependencies from the
+# build contexts instead of requiring Docker to authenticate to GitHub.
+RUN mkdir -p ASAPQuery-backend/.cargo && \
+    printf '%s\n' \
+      '[patch."https://github.com/ProjectASAP/ASAPCollector"]' \
+      'asap-precompute-rs = { path = "/src/ASAPCollector/asap-precompute-rs" }' \
+      '' \
+      '[patch."https://github.com/ProjectASAP/asap_sketchlib"]' \
+      'asap_sketchlib = { path = "/src/asap_sketchlib" }' \
+      > ASAPQuery-backend/.cargo/config.toml
+
+WORKDIR /src/ASAPQuery-backend
+RUN cargo build --release --bin control_plane
 
 # Runtime image: binary + CA certs.
 FROM debian:bookworm-slim
