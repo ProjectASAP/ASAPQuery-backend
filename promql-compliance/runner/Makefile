@@ -5,6 +5,9 @@ SUITE ?= ../suites/temporal.yaml
 REPORT_DIR ?= /tmp/asapquery-backend-promql-reports
 REFERENCE_URL ?= http://localhost:19090
 BACKEND_URL ?= http://localhost:19091
+CONTROL_PLANE_URL ?= http://localhost:18080
+COMPOSE_FILE ?= ../docker-compose.yml
+LOGS_DIR ?= /tmp/asapquery-backend-promql-logs
 
 CASES := \
 	single-rate-temporal:../datasets/single-rate.yaml:../suites/temporal.yaml \
@@ -16,12 +19,12 @@ test:
 	go test ./...
 
 run:
-	go run ./cmd/differential-runner --dataset $(DATASET) --suite $(SUITE) --reference-url $(REFERENCE_URL) --test-url $(BACKEND_URL)
+	go run ./cmd/differential-runner --dataset $(DATASET) --suite $(SUITE) --reference-url $(REFERENCE_URL) --test-url $(BACKEND_URL) --control-plane-url $(CONTROL_PLANE_URL) --compose-file $(COMPOSE_FILE) --logs-dir $(LOGS_DIR)
 
 run-all:
 	@set -eu; mkdir -p "$(REPORT_DIR)"; result=0; \
 	for test_case in $(CASES); do \
 		name="$${test_case%%:*}"; rest="$${test_case#*:}"; dataset="$${rest%%:*}"; suite="$${rest#*:}"; \
 		echo "Running $$name"; \
-		if ! go run ./cmd/differential-runner --dataset "$$dataset" --suite "$$suite" --reference-url "$(REFERENCE_URL)" --test-url "$(BACKEND_URL)" --output "$(REPORT_DIR)/$$name.json"; then result=1; fi; \
+		if ! go run ./cmd/differential-runner --dataset "$$dataset" --suite "$$suite" --reference-url "$(REFERENCE_URL)" --test-url "$(BACKEND_URL)" --control-plane-url "$(CONTROL_PLANE_URL)" --compose-file "$(COMPOSE_FILE)" --logs-dir "$(LOGS_DIR)/$$name" --output "$(REPORT_DIR)/$$name.json"; then result=1; fi; \
 	done; exit $$result
