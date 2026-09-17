@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 
@@ -142,6 +143,21 @@ func LoadDataset(contents []byte) (Dataset, error) {
 		}
 	}
 	return dataset, nil
+}
+
+func LoadSuiteFile(path string) (Suite, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return Suite{}, err
+	}
+	return LoadSuite(contents)
+}
+func LoadDatasetFile(path string) (Dataset, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return Dataset{}, err
+	}
+	return LoadDataset(contents)
 }
 
 func (q QueryCase) EffectiveTolerance(defaults ComparisonPolicy) ComparisonPolicy {
