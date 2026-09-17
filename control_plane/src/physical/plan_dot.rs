@@ -18,7 +18,7 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
         let id = materialization.policy_fingerprint();
         let node = materialization_node(id.as_u64());
         let label = format!(
-            "materialization\\n{}\\nmetric={}\\nwindow={}s / {}s",
+            "materialization\n{}\nmetric={}\nwindow={}s / {}s",
             id, materialization.metric, materialization.window_size, materialization.slide_interval,
         );
         emit_node(&mut dot, &node, &label, "shape=component");
@@ -36,7 +36,7 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
                 .binding
                 .nodes
                 .get(&node.id)
-                .map(|binding| format!("\\n{:?}", binding))
+                .map(|binding| format!("\n{:?}", binding))
                 .unwrap_or_default();
             emit_node(
                 &mut dot,
@@ -128,24 +128,22 @@ fn query_node_label(node: &QueryPlanNode) -> String {
     match node {
         QueryPlanNode::RelationalJoin { .. } => "RelationalJoin".into(),
         QueryPlanNode::Relational { .. } => "Relational".into(),
-        QueryPlanNode::Logical { operator, .. } => {
-            format!("Logical\\n{}", residual_label(operator))
-        }
-        QueryPlanNode::Scalar { value } => format!("Scalar\\n{value}"),
-        QueryPlanNode::Binary { operator, .. } => format!("Binary\\n{operator:?}"),
+        QueryPlanNode::Logical { operator, .. } => format!("Logical\n{}", residual_label(operator)),
+        QueryPlanNode::Scalar { value } => format!("Scalar\n{value}"),
+        QueryPlanNode::Binary { operator, .. } => format!("Binary\n{operator:?}"),
         QueryPlanNode::ReduceSum { .. } => "ReduceSum".into(),
         QueryPlanNode::ReadMaterialization { binding } => format!(
-            "ReadMaterialization\\n{}\\nwindow={}ms\\nlookback={:?}",
+            "ReadMaterialization\n{}\nwindow={}ms\nlookback={:?}",
             binding.materialization.fingerprint(),
             binding.window_ms,
             binding.readout_lookback_ms
         ),
-        QueryPlanNode::SummaryEstimate { query, .. } => format!("SummaryEstimate\\n{query:?}"),
-        QueryPlanNode::ExactReadout { readout, .. } => format!("ExactReadout\\n{readout:?}"),
+        QueryPlanNode::SummaryEstimate { query, .. } => format!("SummaryEstimate\n{query:?}"),
+        QueryPlanNode::ExactReadout { readout, .. } => format!("ExactReadout\n{readout:?}"),
         QueryPlanNode::SummaryMerge { .. } => "SummaryMerge".into(),
-        QueryPlanNode::CandidateTopK { k, .. } => format!("CandidateTopK\\nk={k}"),
+        QueryPlanNode::CandidateTopK { k, .. } => format!("CandidateTopK\nk={k}"),
         QueryPlanNode::ExternalExact { .. } => "ExternalExact".into(),
-        QueryPlanNode::ExactFallback { reason } => format!("ExactFallback\\n{reason}"),
+        QueryPlanNode::ExactFallback { reason } => format!("ExactFallback\n{reason}"),
     }
 }
 
@@ -189,6 +187,19 @@ mod tests {
         assert!(dot.contains("cluster_query_"), "{dot}");
         assert!(dot.contains("style=dashed"), "{dot}");
         assert!(dot.contains("ReadMaterialization"), "{dot}");
+    }
+
+    #[test]
+    fn render_uses_graphviz_line_breaks_in_labels() {
+        let dot = render(&fixture());
+        assert!(
+            dot.contains("materialization\\npolicy_fp:"),
+            "expected a Graphviz line break, not a literal backslash-n: {dot}"
+        );
+        assert!(
+            !dot.contains("materialization\\\\npolicy_fp:"),
+            "label double-escaped its Graphviz line break: {dot}"
+        );
     }
 
     #[test]
