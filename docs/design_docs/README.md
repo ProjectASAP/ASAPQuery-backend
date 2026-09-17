@@ -1,26 +1,26 @@
-# System design location
+# Design documents
 
-ASAPQuery-backend does not maintain a second copy of the system design.
-The canonical component design is in
-[ASAPCollector/docs/design_docs](https://github.com/ProjectASAP/ASAPCollector/tree/main/docs/design_docs).
+These documents are for architects and developers. The integration proposal and
+SDS model below define the target Planner-to-runtime boundary; their current-code
+notes and migration gates distinguish implemented behavior from proposed changes.
 
-Backend-specific implementation design notes are organized by component under
-[`../developer_docs`](../developer_docs/README.md). They explain current Rust
-internals and are subordinate to the shared system contracts.
+- [Planner, physical plans, SDS, and runtime architecture](asapplanner-integration.md)
+  owns semantic/physical compilation, common bindings, the four plan projections,
+  policy ownership, codec boundaries, and publication/activation requirements.
+- [Summary Catalog and SDS](summary-catalog-sds-architecture.md) owns descriptors,
+  definition/instance identity, state references, inventory and lifecycle semantics.
+- [Architecture migration delivery plan](asapplanner-migration-plan.md) defines
+  compatibility fixtures, implementation stages, rollout and retirement gates.
+- [Accepted-input completeness](continuous-summary-completeness.md) describes
+  the backend's bounded admission, publication and recovery behavior.
 
-Proposals for shared-contract review:
+Existing [Collector system contracts](https://github.com/ProjectASAP/ASAPCollector/tree/main/docs/design_docs)
+remain the cross-component compatibility baseline until coordinated migrations
+land. These proposals do not silently change those interfaces. Current backend
+implementation guides live under [developer docs](../developer_docs/README.md).
 
-- [ASAPPlanner integration architecture](asapplanner-integration.md) proposes
-  the Planner/backend responsibility boundary, shared semantic DAG workflow,
-  and high-level consolidation milestones.
-- [Summary Catalog and SDS Architecture](summary-catalog-sds-architecture.md) defines the proposed
-  Summary Descriptor, Data Descriptor and Summary Instance layers.
+Other designs and profiles:
 
-These proposals complement the canonical cross-component contracts above.
-
-Backend-specific operating profiles:
-
-- [ASAPQuery compatibility profile](asapquery-compatibility-profile.md) defines
-  the smaller target configuration for Prometheus Remote Write, backend-local
-  precompute, and PromQL serving without ASAPCollector. It becomes a strict
-  configuration subset after its currently missing Remote Write adapter lands.
+- [ASAPQuery compatibility profile](asapquery-compatibility-profile.md)
+- [Shape-aware ERP](shape-aware-erp-v1.md)
+- [Empirical observability execution plan](empirical-o11y-execution-plan.md)
