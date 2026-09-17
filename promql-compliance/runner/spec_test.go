@@ -55,3 +55,31 @@ series:
 		t.Fatal("LoadDataset accepted unordered or duplicate series")
 	}
 }
+
+func TestEncodeRemoteWriteRoundTripsFixtureSamples(t *testing.T) {
+	dataset, err := LoadDataset([]byte(`name: request
+series:
+  - metric: requests_total
+    labels: {host: a}
+    samples:
+      - {offset_seconds: 0, value: 1}
+      - {offset_seconds: 60, value: 2}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := EncodeRemoteWrite(1_700_000_000_000, dataset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeRemoteWrite(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(decoded.Timeseries), 1; got != want {
+		t.Fatalf("series = %d, want %d", got, want)
+	}
+	if got, want := decoded.Timeseries[0].Samples[1].Timestamp, int64(1_700_000_060_000); got != want {
+		t.Fatalf("timestamp = %d, want %d", got, want)
+	}
+}
