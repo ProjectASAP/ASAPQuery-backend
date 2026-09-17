@@ -15,7 +15,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY . ASAPQuery-backend
-
 RUN cd ASAPQuery-backend && cargo build --locked --release --bin control_plane
 
 # Runtime image: binary + CA certs.
