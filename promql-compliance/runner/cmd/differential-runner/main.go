@@ -12,13 +12,24 @@ import (
 	"github.com/ProjectASAP/ASAPQuery-backend/promql-compliance/runner"
 )
 
+type stringList []string
+
+func (items *stringList) String() string         { return fmt.Sprint([]string(*items)) }
+func (items *stringList) Set(value string) error { *items = append(*items, value); return nil }
+
 func main() {
+	var composeFiles stringList
 	datasetPath := flag.String("dataset", "", "dataset YAML")
 	suitePath := flag.String("suite", "", "query suite YAML")
 	reference := flag.String("reference-url", "", "Prometheus URL")
 	test := flag.String("test-url", "", "backend URL")
 	baseMillis := flag.Int64("base-time-ms", time.Now().Add(-30*time.Minute).UnixMilli(), "fixture base time")
 	reportPath := flag.String("output", "differential-report.json", "JSON report path")
+	controlPlane := flag.String("control-plane-url", "http://localhost:18080", "control-plane URL")
+	composeProject := flag.String("compose-project", "asapquery-backend-promql-compliance", "Compose project name")
+	logsDirectory := flag.String("logs-dir", "", "directory for retained Compose logs")
+	keepServices := flag.Bool("keep-services", false, "leave Compose services running after the run")
+	flag.Var(&composeFiles, "compose-file", "Compose file to start; may be repeated")
 	flag.Parse()
 	if *datasetPath == "" || *suitePath == "" || *reference == "" || *test == "" {
 		flag.Usage()
@@ -37,6 +48,29 @@ func main() {
 		fatal(err)
 	}
 	ctx := context.Background()
+	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory}
+	if err := lifecycle.Start(ctx); err != nil {
+		fatal(err)
+	}
+	if len(composeFiles) > 0 && !*keepServices {
+		defer lifecycle.Stop()
+	}
+	if err := runner.WaitForHTTP(ctx, *reference+"/api/v1/status/runtimeinfo"); err != nil {
+		fatal(err)
+	}
+	if err := runner.WaitForHTTP(ctx, *test+"/api/v1/health"); err != nil {
+		fatal(err)
+	}
+	if err := runner.WaitForHTTP(ctx, *controlPlane+"/api/v1/cost-model"); err != nil {
+		fatal(err)
+	}
+	publication, err := runner.BuildPublicationRequest(dataset, suite, time.Now().UTC())
+	if err != nil {
+		fatal(err)
+	}
+	if err := runner.PublishPhysicalPlan(ctx, *controlPlane, publication); err != nil {
+		fatal(err)
+	}
 	if err := runner.PushRemoteWrite(ctx, body, *reference, *test); err != nil {
 		fatal(err)
 	}
