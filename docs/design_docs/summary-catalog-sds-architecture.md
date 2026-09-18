@@ -98,6 +98,12 @@ redefining sketch payload schemas. Full-state replacement, replay, and delta-bas
 rules are specified in the [integration design](asapplanner-integration.md#identity-and-update-application).
 Matching bytes or descriptor IDs alone never proves safe merging or complete data.
 
+The [physical subplan boundary](asapplanner-integration.md#executable-subgraphs-and-materialization-boundaries)
+connects a materialization sink to reads of the same summary definition. It does
+not add a new SDS identity or require compile-time enumeration of future instances.
+PrecomputePlan owns state production and QueryPlan owns query-time readout;
+semantic provenance retained for tracing does not change execution ownership.
+
 ## Desired state and observed lifecycle
 
 Persistent desired materializations come from control-plane planning. A runtime

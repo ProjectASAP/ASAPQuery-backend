@@ -24,7 +24,7 @@ record unsupported combinations as capabilities rather than broadening claims.
 | Stage | Owner | Deliverable | Exit gate |
 | --- | --- | --- | --- |
 | 1. Contract and behavior inventory | Backend, Collector, Planner maintainers | Authority map, supported capability matrix, cross-language fixtures | Every existing production wire path and plan entry point has an explicit compatibility expectation |
-| 2. Common physical bindings | Backend control plane | Internal binding stage, catalog construction, four projections | Existing supported inputs produce semantically equivalent publications; no repeated selection through PrecomputePlan |
+| 2. Common physical bindings | Backend control plane | Internal binding stage, catalog construction, four projections, and explicit maintenance/query subgraph boundaries | Existing supported inputs retain semantics; subplan execution ownership and state references are explicit |
 | 3. Shared contracts and validation | Backend/Collector; Planner for IR export | Lightweight contracts, typed semantic export, shared publication validation | Actual Go/Rust consumers accept matching artifacts and reject incompatible ones |
 | 4. Policy and deployment boundaries | Compiler and runtimes | Production/transport policy split; explicit application and activation rules | Guarantee, checkpoint, readiness and partial-rollout fixtures pass for enabled modes |
 | 5. Codec extraction | Sketch libraries, Collector, backend | Typed reconstruction APIs and consumer migration | Backend excludes `asap-precompute-rs`; supported decoding and query results remain compatible |
@@ -105,6 +105,48 @@ nondeterministic metadata; do not normalize away semantic or identity difference
 Gate: supported profiles retain query results, window/label semantics, producer
 update counts, configured fallback and publication compatibility. New binding
 provenance makes every runtime task traceable to the selected decision.
+
+### 2a. Split maintenance and query executable subgraphs
+
+After establishing common bindings, implement the
+[materialization boundary design](asapplanner-integration.md#executable-subgraphs-and-materialization-boundaries).
+Extract maintenance subgraphs terminating at materialization sinks and query
+subgraphs reading those definitions. Preserve semantic provenance without keeping
+query-only nodes as executable content in `PrecomputePlan.executable_dags`.
+Reuse existing catalog/materialization/schema identities rather than introducing
+a second boundary registry.
+
+Switch maintenance execution to the extracted subgraphs and their explicit state
+inputs. Validate every cross-plan boundary during installation: definition,
+schema, grouping, window/phase, and accepted generation must agree. Retain all
+query-side operations and maintenance intermediates needed by their respective
+executors. A semantic node may be absorbed into a physical operation, but the
+mapping must still explain where its work occurs.
+
+Update visualization to show the actual two executable subplans and their state
+references. Legacy artifact inspection must label embedded query nodes as context;
+do not silently render a filtered graph as the original serialized document.
+No separate Semantic Plan section is required for understanding execution.
+
+Acceptance cases:
+
+- A build-summary/read-estimate pipeline places SummaryEstimate only in QueryPlan's
+  executable representation, with an explicit read of the produced summary.
+- One query reading multiple summaries has all boundaries resolved; two queries
+  sharing one summary retain one compatible producer per intended partition.
+- A supported derived-summary chain preserves source state reads and maintenance
+  intermediates, including permitted exact finalization on completed inputs.
+- Incorrect schema, grouping/window phase or generation is rejected at installation.
+- Old/new representations produce equivalent supported query results and preserve
+  maintenance update counts, completion checks, fallback and recovery behavior.
+- Rendered plan views agree with executable ownership and retain provenance links.
+
+This changes an installed representation. Stage the work: establish common bindings
+with the old wire format first, then introduce a versioned split representation
+with adapters for supported older publications. Do not reinterpret the old field
+under the same version. Remove the legacy full-DAG path only after producer,
+consumer and recovery fixtures pass and the compatibility window closes. This
+PR proposes the split; it does not claim the runtime migration is implemented.
 
 ## 3. Extract contracts and unify validation
 
