@@ -47,14 +47,17 @@ Input -> BuildKLL -> SummaryEstimate -> Result
 The migration produces:
 
 ```yaml
+plan_version: 42
 summary_catalog:
-  materialization: {id: mat-17, schema: kll-v1, plan_version: 42}
+  definition: {id: def-9, algorithm: kll, k: 200}
 
 precompute_plan:
-  nodes: [Input, BuildKLL, 'WriteState(mat-17)']
+  nodes: [Input, BuildKLL, 'WriteState(slot-17)']
+  write_binding: {state_slot_id: slot-17, definition_id: def-9, schema: kll-v1}
 
 query_plan:
-  nodes: ['ReadState(mat-17)', SummaryEstimate, Result]
+  nodes: ['ReadState(slot-17)', SummaryEstimate, Result]
+  read_binding: {state_slot_id: slot-17, definition_id: def-9, expected_schema: kll-v1}
 
 provenance:
   selected_dag: Input -> BuildKLL -> SummaryEstimate -> Result
@@ -105,7 +108,7 @@ transitive Collector dependencies.
 ## Stage 3: bind and split plans
 
 Create compiler bindings for semantic nodes, summary definitions,
-materializations, schemas and state references. Derive the catalog and both plans
+version-scoped state slots, schemas and state references. Derive the catalog and both plans
 from those bindings using the
 [materialization-boundary rules](asapplanner-integration.md#executable-subgraphs-and-materialization-boundaries):
 
@@ -118,9 +121,16 @@ from those bindings using the
 Version the split representation. Do not reinterpret an old field under an
 unchanged schema version.
 
+Do not introduce a standalone catalog `Materialization` object. Keep definitions
+in the catalog, format/partition/writer configuration in executable bindings,
+and actual coverage/location/readiness in instance inventory. Normalize legacy
+stored-output identities into state slots while preserving payload locators;
+validate all consumers against the same writer configuration. The existing
+`BackendNodeBinding::Materialization` remains a placement marker for stored output.
+
 ## Stage 4: validate and install
 
-Validate definition, materialization, schema, encoding, grouping, time partition,
+Validate definition, state slot, schema, encoding, grouping, time partition,
 coverage and plan version across the catalog and both plans. Then perform local
 resource checks.
 
@@ -155,5 +165,5 @@ Completion requires:
 - backend builds and required tests do not fetch, build or run ASAPCollector.
 
 Record tested revisions, supported state families, fixture results and dependency
-checks. Trace one query from its selected semantic root through the materialization
+checks. Trace one query from its selected semantic root through the state
 writer, SDS reference and QueryPlan reader.

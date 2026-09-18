@@ -8,7 +8,7 @@ notes and migration gates distinguish implemented behavior from proposed changes
   how one selected semantic DAG becomes executable PrecomputePlan and QueryPlan
   subgraphs joined at materialization boundaries.
 - [Summary Catalog and SDS](summary-catalog-sds-architecture.md) owns descriptors,
-  definition/materialization/instance identity, state references, readiness and
+  definition/instance identity, version-scoped state references, readiness and
   lifecycle semantics.
 - [Architecture migration delivery plan](asapplanner-migration-plan.md) defines
   common-library extraction, removal of ASAPCollector dependencies, the two-plan
