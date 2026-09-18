@@ -23,7 +23,10 @@ type QueryResponse struct {
 	ServedBy string `json:"servedBy,omitempty"`
 }
 
-type HTTPQueryTarget struct{ BaseURL string }
+type HTTPQueryTarget struct {
+	BaseURL       string
+	BackendTarget bool
+}
 
 func (target HTTPQueryTarget) Instant(ctx context.Context, expr string, at time.Time) (QueryResponse, error) {
 	return target.request(ctx, "/api/v1/query", url.Values{"query": {expr}, "time": {fmt.Sprintf("%.3f", float64(at.UnixMilli())/1000)}})
@@ -54,5 +57,10 @@ func (target HTTPQueryTarget) request(ctx context.Context, path string, query ur
 		return QueryResponse{}, err
 	}
 	body.ServedBy = response.Header.Get("X-ASAP-Data-Source")
+	if body.ServedBy == "" && target.BackendTarget {
+		// Prometheus fallback returns its native response unchanged, so it has
+		// no ASAPQuery-owned provenance header.
+		body.ServedBy = "prometheus_fallback"
+	}
 	return body, nil
 }
