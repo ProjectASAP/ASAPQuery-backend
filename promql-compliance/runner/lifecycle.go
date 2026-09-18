@@ -36,9 +36,11 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 		"ASAP_GORILLA_RUST_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-gorilla-rust"),
 		"ASAP_PLANNING_SNAPSHOT="+l.PlanningSnapshot,
 	)
-	output, err := command.CombinedOutput()
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	err = command.Run()
 	if err != nil {
-		return fmt.Errorf("start Compose: %w: %s", err, output)
+		return fmt.Errorf("start Compose: %w", err)
 	}
 	l.started = true
 	return nil
