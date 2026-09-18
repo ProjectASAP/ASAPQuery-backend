@@ -49,8 +49,10 @@ flowchart LR
   C --> P[PrecomputePlan]
   C --> S[Summary Catalog / SDS]
   C --> Q[QueryPlan]
-  P -->|write state| S
-  S -->|bound state reference| Q
+  P -->|write state| Store[Summary store]
+  Q -->|bound state read| Store
+  P -->|definition ID| S
+  Q -->|definition ID| S
 ```
 
 Semantic provenance remains available, but query-only operators are not
@@ -253,11 +255,6 @@ summary_catalog:
       group_by: [service]
       range: 5m
       algorithm: {kind: kll, k: 200}
-  materializations:
-    - id: mat-api-latency-kll-v42
-      definition: def-api-latency-kll
-      schema: kll-v1
-      plan_version: 42
 
 precompute_plan:
   plan_version: 42
@@ -265,8 +262,12 @@ precompute_plan:
     - {id: read-samples, op: ReadInput, metric: request_latency_seconds}
     - {id: group-service, op: GroupBy, labels: [service]}
     - {id: build-kll, op: BuildKll, k: 200}
-    - {id: write-kll, op: WriteState,
-       materialization: mat-api-latency-kll-v42}
+    - id: write-kll
+      op: WriteState
+      reference: {state_slot_id: latency-kll, definition_id: def-api-latency-kll}
+      schema: kll-v1
+      encoding: kll-binary-v1
+      partition_by: [service, window_end]
   edges:
     - [read-samples, group-service]
     - [group-service, build-kll]
@@ -283,8 +284,12 @@ query_plan:
       AND timestamp <= :evaluation_time
     GROUP BY service
   nodes:
-    - {id: read-kll, op: ReadState,
-       materialization: mat-api-latency-kll-v42, schema: kll-v1}
+    - id: read-kll
+      op: ReadState
+      reference: {state_slot_id: latency-kll, definition_id: def-api-latency-kll}
+      expected_schema: kll-v1
+      expected_encoding: kll-binary-v1
+      partition: {service: all_requested_services, window_end: evaluation_time}
     - {id: estimate-p99, op: SummaryEstimate, quantile: 0.99}
     - {id: result, op: QueryResult}
   edges:
@@ -296,8 +301,10 @@ provenance:
   planner.estimate-p99: [query.read-kll, query.estimate-p99]
 ```
 
-`mat-api-latency-kll-v42` is the join point: PrecomputePlan writes it,
-QueryPlan reads it, and SDS defines its meaning and schema. Provenance relates
+`latency-kll` is the state slot shared by the writer and reader in plan version
+42. The catalog defines its summary semantics; the matching executable bindings
+declare format and partition rules. There is no separate catalog materialization
+object. Provenance relates
 both physical projections to the selected DAG without making that DAG executable
 inside PrecomputePlan.
 
@@ -327,13 +334,20 @@ Bindings describe the semantic-to-physical mapping:
 | `Query` | The node maps to an explicit QueryPlan operation | `SummaryEstimate` |
 | `QueryInput` | Query semantics are absorbed into another physical operation | A quantile parameter compiled into `SummaryEstimate` |
 
+`Materialization` above is the existing backend node-binding variant marking
+stored output. It does not create a separate catalog object. The compiler assigns
+that output a state slot and emits matching writer/reader bindings; see
+[field ownership and migration](summary-catalog-sds-architecture.md#core-objects).
+
 | Layer | Owns |
 | --- | --- |
 | ASAPPlanner | Semantic candidates, legality, accuracy reasoning and selection among advertised capabilities |
 | Physical compiler | Concrete implementation, subgraph split, catalog bindings and plan version |
 | Precompute runtime | Installed maintenance nodes and state publication |
 | Query runtime | Bound state reads, query operators, exact residuals and fallback |
-| SDS/catalog | Definition, materialization, schema, state reference, readiness and lifecycle metadata |
+| Catalog | Summary definitions |
+| Plan read/write bindings | State references, format, partition rules and writer ownership |
+| Runtime inventory/store | Actual state instances, coverage, readiness, location and payloads |
 
 ## Compiler contract
 
@@ -351,7 +365,7 @@ support.
 
 | Output | Responsibility |
 | --- | --- |
-| Catalog/SDS entries | Summary semantics, materialization identity, schema and state references |
+| Catalog entries | Summary definitions referenced by the plans |
 | PrecomputePlan | Maintenance subgraphs ending in state writes |
 | QueryPlan | Bound state reads, query operators and exact residuals |
 | Provenance | Physical-to-semantic node mapping |
@@ -365,10 +379,13 @@ summary semantics, grouping, time ranges or schemas independently.
 
 For every selected stored summary, the compiler:
 
-1. Creates or reuses one compatible summary definition and materialization.
+1. Creates or reuses a compatible summary definition and assigns a state slot
+   within the plan version. No standalone catalog materialization is created.
 2. Places source reads, maintenance operators, derived-state reads and the state
    sink in PrecomputePlan.
-3. Replaces the stored-summary edge in QueryPlan with an explicit state read.
+3. Replaces the stored-summary edge in QueryPlan with an explicit state read
+   referencing the same slot and definition, with matching format and partition
+   rules. Writer identity belongs to the PrecomputePlan binding.
 4. Places `SummaryEstimate`, merges, exact residuals and result composition in
    QueryPlan.
 5. Records provenance for semantic nodes absorbed into larger physical nodes.
@@ -377,7 +394,11 @@ Two queries may share a producer only when their definition and state partition
 are compatible. Sharing does not multiply maintenance updates; each query keeps
 its own readout operators.
 
-A derived materialization reads completed state explicitly:
+A summary built from completed stored summaries uses explicit source reads and
+a separate destination slot. For example, five compatible one-minute KLL states
+can be merged into a stored five-minute KLL if coverage and accuracy permit it.
+A merge used only to answer a query belongs in QueryPlan and creates no stored
+destination:
 
 ```text
 PrecomputePlan: Read state A -> derive state B -> store B
@@ -395,7 +416,7 @@ The query runtime follows installed state references; it does not search the
 catalog for alternative summaries.
 
 Visualization renders PrecomputePlan and QueryPlan separately, connected by
-labeled materialization references. Legacy full-DAG artifacts may use a projected
+labeled state references. Legacy full-DAG artifacts may use a projected
 view, but it must label maintenance-owned and query-owned nodes.
 
 ## Validation and acceptance
