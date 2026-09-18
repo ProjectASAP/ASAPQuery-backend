@@ -430,11 +430,6 @@ fn validate_profile(args: &Args) -> Result<()> {
         )
         .into());
     }
-    if !args.forward_unsupported_queries {
-        return Err(
-            "--profile asapquery requires --forward-unsupported-queries for exact fallback".into(),
-        );
-    }
     let required_horizon = (args.precompute_allowed_lateness_ms.max(0) as u64)
         .saturating_add(args.remote_write_expected_retry_interval_ms);
     if args.remote_write_dedup_horizon_ms < required_horizon {
@@ -1452,6 +1447,19 @@ mod tests {
         ])
         .unwrap();
         assert!(validate_profile(&valid).is_ok());
+
+        let no_fallback = Args::try_parse_from([
+            "data_plane",
+            "--profile",
+            "asapquery",
+            "--physical-plan",
+            "plan.json",
+        ])
+        .unwrap();
+        assert!(
+            validate_profile(&no_fallback).is_ok(),
+            "a backend-local plan must be allowed to reject unsupported queries"
+        );
 
         let legacy = Args::try_parse_from([
             "data_plane",
