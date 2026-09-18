@@ -101,6 +101,12 @@ func compareOutcome(left, right QueryResponse, leftErr, rightErr error, policy C
 		if err := CompareResponses(left, right, policy); err != nil {
 			outcome.Diff = err.Error()
 		}
+		if outcome.Diff == "" && right.ServedBy == "prometheus_fallback" {
+			outcome.Diff = "backend forwarded the query to Prometheus fallback; no ASAPQuery result was compared"
+		}
+		if outcome.Diff == "" && right.ServedBy == "" {
+			outcome.Diff = "backend response has no serving provenance"
+		}
 	}
 	outcome.Passed = outcome.Diff == "" && outcome.ReferenceError == "" && outcome.BackendError == ""
 	return outcome
