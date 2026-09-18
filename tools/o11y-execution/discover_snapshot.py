@@ -76,7 +76,7 @@ def main():
                             "occurrence_count": frequencies[query], "expected_evaluations": frequencies[query] * args.repetitions,
                             "declared_interval_ms": interval, "evaluation_phase_ms": phase,
                             "lookback_method": "derived by the backend compiler from PromQL and the declared scrape cadence"})
-    snapshot["query_workload"].update(repeating_queries=registrations, data_workload=data, query_batch=None)
+    snapshot["query_workload"].update(repeating_queries=registrations, query_batch=None)
     snapshot["snapshot_version"] = 2
     snapshot.pop("workload_cost_evidence", None)
     implementation = snapshot["implementation"]
@@ -87,6 +87,9 @@ def main():
     if not isinstance(scrape_interval_ms, int) or scrape_interval_ms <= 0 or scrape_interval_ms % 1000:
         raise ValueError("scrape_interval_ms must be a positive whole number of seconds")
     implementation["scrape_interval_ms"] = scrape_interval_ms
+    data["data_ingestion_interval"] = evidence(scrape_interval_ms)
+    if source_sample_interval_ms is None:
+        data["data_ingestion_interval"]["source"] = "declared"
     # Finite replay evaluates the oldest repetition first after loading the
     # complete input. Preserve that admitted historical-query span separately
     # from each query's PromQL range selector.

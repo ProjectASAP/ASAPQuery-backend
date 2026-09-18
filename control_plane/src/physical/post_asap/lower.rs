@@ -122,6 +122,12 @@ fn bind_recursive(
             bind_recursive(&pushed, cost_model)
         }
 
+        // Workload-aware instant selectors retain their source horizon even
+        // when there is no aggregate to bind.
+        QueryExpr::TimeRange { .. } => Ok(PostAsapPlan::Summary(
+            crate::planner_selection::keep_pre_asap(expr)?,
+        )),
+
         // Exact Count cannot use this deployment's Sum accumulator: it counts
         // values rather than samples. Keep it logical for archive execution.
         QueryExpr::Aggregate {

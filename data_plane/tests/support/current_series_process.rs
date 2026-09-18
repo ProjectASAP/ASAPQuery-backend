@@ -26,7 +26,14 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
     ))
     .unwrap();
     snapshot.schema_version = 2;
-    snapshot.physical_inputs.scrape_interval_ms = 60_000;
+    // Exercise a short declared horizon; native differential mode keeps its five-minute contract.
+    let horizon_ms: i64 = if native.is_some() { 300_000 } else { 5_000 };
+    let scrape_ms = horizon_ms / 5;
+    snapshot.physical_inputs.scrape_interval_ms = scrape_ms as u64;
+    snapshot.data_workload.data_ingestion_interval = planner_types::workload::Evidence {
+        value: Some(planner_types::workload::DurationMs(horizon_ms as u64)),
+        ..Default::default()
+    };
     let template = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0].clone();
     let mut queries = vec![];
     for q in [0.5, 0.9, 0.95, 0.99] {
@@ -93,6 +100,21 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         quotes,
     });
     let planned = snapshot.clone().compile_promql().unwrap();
+    for entry in planned.query_plan.entries.values() {
+        for node in entry.nodes.values() {
+            if let asap_types::query_plan::QueryPlanNode::Logical {
+                operator:
+                    asap_types::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                        population,
+                        ..
+                    },
+                ..
+            } = node
+            {
+                assert_eq!(population.lookback_ms, horizon_ms as u64);
+            }
+        }
+    }
     assert!(
         planned
             .query_plan
@@ -141,7 +163,7 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let times: Vec<_> = (0..=5).map(|i| end - 300_000 + i * 60_000).collect();
+    let times: Vec<_> = (0..=5).map(|i| end - horizon_ms + i * scrape_ms).collect();
     let wire = WriteRequest {
         timeseries: [
             ("x", "api", 1.),
@@ -346,8 +368,8 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
     }
     // Keep one series fresh while all members last seen at `end` hit the exact
     // left lookback boundary. Native Prometheus 3.5 must agree for every readout.
-    let updates: Vec<_> = (60_000..=300_000)
-        .step_by(60_000)
+    let updates: Vec<_> = (scrape_ms.max(3_000)..=horizon_ms)
+        .step_by(scrape_ms as usize)
         .map(|offset| (end + offset, 9.0))
         .collect();
     let wire = WriteRequest {
@@ -362,14 +384,14 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
     }
     assert_eq!(remote_write(&client, &base, &wire).await, 204);
     for text in &queries {
-        let body = query(&client, &base, text, end + 300_000).await;
+        let body = query(&client, &base, text, end + horizon_ms).await;
         assert!(is_warm(&body), "{text}: {body}");
         assert_eq!(
             body["data"]["result"].as_array().unwrap().len(),
             1,
             "{text}: {body}"
         );
-        compare_native(&client, &native, text, end + 300_000, &body).await;
+        compare_native(&client, &native, text, end + horizon_ms, &body).await;
     }
     task.abort();
 }

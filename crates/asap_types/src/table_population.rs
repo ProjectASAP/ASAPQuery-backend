@@ -32,8 +32,10 @@ impl TablePopulation {
             ) {
                 return Err("table population comparison is unsupported".into());
             }
-            if matches!(predicate.value, ScalarValue::Null)
-                || matches!(predicate.value, ScalarValue::Float64(value) if !value.is_finite())
+            if matches!(
+                predicate.value,
+                ScalarValue::Null | ScalarValue::Interval { .. }
+            ) || matches!(predicate.value, ScalarValue::Float64(value) if !value.is_finite())
             {
                 return Err("table population requires a finite non-null literal".into());
             }
