@@ -2,6 +2,8 @@
 
 Status: proposed delivery sequence. Audience: backend implementers.
 
+Terminology: [Planner/backend glossary](planner-backend-glossary.md).
+
 ## Goal and scope
 
 Replace complete semantic DAGs stored under PrecomputePlan with separate

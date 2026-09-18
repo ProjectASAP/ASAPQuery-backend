@@ -3,6 +3,8 @@
 Status: proposed contract with current-backend migration notes. Audience:
 developers compiling, storing, recovering or reading summary state.
 
+Terminology: [Planner/backend glossary](planner-backend-glossary.md).
+
 ## Purpose and scope
 
 The Summary Catalog and Self-Describing Summary (SDS) model defines what persisted

@@ -3,6 +3,8 @@
 Status: proposed backend architecture. Audience: developers changing the
 Planner-to-backend compilation and execution boundary.
 
+Terminology: [Planner/backend glossary](planner-backend-glossary.md).
+
 ## Purpose and scope
 
 This design splits one selected ASAPPlanner semantic DAG into two executable
