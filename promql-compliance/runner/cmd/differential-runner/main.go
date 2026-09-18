@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -47,6 +48,7 @@ func main() {
 		fatal(err)
 	}
 	ctx := context.Background()
+	log.Printf("loaded dataset %q and suite %q", dataset.Name, suite.Name)
 	runDirectory, err := os.MkdirTemp("", "asapquery-promql-compliance-")
 	if err != nil {
 		fatal(err)
@@ -60,27 +62,36 @@ func main() {
 	if err := os.WriteFile(snapshotPath, snapshot, 0o600); err != nil {
 		fatal(err)
 	}
+	log.Printf("wrote suite-derived planning snapshot to %s", snapshotPath)
 	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory, PlanningSnapshot: snapshotPath}
+	if len(composeFiles) > 0 {
+		log.Printf("building and starting Compose services; the first run may take several minutes")
+	}
 	if err := lifecycle.Start(ctx); err != nil {
 		fatal(err)
 	}
 	if len(composeFiles) > 0 && !*keepServices {
 		defer lifecycle.Stop()
 	}
+	log.Printf("waiting for Prometheus at %s", *reference)
 	if err := runner.WaitForHTTP(ctx, *reference+"/api/v1/status/runtimeinfo"); err != nil {
 		fatal(err)
 	}
+	log.Printf("waiting for backend at %s", *test)
 	if err := runner.WaitForHTTP(ctx, *test+"/api/v1/health"); err != nil {
 		fatal(err)
 	}
+	log.Printf("seeding identical Remote Write payloads")
 	if err := runner.PushRemoteWrite(ctx, body, *reference, *test); err != nil {
 		fatal(err)
 	}
+	log.Printf("draining backend precompute work")
 	if err := runner.Drain(ctx, *test); err != nil {
 		fatal(err)
 	}
 	base := time.UnixMilli(*baseMillis)
 	refTarget, testTarget := runner.HTTPQueryTarget{BaseURL: *reference}, runner.HTTPQueryTarget{BaseURL: *test}
+	log.Printf("comparing %d query cases", len(suite.Queries))
 	report := runner.CompareSuite(ctx, refTarget, testTarget, suite, dataset.Name, base)
 	if err := os.MkdirAll(filepath.Dir(*reportPath), 0o755); err != nil && filepath.Dir(*reportPath) != "." {
 		fatal(err)
@@ -96,6 +107,7 @@ func main() {
 	if err := file.Close(); err != nil {
 		fatal(err)
 	}
+	log.Printf("wrote comparison report to %s", *reportPath)
 	fmt.Printf("dataset=%s suite=%s passed=%t report=%s\n", report.Dataset, report.Suite, report.Passed, *reportPath)
 	if !report.Passed {
 		os.Exit(1)
