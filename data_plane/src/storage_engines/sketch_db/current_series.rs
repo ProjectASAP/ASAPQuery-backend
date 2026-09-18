@@ -401,6 +401,28 @@ mod tests {
             quantiles: true,
         }
     }
+
+    // A declared one-second horizon expires the left-boundary sample, not five minutes later.
+    #[test]
+    fn declared_one_second_horizon_expires_members() {
+        let mut population = definition();
+        population.lookback_ms = 1_000;
+        population.max_input_lag_ms = 1_000;
+        population.validate().unwrap();
+        let plan = plan(&population);
+        let mut store = CurrentSeriesStore::default();
+        store.ingest(&plan, &[sample("old", "api", 0, Some(10.))]);
+        store.ingest(&plan, &[sample("new", "api", 500, Some(3.))]);
+        let values = store
+            .read((7, 1), &population, &SeriesReadout::Sum, 1_000)
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].1, 3.);
+        let values = store
+            .read((7, 1), &population, &SeriesReadout::Sum, 1_500)
+            .unwrap();
+        assert!(values.is_empty());
+    }
     fn plan(p: &SeriesPopulation) -> QueryPlan {
         let mut plan = QueryPlan::empty();
         plan.plan_id = 7;

@@ -198,6 +198,7 @@ struct CompileAndPublishPhysicalPlanRequest {
     #[serde(default)]
     workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
+    data_workload: planner_types::workload::DataWorkload,
     #[serde(rename = "collector_ids", alias = "target_collector_ids")]
     target_collector_ids: Vec<String>,
     capability_snapshot_id: String,
@@ -505,11 +506,7 @@ fn compile_physical_plan_request(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let mut queries = Vec::with_capacity(request.queries.len());
-    let mut canonical_roots = Vec::with_capacity(request.queries.len());
-    let mut window_models = Vec::new();
-    let mut workload_entries = Vec::new();
-    for query in request.queries {
+    for query in &request.queries {
         if query.query_id.trim().is_empty()
             || query.metric.trim().is_empty()
             || query.window_secs == 0
@@ -521,17 +518,11 @@ fn compile_physical_plan_request(
                     .into(),
             ));
         }
-        let expr = match frontend.parse(&query.query_string, query.accuracy.clone()) {
-            Ok(expr) => expr,
-            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
-        };
-        let post_asap = match control_plane::planner_selection::keep_pre_asap(&expr) {
-            Ok(plan) => plan,
-            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
-        };
-        canonical_roots.push(std::rc::Rc::new(expr));
-        window_models.push(query.window_cost_model);
-        workload_entries.push(planner_types::workload::RepeatingEntry {
+    }
+    let workload_entries = request
+        .queries
+        .iter()
+        .map(|query| planner_types::workload::RepeatingEntry {
             query: planner_types::workload::Query(query.query_string.clone()),
             demand: planner_types::workload::RepeatedDemand::FixedIntervalAt {
                 interval: planner_types::workload::RepetitionInterval(
@@ -552,7 +543,44 @@ fn compile_physical_plan_request(
                 )),
                 ..Default::default()
             },
-        });
+        })
+        .collect();
+    let query_workload = planner_types::workload::QueryWorkload {
+        language: planner_types::workload::QueryLanguage::PromQL,
+        query_batch: None,
+        repeating_queries: Some(workload_entries),
+    };
+    request
+        .data_workload
+        .validate()
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
+    let lowered = match frontend {
+        QueryFrontend::PromQl => asap_frontend_promql::lower_promql_workload(
+            &planner_types::workload::PlanningWorkload {
+                query_workload: query_workload.clone(),
+                data_workload: Some(request.data_workload.clone()),
+            },
+            now,
+        )
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?,
+        QueryFrontend::MetricsQl => request
+            .queries
+            .iter()
+            .map(|query| frontend.parse(&query.query_string, query.accuracy.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?,
+    };
+
+    let mut queries = Vec::with_capacity(request.queries.len());
+    let mut canonical_roots = Vec::with_capacity(request.queries.len());
+    let mut window_models = Vec::new();
+    for (query, expr) in request.queries.into_iter().zip(lowered) {
+        let post_asap = match control_plane::planner_selection::keep_pre_asap(&expr) {
+            Ok(plan) => plan,
+            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
+        };
+        canonical_roots.push(std::rc::Rc::new(expr));
+        window_models.push(query.window_cost_model);
         queries.push(physical::compiler::QueryCompilationInput {
             query_id: query.query_id,
             query_string: query.query_string,
@@ -571,7 +599,7 @@ fn compile_physical_plan_request(
 
     let planner_selection_trace = match physical::compiler::select_logical_roots_with_trace(
         &mut queries,
-        canonical_roots,
+        canonical_roots.clone(),
         &request.evidence,
         &request.exact_composition_costs,
         request.erp.as_ref(),
@@ -586,12 +614,9 @@ fn compile_physical_plan_request(
     }
     let compilation_request = physical::compiler::PhysicalCompilationRequest {
         planner_selection_trace,
-        query_workload: Some(planner_types::workload::QueryWorkload {
-            language: planner_types::workload::QueryLanguage::PromQL,
-            query_batch: None,
-            repeating_queries: Some(workload_entries),
-            data_workload: None,
-        }),
+        query_workload: Some(query_workload),
+        data_workload: Some(request.data_workload),
+        canonical_roots,
         queries,
         allow_mixed_summary_and_exact_execution: request.target
             == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite,
@@ -820,6 +845,7 @@ mod api_tests {
             .unwrap()
             .as_millis() as u64;
         let mut request_body = serde_json::json!({
+            "data_workload": snapshot.data_workload,
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
                 "metric": "m", "window_secs": 60, "accuracy": query.accuracy_target,
@@ -895,6 +921,7 @@ mod api_tests {
             panic!("expected time series fixture");
         };
         let value = serde_json::json!({
+            "data_workload": snapshot.data_workload,
             "target": "backend_local_remote_write",
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
@@ -917,6 +944,21 @@ mod api_tests {
             physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
         );
         assert!(!plan.precompute_plan.materializations.is_empty());
+        // HTTP lowering uses the current planning clock, not a timeless compatibility parse.
+        let mut stale = value.clone();
+        stale["data_workload"]["data_ingestion_interval"]["observed_at_ms"] = serde_json::json!(0);
+        stale["data_workload"]["data_ingestion_interval"]["valid_for_ms"] = serde_json::json!(0);
+        let error = compile_physical_plan_request(
+            serde_json::from_value(stale).unwrap(),
+            false,
+            QueryFrontend::PromQl,
+        )
+        .expect_err("expired cadence must fail HTTP planning");
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error
+            .1
+            .to_string()
+            .contains("evidence is unavailable at planning time"));
         let mut distributed = value;
         distributed["target"] = serde_json::json!("distributed_collectors");
         assert!(compile_physical_plan_request(

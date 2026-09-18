@@ -92,7 +92,8 @@ pub(super) fn operator(
             .scrape_interval_ms
             .unwrap_or(60_000)
             .saturating_add(request.query_retention_margin_ms)
-            .clamp(1, 300_000),
+            .max(1)
+            .min(input.lookback_ms),
     };
     population.validate()?;
     let readout = match readout {
