@@ -12,7 +12,7 @@ backend plans:
 - **QueryPlan** reads stored state and computes query results.
 
 Both plans use identities and state contracts from the
-[SDS design](summary-catalog-sds-architecture.md) and install as one generation.
+[SDS design](summary-catalog-sds-architecture.md) and install as one plan version.
 The [migration plan](asapplanner-migration-plan.md) defines delivery steps.
 CollectorPlan, TransmissionPlan and distributed activation are deferred; this
 migration must not introduce a backend dependency on ASAPCollector.
@@ -119,7 +119,7 @@ Planner supplies legal maintenance alternatives. The backend supplies executable
 implementations and evidence; the control plane commits a feasible selection.
 The compiler validates that commitment without silently changing its mode,
 coverage or sharing. A changed commitment is installed through a new plan
-generation. It need not change the semantic summary definition when only the
+plan version. It need not change the semantic summary definition when only the
 physical maintenance policy changes.
 
 ### Backend capability
@@ -240,7 +240,7 @@ physical_cost_evidence:
 installation_context:
   catalog_version: 12
   state_schema: kll-v1
-  plan_generation: 42
+  plan_version: 42
 ```
 
 ### Compiler output
@@ -254,26 +254,26 @@ summary_catalog:
       range: 5m
       algorithm: {kind: kll, k: 200}
   materializations:
-    - id: mat-api-latency-kll-g42
+    - id: mat-api-latency-kll-v42
       definition: def-api-latency-kll
       schema: kll-v1
-      generation: 42
+      plan_version: 42
 
 precompute_plan:
-  generation: 42
+  plan_version: 42
   nodes:
     - {id: read-samples, op: ReadInput, metric: request_latency_seconds}
     - {id: group-service, op: GroupBy, labels: [service]}
     - {id: build-kll, op: BuildKll, k: 200}
     - {id: write-kll, op: WriteState,
-       materialization: mat-api-latency-kll-g42}
+       materialization: mat-api-latency-kll-v42}
   edges:
     - [read-samples, group-service]
     - [group-service, build-kll]
     - [build-kll, write-kll]
 
 query_plan:
-  generation: 42
+  plan_version: 42
   query_id: p99-api-latency
   query_language: clickhouse_sql
   query_expression: >-
@@ -284,7 +284,7 @@ query_plan:
     GROUP BY service
   nodes:
     - {id: read-kll, op: ReadState,
-       materialization: mat-api-latency-kll-g42, schema: kll-v1}
+       materialization: mat-api-latency-kll-v42, schema: kll-v1}
     - {id: estimate-p99, op: SummaryEstimate, quantile: 0.99}
     - {id: result, op: QueryResult}
   edges:
@@ -296,7 +296,7 @@ provenance:
   planner.estimate-p99: [query.read-kll, query.estimate-p99]
 ```
 
-`mat-api-latency-kll-g42` is the join point: PrecomputePlan writes it,
+`mat-api-latency-kll-v42` is the join point: PrecomputePlan writes it,
 QueryPlan reads it, and SDS defines its meaning and schema. Provenance relates
 both physical projections to the selected DAG without making that DAG executable
 inside PrecomputePlan.
@@ -330,7 +330,7 @@ Bindings describe the semantic-to-physical mapping:
 | Layer | Owns |
 | --- | --- |
 | ASAPPlanner | Semantic candidates, legality, accuracy reasoning and selection among advertised capabilities |
-| Physical compiler | Concrete implementation, subgraph split, catalog bindings and plan generation |
+| Physical compiler | Concrete implementation, subgraph split, catalog bindings and plan version |
 | Precompute runtime | Installed maintenance nodes and state publication |
 | Query runtime | Bound state reads, query operators, exact residuals and fallback |
 | SDS/catalog | Definition, materialization, schema, state reference, readiness and lifecycle metadata |
@@ -343,7 +343,7 @@ The compiler consumes:
 - query accuracy and response requirements;
 - complete lifecycle commitments for the supported backend mode;
 - backend capabilities and concrete implementation evidence;
-- catalog, schema and deployment-generation inputs.
+- catalog, schema and plan-version inputs.
 
 Capabilities constrain Planner choices. A data-at-rest-only backend advertises
 only batch construction; recurring query demand does not imply incremental
@@ -386,8 +386,8 @@ QueryPlan:      Read state B -> estimate -> result
 
 ## Runtime contract
 
-The backend stages the catalog and both plans as one generation and exposes them
-atomically. Failed staging leaves the previous generation active.
+The backend stages the catalog and both plans as one plan version and exposes them
+atomically. Failed staging leaves the previous plan version active.
 
 Installation and readiness are distinct. Until required state coverage exists,
 QueryPlan uses its configured exact fallback or returns explicit unavailability.
@@ -401,7 +401,7 @@ view, but it must label maintenance-owned and query-owned nodes.
 ## Validation and acceptance
 
 Compilation and installation reject unresolved state references, schema/encoding
-mismatches, incompatible grouping or time partitions, wrong generations, cycles,
+mismatches, incompatible grouping or time partitions, wrong plan versions, cycles,
 unsupported phase operators and unsatisfied derived-state completeness.
 
 Acceptance tests demonstrate:
@@ -411,7 +411,7 @@ Acceptance tests demonstrate:
 2. One query can read multiple summaries and two queries can share one producer.
 3. Derived summaries honor completion and schema requirements.
 4. Invalid cross-plan bindings fail before activation.
-5. Staging failure, restart and generation switching preserve consistency and
+5. Staging failure, restart and plan version switching preserve consistency and
    documented fallback behavior.
 6. The backend builds and runs these cases without ASAPCollector.
 
