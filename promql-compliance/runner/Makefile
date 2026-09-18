@@ -26,4 +26,4 @@ run-all:
 		name="$${test_case%%:*}"; rest="$${test_case#*:}"; dataset="$${rest%%:*}"; suite="$${rest#*:}"; \
 		echo "Running $$name"; \
 		if ! go run ./cmd/differential-runner --dataset "$$dataset" --suite "$$suite" --reference-url "$(REFERENCE_URL)" --test-url "$(BACKEND_URL)" --compose-file "$(COMPOSE_FILE)" --logs-dir "$(LOGS_DIR)/$$name" --output "$(REPORT_DIR)/$$name.json"; then result=1; fi; \
-	done; exit $$result
+	done; go run ./cmd/report-card --reports-dir "$(REPORT_DIR)"; exit $$result
