@@ -109,6 +109,60 @@ The compiler produces one coherent backend publication:
 These outputs are derived from the same compiler bindings. They must not make
 independent choices about summary semantics, grouping, windows or schemas.
 
+For the `p99-api-latency` input above, a conceptual compiler output is:
+
+```yaml
+summary_catalog:
+  definitions:
+    - id: def-api-latency-kll
+      input: request_latency_seconds
+      group_by: [service]
+      range: 5m
+      algorithm: {kind: kll, k: 200}
+  materializations:
+    - id: mat-api-latency-kll-g42
+      definition: def-api-latency-kll
+      schema: kll-v1
+      generation: 42
+
+precompute_plan:
+  generation: 42
+  nodes:
+    - {id: read-samples, op: ReadInput, metric: request_latency_seconds}
+    - {id: group-service, op: GroupBy, labels: [service]}
+    - {id: build-kll, op: BuildKll, k: 200}
+    - id: write-kll
+      op: WriteState
+      materialization: mat-api-latency-kll-g42
+  edges:
+    - [read-samples, group-service]
+    - [group-service, build-kll]
+    - [build-kll, write-kll]
+
+query_plan:
+  generation: 42
+  query_id: p99-api-latency
+  nodes:
+    - id: read-kll
+      op: ReadState
+      materialization: mat-api-latency-kll-g42
+      schema: kll-v1
+    - {id: estimate-p99, op: SummaryEstimate, quantile: 0.99}
+    - {id: result, op: QueryResult}
+  edges:
+    - [read-kll, estimate-p99]
+    - [estimate-p99, result]
+
+provenance:
+  planner.build_summary: [precompute.build-kll, precompute.write-kll]
+  planner.estimate-p99: [query.read-kll, query.estimate-p99]
+```
+
+`mat-api-latency-kll-g42` is the join point: PrecomputePlan writes it,
+QueryPlan reads it, and the catalog supplies its definition and schema. The
+provenance mapping explains how both physical projections came from the selected
+Planner DAG without making that DAG executable inside PrecomputePlan.
+
 ## Ownership
 
 | Layer | Owns | Does not own |
