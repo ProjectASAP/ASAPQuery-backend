@@ -15,6 +15,7 @@
 #     --build-context asap-gorilla-rust=/path/ASAPCollector/asap-gorilla-rust \
 #     -t asap/control-plane:dev .
 FROM rust:1.90-bookworm AS build
+ARG LOCAL_DEP_OVERRIDES=false
 WORKDIR /src
 
 # protoc for control_plane/build.rs (prost-build/tonic-build compile
@@ -27,11 +28,26 @@ RUN apt-get update && \
 # Same sibling-checkout layout as data_plane/Dockerfile so workspace path-deps
 # resolve during the build.
 COPY . ASAPQuery-backend
+# hadolint ignore=DL3022
 COPY --from=asap-precompute-rs . ASAPCollector/asap-precompute-rs
+# hadolint ignore=DL3022
 COPY --from=asap-sketchlib     . asap_sketchlib
+# hadolint ignore=DL3022
 COPY --from=asap-gorilla-rust  . ASAPCollector/asap-gorilla-rust
 
-RUN cd ASAPQuery-backend && cargo build --release --bin control_plane
+# See data_plane/Dockerfile: resolve private sibling dependencies from the
+# build contexts instead of requiring Docker to authenticate to GitHub.
+RUN if [ "$LOCAL_DEP_OVERRIDES" = true ]; then mkdir -p ASAPQuery-backend/.cargo && \
+    printf '%s\n' \
+      '[patch."https://github.com/ProjectASAP/ASAPCollector"]' \
+      'asap-precompute-rs = { path = "/src/ASAPCollector/asap-precompute-rs" }' \
+      '' \
+      '[patch."https://github.com/ProjectASAP/asap_sketchlib"]' \
+      'asap_sketchlib = { path = "/src/asap_sketchlib" }' \
+      >> ASAPQuery-backend/.cargo/config.toml; fi
+
+WORKDIR /src/ASAPQuery-backend
+RUN cargo build --release --bin control_plane --bin control_plane_quote_snapshot
 
 # Runtime image: binary + CA certs.
 FROM debian:bookworm-slim
@@ -40,6 +56,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/ASAPQuery-backend/target/release/control_plane \
     /usr/local/bin/control_plane
+COPY --from=build /src/ASAPQuery-backend/target/release/control_plane_quote_snapshot \
+    /usr/local/bin/control_plane_quote_snapshot
 
 ENV RUST_LOG=info
 # OpAMP ws 4320, controller gRPC 4321, controller HTTP 8080.
