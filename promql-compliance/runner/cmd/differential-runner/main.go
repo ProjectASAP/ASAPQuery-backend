@@ -103,7 +103,7 @@ func run() error {
 		return err
 	}
 	base := time.UnixMilli(*baseMillis)
-	refTarget, testTarget := runner.HTTPQueryTarget{BaseURL: *reference}, runner.HTTPQueryTarget{BaseURL: *test}
+	refTarget, testTarget := runner.HTTPQueryTarget{BaseURL: *reference}, runner.HTTPQueryTarget{BaseURL: *test, BackendTarget: true}
 	log.Printf("comparing %d query cases", len(suite.Queries))
 	report := runner.CompareSuite(ctx, refTarget, testTarget, suite, dataset.Name, base)
 	if err := os.MkdirAll(filepath.Dir(*reportPath), 0o755); err != nil && filepath.Dir(*reportPath) != "." {
