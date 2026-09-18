@@ -57,6 +57,12 @@ serialized API schema:
 ```yaml
 selected_planner_dag:
   query_id: p99-api-latency
+  query_language: clickhouse_sql
+  query_expression: >-
+    SELECT service, quantile(0.99)(request_latency_seconds)
+    FROM metrics
+    WHERE timestamp > now() - INTERVAL 5 MINUTE
+    GROUP BY service
   root: estimate-p99
   nodes:
     - input: request_latency_seconds
@@ -142,6 +148,12 @@ precompute_plan:
 query_plan:
   generation: 42
   query_id: p99-api-latency
+  query_language: clickhouse_sql
+  query_expression: >-
+    SELECT service, quantile(0.99)(request_latency_seconds)
+    FROM metrics
+    WHERE timestamp > now() - INTERVAL 5 MINUTE
+    GROUP BY service
   nodes:
     - id: read-kll
       op: ReadState
