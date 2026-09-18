@@ -26,7 +26,7 @@ services:
         asap-precompute-rs: ${ASAP_PRECOMPUTE_RS_CONTEXT}
         asap-sketchlib: ${ASAP_SKETCHLIB_CONTEXT}
         asap-gorilla-rust: ${ASAP_GORILLA_RUST_CONTEXT}
-    command: ["--profile", "asapquery", "--planning-snapshot", "/config/planning-snapshot.json", "--prometheus-server", "http://prometheus:9090", "--http-port", "9091", "--output-dir", "/tmp/asap"]
+    command: ["--profile", "asapquery", "--planning-snapshot", "/config/planning-snapshot.json", "--prometheus-server", "http://prometheus:9090", "--forward-unsupported-queries", "--http-port", "9091", "--output-dir", "/tmp/asap"]
     volumes:
       - ${ASAP_PLANNING_SNAPSHOT}:/config/planning-snapshot.json:ro
     ports: ["${BACKEND_PORT:-19091}:9091"]
