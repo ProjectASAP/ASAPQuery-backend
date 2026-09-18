@@ -45,6 +45,12 @@ decision,” and “same stored payload” have different compatibility rules.
 
 ## Worked example
 
+`plan_version` identifies the coherent version of PrecomputePlan, QueryPlans
+and their catalog bindings installed together. The value `42` below is an
+illustrative version identifier. Updating summary contents or publishing a new
+time partition does not change the plan version. State readiness is tracked
+separately; installing a plan version does not make its required state ready.
+
 Two queries request different percentiles from the same five-minute KLL summary:
 
 ```yaml
@@ -56,24 +62,24 @@ summary_definition:
   algorithm: {kind: kll, k: 200}
 
 materialization:
-  id: mat-api-latency-kll-g42
+  id: mat-api-latency-kll-v42
   definition: def-api-latency-kll
-  generation: 42
+  plan_version: 42
   schema: kll-v1
 
 state_instances:
   - id: state-api-1200
-    materialization: mat-api-latency-kll-g42
+    materialization: mat-api-latency-kll-v42
     partition: {service: api, start: '12:00', end: '12:01'}
     status: ready
   - id: state-api-1201
-    materialization: mat-api-latency-kll-g42
+    materialization: mat-api-latency-kll-v42
     partition: {service: api, start: '12:01', end: '12:02'}
     status: ready
 
 query_state_references:
-  q50: {materialization: mat-api-latency-kll-g42, quantile: 0.50}
-  q99: {materialization: mat-api-latency-kll-g42, quantile: 0.99}
+  q50: {materialization: mat-api-latency-kll-v42, quantile: 0.50}
+  q99: {materialization: mat-api-latency-kll-v42, quantile: 0.99}
 ```
 
 PrecomputePlan updates each state partition once. Both QueryPlans resolve the
@@ -86,7 +92,7 @@ time.
 | Object | Meaning | Changes when |
 | --- | --- | --- |
 | `SummaryDefinition` | Canonical input, operation, grouping, time semantics, algorithm and parameters | Summary semantics change |
-| `Materialization` | An installed decision to produce a definition with one state contract | Plan generation or physical contract changes |
+| `Materialization` | An installed decision to produce a definition with one state contract | Plan version or physical contract changes |
 | `SummaryStateInstance` | One stored partition, such as a series/pane or completed aggregate | Runtime creates or replaces payload state |
 | `StateReference` | A typed plan reference to permitted materialized state | A compiled reader/writer binding changes |
 
@@ -95,9 +101,9 @@ and filters, input value, operation or sketch parameters, grouping, time
 semantics, accuracy fields that affect state, and output type. Display names,
 costs, locations, readiness and retention status are excluded.
 
-A materialization adds definition ID, plan generation, state family, schema,
+A materialization adds definition ID, plan version, state family, schema,
 encoding, physical partition layout, permitted writer identity and provenance.
-Several generations may materialize the same definition.
+Several plan versions may materialize the same definition.
 
 A state instance adds its partition key, coverage/completion, producer sequence
 where applicable, lifecycle status, location and integrity metadata. Payload
@@ -110,15 +116,15 @@ bytes remain in the summary store, not in catalog descriptors.
 | Definition ID | What semantics does the state represent? |
 | Materialization ID | Which installed physical decision produced it? |
 | State-instance ID | Which concrete partition/payload is it? |
-| Plan generation | With which atomic installation may it be used? |
+| Plan version | With which atomic installation may it be used? |
 | Schema/encoding ID | How are its bytes interpreted? |
 
 The compiler/catalog authority assigns these identities once. Human-readable
-names are diagnostics, not join keys. Reuse across generations requires an
+names are diagnostics, not join keys. Reuse across plan versions requires an
 explicit compatibility decision; a matching definition ID is insufficient.
 
 A `StateReference` identifies one materialization and constrains acceptable
-partition, schema, generation and coverage. It may select several instances, such
+partition, schema, plan version and coverage. It may select several instances, such
 as panes covering one range, but cannot broaden semantics or substitute another
 algorithm. QueryPlan and derived PrecomputePlan nodes resolve references through
 exact indexed lookup, never serving-time candidate selection.
@@ -130,14 +136,14 @@ PrecomputePlan
   Input -> BuildKLL -> Write(mat-17)
 
 SDS
-  mat-17 -> def-9, KLL(k=200), kll-v1, generation 42
+  mat-17 -> def-9, KLL(k=200), kll-v1, plan version 42
 
 QueryPlan
   Read(mat-17, kll-v1) -> SummaryEstimate -> Result
 ```
 
 Writer, SDS entry and reader must agree on definition, materialization, state
-family, parameters, schema/encoding, grouping, time partition and generation.
+family, parameters, schema/encoding, grouping, time partition and plan version.
 The query runtime follows the installed reference instead of scanning the catalog.
 
 A derived materialization has a distinct destination identity and an explicit
@@ -165,7 +171,7 @@ observed readiness and coverage, then follows its configured fallback or explici
 unavailability behavior. Reactivation does not make stale instances current.
 
 Completed finite-input state is immutable. Additional writes require a new
-authorized generation or replacement instance. Mutable streaming state publishes
+authorized plan version or replacement instance. Mutable streaming state publishes
 monotone coverage according to its installed contract.
 
 ## Validation and migration
@@ -175,7 +181,7 @@ Compilation, installation, writes, recovery and reads enforce:
 1. Each materialization resolves to one definition and each instance to one
    materialization.
 2. Instance metadata declares the payload's actual schema and encoding.
-3. References preserve definition semantics and compatible generation.
+3. References preserve definition semantics and compatible plan version.
 4. Writer and reader grouping, time partition, schema and coverage agree.
 5. Derived reads meet their completion requirement.
 6. Retirement blocks new bindings before state reclamation.

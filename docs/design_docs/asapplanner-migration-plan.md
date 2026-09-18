@@ -30,7 +30,7 @@ and a general ASAPPlanner API redesign are deferred.
 | 1. Inventory | Freeze current contracts and behavior as fixtures | Every supported path has a fixture or explicit unsupported result |
 | 2. Extract | Move neutral contracts/codecs out of Collector | Backend dependencies and tests contain no ASAPCollector |
 | 3. Split | Derive catalog, maintenance DAGs and query DAGs from one binding | Ownership and state references match selected semantics |
-| 4. Install | Validate and atomically activate one generation | Invalid snapshots fail without disturbing the active generation |
+| 4. Install | Validate and atomically activate one plan version | Invalid snapshots fail without disturbing the active plan version |
 | 5. Retire | Normalize old artifacts and remove superseded paths | Compatibility and end-to-end gates pass |
 
 Do not combine payload-format changes with dependency extraction. Version the new
@@ -48,7 +48,7 @@ The migration produces:
 
 ```yaml
 summary_catalog:
-  materialization: {id: mat-17, schema: kll-v1, generation: 42}
+  materialization: {id: mat-17, schema: kll-v1, plan_version: 42}
 
 precompute_plan:
   nodes: [Input, BuildKLL, 'WriteState(mat-17)']
@@ -121,12 +121,12 @@ unchanged schema version.
 ## Stage 4: validate and install
 
 Validate definition, materialization, schema, encoding, grouping, time partition,
-coverage and generation across the catalog and both plans. Then perform local
+coverage and plan version across the catalog and both plans. Then perform local
 resource checks.
 
 Stage and activate the three artifacts as one snapshot. Readiness remains
 separate: until coverage is ready, QueryPlan follows its configured fallback or
-explicit unavailability. Failed staging preserves the previous generation.
+explicit unavailability. Failed staging preserves the previous plan version.
 
 Render PrecomputePlan and QueryPlan separately, joined by state references.
 Legacy projected views label maintenance-owned and query-owned nodes.
@@ -138,7 +138,7 @@ backend-local publications first and retain versioned adapters for the supported
 compatibility window.
 
 Remove complete-DAG precompute execution and Collector adapter code only after
-fixtures and end-to-end tests pass. State reuse across generations requires an
+fixtures and end-to-end tests pass. State reuse across plan versions requires an
 explicit SDS compatibility decision independently of binary rollback.
 
 ## Completion evidence
@@ -150,7 +150,7 @@ Completion requires:
 - one query can read multiple summaries and two queries can share one producer;
 - derived state observes completion and schema requirements;
 - invalid bindings fail before activation;
-- restart and generation switching preserve consistency and fallback;
+- restart and plan version switching preserve consistency and fallback;
 - legacy and split artifacts produce equivalent results and update counts;
 - backend builds and required tests do not fetch, build or run ASAPCollector.
 
