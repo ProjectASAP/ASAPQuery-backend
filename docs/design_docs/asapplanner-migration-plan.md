@@ -1,226 +1,221 @@
-# Physical-plan architecture: migration delivery plan
+# PrecomputePlan and QueryPlan: migration delivery plan
 
-Audience: developers implementing the
+Audience: developers implementing the backend portion of the
 [integration architecture](asapplanner-integration.md). Status: proposed delivery
-sequence, not a record of completed implementation. This replaces historical PR
-stack tracking with behavior-based gates. Existing merged behavior is the baseline;
-old test totals and PR status are not evidence for this migration.
+sequence, not a record of completed implementation.
 
-## Completion definition
+## Scope and completion definition
 
-For each declared supported deployment profile, one Planner decision is bound
-once and projected into catalog, QueryPlan, PrecomputePlan, CollectorPlan and
-TransmissionPlan. Publication, runtime state, and query readout agree on identity,
-schema, window, guarantees and generation. Backend production code no longer
-imports the Collector execution runtime for reconstruction.
+This iteration handles **PrecomputePlan and QueryPlan only**, including their
+shared SDS/catalog contracts, executable subgraph boundaries, backend installation,
+and state decoding. CollectorPlan and TransmissionPlan compilation, policy redesign,
+producer rollout and distributed activation are deferred. Their implementation or
+release is not a prerequisite for completing this work.
 
-Backend-local and distributed profiles need separate acceptance. Arbitrary
-PromQL, all sketch-family delta modes, general multi-hop execution, and a new
-repository are outside the completion gate. Preserve supported existing behavior;
-record unsupported combinations as capabilities rather than broadening claims.
+The backend must have **no build or runtime dependency on ASAPCollector**. Extract
+the common contracts and codecs into runtime-independent libraries, then consume
+those libraries from the backend. Copying Collector runtime code into a backend-only
+fork or keeping a shared package hosted inside ASAPCollector does not meet this
+boundary. Collector can adopt the common libraries in a separate follow-up.
+
+Completion means:
+
+- One selected Planner decision produces a coherent catalog and two executable
+  subplans, connected by explicit materialization/state references.
+- PrecomputePlan executes state production/maintenance; QueryPlan executes reads
+  and query-time operations, including SummaryEstimate.
+- Both subplans agree on definition identity, schema, grouping/window, guarantees
+  and generation, with backend-local atomic installation and separate readiness.
+- Backend library/binary builds and the required test suite need no ASAPCollector
+  checkout, package or process. Shared reconstruction uses neutral libraries.
+- Supported backend inputs, query results, recovery and legacy decoding retain
+  their documented behavior. No new distributed behavior is claimed.
+
+Existing CollectorPlan/TransmissionPlan fields may remain in legacy publication
+adapters for compatibility. They are not redesigned by this migration. The local
+path requires neither a Collector target nor transmission rules and must not use
+CollectorPlan as the source of shared types or decisions. Do not silently accept
+new distributed capabilities just because the local contract has changed.
 
 ## Sequence and dependencies
 
 | Stage | Owner | Deliverable | Exit gate |
 | --- | --- | --- | --- |
-| 1. Contract and behavior inventory | Backend, Collector, Planner maintainers | Authority map, supported capability matrix, cross-language fixtures | Every existing production wire path and plan entry point has an explicit compatibility expectation |
-| 2. Common physical bindings | Backend control plane | Internal binding stage, catalog construction, four projections, and explicit maintenance/query subgraph boundaries | Existing supported inputs retain semantics; subplan execution ownership and state references are explicit |
-| 3. Shared contracts and validation | Backend/Collector; Planner for IR export | Lightweight contracts, typed semantic export, shared publication validation | Actual Go/Rust consumers accept matching artifacts and reject incompatible ones |
-| 4. Policy and deployment boundaries | Compiler and runtimes | Production/transport policy split; explicit application and activation rules | Guarantee, checkpoint, readiness and partial-rollout fixtures pass for enabled modes |
-| 5. Codec extraction | Sketch libraries, Collector, backend | Typed reconstruction APIs and consumer migration | Backend excludes `asap-precompute-rs`; supported decoding and query results remain compatible |
-| 6. Retirement and release | Participating repositories | Remove superseded copies/adapters, pin compatible versions | Both profiles pass end-to-end gates without retired paths |
+| 1. Inventory and fixtures | Backend | Contract/dependency map and backend behavior baseline | Every scoped entry point and Collector import has a documented replacement or compatibility fixture |
+| 2. Extract common libraries | Backend and shared-library maintainers | Runtime-independent contracts and typed sketch reconstruction | Backend and required tests build without ASAPCollector; existing decoding remains compatible |
+| 3. Bind and split two subplans | Backend compiler/runtime | Common bindings, catalog, maintenance/query subgraphs, explicit state boundaries | Executable ownership and provenance match supported semantics |
+| 4. Validate, install and visualize | Backend | Shared two-plan checks, local generation switching, two execution views | Invalid boundaries fail; readiness and recovery remain correct |
+| 5. Retire and release | Backend and shared-library maintainers | Remove superseded paths, pin common-library versions | Scoped end-to-end and dependency gates pass without Collector work |
 
-Stages 2 and 3 preserve existing wire formats through boundary adapters. Stage 4
-changes public contracts only with negotiated/versioned compatibility. Codec work
-can proceed after stage 1, but its removal gate depends on stable contracts and
-consumer coverage. Do not combine an unrelated Planner upgrade with extraction.
+Stages 2 and 3 may be developed independently after the inventory, but both must
+finish before the final gate. Extract code without changing payload bytes first;
+version changes to installed executable representations separately. Do not combine
+an unrelated Planner upgrade or a new public Planner facade with this work.
 
-## 1. Establish authority and fixtures
+## 1. Establish authority and backend fixtures
 
-Inventory Planner exports, backend installed contracts, Collector Go/Rust DTOs,
-OTel carriers, sketch state/delta schemas and legacy bare-state decoders. Record
-one owner for each concept and the current supported producer/consumer versions.
-Compare actual field shapes, defaults, enum meanings, units and rejection behavior;
-a similarly named struct is not compatibility evidence.
+Inventory the pinned Planner output, backend plan/SDS types, state schemas,
+envelope types, all `asap_precompute_rs` imports, Cargo patches, and tests that
+build or invoke Collector. Identify the smallest common API required at each
+call site. Keep backend execution, storage and accumulator/readout adaptation in
+the backend; do not move all of `asap_types` into a generic package indiscriminately.
 
-Capture supported backend-local, distributed full-state, distributed delta, and
-generation-transition examples. Use distinct evidence for wire equivalence and
-semantic state/readout equivalence; randomized state may require persisted fixtures
-and semantic assertions rather than comparing unrelated fresh encodings.
+Capture backend-local raw ingestion, summary reconstruction, state maintenance,
+query readout, completion, installation and recovery fixtures. For supported
+existing full/delta/legacy payloads, record the bytes and expected state/readout
+behavior with source revision and schema provenance. Frozen compatibility fixtures
+may originate from Collector but must be usable without checking out or running it.
+Randomized sketches may need persisted fixtures and semantic assertions rather
+than comparing independently generated bytes.
 
-Protocol cases include duplicate/conflicting sequences, unknown delta base, gaps,
-producer restart, malformed framed payload, and legacy unframed state. Label any
-currently failing target invariant as migration work, not passing baseline behavior.
-Have a separate reviewer review expected outcomes before protocol changes.
+Input validation tests cover malformed framed payloads and currently supported
+sequence/checkpoint behavior where touched by extraction. Missing target features
+remain explicit gaps; do not turn this into a new transmission protocol project.
+Have a separate reviewer assess boundary/replay expectations for consequential
+implementation changes; independent review is not claimed by this document.
 
-### Planner caller contract gate (#438)
+### Planner input boundary
 
-Resolve [Planner #438](https://github.com/ProjectASAP/ASAPPlanner/issues/438)
-at the public workflow boundary, not only in the backend compiler. First deliver
-an ASAPPlanner user guide for supported entry/exit points, including workflows
-that intentionally stop at pre-ASAP IR, candidates, or a selected semantic DAG.
-Each recipe must document exact APIs, controls, defaults, performed checks and
-output limitations and run against the documented revision. This guide does not
-depend on implementing a unified facade. Document strategy selection and automatic
-passes separately from model providers, runtime capabilities and requirements. Audit actual
-API defaults and low-level output guarantees, including the current all-enabled
-lifecycle capability default, unknown lifecycle cost inputs, and per-root accuracy
-propagation. Distinguish Rust defaults from serialized-field omission. Then specify
-one application-facing
-request/result contract with explicit incomplete/infeasible outcomes. Use the
-[caller contract](asapplanner-integration.md#caller-contract-and-lifecycle-completeness)
-as the target; its omission rules are proposed behavior, not current API facts.
+Consume the existing pinned semantic contract and preserve per-query requirements,
+root associations and lifecycle commitments. Runtime capabilities restrict eligible
+lifecycle modes; a singleton legal lifecycle is valid. Incomplete stateful
+commitments must not reach installation. A data-at-rest-only backend does not gain
+incremental support merely because query demand repeats.
 
-The complete output must associate each materialized state with a selected or
-capability-constrained, validated lifecycle. Planner models the available
-lifecycle vocabulary; runtime support and workload/policy constraints determine
-which modes may enter candidate selection. A singleton legal set is a complete
-selection, not a skipped lifecycle decision. Lifecycle feasibility and applicable
-costs must participate in candidate selection. Keep diagnostic DAG exports accessible, but
-do not allow them to masquerade as deployment-complete results. Document which
-inputs callers control and which evidence/capabilities come from providers.
+[Planner #438](https://github.com/ProjectASAP/ASAPPlanner/issues/438) and its
+[user/API documentation work](https://github.com/ProjectASAP/ASAPPlanner/pull/440)
+remain related work, not completion prerequisites. Change Planner contracts only
+for a demonstrated blocker to this two-plan split; a broad IR redesign or unified
+Planner entry point is deferred.
 
-Gate: executable public-API examples cover one-shot, recurring, unknown-demand,
-and missing-evidence inputs; diagnostics expose defaults and their consequences.
-Include a backend that can build summaries only from data at rest: no incremental
-mode may enter ranking, and a singleton legal lifecycle must produce a complete
-commitment. Recurring demand must not imply incremental support or permission for
-retained reuse. Verify that an empty legal set is reported explicitly.
-The physical compiler rejects incomplete stateful commitments. Stages 2 and 3
-must preserve this distinction while existing lower-level APIs remain compatible.
+## 2. Extract shared contracts and codecs; remove Collector dependency
 
-## 2. Refactor compilation without changing semantics
+Use two narrow ownership boundaries:
 
-Retain candidate selection and cost/capability evaluation. Introduce only a
-compiler-local structure for selected tasks, definitions, state bindings and
-producer/consumer edges. Construct the catalog from the selected definitions,
-then project all four plans from those bindings.
+| Common code | Owner / destination | Excluded dependencies |
+| --- | --- | --- |
+| Runtime envelope metadata, shared IDs/tags, schema references and required validation | Lightweight neutral contract package, outside ASAPCollector | Collector/backend executors and Planner optimizer |
+| Sketch payload schemas, decode/encode/reconstruction and supported state operations | Existing sketch-library APIs, or a neutral codec package if a concrete dependency requires it | Edge windowing, scheduling, host adapters and backend storage |
 
-Remove the dependency of transmission compilation on PrecomputePlan. Preserve
-shared producer identity across roots and reject incompatible physical bindings.
-Target artifacts may embed catalog/rule subsets but must be derived from the
-same publication. Compare old/new outputs with normalization only for explicitly
-nondeterministic metadata; do not normalize away semantic or identity differences.
+Prefer existing sketch libraries and a small contract package over a new general
+framework. If a new neutral package is required, establish its independent source
+and versioned consumption before removing the old imports. Shared does not mean
+that both runtimes must migrate in the same PR: backend adoption is in scope;
+Collector adoption is deferred. Keep one schema authority and preserve compatible
+wire behavior so a later Collector migration can reuse the same implementation.
 
-Gate: supported profiles retain query results, window/label semantics, producer
-update counts, configured fallback and publication compatibility. New binding
-provenance makes every runtime task traceable to the selected decision.
+Move reusable DDSketch/KLL reconstruction out of Collector wrappers. Backend
+accumulators consume typed decoded state, removing the unnecessary KLL
+reconstruction/serialization/decoding round trip. Preserve supported local paths
+for other families until replacement APIs have parity evidence. Keep legacy
+bare-state readers and required vendored schemas until a compatible authoritative
+replacement exists; do not silently change encoding versions or delta semantics.
 
-### 2a. Split maintenance and query executable subgraphs
+Remove the `asap-precompute-rs` dependency and obsolete Collector-specific Cargo
+patches. Replace tests that import/invoke Collector with neutral-library tests and
+provenance-bearing compatibility fixtures. Adapt dependency-enforcement tests to
+the new boundary. Backend CI must not clone/build Collector indirectly through a
+test helper, script, transitive dependency or shared-package location.
 
-After establishing common bindings, implement the
-[materialization boundary design](asapplanner-integration.md#executable-subgraphs-and-materialization-boundaries).
-Extract maintenance subgraphs terminating at materialization sinks and query
-subgraphs reading those definitions. Preserve semantic provenance without keeping
-query-only nodes as executable content in `PrecomputePlan.executable_dags`.
-Reuse existing catalog/materialization/schema identities rather than introducing
-a second boundary registry.
+Gate: inspect manifests, lockfiles, dependency graphs, source imports, build scripts
+and required tests; no ASAPCollector dependency remains. Full-state, supported
+delta and legacy fixtures retain decoding/rejection and readout behavior. Shared
+libraries do not depend back on the backend runtime. No Collector release is needed.
 
-Switch maintenance execution to the extracted subgraphs and their explicit state
-inputs. Validate every cross-plan boundary during installation: definition,
-schema, grouping, window/phase, and accepted generation must agree. Retain all
-query-side operations and maintenance intermediates needed by their respective
-executors. A semantic node may be absorbed into a physical operation, but the
-mapping must still explain where its work occurs.
+## 3. Bind once and split the executable subplans
 
-Update visualization to show the actual two executable subplans and their state
-references. Legacy artifact inspection must label embedded query nodes as context;
-do not silently render a filtered graph as the original serialized document.
-No separate Semantic Plan section is required for understanding execution.
+Retain candidate evaluation and downstream commitment. Introduce only the
+compiler-local bindings needed for selected tasks, summary definitions, state
+schemas, storage and input/output references. Construct the catalog and derive
+PrecomputePlan and QueryPlan from the same decisions. Preserve semantic node
+provenance and shared producers; do not independently choose their meanings.
+
+Implement the [materialization boundary design](asapplanner-integration.md#executable-subgraphs-and-materialization-boundaries):
+
+- Extract maintenance subgraphs terminating at stored-summary sinks, including
+  explicit reads of prior summaries for supported derived-state pipelines.
+- Extract query subgraphs with explicit materialization reads and read-time
+  operations; query-only SummaryEstimate is absent from precompute executable content.
+- Reuse catalog/materialization/schema identities; do not add a parallel boundary
+  identity registry or enumerate future stored pane instances during compilation.
+- Use execution timing, dependencies and bindings rather than operator names to
+  determine ownership. Preserve absorbed operations in semantic-to-physical mapping.
+
+Switch maintenance execution to these subgraphs instead of discovering its work
+inside a complete query DAG. Full semantic provenance can remain an artifact or
+shared installation metadata, but is not executable content owned by PrecomputePlan.
+Preserve its current representation if replacing it is unnecessary for the split.
+
+Version the split installed representation and normalize supported legacy
+publications at the backend boundary. Legacy CollectorPlan/TransmissionPlan fields
+remain compatibility concerns, not additional projections to implement. Do not
+reinterpret the old executable-DAG field under an unchanged version.
+
+## 4. Validate, install and visualize the two plans
+
+Use shared two-plan/catalog validation at compilation and backend installation,
+followed by actual local resource checks. Validate every boundary's definition,
+schema, grouping/window phase and accepted generation. Keep one coherent local
+publication identity; two independently activated subplans must not become visible.
+
+Stage and activate the backend snapshot atomically for query readers. Failed
+staging preserves the previous active generation. Test restart, queued old-generation
+maintenance output and compatible/incompatible state recovery. State readiness
+remains distinct from installation; pending or insufficient coverage uses the
+configured exact fallback or explicit unavailability. Distributed acknowledgements,
+Collector cutover and new transport resynchronization are outside this stage.
+
+Visualize PrecomputePlan and QueryPlan separately, connected by labeled state
+references. Show shared materializations and supported derived chains. For legacy
+artifact inspection, label embedded read-time nodes as query-owned context rather
+than maintenance execution; a projected view must identify itself as such. No
+separate Semantic Plan page is required to understand the two execution plans.
 
 Acceptance cases:
 
-- A build-summary/read-estimate pipeline places SummaryEstimate only in QueryPlan's
-  executable representation, with an explicit read of the produced summary.
-- One query reading multiple summaries has all boundaries resolved; two queries
-  sharing one summary retain one compatible producer per intended partition.
-- A supported derived-summary chain preserves source state reads and maintenance
-  intermediates, including permitted exact finalization on completed inputs.
-- Incorrect schema, grouping/window phase or generation is rejected at installation.
-- Old/new representations produce equivalent supported query results and preserve
-  maintenance update counts, completion checks, fallback and recovery behavior.
-- Rendered plan views agree with executable ownership and retain provenance links.
+- Build-summary/read-estimate places SummaryEstimate only in QueryPlan execution.
+- One query can read multiple bound summaries; two queries can share one compatible
+  producer per intended partition without multiplying maintenance updates.
+- Supported derived-summary chains preserve explicit state reads, completed-input
+  requirements and maintenance intermediates such as exact finalization.
+- Wrong schema, grouping/window phase or generation fails before activation.
+- Local failed-stage, generation-switch and restart cases preserve state lifetime,
+  completion checks, recovery, query consistency and fallback behavior.
+- Old/new supported artifacts produce equivalent results and update counts.
+- Visualization agrees with executable ownership and retains provenance links.
+- These cases run without an ASAPCollector package, checkout or process.
 
-This changes an installed representation. Stage the work: establish common bindings
-with the old wire format first, then introduce a versioned split representation
-with adapters for supported older publications. Do not reinterpret the old field
-under the same version. Remove the legacy full-DAG path only after producer,
-consumer and recovery fixtures pass and the compatibility window closes. This
-PR proposes the split; it does not claim the runtime migration is implemented.
+## 5. Roll out and retire
 
-## 3. Extract contracts and unify validation
+Release the backend with pinned neutral-library versions and preserved rollback
+artifacts. First migrate supported local publications; retain versioned adapters
+for supported older artifacts. Remove full-DAG-in-precompute execution and obsolete
+Collector adapter code only after their replacements pass the scoped fixtures.
+State reuse across generations requires explicit compatibility independently of
+binary rollback. Keep legacy payload readers for their supported recovery window.
 
-Separate lightweight semantic IR export from Planner search internals. Preserve
-node/operator/schema/guarantee meaning while migrating `OwnedPostAsapDag`; do not
-replace typed semantic validation with arbitrary JSON acceptance.
+Distributed deployments continue on their supported compatibility path or receive
+an explicit unsupported-version result. Do not claim a distributed migration or
+require a Collector upgrade for this backend-local milestone. Repository-wide
+schema consolidation and cross-language release coordination can follow separately.
 
-Extract SDS, installed plan, publication and frame contracts into packages that
-import neither execution runtime nor optimizer. Select a schema authority and
-binding-generation approach before removing manual Go/Rust copies. Keep sketch
-payload schemas in their sketch-library authority.
+## Deferred work
 
-Use shared cross-plan validation at compile and install boundaries, followed by
-local resource checks. Versioned legacy adapters normalize once at the boundary.
-Gate: fixtures run against real consumers, including Collector Go and Rust;
-missing/unknown versions, catalog mismatches and unsupported capabilities fail
-before activation. Package boundaries are checked through dependency inspection.
+- CollectorPlan and TransmissionPlan compilation/refactoring and their runtime consumers.
+- Moving production/sampling policy out of transmission policy across components.
+- Collector adoption of the neutral contracts/codecs and Go/Rust binding consolidation.
+- Distributed activation, new delivery/checkpoint/recovery semantics and multi-hop topology.
+- A general Planner facade, broad semantic IR redesign and unrelated capability expansion.
 
-## 4. Make production, delivery and activation explicit
-
-Split sampling/estimator policy from transmission suppression/cadence/checkpoint
-policy. Allocate and validate them together against the selected query guarantee.
-Preserve the rule that adaptive changes produce an authorized successor rather
-than mutate an immutable generation.
-
-For each enabled state family, specify full-state replacement versus independent
-contribution semantics, delta base/application rules, replay persistence, and
-resynchronization. Retain current encoding until the required endpoint migration
-lands. Never assume merge supports subtraction or replacement.
-
-Specify publication content identity and recoverable rollout coordination. Test
-receiver preparation, exact target acknowledgements, failed stage cleanup, partial
-activation, restart and delayed old-generation frames. Distinguish local atomic
-snapshot installation from distributed convergence and state readiness.
-
-Gate: no duplicate application or cross-generation query mixing; insufficient
-coverage uses fallback/unavailability; unsupported recovery modes remain disabled.
-
-## 5. Move codecs below runtimes
-
-Move reusable Collector wrapper reconstruction to typed sketch-library APIs.
-Switch both Collector and backend to these APIs. Preserve backend-specific
-accumulator/readout adaptation while removing the KLL re-encode/decode detour.
-Migrate DDSketch/KLL first; retain supported local paths for other families until
-their replacements have parity evidence. Remove vendored delta definitions only
-when their authoritative replacement is consumed by both endpoints.
-
-Gate: full/delta/legacy fixtures and query results pass; dependency inspection
-shows no backend production import of Collector runtime. Also remove the obsolete
-Collector-specific dependency patch when no longer needed. Test-only end-to-end
-fixtures may still build the actual Collector separately.
-
-## 6. Roll out and retire
-
-Roll out per supported profile with compatible pinned releases and preserved
-rollback artifacts. Keep legacy readers for the agreed producer upgrade window;
-remove them only after consumer inventory and replay/recovery retention permit it.
-Do not reuse a codec version or descriptor identity for changed semantics.
-
-Before activation, failure leaves the previous plan intact and staged resources
-can be discarded. After partial activation, use the specified recovery protocol
-or an explicit successor; a backend-only rollback is not sufficient. State reuse
-across generations must pass compatibility checks independently of binary rollback.
-
-Delete superseded DTO/schema copies, reconstruction paths, and stale documentation
-after the replacement passes its gate. Independent query/maintenance projections,
-profile adapters, and required legacy readers are not duplication to remove blindly.
-Repository relocation and release automation follow stable package boundaries;
-they are not prerequisites for runtime correctness.
+These remain part of the broader architecture, but are not dependencies or exit
+gates for this migration. Existing supported input behavior is preserved through
+backend adapters and fixtures, not through a live dependency on Collector.
 
 ## Final evidence
 
-Record tested revisions, supported families/profiles, fixture results, dependency
-graph checks, and compile/install/ingest measurements. Trace one query through its
-semantic root, state definition, producer, flow and installed publication. Report
-remaining capability gaps explicitly. Completion requires executable evidence,
-not document publication, an open PR, or prior migration test counts.
+Record tested revisions, the supported backend profile/state families, fixture
+results, and dependency checks including tests/scripts. Trace a query through its
+semantic root, materialization boundary, precompute producer and query reader.
+Record compile/install/ingest measurements where extraction changes the path.
+Completion requires the two-plan acceptance cases and zero ASAPCollector build/
+runtime dependency, not completion of the deferred distributed architecture.

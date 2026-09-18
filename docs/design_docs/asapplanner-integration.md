@@ -15,6 +15,16 @@ owns implementation gates. Existing
 remain the compatibility baseline until corresponding changes land in both
 consumers. Conflicts require a versioned migration, not unilateral reinterpretation.
 
+## Current implementation scope
+
+The [migration delivery plan](asapplanner-migration-plan.md) currently implements
+only the backend PrecomputePlan/QueryPlan split and extraction of their common
+contracts/codecs. It requires no backend build/runtime dependency on ASAPCollector.
+CollectorPlan, TransmissionPlan, Collector adoption and distributed rollout are
+future work, not prerequisites. The four-plan architecture below remains the
+longer-term design; its distributed acceptance requirements do not enlarge this
+iteration's completion gate.
+
 ## Problem and current baseline
 
 Collector and backend must agree on what a summary means, how it is produced,
