@@ -19,6 +19,7 @@
 #     --build-context asap-gorilla-rust=/path/ASAPCollector/asap-gorilla-rust \
 #     -t asap/data-plane:dev .
 FROM rust:1.90-bookworm AS build
+ARG LOCAL_DEP_OVERRIDES=false
 WORKDIR /src
 
 # protoc for the backend's prost-build usages; git for any git-dep fetches.
@@ -41,14 +42,14 @@ COPY --from=asap-gorilla-rust  . ASAPCollector/asap-gorilla-rust
 # Build from the supplied sibling checkouts. CI and local Compose builds do
 # not need credentials for ASAPCollector or Sketchlib while this dependency
 # remains private.
-RUN mkdir -p ASAPQuery-backend/.cargo && \
+RUN if [ "$LOCAL_DEP_OVERRIDES" = true ]; then mkdir -p ASAPQuery-backend/.cargo && \
     printf '%s\n' \
       '[patch."https://github.com/ProjectASAP/ASAPCollector"]' \
       'asap-precompute-rs = { path = "/src/ASAPCollector/asap-precompute-rs" }' \
       '' \
       '[patch."https://github.com/ProjectASAP/asap_sketchlib"]' \
       'asap_sketchlib = { path = "/src/asap_sketchlib" }' \
-      > ASAPQuery-backend/.cargo/config.toml
+      >> ASAPQuery-backend/.cargo/config.toml; fi
 
 WORKDIR /src/ASAPQuery-backend
 RUN cargo build --release --bin data_plane

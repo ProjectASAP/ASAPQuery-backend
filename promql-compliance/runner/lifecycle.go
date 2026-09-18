@@ -49,7 +49,7 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	if err := l.runCompose(ctx, environment, "wait", "planner"); err != nil {
 		return fmt.Errorf("derive workload cost evidence: %w", err)
 	}
-	if err := l.runCompose(ctx, environment, "up", "-d", "data-plane"); err != nil {
+	if err := l.runCompose(ctx, environment, "up", "-d", "--build", "data-plane"); err != nil {
 		return err
 	}
 	return nil

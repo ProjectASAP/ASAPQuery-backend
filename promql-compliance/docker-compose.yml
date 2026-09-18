@@ -9,6 +9,7 @@ services:
     build:
       context: ..
       dockerfile: control_plane/Dockerfile
+      args: {LOCAL_DEP_OVERRIDES: "true"}
       additional_contexts:
         asap-precompute-rs: ${ASAP_PRECOMPUTE_RS_CONTEXT}
         asap-sketchlib: ${ASAP_SKETCHLIB_CONTEXT}
@@ -22,6 +23,7 @@ services:
     build:
       context: ..
       dockerfile: data_plane/Dockerfile
+      args: {LOCAL_DEP_OVERRIDES: "true"}
       additional_contexts:
         asap-precompute-rs: ${ASAP_PRECOMPUTE_RS_CONTEXT}
         asap-sketchlib: ${ASAP_SKETCHLIB_CONTEXT}

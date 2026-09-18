@@ -15,6 +15,7 @@
 #     --build-context asap-gorilla-rust=/path/ASAPCollector/asap-gorilla-rust \
 #     -t asap/control-plane:dev .
 FROM rust:1.90-bookworm AS build
+ARG LOCAL_DEP_OVERRIDES=false
 WORKDIR /src
 
 # protoc for control_plane/build.rs (prost-build/tonic-build compile
@@ -36,14 +37,14 @@ COPY --from=asap-gorilla-rust  . ASAPCollector/asap-gorilla-rust
 
 # See data_plane/Dockerfile: resolve private sibling dependencies from the
 # build contexts instead of requiring Docker to authenticate to GitHub.
-RUN mkdir -p ASAPQuery-backend/.cargo && \
+RUN if [ "$LOCAL_DEP_OVERRIDES" = true ]; then mkdir -p ASAPQuery-backend/.cargo && \
     printf '%s\n' \
       '[patch."https://github.com/ProjectASAP/ASAPCollector"]' \
       'asap-precompute-rs = { path = "/src/ASAPCollector/asap-precompute-rs" }' \
       '' \
       '[patch."https://github.com/ProjectASAP/asap_sketchlib"]' \
       'asap_sketchlib = { path = "/src/asap_sketchlib" }' \
-      > ASAPQuery-backend/.cargo/config.toml
+      >> ASAPQuery-backend/.cargo/config.toml; fi
 
 WORKDIR /src/ASAPQuery-backend
 RUN cargo build --release --bin control_plane --bin control_plane_quote_snapshot
