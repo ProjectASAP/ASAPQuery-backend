@@ -4,15 +4,15 @@ These documents are for architects and developers. The integration proposal and
 SDS model below define the target Planner-to-runtime boundary; their current-code
 notes and migration gates distinguish implemented behavior from proposed changes.
 
-- [Planner, physical plans, SDS, and runtime architecture](asapplanner-integration.md)
-  owns semantic/physical compilation, common bindings, the four plan projections,
-  policy ownership, codec boundaries, and publication/activation requirements.
+- [Planner output to backend physical plans](asapplanner-integration.md) defines
+  how one selected semantic DAG becomes executable PrecomputePlan and QueryPlan
+  subgraphs joined at materialization boundaries.
 - [Summary Catalog and SDS](summary-catalog-sds-architecture.md) owns descriptors,
-  definition/instance identity, state references, inventory and lifecycle semantics.
+  definition/materialization/instance identity, state references, readiness and
+  lifecycle semantics.
 - [Architecture migration delivery plan](asapplanner-migration-plan.md) defines
-  the current PrecomputePlan/QueryPlan scope, common-library extraction, removal
-  of ASAPCollector dependencies, and backend acceptance/retirement gates. Collector
-  and transmission plan changes are deferred.
+  common-library extraction, removal of ASAPCollector dependencies, the two-plan
+  rollout, and backend acceptance/retirement gates.
 - [Accepted-input completeness](continuous-summary-completeness.md) describes
   the backend's bounded admission, publication and recovery behavior.
 
