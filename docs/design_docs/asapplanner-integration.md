@@ -49,6 +49,49 @@ The physical compiler consumes:
 - backend capabilities and concrete implementation evidence;
 - catalog, schema and deployment-generation inputs.
 
+For example, suppose query `p99-api-latency` asks for the 99th percentile of
+`request_latency_seconds` over five minutes, grouped by `service`, every minute.
+The following conceptual input shows what each category contributes; it is not a
+serialized API schema:
+
+```yaml
+selected_planner_dag:
+  query_id: p99-api-latency
+  root: estimate-p99
+  nodes:
+    - input: request_latency_seconds
+    - group_by: [service]
+    - build_summary: {algorithm: kll, k: 200}
+    - estimate: {quantile: 0.99}
+
+query_requirements:
+  relative_error: 0.01
+  response_latency_ms: 200
+
+lifecycle_commitment:
+  mode: batch_rebuild_from_data_at_rest
+  rebuild_every: 1m
+  retain_for: 10m
+
+backend_capabilities_and_evidence:
+  supported_modes: [batch_rebuild_from_data_at_rest]
+  supported_algorithms: [kll]
+  kll_200_state_bytes: 4096
+  five_minute_rebuild_cpu_ms: 35
+
+installation_context:
+  catalog_version: 12
+  state_schema: kll-v1
+  plan_generation: 42
+```
+
+The selected DAG states *what* may answer the query. Requirements state the
+promises the selected implementation must meet. The lifecycle commitment states
+how this backend will keep the summary available. Capabilities and evidence prove
+that the concrete KLL implementation is eligible and provide its physical cost.
+The installation context supplies the identities and schema needed to bind the
+resulting PrecomputePlan and QueryPlan into one generation.
+
 Capabilities restrict the choices the Planner may consider. For example, a
 backend that can only build summaries from data at rest advertises only that
 lifecycle. The Planner still models other lifecycle modes, but it must not select
