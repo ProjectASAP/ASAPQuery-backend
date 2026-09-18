@@ -3,56 +3,61 @@
 Status: proposed backend architecture. Audience: developers changing the
 Planner-to-backend compilation and execution boundary.
 
-## Scope
+## Purpose and scope
 
-This document defines how one selected ASAPPlanner semantic DAG becomes two
-backend-executable plans:
+This design splits one selected ASAPPlanner semantic DAG into two executable
+backend plans:
 
 - **PrecomputePlan** produces and maintains stored summary state.
 - **QueryPlan** reads stored state and computes query results.
 
-The two plans share catalog identities and state contracts defined by the
-[Summary Catalog and SDS design](summary-catalog-sds-architecture.md). The
-[migration plan](asapplanner-migration-plan.md) describes how to reach this
-architecture from the current implementation.
+Both plans use identities and state contracts from the
+[SDS design](summary-catalog-sds-architecture.md) and install as one generation.
+The [migration plan](asapplanner-migration-plan.md) defines delivery steps.
+CollectorPlan, TransmissionPlan and distributed activation are deferred; this
+migration must not introduce a backend dependency on ASAPCollector.
 
-CollectorPlan and TransmissionPlan are outside the current implementation scope.
-They may become additional projections of the same selected decision later, but
-the backend migration must neither redesign them nor depend on ASAPCollector.
+## Document map
 
-## Problem
+1. [Architecture at a glance](#architecture-at-a-glance)
+2. [Worked example](#worked-example)
+3. [Core concepts and ownership](#core-concepts-and-ownership)
+4. [Compiler contract](#compiler-contract)
+5. [Compilation rules](#compilation-rules)
+6. [Runtime contract](#runtime-contract)
+7. [Validation and acceptance](#validation-and-acceptance)
+8. [Decisions and deferred work](#decisions-and-deferred-work)
 
-The current `PrecomputePlan.executable_dags` can contain the complete selected
-semantic DAG. For a query such as:
+## Architecture at a glance
 
-```text
-Input -> Sum -> KLL -> SummaryEstimate -> QueryResult
+The current `PrecomputePlan.executable_dags` can contain a complete semantic DAG,
+including query-time nodes such as `SummaryEstimate`. Bindings may prevent those
+nodes from running during maintenance, but the artifact and its visualization do
+not express that ownership clearly.
+
+The compiler instead binds stored summaries once and cuts the DAG at each
+materialization boundary:
+
+```mermaid
+flowchart LR
+  D[Selected Planner DAG] --> C[Physical compiler]
+  C --> P[PrecomputePlan]
+  C --> S[Summary Catalog / SDS]
+  C --> Q[QueryPlan]
+  P -->|write state| S
+  S -->|bound state reference| Q
 ```
 
-`Input -> Sum -> KLL` is maintenance work. `SummaryEstimate -> QueryResult` is
-query-time work. Storing the complete DAG under PrecomputePlan makes ownership
-unclear even when bindings prevent query-time nodes from running during
-maintenance. It also makes a PrecomputePlan visualization look as though
-`SummaryEstimate` executes while state is being built.
+Semantic provenance remains available, but query-only operators are not
+PrecomputePlan executable content.
 
-The target design records one materialization boundary and derives two explicit
-executable subgraphs. Semantic provenance remains available without placing
-query-only operators in PrecomputePlan.
+## Worked example
 
-## Inputs and outputs
+Query `p99-api-latency` asks for the 99th percentile of five minutes of latency,
+grouped by `service` and evaluated every minute. The YAML below is conceptual; it
+is not the current serialized API schema.
 
-The physical compiler consumes:
-
-- selected Planner DAG roots and their query associations;
-- query requirements, including accuracy and response constraints;
-- complete lifecycle commitments for the supported backend mode;
-- backend capabilities and concrete implementation evidence;
-- catalog, schema and deployment-generation inputs.
-
-For example, suppose query `p99-api-latency` asks for the 99th percentile of
-`request_latency_seconds` over five minutes, grouped by `service`, every minute.
-The following conceptual input shows what each category contributes; it is not a
-serialized API schema:
+### Compiler input
 
 ```yaml
 selected_planner_dag:
@@ -91,31 +96,7 @@ installation_context:
   plan_generation: 42
 ```
 
-The selected DAG states *what* may answer the query. Requirements state the
-promises the selected implementation must meet. The lifecycle commitment states
-how this backend will keep the summary available. Capabilities and evidence prove
-that the concrete KLL implementation is eligible and provide its physical cost.
-The installation context supplies the identities and schema needed to bind the
-resulting PrecomputePlan and QueryPlan into one generation.
-
-Capabilities restrict the choices the Planner may consider. For example, a
-backend that can only build summaries from data at rest advertises only that
-lifecycle. The Planner still models other lifecycle modes, but it must not select
-one the backend cannot execute.
-
-The compiler produces one coherent backend publication:
-
-| Output | Responsibility |
-| --- | --- |
-| Summary Catalog/SDS entries | Define summary semantics, materialization identity, state schema and state references |
-| PrecomputePlan | Execute maintenance subgraphs that terminate in stored-state writes |
-| QueryPlan | Execute materialization reads, query-time summary operators and exact residuals |
-| Provenance mapping | Relate physical nodes and state references to the selected semantic DAG |
-
-These outputs are derived from the same compiler bindings. They must not make
-independent choices about summary semantics, grouping, windows or schemas.
-
-For the `p99-api-latency` input above, a conceptual compiler output is:
+### Compiler output
 
 ```yaml
 summary_catalog:
@@ -137,9 +118,8 @@ precompute_plan:
     - {id: read-samples, op: ReadInput, metric: request_latency_seconds}
     - {id: group-service, op: GroupBy, labels: [service]}
     - {id: build-kll, op: BuildKll, k: 200}
-    - id: write-kll
-      op: WriteState
-      materialization: mat-api-latency-kll-g42
+    - {id: write-kll, op: WriteState,
+       materialization: mat-api-latency-kll-g42}
   edges:
     - [read-samples, group-service]
     - [group-service, build-kll]
@@ -155,10 +135,8 @@ query_plan:
     WHERE timestamp > now() - INTERVAL 5 MINUTE
     GROUP BY service
   nodes:
-    - id: read-kll
-      op: ReadState
-      materialization: mat-api-latency-kll-g42
-      schema: kll-v1
+    - {id: read-kll, op: ReadState,
+       materialization: mat-api-latency-kll-g42, schema: kll-v1}
     - {id: estimate-p99, op: SummaryEstimate, quantile: 0.99}
     - {id: result, op: QueryResult}
   edges:
@@ -171,144 +149,120 @@ provenance:
 ```
 
 `mat-api-latency-kll-g42` is the join point: PrecomputePlan writes it,
-QueryPlan reads it, and the catalog supplies its definition and schema. The
-provenance mapping explains how both physical projections came from the selected
-Planner DAG without making that DAG executable inside PrecomputePlan.
+QueryPlan reads it, and SDS defines its meaning and schema. Provenance relates
+both physical projections to the selected DAG without making that DAG executable
+inside PrecomputePlan.
 
-## Ownership
+## Core concepts and ownership
 
-| Layer | Owns | Does not own |
-| --- | --- | --- |
-| ASAPPlanner | Semantic candidates, legality, accuracy reasoning and selection among advertised capabilities | Backend state IDs, storage schema or runtime installation |
-| Physical compiler | Concrete implementation commitment, subgraph split, catalog bindings and plan generation | Re-optimizing a selected DAG at query time |
-| Precompute runtime | Executing installed maintenance nodes and publishing state | Query result operators or selecting a different materialization |
-| Query runtime | Reading bound state and executing installed query nodes | Creating missing summaries or searching the catalog for alternatives |
-| SDS/catalog | Identity, schema, state references, readiness and lifecycle metadata | Operator scheduling or candidate ranking |
+“Maintenance” is the execution phase that constructs or updates state, including
+batch construction, rebuilding, merging and derived summaries. “Precompute” names
+the plan and engine responsible for that work; it does not imply incremental
+maintenance.
 
-## Executable subgraphs and materialization boundaries
-
-The compiler first binds every selected summary-producing node to one
-materialization definition. It then cuts the selected DAG at stored-state
-boundaries.
-
-```mermaid
-flowchart LR
-  subgraph P[PrecomputePlan]
-    I[Input] --> S[Sum]
-    S --> K[Build KLL]
-    K --> W[Write state]
-  end
-  W -->|materialization ID + schema| R
-  subgraph Q[QueryPlan]
-    R[Read state] --> E[SummaryEstimate]
-    E --> O[Query result]
-  end
-```
-
-PrecomputePlan contains:
-
-- source reads accepted by the maintenance runtime;
-- exact or summary operators needed to produce stored state;
-- reads of completed prior state for supported derived summaries;
-- explicit stored-state sinks.
-
-QueryPlan contains:
-
-- explicit reads of materialized state;
-- `SummaryEstimate`, merge and other query-time summary operations;
-- exact residual subtrees and result composition;
-- the configured fallback or unavailable-result behavior.
-
-A semantic node may be represented inside a larger physical operation. The
-provenance mapping records that relationship without requiring a one-to-one
-physical node.
-
-## Binding meanings
-
-Bindings explain how semantic nodes map to the two physical plans. They do not
-create a third execution phase.
+Bindings describe the semantic-to-physical mapping:
 
 | Binding | Meaning | Example |
 | --- | --- | --- |
-| `Materialization` | The node's output is written as stored summary state by PrecomputePlan | `KLL` in `KLL(sum(data))` |
-| `MaintenanceInput` | The node executes in PrecomputePlan as an input or intermediate, but its output is not independently stored | `sum(data)` feeding the KLL builder |
-| `Query` | The node maps to an explicit QueryPlan operation | `SummaryEstimate` reading the KLL state |
-| `QueryInput` | The node contributes query semantics but is absorbed into another QueryPlan operation | A scalar parameter or predicate compiled into a bound read/operator |
+| `Materialization` | PrecomputePlan stores this node's output | `KLL` in `KLL(sum(data))` |
+| `MaintenanceInput` | PrecomputePlan executes this input/intermediate without storing it independently | `sum(data)` feeding KLL |
+| `Query` | The node maps to an explicit QueryPlan operation | `SummaryEstimate` |
+| `QueryInput` | Query semantics are absorbed into another physical operation | A quantile parameter compiled into `SummaryEstimate` |
 
-“Maintenance” names an execution phase that constructs or updates state. It can
-include initial batch construction, rebuilding, merging and derived-summary
-construction; it does not imply incremental processing only. “Precompute” names
-the backend plan and engine responsible for that work.
+| Layer | Owns |
+| --- | --- |
+| ASAPPlanner | Semantic candidates, legality, accuracy reasoning and selection among advertised capabilities |
+| Physical compiler | Concrete implementation, subgraph split, catalog bindings and plan generation |
+| Precompute runtime | Installed maintenance nodes and state publication |
+| Query runtime | Bound state reads, query operators, exact residuals and fallback |
+| SDS/catalog | Definition, materialization, schema, state reference, readiness and lifecycle metadata |
 
-## Shared and derived materializations
+## Compiler contract
 
-Two queries may share a producer only when their bound definition and required
-state partition are compatible. Sharing one producer must not multiply updates.
-Each QueryPlan retains its own readout and result operators.
+The compiler consumes:
 
-A derived materialization is still maintenance work:
+- selected Planner DAG roots and query associations;
+- query accuracy and response requirements;
+- complete lifecycle commitments for the supported backend mode;
+- backend capabilities and concrete implementation evidence;
+- catalog, schema and deployment-generation inputs.
+
+Capabilities constrain Planner choices. A data-at-rest-only backend advertises
+only batch construction; recurring query demand does not imply incremental
+support.
+
+| Output | Responsibility |
+| --- | --- |
+| Catalog/SDS entries | Summary semantics, materialization identity, schema and state references |
+| PrecomputePlan | Maintenance subgraphs ending in state writes |
+| QueryPlan | Bound state reads, query operators and exact residuals |
+| Provenance | Physical-to-semantic node mapping |
+
+The compiler derives all four outputs from the same bindings. They cannot choose
+summary semantics, grouping, time ranges or schemas independently.
+
+## Compilation rules
+
+### Executable subgraphs and materialization boundaries
+
+For every selected stored summary, the compiler:
+
+1. Creates or reuses one compatible summary definition and materialization.
+2. Places source reads, maintenance operators, derived-state reads and the state
+   sink in PrecomputePlan.
+3. Replaces the stored-summary edge in QueryPlan with an explicit state read.
+4. Places `SummaryEstimate`, merges, exact residuals and result composition in
+   QueryPlan.
+5. Records provenance for semantic nodes absorbed into larger physical nodes.
+
+Two queries may share a producer only when their definition and state partition
+are compatible. Sharing does not multiply maintenance updates; each query keeps
+its own readout operators.
+
+A derived materialization reads completed state explicitly:
 
 ```text
-PrecomputePlan: Read completed state A -> derive state B -> store B
+PrecomputePlan: Read state A -> derive state B -> store B
 QueryPlan:      Read state B -> estimate -> result
 ```
 
-The dependency on A is an explicit state reference with completeness and schema
-requirements. QueryPlan does not execute the derivation on demand unless the
-selected physical plan explicitly models it as query work.
+## Runtime contract
 
-## Validation and installation
+The backend stages the catalog and both plans as one generation and exposes them
+atomically. Failed staging leaves the previous generation active.
 
-Compilation and backend installation apply the same cross-plan checks:
+Installation and readiness are distinct. Until required state coverage exists,
+QueryPlan uses its configured exact fallback or returns explicit unavailability.
+The query runtime follows installed state references; it does not search the
+catalog for alternative summaries.
 
-- every state read resolves to one definition and permitted materialization;
-- writer and reader agree on family, parameters, encoding and schema version;
-- grouping, time partition, alignment and generation are compatible;
-- every executable node is reachable from the correct plan root;
-- each subgraph is acyclic and contains only operators supported in that phase;
-- query fallback behavior is explicit;
-- derived-state inputs satisfy their completeness requirement.
+Visualization renders PrecomputePlan and QueryPlan separately, connected by
+labeled materialization references. Legacy full-DAG artifacts may use a projected
+view, but it must label maintenance-owned and query-owned nodes.
 
-The backend stages the catalog, PrecomputePlan and QueryPlan as one generation.
-They become visible atomically. Installation success does not mean state is ready:
-until required coverage exists, QueryPlan follows its exact fallback or returns
-explicit unavailability. Failed staging leaves the previous generation active.
+## Validation and acceptance
 
-## Visualization
+Compilation and installation reject unresolved state references, schema/encoding
+mismatches, incompatible grouping or time partitions, wrong generations, cycles,
+unsupported phase operators and unsatisfied derived-state completeness.
 
-The plan viewer renders PrecomputePlan and QueryPlan separately and connects them
-with labeled state references. It shows materialization ID, state family/schema
-and readiness where useful. Query-only nodes never appear inside the executable
-PrecomputePlan view.
+Acceptance tests demonstrate:
 
-Legacy artifacts that embed complete semantic DAGs may be shown through a
-projected view, but the UI must label that projection and identify which nodes
-are maintenance-owned and query-owned. A separate semantic-plan page is not
-required to understand the two executable plans.
-
-## End-to-end acceptance cases
-
-The design is complete when tests demonstrate:
-
-1. `Input -> Sum -> KLL` executes only in PrecomputePlan, while
-   `SummaryEstimate -> QueryResult` executes only in QueryPlan.
-2. One query can read multiple bound summaries.
-3. Two queries can share one compatible producer without duplicate updates.
-4. A supported derived summary reads completed state and publishes a distinct
-   state reference.
-5. Wrong schema, grouping, time partition or generation fails before activation.
-6. Staging failure, restart and generation switching preserve the previous
-   consistent plan and documented fallback behavior.
-7. The backend builds and runs these cases without ASAPCollector.
+1. Summary construction executes only in PrecomputePlan and estimation only in
+   QueryPlan.
+2. One query can read multiple summaries and two queries can share one producer.
+3. Derived summaries honor completion and schema requirements.
+4. Invalid cross-plan bindings fail before activation.
+5. Staging failure, restart and generation switching preserve consistency and
+   documented fallback behavior.
+6. The backend builds and runs these cases without ASAPCollector.
 
 ## Decisions and deferred work
 
-We reject keeping the full semantic DAG as PrecomputePlan executable content:
-bindings alone do not make plan ownership clear. We also reject compiling the
-two plans independently because that permits identity and schema drift.
-
-The selected semantic DAG may remain as provenance or diagnostic metadata. It is
-not a third executable plan.
+The full semantic DAG is retained only as provenance or diagnostic metadata;
+bindings alone do not make it valid PrecomputePlan executable content. The two
+physical plans are not compiled independently because that permits identity and
+schema drift.
 
 Deferred work includes CollectorPlan and TransmissionPlan compilation, distributed
 activation, new transport/checkpoint protocols, Collector adoption of neutral
