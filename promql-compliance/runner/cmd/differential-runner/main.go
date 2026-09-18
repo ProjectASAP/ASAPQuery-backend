@@ -58,20 +58,21 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	snapshotPath := filepath.Join(runDirectory, "planning-snapshot.json")
-	if err := os.WriteFile(snapshotPath, snapshot, 0o600); err != nil {
+	snapshotTemplatePath := filepath.Join(runDirectory, "planning-snapshot-template.json")
+	if err := os.WriteFile(snapshotTemplatePath, snapshot, 0o600); err != nil {
 		fatal(err)
 	}
-	log.Printf("wrote suite-derived planning snapshot to %s", snapshotPath)
-	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory, PlanningSnapshot: snapshotPath}
+	snapshotPath := filepath.Join(runDirectory, "planning-snapshot.json")
+	log.Printf("wrote suite-derived planning snapshot template to %s", snapshotTemplatePath)
+	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory, PlanningSnapshot: snapshotPath, PlanningSnapshotTemplate: snapshotTemplatePath}
 	if len(composeFiles) > 0 {
 		log.Printf("building and starting Compose services; the first run may take several minutes")
 	}
-	if err := lifecycle.Start(ctx); err != nil {
-		fatal(err)
-	}
 	if len(composeFiles) > 0 && !*keepServices {
 		defer lifecycle.Stop()
+	}
+	if err := lifecycle.Start(ctx); err != nil {
+		fatal(err)
 	}
 	log.Printf("waiting for Prometheus at %s", *reference)
 	if err := runner.WaitForHTTP(ctx, *reference+"/api/v1/status/runtimeinfo"); err != nil {
