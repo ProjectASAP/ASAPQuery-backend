@@ -29,6 +29,9 @@ func main() {
 	}
 	out := card{Passed: true}
 	for _, file := range files {
+		if filepath.Base(file) == "summary.json" {
+			continue
+		}
 		var r runner.Report
 		raw, e := os.ReadFile(file)
 		if e != nil {
@@ -39,12 +42,11 @@ func main() {
 		}
 		c := caseCard{Dataset: r.Dataset, Suite: r.Suite, Passed: r.Passed, Queries: len(r.Queries)}
 		for _, q := range r.Queries {
+			if q.RangeResponses != nil {
+				count(&c, q.RangeResponses.Backend.ServedBy)
+			}
 			for _, i := range q.Instant {
-				if i.Responses.Backend.ServedBy != "" {
-					c.ASAPQuery++
-				} else {
-					c.PrometheusFallback++
-				}
+				count(&c, i.Responses.Backend.ServedBy)
 			}
 		}
 		out.Cases = append(out.Cases, c)
@@ -58,4 +60,12 @@ func main() {
 	for _, c := range out.Cases {
 		fmt.Fprintf(f, "| %s | %s | %t | %d | %d | %d |\n", c.Dataset, c.Suite, c.Passed, c.Queries, c.ASAPQuery, c.PrometheusFallback)
 	}
+}
+
+func count(c *caseCard, servedBy string) {
+	if servedBy == "prometheus_fallback" || servedBy == "" {
+		c.PrometheusFallback++
+		return
+	}
+	c.ASAPQuery++
 }

@@ -21,7 +21,7 @@ run:
 	go run ./cmd/differential-runner --dataset $(DATASET) --suite $(SUITE) --reference-url $(REFERENCE_URL) --test-url $(BACKEND_URL) --compose-file $(COMPOSE_FILE) --logs-dir $(LOGS_DIR)
 
 run-all:
-	@set -eu; mkdir -p "$(REPORT_DIR)"; result=0; \
+	@set -eu; mkdir -p "$(REPORT_DIR)"; rm -f "$(REPORT_DIR)"/*.json "$(REPORT_DIR)"/summary.md; result=0; \
 	for test_case in $(CASES); do \
 		name="$${test_case%%:*}"; rest="$${test_case#*:}"; dataset="$${rest%%:*}"; suite="$${rest#*:}"; \
 		echo "Running $$name"; \
