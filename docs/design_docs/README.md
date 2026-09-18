@@ -10,7 +10,9 @@ notes and migration gates distinguish implemented behavior from proposed changes
 - [Summary Catalog and SDS](summary-catalog-sds-architecture.md) owns descriptors,
   definition/instance identity, state references, inventory and lifecycle semantics.
 - [Architecture migration delivery plan](asapplanner-migration-plan.md) defines
-  compatibility fixtures, implementation stages, rollout and retirement gates.
+  the current PrecomputePlan/QueryPlan scope, common-library extraction, removal
+  of ASAPCollector dependencies, and backend acceptance/retirement gates. Collector
+  and transmission plan changes are deferred.
 - [Accepted-input completeness](continuous-summary-completeness.md) describes
   the backend's bounded admission, publication and recovery behavior.
 
