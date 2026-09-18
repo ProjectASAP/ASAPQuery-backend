@@ -12,37 +12,51 @@ import (
 )
 
 type ComposeLifecycle struct {
-	Files            []string
-	Project          string
-	LogsDirectory    string
-	PlanningSnapshot string
-	started          bool
+	Files                    []string
+	Project                  string
+	LogsDirectory            string
+	PlanningSnapshot         string
+	PlanningSnapshotTemplate string
+	started                  bool
 }
 
 func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	if len(l.Files) == 0 {
 		return nil
 	}
-	args := l.args()
-	args = append(args, "up", "-d", "--build")
-	command := exec.CommandContext(ctx, "docker", args...)
 	sibling, err := siblingCheckoutRoot()
 	if err != nil {
 		return err
 	}
-	command.Env = append(os.Environ(),
+	environment := append(os.Environ(),
 		"ASAP_PRECOMPUTE_RS_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-precompute-rs"),
 		"ASAP_SKETCHLIB_CONTEXT="+filepath.Join(sibling, "asap_sketchlib"),
 		"ASAP_GORILLA_RUST_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-gorilla-rust"),
 		"ASAP_PLANNING_SNAPSHOT="+l.PlanningSnapshot,
+		"ASAP_PLANNING_SNAPSHOT_TEMPLATE="+l.PlanningSnapshotTemplate,
 	)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	err = command.Run()
-	if err != nil {
-		return fmt.Errorf("start Compose: %w", err)
+	if err := l.runCompose(ctx, environment, "up", "-d", "--build", "prometheus", "planner"); err != nil {
+		return err
 	}
 	l.started = true
+	if err := l.runCompose(ctx, environment, "wait", "planner"); err != nil {
+		return fmt.Errorf("derive workload cost evidence: %w", err)
+	}
+	if err := l.runCompose(ctx, environment, "up", "-d", "data-plane"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (l *ComposeLifecycle) runCompose(ctx context.Context, environment []string, commandArgs ...string) error {
+	args := append(l.args(), commandArgs...)
+	command := exec.CommandContext(ctx, "docker", args...)
+	command.Env = environment
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("start Compose: %w", err)
+	}
 	return nil
 }
 
