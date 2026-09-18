@@ -640,10 +640,8 @@ fn select_candidates(
     frontend: super::compiler::QueryFrontend,
 ) -> Result<CompiledPhysicalPlan, CompileError> {
     evidence.validate(&env)?;
-    if candidates.is_empty() || candidates.len() > 64 {
-        return Err(invalid(
-            "candidate inventory must contain 1..=64 alternatives",
-        ));
+    if candidates.is_empty() {
+        return Err(invalid("candidate inventory must not be empty"));
     }
     let candidate_key_sets: BTreeSet<_> = candidates
         .iter()
@@ -1172,6 +1170,21 @@ mod tests {
                 .compile_promql(candidate.clone(), environment.clone())
                 .unwrap();
             assert!(identities.insert(plan.envelope.plan_id));
+            // Each enabled leaf has a bound readout; disabled leaves must leave
+            // no local raw scan after exact-subtree externalization.
+            for entry in plan.query_plan.entries.values() {
+                assert_eq!(entry.materialization_bindings().len(), enabled);
+                assert!(
+                    !entry.nodes.values().any(|node| matches!(
+                        node,
+                        crate::query_plan::QueryPlanNode::Logical {
+                            operator:
+                                asap_types::query_plan::logical::ResidualQueryOperator::Scan { .. },
+                            ..
+                        }
+                    ))
+                );
+            }
             let cost = manifest(&plan, &candidate.queries).unwrap();
             assert_eq!(
                 cost.components
@@ -1386,6 +1399,25 @@ mod tests {
                 crate::query_parser::parse_query_expr_canonical(query, accuracy.clone()).unwrap();
             assert!(exact_source_metrics(&parsed).is_err(), "{query}");
         }
+    }
+
+    // A cheaper quoted alternative after index 64 must still participate.
+    #[test]
+    fn selection_considers_candidates_beyond_64() {
+        let (candidates, env, mut evidence) = quoted();
+        for cost in evidence.quotes[0].unit_costs.values_mut() {
+            *cost = 1e9;
+        }
+        let mut inventory = vec![candidates[0].clone(); 64];
+        inventory.push(candidates[1].clone());
+        let plan = select_lowest_cost_candidate(inventory, env, &evidence).unwrap();
+        assert_eq!(plan.envelope.plan_id, evidence.quotes[1].manifest.plan_id);
+        let report = plan.cost_comparison.unwrap();
+        assert_eq!(report.candidate_evaluations.len(), 65);
+        assert_eq!(
+            report.candidate_evaluations[64].status,
+            CandidateEvaluationStatus::Selected
+        );
     }
 
     #[test]
