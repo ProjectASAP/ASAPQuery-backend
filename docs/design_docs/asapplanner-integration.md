@@ -396,6 +396,119 @@ subset and transmission rules. These are mechanically derived copies from one
 publication, validated against its identity/digest. They are not independently
 editable authorities. Runtimes need no catalog network lookup on each update.
 
+### Executable subgraphs and materialization boundaries
+
+**Decision:** PrecomputePlan and QueryPlan each own the operations they execute.
+The physical compiler explicitly splits the selected DAG at materialization
+boundaries and records the state references connecting the subplans. There can
+be multiple boundaries: one query can consume several summaries and several
+queries can share the same summary.
+
+Today, `PrecomputePlan.executable_dags` stores complete `InstalledPostAsapDag`
+documents, including read-time nodes such as `SummaryEstimate`. Bindings mark
+execution ownership, and the maintenance runtime evaluates dependencies of
+`precompute_sinks` rather than every stored node. This explains current behavior
+but is a mismatch between the PrecomputePlan abstraction and its contents.
+The target removes query-only operations from its executable representation.
+
+```mermaid
+flowchart LR
+    subgraph PP[PrecomputePlan]
+        I[Input] --> B[Build or update summary]
+        B --> W[Materialize summary S]
+    end
+    W -. State reference S .-> R
+    subgraph QP[QueryPlan]
+        R[Read summary S] --> E[SummaryEstimate]
+        E --> O[Query result]
+    end
+```
+
+The dashed connection is a state dependency, not a claim that every query triggers
+a synchronous precompute execution. State must satisfy the installed schema,
+coverage and readiness requirements when read.
+
+A boundary reuses the existing catalog identities and materialization bindings:
+
+| Information | Purpose |
+| --- | --- |
+| Summary definition reference | Producer and reader identify the same logical summary |
+| State schema and representation | Reader interprets the produced state correctly |
+| Window, phase and grouping contract | Read covers the intended population and interval without double counting |
+| Publication/catalog generation | Prevent incompatible installed plans and state from being combined |
+| Semantic node provenance | Relate physical production/read operations to the selected Planner computation |
+
+These are required relationships, not a new duplicate identity registry. Reuse
+`MaterializationBinding`, state-schema contracts and catalog references where they
+already express the relationship. Concrete stored instances are resolved at
+runtime from the definition, extent, group and accepted generation; compilation
+does not allocate every future pane instance.
+
+The compiler extracts subgraphs using execution timing, dependencies and explicit
+materialization bindings. It must not split by operator name alone. Precompute
+subgraphs terminate at materialization sinks and can read prior materializations
+to derive new summaries. Query subgraphs start at state reads or explicit exact
+inputs and perform read-time operations. In the current semantic contract,
+`SummaryEstimate` is read-time and belongs in QueryPlan; maintenance-time exact
+finalization is a distinct permitted operation when its input contract is met.
+Unsupported phase crossings fail compilation rather than silently moving work.
+
+The complete semantic DAG can remain as publication-level provenance or a compiler
+artifact, with semantic-to-physical mappings. It is not executable content owned
+by PrecomputePlan and need not be a third visualization section. Runtime plans
+must contain their required execution information without traversing query-only
+provenance to discover maintenance work.
+
+### Meaning of maintenance and current binding labels
+
+Precompute names the backend plan/engine that produces and maintains summary
+state. Maintenance names the execution phase that builds, updates or derives that
+state rather than answering a query. It includes initial batch construction and
+full rebuilds; it does not imply incremental or continuous ingestion.
+
+The current binding enum classifies semantic nodes as follows. These names remain
+unchanged by this documentation proposal:
+
+| Binding | Meaning |
+| --- | --- |
+| `Materialization` | Maintenance-time node explicitly bound to a stored summary definition |
+| `MaintenanceInput` | Maintenance-time source or intermediate operation without its own stored-summary binding |
+| `Query` | Read-time node explicitly mapped to a QueryPlan node |
+| `QueryInput` | Read-time node without a separate explicit QueryPlan mapping, such as an operation absorbed by a larger query operation |
+
+`MaintenanceInput` is not a data format or necessarily a leaf. For example, in a
+supported derived-summary pipeline, stored exact Sum/Count state can be finalized
+into average-valued rows and then aggregated into a stored KLL. The finalization
+is a maintenance intermediate without its own stored-summary binding; the stored
+states have materialization bindings. An inner aggregate is not automatically a
+`MaintenanceInput`: if its state is separately materialized, it is a
+`Materialization`. Execution still requires the appropriate immutable-input and
+runtime capability checks.
+
+Similarly, an ASAP-side descending Sort followed by Limit can lower to one
+`TopKSelection` QueryPlan node. Limit maps to that node; the absorbed Sort can be
+`QueryInput`. Absorption does not mean the sorting is omitted. Current binding
+labels alone are not executable subgraphs; the new compiler projection makes
+ownership and boundary reads explicit.
+
+### Visualization contract
+
+The default execution visualization has separate PrecomputePlan and QueryPlan
+views, connected by labeled summary references. It shows each subplan's actual
+operations, input/output boundaries, shared materializations, and generation.
+Multiple query consumers must refer to the same shared summary rather than
+suggesting duplicate maintenance. Derived-summary chains remain visible inside
+the maintenance view with their state-read boundaries.
+
+While rendering the legacy serialized format, distinguish embedded semantic
+context from operations executed by that plan. A read-time `SummaryEstimate`
+embedded in PrecomputePlan must be visible in a faithful artifact view and marked
+as query-owned context, never depicted as precompute execution. A projected
+execution view may exclude that context only when it explicitly says it is showing
+the execution projection. The user should not need a separate Semantic Plan page
+to understand either subplan. After migration, the executable artifacts and their
+two execution views should agree directly.
+
 ## SDS, state codecs, and transmission
 
 | Contract | Authority |
@@ -534,6 +647,8 @@ backend install/ingest/query boundaries, including Go/Rust interoperability.
 | Gate | Observable evidence |
 | --- | --- |
 | Semantic preservation | Selected node/root provenance survives all projections; incompatible grouping/window/lifecycle choices fail before publication |
+| Subplan ownership | Precompute executable subgraphs contain no query-only SummaryEstimate; QueryPlan reads explicit compatible state boundaries; shared and derived summaries remain traceable |
+| Visualization fidelity | Separate plan views agree with executable ownership; legacy embedded context is explicitly distinguished from executed operations |
 | Shared production | N admitted observations cause N producer updates per intended partition, not N multiplied by consumer queries |
 | Protocol conformance | Full, delta, duplicate, conflict, gap, epoch restart, unknown-base and legacy fixtures have explicit expected outcomes |
 | State readiness | Missing or pending coverage uses configured fallback/unavailability; installation never certifies completeness |
