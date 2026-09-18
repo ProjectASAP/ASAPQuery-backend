@@ -21,6 +21,7 @@ type QueryReport struct {
 	Expr            string              `json:"expr"`
 	Tolerance       ComparisonPolicy    `json:"tolerance"`
 	Range           *ComparisonOutcome  `json:"range,omitempty"`
+	RangeResponses  *ResponsePair       `json:"rangeResponses,omitempty"`
 	Instant         []InstantComparison `json:"instant,omitempty"`
 	ReferenceParity []InstantComparison `json:"referenceParity,omitempty"`
 	BackendParity   []InstantComparison `json:"backendParity,omitempty"`
@@ -31,6 +32,14 @@ type InstantComparison struct {
 	OffsetSeconds float64           `json:"offsetSeconds"`
 	Time          time.Time         `json:"time"`
 	Comparison    ComparisonOutcome `json:"comparison"`
+	Responses     ResponsePair      `json:"responses"`
+}
+
+// ResponsePair preserves the raw public API payloads behind each comparison.
+// It lets a passing report show exactly what Prometheus and ASAPQuery returned.
+type ResponsePair struct {
+	Reference QueryResponse `json:"reference"`
+	Backend   QueryResponse `json:"backend"`
 }
 type ComparisonOutcome struct {
 	Passed         bool   `json:"passed"`
@@ -58,6 +67,7 @@ func CompareQuery(ctx context.Context, reference, backend HTTPQueryTarget, query
 		right, rightErr := backend.Range(ctx, query.Expr, *query.Range, base)
 		outcome := compareOutcome(left, right, leftErr, rightErr, policy)
 		report.Range, report.Passed = &outcome, report.Passed && outcome.Passed
+		report.RangeResponses = &ResponsePair{Reference: left, Backend: right}
 		referenceRange, backendRange = left, right
 	}
 	for _, offset := range query.InstantOffsetsSeconds {
@@ -65,7 +75,7 @@ func CompareQuery(ctx context.Context, reference, backend HTTPQueryTarget, query
 		left, leftErr := reference.Instant(ctx, query.Expr, at)
 		right, rightErr := backend.Instant(ctx, query.Expr, at)
 		outcome := compareOutcome(left, right, leftErr, rightErr, policy)
-		report.Instant = append(report.Instant, InstantComparison{OffsetSeconds: offset, Time: at, Comparison: outcome})
+		report.Instant = append(report.Instant, InstantComparison{OffsetSeconds: offset, Time: at, Comparison: outcome, Responses: ResponsePair{Reference: left, Backend: right}})
 		report.Passed = report.Passed && outcome.Passed
 		if query.Range == nil || leftErr != nil || rightErr != nil || referenceRange.Status != "success" || backendRange.Status != "success" || left.Status != "success" || right.Status != "success" {
 			continue
