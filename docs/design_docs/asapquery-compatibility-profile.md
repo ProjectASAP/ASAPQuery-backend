@@ -1,438 +1,228 @@
 # ASAPQuery compatibility profile
 
-> Status: implemented; wider maintenance capabilities retain separate admission gates
+> Status: implemented; wider maintenance capabilities retain separate admission gates.
 >
 > Reference: [ProjectASAP/ASAPQuery at `9fb051a`](https://github.com/ProjectASAP/ASAPQuery/tree/9fb051aa798361fca8e3012835412cb6fa338a0c)
->
-> Scope: a deliberately smaller target operating profile of ASAPQuery-backend that
-> accepts raw Prometheus Remote Write samples and does not depend on
-> ASAPCollector.
 
-## Goal
+The `asapquery` profile is a strict, startup-validated subset of
+ASAPQuery-backend. It accepts raw Prometheus Remote Write samples, builds
+summaries in process, serves supported PromQL and falls back to Prometheus. It
+does not depend on ASAPCollector.
 
-ASAPQuery-backend has a broader architecture than ASAPQuery: it can coordinate
-external collectors, accept materialized summaries over modified OTLP, use
-multiple storage tiers, and compile distributed physical plans. This profile
-does not remove those capabilities. It defines the target configuration required
-for ASAPQuery-compatible behavior and gives that configuration an independent
-end-to-end acceptance target. Selecting `--profile asapquery` is now a strict,
-startup-validated subset of the broader runtime.
+## Document map
 
-The user-visible goal is the same drop-in shape as ASAPQuery:
+1. [Profile at a glance](#profile-at-a-glance)
+2. [Worked example](#worked-example)
+3. [Profile boundary](#profile-boundary)
+4. [Planning and runtime contracts](#planning-and-runtime-contracts)
+5. [Remote Write contract](#remote-write-contract)
+6. [Query and fallback contract](#query-and-fallback-contract)
+7. [Activation and readiness](#activation-and-readiness)
+8. [Compatibility evidence](#compatibility-evidence)
+9. [Completion and extensions](#completion-and-extensions)
 
-```text
-Prometheus ── remote_write raw samples ──► ASAPQuery-backend
-     ▲                                      │
-     │ exact fallback                       │ in-process summaries
-     │                                      ▼
-Grafana / PromQL client ── query ──► accelerated query endpoint
+## Profile at a glance
+
+```mermaid
+flowchart LR
+  P[Prometheus] -->|remote_write| I[Backend ingest]
+  I --> C[In-process precompute]
+  C --> S[SummaryStore]
+  U[PromQL client] --> Q[Query router]
+  Q -->|ready and supported| S
+  Q -->|fallback| P
 ```
 
-Prometheus remains the exact raw-data system. It sends a copy of ingested
-samples to ASAPQuery-backend through Prometheus Remote Write. The backend builds
-planned summaries from those raw samples and serves supported PromQL from the
-summaries. Unsupported, not-yet-ready, stale, or unsafe queries are forwarded
-to Prometheus.
+Prometheus remains the exact raw-data authority. The backend accelerates only
+installed queries whose summary state is complete, fresh and accurate enough.
+Unsupported, unsafe, stale or not-yet-ready queries follow the explicit fallback.
 
-The reference behavior is anchored by ASAPQuery's
-[top-level architecture](https://github.com/ProjectASAP/ASAPQuery/blob/9fb051aa798361fca8e3012835412cb6fa338a0c/README.md),
-[Remote Write decoder](https://github.com/ProjectASAP/ASAPQuery/blob/9fb051aa798361fca8e3012835412cb6fa338a0c/asap-query-engine/src/drivers/ingest/prometheus_remote_write.rs),
-[query tracker](https://github.com/ProjectASAP/ASAPQuery/blob/9fb051aa798361fca8e3012835412cb6fa338a0c/asap-query-engine/src/query_tracker/tracker.rs),
-and
-[precompute design](https://github.com/ProjectASAP/ASAPQuery/blob/9fb051aa798361fca8e3012835412cb6fa338a0c/asap-query-engine/src/precompute_engine/precompute_engine_design_doc.md).
-The goal is behavioral compatibility, not copying its historical planner or
-internal types.
+Planning uses configured `QueryWorkload` and `DataWorkload`, canonical
+ASAPPlanner selection and a backend-only physical compiler:
+
+```text
+workloads -> ASAPPlanner -> selected candidate -> backend compiler
+                                             -> SummaryCatalog
+                                             -> PrecomputePlan
+                                             -> QueryPlan
+```
+
+The three outputs share plan and materialization identities and activate as one
+immutable version.
+
+## Worked example
+
+An operator configures a repeating five-minute sum query and Prometheus sends raw
+samples to the backend:
+
+```yaml
+profile: asapquery
+prometheus_fallback: http://prometheus:9090
+query_workload:
+  - id: api-request-sum
+    expression: sum_over_time(api_requests_total[5m])
+    every: 1m
+data_workload:
+  metric: api_requests_total
+  ingestion_rate: 10000
+```
+
+Startup compiles a backend-local materialization, installs inactive query routes
+and begins accepting Remote Write. Before five minutes of complete coverage, the
+query is forwarded to Prometheus. When the materialization becomes ready, the
+same request is served from SummaryStore. An unsupported expression such as
+`absent(up)` continues to fall back.
+
+```text
+request -> active QueryPlan?
+        -> supported binding?
+        -> complete and fresh state?
+        yes: summary result
+        no:  semantically equivalent Prometheus request
+```
 
 ## Profile boundary
 
-### Required in this profile
+Required:
 
-- Prometheus Remote Write v1 ingestion at `POST /api/v1/write`;
-- Snappy decompression and protobuf `WriteRequest` decoding;
-- raw scalar sample, stale-marker, and label canonicalization;
-- in-process streaming precompute with windowing and lateness handling;
-- an in-process summary store sufficient for the accelerated query path;
-- Prometheus-compatible instant and range query endpoints;
-- startup-supplied `QueryWorkload` and `DataWorkload` snapshots and canonical
-  ASAPPlanner invocation;
-- backend-only physical compilation and atomic plan activation;
-- summary-backed execution with explicit Prometheus fallback; and
-- one self-contained compatibility demo and end-to-end test.
+- `POST /api/v1/write` Remote Write v1 with Snappy/protobuf decoding;
+- raw scalar samples, stale markers and canonical labels;
+- backend-local streaming precompute, windowing and lateness handling;
+- in-process SummaryStore and Prometheus-compatible instant/range endpoints;
+- startup workload snapshots, canonical Planner invocation and physical compile;
+- atomic activation, readiness gating and explicit Prometheus fallback;
+- a self-contained compatibility demo and end-to-end test.
 
-### Excluded from the MVP profile
+Disabled and not startup dependencies:
 
-- ASAPCollector discovery, configuration, or plan publication;
-- `CollectorPlan`, `SDKPlan`, OpAMP, or collector activation evidence;
-- OTLP or modified-OTLP ingestion;
-- prebuilt summary ingestion from external producers;
-- source sampling, GOS, sparse delta transmission, and frame ACK protocols;
-- VictoriaMetrics Remote Write, Kafka, CSV, JSON, or other ingest connectors in
-  the MVP;
-- SQL, ClickHouse, and Elasticsearch query protocols in the MVP;
-- S3, Thanos, Gorilla, or other durable/cold tiers; and
-- distributed placement or multi-producer summary merging.
+- ASAPCollector, CollectorPlan, SDKPlan, OpAMP and collector activation;
+- OTLP/prebuilt-summary ingestion and external summary producers;
+- sampling, GOS, sparse delta transmission and frame ACK protocols;
+- non-Prometheus ingest adapters and non-PromQL query protocols;
+- durable/cold tiers and distributed placement or merging.
 
-Excluded features may continue to exist in the larger product. They must be
-disabled and must not be startup dependencies when this profile is selected.
+These capabilities may exist in broader ASAPQuery-backend profiles.
 
-## Target architecture
+## Planning and runtime contracts
 
-```text
-Runtime data path
+| Component | Responsibility |
+| --- | --- |
+| ASAPPlanner | Query semantics, sharing, abstract candidates, accuracy, lifecycle choices and exact fallback |
+| Control plane | Load workloads, advertise backend-local implementations/costs, compile and activate one physical version |
+| Remote Write adapter | Decode and validate wire input; emit canonical raw samples |
+| Precompute runtime | Route series, maintain windows/accumulators and publish state |
+| SummaryStore | Index state by materialization, labels and logical window; track coverage/readiness |
+| Query path | Execute the installed QueryPlan or forward an equivalent request to Prometheus |
 
-Prometheus ── remote_write ──► raw receiver ──► precompute ──► SummaryStore
+The backend does not restore ASAPQuery's historical planner or precompute engine.
+Historical fixes remain a migration source and require regression tests or an
+explicit inapplicability record. The audit includes idle/trailing-window closure,
+wall-clock safety, pane eviction, millisecond windows, value routing,
+CMS-with-heap parameters and accumulator routing.
 
-PromQL client ──► Prometheus API ──► query router
-                                      ├──► summary readout ◄── SummaryStore
-                                      └──► exact fallback ──► Prometheus
+A candidate without backend-local materialization and readout support is
+unavailable; it never receives optimistic zero cost. Request handling does not
+perform planning or choose a substitute materialization.
 
-Planning path
+## Remote Write contract
 
-configured QueryWorkload + DataWorkload
-                    │
-                    ▼
-               ASAPPlanner
-     Post-ASAP candidates + selection
-                    │
-                    ▼
-      backend-only physical compiler
-        │          │          │
-        ▼          ▼          ▼
- PrecomputePlan SummaryCatalog QueryPlan DAG
-        │          │          │
-        ▼          ▼          ▼
-   precompute    catalog   SID-bound executor
-```
-
-The plan has no collector projection. One compile produces an atomic
-`PhysicalPlan` containing one `SummaryCatalog` plus sibling backend-local
-`PrecomputePlan` and `QueryPlan` sections from the same selected Post-ASAP candidate.
-`PrecomputePlan` directly is the runtime precompute contract; there is no second
-streaming-config semantic model or lossy conversion step. All sections share
-plan and materialization identities.
-One immutable version installs the precompute configuration, store catalog, and
-inactive query routes atomically. Materialization readiness is runtime state:
-each route becomes eligible for summary serving only after its required windows
-have complete and fresh coverage.
-
-## Component responsibilities
-
-### ASAPPlanner
-
-ASAPPlanner consumes the complete query workload and associated data workload.
-It owns query semantics, workload-wide sharing, abstract summary candidates,
-accuracy reasoning, logical window/lifecycle choices, selection, and exact
-fallback decisions.
-
-The compatibility profile consumes canonical types and behavior from the pinned
-ASAPPlanner revision. It must not restore ASAPQuery's historical planner as a
-second planner or copy Planner optimizer, intent-algebra, or sketch-capability
-rules into ASAPQuery-backend.
-
-### ASAPQuery-backend control plane
-
-For the first MVP, operators provide immutable `QueryWorkload` and
-`DataWorkload` snapshots at startup. The control plane:
-
-1. validates and loads both configured workload snapshots;
-2. invokes ASAPPlanner with the complete `QueryWorkload` and associated
-   `DataWorkload`;
-3. enumerates only backend-local implementations for Planner candidates;
-4. returns implementation-cost evidence needed for selection;
-5. compiles the selected candidate into a matching SummaryCatalog, PrecomputePlan,
-   and QueryPlan; and
-6. stages and atomically activates those views.
-
-It does not enumerate SDK or Collector placements in this profile. A Planner
-candidate that has no backend-local SummaryStore materialization and readout
-implementation is unavailable; the control plane must not assign it an
-optimistic zero cost.
-
-Online query observation, data-workload estimation from Remote Write, and
-replanning may be added later. If enabled, the data-plane query endpoint emits
-bounded canonical observations and the control plane aggregates them; the
-request path never owns planning. These capabilities are not startup or MVP
-dependencies.
-
-### Raw ingest and precompute
-
-The Remote Write adapter owns only wire decoding and validation:
+The adapter performs:
 
 ```text
-HTTP body
-  -> verify request limits and content encoding
-  -> Snappy decode
-  -> protobuf WriteRequest decode
-  -> validate __name__, labels, timestamps, and sample encodings
-  -> recognize the Prometheus stale-NaN marker before ordinary numeric checks
-  -> canonical series key
-  -> route raw samples to the active PrecomputePlan
+limits -> Snappy decode -> WriteRequest decode -> sample/label validation
+       -> stale-marker recognition -> canonical series key -> active plan routing
 ```
 
-The precompute engine owns series routing, bounded buffering, watermark and
-lateness behavior, window assignment, selected accumulator updates, and writes
-to SummaryStore. The decoder must not choose an aggregation family.
+Only v1 scalar samples are supported. The exact Prometheus stale-NaN marker is
+recognized, deduplicated and counted, then excluded from numeric aggregation.
+Other non-finite values, native histograms and exemplars are rejected.
 
-The current ASAPQuery-backend streaming precompute engine is the destination,
-but the ASAPQuery history is a required bug-fix migration source. Before the
-compatibility profile is complete, relevant ASAPQuery precompute fixes must be
-audited commit by commit and either migrated with regression tests or recorded
-as inapplicable because the affected feature was intentionally retired. The
-known audit set includes idle/trailing-window closure, active-ingest wall-clock
-safety, move-out at pane eviction, millisecond windows, value-column routing,
-CMS-with-heap parameter parsing, and accumulator-family routing.
+Within the in-memory dedup horizon, identical series/timestamp/value input is a
+duplicate and a conflicting value is rejected. The receiver validates the batch
+and reserves all queue capacity before enqueueing. A `204` acknowledges admission
+and dedup bookkeeping, not accumulator mutation or durable commit.
 
-Restoring Remote Write must add an adapter to the current engine; it must not
-restore or fork the historical ASAPQuery engine. In particular, retired
-`SetAggregator` and `DeltaSetAggregator` paths are not restored merely because
-their historical patches touched precompute code. Compatibility tests preserve
-both migrated ASAPQuery fixes and newer backend fixes, and expose any remaining
-semantic mismatch rather than weakening the expected results.
+| Condition | Result |
+| --- | --- |
+| Invalid batch | Fail before enqueueing |
+| Queue/dedup capacity exhausted | Retryable `503` |
+| Body or decoded size limit exceeded | `413` |
+| Process restart | No raw WAL or dedup recovery; Prometheus remains authority |
 
-The exact Prometheus stale-NaN bit pattern is recognized, deduplicated and
-counted, then excluded from numeric aggregation. It is not currently propagated
-as a worker lifecycle event. Other non-finite values, native histograms and
-exemplars are rejected. Only Remote Write v1 is supported.
+Remote Write provides no producer roster or authoritative watermark. Finite
+`POST /api/v1/precompute/drain` closes one input generation; it does not prove
+continuous completion. See [summary completeness](continuous-summary-completeness.md).
 
-Within the configured in-memory deduplication horizon, an identical canonical
-series/timestamp/value is a duplicate; a conflicting value is rejected. The
-receiver validates the batch and reserves all bounded worker-queue capacity
-before exposing messages. A `204` acknowledges that queue admission and
-in-memory dedup bookkeeping, not completed accumulator mutation or durable
-commit. There is no durable raw-sample WAL or receiver dedup recovery after a
-process restart. Summary persistence is a separate later stage.
+## Query and fallback contract
 
-Invalid batches fail before enqueueing. Queue/dedup capacity exhaustion returns
-a retryable `503`; body/decoded size limits return `413`. The dedup horizon must
-cover configured lateness and expected retry duration, but it does not provide
-crash-safe exactly-once delivery. Prometheus remains the raw-data authority.
-
-Remote Write carries neither a producer-partition roster nor an authoritative
-watermark. Finite `POST /api/v1/precompute/drain` closes the input generation;
-it is not continuous completion. Existing typed `SummaryWatermarkBarrier` and
-coordinator APIs need registered producer/partition identity and publication
-ordering before they can establish continuous closure. There is no public HTTP
-barrier endpoint in this profile.
-
-### SummaryStore
-
-The MVP may use the existing in-process summary store. It stores only state
-produced by the active backend-local PrecomputePlan and indexes it by
-materialization, canonical label values, and logical window. It tracks enough
-coverage and watermark state to distinguish ready, missing, incomplete, and
-stale ranges.
-
-Persistent/cold storage is an extension of ASAPQuery-backend, not a dependency
-of this compatibility profile. A process restart may lose the warm summary
-cache only if query routing falls back to Prometheus until the new plan has
-rebuilt complete coverage. Recovery creates a new backend-local producer/runtime
-epoch. Pre-crash partial windows remain incomplete and must never be combined
-with post-restart samples; they can be served only after explicit Prometheus
-backfill, otherwise the first eligible result is a complete post-restart window.
-
-### Query path
-
-The public MVP query surface is:
+The public surface is:
 
 ```text
 GET or POST /api/v1/query
 GET or POST /api/v1/query_range
 ```
 
-For each request, the Prometheus adapter preserves query semantics and response
-shape. Semantic preservation includes `query`, `time`, `start`, `end`, `step`,
-and `timeout`, plus configured tenant and authorization context; it does not
-require byte-for-byte reproduction of the incoming HTTP request. Routing has two
-successful outcomes:
+The adapter preserves `query`, `time`, `start`, `end`, `step`, `timeout`, tenant
+and authorization semantics. It either executes the active QueryPlan with exact
+catalog bindings or forwards a semantically equivalent request to Prometheus.
 
-1. execute the active QueryPlan DAG, whose materialization bindings were
-   resolved through SummaryCatalog, when compatible summary state has
-   complete and fresh coverage; or
-2. forward a semantically equivalent request to the configured Prometheus
-   endpoint.
+Parse failure, unsupported expressions, inactive plans, store misses, incomplete
+or stale windows and insufficient accuracy are never successful empty summary
+results. They fall back or return an error when fallback is unavailable.
 
-A parse failure, store miss, unsupported expression, inactive plan, incomplete
-window, stale coverage, or insufficient accuracy is not an empty successful
-summary result. It follows the explicit fallback route or returns an error if
-fallback is unavailable.
+The first compatibility level covers raw scalar samples, canonical grouping,
+tumbling-window sum, Prometheus `rate` and `increase`, one sketch-backed quantile,
+and instant/range evaluation. Other expressions fall back. Expanding this set
+requires a versioned compatibility level and conformance tests.
 
-The first compatibility level is intentionally explicit rather than claiming
-all PromQL. It supports raw scalar samples, canonical label grouping, tumbling
-window sum, Prometheus `rate` and `increase` over counters, one sketch-backed
-quantile operation, and instant and range evaluation of those planned
-summaries. Selectors or expressions outside that set exercise the exact
-Prometheus fallback path. Expanding the accelerated surface requires a versioned
-compatibility-level change and conformance tests.
-
-## Planning and activation lifecycle
-
-Startup is fallback-safe:
+## Activation and readiness
 
 ```text
-start backend
-  -> verify Prometheus fallback health
-  -> load configured QueryWorkload and DataWorkload snapshots
-  -> run Planner candidate search and selection
-  -> compile one PhysicalPlan (SummaryCatalog + PrecomputePlan + QueryPlan)
-  -> atomically install precompute + catalog + inactive routes under one version
-  -> accept Remote Write and forward every query to Prometheus
-  -> enter Materializing state
-  -> wait for complete summary coverage
-  -> mark each ready materialization Serving
+verify fallback -> load workloads -> select -> compile
+  -> atomically install catalog + precompute + inactive query routes
+  -> accept writes and fall back queries
+  -> materialize complete coverage
+  -> mark each eligible route serving
 ```
 
 The lifecycle is `Compiled -> Installed -> Materializing -> Ready -> Serving`.
-Installation is the atomic configuration boundary; readiness is evidence about
-runtime data coverage. Plan replacement builds a new immutable snapshot.
-Precompute, store metadata, and query routing must never observe a mixture of
-old and new aggregation parameters. Until the new plan is installed and warm,
-the previous compatible route or Prometheus remains authoritative.
+Installation is the atomic configuration boundary; readiness describes runtime
+coverage. A replacement never exposes mixed parameters from old and new plans.
+Until the new version is warm, the previous compatible route or Prometheus is
+authoritative.
 
-The first MVP plans once from the startup snapshots. Runtime observation and
-repeated replanning are optional, but any later implementation must preserve the
-same atomic cutover and warmup rules.
+After restart, pre-crash partial windows remain incomplete and cannot combine
+with post-restart samples. They require explicit backfill; otherwise serving
+starts with the first complete post-restart window.
 
-## Relationship to the broader backend
+## Compatibility evidence
 
-| Concern | ASAPQuery compatibility profile | Broader ASAPQuery-backend |
+| Area | Required executable evidence |
+| --- | --- |
+| Startup | Collector-free profile validation and fallback health gate |
+| Planning | Deterministic workload, selected candidate, catalog and two backend plans |
+| Remote Write | Reference decoding, stale markers, limits, dedup and backpressure |
+| Precompute/store | Planned families, complete windows and canonical state identity |
+| Query | Instant/range summary execution plus captured fallback requests |
+| Activation | Stage/activate failure tests and readiness assertions |
+| Deployment | `./scripts/e2e.sh asapquery-demo` with no Collector |
+
+The E2E query matrix compares every backend result with the same Prometheus:
+
+| Case | Instant | Range |
 | --- | --- | --- |
-| Ingest source | Prometheus Remote Write raw samples | Collector materializations over modified OTLP and other explicit profiles |
-| Summary construction | Backend-local only | Collector or backend placement |
-| Physical outputs | SummaryCatalog + PrecomputePlan + QueryPlan | SummaryCatalog/CollectorPlan/PrecomputePlan/TransmissionPlan/QueryPlan views as applicable |
-| Query protocol | Prometheus HTTP / PromQL | Additional protocols may be supported |
-| Exact fallback | Upstream Prometheus | Prometheus or another compiled storage/query route |
-| Storage required for MVP | In-process warm summary state | Warm, durable, archive, and remote tiers |
-| Sampling and delta | Disabled | Optional physical mechanisms |
+| `rate(counter[window])` | Required | Every returned step |
+| `increase(counter[window])` | Required | Every returned step |
+| Planned sum | Required | Required |
+| Planned sketch quantile | Required | Required |
+| Unsupported expression | Exact fallback | Exact fallback |
 
-The compatibility profile is a restricted runtime configuration. Every enabled
-component belongs to ASAPQuery-backend; broader distributed features remain
-available only outside this profile.
+Counter fixtures cover reset, irregular spacing and boundary samples. Assertions
+include values, labels, timestamps, result type and range-step count; HTTP success
+alone is insufficient. The run records workload/Planner artifacts, active IDs,
+route decisions, coverage, freshness, error, latency, CPU and memory.
 
-The profile is also not a literal subset of historical ASAPQuery internals. It
-preserves the relevant external behavior while adding the current canonical
-ASAPPlanner types, versioned physical compilation, readiness evidence, and
-stronger activation and retry contracts.
-
-## Implementation status
-
-| Area | Implemented contract | Executable evidence |
-| --- | --- | --- |
-| Startup/profile | Collector-free startup, excluded-component validation, fallback health gate | `data_plane` profile tests and production-process E2E |
-| Physical planning | Canonical workload snapshot to one atomic SummaryCatalog/PrecomputePlan/QueryPlan bundle | `compatibility_demo_snapshot_compiles_the_complete_query_matrix` |
-| Remote Write | Strict v1 decoding, stale-marker exclusion, limits, bounded in-memory deduplication and backpressure | receiver unit tests plus process E2E replay/corrupt-batch assertions |
-| Precompute/store | Raw samples use the planned family; first catch-up batches close all complete windows; sketch and exact payloads share canonical SID semantics | worker/store tests and four-family process matrix |
-| Query execution | QueryPlan-only serving-time lookup, node-level materialization binding, generic DAG traversal, exact fallback | instant/range process matrix and fallback request capture |
-| Atomic activation | Versioned stage/activate snapshot and materialization readiness state | physical-plan endpoint tests and `/physical-plan/status` assertions |
-| Real deployment | Prometheus remote_write with no Collector | `./scripts/e2e.sh asapquery-demo` |
-
-## Implemented phases
-
-### Phase A: profile and startup contract
-
-Add an explicit `asapquery` profile with startup validation. It permits only
-Prometheus fallback, Remote Write ingestion, PromQL HTTP serving, backend-local
-precompute, the warm summary store, and configured `QueryWorkload` and
-`DataWorkload` inputs. An excluded connector or required Collector endpoint is
-a configuration error.
-
-Acceptance: the backend starts with no ASAPCollector or OTLP endpoint and all
-queries initially reach Prometheus.
-
-### Phase B: Remote Write ingestion
-
-Implement the v1 receiver, strict resource limits, canonical label and stale
-marker handling, bounded deduplication/retry behavior, visible backpressure, and
-routing into the existing raw-sample precompute input.
-
-Acceptance: valid Snappy/protobuf batches produce the same canonical samples and
-stale-marker recognition as a reference decoder; replayed whole or partial batches
-converge without double-counting; corrupt, oversized, conflicting, and
-overloaded requests cannot leave untracked mutations while returning success.
-
-### Phase C: backend-only planning
-
-Load the configured query and data workload snapshots, call the pinned
-ASAPPlanner, enumerate backend-local implementations, and compile one atomic
-PhysicalPlan with SummaryCatalog, PrecomputePlan, and QueryPlan. Do not create or
-wait for CollectorPlan.
-
-Acceptance: captured Planner input, selected Post-ASAP candidate,
-SummaryCatalog, PrecomputePlan, and QueryPlan are deterministic golden artifacts
-with matching plan/materialization/window/family/parameter identities.
-
-### Phase D: atomic activation and warmup
-
-Install the precompute configuration, store catalog, and inactive query routes
-atomically under one plan version. Track readiness separately for each
-materialization and keep its queries on Prometheus until all required windows
-are complete and fresh.
-
-Acceptance: injected failure at every installation boundary exposes either the
-old complete configuration or the new complete configuration, never a mixed
-one. An installed-but-materializing plan remains on fallback and cannot be
-mistaken for a serving route.
-
-### Phase E: PromQL serving and fallback
-
-Serve the declared compatibility-level instant and range queries from planned
-summaries. Forward every unsupported or unsafe request to Prometheus with
-semantically equivalent parameters and configured request context, and preserve
-Prometheus response types, labels, timestamps, warnings, and errors.
-
-Acceptance: accelerated results satisfy their declared error bound against
-Prometheus, exact operations match Prometheus semantics, and fallback responses
-are equivalent to direct Prometheus calls.
-
-### Phase F: compatibility demo
-
-`./scripts/e2e.sh asapquery-demo` runs Prometheus with `remote_write` configured
-to the backend, starts the backend with fixed workload snapshots, sends their
-corresponding repeating queries
-through the backend, wait for planning and warmup, and capture route decisions
-and resource measurements.
-
-Acceptance evidence includes:
-
-- Remote Write requests, samples, rejected requests, duplicates, and bytes;
-- configured workload snapshots and the exact Planner input/output artifacts;
-- active plan/materialization identities and activation time;
-- summary versus fallback query counts;
-- window coverage and end-to-end freshness;
-- result error against direct Prometheus; and
-- query latency, backend CPU, and backend memory before and after activation.
-
-The E2E query matrix includes all of the following through the backend and
-compares each result with a direct request to the same Prometheus instance:
-
-| PromQL case | Instant `/api/v1/query` | Range `/api/v1/query_range` |
-| --- | --- | --- |
-| `rate(counter[window])` | Required | Required, including every returned step |
-| `increase(counter[window])` | Required | Required, including every returned step |
-| planned sum | Required | Required |
-| planned sketch-backed quantile | Required | Required |
-| unsupported expression | Exact fallback required | Exact fallback required |
-
-The counter fixture includes monotonic input, at least one counter reset,
-irregular sample spacing, and samples near window boundaries. The assertions
-cover values, labels, timestamps, result type, and range-step count. A test that
-only proves that the endpoint returns HTTP success does not satisfy this matrix.
-
-## Post-MVP compatibility extensions
-
-The first query extension should be a SQL endpoint because ASAPQuery exposed SQL
-as an additional query surface. It must translate SQL into canonical Planner
-query semantics and reuse the same catalog-backed QueryPlan readiness, summary store, and
-exact-fallback rules; it must not introduce a second planner or separately
-configured materializations. Its supported SQL subset and fallback target need
-their own versioned compatibility contract and conformance cases.
-
-CSV and JSON ingestion can follow as convenience adapters. Each adapter is
-limited to parsing and validation before emitting the same canonical raw-sample
-records as Remote Write. It must not choose aggregation families or bypass the
-active PrecomputePlan. These adapters remain optional and cannot become startup
-dependencies of the Remote Write profile.
-
-## MVP completion criterion
+## Completion and extensions
 
 The executable completion command is:
 
@@ -440,13 +230,11 @@ The executable completion command is:
 ./scripts/e2e.sh asapquery-demo
 ```
 
-It starts Prometheus and ASAPQuery-backend without ASAPCollector, ingests only
-through Prometheus Remote Write, plans from the configured workloads, activates a
-backend-local summary, serves both the declared sum and sketch-backed quantile
-compatibility cases plus Prometheus `rate` and `increase` through both instant
-and range endpoints from complete summary windows, and transparently falls back
-for an unsupported query. The run must fail if ingestion, planning, activation,
-coverage, accuracy, counter-reset handling, range-step equivalence, or fallback
-evidence is missing.
+It must fail when ingestion, planning, activation, coverage, accuracy, counter
+semantics, range equivalence or fallback evidence is missing. Starting components
+or exposing `/api/v1/write` alone is not completion.
 
-Starting the components or exposing `/api/v1/write` alone is not completion.
+SQL is the first intended query extension. It must translate into canonical
+Planner semantics and reuse the same catalog, readiness, store and fallback
+contracts. Optional CSV/JSON adapters may emit the same canonical raw-sample
+records but cannot choose aggregations or bypass PrecomputePlan.
