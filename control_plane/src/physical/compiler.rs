@@ -587,7 +587,18 @@ impl BackendLocalPlanningInput {
                 ));
             }
         }
-        workload.data_workload = Some(self.data_workload.clone());
+        let mut data_workload = self.data_workload.clone();
+        if data_workload.data_ingestion_interval.value.is_none()
+            && self.physical_inputs.scrape_interval_ms > 0
+        {
+            data_workload.data_ingestion_interval = Evidence {
+                value: Some(DurationMs(self.physical_inputs.scrape_interval_ms)),
+                source: EvidenceSource::Declared,
+                observed_at_ms: None,
+                valid_for_ms: None,
+            };
+        }
+        workload.data_workload = Some(data_workload.clone());
         workload
             .validate()
             .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -596,8 +607,7 @@ impl BackendLocalPlanningInput {
                 "ASAPQuery compatibility profile accepts PromQL workloads only".into(),
             ));
         }
-        let ingestion_rate = self
-            .data_workload
+        let ingestion_rate = data_workload
             .ingestion_rate
             .value_at(self.environment.observed_at_unix_ms)
             .copied()
@@ -610,10 +620,12 @@ impl BackendLocalPlanningInput {
                 "QueryWorkload must contain at least one query".into(),
             ));
         }
+        let canonical_queries = asap_frontend_promql::lower_promql_workload(&workload)
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?;
         let mut queries = Vec::with_capacity(entries.len());
         let mut canonical_roots = Vec::with_capacity(entries.len());
         let mut topk_evidence_by_id = HashMap::new();
-        for (index, entry) in entries.into_iter().enumerate() {
+        for (index, (entry, parsed)) in entries.into_iter().zip(canonical_queries).enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
                 QueryRecurrence::Repeated(RepeatedDemand::FixedIntervalAt {
                     interval, ..
@@ -636,9 +648,6 @@ impl BackendLocalPlanningInput {
             }
             let accuracy = entry.requirements.accuracy.target();
             let query_string = entry.query.0;
-            let parsed =
-                crate::query_parser::parse_query_expr_canonical(&query_string, accuracy.clone())
-                    .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             let lookback_ms =
                 query_history_window_ms(&parsed, self.physical_inputs.scrape_interval_ms)
                     .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
@@ -2934,6 +2943,15 @@ fn select_lifecycle(
         ),
         data_workload: Some(DataWorkload {
             arrival: DataArrival::ContinuouslyIngesting,
+            // This workload is an internal lifecycle projection, not a
+            // plan-ready query input. Use the compatibility profile cadence
+            // when there is no original workload to carry source evidence.
+            data_ingestion_interval: Evidence {
+                value: Some(DurationMs(1_000)),
+                source: EvidenceSource::Declared,
+                observed_at_ms: None,
+                valid_for_ms: None,
+            },
             ingestion_rate: Evidence {
                 value: Some(Rate(
                     query.summary_lifecycle_inputs.ingestion_rate_per_second,
@@ -2952,6 +2970,21 @@ fn select_lifecycle(
             // evidence comes from the same lifecycle input as window pricing.
             if original.data_workload.is_none() {
                 original.data_workload = workload.data_workload;
+            } else if original
+                .data_workload
+                .as_ref()
+                .is_some_and(|data| data.data_ingestion_interval.value.is_none())
+            {
+                original
+                    .data_workload
+                    .as_mut()
+                    .unwrap()
+                    .data_ingestion_interval = workload
+                    .data_workload
+                    .as_ref()
+                    .unwrap()
+                    .data_ingestion_interval
+                    .clone();
             }
             (original, indices)
         }
@@ -5036,7 +5069,8 @@ pub(crate) mod tests {
         let query = "mad_over_time(m[1m])";
         let mut workload = request("vm-q", "last_over_time(m[1m])");
         let accuracy = workload.queries[0].accuracy_target.clone();
-        let canonical = asap_frontend_promql::lower_promql(query, accuracy.clone()).unwrap();
+        let canonical =
+            crate::query_parser::parse_query_expr_canonical(query, accuracy.clone()).unwrap();
         workload.queries[0].query_string = query.into();
         workload.queries[0].selected_plan_root =
             crate::planner_selection::keep_pre_asap(&canonical).unwrap();
@@ -6177,6 +6211,72 @@ pub(crate) mod tests {
             .0
             .queries[0]
             .query_lookback_seconds
+    }
+
+    fn set_data_ingestion_interval(
+        snapshot: &mut BackendLocalPlanningInput,
+        interval_ms: Option<u64>,
+    ) {
+        let evidence = Evidence {
+            value: interval_ms.map(DurationMs),
+            source: EvidenceSource::Declared,
+            observed_at_ms: None,
+            valid_for_ms: None,
+        };
+        snapshot.data_workload.data_ingestion_interval = evidence.clone();
+        snapshot
+            .query_workload
+            .data_workload
+            .as_mut()
+            .unwrap()
+            .data_ingestion_interval = evidence;
+    }
+
+    // Plan-ready lowering uses workload cadence, not the backend-local migration field.
+    #[test]
+    fn instant_aggregate_uses_data_ingestion_interval() {
+        let mut snapshot = planning_snapshot();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum(data)".into());
+        set_data_ingestion_interval(&mut snapshot, Some(1_000));
+
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        assert_eq!(request.queries[0].query_lookback_seconds, 1);
+    }
+
+    // Legacy snapshots migrate their explicit scrape cadence into DataWorkload.
+    #[test]
+    fn missing_data_ingestion_interval_migrates_scrape_interval() {
+        let mut snapshot = planning_snapshot();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum(data)".into());
+        set_data_ingestion_interval(&mut snapshot, None);
+
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        assert_eq!(
+            request
+                .query_workload
+                .unwrap()
+                .data_workload
+                .unwrap()
+                .data_ingestion_interval
+                .value,
+            Some(DurationMs(5_000))
+        );
+        assert_eq!(request.queries[0].query_lookback_seconds, 5);
+    }
+
+    // An explicitly invalid interval must not be replaced by the migration value.
+    #[test]
+    fn zero_data_ingestion_interval_is_rejected() {
+        let mut snapshot = planning_snapshot();
+        set_data_ingestion_interval(&mut snapshot, Some(0));
+
+        let error = snapshot
+            .into_physical_compilation_request()
+            .expect_err("zero interval must fail")
+            .to_string();
+        assert!(error.contains("data_ingestion_interval must be greater than zero"));
     }
 
     // Every concatenated histogram result contributes its source history.

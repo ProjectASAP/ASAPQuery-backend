@@ -1,4 +1,4 @@
-//! PromQL workload extraction through `asap_frontend_promql::lower_promql`.
+//! PromQL workload extraction through `asap_frontend_promql::lower_promql_workload`.
 //!
 //! ASAPPlanner owns parsing and intent classification. Both entry points require
 //! an explicit `AccuracyTarget` because lowering can size summaries.
@@ -14,6 +14,12 @@ use crate::types::AggType;
 use planner_types::pre_asap::AggIntent;
 use planner_types::pre_asap::{ColumnId, CompareOpKind, ScalarValue};
 use planner_types::pre_asap::{Predicate, QueryExpr, Source};
+use planner_types::workload::{
+    AccuracyRequirement, BatchEntry, DataWorkload, DurationMs, Evidence, Query, QueryLanguage,
+    QueryRequirements, QueryWorkload, TimeSelection,
+};
+
+const COMPATIBILITY_DATA_INGESTION_INTERVAL_MS: u64 = 1_000;
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
 
@@ -68,18 +74,38 @@ pub enum QueryHint {
 /// Parse a PromQL query string into the **canonical** L3
 /// [`query_expr::QueryExpr`](planner_types::pre_asap::QueryExpr) IR.
 ///
-/// This is the single public algebra-IR entry point — a direct call into
-/// `asap_frontend_promql::lower_promql`, which does the full L1 parse →
-/// L2 relational tree → L3 canonical conversion in one call. No local
-/// parser, no local L2 tree; `accuracy` is threaded onto every
-/// accuracy-bearing intent the same way ASAPController's own PromQL
-/// front end threads it.
+/// Compatibility entry point for callers that do not own a complete workload.
+/// Plan-ready compilation lowers the complete caller-supplied workload instead.
 pub fn parse_query_expr_canonical(
     query: &str,
     accuracy: AccuracyTarget,
 ) -> anyhow::Result<planner_types::pre_asap::QueryExpr> {
-    let canonical = asap_frontend_promql::lower_promql(query.trim(), accuracy)?;
-    Ok(canonical)
+    let workload = QueryWorkload {
+        language: QueryLanguage::PromQL,
+        query_batch: Some(vec![BatchEntry {
+            query: Query(query.trim().into()),
+            requirements: QueryRequirements {
+                accuracy: AccuracyRequirement::Explicit(accuracy),
+                ..Default::default()
+            },
+            predictability: Default::default(),
+            invocations: 1,
+            execute_at: None,
+            time_selection: TimeSelection::default(),
+        }]),
+        repeating_queries: None,
+        data_workload: Some(DataWorkload {
+            data_ingestion_interval: Evidence {
+                value: Some(DurationMs(COMPATIBILITY_DATA_INGESTION_INTERVAL_MS)),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    };
+    asap_frontend_promql::lower_promql_workload(&workload)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("PromQL compatibility workload produced no query"))
 }
 
 /// Parse a PromQL query string into a [`ParsedQuery`].
