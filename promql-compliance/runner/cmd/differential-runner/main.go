@@ -63,6 +63,11 @@ func main() {
 		fatal(err)
 	}
 	snapshotPath := filepath.Join(runDirectory, "planning-snapshot.json")
+	// Docker creates a directory when a bind-mounted file target is absent.
+	// The planner helper overwrites this placeholder with complete cost evidence.
+	if err := os.WriteFile(snapshotPath, nil, 0o600); err != nil {
+		fatal(err)
+	}
 	log.Printf("wrote suite-derived planning snapshot template to %s", snapshotTemplatePath)
 	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory, PlanningSnapshot: snapshotPath, PlanningSnapshotTemplate: snapshotTemplatePath}
 	if len(composeFiles) > 0 {
