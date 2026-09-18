@@ -17,6 +17,7 @@ type ComposeLifecycle struct {
 	LogsDirectory            string
 	PlanningSnapshot         string
 	PlanningSnapshotTemplate string
+	environment              []string
 	started                  bool
 }
 
@@ -35,6 +36,12 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 		"ASAP_PLANNING_SNAPSHOT="+l.PlanningSnapshot,
 		"ASAP_PLANNING_SNAPSHOT_TEMPLATE="+l.PlanningSnapshotTemplate,
 	)
+	l.environment = environment
+	// A prior interrupted run may have left data behind. Each comparison case
+	// must ingest into an empty Prometheus and backend state.
+	if err := l.runCompose(ctx, environment, "down", "--volumes", "--remove-orphans"); err != nil {
+		return fmt.Errorf("reset Compose services: %w", err)
+	}
 	if err := l.runCompose(ctx, environment, "up", "-d", "--build", "prometheus", "planner"); err != nil {
 		return err
 	}
@@ -81,14 +88,18 @@ func (l *ComposeLifecycle) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	args := append(l.args(), "down", "--volumes", "--remove-orphans")
-	_ = exec.CommandContext(ctx, "docker", args...).Run()
+	command := exec.CommandContext(ctx, "docker", args...)
+	command.Env = l.environment
+	_ = command.Run()
 }
 func (l *ComposeLifecycle) collectLogs() {
 	if l.LogsDirectory == "" || !l.started {
 		return
 	}
 	_ = os.MkdirAll(l.LogsDirectory, 0o755)
-	output, err := exec.Command("docker", append(l.args(), "logs", "--no-color")...).CombinedOutput()
+	command := exec.Command("docker", append(l.args(), "logs", "--no-color")...)
+	command.Env = l.environment
+	output, err := command.CombinedOutput()
 	if err == nil {
 		_ = os.WriteFile(filepath.Join(l.LogsDirectory, "compose.log"), output, 0o644)
 	}
