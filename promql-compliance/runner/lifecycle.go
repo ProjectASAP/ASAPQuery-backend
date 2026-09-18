@@ -12,10 +12,11 @@ import (
 )
 
 type ComposeLifecycle struct {
-	Files         []string
-	Project       string
-	LogsDirectory string
-	started       bool
+	Files            []string
+	Project          string
+	LogsDirectory    string
+	PlanningSnapshot string
+	started          bool
 }
 
 func (l *ComposeLifecycle) Start(ctx context.Context) error {
@@ -33,6 +34,7 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 		"ASAP_PRECOMPUTE_RS_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-precompute-rs"),
 		"ASAP_SKETCHLIB_CONTEXT="+filepath.Join(sibling, "asap_sketchlib"),
 		"ASAP_GORILLA_RUST_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-gorilla-rust"),
+		"ASAP_PLANNING_SNAPSHOT="+l.PlanningSnapshot,
 	)
 	output, err := command.CombinedOutput()
 	if err != nil {

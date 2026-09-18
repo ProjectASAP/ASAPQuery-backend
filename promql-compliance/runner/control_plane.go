@@ -47,6 +47,28 @@ func BuildPublicationRequest(dataset Dataset, suite Suite, now time.Time) (map[s
 	return map[string]any{"target": "backend_local_remote_write", "queries": queries, "collector_ids": []string{}, "capability_snapshot_id": "promql-compliance", "planner_revision": plannerRevision, "max_evidence_age_ms": 600_000, "plan_version": 1, "activation_unix_ms": now.UnixMilli(), "backend_compat": "asap-query-backend.v1", "apply_timeout_ms": 30_000, "backend_revision": backendRevision}, nil
 }
 
+// BuildPlanningSnapshot is the backend-local startup input. The data plane
+// invokes the repository's pinned Planner and PhysicalPlanCompiler from this
+// workload, so the fixture has one source of truth for planning and queries.
+func BuildPlanningSnapshot(suite Suite, now time.Time) map[string]any {
+	queries := make([]any, 0, len(suite.Queries))
+	for _, query := range suite.Queries {
+		interval := 60_000.0
+		if query.Range != nil {
+			interval = query.Range.StepSeconds * 1000
+		}
+		queries = append(queries, map[string]any{
+			"query":          query.Expr,
+			"demand":         map[string]any{"fixed_interval_at": map[string]any{"interval": interval, "evaluation_phase": 0}},
+			"requirements":   map[string]any{"accuracy": map[string]any{"explicit": map[string]any{"EpsilonDelta": map[string]any{"epsilon": 0.01, "delta": 0.01}}}, "response_latency": "unspecified"},
+			"predictability": map[string]any{"predictable": map[string]any{"known_at": nil}},
+			"time_selection": map[string]any{"scope": "real_time", "lookback": nil, "as_of": nil},
+		})
+	}
+	data := map[string]any{"arrival": "continuously_ingesting", "ingestion_volume": map[string]any{"value": nil, "source": "unknown", "observed_at_ms": nil, "valid_for_ms": nil}, "ingestion_rate": map[string]any{"value": 100.0, "source": "declared", "observed_at_ms": nil, "valid_for_ms": nil}, "input_cardinality": map[string]any{"value": nil, "source": "unknown", "observed_at_ms": nil, "valid_for_ms": nil}, "distribution": map[string]any{"value": nil, "source": "unknown", "observed_at_ms": nil, "valid_for_ms": nil}}
+	return map[string]any{"snapshot_version": 2, "query_workload": map[string]any{"language": "promql", "query_batch": nil, "repeating_queries": queries, "data_workload": data}, "data_workload": data, "implementation": map[string]any{"lifecycle_costs": map[string]any{"build": 10.0, "maintenance_per_update": 0.001, "read": 0.1, "retention_per_second": 0.001, "retirement": 1.0}, "evidence_observed_at_unix_ms": now.UnixMilli(), "evidence_valid_for_ms": 600000, "horizon_seconds": 300.0, "window_cost_model": map[string]any{"implementation_id": "promql-compliance", "cost": map[string]any{"model_version": "promql-compliance-v1", "workload_fingerprint": suite.Name, "observed_at_unix_ms": now.UnixMilli(), "valid_for_ms": 600000, "horizon_seconds": 300.0, "cpu_cost": 1.0, "peak_memory_bytes": 4096, "network_bytes": 0, "storage_bytes": 2048, "source_scan_bytes": 0, "weighted_cost": 1.0}}, "scrape_interval_ms": 1000}, "environment": map[string]any{"target": "backend_local_remote_write", "collector_ids": []string{}, "capability_snapshot_id": "promql-compliance", "observed_at_unix_ms": now.UnixMilli(), "max_evidence_age_ms": 600000, "plan_version": 1, "activation_unix_ms": now.UnixMilli(), "expiry_unix_ms": nil, "backend_compat": "asap-query-backend.v1"}}
+}
+
 func buildRevisions() (string, string, error) {
 	if planner, backend := os.Getenv("ASAP_PLANNER_REVISION"), os.Getenv("ASAPQUERY_BACKEND_REVISION"); planner != "" && backend != "" {
 		return planner, backend, nil

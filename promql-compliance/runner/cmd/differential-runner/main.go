@@ -25,7 +25,6 @@ func main() {
 	test := flag.String("test-url", "", "backend URL")
 	baseMillis := flag.Int64("base-time-ms", time.Now().Add(-30*time.Minute).UnixMilli(), "fixture base time")
 	reportPath := flag.String("output", "differential-report.json", "JSON report path")
-	controlPlane := flag.String("control-plane-url", "http://localhost:18080", "control-plane URL")
 	composeProject := flag.String("compose-project", "asapquery-backend-promql-compliance", "Compose project name")
 	logsDirectory := flag.String("logs-dir", "", "directory for retained Compose logs")
 	keepServices := flag.Bool("keep-services", false, "leave Compose services running after the run")
@@ -48,7 +47,20 @@ func main() {
 		fatal(err)
 	}
 	ctx := context.Background()
-	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory}
+	runDirectory, err := os.MkdirTemp("", "asapquery-promql-compliance-")
+	if err != nil {
+		fatal(err)
+	}
+	defer os.RemoveAll(runDirectory)
+	snapshot, err := json.Marshal(runner.BuildPlanningSnapshot(suite, time.Now().UTC()))
+	if err != nil {
+		fatal(err)
+	}
+	snapshotPath := filepath.Join(runDirectory, "planning-snapshot.json")
+	if err := os.WriteFile(snapshotPath, snapshot, 0o600); err != nil {
+		fatal(err)
+	}
+	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory, PlanningSnapshot: snapshotPath}
 	if err := lifecycle.Start(ctx); err != nil {
 		fatal(err)
 	}
@@ -59,16 +71,6 @@ func main() {
 		fatal(err)
 	}
 	if err := runner.WaitForHTTP(ctx, *test+"/api/v1/health"); err != nil {
-		fatal(err)
-	}
-	if err := runner.WaitForHTTP(ctx, *controlPlane+"/api/v1/cost-model"); err != nil {
-		fatal(err)
-	}
-	publication, err := runner.BuildPublicationRequest(dataset, suite, time.Now().UTC())
-	if err != nil {
-		fatal(err)
-	}
-	if err := runner.PublishPhysicalPlan(ctx, *controlPlane, publication); err != nil {
 		fatal(err)
 	}
 	if err := runner.PushRemoteWrite(ctx, body, *reference, *test); err != nil {
