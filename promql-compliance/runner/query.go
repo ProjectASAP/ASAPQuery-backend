@@ -17,6 +17,10 @@ type QueryResponse struct {
 	Data      json.RawMessage `json:"data"`
 	ErrorType string          `json:"errorType"`
 	Error     string          `json:"error"`
+	// ServedBy is emitted by ASAPQuery when its router answered the request.
+	// An empty value on the backend target means the response was forwarded to
+	// Prometheus, which does not emit this backend-owned header.
+	ServedBy string `json:"servedBy,omitempty"`
 }
 
 type HTTPQueryTarget struct{ BaseURL string }
@@ -49,5 +53,6 @@ func (target HTTPQueryTarget) request(ctx context.Context, path string, query ur
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		return QueryResponse{}, err
 	}
+	body.ServedBy = response.Header.Get("X-ASAP-Data-Source")
 	return body, nil
 }
