@@ -2764,6 +2764,7 @@ mod tests {
                     plan_id: 7,
                     plan_version: 1,
                     clickhouse_context: None,
+                    selected_dags: Default::default(),
                     entries: Default::default(),
                 }),
                 storage_routing: Arc::new(
@@ -6068,10 +6069,11 @@ pub use asap_types::plan_publication::PhysicalPlanInstallRequest;
 /// Decode and cross-validate every backend view before it can become visible.
 /// Used by both startup artifact loading and the staged HTTP install path.
 pub fn validate_and_build_runtime_plan(
-    request: PhysicalPlanInstallRequest,
+    mut request: PhysicalPlanInstallRequest,
     default_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 ) -> Result<crate::storage_engines::types::RuntimePhysicalPlan, String> {
     use std::collections::BTreeSet;
+    request.normalize_legacy_dags()?;
     request
         .precompute_plan
         .validate_against_catalog(&request.summary_catalog)
@@ -6153,6 +6155,10 @@ pub fn validate_and_build_runtime_plan(
         .query_plan
         .validate(&typed_fps)
         .map_err(|error| format!("QueryPlan validation error: {error}"))?;
+    asap_types::plan_publication::validate_maintenance_query_bindings(
+        &request.precompute_plan,
+        &request.query_plan,
+    )?;
     let storage_routing = match request.storage_routing.as_ref() {
         Some(value) => Arc::new(
             crate::storage_engines::types::BackendStorageRouting::from_json_payload(value)
@@ -7193,6 +7199,53 @@ mod catalog_install_tests {
             request,
             Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         )
+    }
+
+    #[test]
+    fn legacy_complete_dag_is_normalized_before_install() {
+        use asap_types::executable_plan::{BackendNodeBinding, InstalledPostAsapDag};
+
+        let mut request = request();
+        let (query_id, projected) = request
+            .precompute_plan
+            .executable_dags
+            .iter()
+            .next()
+            .map(|(id, dag)| (id.clone(), dag.clone()))
+            .expect("fixture has a maintained summary");
+        let selected = request.query_plan.selected_dags.remove(&query_id).unwrap();
+        let semantic = selected.decode().unwrap();
+        let mut binding = projected.binding;
+        binding.nodes = semantic
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.id,
+                    binding
+                        .nodes
+                        .get(&node.id)
+                        .cloned()
+                        .unwrap_or(BackendNodeBinding::QueryInput),
+                )
+            })
+            .collect();
+        request.precompute_plan.executable_dags.insert(
+            query_id.clone(),
+            InstalledPostAsapDag {
+                document: selected,
+                binding,
+            },
+        );
+
+        let installed = install(request).unwrap();
+        assert_eq!(
+            installed.precompute_plan.executable_dags[&query_id]
+                .document
+                .schema_version,
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+        );
+        assert!(installed.query_plan.selected_dags.contains_key(&query_id));
     }
 
     #[test]

@@ -56,45 +56,11 @@ impl DatasketchesKLLAccumulator {
     /// DataCollector's `kllprocessor` emits when
     /// `encoding = KLL_SKETCH_ENCODING_PROTO`.
     ///
-    /// ⚠ This is a **lossy statistical reconstruction**, not a
-    /// bit-identical round-trip: the `KllState` proto carries the
-    /// retained items in level order plus an explicit `levels[]`
-    /// boundary array, but sketch-core's `KllSketch` backend types
-    /// keep their level structure private. Rather than touch
-    /// upstream `asap_sketchlib` to add a typed-state constructor,
-    /// we build a fresh `DatasketchesKLLAccumulator` with the same
-    /// `k` and replay every retained item through `update()`.
-    /// Quantile estimates on the reconstructed sketch are
-    /// approximately equivalent to the source's — within KLL's
-    /// own rank-error bound, which is the same bound the source
-    /// already inherited — so Phase 1 hot-path queries that hit
-    /// the reconstructed sketch return answers the user would
-    /// already have accepted from the source. Bit-identical
-    /// reconstruction is tracked as a sketchlib upstream follow-up.
+    /// The neutral codec decodes the full envelope or legacy bare state.
+    /// The level-aware constructor below preserves the supplied retained
+    /// sample layout without replaying updates.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
-        use prost::Message;
-
-        // DataCollector's kllprocessor wraps the state in a
-        // `SketchEnvelope{kll: KllState}` via sketchlib-go's
-        // `SerializePortableFO` + `proto.Marshal`. Try envelope first,
-        // fall back to bare `KllState` for callers (e.g. unit tests)
-        // that encode the state directly. Mirrors the PR #14 fix on
-        // `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
-        let state = match SketchEnvelope::decode(buffer) {
-            Ok(env) => match env.sketch_state {
-                Some(sketch_envelope::SketchState::Kll(st)) => st,
-                Some(other) => {
-                    return Err(format!(
-                        "SketchEnvelope contains non-KLL sketch: {:?}",
-                        std::mem::discriminant(&other)
-                    )
-                    .into());
-                }
-                None => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
-            },
-            Err(_) => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
-        };
+        let state = asap_sketch_codec::kll_state(buffer)?;
         if state.k < 8 {
             return Err(format!("KllState.k must be >= 8 (got {})", state.k).into());
         }

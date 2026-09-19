@@ -128,6 +128,7 @@ pub(super) fn install(
                 plan_id: 1,
                 plan_version: 1,
                 clickhouse_context: None,
+                selected_dags: Default::default(),
                 entries: entries
                     .into_iter()
                     .map(|e| (e.canonical_query.clone(), e))

@@ -57,6 +57,7 @@ pub fn artifact_from_materializations(
         plan_id: 1,
         plan_version: 1,
         clickhouse_context: None,
+        selected_dags: Default::default(),
         entries: BTreeMap::new(),
     };
     for config in &precompute.materializations {

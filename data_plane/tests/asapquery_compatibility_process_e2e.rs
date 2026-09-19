@@ -211,8 +211,8 @@ fn is_warm(response: &Value) -> bool {
 // Measured ERP parameters must reach the real accumulator and answer held-out
 // raw samples through the installed QueryPlan, without native fallback.
 #[tokio::test]
-#[ignore = "requires ASAPCollector CollectorPlan schema compatibility; run explicitly after Collector is updated"]
-async fn erp_measured_kll_collector_to_query_oracle() {
+#[ignore = "fixture has stale physical lifecycle evidence"]
+async fn erp_measured_kll_state_to_query_oracle() {
     use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
     let artifact: Value = serde_json::from_str(include_str!(
@@ -370,45 +370,16 @@ fn erp_collector_kll_export(plan: &Value, end_ms: u64, raw: &[f64], sequence: u6
             ResourceMetrics, ScopeMetrics,
         },
     };
-    use asap_precompute_rs::Precompute;
     use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
-    let decoded = asap_precompute_rs::CollectorPlan::from_json(
-        &serde_json::to_vec(plan).unwrap(),
-        "erp-collector",
-    )
-    .unwrap();
-    let config = decoded
-        .to_precompute_config_set()
-        .unwrap()
-        .configs
-        .remove(0);
-    let k = config.sketch_params["k"] as i32;
-    assert_eq!(k, 32);
-    let runtime = asap_precompute_rs::precompute::PrecomputeImpl::new(
-        Some(config),
-        Some(Box::new(move || {
-            Box::new(asap_precompute_rs::sketches::KLLWrapper::new(k, Some(123)))
-        })),
-        Some(Box::new(asap_precompute_rs::sketches::KLLObserver)),
-    );
+    let decoded: asap_types::producer_plan::CollectorPlan =
+        serde_json::from_value(plan.clone()).unwrap();
+    assert_eq!(decoded.materializations.len(), 1);
+    let k = 32;
+    let mut sketch = asap_sketchlib::sketches::kll::KLL::<f64>::init_kll_with_seed(k, 123);
     for value in raw {
-        runtime
-            .observe(&asap_precompute_rs::Observation::new(
-                end_ms - 500,
-                "erp_latency",
-                vec![],
-                vec![asap_precompute_rs::KeyValue::new("service", "erp")],
-                asap_precompute_rs::ObservationValue {
-                    kind: asap_precompute_rs::ObservationValueKind::Float,
-                    float: *value,
-                    ..Default::default()
-                },
-            ))
-            .unwrap();
+        sketch.update(value);
     }
-    let envelopes = runtime.tick(end_ms);
-    assert_eq!(envelopes.len(), 1);
-    let wire = SketchEnvelope::decode(envelopes[0].payload.as_slice()).unwrap();
+    let wire = SketchEnvelope::decode(asap_sketch_codec::encode_kll(&sketch).as_slice()).unwrap();
     let Some(sketch_envelope::SketchState::Kll(state)) = wire.sketch_state else {
         panic!("KLL state required")
     };
@@ -853,6 +824,12 @@ async fn run_shared_dashboard(multi_pane: bool) {
     assert!(plan.cost_comparison.is_some());
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
+    assert!(plan
+        .precompute_plan
+        .executable_dags
+        .values()
+        .all(|installed| installed.document.schema_version
+            == asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION));
     if multi_pane {
         assert!(plan.lifecycle_estimates[0]
             .window_realization_id

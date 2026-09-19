@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 pub struct QueryNodeId(pub u64);
 
 pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 1;
+pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 2;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
 /// Plan lifecycle belongs to the enclosing `PrecomputePlan`; this document
@@ -193,12 +194,58 @@ pub struct InstalledPostAsapDag {
 
 impl InstalledPostAsapDag {
     pub fn validate(&self) -> Result<(), String> {
-        if self.document.schema_version != OWNED_POST_ASAP_DAG_SCHEMA_VERSION
-            || self.document.query_id.trim().is_empty()
-        {
+        if self.document.query_id.trim().is_empty() {
             return Err("invalid post-ASAP DAG document identity/version".into());
         }
-        self.binding.validate(&self.document.decode()?)
+        match self.document.schema_version {
+            OWNED_POST_ASAP_DAG_SCHEMA_VERSION => self
+                .binding
+                .validate(&self.document.decode()?)
+                .map_err(|error| format!("legacy DAG `{}`: {error}", self.document.query_id)),
+            MAINTENANCE_DAG_SCHEMA_VERSION => {
+                self.binding.validate_maintenance(&self.document.decode()?)
+            }
+            _ => Err("unsupported post-ASAP DAG document version".into()),
+        }
+    }
+
+    /// Project the selected semantic DAG onto the maintenance ancestors of its
+    /// stored outputs. Version 1 remains readable for installed legacy plans.
+    pub fn maintenance_projection(mut self) -> Result<Self, String> {
+        self.validate()?;
+        if self.binding.precompute_sinks.is_empty() {
+            return Err("cannot project a DAG without maintenance sinks".into());
+        }
+        let mut included = self
+            .binding
+            .precompute_sinks
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut frontier = self.binding.precompute_sinks.clone();
+        while let Some(consumer) = frontier.pop() {
+            for edge in self
+                .document
+                .edges
+                .iter()
+                .filter(|edge| edge.consumer == consumer)
+            {
+                if included.insert(edge.producer) {
+                    frontier.push(edge.producer);
+                }
+            }
+        }
+        self.document
+            .nodes
+            .retain(|node| included.contains(&node.id));
+        self.document
+            .edges
+            .retain(|edge| included.contains(&edge.producer) && included.contains(&edge.consumer));
+        self.binding.nodes.retain(|id, _| included.contains(id));
+        self.document.root = *self.binding.precompute_sinks.first().unwrap();
+        self.document.schema_version = MAINTENANCE_DAG_SCHEMA_VERSION;
+        self.validate()?;
+        Ok(self)
     }
 }
 
@@ -232,6 +279,65 @@ pub enum BackendNodeBinding {
 impl BackendExecutableBinding {
     pub fn node(&self, id: PostAsapNodeId) -> Option<&BackendNodeBinding> {
         self.nodes.get(&id)
+    }
+
+    /// Scheduler validation for both the legacy complete DAG and a projected
+    /// maintenance DAG. The installed document version is checked at staging.
+    pub fn validate_precompute_execution(&self, dag: &ExecutableDag) -> Result<(), String> {
+        if dag.nodes.iter().any(|node| node.id == self.query_sink) {
+            self.validate(dag)
+        } else {
+            self.validate_maintenance(dag)
+        }
+    }
+
+    fn validate_maintenance(&self, dag: &ExecutableDag) -> Result<(), String> {
+        let ids = dag
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        if ids.is_empty() || self.nodes.keys().copied().collect::<BTreeSet<_>>() != ids {
+            return Err("maintenance binding does not cover its projected DAG".into());
+        }
+        if self.precompute_sinks.is_empty()
+            || self.precompute_sinks.iter().any(|id| !ids.contains(id))
+        {
+            return Err("maintenance projection has missing sinks".into());
+        }
+        if self.precompute_sinks.iter().any(|id| {
+            !matches!(
+                self.node(*id),
+                Some(BackendNodeBinding::Materialization { .. })
+            )
+        }) {
+            return Err("maintenance sink lacks a stored-output binding".into());
+        }
+        for node in &dag.nodes {
+            match (node.output_state.timing, self.node(node.id)) {
+                (
+                    ExecutionTiming::MaintenanceTime,
+                    Some(
+                        BackendNodeBinding::MaintenanceInput
+                        | BackendNodeBinding::Materialization { .. },
+                    ),
+                ) => {}
+                _ => {
+                    return Err(format!(
+                        "query-owned node {} in maintenance projection",
+                        node.id.0
+                    ))
+                }
+            }
+        }
+        if dag
+            .edges
+            .iter()
+            .any(|edge| !ids.contains(&edge.producer) || !ids.contains(&edge.consumer))
+        {
+            return Err("maintenance projection has dangling edges".into());
+        }
+        Ok(())
     }
 
     pub fn validate(&self, dag: &ExecutableDag) -> Result<(), String> {

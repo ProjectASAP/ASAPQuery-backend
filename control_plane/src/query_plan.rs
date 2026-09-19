@@ -1050,6 +1050,7 @@ mod catalog_binding_tests {
                 plan_id: 7,
                 plan_version: 2,
                 clickhouse_context: None,
+                selected_dags: Default::default(),
                 entries: BTreeMap::from([(entry.canonical_query.clone(), entry)]),
             },
             catalog,
@@ -1328,6 +1329,7 @@ mod tests {
                 tables: Default::default(),
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
+            selected_dags: Default::default(),
             entries: [base, metricsql, clickhouse]
                 .into_iter()
                 .map(|entry| (QueryPlan::catalog_key(entry.language, "shared"), entry))

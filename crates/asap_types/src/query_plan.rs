@@ -27,6 +27,10 @@ pub struct QueryPlan {
     pub plan_version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clickhouse_context: Option<ClickHousePlanningContext>,
+    /// Selected semantic roots retained for provenance; serving executes
+    /// `entries` and never reconstructs a plan from these documents.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selected_dags: BTreeMap<String, crate::executable_plan::OwnedPostAsapDag>,
     pub entries: BTreeMap<String, QueryPlanEntry>,
 }
 
@@ -55,6 +59,7 @@ impl QueryPlan {
             plan_id: 0,
             plan_version: 0,
             clickhouse_context: None,
+            selected_dags: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
     }

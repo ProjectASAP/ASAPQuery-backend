@@ -74,7 +74,9 @@ where
             key.summary_definition, sink_node.0
         )));
     }
-    binding.validate(dag).map_err(ScheduleError::Invalid)?;
+    binding
+        .validate_precompute_execution(dag)
+        .map_err(ScheduleError::Invalid)?;
     if !binding.precompute_sinks.contains(&sink_node)
         || !matches!(
             binding.node(sink_node),

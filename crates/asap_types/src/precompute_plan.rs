@@ -115,8 +115,8 @@ pub struct PrecomputePlan {
     pub schemas: Vec<StateSchemaContract>,
     pub producers: Vec<ProducerContract>,
     pub materializations: Vec<crate::PrecomputeMaterialization>,
-    /// Planner semantic DAGs and backend-owned placement for this generation.
-    /// Empty only for legacy/config-only construction paths.
+    /// Version 2 holds maintenance projections ending at stored outputs.
+    /// Version 1 complete DAGs remain readable for installed legacy plans.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub executable_dags: BTreeMap<String, crate::executable_plan::InstalledPostAsapDag>,
 }
