@@ -4,7 +4,6 @@ pub mod count_sketch_accumulator;
 pub mod count_sketch_with_heap_accumulator;
 pub mod datasketches_kll_accumulator;
 pub mod dd_sketch_accumulator;
-pub mod edge_runtime_adapter;
 pub mod hll_sketch_accumulator;
 pub mod hydra_kll_accumulator;
 pub mod increase_accumulator;

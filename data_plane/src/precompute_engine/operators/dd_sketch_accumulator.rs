@@ -91,42 +91,7 @@ impl DDSketchAccumulator {
     /// DataCollector's `ddsketchprocessor` emits when
     /// `encoding = DD_SKETCH_ENCODING_PROTO`.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
-        use prost::Message;
-
-        // DataCollector's ddsketchprocessor wraps the state in a
-        // `SketchEnvelope{ddsketch: DdSketchState}` via sketchlib-go's
-        // `SerializePortableFO` + `proto.Marshal`. Try envelope first,
-        // fall back to bare `DdSketchState` for callers (e.g. unit
-        // tests) that encode the state directly. Mirrors the PR #14
-        // fix on `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
-        // Capture the envelope's `sample_p` alongside the state so a `Count`
-        // query can rescale by `1/p`. Bare `DdSketchState` bytes (no envelope)
-        // carry no sampling info → `sample_p` 1.0 (no rescale).
-        let (state, sample_p) = match SketchEnvelope::decode(buffer) {
-            Ok(env) => {
-                let sp = env.sample_p;
-                match env.sketch_state {
-                    Some(sketch_envelope::SketchState::Ddsketch(st)) => (st, sp),
-                    Some(other) => {
-                        return Err(format!(
-                            "SketchEnvelope contains non-DDSketch sketch: {:?}",
-                            std::mem::discriminant(&other)
-                        )
-                        .into());
-                    }
-                    None => (
-                        DdSketchState::decode(buffer)
-                            .map_err(|e| format!("decode DDSketchState: {e}"))?,
-                        1.0,
-                    ),
-                }
-            }
-            Err(_) => (
-                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?,
-                1.0,
-            ),
-        };
+        let (state, sample_p) = asap_sketch_codec::ddsketch_state(buffer)?;
         if !(state.alpha > 0.0 && state.alpha < 1.0) {
             return Err(format!(
                 "DDSketchState alpha {} out of range (expected 0 < alpha < 1)",

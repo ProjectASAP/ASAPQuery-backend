@@ -16,7 +16,6 @@ use asap_otel_proto::tonic::metrics::v1::{
     metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_precompute_rs::Precompute;
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope as ProtoEnvelope};
 use control_plane::opamp::{
     opamp_proto, CollectorPlanStatus, CollectorPlanStatusKind, COLLECTOR_PLAN_CAPABILITY,
@@ -76,48 +75,18 @@ fn ddsketch_export(
     plan: &serde_json::Value,
     sequence: u64,
 ) -> Vec<u8> {
-    let decoded = asap_precompute_rs::CollectorPlan::from_json(
-        &serde_json::to_vec(plan).unwrap(),
-        "whole-e2e-collector",
-    )
-    .unwrap();
-    let mut configs = decoded.to_precompute_config_set().unwrap().configs;
-    assert_eq!(
-        configs.len(),
-        1,
-        "two query roots must create only one producer"
-    );
-    let config = configs.remove(0);
-    assert_eq!(config.sketch_params["relative_accuracy"], alpha);
-    let runtime = asap_precompute_rs::precompute::PrecomputeImpl::new(
-        Some(config),
-        Some(Box::new(move || {
-            Box::new(asap_precompute_rs::sketches::DDSketchWrapper::new(alpha))
-        })),
-        Some(Box::new(asap_precompute_rs::sketches::DDSketchObserver)),
-    );
+    let decoded: asap_types::producer_plan::CollectorPlan =
+        serde_json::from_value(plan.clone()).unwrap();
+    assert_eq!(decoded.materializations.len(), 1);
+    let mut sketch = asap_sketchlib::DdSketch::new(alpha);
     for value in values {
-        runtime
-            .observe(&asap_precompute_rs::Observation::new(
-                timestamp_ns / 1_000_000 - 500,
-                metric,
-                vec![],
-                vec![asap_precompute_rs::KeyValue::new("service", "whole-e2e")],
-                asap_precompute_rs::ObservationValue {
-                    kind: asap_precompute_rs::ObservationValueKind::Float,
-                    float: *value,
-                    ..Default::default()
-                },
-            ))
-            .unwrap();
+        sketch.update(*value);
     }
-    let envelopes = runtime.tick(timestamp_ns / 1_000_000);
-    assert_eq!(runtime.stats().input_observations, values.len() as u64);
-    assert_eq!(envelopes.len(), 1);
-    assert_eq!(envelopes[0].count, values.len() as u64);
-    let wire = ProtoEnvelope::decode(envelopes[0].payload.as_slice()).unwrap();
+    assert_eq!(sketch.total_count(), values.len() as u64);
+    let wire =
+        ProtoEnvelope::decode(asap_sketch_codec::encode_ddsketch(&sketch).as_slice()).unwrap();
     let Some(sketch_envelope::SketchState::Ddsketch(state)) = wire.sketch_state else {
-        panic!("expected actual Collector DDSketch state")
+        panic!("expected DDSketch state")
     };
     let materialization = plan["materializations"][0]["materialization"]
         .as_u64()
@@ -297,12 +266,9 @@ async fn respond_next_collector_plan(
         .expect("collector-plan custom message");
     assert_eq!(custom.capability, COLLECTOR_PLAN_CAPABILITY);
     assert_eq!(custom.r#type, COLLECTOR_PLAN_MESSAGE);
-    let decoded = asap_precompute_rs::collector_plan::CollectorPlan::from_json(
-        &custom.data,
-        "whole-e2e-collector",
-    )
-    .expect("actual Collector validator accepts the emitted plan");
-    assert_eq!(decoded.to_precompute_config_set().unwrap().configs.len(), 1);
+    let decoded: asap_types::producer_plan::CollectorPlan =
+        serde_json::from_slice(&custom.data).expect("decode backend CollectorPlan");
+    assert_eq!(decoded.materializations.len(), 1);
     let plan: serde_json::Value =
         serde_json::from_slice(&custom.data).expect("decode collector physical plan");
     let plan_id = plan["envelope"]["plan_id"]
@@ -395,7 +361,7 @@ async fn quote_workload(
 }
 
 #[tokio::test]
-#[ignore = "requires ASAPCollector CollectorPlan schema compatibility; run explicitly after Collector is updated"]
+#[ignore = "whole-process fixture predates current planning workload schema"]
 async fn production_control_plane_to_data_plane_otlp_to_promql() {
     let control_binary = std::env::var("ASAP_E2E_CONTROL_PLANE_BIN")
         .expect("ASAP_E2E_CONTROL_PLANE_BIN is set by scripts/e2e.sh whole");

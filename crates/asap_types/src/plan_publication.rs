@@ -33,6 +33,44 @@ pub struct PhysicalPlanInstallRequest {
     pub adaptation_evidence: Vec<crate::producer_plan::RuntimeAdaptationEvidence>,
 }
 
+impl PhysicalPlanInstallRequest {
+    /// Convert supported complete-DAG artifacts into the split runtime form
+    /// before staging. The selected document remains query provenance.
+    pub fn normalize_legacy_dags(&mut self) -> Result<(), String> {
+        let mut normalized = std::collections::BTreeMap::new();
+        for (query_id, installed) in &self.precompute_plan.executable_dags {
+            if installed.document.schema_version
+                != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+            {
+                normalized.insert(query_id.clone(), installed.clone());
+                continue;
+            }
+            installed.validate()?;
+            let selected = installed.document.clone();
+            if selected.query_id != *query_id {
+                return Err("legacy DAG key differs from its query identity".into());
+            }
+            if let Some(existing) = self.query_plan.selected_dags.get(query_id) {
+                if existing != &selected {
+                    return Err("legacy DAG conflicts with selected query provenance".into());
+                }
+            } else {
+                self.query_plan
+                    .selected_dags
+                    .insert(query_id.clone(), selected);
+            }
+            if !installed.binding.precompute_sinks.is_empty() {
+                normalized.insert(
+                    query_id.clone(),
+                    installed.clone().maintenance_projection()?,
+                );
+            }
+        }
+        self.precompute_plan.executable_dags = normalized;
+        Ok(())
+    }
+}
+
 /// A projected writer must refer to the query entry installed in the same
 /// generation. Legacy complete DAGs retain their existing validation path.
 pub fn validate_maintenance_query_bindings(

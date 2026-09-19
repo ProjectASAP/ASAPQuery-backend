@@ -394,18 +394,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asap-precompute-rs"
-version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPCollector?branch=main#1d8efd07e40fc151cbd4678a5c6aa9774b1aed34"
-dependencies = [
- "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?branch=main)",
- "prost",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
 source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=c9b2aa78aa8baa60ddc2f4d880bee4aaab944c5f#c9b2aa78aa8baa60ddc2f4d880bee4aaab944c5f"
@@ -429,6 +417,14 @@ dependencies = [
  "protoc-bin-vendored",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "asap_sketch_codec"
+version = "0.1.0"
+dependencies = [
+ "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?branch=main)",
+ "prost",
 ]
 
 [[package]]
@@ -1159,9 +1155,9 @@ dependencies = [
  "arrow",
  "asap-aware-mapping",
  "asap-frontend-promql",
- "asap-precompute-rs",
  "asap-types",
  "asap_otel_proto",
+ "asap_sketch_codec",
  "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?branch=main)",
  "asap_types",
  "async-trait",

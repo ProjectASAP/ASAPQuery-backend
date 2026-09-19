@@ -2565,71 +2565,20 @@ fn decode_modified_otlp_sketch_bytes(
 
     match encoding {
         ENCODING_PROTO => match algorithm {
-            // Phase 3 step 3: DDSketch and KLL envelope-parsing /
-            // sketch reconstruction route through the shared
-            // `edge_runtime_adapter`, which delegates to
-            // `asap-precompute-rs`'s `Sketch` trait. Backend's
-            // accumulator wraps the result. Byte parity with Go is
-            // covered by `asap_sketchlib` PRs #40 (DDSketch) and #41
-            // (KLL).
-            //
-            // HLL / CountSketch / CountMinSketch byte parity is
-            // tracked under ProjectASAP/ASAPCollector#243 — until it
-            // lands those three sketches keep using the backend's
-            // existing per-accumulator decoder.
+            // The neutral codec accepts both full envelopes and supported bare
+            // states. Query accumulators retain their family-specific readouts.
             SketchAlgorithm::DDSketch => {
-                use crate::precompute_engine::operators::edge_runtime_adapter::{
-                    reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
+                let (inner, sample_p) = asap_sketch_codec::reconstruct_ddsketch(bytes)?;
+                let sample_p = if sample_p.is_finite() && sample_p > 0.0 && sample_p < 1.0 {
+                    sample_p
+                } else {
+                    1.0
                 };
-                // Prefer the asap-precompute-rs runtime path (envelope-
-                // wrapped bytes, the canonical edge-framework wire format).
-                // If the input is a bare `DdSketchState` (as some unit-test
-                // / pre-envelope agent payloads still emit, mirrored by the
-                // PR #14 contract on `from_sketchlib_proto_bytes`), the
-                // adapter returns an error decoding the envelope — fall
-                // back to the backend's native decoder which already
-                // accepts both shapes.
-                match reconstruct_via_runtime(RtSketchType::DDSketch, bytes) {
-                    Ok(ReconstructedSketch::DdSketch(inner)) => {
-                        // The runtime reconstruction discards the envelope's
-                        // sample_p; re-read it from the same full-frame bytes
-                        // so a sampled series rescales its Count by 1/p.
-                        let sample_p = DDSketchAccumulator::sample_p_from_envelope_bytes(bytes);
-                        Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
-                    }
-                    Ok(_) => {
-                        Err("edge_runtime_adapter returned non-DDSketch reconstruction".into())
-                    }
-                    Err(_) => Ok(Box::new(DDSketchAccumulator::from_sketchlib_proto_bytes(
-                        bytes,
-                    )?)),
-                }
+                Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
             }
-            SketchAlgorithm::Kll => {
-                use crate::precompute_engine::operators::edge_runtime_adapter::{
-                    reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
-                };
-                // Same envelope-vs-bare-state handling as DDSketch above.
-                // Backend's KLL accumulator owns the wire-format-aligned
-                // `KllSketch` rather than the high-throughput `KLL<f64>`
-                // that asap-precompute-rs's `KLLWrapper` wraps internally
-                // — when the adapter succeeds, bridge by re-feeding the
-                // wrapper's snapshot bytes through backend's existing
-                // decoder. The envelope work (decode + state extraction
-                // + reconstruction) has already happened in the runtime
-                // adapter; this final step just reshapes into backend's
-                // accumulator type. On envelope-decode failure (bare
-                // state bytes) fall through to the native decoder.
-                match reconstruct_via_runtime(RtSketchType::KLLSketch, bytes) {
-                    Ok(ReconstructedSketch::Kll { snapshot_bytes }) => Ok(Box::new(
-                        DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&snapshot_bytes)?,
-                    )),
-                    Ok(_) => Err("edge_runtime_adapter returned non-KLL reconstruction".into()),
-                    Err(_) => Ok(Box::new(
-                        DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
-                    )),
-                }
-            }
+            SketchAlgorithm::Kll => Ok(Box::new(
+                DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
+            )),
             SketchAlgorithm::Cms => Ok(Box::new(
                 CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
             )),
