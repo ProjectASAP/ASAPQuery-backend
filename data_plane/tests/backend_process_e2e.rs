@@ -361,7 +361,6 @@ async fn quote_workload(
 }
 
 #[tokio::test]
-#[ignore = "whole-process fixture predates current planning workload schema"]
 async fn production_control_plane_to_data_plane_otlp_to_promql() {
     let control_binary = std::env::var("ASAP_E2E_CONTROL_PLANE_BIN")
         .expect("ASAP_E2E_CONTROL_PLANE_BIN is set by scripts/e2e.sh whole");
@@ -487,6 +486,12 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         "backend_compat": control_plane::physical::compiler::BACKEND_COMPAT,
         "apply_timeout_ms": 10000
     });
+    let workload: serde_json::Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-planning-snapshot.json"
+    ))
+    .unwrap();
+    request["data_workload"] = workload["data_workload"].clone();
+    request["data_workload"]["data_ingestion_interval"]["value"] = 1_000.into();
     let mut second = request["queries"][0].clone();
     second["query_id"] = "whole-process-e2e-median".into();
     second["query_string"] = "quantile_over_time(0.5, whole_process_e2e_latency_ms[1s])".into();
@@ -696,8 +701,13 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .await
                 .unwrap();
             assert_eq!(
-                still_active, physical_plan_status,
+                still_active["plans"], physical_plan_status["plans"],
                 "failed rollout changed active plan"
+            );
+            assert_eq!(
+                still_active["materializations"][0]["materialization"],
+                physical_plan_status["materializations"][0]["materialization"],
+                "failed rollout changed the installed materialization"
             );
             let still_warm: serde_json::Value = client
                 .get(format!("{data_base}/api/v1/query"))
