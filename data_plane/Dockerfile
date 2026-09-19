@@ -6,18 +6,10 @@
 # old cross-repo combined builder (ASAPCollector deploy/docker/Dockerfile.backend)
 # is retired.
 #
-# Cross-repo build-contexts: the data_plane crate path-deps `control_plane`
-# (in-repo, copied with the repo) and, transitively through asap-precompute-rs,
-# the sibling crates asap-precompute-rs / asap-gorilla-rust (in the ASAPCollector
-# repo) and asap_sketchlib (separate repo). They are supplied as BuildKit
-# build-contexts that recreate the canonical sibling layout under /src so the
-# `../../ASAPCollector/...` / `../../asap_sketchlib` path-deps resolve.
+# Build from the backend checkout; Cargo fetches public Git dependencies
+# at the revisions recorded in Cargo.lock.
 #
-#   DOCKER_BUILDKIT=1 docker build -f data_plane/Dockerfile \
-#     --build-context asap-precompute-rs=/path/ASAPCollector/asap-precompute-rs \
-#     --build-context asap-sketchlib=/path/asap_sketchlib \
-#     --build-context asap-gorilla-rust=/path/ASAPCollector/asap-gorilla-rust \
-#     -t asap/data-plane:dev .
+#   docker build -f data_plane/Dockerfile -t asap/data-plane:dev .
 FROM rust:1.90-bookworm AS build
 WORKDIR /src
 
@@ -27,15 +19,9 @@ RUN apt-get update && \
         protobuf-compiler git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Recreate the sibling-checkout layout the path-deps expect:
-#   /src/ASAPQuery-backend, /src/ASAPCollector/asap-precompute-rs,
-#   /src/asap_sketchlib, /src/ASAPCollector/asap-gorilla-rust
 COPY . ASAPQuery-backend
-COPY --from=asap-precompute-rs . ASAPCollector/asap-precompute-rs
-COPY --from=asap-sketchlib     . asap_sketchlib
-COPY --from=asap-gorilla-rust  . ASAPCollector/asap-gorilla-rust
 
-RUN cd ASAPQuery-backend && cargo build --release --bin data_plane
+RUN cd ASAPQuery-backend && cargo build --locked --release --bin data_plane
 
 # Runtime image: binary + CA certs.
 FROM debian:bookworm-slim
