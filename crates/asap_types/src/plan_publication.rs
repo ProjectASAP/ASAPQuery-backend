@@ -33,6 +33,58 @@ pub struct PhysicalPlanInstallRequest {
     pub adaptation_evidence: Vec<crate::producer_plan::RuntimeAdaptationEvidence>,
 }
 
+/// A projected writer must refer to the query entry installed in the same
+/// generation. Legacy complete DAGs retain their existing validation path.
+pub fn validate_maintenance_query_bindings(
+    precompute: &PrecomputePlan,
+    query: &QueryPlan,
+) -> Result<(), String> {
+    for (query_id, installed) in &precompute.executable_dags {
+        if installed.document.schema_version
+            != crate::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+        {
+            continue;
+        }
+        let mut entries = query
+            .entries
+            .values()
+            .filter(|entry| &entry.query_id == query_id);
+        let entry = entries
+            .next()
+            .ok_or("maintenance projection has no query entry")?;
+        if entries.next().is_some() {
+            return Err("maintenance projection has ambiguous query entries".into());
+        }
+        if entry.root != installed.binding.query_plan_sink {
+            return Err("maintenance projection and query entry have different roots".into());
+        }
+        let selected = query
+            .selected_dags
+            .get(query_id)
+            .ok_or("maintenance projection has no selected semantic provenance")?;
+        if selected.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+            || selected.query_id != *query_id
+        {
+            return Err("selected semantic provenance has invalid identity/version".into());
+        }
+        selected.decode()?;
+        if installed
+            .document
+            .nodes
+            .iter()
+            .any(|node| !selected.nodes.contains(node))
+            || installed
+                .document
+                .edges
+                .iter()
+                .any(|edge| !selected.edges.contains(edge))
+        {
+            return Err("maintenance projection differs from its selected DAG".into());
+        }
+    }
+    Ok(())
+}
+
 impl PhysicalPlanPublication {
     /// Validate every plan against the shared catalog snapshot.
     pub fn validate(&self) -> Result<(), String> {
@@ -49,6 +101,7 @@ impl PhysicalPlanPublication {
         self.query_plan
             .validate_against_catalog(catalog)
             .map_err(|e| e.to_string())?;
+        validate_maintenance_query_bindings(&self.precompute_plan, &self.query_plan)?;
         let materializations = self
             .precompute_plan
             .materializations

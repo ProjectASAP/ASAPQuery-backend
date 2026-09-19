@@ -1852,10 +1852,11 @@ impl PhysicalPlanCompiler {
                 });
             }
         }
-        let query_plan = QueryPlan {
+        let mut query_plan = QueryPlan {
             plan_id,
             plan_version: envelope.plan_version,
             clickhouse_context: None,
+            selected_dags: BTreeMap::new(),
             entries: query_entries,
         };
         let mut installed_dags = BTreeMap::new();
@@ -1884,6 +1885,9 @@ impl PhysicalPlanCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
+            query_plan
+                .selected_dags
+                .insert(query_id.clone(), installed.document.clone());
             installed_dags.insert(query_id, installed);
         }
         for materialization in &mut materializations {
@@ -1935,6 +1939,18 @@ impl PhysicalPlanCompiler {
                 }
             })?;
         }
+        // QueryPlan already owns executable readout nodes. Persist only
+        // maintenance ancestors under PrecomputePlan.
+        installed_dags = installed_dags
+            .into_iter()
+            .filter(|(_, installed)| !installed.binding.precompute_sinks.is_empty())
+            .map(|(query_id, installed)| {
+                installed
+                    .maintenance_projection()
+                    .map(|projected| (query_id.clone(), projected))
+                    .map_err(|reason| CompileError::Query { query_id, reason })
+            })
+            .collect::<Result<_, _>>()?;
         let mut precompute_plan = match environment.target {
             PhysicalDeploymentTarget::DistributedCollectors => {
                 PrecomputePlan::build(envelope.clone(), materializations, &producer_ids).and_then(
@@ -3900,8 +3916,8 @@ pub(crate) mod tests {
         assert_eq!(populations.len(), 1);
         let installed = serde_json::to_string(&plan.precompute_plan.executable_dags).unwrap();
         assert!(
-            installed.contains("MaintainPopulation"),
-            "shared state must originate in the installed Planner DAG"
+            !installed.contains("MaintainPopulation"),
+            "query-only population readout must not be executable maintenance"
         );
     }
 
@@ -4601,11 +4617,27 @@ pub(crate) mod tests {
             .precompute_plan
             .executable_dags
             .get(&entry.query_id)
-            .expect("compiled query retains its Planner DAG and backend placement");
+            .expect("compiled query retains its maintenance projection");
         installed.validate().expect("typed DAG document");
-        crate::physical::executable_binding::validate_query_plan(installed, entry)
-            .expect("query node bindings");
+        assert_eq!(
+            installed.document.schema_version,
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+        );
+        assert!(installed
+            .document
+            .nodes
+            .iter()
+            .all(|node| node.output_state.timing
+                == planner_types::post_asap::ExecutionTiming::MaintenanceTime));
         assert_eq!(installed.binding.query_plan_sink, entry.root);
+        let mut mismatched = plan.to_publication_artifact().unwrap();
+        let projected = mismatched
+            .precompute_plan
+            .executable_dags
+            .get_mut(&entry.query_id)
+            .unwrap();
+        projected.binding.query_plan_sink = asap_types::executable_plan::QueryNodeId(u64::MAX);
+        assert!(mismatched.validate().is_err());
         assert!(installed.binding.nodes.values().any(|placement| matches!(
             placement,
             crate::physical::executable_binding::BackendNodeBinding::Materialization { .. }

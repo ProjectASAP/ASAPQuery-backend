@@ -37,7 +37,11 @@ impl DerivedInputIdentity {
         root: PostAsapNodeId,
         frontiers: &BTreeMap<PostAsapNodeId, SummaryDefinitionId>,
     ) -> Result<Self, String> {
-        if document.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION {
+        if !matches!(
+            document.schema_version,
+            crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+                | crate::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+        ) {
             return Err("unsupported derived program document version".into());
         }
         let decoded = document.decode()?;

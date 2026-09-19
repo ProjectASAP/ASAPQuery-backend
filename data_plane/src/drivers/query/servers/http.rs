@@ -2764,6 +2764,7 @@ mod tests {
                     plan_id: 7,
                     plan_version: 1,
                     clickhouse_context: None,
+                    selected_dags: Default::default(),
                     entries: Default::default(),
                 }),
                 storage_routing: Arc::new(
@@ -6153,6 +6154,10 @@ pub fn validate_and_build_runtime_plan(
         .query_plan
         .validate(&typed_fps)
         .map_err(|error| format!("QueryPlan validation error: {error}"))?;
+    asap_types::plan_publication::validate_maintenance_query_bindings(
+        &request.precompute_plan,
+        &request.query_plan,
+    )?;
     let storage_routing = match request.storage_routing.as_ref() {
         Some(value) => Arc::new(
             crate::storage_engines::types::BackendStorageRouting::from_json_payload(value)

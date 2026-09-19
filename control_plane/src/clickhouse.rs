@@ -247,6 +247,7 @@ pub async fn compile_automatic_clickhouse_workload(
     let mut entries = std::collections::BTreeMap::new();
     let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
+    let mut selected_dags = std::collections::BTreeMap::new();
     let mut materializations = std::collections::BTreeMap::new();
     let mut selection_traces = std::collections::BTreeMap::new();
     for query in &request.queries {
@@ -286,7 +287,13 @@ pub async fn compile_automatic_clickhouse_workload(
                 "duplicate canonical SQL query identity".into(),
             ));
         }
-        installed_dags.insert(query.sql.clone(), installed);
+        selected_dags.insert(query.sql.clone(), installed.document.clone());
+        installed_dags.insert(
+            query.sql.clone(),
+            installed
+                .maintenance_projection()
+                .map_err(ClickHousePlanningError::Lower)?,
+        );
     }
     let configs: Vec<_> = materializations.into_values().collect();
     let sds = SummaryCatalog::from_materializations(
@@ -322,6 +329,7 @@ pub async fn compile_automatic_clickhouse_workload(
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
+            selected_dags,
             entries,
         },
     };
@@ -423,6 +431,7 @@ pub async fn compile_clickhouse_workload(
     let mut entries = std::collections::BTreeMap::new();
     let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
+    let mut selected_dags = std::collections::BTreeMap::new();
     for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
         let template = planned.canonical_sql.clone();
@@ -430,7 +439,13 @@ pub async fn compile_clickhouse_workload(
             bind_selected_node(node, family, query, request)
         })?;
         index_sql_template(&mut window_templates, template, &executable);
-        installed_dags.insert(query.sql.clone(), installed);
+        selected_dags.insert(query.sql.clone(), installed.document.clone());
+        installed_dags.insert(
+            query.sql.clone(),
+            installed
+                .maintenance_projection()
+                .map_err(ClickHousePlanningError::Lower)?,
+        );
         let identity =
             QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &executable.canonical_query);
         if entries.insert(identity.clone(), executable).is_some() {
@@ -454,6 +469,7 @@ pub async fn compile_clickhouse_workload(
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
+            selected_dags,
             entries,
         },
     };
@@ -1641,10 +1657,16 @@ mod tests {
             installed.binding.nodes.len(),
             installed.document.nodes.len()
         );
-        assert!(installed.binding.nodes.values().any(|binding| matches!(
+        assert!(!installed.binding.nodes.values().any(|binding| matches!(
             binding,
             crate::physical::executable_binding::BackendNodeBinding::Query { .. }
         )));
+        assert!(
+            publication.query_plan.selected_dags[&request.queries[0].sql]
+                .nodes
+                .len()
+                > installed.document.nodes.len()
+        );
         let entry = publication.query_plan.entries.values().next().unwrap();
         // External SQL retains its literal time range until it can be bound.
         assert!(!entry.canonical_query.starts_with("moving-window-v1:"));

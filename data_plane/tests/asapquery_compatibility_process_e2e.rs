@@ -853,6 +853,12 @@ async fn run_shared_dashboard(multi_pane: bool) {
     assert!(plan.cost_comparison.is_some());
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
+    assert!(plan
+        .precompute_plan
+        .executable_dags
+        .values()
+        .all(|installed| installed.document.schema_version
+            == asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION));
     if multi_pane {
         assert!(plan.lifecycle_estimates[0]
             .window_realization_id

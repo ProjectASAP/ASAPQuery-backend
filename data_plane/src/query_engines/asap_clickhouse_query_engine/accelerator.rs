@@ -728,6 +728,7 @@ mod tests {
                 tables,
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
+            selected_dags: Default::default(),
             entries: BTreeMap::from([(
                 QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &canonical_sql),
                 entry,
