@@ -129,7 +129,7 @@ extend Planner semantics where necessary.
 Do not put concrete engine or implementation IDs into Planner IR. The backend
 retains a binding from logical producer identity to implementation, placement,
 materialization, state schema, and active generation. This follows the
-[Planner/downstream boundary](https://github.com/ProjectASAP/ASAPPlanner/blob/cb50219c582d43f53ab77d3a595bd1ea4a9aa119/docs/design_docs/asapplanner-downstream-boundary.md).
+[planner-runtime contract](https://github.com/ProjectASAP/ASAPPlanner/blob/f46cbf6c5738db2f4460d419baa8af5572f5276a/docs/design_docs/architecture/planner-runtime-contract.md).
 
 One selected DAG can produce several execution projections:
 

@@ -15,8 +15,8 @@ use asap_aware_mapping::empirical_comparison::{
 use asap_aware_mapping::empirical_cost::EmpiricalEvidenceProvider;
 use asap_aware_mapping::{
     CompleteSummaryCandidateEstimate, CostModel, CostProvenance, EvaluationRate,
-    ExactCompositionCostInputs, ExactCompositionCostRequest, Horizon, Implementation,
-    OperationPlacement, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
+    ExactCompositionCostInputs, ExactCompositionCostRequest, Horizon, OperationPlacement,
+    Realization, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
     ValueOperationCapabilities,
 };
 use planner_types::post_asap::{
@@ -413,7 +413,7 @@ impl ControlPlaneCostModel {
 /// one. `_` covers every non-approximate-capable variant, unreachable in
 /// practice (`rank_candidates`/`size_params` are only ever called for
 /// `Quantile`/`Cardinality`/`Count`/`TopK` — the shapes
-/// `boundary::bind_summary_with` handles).
+/// `replacement::SketchAlgorithmStrategy::replacements` handles).
 fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
     match intent {
         AggIntent::Quantile { accuracy, .. }
@@ -611,8 +611,8 @@ impl CostModel for ControlPlaneCostModel {
                 let Some((eps, delta)) = self.combined_eps_delta(&intent_accuracy(intent)) else {
                     // Either side Exact: unreachable in practice for
                     // Quantile/Cardinality/Count (an Exact intent never
-                    // reaches `bind_summary_with` upstream — see
-                    // `implementation_for_with`'s `Exact => exact_realization`
+                    // reaches the replacement strategies upstream — see
+                    // `realizations_for_intent`'s `Exact => exact_realization`
                     // arm), kept as a safe fallback rather than a panic.
                     return asap_aware_mapping::DefaultCostModel
                         .size_params(kind, intent, eps, delta);
@@ -685,9 +685,9 @@ impl CostModel for ControlPlaneCostModel {
     /// here is. `PassThrough` for any other `ext_kind` (none exist yet)
     /// or an unparseable/`Exact` accuracy, matching every other
     /// approximate-capable intent's `Exact ⇒ no sketch form` policy.
-    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
+    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Realization {
         if ext_kind != FREQUENCY_EXT_KIND {
-            return Implementation::PassThrough;
+            return Realization::PassThrough;
         }
         if self.offline_frequency_comparison.is_some() {
             return self
@@ -695,24 +695,24 @@ impl CostModel for ControlPlaneCostModel {
                 .ok()
                 .and_then(|recommendation| recommendation.selected_sketch().cloned())
                 .map(|configuration| {
-                    Implementation::Sketch(planner_types::post_asap::SketchKind::new(
+                    Realization::Sketch(planner_types::post_asap::SketchKind::new(
                         configuration.algorithm,
                         configuration.params,
                     ))
                 })
-                .unwrap_or(Implementation::PassThrough);
+                .unwrap_or(Realization::PassThrough);
         }
         let Some(accuracy) = payload
             .get("accuracy")
             .and_then(|v| serde_json::from_value::<AccuracyTarget>(v.clone()).ok())
         else {
-            return Implementation::PassThrough;
+            return Realization::PassThrough;
         };
         let Some((eps, delta)) = self.combined_eps_delta(&accuracy) else {
-            return Implementation::PassThrough;
+            return Realization::PassThrough;
         };
         let (width, depth) = Self::cms_width_depth(eps, delta);
-        Implementation::Sketch(planner_types::post_asap::SketchKind::new(
+        Realization::Sketch(planner_types::post_asap::SketchKind::new(
             SketchAlgorithm::Cms,
             SketchParams::Cms {
                 width: width.next_power_of_two(),
@@ -810,7 +810,7 @@ impl CostModel for ForcedFamilyCostModel {
     // `ForcedFamilyCostModel`, already knowing its family pick from the
     // capability matrix) would still decline pending #150 even after
     // `ControlPlaneCostModel` itself learned to realize it.
-    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
+    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Realization {
         self.inner.realize_extension(ext_kind, payload)
     }
 

@@ -293,10 +293,10 @@ fn bind_cms_topk_loose_recall_picks_cms_heap() {
 /// **CountSketch-with-heap** — the family that supports exact rank /
 /// signed estimates.
 ///
-/// NOTE — behavior change forced by the new binder, not just a rename:
+/// NOTE — behavior change forced by the new realization pass, not just a rename:
 /// the old fixture used `AggIntent::TopK{accuracy: Exact}` (the intent's
 /// OWN accuracy) to signal "tight/exact-recall". Under
-/// `asap_aware_mapping::boundary::implementation_for_with`, the per-intent
+/// `asap_aware_mapping::replacement::realizations_for_intent`, the per-intent
 /// summary-vs-exact boundary decision checks the intent's own `accuracy`
 /// field FIRST: `TopK{accuracy: Exact}` now declines to bind at all
 /// (`SummaryExpr::KeepPreAsap`) rather than reaching the cost model's
@@ -392,7 +392,7 @@ fn bind_hll_cardinality_basic() {
 fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // `AggIntent::Sum` binds to a bare `SummaryAgg` with `summary:
     // SummaryKind::Sum` and no `SummaryEstimate` wrapper (the partial
-    // state *is* the value — see `asap_aware_mapping::bind`'s module docs). The
+    // state *is* the value — see `asap_aware_mapping::replacement`'s module docs). The
     // old locally-defined `PhysicalExpr::ExactAgg { agg_type, .. }`
     // variant (and `asap_types::AggregationType`) no longer exist at
     // the L4 IR level: `planner_types::post_asap::SummaryExpr` unifies exact
