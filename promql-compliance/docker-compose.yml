@@ -9,11 +9,6 @@ services:
     build:
       context: ..
       dockerfile: control_plane/Dockerfile
-      args: {LOCAL_DEP_OVERRIDES: "true"}
-      additional_contexts:
-        asap-precompute-rs: ${ASAP_PRECOMPUTE_RS_CONTEXT}
-        asap-sketchlib: ${ASAP_SKETCHLIB_CONTEXT}
-        asap-gorilla-rust: ${ASAP_GORILLA_RUST_CONTEXT}
     entrypoint: ["/usr/local/bin/control_plane_quote_snapshot"]
     command: ["/config/planning-snapshot-template.json", "/config/planning-snapshot.json"]
     volumes:
@@ -23,11 +18,6 @@ services:
     build:
       context: ..
       dockerfile: data_plane/Dockerfile
-      args: {LOCAL_DEP_OVERRIDES: "true"}
-      additional_contexts:
-        asap-precompute-rs: ${ASAP_PRECOMPUTE_RS_CONTEXT}
-        asap-sketchlib: ${ASAP_SKETCHLIB_CONTEXT}
-        asap-gorilla-rust: ${ASAP_GORILLA_RUST_CONTEXT}
     command: ["--profile", "asapquery", "--planning-snapshot", "/config/planning-snapshot.json", "--prometheus-server", "http://prometheus:9090", "--forward-unsupported-queries", "--http-port", "9091", "--output-dir", "/tmp/asap"]
     volumes:
       - ${ASAP_PLANNING_SNAPSHOT}:/config/planning-snapshot.json:ro

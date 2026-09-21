@@ -12,7 +12,8 @@ CASES := \
 	single-rate-temporal:../datasets/single-rate.yaml:../suites/temporal.yaml \
 	sparse-checkout-temporal:../datasets/sparse-checkout.yaml:../suites/temporal.yaml \
 	aggregations:../datasets/aggregations.yaml:../suites/aggregations.yaml \
-	aggregations-dense-cadence:../datasets/aggregations-dense-cadence.yaml:../suites/aggregations.yaml
+	aggregations-dense-cadence:../datasets/aggregations-dense-cadence.yaml:../suites/aggregations.yaml \
+	issue-702:../datasets/aggregations-dense-cadence.yaml:../suites/issue-702.yaml
 
 test:
 	go test ./...

@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -25,14 +24,7 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	if len(l.Files) == 0 {
 		return nil
 	}
-	sibling, err := siblingCheckoutRoot()
-	if err != nil {
-		return err
-	}
 	environment := append(os.Environ(),
-		"ASAP_PRECOMPUTE_RS_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-precompute-rs"),
-		"ASAP_SKETCHLIB_CONTEXT="+filepath.Join(sibling, "asap_sketchlib"),
-		"ASAP_GORILLA_RUST_CONTEXT="+filepath.Join(sibling, "ASAPCollector/asap-gorilla-rust"),
 		"ASAP_PLANNING_SNAPSHOT="+l.PlanningSnapshot,
 		"ASAP_PLANNING_SNAPSHOT_TEMPLATE="+l.PlanningSnapshotTemplate,
 	)
@@ -67,19 +59,6 @@ func (l *ComposeLifecycle) runCompose(ctx context.Context, environment []string,
 	return nil
 }
 
-func siblingCheckoutRoot() (string, error) {
-	root, err := repositoryRoot()
-	if err != nil {
-		return "", err
-	}
-	output, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
-	if err != nil {
-		return "", fmt.Errorf("find shared Git directory: %w", err)
-	}
-	// A linked worktree's common Git directory belongs to the primary checkout,
-	// whose parent is the directory containing the sibling repositories.
-	return filepath.Dir(filepath.Dir(strings.TrimSpace(string(output)))), nil
-}
 func (l *ComposeLifecycle) Stop() {
 	if !l.started {
 		return
