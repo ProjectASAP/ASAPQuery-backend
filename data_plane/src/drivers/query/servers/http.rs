@@ -294,16 +294,6 @@ impl HttpServer {
         self
     }
 
-    /// Register the archive engine. The only public archive query
-    /// engine id is `thanos_query`; Gorilla is only an
-    /// encoding/storage detail.
-    pub fn with_archive_query_engine(mut self, engine: Arc<dyn QueryEngine>) -> Self {
-        let mut router: EngineRouter = (*self.query_router).clone();
-        router.register(engine);
-        self.query_router = Arc::new(router);
-        self
-    }
-
     /// Attach a `StreamingConfigHandle` handle so the
     /// `GET/POST /api/v1/streaming-config` endpoints can read and
     /// swap the currently active config. Without this handle the

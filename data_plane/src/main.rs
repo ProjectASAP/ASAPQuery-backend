@@ -1116,18 +1116,6 @@ async fn main() -> Result<()> {
         ),
     );
 
-    // No archive tier: register a `NoDataArchiveEngine` stub under
-    // `thanos_query` so cold queries succeed with an empty result.
-    {
-        use data_plane::query_engines::routing::QueryEngine;
-        use data_plane::query_engines::NoDataArchiveEngine;
-        info!(
-            "Registering NoDataArchiveEngine stub on the archive slot (canonical data_source_id=thanos_query)",
-        );
-        let stub: Arc<dyn QueryEngine> = Arc::new(NoDataArchiveEngine::new());
-        server = server.with_archive_query_engine(stub);
-    }
-
     if args.persistence_delete_older_than_secs > 0 {
         server = server.with_data_retention_ms(args.persistence_delete_older_than_secs * 1000);
     }

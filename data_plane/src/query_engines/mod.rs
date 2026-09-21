@@ -17,7 +17,6 @@
 pub mod asap_clickhouse_query_engine;
 pub mod asap_query_engine;
 pub mod canonical;
-pub mod no_data_archive;
 pub mod query_result;
 pub mod routing;
 
@@ -31,7 +30,6 @@ pub use crate::storage_engines::sketch_db::query::timeline_dispatch;
 pub use crate::storage_engines::sketch_db::query::window_merger;
 
 pub use asap_query_engine::ASAPQueryEngine;
-pub use no_data_archive::{NoDataArchiveEngine, DATA_SOURCE_ID_NO_DATA_ARCHIVE};
 pub use query_result::{InstantVector, QueryResult, RangeVector, RangeVectorElement, Sample};
 pub use timeline_dispatch::{combine_statistic, CombinedResult};
 pub use window_merger::{create_window_merger, NaiveMerger, WindowMerger};

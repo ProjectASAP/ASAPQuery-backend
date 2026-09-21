@@ -84,18 +84,6 @@ pub struct ASAPQueryEngine {
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
     summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
-    /// Phase-5 hybrid-stitch hook — set by `with_archive_engine` from
-    /// `main.rs`'s engine builder. When the ASAP-tier reducer reports a
-    /// `ASAPTierResult.coverage` narrower than the requested
-    /// `[t0, t1]`, the engine calls into this archive engine to fetch
-    /// the missing prefix / suffix and stitches the two answers by
-    /// `(label_values, timestamp)`. Warm-tier values win on overlap.
-    ///
-    /// When `None` (no archive engine wired), the engine returns the
-    /// warm answer as-is; the existing `EngineRouter` failover handles
-    /// the rest of the routing matrix.
-    archive_engine:
-        Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
     /// Generation-consistent physical snapshot used by the production query
     /// path. The QueryPlan and SummaryCatalog must come from the same snapshot.
     active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
@@ -164,7 +152,6 @@ impl ASAPQueryEngine {
         Self {
             prometheus_scrape_interval,
             summary_store: None,
-            archive_engine: None,
             active_physical_plan: None,
             exact_subquery_endpoint: None,
             metricsql_exact_subquery_endpoint: None,
@@ -521,19 +508,6 @@ impl ASAPQueryEngine {
             .filter(|plan| plan.plan_id() != 0)
     }
 
-    #[cfg(test)]
-    /// Phase-5 hybrid-stitch builder — attach an archive engine the
-    /// `QueryEngine` trait adapter will dispatch to when the ASAP-tier
-    /// reducer reports a coverage narrower than the requested range.
-    /// When `None`, the engine returns whatever the ASAP tier covers.
-    pub fn with_archive_engine(
-        mut self,
-        archive: Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>,
-    ) -> Self {
-        self.archive_engine = Some(archive);
-        self
-    }
-
     /// attach the shared `SketchStore` so the `QueryEngine`
     /// trait adapter's classify+failover logic is active. Without this
     /// call, the engine keeps the pre-Phase-5 behavior (route every
@@ -752,31 +726,6 @@ impl ASAPQueryEngine {
 
         // Complete coverage is a prerequisite above. Hybrid stitching is
         // retained for legacy/test callers without an active QueryPlan only.
-        // The instant path (`execute`) already stitches when warm
-        // coverage is narrower than the request; the range path historically
-        // returned warm-only, so a request `[start_ms, end_ms]` whose warm
-        // sketches only cover a suffix `[cov_lo, cov_hi]` lost the
-        // prefix `[start_ms, cov_lo)` (the live "No result" / incomplete
-        // matrix symptom). When the reducer reports a coverage narrower than
-        // the requested range AND an archive engine is wired, fetch the
-        // archive's range answer over the SAME window and stitch them by
-        // (label_values, timestamp) — warm wins on overlap, archive fills the
-        // uncovered prefix/suffix. Mirrors the instant-path logic at the
-        // `execute` trait surface.
-        if let (Some((cov_lo, cov_hi)), Some(archive)) =
-            (result.coverage, self.archive_engine.as_ref())
-        {
-            if cov_lo > start_ms || cov_hi < end_ms {
-                if let Ok(archive_qr) = archive
-                    .execute_range(query, start_ms, end_ms, step_ms)
-                    .await
-                {
-                    return Ok(stitch_warm_and_archive(warm_qr, archive_qr, cov_lo, cov_hi));
-                }
-                // Archive error → fall back to warm-only (best effort).
-            }
-        }
-
         Ok(warm_qr)
     }
 }
@@ -800,70 +749,6 @@ impl ASAPQueryEngine {
 /// `now_ms` is unused for the matrix variant (each sample carries its
 /// own window-end timestamp); it's plumbed for future extension to
 /// the instant-vector case (latest-pane projection).
-/// Merge a ASAP-tier `QueryResult::Matrix` with an archive
-/// `QueryResult::Matrix` by `(label_values, timestamp)`. Samples whose
-/// timestamps fall inside the warm coverage `(cov_lo, cov_hi)` keep
-/// the warm value (warm is approximate but more recent); samples
-/// outside that window come from the archive answer. For
-/// labels-not-present-in-warm series the archive series is taken in
-/// full. Used by `ASAPQueryEngine`'s hybrid-stitch path when the
-/// ASAP-tier reducer reports `coverage` narrower than the request.
-fn stitch_warm_and_archive(
-    warm: crate::query_engines::query_result::QueryResult,
-    archive: crate::query_engines::query_result::QueryResult,
-    cov_lo: u64,
-    cov_hi: u64,
-) -> crate::query_engines::query_result::QueryResult {
-    use crate::query_engines::query_result::{QueryResult, RangeVectorElement, Sample};
-    use std::collections::BTreeMap;
-
-    let warm_matrix = match &warm {
-        QueryResult::Matrix(m) => m.values.clone(),
-        _ => return archive,
-    };
-    let archive_matrix = match &archive {
-        QueryResult::Matrix(m) => m.values.clone(),
-        QueryResult::Vector(_) => return warm,
-    };
-
-    // Index warm series by labels for fast lookup.
-    let mut by_labels: BTreeMap<Vec<String>, RangeVectorElement> = BTreeMap::new();
-    for el in warm_matrix {
-        by_labels.insert(el.labels.labels.clone(), el);
-    }
-
-    // For each archive series, merge into by_labels.
-    for arch_el in archive_matrix {
-        let entry = by_labels
-            .entry(arch_el.labels.labels.clone())
-            .or_insert_with(|| RangeVectorElement::new(arch_el.labels.clone()));
-        // Build a set of warm timestamps inside coverage (kept).
-        let warm_ts: std::collections::HashSet<u64> = entry
-            .samples
-            .iter()
-            .filter(|s| s.timestamp >= cov_lo && s.timestamp <= cov_hi)
-            .map(|s| s.timestamp)
-            .collect();
-        // Drop any warm samples that ended up outside coverage —
-        // archive will replace them.
-        entry
-            .samples
-            .retain(|s| s.timestamp >= cov_lo && s.timestamp <= cov_hi);
-        for s in arch_el.samples {
-            // Skip archive samples whose timestamps fall inside warm
-            // coverage AND warm produced a value there (warm wins).
-            if s.timestamp >= cov_lo && s.timestamp <= cov_hi && warm_ts.contains(&s.timestamp) {
-                continue;
-            }
-            entry.samples.push(Sample::new(s.timestamp, s.value));
-        }
-        entry.samples.sort_by_key(|s| s.timestamp);
-    }
-
-    let elements: Vec<RangeVectorElement> = by_labels.into_values().collect();
-    QueryResult::matrix(elements)
-}
-
 fn annotate_logical_execution(
     result: &mut crate::query_engines::query_result::QueryResult,
     stats: &super::logical_dag::ExecutionStats,
@@ -1088,15 +973,6 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 })?;
 
             let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms, false);
-            if let (Some((cov_lo, cov_hi)), Some(archive)) =
-                (result.coverage, self.archive_engine.as_ref())
-            {
-                if cov_lo > t0_ms || cov_hi < now_ms {
-                    if let Ok(archive_qr) = archive.execute(query).await {
-                        return Ok(stitch_warm_and_archive(warm_qr, archive_qr, cov_lo, cov_hi));
-                    }
-                }
-            }
             return Ok(warm_qr);
         }
 
@@ -2599,110 +2475,6 @@ mod outer_agg_integration_tests {
     }
 }
 
-// ===========================================================================
-// Hybrid warm + archive stitch tests (TODO 3 of the ASAP-tier follow-ups).
-// Exercise `stitch_warm_and_archive` directly with synthetic
-// `QueryResult::Matrix` payloads and assert the merged result honors
-// the "warm wins on overlap; archive fills gaps" contract.
-// ===========================================================================
-#[cfg(test)]
-mod hybrid_stitch_tests {
-    use super::stitch_warm_and_archive;
-    use crate::query_engines::query_result::{QueryResult, RangeVectorElement, Sample};
-    use crate::storage_engines::types::KeyByLabelValues;
-
-    fn matrix_with_samples(label: &str, samples: Vec<(u64, f64)>) -> QueryResult {
-        let labels = KeyByLabelValues::new_with_labels(vec![label.to_string()]);
-        let mut el = RangeVectorElement::new(labels);
-        for (t, v) in samples {
-            el.samples.push(Sample::new(t, v));
-        }
-        QueryResult::matrix(vec![el])
-    }
-
-    #[test]
-    fn stitch_fills_archive_prefix_and_suffix() {
-        // Warm covers [100, 200] with timestamps 100, 150, 200.
-        let warm = matrix_with_samples("host=a", vec![(100, 10.0), (150, 11.0), (200, 12.0)]);
-        // Archive covers [50, 250] with timestamps every 50ms.
-        let archive = matrix_with_samples(
-            "host=a",
-            vec![
-                (50, 1.0),
-                (100, 99.0), // overlap: warm wins
-                (150, 99.0), // overlap: warm wins
-                (200, 99.0), // overlap: warm wins
-                (250, 2.0),
-            ],
-        );
-        let merged = stitch_warm_and_archive(warm, archive, 100, 200);
-        let m = match merged {
-            QueryResult::Matrix(m) => m,
-            _ => panic!("expected matrix"),
-        };
-        assert_eq!(m.values.len(), 1, "one series");
-        let samples = &m.values[0].samples;
-        // Five distinct timestamps in the merged answer.
-        assert_eq!(samples.len(), 5);
-        // Warm values preserved on overlap.
-        let mut by_ts: std::collections::HashMap<u64, f64> =
-            samples.iter().map(|s| (s.timestamp, s.value)).collect();
-        assert_eq!(by_ts.remove(&100), Some(10.0));
-        assert_eq!(by_ts.remove(&150), Some(11.0));
-        assert_eq!(by_ts.remove(&200), Some(12.0));
-        // Archive prefix / suffix preserved.
-        assert_eq!(by_ts.remove(&50), Some(1.0));
-        assert_eq!(by_ts.remove(&250), Some(2.0));
-    }
-
-    #[test]
-    fn stitch_keeps_archive_only_series_in_full() {
-        // Warm has series "a"; archive has series "a" + "b". Both
-        // need to make it into the merged answer; "b" comes from
-        // archive in full.
-        let warm = matrix_with_samples("host=a", vec![(150, 5.0)]);
-        let archive = {
-            let a = {
-                let labels = KeyByLabelValues::new_with_labels(vec!["host=a".to_string()]);
-                let mut el = RangeVectorElement::new(labels);
-                el.samples.push(Sample::new(100, 1.0));
-                el.samples.push(Sample::new(150, 99.0)); // warm wins
-                el.samples.push(Sample::new(200, 2.0));
-                el
-            };
-            let b = {
-                let labels = KeyByLabelValues::new_with_labels(vec!["host=b".to_string()]);
-                let mut el = RangeVectorElement::new(labels);
-                el.samples.push(Sample::new(100, 7.0));
-                el.samples.push(Sample::new(200, 8.0));
-                el
-            };
-            QueryResult::matrix(vec![a, b])
-        };
-        let merged = stitch_warm_and_archive(warm, archive, 150, 150);
-        let m = match merged {
-            QueryResult::Matrix(m) => m,
-            _ => panic!("expected matrix"),
-        };
-        assert_eq!(m.values.len(), 2, "two series after merge");
-        let by_label: std::collections::HashMap<Vec<String>, &RangeVectorElement> = m
-            .values
-            .iter()
-            .map(|e| (e.labels.labels.clone(), e))
-            .collect();
-        let a = by_label.get(&vec!["host=a".to_string()]).expect("series a");
-        assert_eq!(a.samples.len(), 3);
-        let a_at_150 = a
-            .samples
-            .iter()
-            .find(|s| s.timestamp == 150)
-            .expect("warm value at 150 preserved");
-        assert_eq!(a_at_150.value, 5.0, "warm wins on overlap");
-        let b = by_label.get(&vec!["host=b".to_string()]).expect("series b");
-        assert_eq!(b.samples.len(), 2);
-    }
-}
-
 // ---------------------------------------------------------------------------
 /// Planned range execution requires complete warm coverage at every step.
 #[cfg(test)]
@@ -2718,36 +2490,6 @@ mod range_stitch_tests {
     use crate::storage_engines::types::{KeyByLabelValues, StreamingConfigHandle};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, BTreeSet};
-
-    /// Mock archive engine: returns a fixed full-range matrix for any range
-    /// query, so the stitch can pull the uncovered prefix from it.
-    struct FakeArchive {
-        matrix: QueryResult,
-    }
-
-    #[async_trait]
-    impl QueryEngine for FakeArchive {
-        async fn execute(&self, _query: &str) -> Result<QueryResult, EngineError> {
-            Ok(self.matrix.clone())
-        }
-        async fn execute_range(
-            &self,
-            _query: &str,
-            _start_ms: u64,
-            _end_ms: u64,
-            _step_ms: u64,
-        ) -> Result<QueryResult, EngineError> {
-            Ok(self.matrix.clone())
-        }
-        fn capabilities(&self) -> EngineCapabilities {
-            EngineCapabilities {
-                data_source_id: crate::storage_engines::types::StorageBackend::GorillaObjectStore
-                    .data_source_id(),
-                storage_backend: crate::storage_engines::types::StorageBackend::GorillaObjectStore,
-                supports_streams_above_bytes: usize::MAX,
-            }
-        }
-    }
 
     /// Encode a CountMin FULL proto frame whose row 0 sums to `total`
     /// (the per-window frequency TOTAL the `count_over_time` reducer reads).
@@ -2796,13 +2538,14 @@ mod range_stitch_tests {
         }
     }
 
-    /// Incomplete installed materializations must fail closed for archive routing,
-    /// regardless of whether this engine also has an archive client attached.
+    /// Incomplete installed materializations must fail closed: a missing pane
+    /// surfaces as a CapabilityMiss, which the HTTP layer forwards to the
+    /// Prometheus fallback (#746).
     #[tokio::test]
     async fn planned_range_rejects_partial_warm_coverage() {
         use crate::query_engines::asap_query_engine::test_plan;
         use asap_types::query_plan::*;
-        for with_archive in [false, true] {
+        {
             let idx = Arc::new(SketchStore::new());
             idx.register(cms_meta(9100, "req_count"));
             idx.append_sample(
@@ -2835,18 +2578,13 @@ mod range_stitch_tests {
                     },
                 },
             );
-            let mut engine = test_plan::engine(idx, config, vec![9100], entry);
-            if with_archive {
-                engine = engine.with_archive_engine(Arc::new(FakeArchive {
-                    matrix: QueryResult::matrix(vec![]),
-                }));
-            }
+            let engine = test_plan::engine(idx, config, vec![9100], entry);
             let result = engine
                 .execute_range_promql_modern(query, 30_000, 60_000, 30_000)
                 .await;
             assert!(
                 matches!(result, Err(EngineError::CapabilityMiss { .. })),
-                "missing first pane must route the entire request to archive: {result:?}"
+                "a missing first pane must fail closed with a CapabilityMiss: {result:?}"
             );
         }
     }
