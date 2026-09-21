@@ -456,8 +456,7 @@ mod tests {
     async fn router_dispatches_to_asap_tier_for_sketch_metrics() {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
-        let (archive, archive_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        let (archive, archive_calls) = StubEngine::new(StorageBackend::DoubleWrite, Outcome::Ok);
         router.register(warm);
         router.register(archive);
 
@@ -478,11 +477,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_dispatches_archive_spelled_metrics_to_the_sketch_tier() {
+    async fn router_dispatches_double_write_metrics_to_the_sketch_tier() {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
-        let (gorilla, gorilla_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        let (gorilla, gorilla_calls) = StubEngine::new(StorageBackend::DoubleWrite, Outcome::Ok);
         router.register(warm);
         router.register(gorilla);
 
@@ -490,15 +488,14 @@ mod tests {
             .execute(
                 "sum_over_time(audit_events[1h])",
                 Statistic::Sum,
-                StorageBackend::GorillaObjectStore,
+                StorageBackend::DoubleWrite,
             )
             .await;
         assert!(result.is_ok());
         assert_eq!(
             warm_calls.load(Ordering::SeqCst),
             1,
-            "#746: the GorillaObjectStore spelling survives in stored plans but \
-             answers from the sketch tier",
+            "#746: every ASAP-managed axis answers from the sketch tier",
         );
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
@@ -515,8 +512,7 @@ mod tests {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) =
             StubEngine::new(StorageBackend::SketchStore, Outcome::CapabilityMiss);
-        let (gorilla, gorilla_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        let (gorilla, gorilla_calls) = StubEngine::new(StorageBackend::DoubleWrite, Outcome::Ok);
         router.register(warm);
         router.register(gorilla);
 
@@ -588,16 +584,15 @@ mod tests {
     async fn engine_by_id_returns_registered_engines_or_none() {
         let mut router = EngineRouter::new();
         let (warm, _) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
-        let (gorilla, gorilla_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        let (gorilla, gorilla_calls) = StubEngine::new(StorageBackend::DoubleWrite, Outcome::Ok);
         router.register(warm);
         router.register(gorilla);
 
         // Hit by id — must return the engine for that backend.
-        let archive = router
-            .engine_by_id("thanos_query")
-            .expect("thanos_query engine registered");
-        let _ = archive.execute("count(foo)").await;
+        let second = router
+            .engine_by_id("double_write")
+            .expect("double_write engine registered");
+        let _ = second.execute("count(foo)").await;
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -610,7 +605,7 @@ mod tests {
         // Iter exposes every registered id.
         let mut ids: Vec<&str> = router.registered_ids().collect();
         ids.sort();
-        assert_eq!(ids, vec!["asap_query", "thanos_query"]);
+        assert_eq!(ids, vec!["asap_query", "double_write"]);
     }
 
     #[tokio::test]
@@ -704,8 +699,7 @@ mod tests {
     async fn router_range_dispatches_to_asap_tier_first() {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
-        let (archive, archive_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        let (archive, archive_calls) = StubEngine::new(StorageBackend::DoubleWrite, Outcome::Ok);
         router.register(warm);
         router.register(archive);
 
@@ -736,8 +730,7 @@ mod tests {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) =
             StubEngine::new(StorageBackend::SketchStore, Outcome::CapabilityMiss);
-        let (archive, archive_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        let (archive, archive_calls) = StubEngine::new(StorageBackend::DoubleWrite, Outcome::Ok);
         router.register(warm);
         router.register(archive);
 
@@ -770,8 +763,7 @@ mod tests {
     async fn router_range_double_write_answers_from_the_sketch_tier() {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
-        let (archive, archive_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        let (archive, archive_calls) = StubEngine::new(StorageBackend::DoubleWrite, Outcome::Ok);
         router.register(warm);
         router.register(archive);
 

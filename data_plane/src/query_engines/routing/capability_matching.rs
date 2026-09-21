@@ -34,10 +34,8 @@ pub use planner_types::types::AccuracyTarget;
 ///   to answer from. A missing engine surfaces as a `NoEngineRegistered`
 ///   503 from the HTTP handler — the correct fail-loud behaviour for a
 ///   misconfigured deploy.
-/// * every ASAP-managed tier (`SketchStore`, `GorillaObjectStore`,
-///   `DoubleWrite`) → `[SketchStore]`: the ASAP tier is the only engine
-///   left. `GorillaObjectStore` survives only as a stored-plan spelling
-///   (#746) and routes here like the rest.
+/// * every ASAP-managed tier (`SketchStore`, `DoubleWrite`) →
+///   `[SketchStore]`: the ASAP tier is the only engine left.
 ///
 /// The `AccuracyTarget` no longer participates: an `Exact` request means
 /// "do not answer from ε/δ-bounded sketches", which the HTTP handler
@@ -52,9 +50,9 @@ pub fn compatible_storage_backends(
         StorageBackend::PrometheusRemote => vec![StorageBackend::PrometheusRemote],
 
         // Every ASAP-managed tier answers from the sketch tier.
-        StorageBackend::SketchStore
-        | StorageBackend::GorillaObjectStore
-        | StorageBackend::DoubleWrite => vec![StorageBackend::SketchStore],
+        StorageBackend::SketchStore | StorageBackend::DoubleWrite => {
+            vec![StorageBackend::SketchStore]
+        }
     }
 }
 
@@ -73,14 +71,9 @@ mod tests {
 
     #[test]
     fn asap_managed_tiers_route_to_the_sketch_tier() {
-        // #746: no archive tier. Every ASAP-managed storage axis — including
-        // the `GorillaObjectStore` spelling that survives in stored plans —
-        // answers from the sketch tier.
-        for cfg in [
-            StorageBackend::SketchStore,
-            StorageBackend::GorillaObjectStore,
-            StorageBackend::DoubleWrite,
-        ] {
+        // #746: no archive tier. Every ASAP-managed storage axis answers
+        // from the sketch tier.
+        for cfg in [StorageBackend::SketchStore, StorageBackend::DoubleWrite] {
             let backends = compatible_storage_backends(Statistic::Quantile, cfg);
             assert_eq!(
                 backends,
@@ -116,7 +109,6 @@ mod tests {
         ];
         let configs = [
             StorageBackend::SketchStore,
-            StorageBackend::GorillaObjectStore,
             StorageBackend::DoubleWrite,
             StorageBackend::PrometheusRemote,
         ];

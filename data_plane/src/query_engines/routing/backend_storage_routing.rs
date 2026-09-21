@@ -447,7 +447,7 @@ impl BackendStorageRouting {
     ///     { "name": "http_requests_total",
     ///       "targets": [
     ///         { "engine": "asap_query" },
-    ///         { "engine": "thanos_query",
+    ///         { "engine": "prometheus_remote",
     ///           "applies_to_query_shape": ["count", "topk", "rate_post_hoc",
     ///                                      "histogram_quantile", "delta", "absent"] }
     ///       ]
@@ -459,8 +459,11 @@ impl BackendStorageRouting {
     /// Engine-name compatibility (control plane → backend `StorageBackend`):
     ///
     /// * `asap_query` → `SketchStore`
-    /// * `thanos_query` → `GorillaObjectStore` storage (no engine
-    ///   registers under it since #746).
+    /// * `double_write` → `DoubleWrite`
+    /// * `prometheus_remote` → `PrometheusRemote`
+    ///
+    /// `thanos_query` is no longer accepted: #746 deleted the archive tier,
+    /// so a plan naming it is rejected like any other unknown engine.
     ///
     /// Unknown query-shape strings are mapped to [`QueryOperatorShape::Other`]
     /// rather than failing the parse — the control plane's vocabulary may
@@ -725,8 +728,7 @@ impl Default for BackendStorageRouting {
 }
 
 /// Map a JSON `engine` string into a backend `StorageBackend` variant.
-/// Only the two public query engine ids are accepted:
-/// `asap_query` and `thanos_query`.
+/// `thanos_query` is rejected since #746 removed the archive tier.
 /// `unknown_engine` returns an error so a typo doesn't silently turn
 /// into a default-routing footgun.
 fn parse_engine_string(s: &str) -> Result<StorageBackend> {
@@ -1032,33 +1034,30 @@ mod tests {
         let yaml = r#"
 default: sketch_store
 metrics:
-  http_requests_total: gorilla_object_store
-  audit_events: gorilla_object_store
+  http_requests_total: double_write
+  audit_events: double_write
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
-        assert_eq!(
-            r.lookup("http_requests_total"),
-            StorageBackend::GorillaObjectStore
-        );
-        assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaObjectStore);
+        assert_eq!(r.lookup("http_requests_total"), StorageBackend::DoubleWrite);
+        assert_eq!(r.lookup("audit_events"), StorageBackend::DoubleWrite);
         assert_eq!(r.lookup("unlisted"), StorageBackend::SketchStore);
         assert_eq!(r.len(), 2);
     }
 
     #[test]
     fn yaml_default_only_routes_all_metrics_to_default() {
-        let yaml = "default: gorilla_object_store\n";
+        let yaml = "default: double_write\n";
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
-        assert_eq!(r.lookup("anything"), StorageBackend::GorillaObjectStore);
+        assert_eq!(r.lookup("anything"), StorageBackend::DoubleWrite);
         assert!(r.is_empty());
-        assert_eq!(r.default_backend(), StorageBackend::GorillaObjectStore);
+        assert_eq!(r.default_backend(), StorageBackend::DoubleWrite);
     }
 
     #[test]
     fn yaml_omitted_default_falls_back_to_asap_query() {
-        let yaml = "metrics:\n  foo: gorilla_object_store\n";
+        let yaml = "metrics:\n  foo: double_write\n";
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
-        assert_eq!(r.lookup("foo"), StorageBackend::GorillaObjectStore);
+        assert_eq!(r.lookup("foo"), StorageBackend::DoubleWrite);
         assert_eq!(r.lookup("bar"), StorageBackend::SketchStore);
     }
 
@@ -1088,29 +1087,29 @@ routes:
   - metric: http_requests_total
     targets:
       - backend: sketch_store
-      - backend: gorilla_object_store
+      - backend: double_write
         applies_to_query_shape: [count, topk, rate_post_hoc]
   - metric: http_freshness_probe_warm
     targets:
       - backend: sketch_store
   - metric: http_freshness_probe_archive
     targets:
-      - backend: gorilla_object_store
+      - backend: double_write
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
 
         // Count + topk + rate_post_hoc → archive.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::Count),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::Topk),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::RatePostHoc),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
 
         // Quantile + sum_over_time + everything else → warm.
@@ -1140,7 +1139,7 @@ routes:
                 "http_freshness_probe_archive",
                 QueryOperatorShape::LastOverTime
             ),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
     }
 
@@ -1150,7 +1149,7 @@ routes:
         // to the same backend (no dual-routing).
         let yaml = r#"
 metrics:
-  audit_events: gorilla_object_store
+  audit_events: double_write
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         for shape in [
@@ -1162,8 +1161,8 @@ metrics:
         ] {
             assert_eq!(
                 r.lookup_with_shape("audit_events", shape),
-                StorageBackend::GorillaObjectStore,
-                "shape={shape:?} must resolve to thanos_query (single-target)",
+                StorageBackend::DoubleWrite,
+                "shape={shape:?} must resolve to double_write (single-target)",
             );
         }
     }
@@ -1175,12 +1174,12 @@ metrics:
         let yaml = r#"
 default: sketch_store
 metrics:
-  http_requests_total: gorilla_object_store
+  http_requests_total: double_write
 routes:
   - metric: http_requests_total
     targets:
       - backend: sketch_store
-      - backend: gorilla_object_store
+      - backend: double_write
         applies_to_query_shape: [count]
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
@@ -1192,7 +1191,7 @@ routes:
         // Count → archive.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::Count),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         // The `metrics:` entry was overridden by the multi-target
         // `routes:` entry (the single-target archive vanished).
@@ -1220,7 +1219,7 @@ routes:
             "x".to_string(),
             vec![
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![QueryOperatorShape::Count],
                 ),
                 RoutingTarget::for_shapes(
@@ -1234,7 +1233,7 @@ routes:
         // backend.
         assert_eq!(
             r.lookup_with_shape("x", QueryOperatorShape::Quantile),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
     }
 
@@ -1311,7 +1310,7 @@ routes:
                     "targets": [
                         { "engine": "asap_query" },
                         {
-                            "engine": "thanos_query",
+                            "engine": "double_write",
                             "applies_to_query_shape": [
                                 "histogram_quantile", "delta", "deriv",
                                 "absent", "rate_post_hoc", "count"
@@ -1325,7 +1324,7 @@ routes:
                     "targets": [
                         { "engine": "asap_query" },
                         {
-                            "engine": "thanos_query",
+                            "engine": "double_write",
                             "applies_to_query_shape": [
                                 "histogram_quantile", "delta", "absent",
                                 "rate_post_hoc", "topk", "count"
@@ -1347,15 +1346,15 @@ routes:
         // quantile / sum / topk → warm.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::HistogramQuantile),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::Delta),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::Count),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::Quantile),
@@ -1383,7 +1382,7 @@ routes:
                     "targets": [
                         { "engine": "asap_query" },
                         {
-                            "engine": "thanos_query",
+                            "engine": "double_write",
                             "applies_to_query_shape": ["some_future_shape", "count"]
                         }
                     ]
@@ -1395,11 +1394,11 @@ routes:
         // to QueryOperatorShape::Other (silently — forward-compat).
         assert_eq!(
             r.lookup_with_shape("x", QueryOperatorShape::Count),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             r.lookup_with_shape("x", QueryOperatorShape::Other),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
     }
 
@@ -1451,10 +1450,12 @@ routes:
         assert_eq!(r.default_backend(), StorageBackend::SketchStore);
     }
 
+    /// #746 deleted the archive tier. A stale plan still naming
+    /// `thanos_query` must be rejected outright rather than silently
+    /// resolving to some other tier — a typo'd engine and a removed engine
+    /// fail the same way.
     #[test]
-    fn json_payload_back_compat_thanos_query_alias() {
-        // An older deploy might emit the YAML's vocabulary instead of
-        // `thanos_query`; both must parse and resolve the same.
+    fn json_payload_rejects_the_removed_thanos_query_engine() {
         let value = serde_json::json!({
             "default_engine": "asap_query",
             "metrics": [{
@@ -1464,8 +1465,12 @@ routes:
                 ]
             }]
         });
-        let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
-        assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaObjectStore);
+        let err = BackendStorageRouting::from_json_payload(&value)
+            .expect_err("thanos_query must not parse");
+        assert!(
+            err.to_string().contains("thanos_query"),
+            "the error must name the offending engine; got {err}",
+        );
     }
 
     /// the control plane's Mode 3
@@ -1503,7 +1508,7 @@ routes:
     fn replace_swaps_table_in_place() {
         let mut r = BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
-            HashMap::from([("old_metric".to_string(), StorageBackend::GorillaObjectStore)]),
+            HashMap::from([("old_metric".to_string(), StorageBackend::DoubleWrite)]),
         );
         let new = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
         r.replace(new);
@@ -1511,7 +1516,7 @@ routes:
         assert_eq!(r.lookup("old_metric"), StorageBackend::SketchStore);
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryOperatorShape::HistogramQuantile),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
     }
 
@@ -1527,7 +1532,7 @@ routes:
         assert_eq!(snap.len(), 2);
         assert_eq!(
             snap.lookup_with_shape("http_requests_total", QueryOperatorShape::Delta),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
     }
 
@@ -1541,7 +1546,7 @@ routes:
                 let mut metrics = HashMap::new();
                 metrics.insert(
                     format!("metric_{i}"),
-                    vec![RoutingTarget::always(StorageBackend::GorillaObjectStore)],
+                    vec![RoutingTarget::always(StorageBackend::DoubleWrite)],
                 );
                 let new = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
                 writer_hr.swap(new);
@@ -1635,7 +1640,7 @@ routes:
         let yaml = r#"
 default: sketch_store
 metrics:
-  http_requests_total: gorilla_object_store
+  http_requests_total: double_write
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.tenant(), DEFAULT_TENANT);
@@ -1647,7 +1652,7 @@ metrics:
 tenant: tenant-b
 default: sketch_store
 metrics:
-  http_requests_total: gorilla_object_store
+  http_requests_total: double_write
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.tenant(), "tenant-b");
@@ -1661,38 +1666,29 @@ metrics:
         // Push tenant-a's table.
         let table_a = BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
-            HashMap::from([("metric_a".to_string(), StorageBackend::GorillaObjectStore)]),
+            HashMap::from([("metric_a".to_string(), StorageBackend::DoubleWrite)]),
         );
         hr.swap_tenant("tenant-a", table_a);
         // Push tenant-b's table.
         let table_b = BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
-            HashMap::from([("metric_b".to_string(), StorageBackend::GorillaObjectStore)]),
+            HashMap::from([("metric_b".to_string(), StorageBackend::DoubleWrite)]),
         );
         hr.swap_tenant("tenant-b", table_b);
 
         // Replace tenant-a only.
         let table_a_v2 = BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
-            HashMap::from([(
-                "metric_a_v2".to_string(),
-                StorageBackend::GorillaObjectStore,
-            )]),
+            HashMap::from([("metric_a_v2".to_string(), StorageBackend::DoubleWrite)]),
         );
         hr.swap_tenant("tenant-a", table_a_v2);
 
         // tenant-a now reflects v2; tenant-b is unchanged.
         let snap_a = hr.snapshot_for_tenant("tenant-a");
         assert_eq!(snap_a.lookup("metric_a"), StorageBackend::SketchStore);
-        assert_eq!(
-            snap_a.lookup("metric_a_v2"),
-            StorageBackend::GorillaObjectStore
-        );
+        assert_eq!(snap_a.lookup("metric_a_v2"), StorageBackend::DoubleWrite);
         let snap_b = hr.snapshot_for_tenant("tenant-b");
-        assert_eq!(
-            snap_b.lookup("metric_b"),
-            StorageBackend::GorillaObjectStore
-        );
+        assert_eq!(snap_b.lookup("metric_b"), StorageBackend::DoubleWrite);
         assert_eq!(snap_b.lookup("metric_a_v2"), StorageBackend::SketchStore);
     }
 
@@ -1704,24 +1700,18 @@ metrics:
         // Default tenant has an explicit override.
         let default_table = BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
-            HashMap::from([(
-                "shared_metric".to_string(),
-                StorageBackend::GorillaObjectStore,
-            )]),
+            HashMap::from([("shared_metric".to_string(), StorageBackend::DoubleWrite)]),
         );
         hr.swap_tenant(DEFAULT_TENANT, default_table);
 
         // Unknown tenant: fallback to default's table.
         let snap = hr.snapshot_for_tenant("nonexistent-tenant");
-        assert_eq!(
-            snap.lookup("shared_metric"),
-            StorageBackend::GorillaObjectStore,
-        );
+        assert_eq!(snap.lookup("shared_metric"), StorageBackend::DoubleWrite,);
         // Default tenant: same answer.
         let snap_default = hr.snapshot_for_tenant(DEFAULT_TENANT);
         assert_eq!(
             snap_default.lookup("shared_metric"),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
     }
 
@@ -1733,7 +1723,7 @@ metrics:
         let hr = HotReloadBackendStorageRouting::empty();
         let mut table = BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
-            HashMap::from([("m".to_string(), StorageBackend::GorillaObjectStore)]),
+            HashMap::from([("m".to_string(), StorageBackend::DoubleWrite)]),
         );
         table = table.with_tenant("WRONG-TENANT");
         hr.swap_tenant("right-tenant", table);

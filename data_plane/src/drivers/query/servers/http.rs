@@ -4106,7 +4106,7 @@ aggregations:
         let (gorilla, gorilla_calls) =
             MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
             vec![gorilla as Arc<dyn QueryEngine>],
         )
         .await;
@@ -4219,7 +4219,7 @@ aggregations:
             }
         }
         let server_port = setup_test_server_with_router(
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
             vec![Arc::new(ExactStub) as Arc<dyn QueryEngine>],
         )
         .await;
@@ -4266,7 +4266,7 @@ aggregations:
         let (warm_ok, warm_calls) =
             MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let (archive, archive_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::Backend);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::Backend);
         let server_port = setup_test_server_with_router(
             StorageBackend::DoubleWrite,
             vec![
@@ -4321,7 +4321,7 @@ aggregations:
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
@@ -4364,7 +4364,7 @@ aggregations:
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
@@ -4402,7 +4402,7 @@ aggregations:
         // through the router, which lands them on the sketch tier since
         // #746 removed the archive engine.
         let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
             std::collections::HashMap::new(),
         );
         let (gorilla, gorilla_calls) =
@@ -4448,7 +4448,7 @@ aggregations:
             vec![
                 RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![
                         QueryOperatorShape::Count,
                         QueryOperatorShape::Topk,
@@ -4501,7 +4501,7 @@ aggregations:
             vec![
                 RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![
                         QueryOperatorShape::Count,
                         QueryOperatorShape::Topk,
@@ -4578,7 +4578,7 @@ aggregations:
         };
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
 
         // Dual-routing for `metric_warm`: quantiles → warm, count →
         // archive. Without the header the test query routes to warm.
@@ -4591,7 +4591,7 @@ aggregations:
                     vec![QueryOperatorShape::Quantile],
                 ),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![QueryOperatorShape::Count],
                 ),
             ],
@@ -4606,7 +4606,7 @@ aggregations:
         // to archive via the header.
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .header(ENGINE_OVERRIDE_HEADER, "thanos_query")
+            .header(ENGINE_OVERRIDE_HEADER, "double_write")
             .query(&[
                 ("query", "quantile_over_time(0.5, metric_warm[1m])"),
                 ("time", "1700000000"),
@@ -4620,7 +4620,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "double_write");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -4638,7 +4638,7 @@ aggregations:
         };
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
 
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
@@ -4649,7 +4649,7 @@ aggregations:
                     vec![QueryOperatorShape::Quantile],
                 ),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![QueryOperatorShape::Count],
                 ),
             ],
@@ -4690,7 +4690,7 @@ aggregations:
     #[tokio::test]
     async fn http_engine_override_query_param_routes_to_named_engine() {
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
 
         let server_port = setup_test_server_with_router(
             StorageBackend::SketchStore,
@@ -4704,14 +4704,14 @@ aggregations:
             .query(&[
                 ("query", "sum_over_time(foo[5m])"),
                 ("time", "1700000000"),
-                (ENGINE_OVERRIDE_QUERY_PARAM, "thanos_query"),
+                (ENGINE_OVERRIDE_QUERY_PARAM, "double_write"),
             ])
             .send()
             .await
             .expect("Failed to send request");
         assert!(resp.status().is_success(), "query-param override must 2xx");
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "double_write");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -4754,7 +4754,7 @@ aggregations:
     #[tokio::test]
     async fn http_engine_override_post_header_routes_to_named_engine() {
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
             StorageBackend::SketchStore,
             vec![gorilla as Arc<dyn QueryEngine>],
@@ -4765,7 +4765,7 @@ aggregations:
         let form_body = "query=sum_over_time(foo%5B5m%5D)&time=1700000000";
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .header(ENGINE_OVERRIDE_HEADER, "thanos_query")
+            .header(ENGINE_OVERRIDE_HEADER, "double_write")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body)
             .send()
@@ -4777,7 +4777,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "double_write");
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -4825,7 +4825,7 @@ aggregations:
                     "targets": [
                         { "engine": "asap_query" },
                         {
-                            "engine": "thanos_query",
+                            "engine": "double_write",
                             "applies_to_query_shape": [
                                 "histogram_quantile", "delta", "absent",
                                 "rate_post_hoc", "count"
@@ -5099,7 +5099,7 @@ aggregations:
                 "http_requests_total",
                 crate::storage_engines::types::QueryOperatorShape::Count,
             ),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             snap.lookup_with_shape(
