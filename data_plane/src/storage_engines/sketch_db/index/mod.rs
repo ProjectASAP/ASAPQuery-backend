@@ -14,7 +14,7 @@
 //! exist when an agent registers a pre-merge identity that the gateway
 //! folds into a different (post-merge) identity before backend ever sees
 //! the sketch payload. Query path treats ghost sids as ASAP-tier MISS
-//! and falls through to Thanos archive.
+//! and reports a capability miss (the HTTP layer forwards those).
 //!
 //! See design doc §4.6 ("OTLP metadata model + backend store layout") at
 //! `docs/design_docs/series-identity.md`.
@@ -630,7 +630,7 @@ pub struct SketchStore {
     item_labels: RwLock<HashMap<u64, String>>,
     /// sid → per-sid columnar storage. Empty `SidStoreData` (or absent
     /// key) for ghost sids — query path detects this and falls through
-    /// to Thanos archive.
+    /// as a capability miss.
     series: DashMap<u64, SidStore>,
     /// Derived rollup categories over canonical SummaryStore panes.
     rollups: Rollups,
@@ -725,7 +725,7 @@ pub struct PersistenceReadHandle {
 /// Query path uses this enum to drive routing decisions:
 /// - `Hit`: ASAP-tier sketch has data — evaluate.
 /// - `Ghost`: backend knows the identity (metadata is present) but no
-///   sketch state ever arrived under this sid — fall through to Thanos
+///   sketch state ever arrived under this sid — capability miss
 ///   for raw archive. See design doc §5.4 ("Ghost sids").
 /// - `Unknown`: sid not registered. Sender's cache is stale; respond
 ///   with `unknown_series_ids` so sender re-emits with attributes.

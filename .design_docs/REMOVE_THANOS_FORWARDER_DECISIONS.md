@@ -1,6 +1,8 @@
 # Remove `ASAP_THANOS_QUERY_URL` and the Thanos forwarder — scoping decisions
 
-Issue: #746. Status: **pending approval** — scoping complete, no implementation started.
+Issue: #746. Status: **implemented, pending review** — the decisions below were
+agreed before implementation; the series that carries them out is the 6 commits
+on this branch.
 
 ## Background
 
@@ -193,9 +195,17 @@ always gets `NoDataArchiveEngine` (empty results), or nothing (503) when
   from the router meant `Exact` range queries would otherwise have been answered
   from sketches. `process_range_query_request` now forwards them the same way
   the instant path does (`forward_range_to_fallback`).
-- **Commit count: 5, not 6.** Q7's accuracy change is one branch in the same
-  dispatch edit as Q5/Q6, so splitting it into its own commit would have meant a
-  commit that only moved a line. Q12's order is otherwise unchanged.
+- **Commit order changed.** Q7's accuracy change landed inside the Q5/Q6
+  dispatch commit (splitting it would have meant a commit that only moved a
+  line), and the control-plane change (Q8) moved *earlier* — before the id
+  removal (Q10/Q11). Otherwise no commit in the series would emit plans that
+  the same commit's backend rejects. Final order:
+  1. delete the Thanos forwarder + env vars (Q1, Q3, Q4)
+  2. remove data-plane archive routing, incl. the accuracy header (Q5, Q6, Q7, Q9)
+  3. control plane stops emitting `thanos_query` targets (Q8)
+  4. remove the archive engine slot: stub + ASAP-engine stitch (Q10)
+  5. drop the `GorillaObjectStore` axis and `thanos_query` id (Q10, Q11)
+  6. delete the dead cold counters, refresh stale comments + the merger doc
 
 ## Out of scope
 

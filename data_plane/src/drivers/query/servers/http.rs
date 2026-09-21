@@ -36,9 +36,8 @@ use asap_types::Statistic;
 /// (Fix 1) for the design rationale.
 ///
 /// Recognised values match `StorageBackend::data_source_id()` —
-/// `asap_query`, `thanos_query`, `double_write`. (Step-1 of
-/// the JSONL deprecation removed the `cold_jsonl` value.) An
-/// unknown value returns 400.
+/// `asap_query`, `double_write`, `prometheus_remote`. An unknown
+/// value returns 400.
 pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
 pub const ENGINE_OVERRIDE_QUERY_PARAM: &str = "engine";
 /// Per-request accuracy contract. `exact` routes ASAP-managed metrics directly
@@ -185,8 +184,8 @@ pub struct HttpServer {
     /// names and answers from RAM. The same cache is fed by the OTLP
     /// receiver — see `OtlpReceiver::with_probe_cache`. `None`
     /// disables the short-circuit; the dispatch falls through to the
-    /// normal routing-table path (which goes to Thanos for the cold
-    /// archive and observes the 60–90 s flush gap).
+    /// normal routing-table path, which observes the warm tier's
+    /// 60–90 s flush gap.
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     /// Serializes multi-document physical-plan publication so two control
     /// plane generations cannot interleave their plan projections and catalog.
@@ -702,10 +701,8 @@ async fn process_query_request(
     //
     // If the caller explicitly named an engine (via `X-ASAP-Engine`
     // header or `?engine=` query param) bypass `BackendStorageRouting`
-    // and dispatch directly. The accuracy reducer relies on this to
-    // ask the same PromQL against the warm sketch (`asap_query`) and
-    // the Gorilla archive (`thanos_query`) so it can compute
-    // apples-to-apples relative error per replay row.
+    // and dispatch directly — the accuracy reducer uses this to pin one
+    // engine per replay row.
     if let Some(override_id) = engine_override.as_deref() {
         return process_via_named_engine(state, parsed_request, start_time, override_id).await;
     }
@@ -788,9 +785,8 @@ async fn process_query_request(
     //       `backend-storage-routing.yaml` at startup). The PromQL
     //       query is parsed; the metric name is extracted from the
     //       AST and looked up in the table. This is the production
-    //       path the issue-46 MVP relies on so cold-archive metrics
-    //       (e.g. `http_requests_total` → `thanos_query`) actually
-    //       route through the `EngineRouter`.
+    //       path the issue-46 MVP relies on so non-default metrics
+    //       actually route through the `EngineRouter`.
     //   (b) Single-axis `StreamingConfig::storage_backend()` from the
     //       hot-reload config (the pre-Phase-5 fallback). Pre-control-plane
     //       deploys ride this path; it always lands on `SketchStore`
@@ -2133,15 +2129,11 @@ async fn process_range_query_request(
     );
 
     // ASAP-first centralization refactor — the range path is now a
-    // thin transport layer. All engine-selection / failover lives in
+    // thin transport layer. Engine selection lives in
     // `EngineRouter::execute_range`, which walks the shared
-    // `compatible_storage_backends` policy table:
-    //   * `accuracy == Exact`  → archive only (thanos_query)
-    //   * otherwise            → ASAP-tier (asap_query) first, fall
-    //                            back to the archive on CapabilityMiss.
-    // The handler no longer reaches into `query_engine` /
-    // `engine_by_id` to do its own Thanos lookup; it just resolves the
-    // metric's storage axis and hands the range request to the router.
+    // `compatible_storage_backends` policy table. Since #746 that table
+    // has one ASAP-managed answer (the sketch tier); a CapabilityMiss
+    // forwards to the Prometheus fallback rather than to another tier.
     let start_ms = (parsed_request.start * 1000.0) as u64;
     let end_ms = (parsed_request.end * 1000.0) as u64;
     let step_ms = (parsed_request.step * 1000.0) as u64;
@@ -4314,7 +4306,7 @@ aggregations:
         // Production path: streaming-config single axis stays on
         // `SketchStore` (the YAML loader's default), but the
         // per-metric routing table flips `http_requests_total` to
-        // `thanos_query`. The handler must extract the metric name
+        // a non-default axis. The handler must extract the metric name
         // from the PromQL AST, look it up, and dispatch through the
         // EngineRouter. Since #746 that archive spelling resolves to the
         // sketch tier, so the response carries `data_source: asap_query`.
@@ -4398,7 +4390,7 @@ aggregations:
     #[tokio::test]
     async fn http_production_path_default_axis_routes_all_metrics() {
         // Routing table with no per-metric overrides but a non-default
-        // top-level `default: thanos_query` — every metric must route
+        // top-level non-sketch `default` — every metric must route
         // through the router, which lands them on the sketch tier since
         // #746 removed the archive engine.
         let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
@@ -4685,7 +4677,7 @@ aggregations:
         );
     }
 
-    /// Query-param fallback: `?engine=thanos_query` overrides the
+    /// Query-param fallback: `?engine=double_write` overrides the
     /// routing table when the header is absent.
     #[tokio::test]
     async fn http_engine_override_query_param_routes_to_named_engine() {

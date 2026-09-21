@@ -1,7 +1,16 @@
 # Gorilla Merger — design (Go, co-located; Thanos-Receive pattern)
 
-Status: draft for review. Supersedes the GORILLA1 compactor direction AND the
-earlier Model-A (finalizer-on-cut, accept-the-lag) variant.
+Status: **read path removed from the backend (#746).** The write path below
+still describes `gorilla-merger/` as built. The backend-side read path does
+NOT exist any more: #746 deleted `ThanosQueryEngine`, the `thanos_query`
+engine id and all archive routing, so the backend cannot query the merger's
+blocks. Reviving this design means restoring that engine from git history
+(`git show 44653cc9:data_plane/src/query_engines/thanos_query_engine/`) and
+re-adding an archive tier to the routing policy. Queries the sketch tier
+cannot answer now go to the backend's Prometheus fallback instead.
+
+Otherwise: draft for review. Supersedes the GORILLA1 compactor direction AND
+the earlier Model-A (finalizer-on-cut, accept-the-lag) variant.
 
 ## Goal
 
@@ -28,8 +37,9 @@ Small CPU/mem/disk where possible.
   via `thanos store.TSDBStore`, with a `thanos shipper` uploading cut blocks to
   S3. "Thanos Receive with an XOR-fragment frontend instead of remote-write."
 - **Union via thanos-query.** thanos-query fans out to the merger's StoreAPI
-  (<2h pending) + thanos-store-gateway (≥2h S3). The backend's existing
-  `ThanosQueryEngine` (HTTP-forward to thanos-query) is UNCHANGED.
+  (<2h pending) + thanos-store-gateway (≥2h S3). This assumed the backend's
+  `ThanosQueryEngine` would forward to thanos-query — **removed in #746**, so
+  nothing in the backend reads this union today.
 - **GORILLA1 is superseded** and slated for deletion (the codebase's own "Phase
   δ" legacy-leg removal; task #30).
 
@@ -53,7 +63,7 @@ thanos-query  fan-out + union ────────────────�
    ├─ merger StoreAPI         (recent, <2h pending)                               │
    └─ thanos-store-gateway ── S3 TSDB blocks (≥2h) ◀──────────────────────────────┘
 
-ASAP fallback PromQL ─▶ ThanosQueryEngine (forward.rs, UNCHANGED) ─▶ thanos-query ─▶ union
+ASAP fallback PromQL ─▶ (ThanosQueryEngine: DELETED in #746) ─▶ thanos-query ─▶ union
 ```
 
 ## Wire contract (shared codec, task #31)
@@ -122,18 +132,22 @@ with `cmd/gorilla-merger/main.go`.
 - Disk: WAL + the not-yet-shipped block(s); bounded by ship cadence + retention.
 - S3: ONE PUT per 2h block (the explicit goal).
 
-## Read path — UNCHANGED in the backend
+## Read path — REMOVED from the backend (#746)
 
-`ThanosQueryEngine` (`data_plane/.../thanos_query_engine/forward.rs`) HTTP-
-forwards archive PromQL to thanos-query (`ASAP_THANOS_QUERY_URL`, default
-`http://thanos-query:10903`). thanos-query unions merger-StoreAPI + store-
-gateway. The legacy `GorillaS3Store` (GORILLA1) leg is deleted in Phase δ (#30).
-Recency for warm/sketch queries is still served by the warm tier; the freshness
-probe cache is unaffected.
+As designed, `ThanosQueryEngine` (`data_plane/.../thanos_query_engine/forward.rs`)
+HTTP-forwarded archive PromQL to thanos-query (`ASAP_THANOS_QUERY_URL`, default
+`http://thanos-query:10903`), which unioned merger-StoreAPI + store-gateway.
+
+That engine, the env var and the whole archive routing path were deleted in
+#746: nothing set the env var, so the forwarder never ran in any deploy or CI
+job. Queries the sketch tier cannot answer now forward to the backend's
+Prometheus fallback (`--prometheus-server`). Recency for warm/sketch queries is
+still served by the warm tier; the freshness probe cache is unaffected.
 
 ## Cleanup (Track 3)
-- Rewire `main.rs` archive selection to Path A2 (set `ASAP_THANOS_QUERY_URL`);
-  delete legacy `GorillaS3Store` leg (#30).
+- ~~Rewire `main.rs` archive selection to Path A2 (set `ASAP_THANOS_QUERY_URL`)~~
+  — obsolete: #746 removed the archive selection entirely.
+- Delete legacy `GorillaS3Store` leg (#30).
 - Delete GORILLA1: Go encoder (`gorilla.go` Build*/EncodeSeriesBody + bit
   encoders), Rust store/decoder, abandoned `compactor.rs`, stale strings (#30).
 - Retire `gateway_fragment` OTel role (#27).

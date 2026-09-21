@@ -78,7 +78,7 @@ pub trait QueryEngine: Send + Sync {
     ///
     /// Params are milliseconds since epoch. The default returns `CapabilityMiss`
     /// so existing impls need not change; override when the engine has native
-    /// range-query support (e.g. Thanos, or the ASAP-tier reducer).
+    /// range-query support (e.g. the ASAP-tier reducer).
     async fn execute_range(
         &self,
         query: &str,
@@ -175,7 +175,7 @@ impl EngineRouter {
     /// capability matrix entirely — the caller has explicitly named the
     /// engine and accepts the consequences. Used by the accuracy
     /// reducer to query the same PromQL against the warm sketch and
-    /// the Gorilla archive on MinIO so it can compute apples-to-apples
+    /// a second named engine so it can compute apples-to-apples
     /// relative error.
     pub fn engine_by_id(&self, data_source_id: &str) -> Option<&Arc<dyn QueryEngine>> {
         self.engines.get(data_source_id)
@@ -212,7 +212,7 @@ impl EngineRouter {
 
     /// Instant dispatch that also returns the canonical id of the engine that
     /// answered. HTTP callers use this to report truthful provenance after a
-    /// warm-to-archive routing decision.
+    /// routing decision.
     pub async fn execute_routed(
         &self,
         query: &str,

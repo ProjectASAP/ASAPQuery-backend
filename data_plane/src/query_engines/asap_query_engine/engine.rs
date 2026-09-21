@@ -79,8 +79,8 @@ pub struct ASAPQueryEngine {
     /// ASAP-tier sketch index. When `Some`, the trait's
     /// `execute` adapter classifies the query's metric/group-by against
     /// the index and short-circuits to `EngineError::CapabilityMiss` when
-    /// no ASAP-tier identity covers the request — driving the
-    /// EngineRouter's archive failover. When `None`, the
+    /// no ASAP-tier identity covers the request, which the HTTP layer
+    /// forwards to the Prometheus fallback. When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
     summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
