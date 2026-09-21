@@ -152,56 +152,15 @@ fn build_routing_entry(metric_name: &str, algorithms: &[SketchAlgorithm]) -> Jso
         warm_shapes.push("max");
     }
 
-    // Archive-eligible shapes — Thanos / cold archive answers these
-    // because no ASAP-tier sketch can.
-    //
-    // Classification rule (surprised-me bullet for the report): `topk`
-    // and `count` route to archive only when NO matching sketch was
-    // planned. With Count-Sketch the ASAP tier answers `topk` via the
-    // CountSketch's heap-augmented Estimate; with HLL the ASAP tier
-    // answers `count` via the cardinality estimate. Pruning the
-    // archive's claim list is what makes Phase α a planner-driven
-    // routing table rather than a static "everything goes to archive"
-    // failover.
-    let mut archive_shapes: Vec<&'static str> = Vec::new();
-    archive_shapes.push("histogram_quantile");
-    archive_shapes.push("delta");
-    archive_shapes.push("deriv");
-    archive_shapes.push("absent");
-    archive_shapes.push("rate_post_hoc");
-    if !has_count_sketch {
-        archive_shapes.push("topk");
-    }
-    if !has_hll && !has_cms {
-        archive_shapes.push("count");
-    }
-
-    // Emit the ASAP-tier default slot first (no filter — catches every
-    // shape the archive doesn't claim), then the archive slot with the
-    // explicit-shape claim list. Ordering matches the existing
-    // `deploy/configs/backend-storage-routing.yaml` convention. The
-    // backend's `lookup_with_shape` is two-pass: explicit-shape match
-    // wins (so `count` / `topk` / etc. land on archive when listed
-    // there), default slot otherwise (so `quantile` / `sum` / etc.
-    // land on warm).
-    //
-    // We do NOT attach `applies_to_query_shape` to the warm slot —
-    // attaching it would turn warm into a shape-specific target and
-    // any unanticipated shape (e.g. `LastOverTime` on a metric where
-    // the operator added a probe after planning) would fall through
-    // to the archive's first-target fallback, which is the wrong
-    // failure mode. Warm = default; archive = the specific shapes
-    // archive serves better.
-    let mut targets: Vec<JsonValue> = Vec::new();
-    targets.push(json!({
+    // One target: the ASAP tier, as the unfiltered default slot. #746
+    // deleted the archive tier, so there is no second engine to claim the
+    // shapes the sketches cannot answer — the backend forwards those to its
+    // Prometheus fallback instead. We do NOT attach
+    // `applies_to_query_shape` to this slot: that would make it
+    // shape-specific and leave unanticipated shapes with no target at all.
+    let targets: Vec<JsonValue> = vec![json!({
         "engine": "asap_query",
-    }));
-    if !archive_shapes.is_empty() {
-        targets.push(json!({
-            "engine": "thanos_query",
-            "applies_to_query_shape": archive_shapes,
-        }));
-    }
+    })];
 
     // The warm-shape list is informational — surface it on a side
     // field for operators / tests to spot-check what the controller

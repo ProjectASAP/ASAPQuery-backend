@@ -210,10 +210,19 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_with_explicit_archive_pin() {
-        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_object_store\"}";
+    fn deserialize_with_explicit_double_write_pin() {
+        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"double_write\"}";
         let cfg: StreamingConfig = serde_json::from_str(yaml).expect("Phase-5 decode");
-        assert_eq!(cfg.storage_backend(), StorageBackend::GorillaObjectStore);
+        assert_eq!(cfg.storage_backend(), StorageBackend::DoubleWrite);
+    }
+
+    /// #746 deleted the archive tier; its storage-axis spelling is no longer
+    /// a known variant, so a stale config naming it fails to decode rather
+    /// than silently pinning some other tier.
+    #[test]
+    fn deserialize_rejects_the_removed_archive_axis() {
+        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_object_store\"}";
+        assert!(serde_json::from_str::<StreamingConfig>(yaml).is_err());
     }
 
     #[test]

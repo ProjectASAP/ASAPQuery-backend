@@ -371,8 +371,8 @@ struct Args {
     /// Path to the per-metric backend storage routing YAML
     /// (`{metric_name: storage_backend}` map). Loaded at startup and
     /// consulted by the HTTP query handler on every PromQL request to
-    /// pick the right engine (`ASAPQueryEngine` for ASAP-tier sketches,
-    /// `ThanosQueryEngine` for the cold archive, etc.). Without
+    /// pick the right engine (`ASAPQueryEngine` for ASAP-tier
+    /// sketches). Without
     /// this flag the handler falls back to the streaming-config
     /// single axis (always `SketchStore`) and the EngineRouter is
     /// effectively bypassed — the issue-46 v2 demo's criterion ⑤
@@ -1115,56 +1115,6 @@ async fn main() -> Result<()> {
             active_physical_plan.clone(),
         ),
     );
-
-    // Register the Thanos forwarder when `ASAP_THANOS_QUERY_URL` is configured.
-    // Otherwise use an empty-result archive stub unless
-    // `ASAP_REQUIRE_ARCHIVE_ENGINE=1` requests fail-loud behavior.
-    let mut archive_registered = false;
-    match data_plane::query_engines::thanos_query_engine::thanos_engine_from_env() {
-        Ok(Some(thanos)) => {
-            use data_plane::query_engines::routing::QueryEngine;
-            info!(
-                upstream = thanos.base_url(),
-                "Path A2: registering ThanosQueryEngine for the archive tier (data_source_id=thanos_query)",
-            );
-            let thanos_arc: Arc<dyn QueryEngine> = Arc::new(thanos);
-            server = server.with_archive_query_engine(thanos_arc);
-            archive_registered = true;
-        }
-        Ok(None) => {
-            info!(
-                "ASAP_THANOS_QUERY_URL not configured — router serves ASAP-tier metrics only (set ASAP_THANOS_QUERY_URL to enable Path A2 thanos archive forwarding)",
-            );
-        }
-        Err(e) => {
-            warn!(
-                "ASAP_THANOS_QUERY_URL set but ThanosQueryEngine failed to build ({e}); router will not have an archive engine",
-            );
-        }
-    }
-
-    // No archive engine configured — register a `NoDataArchiveEngine`
-    // stub under `thanos_query` so cold queries succeed
-    // with an empty result. `ASAP_REQUIRE_ARCHIVE_ENGINE=1` opts back
-    // into the original fail-loud (`503 NoEngineRegistered`) behaviour.
-    if !archive_registered {
-        let require_archive = std::env::var("ASAP_REQUIRE_ARCHIVE_ENGINE")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
-        if require_archive {
-            warn!(
-                "ASAP_REQUIRE_ARCHIVE_ENGINE=1 set and no archive engine configured — cold queries will return 503 NoEngineRegistered",
-            );
-        } else {
-            use data_plane::query_engines::routing::QueryEngine;
-            use data_plane::query_engines::NoDataArchiveEngine;
-            info!(
-                "Registering NoDataArchiveEngine stub on the archive slot (canonical data_source_id=thanos_query); set ASAP_REQUIRE_ARCHIVE_ENGINE=1 to disable",
-            );
-            let stub: Arc<dyn QueryEngine> = Arc::new(NoDataArchiveEngine::new());
-            server = server.with_archive_query_engine(stub);
-        }
-    }
 
     if args.persistence_delete_older_than_secs > 0 {
         server = server.with_data_retention_ms(args.persistence_delete_older_than_secs * 1000);
