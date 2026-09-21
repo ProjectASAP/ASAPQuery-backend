@@ -13,7 +13,7 @@ in the serialized API.
 | Selected post-ASAP DAG | Planner-selected computation graph, including summary producers, shared dependencies and query readouts. Called the “semantic DAG” in earlier discussion. |
 | Summary producer | An operation or subgraph that builds summary state. Multiple queries may share its stored output. |
 | `SummaryMaintenanceLifecyclePlan` | Planner result associating a post-ASAP root with deployment decisions for its unique reachable summary producers, plus workload and costing context. |
-| Lifecycle commitment | Selected maintenance promise for one producer, with its scheduling and retention binding. A deployment's `SummaryMaintenanceLifecycleGuarantee` carries the Planner-level commitment. |
+| Selected deployment guarantee and schedule/retention | The selected `SummaryMaintenanceLifecycleGuarantee` for one producer, together with its concrete scheduling and retention binding. This is part of a deployment in `SummaryMaintenanceLifecyclePlan`, not a separate model. |
 | Maintenance | Work that constructs, refreshes or derives stored summary state, including batch rebuilds and incremental updates. |
 | `PrecomputePlan` | Backend executable plan for maintenance and state writes. |
 | `QueryPlan` | Backend executable plan for state reads, query readouts and remaining query operations. |
