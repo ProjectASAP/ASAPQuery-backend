@@ -2264,7 +2264,6 @@ async fn process_range_query_request(
                     )})),
             )
                 .into_response()
-
         }
         Err(EngineRouterError::AllFailed { last }) => {
             use crate::query_engines::EngineError;

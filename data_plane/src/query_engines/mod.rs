@@ -31,7 +31,7 @@ pub use crate::storage_engines::sketch_db::query::timeline_dispatch;
 pub use crate::storage_engines::sketch_db::query::window_merger;
 
 pub use asap_query_engine::ASAPQueryEngine;
-pub use query_forwarding::{QueryForwardingError, QueryForwardingPolicy};
+pub use query_forwarding::QueryForwardingPolicy;
 pub use query_result::{InstantVector, QueryResult, RangeVector, RangeVectorElement, Sample};
 pub use timeline_dispatch::{combine_statistic, CombinedResult};
 pub use window_merger::{create_window_merger, NaiveMerger, WindowMerger};

@@ -13,13 +13,13 @@ Q: What happens when a plan needs an external exact subquery?
 A: Fail closed with the normal protocol-specific unsupported/capability-miss response; never return an empty or partial result.
 
 Q: How is the behavior represented in code?
-A: A centralized forwarding policy with typed errors/enums, not scattered booleans or ad-hoc error strings.
+A: A shared forwarding-policy enum gates adapter fallback and planned exact subqueries.
 
 Q: What is the default?
 A: No flag means existing forwarding behavior is unchanged.
 
 Q: How is it tested?
-A: Request-capturing mocks cover instant and range paths, proving zero external query requests.
+A: A production-process request-capture test covers instant and range paths; CLI validation tests cover conflicting settings.
 
 Q: What observability is required?
-A: Startup INFO announces the mode; blocked attempts emit DEBUG logs and increment a backend/path-labeled counter. Existing protocol response shapes remain unchanged.
+A: Startup INFO announces the mode; blocked HTTP fallbacks and planned exact subqueries emit DEBUG logs and increment a backend/path-labeled counter. Existing protocol response shapes remain unchanged.

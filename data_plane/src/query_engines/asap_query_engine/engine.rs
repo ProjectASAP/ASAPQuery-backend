@@ -249,6 +249,13 @@ impl ASAPQueryEngine {
                 query_id = %entry.query_id,
                 "query forwarding disabled; external exact subquery blocked"
             );
+            crate::drivers::query::servers::metrics::record_query_forwarding_blocked(
+                match entry.language {
+                    asap_types::QueryLanguage::MetricsQl => "victoriametrics",
+                    _ => "prometheus",
+                },
+                "exact_subquery",
+            );
         }
         super::exact_subqueries::prepare_external(
             entry,

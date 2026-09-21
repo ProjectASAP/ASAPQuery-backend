@@ -1484,7 +1484,7 @@ fn setup_logging(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_profile, validate_query_forwarding_configuration, Args};
+    use super::{validate_profile, Args};
     use clap::Parser;
     use data_plane::drivers::AdapterConfig;
 
@@ -1617,7 +1617,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("clickhouse-http-port"));
-
     }
 
     #[test]
