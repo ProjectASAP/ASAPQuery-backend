@@ -80,7 +80,7 @@ Each deployment identifies its `post_asap_node_id` and carries an optional
 window framework. The plan also carries workload demand and costing context.
 Thus the lifecycle plan already refers to the computation DAG; it is not a
 separate query representation, nor is one whole lifecycle plan required per
-producer. A missing guarantee is not an executable maintenance commitment.
+producer. A missing guarantee does not define executable maintenance.
 
 See the Planner
 [lifecycle plan types](https://github.com/ProjectASAP/ASAPPlanner/blob/ba1c4436a3410dc03a133363ab5b75649e70f97a/crates/asap-aware-mapping/src/summary_maintenance_lifecycle.rs)
@@ -95,12 +95,11 @@ decisions together, validates them against backend support, and emits the two
 physical plans plus catalog bindings. A shared producer is maintained once for
 all compatible consumers.
 
-### Lifecycle commitment
+### Selected deployment guarantee and schedule/retention
 
-A **lifecycle commitment** is the selected maintenance promise for one logical
-summary producer in a particular selected plan. This is a design term for the
-selected guarantee and its concrete scheduling/retention binding, not a proposed
-replacement for `SummaryMaintenanceLifecyclePlan`.
+For each logical summary producer, the selected deployment guarantee and its
+schedule/retention specify how the producer's state is built and kept available.
+These are decisions within `SummaryMaintenanceLifecyclePlan`, not another model.
 
 | Field in the example | Definition and constraint |
 | --- | --- |
@@ -109,7 +108,7 @@ replacement for `SummaryMaintenanceLifecyclePlan`.
 | `refresh.every` | Spacing of scheduled evaluation endpoints, not elapsed time after the preceding build finishes. |
 | `refresh.anchor` | Origin of that schedule; `unix_epoch` with `every: 1m` yields UTC minute boundaries. |
 | `retention.completed_state_for` | Minimum duration to retain each completed output snapshot after publication. It is independent of input coverage and raw-data retention. |
-| `implementation` | Backend implementation selected to fulfill this commitment. |
+| `implementation` | Backend implementation selected to fulfill the selected guarantee and schedule/retention. |
 
 For each endpoint `T`, a rebuild reads exactly the logical input interval for
 `T` and publishes state labeled with that coverage. Publication after `T` does
@@ -121,10 +120,10 @@ policy and must not silently change query time semantics.
 
 Planner supplies legal maintenance alternatives. The backend supplies executable
 implementations and evidence; the control plane commits a feasible selection.
-The compiler validates that commitment without silently changing its mode,
-coverage or sharing. A changed commitment is installed through a new plan
-plan version. It need not change the semantic summary definition when only the
-physical maintenance policy changes.
+The compiler validates the selected deployment guarantee and schedule/retention
+without silently changing the mode, coverage or sharing. A changed selection is
+installed through a new plan version. It need not change the semantic summary
+definition when only the physical maintenance policy changes.
 
 ### Backend capability
 
@@ -147,7 +146,8 @@ the corresponding producer is supported.
 **Physical cost evidence** is a scoped estimate or measurement for one
 implementation/configuration and maintenance mode. It is supplied by the backend
 provider and used when comparing feasible alternatives over the same planning
-horizon. It is separate from both capability and the final commitment.
+horizon. It is separate from both capability and the selected deployment
+guarantee and schedule/retention.
 
 An evidence record identifies the implementation, algorithm parameters, mode,
 input range, sample count, group count and execution profile. It declares whether
@@ -168,7 +168,7 @@ sample count or CPU cost.
 Selected computation and lifecycle alternatives
     + backend capabilities: supported combinations
     + scoped cost evidence: resource costs of those combinations
-        -> control-plane commitment per selected producer
+        -> selected deployment guarantee and schedule/retention per producer
         -> physical compiler validation
         -> PrecomputePlan + QueryPlan + catalog bindings
 ```
@@ -217,7 +217,7 @@ query_requirements:
   accuracy: supplied_by_selected_planner_guarantee
   response_latency_ms: 200
 
-lifecycle_commitment:
+selected_deployment:
   producer: build-kll
   implementation: local-kll-batch-v1
   mode: batch_rebuild_from_data_at_rest
@@ -357,7 +357,8 @@ The compiler consumes:
 
 - selected Planner DAG roots and query associations;
 - query accuracy and response requirements;
-- complete lifecycle commitments for the supported backend mode;
+- each selected deployment guarantee and its schedule/retention for the
+  supported backend mode;
 - backend capabilities and concrete implementation evidence;
 - catalog, schema and plan-version inputs.
 

@@ -87,9 +87,9 @@ Fixtures may originate from Collector but must run without a Collector checkout
 or process. Record source revision and schema provenance; use semantic assertions
 when randomized sketch bytes are unstable.
 
-Preserve complete lifecycle commitments from Planner selection. A backend that
-only supports batch construction from data at rest must not infer incremental
-support from recurring query demand.
+Preserve each selected deployment guarantee and its schedule/retention from
+Planner selection. A backend that only supports batch construction from data at
+rest must not infer incremental support from recurring query demand.
 
 ## Stage 2: extract common code
 
