@@ -17,6 +17,9 @@ pub struct AdapterConfig {
 
     /// Whether this adapter may issue query requests to its fallback backend.
     pub query_forwarding_policy: QueryForwardingPolicy,
+
+    /// A fallback was configured but removed by the forwarding policy.
+    pub fallback_blocked_by_policy: bool,
 }
 
 impl std::fmt::Debug for AdapterConfig {
@@ -29,6 +32,10 @@ impl std::fmt::Debug for AdapterConfig {
                 &self.fallback.as_ref().map(|_| "Some(FallbackClient)"),
             )
             .field("query_forwarding_policy", &self.query_forwarding_policy)
+            .field(
+                "fallback_blocked_by_policy",
+                &self.fallback_blocked_by_policy,
+            )
             .finish()
     }
 }
@@ -45,13 +52,17 @@ impl AdapterConfig {
             language,
             fallback,
             query_forwarding_policy: QueryForwardingPolicy::Enabled,
+            fallback_blocked_by_policy: false,
         }
     }
 
     pub fn with_query_forwarding_policy(mut self, policy: QueryForwardingPolicy) -> Self {
         self.query_forwarding_policy = policy;
         if !policy.allows_external_queries() {
+            self.fallback_blocked_by_policy |= self.fallback.is_some();
             self.fallback = None;
+        } else {
+            self.fallback_blocked_by_policy = false;
         }
         self
     }
@@ -108,9 +119,17 @@ mod tests {
         let config = AdapterConfig::prometheus_promql("http://prom:9090".into(), true)
             .with_query_forwarding_policy(QueryForwardingPolicy::Disabled);
         assert!(config.fallback.is_none());
+        assert!(config.fallback_blocked_by_policy);
         assert_eq!(
             config.query_forwarding_policy,
             QueryForwardingPolicy::Disabled
         );
+    }
+
+    #[test]
+    fn disabling_without_a_fallback_does_not_claim_a_blocked_request() {
+        let config = AdapterConfig::prometheus_promql("http://prom:9090".into(), false)
+            .with_query_forwarding_policy(QueryForwardingPolicy::Disabled);
+        assert!(!config.fallback_blocked_by_policy);
     }
 }

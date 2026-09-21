@@ -2036,11 +2036,12 @@ fn query_status_label(response: &Response) -> &'static str {
 }
 
 fn record_disabled_forwarding(state: &AppState, backend: &str, path: &str) {
-    if !state
-        .config
-        .adapter_config
-        .query_forwarding_policy
-        .allows_external_queries()
+    if state.config.adapter_config.fallback_blocked_by_policy
+        && !state
+            .config
+            .adapter_config
+            .query_forwarding_policy
+            .allows_external_queries()
     {
         debug!(
             backend,
