@@ -172,7 +172,7 @@ mod tests {
         let a =
             SummaryCatalog::from_materializations(1, 1, &[raw.clone(), derived.clone()]).unwrap();
         let b = SummaryCatalog::from_materializations(2, 9, &[raw, derived.clone()]).unwrap();
-        assert_eq!(a.materializations, b.materializations);
+        assert_eq!(a.definitions, b.definitions);
         assert_eq!(a.data_descriptors, b.data_descriptors);
         let mut renamed = derived.clone();
         renamed.metric = "output_alias".into();
@@ -325,7 +325,6 @@ mod tests {
                 config.policy_fingerprint(),
                 SummaryDescriptor::from_config(&config).unwrap(),
                 data,
-                config.window_layout
             )]
         )
         .is_err());

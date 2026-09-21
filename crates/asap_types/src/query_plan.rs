@@ -110,7 +110,7 @@ impl QueryPlan {
             ));
         }
         let available = catalog
-            .materializations
+            .definitions
             .keys()
             .copied()
             .map(Into::into)
@@ -119,7 +119,7 @@ impl QueryPlan {
         for entry in self.entries.values() {
             for binding in entry.materialization_bindings() {
                 let identity = catalog
-                    .materializations
+                    .definitions
                     .get(&binding.materialization)
                     .ok_or_else(|| {
                         QueryPlanError::Invalid(
@@ -132,20 +132,9 @@ impl QueryPlan {
                         "zero physical pane duration".into(),
                     ));
                 }
-                if binding.full_window_slide_ms.is_some()
-                    != matches!(
-                        identity.window_layout,
-                        crate::WindowMaterializationLayout::FullWindow
-                    )
-                    || binding.full_window_slide_ms == Some(0)
-                {
+                if binding.full_window_slide_ms == Some(0) {
                     return Err(QueryPlanError::Invalid(
-                        "query storage layout differs from catalog definition".into(),
-                    ));
-                }
-                if binding.pane_origin_ms != identity.pane_origin_ms {
-                    return Err(QueryPlanError::Invalid(
-                        "query pane origin differs from catalog definition".into(),
+                        "query full-window cadence must be nonzero".into(),
                     ));
                 }
             }
@@ -162,7 +151,7 @@ impl QueryPlan {
                         "counter readout must directly consume one catalog materialization".into(),
                     ));
                 };
-                let identity = &catalog.materializations[&binding.materialization];
+                let identity = &catalog.definitions[&binding.materialization];
                 let descriptor = &catalog.summary_descriptors[&identity.summary_descriptor_id];
                 if !matches!(
                     descriptor.fidelity,
@@ -408,6 +397,13 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
+                if binding.state_reference.validate().is_err()
+                    || binding.state_reference.definition_id != binding.materialization
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "read binding has invalid state slot or definition".into(),
+                    ));
+                }
                 if binding.readout_lookback_ms == Some(0) {
                     return Err(QueryPlanError::Invalid(
                         "zero semantic readout lookback".into(),
@@ -444,6 +440,7 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
+    pub state_reference: crate::sds::StateReference,
     /// Complete-window storage advances independently of its stored extent.
     /// None denotes disjoint pane storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]

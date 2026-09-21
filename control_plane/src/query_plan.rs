@@ -1031,6 +1031,9 @@ mod catalog_binding_tests {
                         full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: config.policy_fingerprint().into(),
+                        state_reference: asap_types::sds::StateReference::for_definition(
+                            config.policy_fingerprint().into(),
+                        ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 10_000,
                         pane_origin_ms: Some(0),
@@ -1160,6 +1163,8 @@ mod catalog_binding_tests {
             SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
         let (mut counter_plan, _) = fixture();
         binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
+        binding(&mut counter_plan).state_reference =
+            asap_types::sds::StateReference::for_definition(counter.policy_fingerprint().into());
         as_rate_plan(counter_plan)
             .validate_against_catalog(&counter_catalog)
             .unwrap();
@@ -1202,6 +1207,9 @@ mod tests {
                     Ok(MaterializationBinding {
                         full_window_slide_ms: None,
                         materialization: PolicyFingerprint(7).into(),
+                        state_reference: asap_types::sds::StateReference::for_definition(
+                            PolicyFingerprint(7).into(),
+                        ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
                         pane_origin_ms: Some(0),

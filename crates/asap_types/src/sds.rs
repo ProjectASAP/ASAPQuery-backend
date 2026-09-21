@@ -53,6 +53,39 @@ impl From<SummaryDefinitionId> for crate::PolicyFingerprint {
     }
 }
 
+/// Identity of one producer output within an installed plan version. The
+/// enclosing plan version scopes this value; shared readers use the same slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StateSlotId(pub u64);
+
+/// Typed join key carried by both the writer and every bound reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateReference {
+    pub state_slot_id: StateSlotId,
+    pub definition_id: SummaryDefinitionId,
+}
+
+impl StateReference {
+    pub fn for_definition(definition_id: SummaryDefinitionId) -> Self {
+        Self {
+            state_slot_id: StateSlotId(definition_id.as_u64()),
+            definition_id,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if *self == Self::for_definition(self.definition_id) {
+            Ok(())
+        } else {
+            Err(SdsError(
+                "state slot differs from its definition binding".into(),
+            ))
+        }
+    }
+}
+
 descriptor_id!(SummaryDescriptorId);
 descriptor_id!(DataDescriptorId);
 
@@ -275,6 +308,7 @@ pub enum InstanceLifecycle {
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstance {
     pub instance_id: SummaryInstanceId,
+    pub state_slot_id: StateSlotId,
     #[serde(alias = "materialization_id")]
     pub summary_definition_id: SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
@@ -282,6 +316,10 @@ pub struct SummaryInstance {
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
     pub catalog_generation: CatalogGeneration,
+    /// Original storage generation when an identical state contract is
+    /// explicitly reused by the active plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_from_generation: Option<CatalogGeneration>,
     pub placement: SummaryPlacement,
     pub state_reference: SummaryStateReference,
     pub status: SummaryInstanceStatus,
@@ -292,6 +330,13 @@ pub struct SummaryInstance {
 
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
+        if self.state_slot_id
+            != StateReference::for_definition(self.summary_definition_id).state_slot_id
+        {
+            return Err(SdsError(
+                "summary instance has an invalid state slot".into(),
+            ));
+        }
         if self.time_range.start_ms >= self.time_range.end_ms {
             return Err(SdsError(
                 "summary instance time range must be non-empty".into(),
@@ -309,9 +354,23 @@ impl SummaryInstance {
                 "summary instance placement must be resolved".into(),
             ));
         }
+        let state_generation = if let Some(source) = &self.reused_from_generation {
+            validate_catalog_generation(source)?;
+            if source.plan_id != self.catalog_generation.plan_id
+                || source.plan_version >= self.catalog_generation.plan_version
+            {
+                return Err(SdsError(
+                    "summary instance has invalid reuse provenance".into(),
+                ));
+            }
+            source.plan_version
+        } else {
+            self.catalog_generation.plan_version
+        };
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
+            || self.state_reference.generation != state_generation
         {
             return Err(SdsError(
                 "summary instance has invalid state reference".into(),
@@ -359,6 +418,38 @@ impl ObservedSummaryInventory {
             if instance.observed_at_ms > self.observed_at_ms {
                 return Err(SdsError(
                     "instance observation is newer than inventory".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &crate::summary_catalog::SummaryCatalog,
+    ) -> Result<(), SdsError> {
+        self.validate()?;
+        let generation = catalog
+            .reference()
+            .map_err(|error| SdsError(error.to_string()))?;
+        for instance in self.instances.values() {
+            if instance.catalog_generation != generation {
+                return Err(SdsError(
+                    "summary instance belongs to another plan generation".into(),
+                ));
+            }
+            let definition = catalog
+                .definitions
+                .get(&instance.summary_definition_id)
+                .ok_or_else(|| SdsError("summary instance has no catalog definition".into()))?;
+            if instance.summary_descriptor_id != definition.summary_descriptor_id
+                || instance.data_descriptor_id != definition.data_descriptor_id
+                || instance.state_reference.state_schema_version
+                    != catalog.summary_descriptors[&definition.summary_descriptor_id]
+                        .state_schema_version
+            {
+                return Err(SdsError(
+                    "summary instance differs from its catalog definition".into(),
                 ));
             }
         }
@@ -1201,6 +1292,7 @@ mod tests {
     fn observed_instance(lifecycle: InstanceLifecycle) -> SummaryInstance {
         SummaryInstance {
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
+            state_slot_id: StateSlotId(7),
             summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
             summary_descriptor_id: descriptor(
                 200,
@@ -1223,6 +1315,7 @@ mod tests {
                 plan_version: 2,
                 snapshot_sha256: "abc".into(),
             },
+            reused_from_generation: None,
             placement: SummaryPlacement {
                 producer_id: "producer".into(),
                 storage_node_id: "store".into(),
@@ -1231,7 +1324,7 @@ mod tests {
                 store: "summary-store".into(),
                 key: "state/1".into(),
                 state_schema_version: 1,
-                generation: 1,
+                generation: 2,
                 sequence: 3,
                 checksum: None,
             },
@@ -1258,6 +1351,33 @@ mod tests {
             instances: BTreeMap::from([(instance.instance_id.clone(), instance)]),
         };
         inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn state_slot_and_plan_version_must_match_instance_definition() {
+        let mut instance = observed_instance(InstanceLifecycle::Persistent);
+        instance.state_slot_id = StateSlotId(8);
+        assert!(instance.validate().is_err());
+        instance.state_slot_id = StateSlotId(7);
+        instance.state_reference.generation = 3;
+        assert!(instance.validate().is_err());
+        let mut reference = StateReference::for_definition(instance.summary_definition_id);
+        reference.state_slot_id = StateSlotId(8);
+        assert!(reference.validate().is_err());
+    }
+
+    #[test]
+    fn reused_instance_requires_explicit_matching_source_generation() {
+        let mut instance = observed_instance(InstanceLifecycle::Persistent);
+        let mut source = instance.catalog_generation.clone();
+        source.plan_version -= 1;
+        instance.reused_from_generation = Some(source.clone());
+        instance.state_reference.generation = source.plan_version;
+        instance.validate().unwrap();
+        instance.reused_from_generation.as_mut().unwrap().plan_id += 1;
+        assert!(instance.validate().is_err());
+        instance.reused_from_generation = Some(instance.catalog_generation.clone());
+        assert!(instance.validate().is_err());
     }
 
     #[test]

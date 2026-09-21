@@ -218,6 +218,7 @@ impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StateSchemaContract {
+    pub state_reference: crate::sds::StateReference,
     pub schema_id: String,
     pub schema_version: u32,
     pub materialization: crate::sds::SummaryDefinitionId,
@@ -332,6 +333,7 @@ impl PrecomputePlan {
                 );
                 let value_projection = materialization.effective_value_projection().clone();
                 Ok(StateSchemaContract {
+                    state_reference: crate::sds::StateReference::for_definition(fingerprint.into()),
                     schema_id: state_schema_id(fingerprint),
                     schema_version: 1,
                     materialization: fingerprint.into(),
@@ -791,6 +793,8 @@ impl PrecomputePlan {
                 || !schema_ids.insert(schema.schema_id.as_str())
                 || schema.schema_version == 0
                 || schema.encodings.is_empty()
+                || schema.state_reference.validate().is_err()
+                || schema.state_reference.definition_id != schema.materialization
             {
                 return Err(PrecomputePlanError::InvalidSchema {
                     schema_id: schema.schema_id.clone(),

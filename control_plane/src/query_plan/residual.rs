@@ -602,6 +602,14 @@ mod hybrid_tests {
                             if spatial_filter.is_empty() { 7 } else { 8 },
                         )
                         .into(),
+                        state_reference: asap_types::sds::StateReference::for_definition(
+                            asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
+                                7
+                            } else {
+                                8
+                            })
+                            .into(),
+                        ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
                         pane_origin_ms: Some(0),

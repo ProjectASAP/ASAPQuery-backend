@@ -6090,43 +6090,10 @@ pub fn validate_and_build_runtime_plan(
             .validate_against_catalog(&request.summary_catalog)
             .map_err(|error| format!("CollectorPlan catalog validation error: {error}"))?;
     }
-    for entry in request.query_plan.entries.values() {
-        for binding in entry.materialization_bindings() {
-            let materialization = request
-                .precompute_plan
-                .materializations
-                .iter()
-                .find(|config| config.policy_fingerprint() == binding.materialization.fingerprint())
-                .ok_or_else(|| "query binding has no precompute definition".to_string())?;
-            if binding.window_ms != materialization.stored_window_ms() {
-                return Err(
-                    "query physical pane duration differs from installed precompute definition"
-                        .into(),
-                );
-            }
-            if binding.pane_origin_ms != materialization.pane_origin_ms {
-                return Err(
-                    "query physical pane origin differs from installed precompute definition"
-                        .into(),
-                );
-            }
-            // `full_window_slide_ms` is `#[serde(default)]`, so a publication from an
-            // older controller -- or one replayed from a stored artifact -- arrives as
-            // `None` on a FullWindow materialization. Without this gate the readout
-            // silently takes the overlap-merging path and counts observations twice,
-            // which is exactly what the full-window binding exists to prevent.
-            let full_window_slide_ms = matches!(
-                materialization.window_layout,
-                asap_types::WindowMaterializationLayout::FullWindow
-            )
-            .then_some(materialization.slide_interval.saturating_mul(1_000));
-            if binding.full_window_slide_ms != full_window_slide_ms {
-                return Err(
-                    "query window layout differs from installed precompute definition".into(),
-                );
-            }
-        }
-    }
+    asap_types::plan_publication::validate_state_references(
+        &request.precompute_plan,
+        &request.query_plan,
+    )?;
     let runtime_materializations = request
         .precompute_plan
         .runtime_materializations()
@@ -7329,7 +7296,7 @@ mod catalog_install_tests {
             })
             .expect("demo has maintained summaries");
         binding.window_ms += 1;
-        assert!(install(request).unwrap_err().contains("pane duration"));
+        assert!(install(request).unwrap_err().contains("query pane differs"));
     }
 
     #[test]
