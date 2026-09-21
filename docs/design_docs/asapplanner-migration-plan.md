@@ -6,7 +6,7 @@ Terminology: [Planner/backend glossary](planner-backend-glossary.md).
 
 ## Goal and scope
 
-Replace complete semantic DAGs stored under PrecomputePlan with separate
+Replace complete post-ASAP DAGs stored under PrecomputePlan with separate
 PrecomputePlan and QueryPlan executable subgraphs connected by SDS state
 references. Also remove the backend build/runtime dependency on ASAPCollector by
 moving shared contracts and reconstruction code to neutral libraries.

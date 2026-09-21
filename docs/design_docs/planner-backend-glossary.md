@@ -10,7 +10,7 @@ in the serialized API.
 
 | Term | Meaning |
 | --- | --- |
-| Selected post-ASAP DAG | Planner-selected computation graph, including summary producers, shared dependencies and query readouts. Called the “semantic DAG” in earlier discussion. |
+| Selected post-ASAP DAG | Planner-selected computation graph, including summary producers, shared dependencies and query readouts. |
 | Summary producer | An operation or subgraph that builds summary state. Multiple queries may share its stored output. |
 | `SummaryMaintenanceLifecyclePlan` | Planner result associating a post-ASAP root with deployment decisions for its unique reachable summary producers, plus workload and costing context. |
 | Selected deployment guarantee and schedule/retention | The selected `SummaryMaintenanceLifecycleGuarantee` for one producer, together with its concrete scheduling and retention binding. This is part of a deployment in `SummaryMaintenanceLifecyclePlan`, not a separate model. |
@@ -38,7 +38,7 @@ compatible grouping, coverage and accuracy.
 | `StateReference` | Plan reference identifying a slot and summary definition within the enclosing plan version. Reader configuration selects the required state instances and constrains format and coverage. |
 | `SummaryStateInstance` | A concrete stored state, such as one service's completed five-minute KLL snapshot, with partition, coverage, format and location metadata. |
 | Summary store | Storage for actual summary payloads. Runtime inventory records their existence, coverage and readiness. |
-| `plan_version` | Version shared by an installed plan bundle and its catalog bindings. Creating or updating state instances does not itself change this version. Previously called “generation” in this proposal. |
+| `plan_version` | Version shared by an installed plan bundle and its catalog bindings. Creating or updating state instances does not itself change this version. |
 | Schema / encoding | Schema describes the state structure; encoding describes how that structure is represented as bytes. |
 | Provenance | Mapping from physical plan operations back to the selected Planner computation. |
 

@@ -7,7 +7,7 @@ notes and migration gates distinguish implemented behavior from proposed changes
 - [Planner/backend glossary](planner-backend-glossary.md) defines the terms used
   by the following three designs.
 - [Planner output to backend physical plans](asapplanner-integration.md) defines
-  how one selected semantic DAG becomes executable PrecomputePlan and QueryPlan
+  how one selected post-ASAP DAG becomes executable PrecomputePlan and QueryPlan
   subgraphs joined at materialization boundaries.
 - [Summary Catalog and SDS](summary-catalog-sds-architecture.md) owns descriptors,
   definition/instance identity, version-scoped state references, readiness and
