@@ -18,7 +18,7 @@ use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryNode};
 #[derive(Debug, Clone)]
 pub enum PostAsapPlan {
     /// A committed post-ASAP sub-tree — `SummaryAgg` / `SummaryEstimate` /
-    /// `SummaryMerge` / `Logical`, whatever `implement_tree_in_with` (or a
+    /// `SummaryMerge` / `Logical`, whatever `realizations_for_intent` (or a
     /// deployment-specific pre-pass) produced.
     Summary(Rc<SummaryNode>),
 

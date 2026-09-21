@@ -20,10 +20,10 @@ asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch
 [workspace.dependencies]
 # Keep Planner frontends, selection, and IR on the same immutable revision.
 # Alias upstream asap-types because this workspace also defines asap_types.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "c9b2aa78aa8baa60ddc2f4d880bee4aaab944c5f" }
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "c9b2aa78aa8baa60ddc2f4d880bee4aaab944c5f" }
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "c9b2aa78aa8baa60ddc2f4d880bee4aaab944c5f" }
-asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "c9b2aa78aa8baa60ddc2f4d880bee4aaab944c5f" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f46cbf6c5738db2f4460d419baa8af5572f5276a" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f46cbf6c5738db2f4460d419baa8af5572f5276a" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f46cbf6c5738db2f4460d419baa8af5572f5276a" }
+asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f46cbf6c5738db2f4460d419baa8af5572f5276a" }
 
 # Shared external deps (used by 2+ crates)
 serde = { version = "1.0", features = ["derive"] }
