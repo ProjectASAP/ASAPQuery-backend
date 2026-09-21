@@ -104,6 +104,17 @@ For each logical summary producer, the selected deployment guarantee and its
 schedule/retention specify how the producer's state is built and kept available.
 These are decisions within `SummaryMaintenanceLifecyclePlan`, not another model.
 
+For example, suppose two queries share a five-minute KLL summary and need a
+readout at every UTC minute. The selected deployment says to rebuild that
+producer from stored rows at each minute boundary and retain completed snapshots
+for ten minutes. The DAG alone identifies the shared KLL computation, but does
+not tell the backend to produce every required endpoint or keep its snapshot
+available. If the backend independently refreshes every five minutes, four of
+five requested endpoints lack matching state; serving an older snapshot as if
+it covered the requested interval changes the query result. The requirement is
+to carry and validate the existing selected deployment decision, not to add a
+new planning object.
+
 | Field in the example | Definition and constraint |
 | --- | --- |
 | `producer` | Node identity in the selected DAG; must resolve to a stored summary producer. |
