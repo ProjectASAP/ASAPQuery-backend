@@ -100,6 +100,10 @@ CPU     = updates*Cupdate + merges*Cmerge + queries*Cquery
 
 This separates machine-specific atomic measurements from workload-specific
 window, retention and sharing decisions.
+The count `m` refers to stored producer outputs, not a standalone catalog
+`Materialization` object. A selected producer deployment also specifies its
+maintenance mode and schedule/retention; those choices must be costed and
+validated separately from the logical query range.
 
 ## Miss and fallback behavior
 
@@ -125,8 +129,8 @@ and must not be advertised as a general numeric-distribution model.
 
 `Reduction::PerEntity` creates one temporal scalar state per source series. An
 explicit reduction with no grouping keys creates one pooled population. They are
-different materializations even when source, parameters and visible grouping keys
-look identical.
+different stored producer bindings even when source, parameters and visible
+grouping keys look identical.
 
 The compiler stores `PopulationPartitioning` in runtime configuration and
 `DataDescriptor`; both identities include it. Installation checks it against the

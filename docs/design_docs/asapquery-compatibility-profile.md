@@ -9,6 +9,10 @@ ASAPQuery-backend. It accepts raw Prometheus Remote Write samples, builds
 summaries in process, serves supported PromQL and falls back to Prometheus. It
 does not depend on ASAPCollector.
 
+The profile is implemented. The state-slot, separate runtime-inventory and
+Planner handoff descriptions below are [proposed contracts](asapplanner-integration.md),
+not claims that those fields already exist in the running backend.
+
 ## Document map
 
 1. [Profile at a glance](#profile-at-a-glance)
@@ -41,14 +45,19 @@ Planning uses configured `QueryWorkload` and `DataWorkload`, canonical
 ASAPPlanner selection and a backend-only physical compiler:
 
 ```text
-workloads -> ASAPPlanner -> selected candidate -> backend compiler
-                                             -> SummaryCatalog
-                                             -> PrecomputePlan
-                                             -> QueryPlan
+workloads -> ASAPPlanner -> selected post-ASAP computation and producer deployments
+                    -> backend physical compiler
+                    -> Summary Catalog definitions + PrecomputePlan + QueryPlan
 ```
 
-The three outputs share plan and materialization identities and activate as one
-immutable version.
+In the proposed SDS contract, the compiler binds each stored producer's writer
+and query readers to the same definition and plan-scoped state slot. The plans
+and catalog bindings install as one `plan_version`; publishing a new state
+instance does not change that version.
+The current backend obtains producer lifecycle decisions during physical
+compilation. The [target integration](asapplanner-integration.md) passes the
+selected computation and its associated deployment decisions together, while
+retaining the complete query root and shared producer identity.
 
 ## Worked example
 
@@ -67,10 +76,14 @@ data_workload:
   ingestion_rate: 10000
 ```
 
-Startup compiles a backend-local materialization, installs inactive query routes
-and begins accepting Remote Write. Before five minutes of complete coverage, the
-query is forwarded to Prometheus. When the materialization becomes ready, the
-same request is served from SummaryStore. An unsupported expression such as
+Startup compiles one backend-local producer and its query readout, installs
+inactive query routes and begins accepting Remote Write. The five-minute input
+range and one-minute query cadence are distinct from the producer's physical
+pane width, refresh schedule and state retention. The selected deployment must
+provide state for each required query endpoint; the backend cannot infer that
+schedule from the query DAG alone. Before complete coverage for an endpoint, the
+query is forwarded to Prometheus. Once a matching state instance is ready, the
+same request is served from its payload. An unsupported expression such as
 `absent(up)` continues to fall back.
 
 ```text
@@ -107,12 +120,12 @@ These capabilities may exist in broader ASAPQuery-backend profiles.
 
 | Component | Responsibility |
 | --- | --- |
-| ASAPPlanner | Query semantics, sharing, abstract candidates, accuracy, lifecycle choices and exact fallback |
-| Control plane | Load workloads, advertise backend-local implementations/costs, compile and activate one physical version |
+| ASAPPlanner | Query semantics, sharing, abstract candidates, accuracy and selected producer deployment decisions |
+| Control plane | Load workloads, advertise backend-local implementations/costs, validate selected guarantee and schedule/retention, then compile and activate one physical version |
 | Remote Write adapter | Decode and validate wire input; emit canonical raw samples |
 | Precompute runtime | Route series, maintain windows/accumulators and publish state |
-| SummaryStore | Index state by materialization, labels and logical window; track coverage/readiness |
-| Query path | Execute the installed QueryPlan or forward an equivalent request to Prometheus |
+| SummaryStore and runtime inventory | Current store tracks state and readiness; proposed SDS separates payload bytes from instance metadata for partition, coverage, format and readiness |
+| Query path | Execute the installed QueryPlan or forward an equivalent request to Prometheus; proposed SDS resolves ready instances through bound state references |
 
 The backend does not restore ASAPQuery's historical planner or precompute engine.
 Historical fixes remain a migration source and require regression tests or an
@@ -120,9 +133,11 @@ explicit inapplicability record. The audit includes idle/trailing-window closure
 wall-clock safety, pane eviction, millisecond windows, value routing,
 CMS-with-heap parameters and accumulator routing.
 
-A candidate without backend-local materialization and readout support is
-unavailable; it never receives optimistic zero cost. Request handling does not
-perform planning or choose a substitute materialization.
+A candidate without backend-local producer and readout support is unavailable;
+it never receives optimistic zero cost. If Planner selects no feasible
+maintenance guarantee for a required producer, the backend must use an explicit
+supported fallback or reject the plan. Request handling does not perform
+planning or choose a substitute producer.
 
 ## Remote Write contract
 
@@ -163,8 +178,11 @@ GET or POST /api/v1/query_range
 ```
 
 The adapter preserves `query`, `time`, `start`, `end`, `step`, `timeout`, tenant
-and authorization semantics. It either executes the active QueryPlan with exact
-catalog bindings or forwards a semantically equivalent request to Prometheus.
+and authorization semantics. It either executes the active QueryPlan or forwards
+a semantically equivalent request to Prometheus. Under the proposed SDS contract,
+the QueryPlan has a bound definition and state slot, resolves a matching ready
+instance and reads its payload. Serving does not search the catalog for another
+materialization.
 
 Parse failure, unsupported expressions, inactive plans, store misses, incomplete
 or stale windows and insufficient accuracy are never successful empty summary
@@ -179,7 +197,7 @@ requires a versioned compatibility level and conformance tests.
 
 ```text
 verify fallback -> load workloads -> select -> compile
-  -> atomically install catalog + precompute + inactive query routes
+  -> atomically install catalog bindings + precompute + inactive query routes
   -> accept writes and fall back queries
   -> materialize complete coverage
   -> mark each eligible route serving
@@ -187,7 +205,8 @@ verify fallback -> load workloads -> select -> compile
 
 The lifecycle is `Compiled -> Installed -> Materializing -> Ready -> Serving`.
 Installation is the atomic configuration boundary; readiness describes runtime
-coverage. A replacement never exposes mixed parameters from old and new plans.
+coverage and format validation for a particular state instance. A replacement
+never exposes mixed parameters from old and new plans.
 Until the new version is warm, the previous compatible route or Prometheus is
 authoritative.
 

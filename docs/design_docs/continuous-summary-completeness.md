@@ -61,6 +61,14 @@ record is created and the request is retryable.
 The in-memory admission inventory is keyed by catalog generation, summary
 definition, group population and physical time window.
 
+Here `catalog generation` names the current admission and recovery key. In the
+[proposed SDS contract](summary-catalog-sds-architecture.md), the coherent
+installed plan bundle uses `plan_version` and a plan-scoped state slot; runtime
+instance metadata records actual partition, coverage, format and readiness.
+Adapting persisted records requires an explicit mapping, not a silent rename of
+the existing generation field. The catalog holds definition semantics rather
+than per-instance publication status.
+
 - Remote Write reserves every required worker slot before admitting any work.
 - All queued work carries the same immutable input revision.
 - Queue rejection leaves no messages or admission records.
@@ -102,10 +110,10 @@ watermark, so the fastest series cannot establish global event-time completeness
 ## Budgets, recovery and retirement
 
 Admission metadata has bounded coordinate, pending-revision and byte budgets.
-Completed receipts expire with materialization retention; pending work and its
-published prefixes remain protected. Admitted slow-worker outputs may finish
-behind another worker's replay frontier. Unsolicited expired input and expired
-untagged replay are rejected.
+Completed receipts expire with the selected producer's state retention; pending
+work and its published prefixes remain protected. Admitted slow-worker outputs
+may finish behind another worker's replay frontier. Unsolicited expired input
+and expired untagged replay are rejected.
 
 Startup installs the authoritative catalog before persistence recovery. Version-3
 series metadata preserves summary-definition identity and catalog provenance.

@@ -56,6 +56,11 @@ planner retains its non-empirical choice or exact fallback. The report records
 the match, selected plan and evidence provenance; it does not report missing
 exact-baseline cost as zero.
 
+Evidence for a query readout alone does not establish that its shared producer
+can meet the selected maintenance guarantee and schedule/retention. The physical
+compiler must validate the complete implementation combination before binding
+the producer to a PrecomputePlan writer and QueryPlan readers.
+
 ## Evidence contract
 
 Every artifact declares:
