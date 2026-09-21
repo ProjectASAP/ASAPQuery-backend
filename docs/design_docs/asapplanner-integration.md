@@ -80,7 +80,10 @@ Each deployment identifies its `post_asap_node_id` and carries an optional
 window framework. The plan also carries workload demand and costing context.
 Thus the lifecycle plan already refers to the computation DAG; it is not a
 separate query representation, nor is one whole lifecycle plan required per
-producer. A missing guarantee does not define executable maintenance.
+producer. If a deployment's guarantee is `None`, Planner selected no feasible
+maintenance alternative for that producer. The backend must not invent a
+maintenance mode or schedule for it; a query requiring that stored state needs
+an explicit supported fallback, or plan installation must fail.
 
 See the Planner
 [lifecycle plan types](https://github.com/ProjectASAP/ASAPPlanner/blob/ba1c4436a3410dc03a133363ab5b75649e70f97a/crates/asap-aware-mapping/src/summary_maintenance_lifecycle.rs)
