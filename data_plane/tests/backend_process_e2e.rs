@@ -83,11 +83,12 @@ fn ddsketch_export(
         sketch.update(*value);
     }
     assert_eq!(sketch.total_count(), values.len() as u64);
-    let wire =
-        ProtoEnvelope::decode(asap_sketch_codec::encode_ddsketch(&sketch).as_slice()).unwrap();
-    let Some(sketch_envelope::SketchState::Ddsketch(state)) = wire.sketch_state else {
-        panic!("expected DDSketch state")
-    };
+    let sketch_bytes = asap_sketch_codec::encode_ddsketch(&sketch);
+    let wire = ProtoEnvelope::decode(sketch_bytes.as_slice()).unwrap();
+    assert!(matches!(
+        wire.sketch_state,
+        Some(sketch_envelope::SketchState::Ddsketch(_))
+    ));
     let materialization = plan["materializations"][0]["materialization"]
         .as_u64()
         .unwrap();
@@ -135,7 +136,7 @@ fn ddsketch_export(
         attributes,
         start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
         time_unix_nano: timestamp_ns,
-        sketch: state.encode_to_vec(),
+        sketch: sketch_bytes,
         encoding: DdSketchEncoding::DdsketchEncodingProto as i32,
         exemplars: Vec::new(),
         flags: 0,
