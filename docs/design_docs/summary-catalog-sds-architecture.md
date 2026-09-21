@@ -11,9 +11,10 @@ The Summary Catalog and Self-Describing Summary (SDS) model defines what persist
 summary state means. It connects PrecomputePlan writers to QueryPlan readers
 without requiring either runtime to reinterpret Planner IR.
 
-This document owns summary identity, schema, state references, readiness and
-lifecycle. The [integration design](asapplanner-integration.md) owns executable
-plan splitting; the [migration plan](asapplanner-migration-plan.md) owns delivery.
+This document owns summary identity, schema, state references, instance readiness
+and state lifecycle. The [integration design](asapplanner-integration.md) owns
+executable plan splitting; the [migration plan](asapplanner-migration-plan.md)
+owns delivery.
 Cost ranking, operator scheduling and transmission policy are outside SDS.
 
 ## Document map
@@ -29,9 +30,10 @@ Cost ranking, operator scheduling and transmission policy are outside SDS.
 
 ## Architecture at a glance
 
-The catalog stores summary definitions. PrecomputePlan and QueryPlan carry
-matching state references and format/partition configuration. Runtime inventory
-records actual state instances; payload bytes live in the summary store.
+The Summary Catalog stores `SummaryDefinition` entries. PrecomputePlan and
+QueryPlan carry matching state references and format/partition configuration.
+Runtime inventory records actual state instances; payload bytes live in the
+summary store.
 There is no separate catalog `Materialization` object.
 
 The compiler/catalog authority registers a `SummaryDefinition` when installing
@@ -41,13 +43,13 @@ catalog searches. At runtime, PrecomputePlan writes summary payload bytes to
 the store and publishes each instance's metadata to the inventory. QueryPlan
 checks the inventory for a ready matching instance, then reads its payload from
 the store. SDS describes this combined contract; its metadata is not all stored
-in the `SummaryDefinition` catalog. Definition semantics live in the catalog,
+in the Summary Catalog. Definition semantics live in the catalog,
 writer/reader constraints in the installed plans, and actual partition,
 coverage, format, readiness and location in runtime instance metadata.
 
 ```mermaid
 flowchart LR
-  C[Compiler/catalog authority] -->|register definition: write| D[SummaryDefinition catalog]
+  C[Compiler/catalog authority] -->|register definition: write| D[Summary Catalog]
   P[PrecomputePlan] -->|validate definition: read at install| D
   Q[QueryPlan] -->|validate definition: read at install| D
   P -->|write payload| S[Summary store]
@@ -112,18 +114,17 @@ query_plans:
     estimate: {quantile: 0.99}
 ```
 
-PrecomputePlan updates each state partition once. Both QueryPlans resolve the
-same bound slot and apply different readout parameters. They neither
-create duplicate producers nor search the catalog for alternatives at serving
-time.
+PrecomputePlan produces each required state partition once. Both QueryPlans
+resolve the same bound slot and apply different readout parameters. They neither
+create duplicate producers nor search the catalog for alternatives at serving time.
 
 ## Core objects
 
 | Object | Meaning | Changes when |
 | --- | --- | --- |
 | `SummaryDefinition` | Canonical input, operation, grouping, time semantics, algorithm and parameters | Summary semantics change |
-| `SummaryStateInstance` | One stored partition, such as a series/pane or completed aggregate | Runtime creates or replaces payload state |
-| `StateReference` | A typed plan reference to permitted materialized state | A compiled reader/writer binding changes |
+| `SummaryStateInstance` | One stored partition, such as a series/pane or completed aggregate | Runtime publishes a new or replacement instance |
+| `StateReference` | A typed plan reference to a permitted stored producer output | A compiled reader/writer binding changes |
 
 A definition includes every field needed to decide semantic equivalence: source
 and filters, input value, operation or sketch parameters, grouping, time
@@ -148,8 +149,9 @@ instance metadata. Their ownership is explicit below.
 The compiler emits both bindings from one decision and validates agreement
 before installation. Repetition of format fields in the serialized plans does
 not authorize independent selection. The catalog does not need a second registry
-for those fields. Retention and refresh policy belong to the producer's selected
-lifecycle and PrecomputePlan; observed readiness belongs to runtime inventory.
+for those fields. The selected deployment guarantee and schedule/retention belong
+to Planner's deployment decision and the installed PrecomputePlan binding;
+observed readiness belongs to runtime inventory.
 
 A state instance records plan version, slot, definition, actual format and its
 partition key, coverage/completion, producer sequence
@@ -166,13 +168,16 @@ bytes remain in the summary store, not in catalog descriptors.
 | Plan version | With which atomic installation may it be used? |
 | Schema/encoding ID | How are its bytes interpreted? |
 
-The compiler/catalog authority assigns these identities once. Human-readable
-names are diagnostics, not join keys. Reuse across plan versions requires an
-explicit compatibility decision; a matching definition ID is insufficient.
+The catalog authority assigns definition IDs; installation assigns the plan
+version; the compiler assigns state-slot IDs within that version; and the runtime
+assigns state-instance IDs. Schema/encoding IDs identify supported formats.
+Human-readable names are diagnostics, not join keys. Reuse across plan versions
+requires an explicit compatibility decision; a matching definition ID is
+insufficient.
 
 A `StateReference` identifies a state slot and definition within the enclosing
-plan version. The reader/writer binding constrains acceptable
-partition, schema, plan version and coverage. It may select several instances, such
+plan version. The reader/writer binding constrains acceptable partition, schema,
+plan version and coverage. A reader binding may select several instances, such
 as panes covering one range, but cannot broaden semantics or substitute another
 algorithm. QueryPlan and derived PrecomputePlan nodes resolve references through
 exact indexed lookup, never serving-time candidate selection.
@@ -186,7 +191,8 @@ PrecomputePlan
 SDS
   Catalog: def-9 -> KLL(k=200) and input semantics
   Plan bundle: version 42; writer/reader bind slot-17 to def-9
-  Store: instances indexed by plan version, slot and partition
+  Runtime inventory: instances indexed by plan version, slot and partition
+  Summary store: encoded payload bytes located by instance metadata
 
 QueryPlan
   Read(slot-17, kll-v1) -> SummaryEstimate -> Result
@@ -209,13 +215,17 @@ Source and destination are never represented as the same instance.
 
 ## Lifecycle and readiness
 
-| State | Meaning |
-| --- | --- |
-| `Desired` | Installed plans require state for this slot and coverage |
-| `Building` | Required state is being produced or recovered |
-| `Ready` | Required schema and coverage are available |
-| `Draining` | New work has stopped while existing use completes |
-| `Retired` | New reads are prohibited; safe reclamation may follow |
+These are conceptual phases, not one `SummaryStateInstance` status enum. `Desired`
+is demand from an installed plan; the other phases describe observed runtime
+state or its retirement.
+
+| Phase | View | Meaning |
+| --- | --- | --- |
+| `Desired` | Installed plan | The plan requires state for this slot and coverage |
+| `Building` | Runtime inventory | Required state is being produced or recovered |
+| `Ready` | Runtime inventory | Required schema and coverage are available |
+| `Draining` | Runtime inventory | New work has stopped while existing use completes |
+| `Retired` | Runtime inventory | New reads are prohibited; safe reclamation may follow |
 
 Atomic activation installs intent, not ready data. A QueryPlan read checks
 observed readiness and coverage, then follows its configured fallback or explicit
