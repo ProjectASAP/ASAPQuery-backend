@@ -1,7 +1,7 @@
 # Builds the data_plane (backend) binary → asap/data-plane:dev.
 #
 # Repo-ownership (2026-05): each ASAPQuery-backend crate owns its own image
-# Dockerfile here — companions: control_plane/Dockerfile, gorilla-merger/
+# Dockerfile here — companion: control_plane/Dockerfile
 # Dockerfile. ASAPCollector only orchestrates + references images by name; the
 # old cross-repo combined builder (ASAPCollector deploy/docker/Dockerfile.backend)
 # is retired.

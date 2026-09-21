@@ -29,19 +29,15 @@ use asap_types::Statistic;
 /// equivalent `?engine=<data_source_id>` query param), the HTTP layer
 /// bypasses the per-metric `BackendStorageRouting` lookup and dispatches
 /// the PromQL string straight to the named engine. Used by the
-/// `accuracy_reduce.py` reducer to ask the same query against the warm
-/// sketch and the Gorilla archive on MinIO so it can compute
-/// apples-to-apples relative error per replay row. See
-/// `docs/design-jsonl-deprecation-and-gorilla-promql-completeness.md`
-/// (Fix 1) for the design rationale.
+/// `accuracy_reduce.py` reducer to select a registered query engine.
 ///
 /// Recognised values match `StorageBackend::data_source_id()` —
 /// `asap_query`, `double_write`, `prometheus_remote`. An unknown
 /// value returns 400.
 pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
 pub const ENGINE_OVERRIDE_QUERY_PARAM: &str = "engine";
-/// Per-request accuracy contract. `exact` routes ASAP-managed metrics directly
-/// to the archive; `approximate` (the default) keeps warm-first failover.
+/// Per-request accuracy contract. `exact` forwards to the configured exact
+/// backend; `approximate` (the default) tries ASAP execution first.
 pub const ACCURACY_HEADER: &str = "X-ASAP-Accuracy";
 
 fn extract_accuracy(headers: &HeaderMap) -> Result<AccuracyTarget, String> {
@@ -2673,10 +2669,9 @@ mod tests {
             .expect("Failed to start test server")
     }
 
-    async fn setup_victoriametrics_test_server() -> u16 {
+    async fn setup_victoriametrics_test_server(fallback_url: String) -> u16 {
         use crate::drivers::query::adapters::VictoriaMetricsHttpAdapter;
-        let adapter_config =
-            AdapterConfig::victoriametrics_metricsql("http://127.0.0.1:9999".to_string());
+        let adapter_config = AdapterConfig::victoriametrics_metricsql(fallback_url);
         let server = HttpServer::new(
             HttpServerConfig {
                 port: 0,
@@ -2692,7 +2687,7 @@ mod tests {
 
     #[tokio::test]
     async fn victoriametrics_cluster_routes_are_registered() {
-        let port = setup_victoriametrics_test_server().await;
+        let port = setup_victoriametrics_test_server("http://127.0.0.1:9999".into()).await;
         let response = Client::new()
             .get(format!(
                 "http://127.0.0.1:{port}/select/42/prometheus/api/v1/query"
@@ -2702,6 +2697,76 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn promql_exact_request_forwards_to_prometheus() {
+        let upstream = Router::new().route(
+            "/api/v1/query",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                Json(serde_json::json!({
+                    "status": "success",
+                    "data": {"received": params["query"]}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let config = AdapterConfig::prometheus_promql(format!("http://{address}"), true);
+        let server = HttpServer::new(
+            HttpServerConfig {
+                port: 0,
+                handle_http_requests: true,
+                adapter_config: config,
+            },
+            Arc::new(ASAPQueryEngine::new(15_000)),
+            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+        );
+        let port = server.start_test_server().await.unwrap();
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/v1/query"))
+            .header(ACCURACY_HEADER, "exact")
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(payload["data"]["received"], "sum_over_time(foo[5m])");
+    }
+
+    #[tokio::test]
+    async fn metricsql_exact_request_forwards_to_victoriametrics() {
+        let upstream = Router::new().route(
+            "/api/v1/query",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                Json(serde_json::json!({
+                    "status": "success",
+                    "data": {"received": params["query"]}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let port = setup_victoriametrics_test_server(format!("http://{address}")).await;
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/v1/query"))
+            .header(ACCURACY_HEADER, "exact")
+            .query(&[
+                ("query", "rate(requests[5m]) keep_metric_names"),
+                ("time", "1"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            payload["data"]["received"],
+            "rate(requests[5m]) keep_metric_names"
+        );
     }
 
     #[tokio::test]

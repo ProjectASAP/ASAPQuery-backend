@@ -21,10 +21,7 @@ change process environment or still use fixed loopback ports. It covers:
 4. the monitor coordinator hosted by a real data-plane process, with two edge
    clients exchanging reports and differentiated grants over bidirectional
    gRPC;
-5. a real Gorilla merger process that accepts an XOR fragment over HTTP,
-   durably writes its TSDB block, and returns the exact chunk over Thanos
-   StoreAPI, plus its compaction, recovery, and shipping suites; and
-6. the final production-process path: typed physical-plan compilation,
+5. the final production-process path: typed physical-plan compilation,
    catalog and execution-plan installation, collector capability and applied ACK
    over OpAMP, modified-OTLP ingest, SketchStore policy routing, and PromQL
    query readout of that same plan.
@@ -38,7 +35,6 @@ The component suites can also be run separately:
 ./scripts/e2e.sh differential
 ./scripts/e2e.sh sketch-oracles
 ./scripts/e2e.sh monitor
-./scripts/e2e.sh gorilla-merger
 ./scripts/e2e.sh whole
 ```
 
@@ -134,7 +130,4 @@ behind `#[ignore]` with:
 ```
 
 The final local whole-backend test is
-`data_plane/tests/backend_process_e2e.rs`. The environment-gated VictoriaMetrics
-comparison in `gorilla-merger/internal/merger/vmload_test.go` remains an
-explicit external integration test and reports a Go skip when `VM_ADDR` is not
-provided.
+`data_plane/tests/backend_process_e2e.rs`.
