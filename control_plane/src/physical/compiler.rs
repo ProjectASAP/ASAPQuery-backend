@@ -454,7 +454,11 @@ pub fn build_transmission_plan(
 
 /// Complete physical projection of one post-ASAP planning decision.
 /// All three child plans share the same envelope and are compiled together.
-#[derive(Debug, Clone)]
+/// Complete selected physical plan, serializable for developer inspection.
+///
+/// The serialized form is an inspection artifact emitted by
+/// `compile_workload_artifact`; it is not an input accepted by the compiler.
+#[derive(Debug, Clone, Serialize)]
 pub struct CompiledPhysicalPlan {
     pub envelope: PlanEnvelope,
     pub summary_catalog: super::summary_catalog::SummaryCatalog,
