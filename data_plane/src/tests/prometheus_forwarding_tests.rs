@@ -1,11 +1,14 @@
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
-use crate::query_engines::ASAPQueryEngine;
+use crate::query_engines::{ASAPQueryEngine, QueryForwardingPolicy};
 #[cfg(test)]
 use crate::storage_engines::types::{QueryLanguage, StreamingConfig};
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 
@@ -59,6 +62,40 @@ async fn start_mock_prometheus_server() -> Result<u16, Box<dyn std::error::Error
     });
 
     // Give the server time to start
+    sleep(Duration::from_millis(100)).await;
+    Ok(port)
+}
+
+async fn start_counting_prometheus_server(
+    calls: Arc<AtomicUsize>,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    use axum::{routing::get, Router};
+    let app = Router::new()
+        .route(
+            "/api/v1/query",
+            get({
+                let calls = calls.clone();
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"status":"success","data":{"resultType":"vector","result":[]}}))
+                }
+            }),
+        )
+        .route(
+            "/api/v1/query_range",
+            get({
+                let calls = calls.clone();
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"status":"success","data":{"resultType":"matrix","result":[]}}))
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     sleep(Duration::from_millis(100)).await;
     Ok(port)
 }
@@ -183,6 +220,50 @@ async fn test_forwarding_disabled() {
 
     // Should return an error response when forwarding is disabled
     assert_eq!(response_json["status"], "error");
+}
+
+#[tokio::test]
+async fn disable_query_forwarding_makes_zero_instant_or_range_requests() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prometheus_port = start_counting_prometheus_server(calls.clone())
+        .await
+        .unwrap();
+    let config = HttpServerConfig {
+        port: 0,
+        handle_http_requests: true,
+        adapter_config: AdapterConfig::prometheus_promql(
+            format!("http://127.0.0.1:{prometheus_port}"),
+            true,
+        )
+        .with_query_forwarding_policy(QueryForwardingPolicy::Disabled),
+    };
+    let query_engine = Arc::new(ASAPQueryEngine::new(15000));
+    let idx = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    let server = HttpServer::new(config, query_engine, idx);
+    let server_port = server.start_test_server().await.unwrap();
+    let client = Client::new();
+
+    let instant = client
+        .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+        .query(&[("query", "rate(unsupported_metric[5m])")])
+        .send()
+        .await
+        .unwrap();
+    assert!(instant.status().is_success());
+
+    let range = client
+        .get(format!("http://127.0.0.1:{server_port}/api/v1/query_range"))
+        .query(&[
+            ("query", "rate(unsupported_metric[5m])"),
+            ("start", "100"),
+            ("end", "200"),
+            ("step", "15"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(range.status().is_success() || range.status().is_client_error());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

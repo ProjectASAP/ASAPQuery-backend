@@ -134,6 +134,10 @@ policy and must not silently change query time semantics.
 
 Planner supplies legal maintenance alternatives. The backend supplies executable
 implementations and evidence; the control plane commits a feasible selection.
+Concrete engine and implementation IDs remain in backend bindings, not Planner
+IR. The backend binds each producer to its implementation, placement, state
+schema and active plan version, following the
+[planner-runtime contract](https://github.com/ProjectASAP/ASAPPlanner/blob/f46cbf6c5738db2f4460d419baa8af5572f5276a/docs/design_docs/architecture/planner-runtime-contract.md).
 The compiler validates the selected deployment guarantee and schedule/retention
 without silently changing the mode, coverage or sharing. A changed selection is
 installed through a new plan version. It need not change the semantic summary

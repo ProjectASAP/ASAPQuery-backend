@@ -291,6 +291,41 @@ pub fn compile_logical(
     Ok(entry)
 }
 
+fn horizons(expr: &planner_types::pre_asap::QueryExpr, out: &mut Vec<u64>) {
+    use planner_types::pre_asap::QueryExpr;
+    if let QueryExpr::TimeRange { range, .. } = expr {
+        if let Ok(ms) = u64::try_from(range.as_millis()) {
+            out.push(ms);
+        }
+    }
+    match expr {
+        QueryExpr::PromqlScalarBridge(child)
+        | QueryExpr::PromqlVectorFromScalar(child)
+        | QueryExpr::PromqlScalarFromVector(child)
+        | QueryExpr::PromqlRelabel { child, .. }
+        | QueryExpr::PromqlSeriesSample { child, .. }
+        | QueryExpr::PromqlInfoEnrich { child, .. }
+        | QueryExpr::Filter { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Aggregate { child, .. }
+        | QueryExpr::Dedup { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::PromqlSubquery { child, .. }
+        | QueryExpr::TimeRange { child, .. }
+        | QueryExpr::TimeShift { child, .. } => horizons(child, out),
+        QueryExpr::BinaryOp { lhs, rhs, .. } => {
+            horizons(lhs, out);
+            horizons(rhs, out);
+        }
+        QueryExpr::Join { left, right, .. } | QueryExpr::SetOp { left, right, .. } => {
+            horizons(left, out);
+            horizons(right, out);
+        }
+        _ => {}
+    }
+}
+
 /// Match residuals by semantic IR equality, not display text or source names.
 /// This ensures a subtree parsed for physical lowering is the subtree Planner kept.
 pub(super) fn residual_nodes(
@@ -319,18 +354,28 @@ pub(super) fn residual_nodes(
     let original = parser::parse(original).map_err(|e| invalid(e.to_string()))?;
     let mut expressions = Vec::new();
     visit(&original, &mut expressions);
+    // Reconstruct equality witnesses with the selected IR's source horizon,
+    // not the compatibility parser's default. Explicit matrix ranges remain
+    // query-owned and equality still checks the complete tree.
+    let mut intervals = vec![1_000];
+    horizons(residual, &mut intervals);
+    intervals.sort_unstable();
+    intervals.dedup();
     for expression in expressions {
-        if let Ok(candidate) = crate::query_parser::parse_query_expr_canonical(
-            &expression.to_string(),
-            planner_types::types::AccuracyTarget::Exact,
-        ) {
-            if &candidate == residual {
-                let mut lower = Lower {
-                    nodes: BTreeMap::new(),
-                    seen: BTreeMap::new(),
-                };
-                let root = lower.lower(expression)?;
-                return Ok((root, lower.nodes));
+        for interval in &intervals {
+            if let Ok(candidate) = crate::query_parser::parse_query_expr_with_interval(
+                &expression.to_string(),
+                planner_types::types::AccuracyTarget::Exact,
+                *interval,
+            ) {
+                if &candidate == residual {
+                    let mut lower = Lower {
+                        nodes: BTreeMap::new(),
+                        seen: BTreeMap::new(),
+                    };
+                    let root = lower.lower(expression)?;
+                    return Ok((root, lower.nodes));
+                }
             }
         }
     }
@@ -424,33 +469,78 @@ pub(crate) fn selected_residual_nodes(
     let parsed = parser::parse(original).map_err(|e| invalid(e.to_string()))?;
     let mut expressions = Vec::new();
     visit(&parsed, &mut expressions);
+    fn selected_horizons(node: &planner_types::post_asap::SummaryNode, out: &mut Vec<u64>) {
+        use planner_types::post_asap::SummaryExpr;
+        match &node.expr {
+            SummaryExpr::KeepPreAsap(expr) => horizons(expr, out),
+            SummaryExpr::ValueOperation { child, .. } | SummaryExpr::SummaryAgg { child, .. } => {
+                selected_horizons(child, out)
+            }
+            SummaryExpr::SummaryEstimate { summary_input, .. }
+            | SummaryExpr::SummaryDelete { summary_input, .. } => {
+                selected_horizons(summary_input, out)
+            }
+            SummaryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            }
+            | SummaryExpr::CandidateTopK {
+                candidates: left,
+                values: right,
+                ..
+            }
+            | SummaryExpr::RelationalJoin { left, right, .. }
+            | SummaryExpr::SummaryJoin {
+                outer: left,
+                inner: right,
+                ..
+            }
+            | SummaryExpr::SummarySubtract { left, right } => {
+                selected_horizons(left, out);
+                selected_horizons(right, out);
+            }
+            SummaryExpr::SummaryMerge { children } => {
+                for child in children {
+                    selected_horizons(child, out);
+                }
+            }
+        }
+    }
+    let mut intervals = vec![1_000];
+    selected_horizons(selected, &mut intervals);
+    intervals.sort_unstable();
+    intervals.dedup();
     let mut matched = None;
     for expression in expressions {
-        let Ok(canonical) = crate::query_parser::parse_query_expr_canonical(
-            &expression.to_string(),
-            planner_types::types::AccuracyTarget::Exact,
-        ) else {
-            continue;
-        };
-        let Ok(witness) = crate::planner_selection::select_summary_default(&canonical) else {
-            continue;
-        };
-        if witness.as_ref() == selected {
-            let mut lower = Lower {
-                nodes: BTreeMap::new(),
-                seen: BTreeMap::new(),
+        for interval in &intervals {
+            let Ok(canonical) = crate::query_parser::parse_query_expr_with_interval(
+                &expression.to_string(),
+                planner_types::types::AccuracyTarget::Exact,
+                *interval,
+            ) else {
+                continue;
             };
-            let root = lower.lower(expression)?;
-            let candidate = (root, lower.nodes);
-            if matched
-                .as_ref()
-                .is_some_and(|previous| previous != &candidate)
-            {
-                return Err(invalid(
-                    "ambiguous original subtrees share a Planner summary representation",
-                ));
+            let Ok(witness) = crate::planner_selection::select_summary_default(&canonical) else {
+                continue;
+            };
+            if witness.as_ref() == selected {
+                let mut lower = Lower {
+                    nodes: BTreeMap::new(),
+                    seen: BTreeMap::new(),
+                };
+                let root = lower.lower(expression)?;
+                let candidate = (root, lower.nodes);
+                if matched
+                    .as_ref()
+                    .is_some_and(|previous| previous != &candidate)
+                {
+                    return Err(invalid(
+                        "ambiguous original subtrees share a Planner summary representation",
+                    ));
+                }
+                matched = Some(candidate);
             }
-            matched = Some(candidate);
         }
     }
     matched.ok_or_else(|| {
@@ -1249,6 +1339,26 @@ pub use eligible_materialization_keys as materialization_candidate_keys;
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A workload horizon changes the equality witness, never its filter or explicit range.
+    #[test]
+    fn workload_horizon_residual_keeps_semantic_equality() {
+        let residual = crate::query_parser::parse_query_expr_with_interval(
+            "sum(m{job=\"api\"})",
+            planner_types::types::AccuracyTarget::Exact,
+            5_000,
+        )
+        .unwrap();
+        assert!(residual_nodes("sum(m{job=\"api\"})", &residual).is_ok());
+        assert!(residual_nodes("sum(m{job=\"worker\"})", &residual).is_err());
+        let range = crate::query_parser::parse_query_expr_with_interval(
+            "sum_over_time(m[1m])",
+            planner_types::types::AccuracyTarget::Exact,
+            5_000,
+        )
+        .unwrap();
+        assert!(residual_nodes("sum_over_time(m[2m])", &range).is_err());
+    }
+
     fn instant() -> InstantExecution {
         InstantExecution {
             lookback_ms: 300_000,

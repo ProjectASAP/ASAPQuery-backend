@@ -356,14 +356,16 @@ fn replacement_strategies<'a>(
     accuracy_model: &'a dyn AccuracyModel,
 ) -> Vec<Box<dyn ReplacementStrategy + 'a>> {
     vec![
-        Box::new(SketchAlgorithmStrategy::with_models_and_evidence(
-            cost_model,
-            accuracy_model,
-            &asap_aware_mapping::EqualSplitAllocator,
-            evidence,
-        )),
         Box::new(
-            asap_aware_mapping::HydraGroupingStrategy::with_models_and_evidence(
+            SketchAlgorithmStrategy::new_with_planning_inputs_and_evidence(
+                cost_model,
+                accuracy_model,
+                &asap_aware_mapping::EqualSplitAllocator,
+                evidence,
+            ),
+        ),
+        Box::new(
+            asap_aware_mapping::HydraGroupingStrategy::new_with_planning_inputs_and_evidence(
                 cost_model,
                 accuracy_model,
                 &asap_aware_mapping::EqualSplitAllocator,
@@ -460,7 +462,7 @@ pub fn select_summary_with_evidence(
     evidence: &dyn AccuracyEvidenceProvider,
 ) -> Result<Rc<SummaryNode>, SelectionError> {
     let root = Rc::new(expr.clone());
-    let strategy = SketchAlgorithmStrategy::with_models_and_evidence(
+    let strategy = SketchAlgorithmStrategy::new_with_planning_inputs_and_evidence(
         cost_model,
         accuracy_model,
         allocator,
@@ -740,7 +742,7 @@ mod workload_tests {
         let cost_model = ControlPlaneCostModel::new(accuracy);
         let target = TargetSubDAG::new(&grouped_count);
         let hydra = |evidence: &dyn AccuracyEvidenceProvider| {
-            asap_aware_mapping::HydraGroupingStrategy::with_models_and_evidence(
+            asap_aware_mapping::HydraGroupingStrategy::new_with_planning_inputs_and_evidence(
                 &cost_model,
                 &asap_aware_mapping::DefaultAccuracyModel,
                 &asap_aware_mapping::EqualSplitAllocator,

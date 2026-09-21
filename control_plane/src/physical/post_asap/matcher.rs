@@ -1,8 +1,8 @@
 //! The reference downstream implementation of [`asap_aware_mapping::Matcher`].
 //!
-//! `asap_aware_mapping::boundary::Matcher` is a trait with no default implementation
+//! `asap_aware_mapping::replacement::Matcher` is a trait with no default implementation
 //! and no shipped instance — deliberately, per its crate doc: which
-//! `Implementation`s are actually *available* anywhere is entirely a
+//! `Realization`s are actually *available* anywhere is entirely a
 //! downstream deployment's concern, and even the pure sketch-algebra
 //! compatibility rules (a heap-bearing top-k sketch also satisfying a bare
 //! frequency point-query) turned out to have deployment-specific competitors
@@ -10,18 +10,18 @@
 //! about `SummaryKind` alone.
 //!
 //! [`SummaryFamilyMatcher`] restores exactly the family-compatibility logic
-//! that briefly lived as a concrete `Implementation::is_satisfied_by` method
+//! that briefly lived as a concrete `Realization::is_satisfied_by` method
 //! in `asap-plan` (PR #140) before it was converted into this trait (PR
 //! #141) — the `SummaryFamily`/`summary_family` classifier below is a
 //! verbatim port. It answers only the kind-family question: "is an
 //! available `(SummaryKind, SummaryParams)` pair an acceptable substitute
 //! for a required one." It deliberately does **not** attempt the
 //! single-vs-multi-population re-aggregation question (e.g. "can a keyed
-//! `Sum` accumulator serve an unkeyed `Sum` query") — `Implementation`
+//! `Sum` accumulator serve an unkeyed `Sum` query") — `Realization`
 //! carries no grouping information at all (grouping lives beside the kind,
 //! on whatever node carries it, not inside the kind — see
 //! `crates/asap_types/src/key_by_label_names.rs`'s module doc for the same
-//! design call made on the data-plane side), so a two-`Implementation`
+//! design call made on the data-plane side), so a two-`Realization`
 //! `Matcher` cannot correctly answer that question. A caller needing that
 //! richer, grouping-aware answer must check `AggregationType` compatibility
 //! (analogous to `SummaryFamily` here) *and* `grouping_labels`
@@ -37,7 +37,7 @@
 //! which is actively being built to replace
 //! `storage_engines/sketch_db/query/sketch_reducer.rs`. Restored in full.
 
-use asap_aware_mapping::{Implementation, Matcher};
+use asap_aware_mapping::{Matcher, Realization};
 use planner_types::post_asap::SketchAlgorithm;
 
 /// [`Matcher`] impl covering pure sketch-family compatibility. See the
@@ -62,7 +62,7 @@ impl Matcher for SummaryFamilyMatcher {
     ///   additional info layered on top of the same underlying matrix —
     ///   but not the reverse (a heap-less sketch cannot enumerate top-k
     ///   items it never tracked).
-    fn is_satisfied_by(&self, required: &Implementation, available: &Implementation) -> bool {
+    fn is_satisfied_by(&self, required: &Realization, available: &Realization) -> bool {
         // ASAPController#170 had merged `Sketch`/`ExactAccumulator` into
         // one `Summary { kind, params }` variant, recoverable via
         // `kind.is_exact()`; ASAPPlanner#218 split them back into
@@ -73,12 +73,12 @@ impl Matcher for SummaryFamilyMatcher {
         // just the natural consequence of them being separate variants
         // again, same behavior as the `is_exact()` mismatch this replaced.
         match (required, available) {
-            (Implementation::PassThrough, _) => true,
+            (Realization::PassThrough, _) => true,
             (
-                Implementation::ExactAggregate { kind: required, .. },
-                Implementation::ExactAggregate { kind: have, .. },
+                Realization::ExactAggregate { kind: required, .. },
+                Realization::ExactAggregate { kind: have, .. },
             ) => required == have,
-            (Implementation::Sketch(required), Implementation::Sketch(have)) => {
+            (Realization::Sketch(required), Realization::Sketch(have)) => {
                 sketch_family_satisfied(required.algorithm(), have.algorithm())
             }
             _ => false,
@@ -93,7 +93,7 @@ impl Matcher for SummaryFamilyMatcher {
 /// `control_plane::physical::runtime_capability::Capability::is_satisfied_by`
 /// is the first such caller: its `SketchAlgorithm` query-side dispatch
 /// tag never carries params, so constructing a full
-/// `Implementation::Sketch{kind, params}` just to discard the params
+/// `Realization::Sketch{kind, params}` just to discard the params
 /// would mean fabricating meaningless param values. See that module's
 /// doc for why `Capability`/`SketchAlgorithm` themselves aren't deleted
 /// outright (`scratchpad/artifacts/enum-unification-plan.md` §8 Step 4).
@@ -197,14 +197,14 @@ mod tests {
         }
     }
 
-    fn sketch(kind: SketchAlgorithm) -> Implementation {
+    fn sketch(kind: SketchAlgorithm) -> Realization {
         let params = params_for(&kind);
-        Implementation::Sketch(planner_types::post_asap::SketchKind::new(kind, params))
+        Realization::Sketch(planner_types::post_asap::SketchKind::new(kind, params))
     }
 
-    fn accumulator(kind: ExactKind) -> Implementation {
+    fn accumulator(kind: ExactKind) -> Realization {
         let params = exact_params_for(&kind);
-        Implementation::ExactAggregate { kind, params }
+        Realization::ExactAggregate { kind, params }
     }
 
     #[test]
@@ -302,16 +302,16 @@ mod tests {
     #[test]
     fn pass_through_required_is_vacuously_satisfied() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(&Implementation::PassThrough, &sketch(SketchAlgorithm::Kll)));
-        assert!(m.is_satisfied_by(&Implementation::PassThrough, &accumulator(ExactKind::Sum)));
-        assert!(m.is_satisfied_by(&Implementation::PassThrough, &Implementation::PassThrough));
+        assert!(m.is_satisfied_by(&Realization::PassThrough, &sketch(SketchAlgorithm::Kll)));
+        assert!(m.is_satisfied_by(&Realization::PassThrough, &accumulator(ExactKind::Sum)));
+        assert!(m.is_satisfied_by(&Realization::PassThrough, &Realization::PassThrough));
     }
 
     #[test]
     fn pass_through_available_never_satisfies_a_real_requirement() {
         let m = SummaryFamilyMatcher;
-        assert!(!m.is_satisfied_by(&sketch(SketchAlgorithm::Kll), &Implementation::PassThrough));
-        assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &Implementation::PassThrough));
+        assert!(!m.is_satisfied_by(&sketch(SketchAlgorithm::Kll), &Realization::PassThrough));
+        assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &Realization::PassThrough));
     }
 
     // ── sketch_family_satisfied (the bare-kind entry point) ──────────────

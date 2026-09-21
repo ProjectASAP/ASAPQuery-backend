@@ -1,79 +1,58 @@
-//! Storage-backend routing policy: given a `(statistic, accuracy)` query
-//! and the storage tier a metric is configured for, decide which backends
-//! can serve it and in what preference order.
+//! Storage-backend routing policy: given the storage tier a metric is
+//! configured for, decide which backends can serve it and in what
+//! preference order.
 //!
 //! Split out of `asap_types`'s former `capability_matching` module (see
 //! `scratchpad/artifacts/enum-unification-plan.md`). `StorageBackend` and
 //! the `StreamingConfig` wire format it's a field of both turned out to
 //! have zero real `control_plane` dependency either — see
 //! [`crate::storage_engines::types::storage_backend`]'s module doc — so
-//! both moved into this crate; only `AccuracyTarget` and the routing
-//! *decision* below were ever split out separately, since neither has a
-//! shared-struct-field reason to exist. Exercised only by this crate's
-//! own [`super::query_engine_routing`].
+//! both moved into this crate; only the routing *decision* below was ever
+//! split out separately.
+//!
+//! Since #746 there is no archive tier, so the policy has one branch left:
+//! `PrometheusRemote` metrics answer from Prometheus, everything else from
+//! the ASAP sketch tier. A query the ASAP tier cannot serve falls through
+//! to the HTTP layer's Prometheus fallback rather than to another engine.
 
 use crate::storage_engines::types::StorageBackend;
 use asap_types::Statistic;
 pub use planner_types::types::AccuracyTarget;
 
-/// Accuracy hint pushed by the controller at intent-binding time
-/// (`controller/docs/design.md` §6 `core::workload`). The Phase-5 capability
-/// router consults this to decide whether a metric configured for both warm-
-/// tier and Gorilla-S3 should answer from the archive (Exact) or the
-/// approximate ASAP-tier sketch.
-/// Returns the storage backends that can serve a `(statistic, accuracy)`
-/// query when the metric is configured for `metric_storage_config`.
+/// Returns the storage backends that can serve a query when the metric is
+/// configured for `metric_storage_config`.
 ///
 /// The returned list is **ordered by preference**: the router walks it in
 /// order and dispatches to the first backend whose engine is registered,
-/// falling through on `CapabilityMiss` / `Backend` to the next entry.
+/// falling through on `CapabilityMiss` / `Backend` to the next entry. With
+/// the archive tier gone every list holds exactly one backend, so the
+/// failover loop is a no-op in practice — it stays because the router is
+/// also the `X-ASAP-Engine` override surface.
 ///
-/// **ASAP-first centralization refactor**: the decision tree is now
-/// owned here (and consumed identically by `EngineRouter::execute` and
-/// `EngineRouter::execute_range`) so the HTTP transport layer never
-/// re-derives routing. The policy is:
+/// * `PrometheusRemote` → `[PrometheusRemote]`: the metric's raw samples
+///   never landed in ASAP-managed storage, so there is no ASAP-tier sketch
+///   to answer from. A missing engine surfaces as a `NoEngineRegistered`
+///   503 from the HTTP handler — the correct fail-loud behaviour for a
+///   misconfigured deploy.
+/// * every ASAP-managed tier (`SketchStore`, `DoubleWrite`) →
+///   `[SketchStore]`: the ASAP tier is the only engine left.
 ///
-/// * `accuracy == Exact` → archive only `[GorillaObjectStore]` (served
-///   by the `thanos_query` engine). The caller demands an exact answer,
-///   so the ε/δ-bounded ASAP-tier sketches are not eligible — go
-///   straight to the archive regardless of where the metric is stored.
-/// * `accuracy == Approximate` (the default) → ASAP-first failover
-///   `[SketchStore, GorillaObjectStore]` for any metric stored in an
-///   ASAP-managed tier (`SketchStore`, `GorillaObjectStore`, or
-///   `DoubleWrite`): try the warm sketch (`asap_query`) first and fall
-///   back to the archive (`thanos_query`) on a capability miss. This
-///   collapses the old per-`metric_storage` sequences into one shared
-///   ASAP-first-then-archive contract.
-/// * `PrometheusRemote` keeps its own single-backend sequence
-///   `[PrometheusRemote]`: the metric's raw samples never
-///   landed in ASAP-managed storage, so there is no ASAP-tier sketch to
-///   fall back on and the accuracy hint does not apply. A missing
-///   engine surfaces as a `NoEngineRegistered` 503 from the HTTP
-///   handler — the correct fail-loud behaviour for a misconfigured
-///   deploy.
+/// The `AccuracyTarget` no longer participates: an `Exact` request means
+/// "do not answer from ε/δ-bounded sketches", which the HTTP handler
+/// serves by forwarding to Prometheus before it ever reaches the router.
 pub fn compatible_storage_backends(
     _stat: Statistic,
-    accuracy: &AccuracyTarget,
     metric_storage_config: StorageBackend,
 ) -> Vec<StorageBackend> {
     match metric_storage_config {
-        // Prometheus-remote owns its own storage; the accuracy hint does
-        // not apply and there is no ASAP-tier sketch to fall back on.
+        // Prometheus-remote owns its own storage; there is no ASAP-tier
+        // sketch to fall back on.
         StorageBackend::PrometheusRemote => vec![StorageBackend::PrometheusRemote],
 
-        // Every ASAP-managed tier shares the same ASAP-first policy,
-        // gated only on the accuracy target.
-        StorageBackend::SketchStore
-        | StorageBackend::GorillaObjectStore
-        | StorageBackend::DoubleWrite => match accuracy {
-            // Exact: archive only — the warm sketches are ε/δ-bounded.
-            AccuracyTarget::Exact => vec![StorageBackend::GorillaObjectStore],
-            // Approximate: ASAP-tier first, archive (Thanos) fallback.
-            AccuracyTarget::Epsilon(_) | AccuracyTarget::EpsilonDelta { .. } => vec![
-                StorageBackend::SketchStore,
-                StorageBackend::GorillaObjectStore,
-            ],
-        },
+        // Every ASAP-managed tier answers from the sketch tier.
+        StorageBackend::SketchStore | StorageBackend::DoubleWrite => {
+            vec![StorageBackend::SketchStore]
+        }
     }
 }
 
@@ -84,64 +63,37 @@ mod tests {
     // -----------------------------------------------------------------------
     // storage-backend routing
     //
-    // The Phase-5 `EngineRouter` (see `query_engine_routing.rs`) consults
-    // `compatible_storage_backends(stat, accuracy, metric_storage)` to pick
-    // a backend. These tests pin the routing matrix so the dispatcher stays
-    // in lock-step with the design doc §8.
+    // The `EngineRouter` (see `query_engine_routing.rs`) consults
+    // `compatible_storage_backends(stat, metric_storage)` to pick a backend.
+    // These tests pin the routing matrix so the dispatcher stays in lock-step
+    // with the module doc.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn exact_accuracy_routes_to_archive_only() {
-        // ASAP-first refactor: `Exact` goes straight to the archive
-        // (Thanos via the GorillaObjectStore slot) regardless of where
-        // the metric is stored — the warm sketches are ε/δ-bounded.
-        for cfg in [
-            StorageBackend::GorillaObjectStore,
-            StorageBackend::SketchStore,
-            StorageBackend::DoubleWrite,
-        ] {
-            let backends = compatible_storage_backends(Statistic::Sum, &AccuracyTarget::Exact, cfg);
+    fn asap_managed_tiers_route_to_the_sketch_tier() {
+        // #746: no archive tier. Every ASAP-managed storage axis answers
+        // from the sketch tier.
+        for cfg in [StorageBackend::SketchStore, StorageBackend::DoubleWrite] {
+            let backends = compatible_storage_backends(Statistic::Quantile, cfg);
             assert_eq!(
                 backends,
-                vec![StorageBackend::GorillaObjectStore],
-                "Exact accuracy must route to archive only for {cfg:?}",
+                vec![StorageBackend::SketchStore],
+                "ASAP-managed tier {cfg:?} must route to the sketch tier",
             );
         }
     }
 
     #[test]
-    fn approximate_accuracy_is_asap_first_with_archive_fallback() {
-        // ASAP-first refactor: every ASAP-managed tier shares the same
-        // `[SketchStore, GorillaObjectStore]` sequence for `Approximate`
-        // — try the warm sketch first, fall back to the Thanos archive
-        // on a capability miss.
-        for cfg in [
-            StorageBackend::SketchStore,
-            StorageBackend::GorillaObjectStore,
-            StorageBackend::DoubleWrite,
-        ] {
-            let backends = compatible_storage_backends(
-                Statistic::Quantile,
-                &AccuracyTarget::Epsilon(0.01),
-                cfg,
-            );
-            assert_eq!(
-                backends,
-                vec![
-                    StorageBackend::SketchStore,
-                    StorageBackend::GorillaObjectStore,
-                ],
-                "Approximate accuracy must be ASAP-first then archive for {cfg:?}",
-            );
-        }
+    fn prometheus_remote_keeps_its_own_slot() {
+        let backends =
+            compatible_storage_backends(Statistic::Sum, StorageBackend::PrometheusRemote);
+        assert_eq!(backends, vec![StorageBackend::PrometheusRemote]);
     }
 
     /// Source-of-truth agreement check for the storage axis.
     ///
-    /// For every `(Statistic, AccuracyTarget, StorageBackend)` triple
-    /// the returned backend list must be non-empty and its head must
-    /// match the routing matrix in `compatible_storage_backends`'s
-    /// docstring.
+    /// For every `(Statistic, StorageBackend)` pair the returned backend
+    /// list must be non-empty and dispatchable.
     #[test]
     fn capability_storage_backend_agreement() {
         let stats = [
@@ -155,50 +107,29 @@ mod tests {
             Statistic::Quantile,
             Statistic::Topk,
         ];
-        let accuracies = [AccuracyTarget::Exact, AccuracyTarget::Epsilon(0.01)];
         let configs = [
             StorageBackend::SketchStore,
-            StorageBackend::GorillaObjectStore,
             StorageBackend::DoubleWrite,
             StorageBackend::PrometheusRemote,
         ];
 
         for &stat in &stats {
-            for acc in &accuracies {
-                for &cfg in &configs {
-                    let backends = compatible_storage_backends(stat, acc, cfg);
-                    assert!(
-                        !backends.is_empty(),
-                        "compatible_storage_backends({stat:?}, {acc:?}, {cfg:?}) returned empty \
-                         — every metric configuration must route to at least one backend",
-                    );
-                    let last = *backends.last().unwrap();
-                    assert!(
-                        last == StorageBackend::SketchStore
-                            || last == StorageBackend::GorillaObjectStore
-                            || last == StorageBackend::PrometheusRemote,
-                        "backend list for ({stat:?}, {acc:?}, {cfg:?}) must terminate in a \
-                         dispatchable failover (SketchStore, GorillaObjectStore, or \
-                         PrometheusRemote); got {last:?}",
-                    );
-                    // ASAP-first refactor: the head is determined by
-                    // `(metric_storage_config, accuracy)`. PrometheusRemote
-                    // keeps its single-backend slot; every ASAP-managed tier
-                    // goes archive-only on `Exact` and ASAP-tier-first on
-                    // `Approximate`.
-                    let expected_head = match (cfg, acc) {
-                        (StorageBackend::PrometheusRemote, _) => StorageBackend::PrometheusRemote,
-                        (_, AccuracyTarget::Exact) => StorageBackend::GorillaObjectStore,
-                        (_, AccuracyTarget::Epsilon(_) | AccuracyTarget::EpsilonDelta { .. }) => {
-                            StorageBackend::SketchStore
-                        }
-                    };
-                    assert_eq!(
-                        backends[0], expected_head,
-                        "head mismatch for ({stat:?}, {acc:?}, {cfg:?}): expected {expected_head:?}, got {:?}",
-                        backends[0],
-                    );
-                }
+            for &cfg in &configs {
+                let backends = compatible_storage_backends(stat, cfg);
+                assert!(
+                    !backends.is_empty(),
+                    "compatible_storage_backends({stat:?}, {cfg:?}) returned empty \
+                     — every metric configuration must route to at least one backend",
+                );
+                let expected_head = match cfg {
+                    StorageBackend::PrometheusRemote => StorageBackend::PrometheusRemote,
+                    _ => StorageBackend::SketchStore,
+                };
+                assert_eq!(
+                    backends[0], expected_head,
+                    "head mismatch for ({stat:?}, {cfg:?}): expected {expected_head:?}, got {:?}",
+                    backends[0],
+                );
             }
         }
     }

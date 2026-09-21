@@ -46,6 +46,10 @@ fn discovered_snapshot_plans_with_observed_cadence_and_promql_history() {
     let snapshot: BackendLocalPlanningInput =
         serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
     assert_eq!(snapshot.physical_inputs.scrape_interval_ms, 60_000);
+    assert_eq!(
+        snapshot.data_workload.data_ingestion_interval.value,
+        Some(planner_types::workload::DurationMs(60_000))
+    );
     let (request, _) = snapshot
         .clone()
         .into_physical_compilation_request()

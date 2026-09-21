@@ -34,6 +34,13 @@ lazy_static! {
     )
     .unwrap();
 
+    pub static ref QUERY_FORWARDING_BLOCKED_TOTAL: CounterVec = register_counter_vec!(
+        "asap_query_forwarding_blocked_total",
+        "External query attempts blocked by the query-forwarding policy",
+        &["backend", "path"]
+    )
+    .unwrap();
+
     pub static ref INGEST_SAMPLES_TOTAL: CounterVec = register_counter_vec!(
         "asap_ingest_samples_total",
         "Raw samples accepted by the ingest server, labelled by wire protocol",
@@ -63,6 +70,7 @@ lazy_static! {
 pub fn register_all() {
     lazy_static::initialize(&QUERY_REQUESTS_TOTAL);
     lazy_static::initialize(&QUERY_DURATION_SECONDS);
+    lazy_static::initialize(&QUERY_FORWARDING_BLOCKED_TOTAL);
     lazy_static::initialize(&INGEST_SAMPLES_TOTAL);
     lazy_static::initialize(&INGEST_BATCH_DURATION_SECONDS);
     lazy_static::initialize(&INGEST_DECODE_ERRORS_TOTAL);
@@ -77,5 +85,11 @@ pub fn start_query_timer(query_type: &str) -> HistogramTimer {
 pub fn record_query_outcome(query_type: &str, status: &str) {
     QUERY_REQUESTS_TOTAL
         .with_label_values(&[query_type, status])
+        .inc();
+}
+
+pub fn record_query_forwarding_blocked(backend: &str, path: &str) {
+    QUERY_FORWARDING_BLOCKED_TOTAL
+        .with_label_values(&[backend, path])
         .inc();
 }

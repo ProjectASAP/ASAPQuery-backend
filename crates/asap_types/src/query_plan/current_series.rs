@@ -24,7 +24,8 @@ impl SeriesPopulation {
     }
     pub fn validate(&self) -> Result<(), QueryPlanError> {
         if self.metric.is_empty()
-            || self.lookback_ms != 300_000
+            || self.lookback_ms == 0
+            || self.lookback_ms > i64::MAX as u64
             || self.max_input_lag_ms == 0
             || self.max_input_lag_ms > self.lookback_ms
             || self.max_series == 0
@@ -49,4 +50,34 @@ pub enum SeriesReadout {
     Sum,
     Count,
     Average,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Planner-declared horizons are valid independently of the old five-minute default.
+    #[test]
+    fn accepts_declared_horizon_with_bounded_lag() {
+        let mut population = SeriesPopulation {
+            metric: "a".into(),
+            matchers: vec![],
+            grouping: Grouping {
+                labels: vec![],
+                without: false,
+            },
+            lookback_ms: 1_000,
+            max_input_lag_ms: 1_000,
+            max_series: 100,
+            max_bytes: 1_000_000,
+            max_k: 3,
+            quantiles: true,
+        };
+        population.validate().unwrap();
+        population.lookback_ms = 0;
+        assert!(population.validate().is_err());
+        population.lookback_ms = u64::MAX;
+        assert!(population.validate().is_err());
+        population.lookback_ms = 999;
+        assert!(population.validate().is_err());
+    }
 }

@@ -88,6 +88,15 @@ ASAPPlanner, compiles matching SummaryCatalog/PrecomputePlan/QueryPlan views, an
 installs the resulting immutable snapshot before accepting traffic. It does
 not create or wait for a CollectorPlan.
 
+Supply data evidence only in the top-level `data_workload`; nesting it inside
+`query_workload` is no longer accepted. `data_ingestion_interval` declares the
+instant-selector horizon in milliseconds. Snapshot planning checks its freshness
+at `environment.observed_at_unix_ms`; HTTP physical planning checks it at the
+current planning time and requires the same top-level data evidence.
+Current-series plans retain this horizon for membership expiry, and their input
+lag allowance never exceeds it. Missing cadence in a legacy snapshot is derived
+from its explicit scrape interval; expired or invalid supplied evidence is rejected.
+
 `implementation.max_retained_summary_bytes` limits the estimated total encoded
 summary footprint across every retained pane and partition. It defaults to 2
 GiB for older snapshots and is clamped to `--persistence-memory-limit-mb` at

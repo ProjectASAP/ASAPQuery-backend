@@ -1,6 +1,5 @@
-//! L3 → L4/L5 lowering — `QueryExpr` walk that adopts
-//! `asap_aware_mapping::bind::implement_tree_in_with` for the sketch algebra
-//! itself (Step B of the plan-shaped-serving migration), with
+//! L3 → L4/L5 lowering — `QueryExpr` walk that selects candidates from
+//! `SketchAlgorithmStrategy::replacements` via `planner_selection::select_summary`, with
 //! `crate::physical::post_asap::cost_model::ControlPlaneCostModel` plugged in
 //! for family selection + parameter sizing.
 //!
@@ -9,9 +8,8 @@
 //! variants when a binding rule fires; everything else stays inside
 //! `Logical(…)`."
 //!
-//! Two node shapes are rewritten *before* delegating to
-//! `implement_tree_in_with`, because `asap_aware_mapping::boundary::implementation_for`
-//! actively binds them to an `Implementation` this deployment's data plane
+//! Two node shapes are rewritten *before* selecting a candidate, because
+//! the upstream strategy can produce summaries this deployment's data plane
 //! doesn't (or, deliberately, shouldn't) serve — not something the
 //! `CostModel` hook can reach, since the decision of *whether* to call
 //! into `rank_candidates`/`size_params` at all is made before the
@@ -21,10 +19,9 @@
 //! `AggIntent::Extension` (the `Frequency` point-query) needs no such
 //! pre-pass anymore: `ControlPlaneCostModel::realize_extension`/
 //! `readout_extension` (ASAPController#150) now realize it as a real
-//! `CountSketch`, so the catch-all arm below commits it via
-//! `implement_tree_in_with` like any other intent.
+//! `CountSketch`, so the catch-all arm below selects it like any other intent.
 //! `AggIntent::TopK { accuracy: Exact }` is the one remaining case left to
-//! fall through to `implement_tree_in_with`'s own `Logical` fallback
+//! fall through to the strategy's `KeepPreAsap` fallback
 //! unchanged — a genuine, still-open `asap-plan` coverage gap (filed
 //! upstream — see ASAPController#151), not something this deployment
 //! should route around locally.
@@ -45,7 +42,7 @@ use planner_types::pre_asap::{AggIntent, QueryExpr};
 #[derive(Debug, Error)]
 pub enum BindingError {
     /// L3 schema derivation failed while lifting an edge to `SummarySchema` —
-    /// forwarded from `asap_aware_mapping::bind`.
+    /// forwarded from `asap_aware_mapping::replacement`.
     #[error("L3->L4 implementation failed: {0}")]
     Implement(#[from] crate::planner_selection::SelectionError),
 }
@@ -89,7 +86,7 @@ fn bind_recursive(
 
         // The canonical L3 IR places `TimeRange` *above* a single-statistic
         // sketchable `Aggregate` (`lower_promql`'s window-swap; was
-        // `Window` before the ASAPPlanner pin migration). `implement_tree_with`
+        // `Window` before the ASAPPlanner pin migration). The replacement strategy
         // only recurses through the `Aggregate` spine (see its module
         // docs' "conservative fallbacks" — a logical parent above a
         // bindable aggregate subsumes it unbound), so push the range
@@ -121,6 +118,12 @@ fn bind_recursive(
             };
             bind_recursive(&pushed, cost_model)
         }
+
+        // Workload-aware instant selectors retain their source horizon even
+        // when there is no aggregate to bind.
+        QueryExpr::TimeRange { .. } => Ok(PostAsapPlan::Summary(
+            crate::planner_selection::keep_pre_asap(expr)?,
+        )),
 
         // Exact Count cannot use this deployment's Sum accumulator: it counts
         // values rather than samples. Keep it logical for archive execution.

@@ -1,4 +1,4 @@
-//! PromQL workload extraction through `asap_frontend_promql::lower_promql`.
+//! PromQL workload extraction through `asap_frontend_promql::lower_promql_workload`.
 //!
 //! ASAPPlanner owns parsing and intent classification. Both entry points require
 //! an explicit `AccuracyTarget` because lowering can size summaries.
@@ -14,6 +14,12 @@ use crate::types::AggType;
 use planner_types::pre_asap::AggIntent;
 use planner_types::pre_asap::{ColumnId, CompareOpKind, ScalarValue};
 use planner_types::pre_asap::{Predicate, QueryExpr, Source};
+use planner_types::workload::{
+    AccuracyRequirement, BatchEntry, DataWorkload, DurationMs, Evidence, Query, QueryLanguage,
+    QueryRequirements, QueryWorkload, TimeSelection,
+};
+
+const COMPATIBILITY_DATA_INGESTION_INTERVAL_MS: u64 = 1_000;
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
 
@@ -68,18 +74,48 @@ pub enum QueryHint {
 /// Parse a PromQL query string into the **canonical** L3
 /// [`query_expr::QueryExpr`](planner_types::pre_asap::QueryExpr) IR.
 ///
-/// This is the single public algebra-IR entry point — a direct call into
-/// `asap_frontend_promql::lower_promql`, which does the full L1 parse →
-/// L2 relational tree → L3 canonical conversion in one call. No local
-/// parser, no local L2 tree; `accuracy` is threaded onto every
-/// accuracy-bearing intent the same way ASAPController's own PromQL
-/// front end threads it.
+/// Compatibility entry point for callers that do not own a complete workload.
+/// Plan-ready compilation lowers the complete caller-supplied workload instead.
 pub fn parse_query_expr_canonical(
     query: &str,
     accuracy: AccuracyTarget,
 ) -> anyhow::Result<planner_types::pre_asap::QueryExpr> {
-    let canonical = asap_frontend_promql::lower_promql(query.trim(), accuracy)?;
-    Ok(canonical)
+    parse_query_expr_with_interval(query, accuracy, COMPATIBILITY_DATA_INGESTION_INTERVAL_MS)
+}
+
+pub(crate) fn parse_query_expr_with_interval(
+    query: &str,
+    accuracy: AccuracyTarget,
+    interval_ms: u64,
+) -> anyhow::Result<planner_types::pre_asap::QueryExpr> {
+    let workload = planner_types::workload::PlanningWorkload {
+        query_workload: QueryWorkload {
+            language: QueryLanguage::PromQL,
+            query_batch: Some(vec![BatchEntry {
+                query: Query(query.trim().into()),
+                requirements: QueryRequirements {
+                    accuracy: AccuracyRequirement::Explicit(accuracy),
+                    ..Default::default()
+                },
+                predictability: Default::default(),
+                invocations: 1,
+                execute_at: None,
+                time_selection: TimeSelection::default(),
+            }]),
+            repeating_queries: None,
+        },
+        data_workload: Some(DataWorkload {
+            data_ingestion_interval: Evidence {
+                value: Some(DurationMs(interval_ms)),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    };
+    asap_frontend_promql::lower_promql_workload(&workload, 0)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("PromQL compatibility workload produced no query"))
 }
 
 /// Parse a PromQL query string into a [`ParsedQuery`].
@@ -100,7 +136,7 @@ pub fn parse_query(query: &str, accuracy: AccuracyTarget) -> anyhow::Result<Pars
 /// calls. Canonical `Scan` also carries `label_filters` inline, so they
 /// are picked up at the scan leaf as well as from any `Filter` predicate.
 pub(crate) fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
-    // The Binder-built `Scan.schema` is the complete, self-contained
+    // The SchemaResolver-built `Scan.schema` is the complete, self-contained
     // column universe every `ColumnId` in the tree indexes into. We grab
     // it up-front so the `Aggregate` walk can recover group-by *names*
     // from positional `by` ids.
@@ -111,7 +147,7 @@ pub(crate) fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
 }
 
 /// Find the schema carried by the tree's first `Scan` leaf. Every `Scan`
-/// in a converted tree carries the same Binder schema, so the first one
+/// in a converted tree carries the same SchemaResolver schema, so the first one
 /// found is representative.
 fn root_scan_schema(qe: &QueryExpr) -> Option<&planner_types::pre_asap::Schema> {
     match qe {
@@ -160,7 +196,7 @@ struct QeCollector {
 }
 
 impl QeCollector {
-    /// `schema` is the Binder-built `Scan.schema` — the complete column
+    /// `schema` is the SchemaResolver-built `Scan.schema` — the complete column
     /// universe `Aggregate.by` positional ids index into. Threaded
     /// unchanged through the walk; only the `Aggregate` arm reads it.
     fn visit(&mut self, expr: &QueryExpr, schema: Option<&planner_types::pre_asap::Schema>) {
@@ -213,9 +249,9 @@ impl QeCollector {
                 // The canonical IR folds legacy SketchAgg / WindowedAgg-inner
                 // / TopK / Aggregate into one variant carrying `AggIntent`s.
                 // `by` is positional — recover the group-by label *names*
-                // from the Binder schema (the legacy `Aggregate.keys` were
+                // from the SchemaResolver schema (the legacy `Aggregate.keys` were
                 // names; multi-agg aggregates reach here with a non-empty
-                // `by` after the Binder resolves them). A per-entity
+                // `by` after the SchemaResolver resolves them). A per-entity
                 // reduction (ASAPController#163/#165) has no `by` at all —
                 // same as an empty one here, no label names to recover.
                 let by: &[ColumnId] = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);

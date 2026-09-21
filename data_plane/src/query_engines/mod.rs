@@ -1,10 +1,9 @@
 //! Query engines.
 //!
 //! The public query-engine surface is intentionally small:
-//! [`asap_query_engine`] answers from ASAP's sketch store, and
-//! [`thanos_query_engine`] forwards exact/archive queries to `thanos-query`
-//! (Path A2 — the only archive path now that the superseded in-process
-//! Gorilla executor / GORILLA1 store has been deleted).
+//! [`asap_query_engine`] answers from ASAP's sketch store. Queries the
+//! ASAP tier cannot serve fall through to the Prometheus fallback in
+//! the HTTP layer (there is no archive tier — see #746).
 //!
 //! ## Public surface
 //!
@@ -12,18 +11,15 @@
 //!
 //! * [`asap_query_engine::ASAPQueryEngine`] — ASAP-tier sketch query
 //!   engine.
-//! * [`thanos_query_engine::ThanosQueryEngine`] — archive-tier query
-//!   engine.
 //! * [`EngineError`] — the trait-level error envelope every
 //!   `crate::query_engines::routing::QueryEngine` impl returns.
 
 pub mod asap_clickhouse_query_engine;
 pub mod asap_query_engine;
 pub mod canonical;
-pub mod no_data_archive;
+pub mod query_forwarding;
 pub mod query_result;
 pub mod routing;
-pub mod thanos_query_engine;
 
 // Post-M2.3 reorg: timeline_dispatch + window_merger are ASAP-tier driver
 // primitives (they reason about reconfigure boundaries that only exist
@@ -35,13 +31,8 @@ pub use crate::storage_engines::sketch_db::query::timeline_dispatch;
 pub use crate::storage_engines::sketch_db::query::window_merger;
 
 pub use asap_query_engine::ASAPQueryEngine;
-pub use no_data_archive::{NoDataArchiveEngine, DATA_SOURCE_ID_NO_DATA_ARCHIVE};
+pub use query_forwarding::QueryForwardingPolicy;
 pub use query_result::{InstantVector, QueryResult, RangeVector, RangeVectorElement, Sample};
-pub use thanos_query_engine::{
-    thanos_engine_from_env, ThanosQueryConfig, ThanosQueryEngine, ThanosQueryError,
-    ASAP_THANOS_QUERY_URL_ENV, DATA_SOURCE_THANOS_QUERY_ID, DATA_SOURCE_THANOS_QUERY_INFO,
-    DEFAULT_THANOS_QUERY_URL, QUIRK_THANOS_UNREACHABLE,
-};
 pub use timeline_dispatch::{combine_statistic, CombinedResult};
 pub use window_merger::{create_window_merger, NaiveMerger, WindowMerger};
 
