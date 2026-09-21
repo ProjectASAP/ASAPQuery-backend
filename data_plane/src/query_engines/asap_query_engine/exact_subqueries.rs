@@ -632,6 +632,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_external_endpoint_fails_closed_before_any_rpc() {
+        let result = prepare_external(
+            &candidate_entry("sum by (job) (rate(m[5m]))"),
+            &[1_000],
+            None,
+            None,
+            &reqwest::Client::new(),
+            candidate_rows(["api".into()]),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::CapabilityMiss { ref detail, .. })
+                if detail.contains("Prometheus exact endpoint unavailable")
+        ));
+    }
+
+    #[tokio::test]
     async fn candidate_exact_is_discovered_and_prepared_behind_candidate_topk_root() {
         use asap_types::query_plan::{logical::Grouping, CandidateCompleteness};
         let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");

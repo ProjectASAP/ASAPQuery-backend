@@ -31,7 +31,6 @@ Targets:
   differential    Production DDSketch PromQL vs deterministic raw-value oracle
   sketch-oracles  Every sketch via production binary + independent raw oracle
   monitor         Real monitor gRPC transport tests
-  gorilla-merger  Gorilla HTTP/WAL/block/StoreAPI/compaction/shipper tests
   whole           Controller plan -> backend install -> OTLP -> store -> PromQL
   whole-matrix    All sketch families and query shapes (diagnostic)
   differential-all Production sketch oracles plus the in-process query matrix
@@ -148,20 +147,7 @@ monitor() {
     rust_test data_plane --test monitor_process_e2e
 }
 
-gorilla_merger() {
-    CURRENT_STAGE="gorilla-merger"
-    say "gorilla-merger: HTTP ingest, WAL, blocks, StoreAPI, compaction, shipping"
-    need go
-    mkdir -p "${CARGO_TARGET_DIR}"
-    (
-        cd "${REPO_DIR}/gorilla-merger"
-        GOPRIVATE="${GOPRIVATE:-github.com/ProjectASAP/*}" \
-            go build -o "${CARGO_TARGET_DIR}/gorilla-merger-e2e" ./cmd/gorilla-merger
-        GORILLA_MERGER_E2E_BIN="${CARGO_TARGET_DIR}/gorilla-merger-e2e" \
-            GOPRIVATE="${GOPRIVATE:-github.com/ProjectASAP/*}" \
-            go test -count=1 ./...
-    )
-}
+
 
 whole() {
     CURRENT_STAGE="whole/controller-to-query"
@@ -216,7 +202,6 @@ main() {
             control_plane
             data_plane
             monitor
-            gorilla_merger
             whole
             ;;
         contracts) need cargo; contracts ;;
@@ -227,7 +212,6 @@ main() {
         differential) need cargo; differential ;;
         sketch-oracles) need cargo; sketch_oracles ;;
         monitor) need cargo; monitor ;;
-        gorilla-merger) gorilla_merger ;;
         whole) need cargo; whole ;;
         whole-matrix) need cargo; whole_matrix ;;
         differential-all) need cargo; differential_all ;;

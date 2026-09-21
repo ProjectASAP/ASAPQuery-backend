@@ -136,7 +136,7 @@ pub fn parse_query(query: &str, accuracy: AccuracyTarget) -> anyhow::Result<Pars
 /// calls. Canonical `Scan` also carries `label_filters` inline, so they
 /// are picked up at the scan leaf as well as from any `Filter` predicate.
 pub(crate) fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
-    // The Binder-built `Scan.schema` is the complete, self-contained
+    // The SchemaResolver-built `Scan.schema` is the complete, self-contained
     // column universe every `ColumnId` in the tree indexes into. We grab
     // it up-front so the `Aggregate` walk can recover group-by *names*
     // from positional `by` ids.
@@ -147,7 +147,7 @@ pub(crate) fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
 }
 
 /// Find the schema carried by the tree's first `Scan` leaf. Every `Scan`
-/// in a converted tree carries the same Binder schema, so the first one
+/// in a converted tree carries the same SchemaResolver schema, so the first one
 /// found is representative.
 fn root_scan_schema(qe: &QueryExpr) -> Option<&planner_types::pre_asap::Schema> {
     match qe {
@@ -196,7 +196,7 @@ struct QeCollector {
 }
 
 impl QeCollector {
-    /// `schema` is the Binder-built `Scan.schema` — the complete column
+    /// `schema` is the SchemaResolver-built `Scan.schema` — the complete column
     /// universe `Aggregate.by` positional ids index into. Threaded
     /// unchanged through the walk; only the `Aggregate` arm reads it.
     fn visit(&mut self, expr: &QueryExpr, schema: Option<&planner_types::pre_asap::Schema>) {
@@ -249,9 +249,9 @@ impl QeCollector {
                 // The canonical IR folds legacy SketchAgg / WindowedAgg-inner
                 // / TopK / Aggregate into one variant carrying `AggIntent`s.
                 // `by` is positional — recover the group-by label *names*
-                // from the Binder schema (the legacy `Aggregate.keys` were
+                // from the SchemaResolver schema (the legacy `Aggregate.keys` were
                 // names; multi-agg aggregates reach here with a non-empty
-                // `by` after the Binder resolves them). A per-entity
+                // `by` after the SchemaResolver resolves them). A per-entity
                 // reduction (ASAPController#163/#165) has no `by` at all —
                 // same as an empty one here, no label names to recover.
                 let by: &[ColumnId] = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);

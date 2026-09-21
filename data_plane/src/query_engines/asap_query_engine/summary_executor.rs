@@ -46,7 +46,7 @@
 //! `exact_agg_kind_match`'s doc for why `Min`/`Max`/`Count`/`Rate` aren't
 //! matched) — one sid is one aggregation, read out directly, with no
 //! special-casing of exact-vs-approximate at the `find_candidates`/merge
-//! level. But `readout`/`SketchQuery` NEVER see these: `asap_aware_mapping::bind`
+//! level. But `readout`/`SketchQuery` NEVER see these: `asap_aware_mapping::replacement`
 //! never wraps an `ExactAccumulator` implementation in a
 //! `SummaryEstimate` (`estimate = false` in `bind_summary_agg`), so
 //! `execute()` on such a tree returns `ExecOutcome::State` at the root
@@ -940,7 +940,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         query: &SketchQuery,
     ) -> Result<Self::Value, Self::Error> {
         // `ExactAgg` states never reach here in practice -- see this
-        // module's doc (`asap_aware_mapping::bind` never wraps an ExactAccumulator
+        // module's doc (`asap_aware_mapping::replacement` never wraps an ExactAccumulator
         // in a `SummaryEstimate`, so `execute()` stops at
         // `ExecOutcome::State` before ever calling `readout`). Defensive,
         // not a real path.

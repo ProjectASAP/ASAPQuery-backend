@@ -29,20 +29,15 @@ use asap_types::Statistic;
 /// equivalent `?engine=<data_source_id>` query param), the HTTP layer
 /// bypasses the per-metric `BackendStorageRouting` lookup and dispatches
 /// the PromQL string straight to the named engine. Used by the
-/// `accuracy_reduce.py` reducer to ask the same query against the warm
-/// sketch and the Gorilla archive on MinIO so it can compute
-/// apples-to-apples relative error per replay row. See
-/// `docs/design-jsonl-deprecation-and-gorilla-promql-completeness.md`
-/// (Fix 1) for the design rationale.
+/// `accuracy_reduce.py` reducer to select a registered query engine.
 ///
 /// Recognised values match `StorageBackend::data_source_id()` —
-/// `asap_query`, `thanos_query`, `double_write`. (Step-1 of
-/// the JSONL deprecation removed the `cold_jsonl` value.) An
-/// unknown value returns 400.
+/// `asap_query`, `double_write`, `prometheus_remote`. An unknown
+/// value returns 400.
 pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
 pub const ENGINE_OVERRIDE_QUERY_PARAM: &str = "engine";
-/// Per-request accuracy contract. `exact` routes ASAP-managed metrics directly
-/// to the archive; `approximate` (the default) keeps warm-first failover.
+/// Per-request accuracy contract. `exact` forwards to the configured exact
+/// backend; `approximate` (the default) tries ASAP execution first.
 pub const ACCURACY_HEADER: &str = "X-ASAP-Accuracy";
 
 fn extract_accuracy(headers: &HeaderMap) -> Result<AccuracyTarget, String> {
@@ -185,8 +180,8 @@ pub struct HttpServer {
     /// names and answers from RAM. The same cache is fed by the OTLP
     /// receiver — see `OtlpReceiver::with_probe_cache`. `None`
     /// disables the short-circuit; the dispatch falls through to the
-    /// normal routing-table path (which goes to Thanos for the cold
-    /// archive and observes the 60–90 s flush gap).
+    /// normal routing-table path, which observes the warm tier's
+    /// 60–90 s flush gap.
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     /// Serializes multi-document physical-plan publication so two control
     /// plane generations cannot interleave their plan projections and catalog.
@@ -288,16 +283,6 @@ impl HttpServer {
         // hold an `Arc<EngineRouter>`, so we rebuild from a fresh
         // `EngineRouter::clone()` (cheap; the `engines` map clones the
         // inner `Arc`s, not the engines themselves).
-        let mut router: EngineRouter = (*self.query_router).clone();
-        router.register(engine);
-        self.query_router = Arc::new(router);
-        self
-    }
-
-    /// Register the archive engine. The only public archive query
-    /// engine id is `thanos_query`; Gorilla is only an
-    /// encoding/storage detail.
-    pub fn with_archive_query_engine(mut self, engine: Arc<dyn QueryEngine>) -> Self {
         let mut router: EngineRouter = (*self.query_router).clone();
         router.register(engine);
         self.query_router = Arc::new(router);
@@ -712,10 +697,8 @@ async fn process_query_request(
     //
     // If the caller explicitly named an engine (via `X-ASAP-Engine`
     // header or `?engine=` query param) bypass `BackendStorageRouting`
-    // and dispatch directly. The accuracy reducer relies on this to
-    // ask the same PromQL against the warm sketch (`asap_query`) and
-    // the Gorilla archive (`thanos_query`) so it can compute
-    // apples-to-apples relative error per replay row.
+    // and dispatch directly — the accuracy reducer uses this to pin one
+    // engine per replay row.
     if let Some(override_id) = engine_override.as_deref() {
         return process_via_named_engine(state, parsed_request, start_time, override_id).await;
     }
@@ -798,9 +781,8 @@ async fn process_query_request(
     //       `backend-storage-routing.yaml` at startup). The PromQL
     //       query is parsed; the metric name is extracted from the
     //       AST and looked up in the table. This is the production
-    //       path the issue-46 MVP relies on so cold-archive metrics
-    //       (e.g. `http_requests_total` → `thanos_query`) actually
-    //       route through the `EngineRouter`.
+    //       path the issue-46 MVP relies on so non-default metrics
+    //       actually route through the `EngineRouter`.
     //   (b) Single-axis `StreamingConfig::storage_backend()` from the
     //       hot-reload config (the pre-Phase-5 fallback). Pre-control-plane
     //       deploys ride this path; it always lands on `SketchStore`
@@ -824,12 +806,67 @@ async fn process_query_request(
         state.hot_reload_config.is_some(),
     );
 
-    if matches!(metric_storage, StorageBackend::SketchStore)
-        && !matches!(accuracy, AccuracyTarget::Exact)
-    {
+    // `X-ASAP-Accuracy: exact` means "do not answer from the ε/δ-bounded
+    // sketches". Since #746 removed the archive tier there is no exact
+    // engine left in-process, so an exact request goes straight to the
+    // Prometheus fallback (or the adapter's unsupported-query response
+    // when no fallback is configured).
+    if matches!(accuracy, AccuracyTarget::Exact) {
+        debug!("Exact accuracy requested — bypassing the sketch tier");
+        return forward_instant_to_fallback(state, parsed_request, headers).await;
+    }
+
+    if matches!(metric_storage, StorageBackend::SketchStore) {
         process_via_simple_engine(state, parsed_request, start_time, headers).await
     } else {
-        process_via_router(state, parsed_request, start_time, metric_storage, accuracy).await
+        process_via_router(state, parsed_request, start_time, metric_storage, headers).await
+    }
+}
+
+/// Range sibling of [`forward_instant_to_fallback`].
+async fn forward_range_to_fallback(
+    state: &AppState,
+    parsed_request: &ParsedRangeQueryRequest,
+    headers: HashMap<String, String>,
+) -> Response {
+    if let Some(fallback) = &state.fallback {
+        return match fallback
+            .execute_range_query_with_headers(parsed_request, headers)
+            .await
+        {
+            Ok(response) => response.into_response(),
+            Err(status) => status.into_response(),
+        };
+    }
+    match state.adapter.format_unsupported_query_response().await {
+        Ok(json) => json.into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+/// Forward an instant query to the Prometheus fallback, or render the
+/// adapter's unsupported-query response when no fallback is configured.
+///
+/// The single exit for "the ASAP tier cannot serve this" since #746: an
+/// exact-accuracy request, or a router that ran out of compatible
+/// engines.
+async fn forward_instant_to_fallback(
+    state: &AppState,
+    parsed_request: &ParsedQueryRequest,
+    headers: HashMap<String, String>,
+) -> Response {
+    if let Some(fallback) = &state.fallback {
+        return match fallback
+            .execute_query_with_headers(parsed_request, headers)
+            .await
+        {
+            Ok(response) => response.into_response(),
+            Err(status) => status.into_response(),
+        };
+    }
+    match state.adapter.format_unsupported_query_response().await {
+        Ok(json) => json.into_response(),
+        Err(status) => status.into_response(),
     }
 }
 
@@ -917,88 +954,6 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                         backend = StorageBackend::SketchStore;
                     }
 
-                    // ── Archive override for topk with no heap-bearing sid ──
-                    // Finding P1: a `topk(...)` query requires a
-                    // `FrequencyTopk` capability, which only a heap-BEARING
-                    // warm sid (`CountMinSketchWithHeap` /
-                    // `CountSketchWithHeap`) can satisfy. When the control
-                    // plane plans a heap-LESS `CountSketch` for the metric,
-                    // `build_routing_entry` leaves the `Topk` shape on the
-                    // warm tier (`SketchStore`) on the assumption that the
-                    // sketch can answer it — but a heap-less sketch
-                    // capability-misses on `FrequencyTopk`. Because the
-                    // `SketchStore` axis dispatches the ASAP engine
-                    // *directly* (`process_via_simple_engine`, no router),
-                    // that miss never reaches the archive failover the
-                    // `EngineRouter` would otherwise perform, so the caller
-                    // got `data_source: asap_query` "No result" instead of
-                    // an exact answer from raw data.
-                    //
-                    // Push such queries to the archive so they dispatch
-                    // through `process_via_router` (which fails over the
-                    // `[SketchStore, GorillaObjectStore]` sequence and
-                    // answers from Thanos). Only do this when the warm tier
-                    // genuinely cannot serve the topk: NO heap-bearing
-                    // `FrequencyTopk` sid AND no `ExactAgg(Sum)` sid (the
-                    // latter is handled by `try_topk_over_rate_fallback`
-                    // for `topk(K, sum by (..) (rate(..)))` shapes, already
-                    // pulled back to `SketchStore` by the override above).
-                    if matches!(backend, StorageBackend::SketchStore)
-                        && matches!(
-                            shape,
-                            crate::storage_engines::types::QueryOperatorShape::Topk
-                        )
-                        && !metric_has_frequency_topk_sid(&state.summary_store, &metric_name)
-                        && !metric_has_exact_agg_sum_sid(&state.summary_store, &metric_name)
-                    {
-                        debug!(
-                            "resolve_metric_storage: overriding SketchStore → \
-                             GorillaObjectStore for metric={} shape={:?} (no \
-                             heap-bearing FrequencyTopk sid and no ExactAgg(Sum) \
-                             sid; warm tier cannot answer topk, routing to \
-                             archive for an exact answer)",
-                            metric_name, shape,
-                        );
-                        backend = StorageBackend::GorillaObjectStore;
-                    }
-
-                    // ── Archive override for sum_over_time over a counter ──
-                    // `sum_over_time(metric[r])` and instant `sum by (..)
-                    // (metric)` BOTH classify as `QueryOperatorShape::Sum`, but only
-                    // the range form is the counter-delta case the warm tier
-                    // cannot serve: the ExactAgg(Sum) sids store per-window
-                    // counter *deltas*, and `sum_over_time` wants the
-                    // Σ-of-cumulative-*samples*, which is not reconstructable
-                    // from deltas (issue #301; the engine returns a
-                    // CapabilityMiss for this exact shape). Because the
-                    // `SketchStore` axis dispatches the ASAP engine *directly*
-                    // (`process_via_simple_engine`, no router), that miss never
-                    // reaches the archive failover the `EngineRouter` performs —
-                    // so the caller got `data_source: asap_query` "No result"
-                    // instead of an exact answer from raw data. Push only the
-                    // `sum_over_time` form to the archive so it dispatches
-                    // through `process_via_router` ([SketchStore,
-                    // GorillaObjectStore] → Thanos). Instant `sum by (..)` is
-                    // left on `SketchStore` (it is served warm).
-                    if matches!(backend, StorageBackend::SketchStore)
-                        && matches!(
-                            shape,
-                            crate::storage_engines::types::QueryOperatorShape::Sum
-                        )
-                        && query_is_sum_over_time(&expr)
-                        && metric_has_exact_agg_sum_sid(&state.summary_store, &metric_name)
-                    {
-                        debug!(
-                            "resolve_metric_storage: overriding SketchStore → \
-                             GorillaObjectStore for metric={} (sum_over_time over \
-                             counter deltas; warm ExactAgg(Sum) cannot reconstruct \
-                             Σ-of-cumulative-samples — issue #301 — routing to \
-                             archive for an exact answer)",
-                            metric_name,
-                        );
-                        backend = StorageBackend::GorillaObjectStore;
-                    }
-
                     debug!(
                         "resolve_metric_storage: routing-table hit for tenant={} metric={} shape={:?} → {:?}",
                         tenant, metric_name, shape, backend,
@@ -1023,26 +978,6 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
         .as_ref()
         .map(|h| h.snapshot().storage_backend())
         .unwrap_or_default()
-}
-
-/// True when the query's effective shape is a `sum_over_time(...)` range
-/// aggregation, as opposed to an instant `sum by (...)`. Both classify as
-/// [`QueryOperatorShape::Sum`], so [`resolve_metric_storage`] disambiguates on the
-/// AST: only the range form is the counter-delta case the warm
-/// ExactAgg(Sum) tier cannot reconstruct (issue #301), so only it is
-/// re-routed to the archive. Walks through the wrapping aggregate / paren /
-/// unary / binary / subquery nodes and matches a `sum_over_time` call.
-fn query_is_sum_over_time(expr: &promql_parser::parser::Expr) -> bool {
-    use promql_parser::parser::Expr;
-    match expr {
-        Expr::Call(call) => call.func.name.eq_ignore_ascii_case("sum_over_time"),
-        Expr::Aggregate(agg) => query_is_sum_over_time(&agg.expr),
-        Expr::Paren(p) => query_is_sum_over_time(&p.expr),
-        Expr::Unary(u) => query_is_sum_over_time(&u.expr),
-        Expr::Binary(bin) => query_is_sum_over_time(&bin.lhs) || query_is_sum_over_time(&bin.rhs),
-        Expr::Subquery(sq) => query_is_sum_over_time(&sq.expr),
-        _ => false,
-    }
 }
 
 /// True when the sketch index carries at least one ExactAgg(Sum-family)
@@ -1074,42 +1009,6 @@ fn metric_has_exact_agg_sum_sid(
                             | AggregationType::MultipleIncrease
                     )
                 ) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// True when the sketch index carries at least one heap-BEARING
-/// `FrequencyTopk` sid (`CountMinSketchWithHeap` / `CountSketchWithHeap`)
-/// for `metric_name`. Used by [`resolve_metric_storage`] to decide
-/// whether a `topk(...)` shape left on the warm tier can actually be
-/// answered there: only a heap-bearing sid can enumerate top-k items.
-/// A heap-less `CountMinSketch` / `CountSketch` sid (registered under
-/// `Capability::FrequencyEstimate`) does NOT count — it capability-misses
-/// on `FrequencyTopk`, so the query must route to the archive instead.
-///
-/// Mirrors `metric_has_exact_agg_sum_sid`'s any-sid (group-by-agnostic)
-/// scan — we only care whether the metric has ANY heap-bearing topk sid;
-/// the engine's per-candidate dispatch handles the per-group-by match.
-fn metric_has_frequency_topk_sid(
-    idx: &crate::storage_engines::sketch_db::index::SketchStore,
-    metric_name: &str,
-) -> bool {
-    use crate::storage_engines::sketch_db::index::Capability;
-    let sids = idx.instances_matching(metric_name, &std::collections::BTreeSet::new());
-    for sid in sids {
-        if let Some(meta) = idx.instance(sid) {
-            if let Some(cap) = meta.capability.as_ref() {
-                // `FrequencyTopk(_)` is only ever registered for
-                // heap-bearing handles (see `policy_capability` /
-                // ingest's `CountMinSketchWithHeap` /
-                // `CountSketchWithHeap` arms). Heap-less variants are
-                // registered under `FrequencyEstimate`, so matching the
-                // variant alone is the correct heap-bearing predicate.
-                if matches!(cap, Capability::FrequencyTopk(_)) {
                     return true;
                 }
             }
@@ -1337,6 +1236,7 @@ async fn process_via_simple_engine(
                     Err(status) => status.into_response(),
                 }
             } else {
+                record_disabled_forwarding(state, "prometheus", "instant");
                 debug!("Query not supported and forwarding disabled, returning error");
                 // Adapter formats the unsupported query error for its protocol.
                 // We still annotate `data_source: asap_query` so callers
@@ -1498,7 +1398,7 @@ async fn process_via_router(
     parsed_request: &ParsedQueryRequest,
     start_time: Instant,
     metric_storage: StorageBackend,
-    accuracy: AccuracyTarget,
+    headers: HashMap<String, String>,
 ) -> Response {
     use crate::drivers::query::adapters::QueryExecutionResult;
     use crate::query_engines::EngineError;
@@ -1514,7 +1414,7 @@ async fn process_via_router(
     let stat = Statistic::Sum;
     let router_result = state
         .query_router
-        .execute_routed(&parsed_request.query, stat, accuracy, metric_storage)
+        .execute_routed(&parsed_request.query, stat, metric_storage)
         .await;
 
     match router_result {
@@ -1554,6 +1454,8 @@ async fn process_via_router(
                 Err(status) => status.into_response(),
             }
         }
+        // No engine for the metric's tier is a deploy misconfig, not a
+        // query the ASAP tier cannot serve — keep it fail-loud.
         Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
             warn!(
                 tried = ?tried,
@@ -1571,20 +1473,25 @@ async fn process_via_router(
             )
                 .into_response()
         }
+        // A CapabilityMiss means the ASAP tier cannot serve this query;
+        // forward it rather than answering "no result" (#746 — the archive
+        // failover that used to absorb these is gone). A Backend error is a
+        // real upstream failure, so it stays a 5xx.
         Err(EngineRouterError::AllFailed { last }) => {
             warn!(error = %last, "EngineRouter: all compatible engines failed");
-            let (status, error_type) = match &last {
-                EngineError::CapabilityMiss { .. } => (StatusCode::NOT_FOUND, "bad_data"),
-                EngineError::Backend { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-            };
-            (
-                status,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "errorType": error_type,
-                    "error": last.to_string()})),
-            )
-                .into_response()
+            match &last {
+                EngineError::CapabilityMiss { .. } => {
+                    forward_instant_to_fallback(state, parsed_request, headers).await
+                }
+                EngineError::Backend { .. } => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "errorType": "internal",
+                        "error": last.to_string()})),
+                )
+                    .into_response(),
+            }
         }
     }
 }
@@ -2128,6 +2035,22 @@ fn query_status_label(response: &Response) -> &'static str {
     }
 }
 
+fn record_disabled_forwarding(state: &AppState, backend: &str, path: &str) {
+    if state.config.adapter_config.fallback_blocked_by_policy
+        && !state
+            .config
+            .adapter_config
+            .query_forwarding_policy
+            .allows_external_queries()
+    {
+        debug!(
+            backend,
+            path, "query forwarding disabled; external query blocked"
+        );
+        srv_metrics::record_query_forwarding_blocked(backend, path);
+    }
+}
+
 // ============================================================
 // Metrics Handler
 // ============================================================
@@ -2185,46 +2108,6 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 // Range Query Handlers
 // ============================================================
 
-/// Warm-vs-archive routing fix: classify a range query's
-/// [`RangeTier`] from its window start vs the warm-retention boundary.
-///
-/// The defect: with cold/archive ON, a recent range query whose data is
-/// still warm-resident (and NOT yet archived) was failing over to the
-/// archive, which answers `Ok` with an EMPTY series for that recent
-/// range — the caller saw "No result" stamped `data_source:
-/// thanos_query`. The split must be by **time vs the warm-retention
-/// boundary**, not "archive-on ⇒ everything to archive".
-///
-/// * `retention_ms == Some(r)` with `r > 0`: the warm floor is
-///   `now_ms − r`. A window whose `start_ms >= warm_floor_ms` lies
-///   entirely inside warm retention ⇒ [`RangeTier::WarmOnly`] (archive
-///   guaranteed empty, so its failover leg is dropped). A window that
-///   reaches at/before the floor (genuinely-archived history, or a
-///   range straddling the boundary) ⇒ [`RangeTier::ArchiveEligible`]:
-///   the full ASAP-first-then-archive sequence runs, and the ASAP
-///   engine's hybrid-stitch path merges warm ∪ archive on overlap.
-/// * `retention_ms == None` / `Some(0)`: no boundary to split on, so we
-///   keep the archive eligible — the pre-fix behaviour — and never
-///   narrow a query that might legitimately need the archive.
-fn classify_range_tier(
-    start_ms: u64,
-    retention_ms: Option<u64>,
-    now_ms: u64,
-) -> crate::query_engines::routing::RangeTier {
-    use crate::query_engines::routing::RangeTier;
-    match retention_ms {
-        Some(retention_ms) if retention_ms > 0 => {
-            let warm_floor_ms = now_ms.saturating_sub(retention_ms);
-            if start_ms >= warm_floor_ms {
-                RangeTier::WarmOnly
-            } else {
-                RangeTier::ArchiveEligible
-            }
-        }
-        _ => RangeTier::ArchiveEligible,
-    }
-}
-
 /// Core range query execution logic shared between GET and POST handlers
 async fn process_range_query_request(
     state: &AppState,
@@ -2259,15 +2142,11 @@ async fn process_range_query_request(
     );
 
     // ASAP-first centralization refactor — the range path is now a
-    // thin transport layer. All engine-selection / failover lives in
+    // thin transport layer. Engine selection lives in
     // `EngineRouter::execute_range`, which walks the shared
-    // `compatible_storage_backends` policy table:
-    //   * `accuracy == Exact`  → archive only (thanos_query)
-    //   * otherwise            → ASAP-tier (asap_query) first, fall
-    //                            back to the archive on CapabilityMiss.
-    // The handler no longer reaches into `query_engine` /
-    // `engine_by_id` to do its own Thanos lookup; it just resolves the
-    // metric's storage axis and hands the range request to the router.
+    // `compatible_storage_backends` policy table. Since #746 that table
+    // has one ASAP-managed answer (the sketch tier); a CapabilityMiss
+    // forwards to the Prometheus fallback rather than to another tier.
     let start_ms = (parsed_request.start * 1000.0) as u64;
     let end_ms = (parsed_request.end * 1000.0) as u64;
     let step_ms = (parsed_request.step * 1000.0) as u64;
@@ -2315,46 +2194,32 @@ async fn process_range_query_request(
         }
     }
 
+    // `X-ASAP-Accuracy: exact` means "do not answer from the ε/δ-bounded
+    // sketches" — with no archive tier left (#746) that is the Prometheus
+    // fallback's job.
+    if matches!(accuracy, AccuracyTarget::Exact) {
+        debug!("Exact accuracy requested on range query — bypassing the sketch tier");
+        return forward_range_to_fallback(state, parsed_request, forwarding_headers).await;
+    }
+
     let metric_storage = resolve_metric_storage(state, &parsed_request.query, tenant);
 
-    // Statistic is not currently used by the routing policy. Accuracy is
-    // the validated request contract threaded in by the HTTP handler.
+    // Statistic is not currently used by the routing policy.
     let stat = Statistic::Sum;
-    // Warm-vs-archive routing fix: split by the warm-retention boundary
-    // rather than "archive-on ⇒ everything to archive". When the
-    // requested `[start_ms, end_ms]` window lies entirely inside the
-    // warm-retention horizon, the data (if any) is warm-resident and the
-    // archive is guaranteed empty for that range — so we must NOT let an
-    // empty-but-`Ok` archive answer (stamped `data_source: thanos_query`)
-    // mask the warm tier. Suppressing the archive leg for warm-only
-    // ranges is the root fix for the recurring "No result" class of
-    // recent range queries when cold/archive is ON.
-    //
-    // The boundary is the configured SketchStore data-retention horizon
-    // (`AppState::data_retention_ms`, mirroring
-    // `--persistence-delete-older-than-secs`). When it is unset we have
-    // no boundary to split on, so we keep the archive eligible — the
-    // pre-fix behaviour — and never narrow a query that might need it.
-    let now_ms = crate::query_engines::routing::freshness_probe_now_ms() as u64;
-    let range_tier = classify_range_tier(start_ms, state.data_retention_ms, now_ms);
-
     debug!(
-        "Dispatching range query via EngineRouter: query='{}' metric_storage={:?} \
-         stat={:?} accuracy={:?} range_tier={:?} data_retention_ms={:?}",
-        parsed_request.query, metric_storage, stat, accuracy, range_tier, state.data_retention_ms,
+        "Dispatching range query via EngineRouter: query='{}' metric_storage={:?} stat={:?}",
+        parsed_request.query, metric_storage, stat,
     );
 
     let router_result = state
         .query_router
-        .execute_range_for_tier_routed(
+        .execute_range_routed(
             &parsed_request.query,
             stat,
-            accuracy,
             metric_storage,
             start_ms,
             end_ms,
             step_ms,
-            range_tier,
         )
         .await;
 
@@ -2390,26 +2255,16 @@ async fn process_range_query_request(
                 registered = ?registered,
                 "EngineRouter (range): no engine registered for any compatible backend",
             );
-            if let Some(fallback) = &state.fallback {
-                match fallback
-                    .execute_range_query_with_headers(parsed_request, forwarding_headers)
-                    .await
-                {
-                    Ok(response) => response.into_response(),
-                    Err(status) => status.into_response(),
-                }
-            } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "status": "error",
-                        "errorType": "internal",
-                        "error": format!(
-                            "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
-                        )})),
-                )
-                    .into_response()
-            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errorType": "internal",
+                    "error": format!(
+                        "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
+                    )})),
+            )
+                .into_response()
         }
         Err(EngineRouterError::AllFailed { last }) => {
             use crate::query_engines::EngineError;
@@ -2435,6 +2290,7 @@ async fn process_range_query_request(
                             Err(status) => status.into_response(),
                         }
                     } else {
+                        record_disabled_forwarding(state, "prometheus", "range");
                         match state.adapter.format_unsupported_query_response().await {
                             Ok(json) => json.into_response(),
                             Err(status) => status.into_response(),
@@ -2631,74 +2487,6 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    // ── warm-vs-archive range routing: tier classification ──────────────
-    // The defect is that a recent (warm-resident, not-yet-archived) range
-    // query was routed to the empty archive when cold/archive is ON. These
-    // pin the time-boundary decision `process_range_query_request` makes
-    // before dispatching to `EngineRouter::execute_range_for_tier`.
-
-    #[test]
-    fn classify_range_tier_recent_range_is_warm_only() {
-        use crate::query_engines::routing::RangeTier;
-        let now_ms = 1_700_000_000_000u64;
-        let retention_ms = 6 * 60 * 60 * 1000; // 6h warm horizon
-                                               // A `[...300s]` query ending ~now, starting 5 min ago —
-                                               // well inside the 6h warm window.
-        let start_ms = now_ms - 300_000;
-        assert_eq!(
-            classify_range_tier(start_ms, Some(retention_ms), now_ms),
-            RangeTier::WarmOnly,
-            "a recent range inside warm retention must be WarmOnly (archive is empty there)",
-        );
-    }
-
-    #[test]
-    fn classify_range_tier_old_range_is_archive_eligible() {
-        use crate::query_engines::routing::RangeTier;
-        let now_ms = 1_700_000_000_000u64;
-        let retention_ms = 6 * 60 * 60 * 1000;
-        // A range entirely older than the 6h warm floor → genuinely archived.
-        let start_ms = now_ms - 24 * 60 * 60 * 1000; // 24h ago
-        assert_eq!(
-            classify_range_tier(start_ms, Some(retention_ms), now_ms),
-            RangeTier::ArchiveEligible,
-            "a range older than the warm floor must stay ArchiveEligible",
-        );
-    }
-
-    #[test]
-    fn classify_range_tier_boundary_straddle_is_archive_eligible() {
-        use crate::query_engines::routing::RangeTier;
-        let now_ms = 1_700_000_000_000u64;
-        let retention_ms = 6 * 60 * 60 * 1000;
-        // Starts just before the warm floor, ends now → overlaps the
-        // boundary. Must stay ArchiveEligible so the older prefix is
-        // served from the archive (warm suffix merged via hybrid-stitch).
-        let warm_floor_ms = now_ms - retention_ms;
-        let start_ms = warm_floor_ms - 1;
-        assert_eq!(
-            classify_range_tier(start_ms, Some(retention_ms), now_ms),
-            RangeTier::ArchiveEligible,
-            "a boundary-straddling range must stay ArchiveEligible",
-        );
-    }
-
-    #[test]
-    fn classify_range_tier_no_retention_keeps_archive_eligible() {
-        use crate::query_engines::routing::RangeTier;
-        let now_ms = 1_700_000_000_000u64;
-        // No configured retention → no boundary to split on → never narrow.
-        assert_eq!(
-            classify_range_tier(now_ms - 300_000, None, now_ms),
-            RangeTier::ArchiveEligible,
-        );
-        assert_eq!(
-            classify_range_tier(now_ms - 300_000, Some(0), now_ms),
-            RangeTier::ArchiveEligible,
-            "retention of 0 must not narrow (degenerate boundary)",
-        );
-    }
-
     async fn setup_test_server() -> u16 {
         setup_test_server_with_hot_reload(None).await
     }
@@ -2890,10 +2678,9 @@ mod tests {
             .expect("Failed to start test server")
     }
 
-    async fn setup_victoriametrics_test_server() -> u16 {
+    async fn setup_victoriametrics_test_server(fallback_url: String) -> u16 {
         use crate::drivers::query::adapters::VictoriaMetricsHttpAdapter;
-        let adapter_config =
-            AdapterConfig::victoriametrics_metricsql("http://127.0.0.1:9999".to_string());
+        let adapter_config = AdapterConfig::victoriametrics_metricsql(fallback_url);
         let server = HttpServer::new(
             HttpServerConfig {
                 port: 0,
@@ -2909,7 +2696,7 @@ mod tests {
 
     #[tokio::test]
     async fn victoriametrics_cluster_routes_are_registered() {
-        let port = setup_victoriametrics_test_server().await;
+        let port = setup_victoriametrics_test_server("http://127.0.0.1:9999".into()).await;
         let response = Client::new()
             .get(format!(
                 "http://127.0.0.1:{port}/select/42/prometheus/api/v1/query"
@@ -2919,6 +2706,76 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn promql_exact_request_forwards_to_prometheus() {
+        let upstream = Router::new().route(
+            "/api/v1/query",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                Json(serde_json::json!({
+                    "status": "success",
+                    "data": {"received": params["query"]}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let config = AdapterConfig::prometheus_promql(format!("http://{address}"), true);
+        let server = HttpServer::new(
+            HttpServerConfig {
+                port: 0,
+                handle_http_requests: true,
+                adapter_config: config,
+            },
+            Arc::new(ASAPQueryEngine::new(15_000)),
+            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+        );
+        let port = server.start_test_server().await.unwrap();
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/v1/query"))
+            .header(ACCURACY_HEADER, "exact")
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(payload["data"]["received"], "sum_over_time(foo[5m])");
+    }
+
+    #[tokio::test]
+    async fn metricsql_exact_request_forwards_to_victoriametrics() {
+        let upstream = Router::new().route(
+            "/api/v1/query",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                Json(serde_json::json!({
+                    "status": "success",
+                    "data": {"received": params["query"]}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let port = setup_victoriametrics_test_server(format!("http://{address}")).await;
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/v1/query"))
+            .header(ACCURACY_HEADER, "exact")
+            .query(&[
+                ("query", "rate(requests[5m]) keep_metric_names"),
+                ("time", "1"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            payload["data"]["received"],
+            "rate(requests[5m]) keep_metric_names"
+        );
     }
 
     #[tokio::test]
@@ -4069,8 +3926,19 @@ aggregations:
         metric_storage_backend: StorageBackend,
         extra_engines: Vec<Arc<dyn QueryEngine>>,
     ) -> u16 {
-        let adapter_config =
-            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
+        setup_test_server_with_router_and_fallback(metric_storage_backend, extra_engines, false)
+            .await
+    }
+
+    async fn setup_test_server_with_router_and_fallback(
+        metric_storage_backend: StorageBackend,
+        extra_engines: Vec<Arc<dyn QueryEngine>>,
+        forward_unsupported: bool,
+    ) -> u16 {
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            forward_unsupported,
+        );
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -4198,13 +4066,18 @@ aggregations:
         assert!(extract_accuracy(&headers).is_err());
     }
 
+    /// #746: `exact` means "not from the sketches". With no archive tier
+    /// left the request is forwarded to the Prometheus fallback, so no
+    /// in-process engine runs. The test fallback points at a dead port, so
+    /// the body is the forwarder's error — what matters is that the sketch
+    /// tier was never consulted.
     #[tokio::test]
-    async fn exact_accuracy_header_bypasses_warm_tier_for_archive() {
-        let (archive, archive_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+    async fn exact_accuracy_header_bypasses_the_sketch_tier() {
+        let (sketch, sketch_calls) =
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
             StorageBackend::SketchStore,
-            vec![archive as Arc<dyn QueryEngine>],
+            vec![sketch as Arc<dyn QueryEngine>],
         )
         .await;
         let response = Client::new()
@@ -4214,19 +4087,25 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert!(response.status().is_success());
         let body: serde_json::Value = response.json().await.unwrap();
-        assert_data_source(&body, StorageBackend::GorillaObjectStore.data_source_id());
-        assert_eq!(archive_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sketch_calls.load(Ordering::SeqCst),
+            0,
+            "an exact request must never be answered from the sketch tier; got {body}",
+        );
+        assert_eq!(
+            body["status"], "error",
+            "the test fallback is unreachable, so the forward must surface an error; got {body}",
+        );
     }
 
     #[tokio::test]
-    async fn exact_accuracy_header_routes_range_query_to_archive() {
-        let (archive, archive_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+    async fn exact_accuracy_header_bypasses_the_sketch_tier_for_range_queries() {
+        let (sketch, sketch_calls) =
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
             StorageBackend::SketchStore,
-            vec![archive as Arc<dyn QueryEngine>],
+            vec![sketch as Arc<dyn QueryEngine>],
         )
         .await;
         let response = Client::new()
@@ -4241,10 +4120,16 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert!(response.status().is_success());
         let body: serde_json::Value = response.json().await.unwrap();
-        assert_data_source(&body, StorageBackend::GorillaObjectStore.data_source_id());
-        assert_eq!(archive_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sketch_calls.load(Ordering::SeqCst),
+            0,
+            "an exact range request must never be answered from the sketch tier; got {body}",
+        );
+        assert_eq!(
+            body["status"], "error",
+            "the test fallback is unreachable, so the forward must surface an error; got {body}",
+        );
     }
 
     #[tokio::test]
@@ -4290,15 +4175,15 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn http_routes_archive_metric_to_gorilla_engine() {
-        // Pin `storage_backend = GorillaObjectStore` and register a
-        // `MockQueryEngine` under that id. The handler must dispatch
-        // through the router (not ASAPQueryEngine) and the response's
-        // `infos` array must carry `data_source: thanos_query`.
+    async fn http_routes_archive_spelled_metric_to_the_sketch_tier() {
+        // #746: `GorillaObjectStore` survives as a stored-plan spelling but
+        // has no engine of its own. A metric pinned to it dispatches through
+        // the router to the sketch tier, so the response carries
+        // `data_source: asap_query`.
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
             vec![gorilla as Arc<dyn QueryEngine>],
         )
         .await;
@@ -4314,15 +4199,15 @@ aggregations:
             .expect("Failed to send request");
         assert!(
             resp.status().is_success(),
-            "archive dispatch must return 2xx; got {}",
+            "router dispatch must return 2xx; got {}",
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "asap_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
-            "Gorilla mock engine should have been hit exactly once",
+            "the sketch-tier mock engine should have been hit exactly once",
         );
     }
 
@@ -4385,6 +4270,33 @@ aggregations:
     }
 
     #[tokio::test]
+    async fn range_returns_503_when_engine_missing_even_with_fallback() {
+        let server_port = setup_test_server_with_router_and_fallback(
+            StorageBackend::PrometheusRemote,
+            Vec::new(),
+            true,
+        )
+        .await;
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query_range"))
+            .query(&[
+                ("query", "sum_over_time(foo[5m])"),
+                ("start", "1699999940"),
+                ("end", "1700000000"),
+                ("step", "10"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no engine registered"));
+    }
+
+    #[tokio::test]
     async fn http_passes_through_accuracy_envelope() {
         // The Phase-5 `QueryResult` carries an `accuracy:
         // AccuracyEnvelope` field; the HTTP adapter mirrors it onto
@@ -4404,14 +4316,14 @@ aggregations:
             }
             fn capabilities(&self) -> EngineCapabilities {
                 EngineCapabilities {
-                    data_source_id: StorageBackend::GorillaObjectStore.data_source_id(),
-                    storage_backend: StorageBackend::GorillaObjectStore,
+                    data_source_id: StorageBackend::SketchStore.data_source_id(),
+                    storage_backend: StorageBackend::SketchStore,
                     supports_streams_above_bytes: 1024 * 1024,
                 }
             }
         }
         let server_port = setup_test_server_with_router(
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
             vec![Arc::new(ExactStub) as Arc<dyn QueryEngine>],
         )
         .await;
@@ -4428,7 +4340,7 @@ aggregations:
         // `accuracy: ε=..., δ=..., kind=exact` summary must land on
         // the response — proving the router-path dispatch preserves
         // the engine's wire annotations.
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "asap_query");
         let infos = body["infos"].as_array().expect("infos array");
         assert!(
             infos
@@ -4458,7 +4370,7 @@ aggregations:
         let (warm_ok, warm_calls) =
             MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let (archive, archive_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::Backend);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::Backend);
         let server_port = setup_test_server_with_router(
             StorageBackend::DoubleWrite,
             vec![
@@ -4506,21 +4418,21 @@ aggregations:
         // Production path: streaming-config single axis stays on
         // `SketchStore` (the YAML loader's default), but the
         // per-metric routing table flips `http_requests_total` to
-        // `thanos_query`. The handler must extract the metric name
+        // a non-default axis. The handler must extract the metric name
         // from the PromQL AST, look it up, and dispatch through the
-        // EngineRouter — landing the `data_source: thanos_query`
-        // info-line on the response.
+        // EngineRouter. Since #746 that archive spelling resolves to the
+        // sketch tier, so the response carries `data_source: asap_query`.
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
             metrics,
         );
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port =
             setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
                 .await;
@@ -4540,11 +4452,11 @@ aggregations:
             resp.status(),
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "asap_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
-            "GorillaQueryEngine must be hit exactly once on the production path",
+            "the sketch-tier engine must be hit exactly once on the production path",
         );
     }
 
@@ -4556,7 +4468,7 @@ aggregations:
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
@@ -4590,15 +4502,15 @@ aggregations:
     #[tokio::test]
     async fn http_production_path_default_axis_routes_all_metrics() {
         // Routing table with no per-metric overrides but a non-default
-        // top-level `default: thanos_query` — every metric must
-        // route through the router. Pins the §8 "all-metrics-archive"
-        // deploy mode.
+        // top-level non-sketch `default` — every metric must route
+        // through the router, which lands them on the sketch tier since
+        // #746 removed the archive engine.
         let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
             std::collections::HashMap::new(),
         );
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port =
             setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
                 .await;
@@ -4614,7 +4526,7 @@ aggregations:
             .expect("Failed to send request");
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "asap_query");
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -4640,7 +4552,7 @@ aggregations:
             vec![
                 RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![
                         QueryOperatorShape::Count,
                         QueryOperatorShape::Topk,
@@ -4652,7 +4564,7 @@ aggregations:
         let routing = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port =
             setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
                 .await;
@@ -4673,11 +4585,12 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "asap_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
-            "v7 dual-routing: count must hit the archive engine",
+            "v7 dual-routing: the archive-claimed shape still dispatches \
+             through the router, now onto the sketch tier",
         );
     }
 
@@ -4692,7 +4605,7 @@ aggregations:
             vec![
                 RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![
                         QueryOperatorShape::Count,
                         QueryOperatorShape::Topk,
@@ -4707,7 +4620,7 @@ aggregations:
         // failed assertion rather than a silent fall-through. The
         // mock starts with 0 calls; a quantile must NOT touch it.
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let server_port =
             setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
                 .await;
@@ -4745,59 +4658,6 @@ aggregations:
         );
     }
 
-    #[tokio::test]
-    async fn http_topk_with_no_heap_sid_routes_to_archive() {
-        // Finding P1: the control plane plans a heap-LESS `CountSketch`
-        // for `top_endpoint_qps`, so its routing table leaves the `Topk`
-        // shape on the warm tier (`SketchStore`). But a heap-less sketch
-        // capability-misses on `FrequencyTopk`, and the `SketchStore`
-        // axis dispatches the ASAP engine directly — so the miss never
-        // reaches the archive failover and the caller got
-        // `data_source: asap_query` "No result". `resolve_metric_storage`
-        // now detects that the metric has no heap-bearing `FrequencyTopk`
-        // sid (here: an empty warm index) and reroutes the topk to the
-        // archive, which answers exactly via `process_via_router`.
-        use crate::storage_engines::types::{BackendStorageRouting, RoutingTarget};
-        let mut metrics = std::collections::HashMap::new();
-        metrics.insert(
-            "top_endpoint_qps".to_string(),
-            // Single always-target on the warm tier — mirrors the
-            // control plane's CountSketch plan, which keeps Topk on
-            // SketchStore rather than claiming it for the archive.
-            vec![RoutingTarget::always(StorageBackend::SketchStore)],
-        );
-        let routing = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
-
-        let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
-        let server_port =
-            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
-                .await;
-
-        let client = Client::new();
-        let resp = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .query(&[
-                ("query", "topk(5, top_endpoint_qps)"),
-                ("time", "1700000000"),
-            ])
-            .send()
-            .await
-            .expect("Failed to send request");
-        assert!(
-            resp.status().is_success(),
-            "topk with no heap-bearing sid must fail over to the archive (2xx); got {}",
-            resp.status()
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
-        assert_eq!(
-            gorilla_calls.load(Ordering::SeqCst),
-            1,
-            "topk(top_endpoint_qps) must reach the archive engine exactly once",
-        );
-    }
-
     // ── Phase-6 Fix 1: per-query engine override ─────────────────────────
     //
     // The accuracy reducer asks the same PromQL against both the warm
@@ -4822,7 +4682,7 @@ aggregations:
         };
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
 
         // Dual-routing for `metric_warm`: quantiles → warm, count →
         // archive. Without the header the test query routes to warm.
@@ -4835,7 +4695,7 @@ aggregations:
                     vec![QueryOperatorShape::Quantile],
                 ),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![QueryOperatorShape::Count],
                 ),
             ],
@@ -4850,7 +4710,7 @@ aggregations:
         // to archive via the header.
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .header(ENGINE_OVERRIDE_HEADER, "thanos_query")
+            .header(ENGINE_OVERRIDE_HEADER, "double_write")
             .query(&[
                 ("query", "quantile_over_time(0.5, metric_warm[1m])"),
                 ("time", "1700000000"),
@@ -4864,7 +4724,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "double_write");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -4882,7 +4742,7 @@ aggregations:
         };
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
 
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
@@ -4893,7 +4753,7 @@ aggregations:
                     vec![QueryOperatorShape::Quantile],
                 ),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaObjectStore,
+                    StorageBackend::DoubleWrite,
                     vec![QueryOperatorShape::Count],
                 ),
             ],
@@ -4929,12 +4789,12 @@ aggregations:
         );
     }
 
-    /// Query-param fallback: `?engine=thanos_query` overrides the
+    /// Query-param fallback: `?engine=double_write` overrides the
     /// routing table when the header is absent.
     #[tokio::test]
     async fn http_engine_override_query_param_routes_to_named_engine() {
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
 
         let server_port = setup_test_server_with_router(
             StorageBackend::SketchStore,
@@ -4948,14 +4808,14 @@ aggregations:
             .query(&[
                 ("query", "sum_over_time(foo[5m])"),
                 ("time", "1700000000"),
-                (ENGINE_OVERRIDE_QUERY_PARAM, "thanos_query"),
+                (ENGINE_OVERRIDE_QUERY_PARAM, "double_write"),
             ])
             .send()
             .await
             .expect("Failed to send request");
         assert!(resp.status().is_success(), "query-param override must 2xx");
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "double_write");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -4998,7 +4858,7 @@ aggregations:
     #[tokio::test]
     async fn http_engine_override_post_header_routes_to_named_engine() {
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
             StorageBackend::SketchStore,
             vec![gorilla as Arc<dyn QueryEngine>],
@@ -5009,7 +4869,7 @@ aggregations:
         let form_body = "query=sum_over_time(foo%5B5m%5D)&time=1700000000";
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .header(ENGINE_OVERRIDE_HEADER, "thanos_query")
+            .header(ENGINE_OVERRIDE_HEADER, "double_write")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body)
             .send()
@@ -5021,7 +4881,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
+        assert_data_source(&body, "double_write");
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -5069,7 +4929,7 @@ aggregations:
                     "targets": [
                         { "engine": "asap_query" },
                         {
-                            "engine": "thanos_query",
+                            "engine": "double_write",
                             "applies_to_query_shape": [
                                 "histogram_quantile", "delta", "absent",
                                 "rate_post_hoc", "count"
@@ -5343,7 +5203,7 @@ aggregations:
                 "http_requests_total",
                 crate::storage_engines::types::QueryOperatorShape::Count,
             ),
-            StorageBackend::GorillaObjectStore,
+            StorageBackend::DoubleWrite,
         );
         assert_eq!(
             snap.lookup_with_shape(
@@ -5352,220 +5212,6 @@ aggregations:
             ),
             StorageBackend::SketchStore,
         );
-    }
-
-    // ── Step 2.3: Path A2 thanos forwarder integration tests ────────────────
-    //
-    // Pin the full HTTP path: backend receives PromQL → routes to
-    // `thanos_query` (via the alias) → forwards to a mock
-    // `thanos-query` sidecar → returns wrapped Prometheus response.
-    //
-    // The mock thanos sidecar is a tiny in-process axum server bound
-    // to an ephemeral 127.0.0.1 port; the real wire path runs end-to-
-    // end (reqwest serialises the form, axum parses it, the mock
-    // returns canned JSON, the engine parses it back, the HTTP
-    // handler annotates `data_source: thanos_query` on the wire
-    // response).
-
-    #[tokio::test]
-    async fn http_archive_metric_forwards_to_thanos_query() {
-        use crate::query_engines::thanos_query_engine::forward::test_support::{
-            spawn_mock_thanos, CANNED_VECTOR_BODY,
-        };
-        use crate::query_engines::thanos_query_engine::{ThanosQueryConfig, ThanosQueryEngine};
-
-        let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
-        let cfg = ThanosQueryConfig {
-            base_url: mock_url,
-            request_timeout: std::time::Duration::from_secs(5),
-        };
-        let engine = ThanosQueryEngine::new(cfg).expect("engine");
-        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
-
-        // Mirror the binary's Step-2.3 wiring: register once under
-        // the engine's canonical `thanos_query` id.
-        let server_port = setup_test_server_with_named_router(
-            StorageBackend::GorillaObjectStore,
-            vec![arc_engine],
-        )
-        .await;
-
-        let client = Client::new();
-        let resp = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .query(&[("query", "up"), ("time", "1700000000")])
-            .send()
-            .await
-            .expect("Failed to send request");
-        assert!(
-            resp.status().is_success(),
-            "thanos-forward dispatch must return 2xx; got {}",
-            resp.status()
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        // The failover-dispatch path annotates `data_source:
-        // <metric_storage>.data_source_id()`, which for an
-        // archive-pinned metric is `thanos_query`. Path A2
-        // re-uses the archive tier slot in the routing matrix —
-        // the wire `data_source` reflects the *tier* (archive),
-        // not which engine implementation answered. The explicit
-        // `X-ASAP-Engine: thanos_query` override path (covered
-        // by `http_engine_override_can_target_thanos_query_id`)
-        // is the route that pins `data_source: thanos_query`
-        // on the wire.
-        assert_data_source(&body, "thanos_query");
-    }
-
-    #[tokio::test]
-    async fn http_thanos_unreachable_returns_503_with_quirk() {
-        use crate::query_engines::thanos_query_engine::forward::test_support::spawn_mock_thanos_503;
-        use crate::query_engines::thanos_query_engine::{ThanosQueryConfig, ThanosQueryEngine};
-
-        let (mock_url, _mock_handle) = spawn_mock_thanos_503().await;
-        let cfg = ThanosQueryConfig {
-            base_url: mock_url,
-            request_timeout: std::time::Duration::from_secs(2),
-        };
-        let engine = ThanosQueryEngine::new(cfg).expect("engine");
-        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
-
-        let server_port = setup_test_server_with_named_router(
-            StorageBackend::GorillaObjectStore,
-            vec![arc_engine],
-        )
-        .await;
-
-        let client = Client::new();
-        let resp = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .query(&[("query", "up"), ("time", "1700000000")])
-            .send()
-            .await
-            .expect("Failed to send request");
-        // The HTTP handler maps `EngineError::Backend` to 5xx via
-        // `EngineRouterError::AllFailed`. We only assert on 5xx
-        // (any 5xx is acceptable; the precise code is determined by
-        // the router-error → status mapping).
-        assert!(
-            resp.status().is_server_error(),
-            "thanos-unreachable dispatch must return 5xx; got {}",
-            resp.status()
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        // The error body must mention the quirk so the upcoming
-        // Step-2.4 e2e demo can pin fail-loud behaviour.
-        let body_str = serde_json::to_string(&body).unwrap();
-        assert!(
-            body_str.contains("thanos_unreachable"),
-            "5xx body must carry thanos_unreachable marker; got {body_str}",
-        );
-    }
-
-    // ── Path A2 range-query e2e test ────────────────────────────────────
-
-    /// GET /api/v1/query_range returns success when the ASAP sketch
-    /// tier misses and the `ThanosQueryEngine` is registered. Covers
-    /// the full centralized HTTP path:
-    ///   browser → ASAP backend → EngineRouter::execute_range
-    ///           → asap_query (CapabilityMiss) → thanos_query
-    ///           → mock thanos → matrix response
-    #[tokio::test]
-    async fn http_query_range_forwards_to_thanos_when_asap_misses() {
-        use crate::query_engines::thanos_query_engine::forward::test_support::spawn_mock_thanos_capture_range;
-        use crate::query_engines::thanos_query_engine::forward::test_support::CANNED_MATRIX_BODY;
-        use crate::query_engines::thanos_query_engine::{ThanosQueryConfig, ThanosQueryEngine};
-
-        let (mock_url, _captured, _mock_handle) =
-            spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
-        let cfg = ThanosQueryConfig {
-            base_url: mock_url,
-            request_timeout: std::time::Duration::from_secs(5),
-        };
-        let engine = ThanosQueryEngine::new(cfg).expect("engine");
-        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
-
-        // GorillaObjectStore metric → `Approximate` policy yields
-        // `[SketchStore, GorillaObjectStore]`: the ASAP tier misses
-        // (no sketch index for the query) and the router falls over to
-        // the registered thanos_query engine.
-        let server_port = setup_test_server_with_named_router(
-            StorageBackend::GorillaObjectStore,
-            vec![arc_engine],
-        )
-        .await;
-
-        let client = Client::new();
-        let resp = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/query_range"))
-            .query(&[
-                ("query", "rate(http_requests_total[1m])"),
-                ("start", "1700000000"),
-                ("end", "1700003600"),
-                ("step", "15"),
-            ])
-            .send()
-            .await
-            .expect("request");
-
-        assert!(
-            resp.status().is_success(),
-            "expected 2xx from range query forwarded to Thanos; got {}",
-            resp.status()
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body["status"].as_str().unwrap_or(""),
-            "success",
-            "wire response must carry status=success; got {body}"
-        );
-        assert_eq!(
-            body["data"]["resultType"].as_str().unwrap_or(""),
-            "matrix",
-            "wire response must carry resultType=matrix; got {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn http_engine_override_can_target_thanos_query_id() {
-        // X-ASAP-Engine: thanos_query must reach the forwarder
-        // even when the metric's storage axis would otherwise route
-        // to the ASAP tier. Path A2's accuracy reducer relies on
-        // this for apples-to-apples comparison runs.
-        use crate::query_engines::thanos_query_engine::forward::test_support::{
-            spawn_mock_thanos, CANNED_VECTOR_BODY,
-        };
-        use crate::query_engines::thanos_query_engine::{
-            ThanosQueryConfig, ThanosQueryEngine, DATA_SOURCE_THANOS_QUERY_ID,
-        };
-
-        let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
-        let cfg = ThanosQueryConfig {
-            base_url: mock_url,
-            request_timeout: std::time::Duration::from_secs(5),
-        };
-        let engine = ThanosQueryEngine::new(cfg).expect("engine");
-        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
-
-        let server_port = setup_test_server_with_named_router(
-            StorageBackend::SketchStore, // Default storage axis is ASAP tier.
-            vec![arc_engine],
-        )
-        .await;
-        let client = Client::new();
-        let resp = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .query(&[("query", "up"), ("time", "1700000000")])
-            .header(ENGINE_OVERRIDE_HEADER, DATA_SOURCE_THANOS_QUERY_ID)
-            .send()
-            .await
-            .expect("Failed to send request");
-        assert!(
-            resp.status().is_success(),
-            "X-ASAP-Engine: thanos_query must reach the forwarder; got {}",
-            resp.status()
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_query");
     }
 
     /// Build an `HttpServer` whose router holds the supplied engines.
