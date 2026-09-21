@@ -61,7 +61,7 @@ async fn cli_mode_blocks_instant_and_range_forwarding() {
     });
 
     let mut config = tempfile::NamedTempFile::new().unwrap();
-    write!(config, "aggregations: []\n").unwrap();
+    writeln!(config, "aggregations: []").unwrap();
     let output = tempfile::tempdir().unwrap();
     let port = unused_port();
     let mut child = ChildGuard(
