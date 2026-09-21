@@ -459,8 +459,8 @@ impl BackendStorageRouting {
     /// Engine-name compatibility (control plane → backend `StorageBackend`):
     ///
     /// * `asap_query` → `SketchStore`
-    /// * `thanos_query` → `GorillaObjectStore` storage, served by
-    ///   `ThanosQueryEngine`.
+    /// * `thanos_query` → `GorillaObjectStore` storage (no engine
+    ///   registers under it since #746).
     ///
     /// Unknown query-shape strings are mapped to [`QueryOperatorShape::Other`]
     /// rather than failing the parse — the control plane's vocabulary may

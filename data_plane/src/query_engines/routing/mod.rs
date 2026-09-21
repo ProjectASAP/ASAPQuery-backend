@@ -2,8 +2,8 @@
 //!
 //! This module is the dispatch boundary between the HTTP query
 //! handler and the tier-co-located engines (warm sketch tier in
-//! [`crate::query_engines::asap_query_engine`], archive tier in
-//! [`crate::query_engines::thanos_query_engine`]). Two cooperating pieces:
+//! [`crate::query_engines::asap_query_engine`]). Two cooperating
+//! pieces:
 //!
 //! * [`backend_storage_routing`] — config loader + multi-target
 //!   per-metric lookup (`metric → [(backend, query-shape filter), ...]`).

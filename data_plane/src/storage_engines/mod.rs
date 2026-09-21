@@ -10,10 +10,9 @@
 //!   workers / HTTP endpoints) AND the physical storage backend
 //!   (`sketch_db::index`) are co-located under this path.
 //!
-//! The archive tier is served by the
-//! [`crate::query_engines::thanos_query_engine::ThanosQueryEngine`]
-//! (Path A2). The superseded in-process `gorilla_object_store`
-//! (custom GORILLA1 container format) has been deleted.
+//! There is no archive tier: the superseded in-process
+//! `gorilla_object_store` (custom GORILLA1 container format) and the
+//! Thanos forwarder that replaced it have both been deleted (#746).
 //!
 //! `SketchStore` is re-exported at the top level
 //! (`crate::storage_engines::SketchStore`) for call-site stability.

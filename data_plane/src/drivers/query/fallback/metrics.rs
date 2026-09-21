@@ -8,8 +8,7 @@
 //!
 //! * **Hot** = the `ASAPQueryEngine` handled the query from live
 //!   sketch-backed state.
-//! * **Cold** = the query was answered from the archive tier
-//!   ([`crate::query_engines::thanos_query_engine::ThanosQueryEngine`], Path A2).
+//! * **Cold** = the query was answered outside the ASAP tier.
 //!
 //! The "shape" label is the parsed query's root op (`sum`,
 //! `count`, `avg`, `selector`, ...) — low-cardinality by design,
