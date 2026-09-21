@@ -1236,6 +1236,7 @@ async fn process_via_simple_engine(
                     Err(status) => status.into_response(),
                 }
             } else {
+                record_disabled_forwarding(state, "prometheus", "instant");
                 debug!("Query not supported and forwarding disabled, returning error");
                 // Adapter formats the unsupported query error for its protocol.
                 // We still annotate `data_source: asap_query` so callers
@@ -2034,6 +2035,21 @@ fn query_status_label(response: &Response) -> &'static str {
     }
 }
 
+fn record_disabled_forwarding(state: &AppState, backend: &str, path: &str) {
+    if !state
+        .config
+        .adapter_config
+        .query_forwarding_policy
+        .allows_external_queries()
+    {
+        debug!(
+            backend,
+            path, "query forwarding disabled; external query blocked"
+        );
+        srv_metrics::record_query_forwarding_blocked(backend, path);
+    }
+}
+
 // ============================================================
 // Metrics Handler
 // ============================================================
@@ -2248,6 +2264,7 @@ async fn process_range_query_request(
                     )})),
             )
                 .into_response()
+
         }
         Err(EngineRouterError::AllFailed { last }) => {
             use crate::query_engines::EngineError;
@@ -2273,6 +2290,7 @@ async fn process_range_query_request(
                             Err(status) => status.into_response(),
                         }
                     } else {
+                        record_disabled_forwarding(state, "prometheus", "range");
                         match state.adapter.format_unsupported_query_response().await {
                             Ok(json) => json.into_response(),
                             Err(status) => status.into_response(),

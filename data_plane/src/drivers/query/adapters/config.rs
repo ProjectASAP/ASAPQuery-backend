@@ -1,4 +1,5 @@
 use crate::drivers::query::fallback::FallbackClient;
+use crate::query_engines::QueryForwardingPolicy;
 use crate::storage_engines::types::enums::{QueryLanguage, QueryProtocol};
 use std::sync::Arc;
 
@@ -13,6 +14,9 @@ pub struct AdapterConfig {
 
     /// Optional fallback client for unsupported queries
     pub fallback: Option<Arc<dyn FallbackClient>>,
+
+    /// Whether this adapter may issue query requests to its fallback backend.
+    pub query_forwarding_policy: QueryForwardingPolicy,
 }
 
 impl std::fmt::Debug for AdapterConfig {
@@ -24,6 +28,7 @@ impl std::fmt::Debug for AdapterConfig {
                 "fallback",
                 &self.fallback.as_ref().map(|_| "Some(FallbackClient)"),
             )
+            .field("query_forwarding_policy", &self.query_forwarding_policy)
             .finish()
     }
 }
@@ -39,7 +44,16 @@ impl AdapterConfig {
             protocol,
             language,
             fallback,
+            query_forwarding_policy: QueryForwardingPolicy::Enabled,
         }
+    }
+
+    pub fn with_query_forwarding_policy(mut self, policy: QueryForwardingPolicy) -> Self {
+        self.query_forwarding_policy = policy;
+        if !policy.allows_external_queries() {
+            self.fallback = None;
+        }
+        self
     }
 
     /// Create a configuration for Prometheus HTTP with PromQL
@@ -86,6 +100,17 @@ mod tests {
         assert_eq!(
             AdapterConfig::victoriametrics_metricsql(String::new()).language,
             QueryLanguage::MetricsQl
+        );
+    }
+
+    #[test]
+    fn disabled_query_forwarding_removes_the_fallback_client() {
+        let config = AdapterConfig::prometheus_promql("http://prom:9090".into(), true)
+            .with_query_forwarding_policy(QueryForwardingPolicy::Disabled);
+        assert!(config.fallback.is_none());
+        assert_eq!(
+            config.query_forwarding_policy,
+            QueryForwardingPolicy::Disabled
         );
     }
 }

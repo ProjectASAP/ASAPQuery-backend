@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::debug;
 
 use asap_types::query_requirements::QueryRequirements;
 use asap_types::KeyByLabelNames;
@@ -89,6 +90,7 @@ pub struct ASAPQueryEngine {
     active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
     exact_subquery_endpoint: Option<String>,
     metricsql_exact_subquery_endpoint: Option<String>,
+    query_forwarding_policy: crate::query_engines::QueryForwardingPolicy,
     exact_subquery_client: reqwest::Client,
 }
 
@@ -155,6 +157,7 @@ impl ASAPQueryEngine {
             active_physical_plan: None,
             exact_subquery_endpoint: None,
             metricsql_exact_subquery_endpoint: None,
+            query_forwarding_policy: crate::query_engines::QueryForwardingPolicy::Enabled,
             exact_subquery_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
@@ -169,6 +172,14 @@ impl ASAPQueryEngine {
 
     pub fn with_metricsql_exact_subquery_endpoint(mut self, endpoint: String) -> Self {
         self.metricsql_exact_subquery_endpoint = Some(endpoint);
+        self
+    }
+
+    pub fn with_query_forwarding_policy(
+        mut self,
+        policy: crate::query_engines::QueryForwardingPolicy,
+    ) -> Self {
+        self.query_forwarding_policy = policy;
         self
     }
     async fn prepare_query_inputs(
@@ -225,11 +236,33 @@ impl ASAPQueryEngine {
                 },
             );
         }
+        if !self.query_forwarding_policy.allows_external_queries()
+            && entry.nodes.values().any(|node| {
+                matches!(
+                    node,
+                    asap_types::query_plan::QueryPlanNode::ExternalExact { .. }
+                )
+            })
+        {
+            debug!(
+                language = ?entry.language,
+                query_id = %entry.query_id,
+                "query forwarding disabled; external exact subquery blocked"
+            );
+        }
         super::exact_subqueries::prepare_external(
             entry,
             times,
-            self.exact_subquery_endpoint.as_deref(),
-            self.metricsql_exact_subquery_endpoint.as_deref(),
+            if self.query_forwarding_policy.allows_external_queries() {
+                self.exact_subquery_endpoint.as_deref()
+            } else {
+                None
+            },
+            if self.query_forwarding_policy.allows_external_queries() {
+                self.metricsql_exact_subquery_endpoint.as_deref()
+            } else {
+                None
+            },
             &self.exact_subquery_client,
             prepared,
         )
