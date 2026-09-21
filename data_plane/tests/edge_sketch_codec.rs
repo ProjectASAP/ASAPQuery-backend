@@ -22,7 +22,7 @@ fn ddsketch_full_envelope_round_trips_without_collector_runtime() {
 }
 
 #[test]
-fn ddsketch_bare_state_and_query_readout_are_supported() {
+fn ddsketch_bare_state_is_rejected_and_envelope_supports_query_readout() {
     let mut source = asap_sketchlib::DdSketch::new(0.01);
     for value in 1..=100 {
         source.update(value as f64);
@@ -33,7 +33,8 @@ fn ddsketch_bare_state_and_query_readout_are_supported() {
         panic!("DDSketch state required")
     };
     let bare = prost::Message::encode_to_vec(&state);
-    let (decoded, _) = asap_sketch_codec::reconstruct_ddsketch(&bare).unwrap();
+    assert!(asap_sketch_codec::reconstruct_ddsketch(&bare).is_err());
+    let (decoded, _) = asap_sketch_codec::reconstruct_ddsketch(&envelope).unwrap();
     let accumulator = data_plane::precompute_engine::operators::DDSketchAccumulator {
         inner: decoded,
         sample_p: 1.0,

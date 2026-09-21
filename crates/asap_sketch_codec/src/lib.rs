@@ -12,19 +12,12 @@ pub fn envelope_state(bytes: &[u8]) -> Result<Option<SketchState>, String> {
         .map_err(|error| format!("decode SketchEnvelope: {error}"))
 }
 
-/// Accept the current full envelope and the supported legacy bare state.
 pub fn ddsketch_state(bytes: &[u8]) -> Result<(DdSketchState, f64), String> {
-    match SketchEnvelope::decode(bytes) {
-        Ok(envelope) => match envelope.sketch_state {
-            Some(SketchState::Ddsketch(state)) => Ok((state, envelope.sample_p)),
-            Some(_) => Err("SketchEnvelope contains a non-DDSketch state".into()),
-            None => DdSketchState::decode(bytes)
-                .map(|state| (state, 1.0))
-                .map_err(|error| format!("decode DdSketchState: {error}")),
-        },
-        Err(_) => DdSketchState::decode(bytes)
-            .map(|state| (state, 1.0))
-            .map_err(|error| format!("decode DdSketchState: {error}")),
+    let envelope =
+        SketchEnvelope::decode(bytes).map_err(|error| format!("decode SketchEnvelope: {error}"))?;
+    match envelope.sketch_state {
+        Some(SketchState::Ddsketch(state)) => Ok((state, envelope.sample_p)),
+        _ => Err("SketchEnvelope contains no DDSketch state".into()),
     }
 }
 
@@ -40,13 +33,11 @@ pub fn reconstruct_ddsketch(bytes: &[u8]) -> Result<(DdSketch, f64), String> {
 }
 
 pub fn kll_state(bytes: &[u8]) -> Result<KllState, String> {
-    match SketchEnvelope::decode(bytes) {
-        Ok(envelope) => match envelope.sketch_state {
-            Some(SketchState::Kll(state)) => Ok(state),
-            Some(_) => Err("SketchEnvelope contains a non-KLL state".into()),
-            None => KllState::decode(bytes).map_err(|error| format!("decode KllState: {error}")),
-        },
-        Err(_) => KllState::decode(bytes).map_err(|error| format!("decode KllState: {error}")),
+    let envelope =
+        SketchEnvelope::decode(bytes).map_err(|error| format!("decode SketchEnvelope: {error}"))?;
+    match envelope.sketch_state {
+        Some(SketchState::Kll(state)) => Ok(state),
+        _ => Err("SketchEnvelope contains no KLL state".into()),
     }
 }
 

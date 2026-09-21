@@ -197,22 +197,19 @@ impl InstalledPostAsapDag {
         if self.document.query_id.trim().is_empty() {
             return Err("invalid post-ASAP DAG document identity/version".into());
         }
-        match self.document.schema_version {
-            OWNED_POST_ASAP_DAG_SCHEMA_VERSION => self
-                .binding
-                .validate(&self.document.decode()?)
-                .map_err(|error| format!("legacy DAG `{}`: {error}", self.document.query_id)),
-            MAINTENANCE_DAG_SCHEMA_VERSION => {
-                self.binding.validate_maintenance(&self.document.decode()?)
-            }
-            _ => Err("unsupported post-ASAP DAG document version".into()),
+        if self.document.schema_version != MAINTENANCE_DAG_SCHEMA_VERSION {
+            return Err("unsupported maintenance DAG document version".into());
         }
+        self.binding.validate_maintenance(&self.document.decode()?)
     }
 
     /// Project the selected semantic DAG onto the maintenance ancestors of its
-    /// stored outputs. Version 1 remains readable for installed legacy plans.
+    /// stored outputs.
     pub fn maintenance_projection(mut self) -> Result<Self, String> {
-        self.validate()?;
+        if self.document.schema_version != OWNED_POST_ASAP_DAG_SCHEMA_VERSION {
+            return Err("selected DAG has an unsupported document version".into());
+        }
+        self.binding.validate(&self.document.decode()?)?;
         if self.binding.precompute_sinks.is_empty() {
             return Err("cannot project a DAG without maintenance sinks".into());
         }
@@ -281,17 +278,7 @@ impl BackendExecutableBinding {
         self.nodes.get(&id)
     }
 
-    /// Scheduler validation for both the legacy complete DAG and a projected
-    /// maintenance DAG. The installed document version is checked at staging.
-    pub fn validate_precompute_execution(&self, dag: &ExecutableDag) -> Result<(), String> {
-        if dag.nodes.iter().any(|node| node.id == self.query_sink) {
-            self.validate(dag)
-        } else {
-            self.validate_maintenance(dag)
-        }
-    }
-
-    fn validate_maintenance(&self, dag: &ExecutableDag) -> Result<(), String> {
+    pub fn validate_maintenance(&self, dag: &ExecutableDag) -> Result<(), String> {
         let ids = dag
             .nodes
             .iter()
@@ -398,5 +385,28 @@ mod tests {
         let document: OwnedPostAsapDag = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(document).unwrap(), wire);
         assert_eq!(serde_json::to_value(QueryNodeId(9)).unwrap(), 9);
+    }
+
+    #[test]
+    fn installed_maintenance_dag_rejects_complete_dag_version() {
+        let installed = InstalledPostAsapDag {
+            document: OwnedPostAsapDag {
+                schema_version: OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
+                query_id: "q".into(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                root: PostAsapNodeId(0),
+            },
+            binding: BackendExecutableBinding {
+                nodes: BTreeMap::new(),
+                query_sink: PostAsapNodeId(0),
+                query_plan_sink: QueryNodeId(0),
+                precompute_sinks: Vec::new(),
+            },
+        };
+        assert!(installed
+            .validate()
+            .unwrap_err()
+            .contains("unsupported maintenance DAG"));
     }
 }

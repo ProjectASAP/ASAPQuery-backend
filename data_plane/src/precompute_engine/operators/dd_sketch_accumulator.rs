@@ -305,14 +305,18 @@ mod tests {
     // asap_sketchlib#57); the proto now carries only
     // `alpha`/`store_counts`/`store_offset`.
     fn encode_state(alpha: f64, store_counts: Vec<u64>, store_offset: i32) -> Vec<u8> {
-        use asap_sketchlib::proto::sketchlib::DdSketchState;
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
         let state = DdSketchState {
             alpha,
             store_counts,
             store_offset,
         };
-        state.encode_to_vec()
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
     }
 
     #[test]

@@ -4302,6 +4302,8 @@ pub(crate) mod tests {
             &dag,
         )
         .unwrap();
+        installed.document.schema_version =
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
         assert!(plan
             .precompute_plan
             .validate()
@@ -4618,7 +4620,9 @@ pub(crate) mod tests {
             .executable_dags
             .get(&entry.query_id)
             .expect("compiled query retains its maintenance projection");
-        installed.validate().expect("typed DAG document");
+        installed
+            .validate()
+            .expect("typed maintenance DAG document");
         assert_eq!(
             installed.document.schema_version,
             asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION

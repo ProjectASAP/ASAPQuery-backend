@@ -3798,7 +3798,7 @@ mod sid_resolution_tests {
     async fn delta_apply_rotates_per_series_base_at_window_boundary() {
         use crate::precompute_engine::operators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
-        use asap_sketchlib::proto::sketchlib::DdSketchState;
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -3830,10 +3830,13 @@ mod sid_resolution_tests {
         );
 
         // ── Window 1: full frame. Base buckets [10, 0, 5]. ──
-        let full_w1 = DdSketchState {
-            alpha: 0.01,
-            store_counts: vec![10, 0, 5],
-            store_offset: 0,
+        let full_w1 = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(DdSketchState {
+                alpha: 0.01,
+                store_counts: vec![10, 0, 5],
+                store_offset: 0,
+            })),
+            ..Default::default()
         }
         .encode_to_vec();
         route_modified_otlp_sketches_to_precompute(

@@ -56,7 +56,7 @@ impl DatasketchesKLLAccumulator {
     /// DataCollector's `kllprocessor` emits when
     /// `encoding = KLL_SKETCH_ENCODING_PROTO`.
     ///
-    /// The neutral codec decodes the full envelope or legacy bare state.
+    /// The neutral codec decodes the sketchlib envelope.
     /// The level-aware constructor below preserves the supplied retained
     /// sample layout without replaying updates.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
@@ -360,6 +360,16 @@ impl MergeableAccumulator<DatasketchesKLLAccumulator> for DatasketchesKLLAccumul
 mod tests {
     use super::*;
 
+    fn encode_state(state: asap_sketchlib::proto::sketchlib::KllState) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
+        use prost::Message;
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
     #[test]
     fn test_datasketches_kll_creation() {
         let kll = DatasketchesKLLAccumulator::new(200);
@@ -556,7 +566,7 @@ mod tests {
             value_scale: 0,
             residuals: Vec::new(),
         };
-        let bytes = state.encode_to_vec();
+        let bytes = encode_state(state);
 
         let acc =
             DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
@@ -601,7 +611,7 @@ mod tests {
             residuals: vec![],
         };
         let decoded =
-            DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&state.encode_to_vec()).unwrap();
+            DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&encode_state(state)).unwrap();
         assert_eq!(decoded.inner.count(), source.count() as u64);
         for q in [0.0, 0.1, 0.5, 0.9, 1.0] {
             assert_eq!(decoded.inner.quantile(q), source.quantile(q), "q={q}");
@@ -671,7 +681,7 @@ mod tests {
             value_scale: 0,
             residuals: Vec::new(),
         };
-        let bytes = state.encode_to_vec();
+        let bytes = encode_state(state);
         let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("k must be >= 8"));
@@ -693,7 +703,7 @@ mod tests {
             value_scale: 0,
             residuals: Vec::new(),
         };
-        let bytes = state.encode_to_vec();
+        let bytes = encode_state(state);
         let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("levels length"));
