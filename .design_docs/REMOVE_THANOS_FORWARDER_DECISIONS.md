@@ -183,6 +183,20 @@ always gets `NoDataArchiveEngine` (empty results), or nothing (503) when
   `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`). If it isn't reachable those two are
   reported as skipped/failing infra rather than silently dropped.
 
+## Refinements made during implementation
+
+- **`NoEngineRegistered` stays fail-loud (503).** Q6 covers queries the ASAP
+  tier *cannot serve* (a `CapabilityMiss`). "No engine registered for the
+  metric's tier" is a deploy misconfig, so it keeps its 503 rather than being
+  quietly forwarded to Prometheus. Only `CapabilityMiss` and `Exact` forward.
+- **Q7 needed a guard on the range path too.** Dropping the accuracy argument
+  from the router meant `Exact` range queries would otherwise have been answered
+  from sketches. `process_range_query_request` now forwards them the same way
+  the instant path does (`forward_range_to_fallback`).
+- **Commit count: 5, not 6.** Q7's accuracy change is one branch in the same
+  dispatch edit as Q5/Q6, so splitting it into its own commit would have meant a
+  commit that only moved a line. Q12's order is otherwise unchanged.
+
 ## Out of scope
 
 - `ASAP_LEGACY_DUAL_WRITE`, `ASAP_SKETCH_RETENTION_MS`,

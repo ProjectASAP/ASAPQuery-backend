@@ -42,6 +42,4 @@ pub use backend_storage_routing::{
 pub use freshness_probe_cache::{
     is_freshness_probe, now_ms as freshness_probe_now_ms, FreshnessProbeCache, ProbeSample,
 };
-pub use query_engine_routing::{
-    EngineCapabilities, EngineRouter, EngineRouterError, QueryEngine, RangeTier,
-};
+pub use query_engine_routing::{EngineCapabilities, EngineRouter, EngineRouterError, QueryEngine};
