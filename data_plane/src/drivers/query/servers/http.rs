@@ -2238,26 +2238,16 @@ async fn process_range_query_request(
                 registered = ?registered,
                 "EngineRouter (range): no engine registered for any compatible backend",
             );
-            if let Some(fallback) = &state.fallback {
-                match fallback
-                    .execute_range_query_with_headers(parsed_request, forwarding_headers)
-                    .await
-                {
-                    Ok(response) => response.into_response(),
-                    Err(status) => status.into_response(),
-                }
-            } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "status": "error",
-                        "errorType": "internal",
-                        "error": format!(
-                            "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
-                        )})),
-                )
-                    .into_response()
-            }
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errorType": "internal",
+                    "error": format!(
+                        "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
+                    )})),
+            )
+                .into_response()
         }
         Err(EngineRouterError::AllFailed { last }) => {
             use crate::query_engines::EngineError;
@@ -3917,8 +3907,19 @@ aggregations:
         metric_storage_backend: StorageBackend,
         extra_engines: Vec<Arc<dyn QueryEngine>>,
     ) -> u16 {
-        let adapter_config =
-            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
+        setup_test_server_with_router_and_fallback(metric_storage_backend, extra_engines, false)
+            .await
+    }
+
+    async fn setup_test_server_with_router_and_fallback(
+        metric_storage_backend: StorageBackend,
+        extra_engines: Vec<Arc<dyn QueryEngine>>,
+        forward_unsupported: bool,
+    ) -> u16 {
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            forward_unsupported,
+        );
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -4247,6 +4248,33 @@ aggregations:
             err.contains("no engine registered"),
             "503 body must explain the routing failure; got {err}",
         );
+    }
+
+    #[tokio::test]
+    async fn range_returns_503_when_engine_missing_even_with_fallback() {
+        let server_port = setup_test_server_with_router_and_fallback(
+            StorageBackend::PrometheusRemote,
+            Vec::new(),
+            true,
+        )
+        .await;
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query_range"))
+            .query(&[
+                ("query", "sum_over_time(foo[5m])"),
+                ("start", "1699999940"),
+                ("end", "1700000000"),
+                ("step", "10"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no engine registered"));
     }
 
     #[tokio::test]
