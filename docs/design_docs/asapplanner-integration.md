@@ -47,18 +47,21 @@ materialization boundary:
 
 ```mermaid
 flowchart LR
-  D[Selected Planner DAG] --> C[Physical compiler]
+  D[Selected post-ASAP DAG] --> C[Physical compiler]
   C --> P[PrecomputePlan]
-  C --> S[Summary Catalog / SDS]
+  C -->|register definition| S[Summary Catalog]
   C --> Q[QueryPlan]
+  P -->|definition reference: validate at install| S
+  Q -->|definition reference: validate at install| S
+  P -->|publish instance metadata| I[Runtime inventory]
   P -->|write state| Store[Summary store]
+  Q -->|resolve ready instance| I
   Q -->|bound state read| Store
-  P -->|definition ID| S
-  Q -->|definition ID| S
 ```
 
-Semantic provenance remains available, but query-only operators are not
-PrecomputePlan executable content.
+SDS is the contract across these bindings, catalog definitions, runtime
+instances and payloads; it is not a separate store. Semantic provenance remains
+available, but query-only operators are not PrecomputePlan executable content.
 
 ## Design definitions and selection
 
@@ -367,7 +370,8 @@ that output a state slot and emits matching writer/reader bindings; see
 | Query runtime | Bound state reads, query operators, exact residuals and fallback |
 | Catalog | Summary definitions |
 | Plan read/write bindings | State references, format, partition rules and writer ownership |
-| Runtime inventory/store | Actual state instances, coverage, readiness, location and payloads |
+| Runtime inventory | Actual state instances, coverage, readiness and payload locations |
+| Summary store | Encoded state payload bytes |
 
 ## Compiler contract
 

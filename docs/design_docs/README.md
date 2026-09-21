@@ -9,8 +9,8 @@ notes and migration gates distinguish implemented behavior from proposed changes
 - [Planner output to backend physical plans](asapplanner-integration.md) defines
   how one selected post-ASAP DAG becomes executable PrecomputePlan and QueryPlan
   subgraphs joined at materialization boundaries.
-- [Summary Catalog and SDS](summary-catalog-sds-architecture.md) owns descriptors,
-  definition/instance identity, version-scoped state references, readiness and
+- [Summary Catalog and SDS](summary-catalog-sds-architecture.md) owns definition
+  and instance identity, version-scoped state references, readiness and state
   lifecycle semantics.
 - [Architecture migration delivery plan](asapplanner-migration-plan.md) defines
   common-library extraction, removal of ASAPCollector dependencies, the two-plan
