@@ -442,7 +442,12 @@ fn erp_collector_kll_export(plan: &Value, end_ms: u64, raw: &[f64], sequence: u6
                             attributes,
                             start_time_unix_nano: (end_ms - 5000) * 1_000_000,
                             time_unix_nano: end_ms * 1_000_000,
-                            sketch: state.encode_to_vec(),
+                            sketch: SketchEnvelope {
+                                format_version: 1,
+                                sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
                             encoding: KllSketchEncoding::Proto as i32,
                             flags: 0,
                             series_id: 0,
