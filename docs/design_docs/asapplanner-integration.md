@@ -7,7 +7,7 @@ Terminology: [Planner/backend glossary](planner-backend-glossary.md).
 
 ## Purpose and scope
 
-This design splits one selected ASAPPlanner semantic DAG into two executable
+This design splits one selected post-ASAP DAG from ASAPPlanner into two executable
 backend plans:
 
 - **PrecomputePlan** produces and maintains stored summary state.
@@ -33,7 +33,7 @@ migration must not introduce a backend dependency on ASAPCollector.
 
 ## Architecture at a glance
 
-The current `PrecomputePlan.executable_dags` can contain a complete semantic DAG,
+The current `PrecomputePlan.executable_dags` can contain a complete post-ASAP DAG,
 including query-time nodes such as `SummaryEstimate`. Bindings may prevent those
 nodes from running during maintenance, but the artifact and its visualization do
 not express that ownership clearly.
@@ -459,7 +459,7 @@ Acceptance tests demonstrate:
 
 ## Decisions and deferred work
 
-The full semantic DAG is retained only as provenance or diagnostic metadata;
+The selected post-ASAP DAG is retained only as provenance or diagnostic metadata;
 bindings alone do not make it valid PrecomputePlan executable content. The two
 physical plans are not compiled independently because that permits identity and
 schema drift.
