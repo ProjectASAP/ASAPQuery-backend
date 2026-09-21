@@ -34,13 +34,26 @@ matching state references and format/partition configuration. Runtime inventory
 records actual state instances; payload bytes live in the summary store.
 There is no separate catalog `Materialization` object.
 
+The compiler/catalog authority registers a `SummaryDefinition` when installing
+the plan. The edges from both plans to that catalog are definition references
+validated by catalog reads at installation, not runtime writes or serving-time
+catalog searches. At runtime, PrecomputePlan writes summary payload bytes to
+the store and publishes each instance's metadata to the inventory. QueryPlan
+checks the inventory for a ready matching instance, then reads its payload from
+the store. SDS describes this combined contract; its metadata is not all stored
+in the `SummaryDefinition` catalog. Definition semantics live in the catalog,
+writer/reader constraints in the installed plans, and actual partition,
+coverage, format, readiness and location in runtime instance metadata.
+
 ```mermaid
 flowchart LR
-  P[PrecomputePlan] -->|write through StateReference| S[Summary store]
-  Q[QueryPlan] -->|read through StateReference| S
-  P -->|definition ID| D[SummaryDefinition catalog]
-  Q -->|definition ID| D
-  I[Runtime instance inventory] -->|location and readiness| S
+  C[Compiler/catalog authority] -->|register definition: write| D[SummaryDefinition catalog]
+  P[PrecomputePlan] -->|validate definition: read at install| D
+  Q[QueryPlan] -->|validate definition: read at install| D
+  P -->|write payload| S[Summary store]
+  P -->|publish instance metadata: write| I[Runtime instance inventory]
+  Q -->|resolve ready instance: read| I
+  Q -->|read payload| S
 ```
 
 The compiler assigns a `state_slot_id` to a stored producer output within a plan
