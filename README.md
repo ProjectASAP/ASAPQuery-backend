@@ -289,14 +289,17 @@ jq '.candidates[] | {candidate_index, unavailable_reason}' \
 
 target/debug/examples/compile_workload_artifact \
   "$ASAPQUERY_PLANNING_SNAPSHOT" \
+  --dot target/readme-evidence/selected.dot \
   > target/readme-evidence/selected.json
 jq '.cost_comparison' target/readme-evidence/selected.json
-jq '.install_request.summary_catalog' target/readme-evidence/selected.json
-jq '.install_request.precompute_plan | {materializations, executable_dags}' \
+jq '.summary_catalog' target/readme-evidence/selected.json
+jq '.precompute_plan | {materializations, executable_dags}' \
   target/readme-evidence/selected.json
-jq '.install_request.query_plan.entries' target/readme-evidence/selected.json
-jq '.install_request.precompute_plan.schemas[] | {materialization, schema_id}' \
+jq '.query_plan.entries' target/readme-evidence/selected.json
+jq '.precompute_plan.schemas[] | {materialization, schema_id}' \
   target/readme-evidence/selected.json
+dot -Tsvg target/readme-evidence/selected.dot \
+  -o target/readme-evidence/selected.svg
 ```
 
 Candidate discovery accepts the checked-in unquoted templates. Deployment and
@@ -471,7 +474,7 @@ To inspect supported MetricsQL planning independently:
 target/debug/examples/compile_workload_artifact \
   "$ASAPQUERY_PLANNING_SNAPSHOT" --metricsql \
   > target/readme-evidence/victoriametrics/selected.json
-jq '.install_request.query_plan.entries' \
+jq '.query_plan.entries' \
   target/readme-evidence/victoriametrics/selected.json
 ```
 
@@ -522,7 +525,7 @@ python3 - <<'PY'
 import json
 from pathlib import Path
 root = Path('target/readme-evidence')
-envelope = json.loads((root / 'selected.json').read_text())['install_request']['precompute_plan']['envelope']
+envelope = json.loads((root / 'selected.json').read_text())['precompute_plan']['envelope']
 envelope['plan_id'] = 9001
 envelope['plan_version'] = 1
 workload = {

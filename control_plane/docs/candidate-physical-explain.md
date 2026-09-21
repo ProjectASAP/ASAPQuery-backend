@@ -18,7 +18,7 @@ Physical identity combines the logical/mask alternative with existing materializ
 
 The read-only `/api/v1/physical-plan/cost-manifests` and MetricsQL equivalent retain their default manifest-array response. Add `"explain": true` to the existing request to receive `{ "manifests": [...], "alternatives": [...], "logical_selection": [...] }`. Failed alternatives remain alongside usable manifests. When none can bind or be completely priced, the error retains an `all_infeasible` report and every accumulated alternative rather than only a generic message.
 
-Snapshot compilation exposes the same logical trace on `PhysicalPlan`; `compile_workload_artifact` prints it outside the install request. Compile-and-publish returns the trace without adding it to executable wire DTOs. SQL's existing selection trace gains the same semantic candidate/root identities.
+Snapshot compilation exposes the same logical trace on `CompiledPhysicalPlan`; `compile_workload_artifact` serializes it as `planner_selection_trace`. Compile-and-publish returns the trace without adding it to executable wire DTOs. SQL's existing selection trace gains the same semantic candidate/root identities.
 
 These are bounded explanations: they cover the actual Planner search and the existing physical materialization/exact inventory, not every possible placement or resource-constrained cluster assignment. Missing numeric measurements remain missing. The next provider integration must occur before logical commitment and reuse Planner's provider/resource contracts.
 
