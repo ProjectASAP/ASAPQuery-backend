@@ -114,9 +114,10 @@ query_plans:
     estimate: {quantile: 0.99}
 ```
 
-PrecomputePlan produces each required state partition once. Both QueryPlans
-resolve the same bound slot and apply different readout parameters. They neither
-create duplicate producers nor search the catalog for alternatives at serving time.
+One shared PrecomputePlan producer writes the required state partitions. Both
+QueryPlans resolve the same bound slot and apply different readout parameters.
+They neither create duplicate producers nor search the catalog for alternatives
+at serving time.
 
 ## Core objects
 
@@ -168,9 +169,9 @@ bytes remain in the summary store, not in catalog descriptors.
 | Plan version | With which atomic installation may it be used? |
 | Schema/encoding ID | How are its bytes interpreted? |
 
-The catalog authority assigns definition IDs; installation assigns the plan
-version; the compiler assigns state-slot IDs within that version; and the runtime
-assigns state-instance IDs. Schema/encoding IDs identify supported formats.
+Definition IDs come from the catalog authority, plan versions from the
+installation authority, state-slot IDs from the compiler, and state-instance IDs
+from the runtime. Schema/encoding IDs identify supported formats.
 Human-readable names are diagnostics, not join keys. Reuse across plan versions
 requires an explicit compatibility decision; a matching definition ID is
 insufficient.
