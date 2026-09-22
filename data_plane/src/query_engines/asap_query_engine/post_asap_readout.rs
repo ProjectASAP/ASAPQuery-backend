@@ -154,8 +154,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                         .catalog
                         .as_ref()
                         .and_then(|catalog| {
-                            let definition =
-                                catalog.materializations.get(&binding.materialization)?;
+                            let definition = catalog.definitions.get(&binding.materialization)?;
                             catalog
                                 .data_descriptors
                                 .get(&definition.data_descriptor_id)?
@@ -883,6 +882,10 @@ mod tests {
                         binding: MaterializationBinding {
                             full_window_slide_ms: None,
                             materialization: config.policy_fingerprint().into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    config.policy_fingerprint().into(),
+                                ),
                             output_grouping: PhysicalGrouping::PerEntity,
                             item_labels: vec![],
                             window_ms: 1000,
@@ -1314,6 +1317,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    policy.into(),
+                                ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
                             pane_origin_ms: Some(0),
@@ -1411,6 +1418,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    policy.into(),
+                                ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
                             pane_origin_ms: Some(0),

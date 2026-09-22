@@ -19,7 +19,7 @@ use asap_otel_proto::tonic::metrics::v1::{
     metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_sketchlib::proto::sketchlib::DdSketchState;
+use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
 use prost::Message;
 use serde_json::Value;
 
@@ -80,7 +80,12 @@ fn ddsketch_export(metric: &str, timestamp_ns: u64, values: &[f64]) -> Vec<u8> {
         }],
         start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
         time_unix_nano: timestamp_ns,
-        sketch: state.encode_to_vec(),
+        sketch: SketchEnvelope {
+            format_version: 1,
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+            ..Default::default()
+        }
+        .encode_to_vec(),
         encoding: DdSketchEncoding::DdsketchEncodingProto as i32,
         exemplars: Vec::new(),
         flags: 0,

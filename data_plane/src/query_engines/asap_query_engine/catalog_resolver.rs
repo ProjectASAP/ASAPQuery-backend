@@ -24,7 +24,7 @@ pub(crate) fn resolve(
     id: SummaryDefinitionId,
 ) -> Result<ResolvedMaterialization<'_>, EngineError> {
     let identity = catalog
-        .materializations
+        .definitions
         .get(&id)
         .ok_or_else(|| miss(format!("unknown materialization {}", id.fingerprint().0)))?;
     let summary = catalog
@@ -232,11 +232,11 @@ mod tests {
     fn resolves_without_descriptor_copies() {
         let bundle = fixture();
         let catalog = &bundle.summary_catalog;
-        let id = *catalog.materializations.keys().next().unwrap();
+        let id = *catalog.definitions.keys().next().unwrap();
         let result = resolve(catalog, id).unwrap();
         assert!(std::ptr::eq(
             result.summary,
-            &catalog.summary_descriptors[&catalog.materializations[&id].summary_descriptor_id]
+            &catalog.summary_descriptors[&catalog.definitions[&id].summary_descriptor_id]
         ));
         let mut broken = catalog.clone();
         broken.data_descriptors.clear();
@@ -246,8 +246,8 @@ mod tests {
     #[test]
     fn rejects_operator_fidelity_mismatch_during_resolution() {
         let mut catalog = catalog_fixture();
-        let id = *catalog.materializations.keys().next().unwrap();
-        let descriptor_id = catalog.materializations[&id].summary_descriptor_id.clone();
+        let id = *catalog.definitions.keys().next().unwrap();
+        let descriptor_id = catalog.definitions[&id].summary_descriptor_id.clone();
         catalog
             .summary_descriptors
             .get_mut(&descriptor_id)

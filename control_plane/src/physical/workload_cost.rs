@@ -950,13 +950,11 @@ mod tests {
         let plan = PhysicalPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
-        for document in [
-            serde_json::to_value(&plan.summary_catalog).unwrap(),
-            serde_json::to_value(&plan.precompute_plan).unwrap(),
-        ] {
-            assert!(document.get("materializations").is_some());
-            assert!(document.get("get_all_aggregation_configs").is_none());
-        }
+        let catalog = serde_json::to_value(&plan.summary_catalog).unwrap();
+        assert!(catalog.get("definitions").is_some());
+        let precompute = serde_json::to_value(&plan.precompute_plan).unwrap();
+        assert!(precompute.get("materializations").is_some());
+        assert!(precompute.get("get_all_aggregation_configs").is_none());
         let compile = |input: BackendLocalPlanningInput| {
             let (request, environment) = input.into_physical_compilation_request().unwrap();
             compile_candidates_for_pricing(

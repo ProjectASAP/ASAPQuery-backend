@@ -2552,6 +2552,7 @@ mod tests {
                     plan_id: 7,
                     plan_version: 1,
                     clickhouse_context: None,
+                    selected_dags: Default::default(),
                     entries: Default::default(),
                 }),
                 storage_routing: Arc::new(
@@ -5402,6 +5403,10 @@ pub fn validate_and_build_runtime_plan(
             }
         }
     }
+    asap_types::plan_publication::validate_stored_output_references(
+        &request.precompute_plan,
+        &request.query_plan,
+    )?;
     let _runtime_materializations = request
         .precompute_plan
         .runtime_materializations()
@@ -5431,6 +5436,10 @@ pub fn validate_and_build_runtime_plan(
         .query_plan
         .validate(&typed_fps)
         .map_err(|error| format!("QueryPlan validation error: {error}"))?;
+    asap_types::plan_publication::validate_maintenance_query_bindings(
+        &request.precompute_plan,
+        &request.query_plan,
+    )?;
     let storage_routing = match request.storage_routing.as_ref() {
         Some(value) => Arc::new(
             crate::storage_engines::types::BackendStorageRouting::from_json_payload(value)
@@ -5678,12 +5687,30 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
         .producers
         .iter()
         .map(|producer| {
-            (
-                asap_types::sds::SummaryDefinitionId::from(producer.materialization),
-                producer.producer_id.clone(),
-            )
+            let definition = asap_types::sds::SummaryDefinitionId::from(producer.materialization);
+            active
+                .precompute_plan
+                .schemas
+                .iter()
+                .find(|schema| schema.materialization == definition)
+                .map(|schema| {
+                    (
+                        definition,
+                        (
+                            schema.stored_output_reference.stored_output_id,
+                            producer.producer_id.clone(),
+                        ),
+                    )
+                })
         })
-        .collect();
+        .collect::<Option<std::collections::BTreeMap<_, _>>>();
+    let Some(producers) = producers else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"status":"error","error":"precompute producer has no stored-output binding"})),
+        )
+            .into_response();
+    };
     let reporter = std::env::var("HOSTNAME").unwrap_or_else(|_| "asapquery-backend".into());
     match state.summary_store.observed_summary_inventory(
         &reporter,
@@ -6474,6 +6501,48 @@ mod catalog_install_tests {
     }
 
     #[test]
+    fn complete_dag_cannot_be_installed_as_maintenance() {
+        let mut request = request();
+        let query_id = request
+            .precompute_plan
+            .executable_dags
+            .iter()
+            .next()
+            .map(|(id, _)| id.clone())
+            .expect("fixture has a maintained summary");
+        request
+            .precompute_plan
+            .executable_dags
+            .get_mut(&query_id)
+            .unwrap()
+            .document = request.query_plan.selected_dags[&query_id].clone();
+        assert!(install(request)
+            .unwrap_err()
+            .contains("unsupported maintenance DAG"));
+    }
+
+    #[test]
+    fn selected_dag_identity_is_validated_even_without_using_its_projection() {
+        let mut request = request();
+        let query_id = request
+            .query_plan
+            .selected_dags
+            .keys()
+            .next()
+            .cloned()
+            .expect("fixture has selected DAG provenance");
+        request
+            .query_plan
+            .selected_dags
+            .get_mut(&query_id)
+            .unwrap()
+            .query_id = "different-query".into();
+        assert!(install(request)
+            .unwrap_err()
+            .contains("differs from document query ID"));
+    }
+
+    #[test]
     fn invalid_clickhouse_entry_cannot_change_active_generation() {
         let active = install(request()).expect("baseline plan installs");
         let handle = crate::storage_engines::types::ActivePhysicalPlanHandle::new(active);
@@ -6581,7 +6650,7 @@ mod catalog_install_tests {
             })
             .expect("demo has maintained summaries");
         binding.window_ms += 1;
-        assert!(install(request).unwrap_err().contains("pane duration"));
+        assert!(install(request).unwrap_err().contains("query pane differs"));
     }
 
     #[test]
