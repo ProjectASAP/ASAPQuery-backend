@@ -57,6 +57,10 @@ async fn main() {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(true)
+        .with_writer(std::io::stdout)
         .init();
 
     let api_addr = std::env::var("CONTROLLER_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
