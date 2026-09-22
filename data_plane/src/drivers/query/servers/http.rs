@@ -5716,10 +5716,14 @@ pub use asap_types::plan_publication::PhysicalPlanInstallRequest;
 
 /// Decode and cross-validate every backend view before it can become visible.
 /// Used by both startup artifact loading and the staged HTTP install path.
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(plan_id = request.transmission_plan.envelope.plan_id,
+        plan_version = request.transmission_plan.envelope.plan_version))]
 pub fn validate_and_build_runtime_plan(
     request: PhysicalPlanInstallRequest,
     default_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 ) -> Result<crate::storage_engines::types::RuntimePhysicalPlan, String> {
+    tracing::debug!(target: "asap_runtime_debug", "backend runtime plan validation started");
     use std::collections::BTreeSet;
     request
         .precompute_plan

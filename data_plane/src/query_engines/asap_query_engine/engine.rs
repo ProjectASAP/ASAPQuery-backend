@@ -350,12 +350,16 @@ impl ASAPQueryEngine {
         self.query_forwarding_policy = policy;
         self
     }
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %entry.query_id, evaluation_count = times.len()))]
     async fn prepare_query_inputs(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
+        debug!(target: "asap_runtime_debug", "installed query input preparation started");
         super::catalog_resolver::validate_entry(
             physical.summary_catalog.as_deref(),
             entry,
@@ -444,6 +448,9 @@ impl ASAPQueryEngine {
         .await
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %entry.query_id, evaluation_ms = at))]
     fn execute_logical_entry(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
@@ -624,6 +631,9 @@ impl ASAPQueryEngine {
         result
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %entry.query_id, start_ms = start, end_ms = end, step_ms = step))]
     async fn execute_logical_range(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
@@ -637,6 +647,7 @@ impl ASAPQueryEngine {
             query_result::{QueryResult, RangeVectorElement},
             EngineError,
         };
+        debug!(target: "asap_runtime_debug", "installed query range execution started");
         if step == 0 || start > end || (end - start) / step >= 11_000 {
             return Err(EngineError::capability_miss(
                 "installed_logical_dag",

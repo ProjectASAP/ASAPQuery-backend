@@ -861,10 +861,13 @@ impl SketchStore {
 
     /// Install one authoritative catalog snapshot for future registrations.
     /// Existing Series IDs retain their generation's descriptor Arcs while draining.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = catalog.plan_id, plan_version = catalog.plan_version))]
     pub fn install_summary_catalog(
         &self,
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
     ) -> Result<(), String> {
+        tracing::debug!(target: "asap_runtime_debug", "summary store catalog installation started");
         let reference = catalog.reference().map_err(|error| error.to_string())?;
         let mut inventory = self.admission.write().unwrap();
         let generation = CatalogGeneration {

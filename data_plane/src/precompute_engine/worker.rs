@@ -480,6 +480,8 @@ impl Worker {
     /// `AggregationConfig` fingerprint used to resolve the bucket's
     /// config on first sight; `group_key` is held on the resulting
     /// `GroupState` for emit-time label rendering.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sid, policy_fp = %policy_fp, sample_count = samples.len()))]
     pub fn process_group_samples(
         &mut self,
         sid: u64,
@@ -487,6 +489,7 @@ impl Worker {
         group_key: &Arc<GroupKey>,
         samples: Vec<(String, i64, f64)>, // (series_key, timestamp_ms, value)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker group processing started");
         let input_revision = self.current_input_revision.clone();
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
@@ -768,6 +771,8 @@ impl Worker {
     ///
     /// `policy_fp` / `group_key` carry the same semantics as on
     /// `process_group_samples` — policy lookup + emit-time label rendering.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sid, policy_fp = %policy_fp, timestamp_ms))]
     pub fn process_accumulator_input(
         &mut self,
         sid: u64,
@@ -776,6 +781,7 @@ impl Worker {
         timestamp_ms: i64,
         incoming: Box<dyn AggregateCore>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker accumulator processing started");
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
         let late_data_policy = self.late_data_policy;
@@ -935,11 +941,14 @@ impl Worker {
     }
 
     /// Raw fast-path: emit each sample as a standalone `SumAccumulator`.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sample_count = samples.len()))]
     pub fn process_samples_raw(
         &self,
         series_key: &str,
         samples: Vec<(i64, f64)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker raw processing started");
         let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> =
             Vec::with_capacity(samples.len());
 
@@ -1011,7 +1020,10 @@ impl Worker {
         }
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, group_count = self.group_states.len()))]
     fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker flush started");
         if self.pass_raw_samples {
             return Ok(());
         }

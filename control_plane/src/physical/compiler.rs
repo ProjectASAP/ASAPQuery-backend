@@ -388,11 +388,15 @@ pub fn gos_policy_from_accuracy_budget(
     })
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(plan_id = envelope.plan_id, plan_version = envelope.plan_version,
+        producer_count = precompute.producers.len()))]
 pub fn build_transmission_plan(
     envelope: PlanEnvelope,
     precompute: &PrecomputePlan,
     runtime_policies: &BTreeMap<asap_types::PolicyFingerprint, RuntimeRulePolicy>,
 ) -> Result<TransmissionPlan, TransmissionPlanError> {
+    tracing::debug!(target: "asap_runtime_debug", "transmission plan construction started");
     if envelope != precompute.envelope {
         return Err(TransmissionPlanError::EnvelopeMismatch);
     }
@@ -964,12 +968,16 @@ impl PhysicalPlanCompiler {
         self.compile_for_frontend(request, environment, QueryFrontend::MetricsQl)
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(frontend = ?frontend, plan_version = environment.plan_version,
+            query_count = request.queries.len()))]
     pub fn compile_for_frontend(
         &self,
         mut request: PhysicalCompilationRequest,
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
+        tracing::debug!(target: "asap_runtime_debug", "physical plan compiler entered");
         if let Some(data) = &request.data_workload {
             data.validate()
                 .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -2155,6 +2163,8 @@ pub fn select_logical_roots_with_error_resource_profiles(
     select_logical_roots_with_trace(queries, roots, evidence, exact_costs, erp).map(|_| ())
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(query_count = queries.len(), root_count = roots.len()))]
 pub fn select_logical_roots_with_trace(
     queries: &mut [QueryCompilationInput],
     roots: Vec<Rc<QueryExpr>>,
@@ -2162,6 +2172,7 @@ pub fn select_logical_roots_with_trace(
     exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
     erp: Option<&super::erp::ErpPlanningInput>,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
+    tracing::debug!(target: "asap_runtime_debug", "logical root selection started");
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(
