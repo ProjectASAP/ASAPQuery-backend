@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct QueryNodeId(pub u64);
 
-pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 1;
+pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 2;
 pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 2;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
