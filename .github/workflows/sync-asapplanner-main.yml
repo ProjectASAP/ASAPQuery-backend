@@ -21,9 +21,6 @@ jobs:
       - name: Checkout backend
         uses: actions/checkout@v4
 
-      - name: Install Rust components
-        run: rustup component add rustfmt
-
       - name: Configure private Cargo dependencies
         env:
           ASAP_CI_REPO_TOKEN: ${{ secrets.ASAP_CI_REPO_TOKEN }}
@@ -33,13 +30,6 @@ jobs:
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: ./scripts/sync-asapplanner-main.sh
-
-      - name: Check synchronized workspace
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        run: |
-          cargo fmt -p control_plane -p data_plane -p asap_types -p asap_otel_proto -- --check
-          cargo check --workspace
 
       - name: Create or update synchronization PR
         uses: peter-evans/create-pull-request@v7
@@ -52,4 +42,4 @@ jobs:
           body: |
             Updates all ASAPPlanner workspace dependencies to the current `main` commit and regenerates `Cargo.lock`.
 
-            The synchronization workflow verified formatting and `cargo check --workspace` before opening this PR.
+            MVP CI validates formatting, compilation, linting and tests. A semantic Planner change stays visible as a failing synchronization PR until the backend adaptation is added.
