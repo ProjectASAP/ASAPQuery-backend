@@ -87,7 +87,7 @@ impl Fixture {
             relative_accuracy: 0.01,
         };
         store.register(SummarySeriesMetadata {
-            sid: 1,
+            storage_handle: 1,
             metric_name: "overhead_values".into(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
