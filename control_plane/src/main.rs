@@ -53,9 +53,15 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    let default_filter = if std::env::var("ASAP_DEBUG").as_deref() == Ok("1") {
+        "info,asap_runtime_debug=debug"
+    } else {
+        "info,asap_runtime_debug=off"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .with_file(true)
         .with_line_number(true)
@@ -279,7 +285,8 @@ async fn compile_and_publish_physical_plan(
 ) -> Response {
     let call_id = NEXT_PLAN_CALL_ID.fetch_add(1, Ordering::Relaxed);
     let started = std::time::Instant::now();
-    tracing::debug!(call_id, ?frontend, "physical plan compilation requested");
+    tracing::debug!(target: "asap_runtime_debug", call_id, ?frontend,
+        "physical plan compilation requested");
     // Serialize typed activations so an older response cannot overwrite the
     // catalog recorded after a newer backend activation.
     let mut active_catalog = st.active_summary_catalog.lock().await;

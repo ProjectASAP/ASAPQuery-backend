@@ -287,6 +287,7 @@ impl Worker {
                 } => {
                     let sample_count = samples.len();
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_group",
                         worker_id = self.id,
                         plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
@@ -306,6 +307,7 @@ impl Worker {
                             error = %e, "worker group processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete"
                     );
@@ -316,6 +318,7 @@ impl Worker {
                     ingest_received_at,
                 } => {
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_raw",
                         worker_id = self.id,
                         plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
@@ -332,6 +335,7 @@ impl Worker {
                             error = %e, "worker raw processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete (raw)"
                     );
@@ -345,6 +349,7 @@ impl Worker {
                     ingest_received_at,
                 } => {
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_accumulator",
                         worker_id = self.id,
                         plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
@@ -370,6 +375,7 @@ impl Worker {
                             error = %e, "worker accumulator processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete (accumulator)"
                     );

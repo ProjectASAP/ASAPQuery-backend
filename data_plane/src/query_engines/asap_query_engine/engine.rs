@@ -16,15 +16,17 @@ fn log_query_outcome<T>(
     result: &Result<T, crate::query_engines::EngineError>,
 ) {
     match result {
-        Ok(_) => debug!(
+        Ok(_) => debug!(target: "asap_runtime_debug",
             call_id,
             operation,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "query call completed"
         ),
-        Err(error @ crate::query_engines::EngineError::CapabilityMiss { .. }) => debug!(
+        Err(error @ crate::query_engines::EngineError::CapabilityMiss { .. }) => {
+            debug!(target: "asap_runtime_debug",
             call_id, operation, elapsed_ms = started.elapsed().as_millis() as u64,
-            %error, "query call could not be served by ASAP tier"),
+            %error, "query call could not be served by ASAP tier")
+        }
         Err(error) => tracing::warn!(call_id, operation,
             elapsed_ms = started.elapsed().as_millis() as u64, %error,
             "query call failed"),
@@ -222,7 +224,7 @@ impl ASAPQueryEngine {
     {
         let call_id = query_call_id();
         let started = Instant::now();
-        debug!(
+        debug!(target: "asap_runtime_debug",
             call_id,
             operation = "metricsql_instant",
             evaluation_ms = now_ms,
@@ -244,7 +246,7 @@ impl ASAPQueryEngine {
                         error.to_string(),
                     )
                 })?;
-            debug!(call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
             query_id = %planned.query_id, evaluation_ms = now_ms,
             "installed MetricsQL instant query selected");
             let leaves = self
@@ -255,7 +257,7 @@ impl ASAPQueryEngine {
             stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
             stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
             annotate_logical_execution(&mut result, &stats);
-            debug!(call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
             query_id = %planned.query_id, remote_evaluations = stats.remote_evaluations,
             remote_rpcs = stats.remote_rpcs, "installed MetricsQL instant query completed");
             Ok(result)
@@ -276,7 +278,7 @@ impl ASAPQueryEngine {
     {
         let call_id = query_call_id();
         let started = Instant::now();
-        debug!(
+        debug!(target: "asap_runtime_debug",
             call_id,
             operation = "metricsql_range",
             start_ms,
@@ -300,7 +302,7 @@ impl ASAPQueryEngine {
                         error.to_string(),
                     )
                 })?;
-            debug!(call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
             query_id = %planned.query_id, start_ms, end_ms, step_ms,
             "installed MetricsQL range query selected");
             self.execute_logical_range(&physical, planned, start_ms, end_ms, step_ms)
@@ -408,7 +410,7 @@ impl ASAPQueryEngine {
                 )
             })
         {
-            debug!(
+            debug!(target: "asap_runtime_debug",
                 language = ?entry.language,
                 query_id = %entry.query_id,
                 "query forwarding disabled; external exact subquery blocked"
@@ -825,7 +827,7 @@ impl ASAPQueryEngine {
     {
         let call_id = query_call_id();
         let started = Instant::now();
-        debug!(
+        debug!(target: "asap_runtime_debug",
             call_id,
             operation = "promql_range",
             start_ms,
@@ -839,7 +841,7 @@ impl ASAPQueryEngine {
                 if entry.nodes.values().any(|node| {
                     matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
                 }) {
-                    debug!(call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                    debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
                         query_id = %entry.query_id, "installed query DAG selected");
                     return self
                         .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
@@ -1092,7 +1094,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     {
         let call_id = query_call_id();
         let started = Instant::now();
-        debug!(
+        debug!(target: "asap_runtime_debug",
             call_id,
             operation = "promql_instant",
             evaluation_ms = now_ms,
@@ -1101,7 +1103,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         let result = async {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                debug!(call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
                     query_id = %entry.query_id, evaluation_ms = now_ms,
                     "installed query DAG selected");
                 let leaves = self
@@ -1125,7 +1127,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     leaves.values().map(|leaf| leaf.remote_evaluations).sum();
                 stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
                 annotate_logical_execution(&mut result, &stats);
-                debug!(call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
                     query_id = %entry.query_id, remote_evaluations = stats.remote_evaluations,
                     remote_rpcs = stats.remote_rpcs, "installed query DAG completed");
                 return Ok(result);

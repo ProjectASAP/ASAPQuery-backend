@@ -2010,7 +2010,7 @@ async fn handle_runtime_info(
     let mut forwarding_headers = HashMap::new();
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
-            debug!("Found Authorization header for runtime info: {}", auth_str);
+            debug!("Found Authorization header for runtime info");
             forwarding_headers.insert("Authorization".to_string(), auth_str.to_string());
         }
     } else {
@@ -5832,7 +5832,7 @@ async fn handle_post_physical_plan(
     let started = Instant::now();
     let requested_plan_id = request.transmission_plan.envelope.plan_id;
     let requested_plan_version = request.transmission_plan.envelope.plan_version;
-    tracing::debug!(
+    tracing::debug!(target: "asap_runtime_debug",
         call_id,
         plan_id = requested_plan_id,
         plan_version = requested_plan_version,
@@ -5989,7 +5989,7 @@ async fn handle_activate_physical_plan(
     use axum::response::IntoResponse;
     let call_id = NEXT_PLAN_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    tracing::debug!(
+    tracing::debug!(target: "asap_runtime_debug",
         call_id,
         plan_id = request.plan_id,
         plan_version = request.plan_version,
