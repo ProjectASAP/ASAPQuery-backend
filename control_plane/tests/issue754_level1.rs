@@ -1,7 +1,11 @@
 //! Issue #754 level 1: every shared workload query has a valid physical plan.
-use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+use control_plane::physical::compiler::{
+    BackendLocalPlanningInput, PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
+};
 use control_plane::physical::executable_binding::validate_query_plan;
-use control_plane::physical::workload_cost::enumerate_exact_and_materialized_candidates;
+use control_plane::physical::workload_cost::{
+    enumerate_exact_and_materialized_candidates, manifest, WorkloadCostEvidence, WorkloadQuote,
+};
 use control_plane::query_plan::QueryPlanNode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -42,13 +46,14 @@ fn issue754_queries_have_valid_physical_plans() {
         ))
         .unwrap();
         snapshot["query_workload"]["repeating_queries"][0]["query"] = case.expr.clone().into();
-        let input: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
-        let (request, environment) = input.into_physical_compilation_request().unwrap();
+        let mut input: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
+        let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let mut valid_plans = Vec::new();
+        let mut quotes = Vec::new();
         let mut errors = Vec::new();
         for candidate in candidates {
-            match PhysicalPlanCompiler.compile_promql(candidate, environment.clone()) {
+            match PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone()) {
                 Ok(plan) => {
                     let entry = plan.query_plan.lookup(&case.expr).unwrap();
                     assert_eq!(entry.canonical_query, case.expr);
@@ -69,6 +74,17 @@ fn issue754_queries_have_valid_physical_plans() {
                     }
                     let dot = control_plane::physical::plan_dot::render(&plan);
                     assert!(dot.contains("PrecomputePlan") && dot.contains("QueryPlan:"));
+                    let cost = if valid_plans.is_empty() { 1.0 } else { 1e12 };
+                    let manifest = manifest(&plan, &candidate.queries).unwrap();
+                    quotes.push(WorkloadQuote {
+                        unit_costs: manifest
+                            .components
+                            .keys()
+                            .map(|key| (key.clone(), cost))
+                            .collect(),
+                        manifest,
+                        executable: true,
+                    });
                     valid_plans.push(plan);
                 }
                 Err(error) => errors.push(error.to_string()),
@@ -99,18 +115,59 @@ fn issue754_queries_have_valid_physical_plans() {
                 case.name
             );
         }
+        input.workload_cost_evidence = Some(WorkloadCostEvidence {
+            backend_revision: BACKEND_REVISION.into(),
+            planner_revision: PLANNER_REVISION.into(),
+            data_snapshot_id: "issue-754-level1".into(),
+            model_version: "deterministic-test-costs".into(),
+            observed_at_unix_ms: environment.observed_at_unix_ms,
+            valid_for_ms: environment.max_evidence_age_ms,
+            quotes,
+        });
+        let selected = input
+            .compile_promql()
+            .unwrap_or_else(|error| panic!("{} selected plan failed: {error}", case.name));
+        let selected_entry = selected.query_plan.lookup(&case.expr).unwrap();
+        assert!(selected_entry.nodes.contains_key(&selected_entry.root));
+        if let Some(family) = expected {
+            assert!(
+                selected
+                    .precompute_plan
+                    .materializations
+                    .iter()
+                    .any(|m| format!("{:?}", m.aggregation_type) == family),
+                "{} selected plan lost the expected {family} summary",
+                case.name
+            );
+            assert!(
+                !selected_entry
+                    .nodes
+                    .values()
+                    .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })),
+                "{} silently fell back despite a selected summary",
+                case.name
+            );
+        } else {
+            assert!(selected.precompute_plan.materializations.is_empty());
+            assert!(
+                matches!(
+                    selected_entry.nodes.get(&selected_entry.root),
+                    Some(QueryPlanNode::ExactFallback { .. })
+                ),
+                "{} must expose an explicit exact fallback",
+                case.name
+            );
+        }
+        if let Some(installed) = selected
+            .precompute_plan
+            .executable_dags
+            .get(&selected_entry.query_id)
+        {
+            installed.validate().unwrap();
+            validate_query_plan(installed, selected_entry).unwrap();
+        }
         if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
-            let plan = valid_plans
-                .iter()
-                .find(|plan| {
-                    expected.is_some_and(|family| {
-                        plan.precompute_plan
-                            .materializations
-                            .iter()
-                            .any(|m| format!("{:?}", m.aggregation_type) == family)
-                    })
-                })
-                .unwrap_or(&valid_plans[0]);
+            let plan = &selected;
             std::fs::create_dir_all(&directory).unwrap();
             let base = std::path::Path::new(&directory).join(&case.name);
             std::fs::write(
