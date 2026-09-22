@@ -16,6 +16,7 @@ type ComposeLifecycle struct {
 	LogsDirectory            string
 	PlanningSnapshot         string
 	PlanningSnapshotTemplate string
+	SelectedPlan             string
 	environment              []string
 	started                  bool
 }
@@ -41,10 +42,32 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	if err := l.runCompose(ctx, environment, "wait", "planner"); err != nil {
 		return fmt.Errorf("derive workload cost evidence: %w", err)
 	}
+	if l.SelectedPlan != "" {
+		if err := l.compileSelectedPlan(ctx, environment); err != nil {
+			return err
+		}
+	}
 	if err := l.runCompose(ctx, environment, "up", "-d", "--build", "data-plane"); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (l *ComposeLifecycle) compileSelectedPlan(ctx context.Context, environment []string) error {
+	if err := os.MkdirAll(filepath.Dir(l.SelectedPlan), 0o755); err != nil {
+		return err
+	}
+	args := append(l.args(), "run", "--rm", "--no-deps", "--entrypoint", "/usr/local/bin/compile_workload_artifact", "planner", "/config/planning-snapshot.json")
+	command := exec.CommandContext(ctx, "docker", args...)
+	command.Env = environment
+	output, err := command.Output()
+	if err != nil {
+		return fmt.Errorf("compile selected plan: %w", err)
+	}
+	if err := os.WriteFile(l.SelectedPlan, output, 0o644); err != nil {
+		return err
+	}
+	return ValidateLocalPlan(output)
 }
 
 func (l *ComposeLifecycle) runCompose(ctx context.Context, environment []string, commandArgs ...string) error {
