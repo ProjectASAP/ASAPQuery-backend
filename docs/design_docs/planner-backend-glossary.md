@@ -24,20 +24,32 @@ in the serialized API.
 
 For example, merging five compatible one-minute KLL summaries and storing the
 five-minute result produces derived summary state in a separate destination
-slot. Merging them only to answer a query is a query-time operation. Both require
+stored output. Merging them only to answer a query is a query-time operation. Both require
 compatible grouping, coverage and accuracy.
 
 ## State and identity
 
+These are proposed design names, not a rename of existing Rust APIs or wire
+fields. `SummaryDefinition` retains its meaning. The former Summary Catalog is
+the internal `summary_definitions` table and its installation snapshot;
+`SummaryStateInstance` is now `StoredSummary`, and `StateReference` is now
+`StoredOutputReference`. The latter names a producer output, while the composite
+record key locates one population/window payload. V1 stores only two kinds of
+objects: `SummaryDefinition` and `StoredSummary`. `StoredOutputReference` belongs
+to installed plan bindings, not a third storage table. Instance metadata and
+payload are both part of `StoredSummary`; their internal physical layout is an
+implementation detail.
+
 | Term | Meaning |
 | --- | --- |
-| Summary Catalog | Metadata registry of summary definitions; payload bytes live in the summary store. |
+| `summary_definitions` | Logical table inside `SummaryStore`: definition ID → `SummaryDefinition`. The compiler supplies a snapshot for validation and registration during installation. |
+| `stored_summaries` | Logical table inside the same store: `(plan_version, stored_output_id, population_key, window)` → `StoredSummary`. |
 | SDS (Self-Describing Summary) | The description and metadata needed to interpret and validate stored summary state. It is not a separate execution engine or payload store. |
 | `SummaryDefinition` | What a summary represents: source/filter, input value, grouping, time semantics, algorithm and parameters. |
-| `state_slot_id` | Compiler-assigned identifier for a stored producer output within one plan version. Shared readers use the same slot; it has no independent catalog object. |
-| `StateReference` | Plan reference identifying a slot and summary definition within the enclosing plan version. Reader configuration selects the required state instances and constrains format and coverage. |
-| `SummaryStateInstance` | A concrete stored state, such as one service's completed five-minute KLL snapshot, with partition, coverage, format and location metadata. |
-| Summary store | Storage for actual summary payloads. Runtime inventory records their existence, coverage and readiness. |
+| `stored_output_id` | Compiler-assigned binding ID for a persisted PrecomputePlan DAG output within one plan version. Writers and shared readers use it to name the same output; it is not a memory slot or independent catalog object. |
+| `StoredOutputReference` | Plan reference identifying a stored output and summary definition within the enclosing plan version. Reader configuration selects the required state instances and constrains format and coverage. |
+| `StoredSummary` | One committed record containing instance metadata and payload, such as one service's completed five-minute KLL snapshot. |
+| `SummaryStore` | One storage engine owning `summary_definitions` and `stored_summaries`, including definition rows, instance metadata and payload bytes. The current implementation is `SketchStore`; no separate metadata or payload service is required. |
 | `plan_version` | Version shared by an installed plan bundle and its catalog bindings. Creating or updating state instances does not itself change this version. |
 | Schema / encoding | Schema describes the state structure; encoding describes how that structure is represented as bytes. |
 | Provenance | Mapping from physical plan operations back to the selected Planner computation. |
