@@ -4,6 +4,86 @@ Audience: backend developers and reviewers of issue #762 / PR #763.
 
 The selected ASAPPlanner post-ASAP DAG owns computation semantics. The backend installs physical bindings and executes two projections: raw-source producers in streaming workers, and maintenance subgraphs over materialized inputs. **Current parallelism is across worker-owned state partitions. A single maintenance subgraph executes its nodes sequentially in dependency order. There is no general parallel DAG task scheduler in this implementation.**
 
+## V1 target: data-parallel execution of the complete precompute subgraph
+
+The compiler splits the selected Planner DAG into a PrecomputePlan subgraph and
+QueryPlan subgraphs at explicit stored-output boundaries. Every precompute
+worker runs the same complete PrecomputePlan subgraph on its assigned data
+partition. Operators are not distributed among workers. Within each worker,
+nodes execute sequentially in dependency order; parallelism comes from workers
+processing independent partitions concurrently.
+
+```mermaid
+flowchart TD
+  D[Selected Planner DAG] --> P[PrecomputePlan subgraph]
+  D --> Q[QueryPlan subgraphs]
+  P --> W0[Worker 0: complete subgraph over partition A]
+  P --> W1[Worker 1: complete subgraph over partition B]
+  P --> W2[Worker 2: complete subgraph over partition C]
+  W0 --> S[SummaryStore: committed StoredSummary records]
+  W1 --> S
+  W2 --> S
+  S --> Q
+```
+
+Workers may share an immutable DAG description, but each owns its accumulator,
+window, ordering and intermediate state. A worker is a scheduling unit, not a
+promise of a dedicated OS thread. Each invocation reuses shared upstream node
+results within that worker; it does not compute the node again for each
+consumer. Publishing multiple stored outputs from the same invocation must
+preserve this reuse.
+
+### Partitioning must make the entire subgraph locally executable
+
+The compiler validates one partitioning rule against every dependency and
+reduction in the subgraph. Assigning arbitrary raw series or individual producer
+states to workers is insufficient: all inputs that a downstream operation must
+combine must reach the same worker. An ungrouped result cannot be replaced by
+several partial results without an explicit merge in the selected plan.
+
+| Computation | Partitioning requirement for v1 |
+| --- | --- |
+| `sum by (service)` | Route all inputs for one service to the same worker. |
+| Per-series `rate()` | Keep each series together and preserve the required sample-time ordering, including counter-reset handling. |
+| Per-series Rate followed by Sum by service | Partition by service; keep separate per-series Rate states inside that worker, then perform the service reduction locally. |
+| Global Sum | Use one worker unless the plan explicitly provides valid partial aggregation and a final merge. |
+
+A coarser partition can satisfy several nodes: grouping by service still keeps
+individual series together. If no supported parallel partitioning rule makes
+the whole subgraph local, v1 may use a single worker when that satisfies the
+selected deployment and resource constraints; otherwise it rejects the plan.
+It must not silently change the reduction, family, coverage or deployment
+selection. V1 introduces no implicit cross-worker shuffle or merge. Scheduling
+work after complete input windows become available remains necessary even when
+all dependencies belong to one worker.
+
+### Configuration and implementation boundary
+
+`PrecomputePlan` is the sole executable precompute configuration: DAG, source
+and stored-output bindings, partition assignment, and the selected deployment
+guarantee and schedule/retention. Worker counts and queue capacities remain
+engine settings in `PrecomputeEngineConfig`. Runtime programs and routing
+indexes are derived from the installed plan. The target removes the independently
+installable `StreamingConfig` wrapper rather than creating another DAG format.
+
+PR #763 does not yet implement this complete worker model. It currently routes
+individual stored-state `sid`s to workers, fuses supported raw producer paths,
+and executes maintenance through separate synchronous paths, including the
+shared output-batch lock. These mechanisms must be brought under the worker's
+complete-subgraph execution context; renaming configuration or retaining a DAG
+in a wrapper alone does not achieve the target.
+
+Acceptance must demonstrate that every worker uses the same installed subgraph,
+receives only its assigned partition, and executes all reachable precompute
+nodes needed for that partition's stored outputs. Compare one-worker and
+multi-worker results for grouped Sum, per-series Rate, and Rate followed by
+service reduction; check shared-node execution counts and reject a partitioning
+rule that splits a required group. This verifies data parallelism without
+requiring node-parallel scheduling.
+
+The remaining sections describe the current implementation, not completion of
+this v1 target.
+
 ## Relationship to the v1 design in PR #737
 
 This implementation is stacked on the [plan split design](asapplanner-integration.md)
@@ -140,7 +220,7 @@ Queues are bounded by `channel_buffer_size` (default 10,000). Awaiting sends app
 
 The shared output lock protects batch retry/publication ordering, but limits throughput when many workers close panes at once. CPU-heavy kernels and maintenance evaluation execute synchronously in their calling task; they are not automatically offloaded to a CPU pool. Increasing the worker count therefore does not imply proportional speedup, and a single large maintenance DAG does not become parallel.
 
-A future node-parallel executor would need an indegree-based ready queue, bounded CPU execution, immutable intermediate ownership, and commit coordination scoped to each target/window/lineage instead of the current whole-batch lock. It would also need deterministic failure/retry and generation-switch tests. Those mechanisms are **not implemented by PR #763** and must not be assumed when assessing its performance.
+Node-level parallelism is outside the v1 target above. A later node-parallel executor would need an indegree-based ready queue, bounded CPU execution, immutable intermediate ownership, and commit coordination scoped to each target/window/lineage instead of the current whole-batch lock. It would also need deterministic failure/retry and generation-switch tests. Those mechanisms are **not implemented by PR #763** and must not be assumed when assessing its performance.
 
 ## 6. Validation and supported boundaries
 
