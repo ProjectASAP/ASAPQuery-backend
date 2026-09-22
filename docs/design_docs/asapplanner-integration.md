@@ -291,7 +291,7 @@ precompute_plan:
     - {id: build-kll, op: BuildKll, k: 200}
     - id: write-kll
       op: WriteState
-      reference: {state_slot_id: latency-kll, definition_id: def-api-latency-kll}
+      reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
       schema: kll-v1
       encoding: kll-binary-v1
       partition_by: [service, window_end]
@@ -313,7 +313,7 @@ query_plan:
   nodes:
     - id: read-kll
       op: ReadState
-      reference: {state_slot_id: latency-kll, definition_id: def-api-latency-kll}
+      reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
       expected_schema: kll-v1
       expected_encoding: kll-binary-v1
       partition: {service: all_requested_services, window_end: evaluation_time}
@@ -328,7 +328,7 @@ provenance:
   planner.estimate-p99: [query.read-kll, query.estimate-p99]
 ```
 
-`latency-kll` is the state slot shared by the writer and reader in plan version
+`latency-kll` is the stored output shared by the writer and reader in plan version
 42. The catalog defines its summary semantics; the matching executable bindings
 declare format and partition rules. There is no separate catalog materialization
 object. Provenance relates
@@ -363,7 +363,7 @@ Bindings describe the semantic-to-physical mapping:
 
 `Materialization` above is the existing backend node-binding variant marking
 stored output. It does not create a separate catalog object. The compiler assigns
-that output a state slot and emits matching writer/reader bindings; see
+that output a `stored_output_id` and emits matching writer/reader bindings; see
 [field ownership and migration](summary-catalog-sds-architecture.md#core-objects).
 
 | Layer | Owns |
@@ -407,12 +407,13 @@ summary semantics, grouping, time ranges or schemas independently.
 
 For every selected stored summary, the compiler:
 
-1. Creates or reuses a compatible summary definition and assigns a state slot
-   within the plan version. No standalone catalog materialization is created.
+1. Creates or reuses a compatible summary definition and assigns the persisted
+   DAG output a `stored_output_id` within the plan version. No standalone catalog
+   materialization is created.
 2. Places source reads, maintenance operators, derived-state reads and the state
    sink in PrecomputePlan.
 3. Replaces the stored-summary edge in QueryPlan with an explicit state read
-   referencing the same slot and definition, with matching format and partition
+   referencing the same stored output and definition, with matching format and partition
    rules. Writer identity belongs to the PrecomputePlan binding.
 4. Places `SummaryEstimate`, merges, exact residuals and result composition in
    QueryPlan.
@@ -423,7 +424,7 @@ are compatible. Sharing does not multiply maintenance updates; each query keeps
 its own readout operators.
 
 A summary built from completed stored summaries uses explicit source reads and
-a separate destination slot. For example, five compatible one-minute KLL states
+a separate destination output. For example, five compatible one-minute KLL states
 can be merged into a stored five-minute KLL if coverage and accuracy permit it.
 A merge used only to answer a query belongs in QueryPlan and creates no stored
 destination:

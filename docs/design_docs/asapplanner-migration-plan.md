@@ -54,12 +54,12 @@ summary_catalog:
   definition: {id: def-9, algorithm: kll, k: 200}
 
 precompute_plan:
-  nodes: [Input, BuildKLL, 'WriteState(slot-17)']
-  write_binding: {state_slot_id: slot-17, definition_id: def-9, schema: kll-v1}
+  nodes: [Input, BuildKLL, 'WriteState(output-17)']
+  write_binding: {stored_output_id: output-17, definition_id: def-9, schema: kll-v1}
 
 query_plan:
-  nodes: ['ReadState(slot-17)', SummaryEstimate, Result]
-  read_binding: {state_slot_id: slot-17, definition_id: def-9, expected_schema: kll-v1}
+  nodes: ['ReadState(output-17)', SummaryEstimate, Result]
+  read_binding: {stored_output_id: output-17, definition_id: def-9, expected_schema: kll-v1}
 
 provenance:
   selected_dag: Input -> BuildKLL -> SummaryEstimate -> Result
@@ -110,8 +110,8 @@ transitive Collector dependencies.
 ## Stage 3: bind and split plans
 
 Create compiler bindings for semantic nodes, summary definitions,
-version-scoped state slots, schemas and state references. Derive the catalog and both plans
-from those bindings using the
+version-scoped stored-output IDs, schemas and state references. Derive the
+catalog and both plans from those bindings using the
 [materialization-boundary rules](asapplanner-integration.md#executable-subgraphs-and-materialization-boundaries):
 
 - PrecomputePlan contains maintenance inputs/operators and state sinks.
@@ -125,14 +125,14 @@ unchanged schema version.
 
 Do not introduce a standalone catalog `Materialization` object. Keep definitions
 in the catalog, format/partition/writer configuration in executable bindings,
-and actual coverage/location/readiness in instance inventory. Normalize legacy
-stored-output identities into state slots while preserving payload locators;
+and actual coverage/readiness with payloads in `SummaryStore`. Normalize legacy
+stored-output identities into version-scoped `stored_output_id` values;
 validate all consumers against the same writer configuration. The existing
 `BackendNodeBinding::Materialization` remains a placement marker for stored output.
 
 ## Stage 4: validate and install
 
-Validate definition, state slot, schema, encoding, grouping, time partition,
+Validate definition, stored output, schema, encoding, grouping, time partition,
 coverage and plan version across the catalog and both plans. Then perform local
 resource checks.
 
