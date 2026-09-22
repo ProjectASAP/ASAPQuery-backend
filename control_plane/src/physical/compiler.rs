@@ -3999,26 +3999,6 @@ fn collect_selected_materializations(
     Ok(selected)
 }
 
-pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
-    match family {
-        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _) => {
-            // The SummaryStore Sum accumulator retains the observation count
-            // alongside its sum. Both logical states can share this producer.
-            SummaryFamilyType::ExactAggregate(
-                planner_types::post_asap::ExactKind::Sum,
-                planner_types::post_asap::ExactParams::Sum,
-            )
-        }
-        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Rate, _) => {
-            SummaryFamilyType::ExactAggregate(
-                planner_types::post_asap::ExactKind::Increase,
-                planner_types::post_asap::ExactParams::Increase,
-            )
-        }
-        _ => family.clone(),
-    }
-}
-
 pub(crate) fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
