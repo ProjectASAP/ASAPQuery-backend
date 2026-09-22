@@ -1,4 +1,5 @@
 //! Issue #754 level 1: every shared workload query has a valid physical plan.
+use asap_types::sds::SummaryOperator;
 use control_plane::physical::compiler::{
     BackendLocalPlanningInput, CompiledPhysicalPlan, PhysicalPlanCompiler, BACKEND_REVISION,
     PLANNER_REVISION,
@@ -119,6 +120,23 @@ fn family_matches(expected: &ExpectedFamily, actual: &SummaryFamilyType) -> bool
 }
 
 fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<String> {
+    for materialization in &plan.precompute_plan.materializations {
+        let definition = plan
+            .summary_catalog
+            .materializations
+            .get(&materialization.policy_fingerprint().into())
+            .expect("precompute producer has no catalog definition");
+        let descriptor =
+            &plan.summary_catalog.summary_descriptors[&definition.summary_descriptor_id];
+        let SummaryOperator::Configured { family, .. } = &descriptor.operator else {
+            panic!("{name}: producer catalog descriptor lacks Planner family");
+        };
+        assert_eq!(
+            family,
+            &materialization.accumulator_spec().unwrap().family,
+            "{name}: precompute producer and catalog disagree about Planner family"
+        );
+    }
     let expected = expected_plan(name);
     let artifact = serde_json::to_value(plan).unwrap();
     let entries = artifact["query_plan"]["entries"].as_object().unwrap();
