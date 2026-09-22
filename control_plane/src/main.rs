@@ -304,7 +304,10 @@ async fn compile_and_publish_physical_plan(
                 (bundle, ids, timeout, adaptation, manifests)
             }
             Ok((None, ..)) => {
-                tracing::error!(call_id, "physical plan compilation selected no plan");
+                tracing::error!(
+                    call_id,
+                    "physical plan compilation produced no deployable plan"
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "publication requires a selected plan",
@@ -330,7 +333,7 @@ async fn compile_and_publish_physical_plan(
             call_id,
             plan_id = bundle.envelope.plan_id,
             plan_version = bundle.envelope.plan_version,
-            "backend endpoint is unavailable"
+            "backend endpoint is not configured"
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -420,7 +423,7 @@ async fn compile_and_publish_physical_plan(
             plan_version = bundle.envelope.plan_version,
             activation_wait_ms = activation_wait,
             timeout_ms = apply_timeout.as_millis() as u64,
-            "physical plan activation time exceeds timeout"
+            "scheduled activation exceeds apply timeout; backend plan remains staged"
         );
         return (
             StatusCode::GATEWAY_TIMEOUT,

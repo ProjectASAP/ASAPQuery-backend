@@ -111,6 +111,7 @@ where
         stats: ExecutionStats::default(),
         memo: BTreeMap::new(),
         active: BTreeSet::new(),
+        failed_node: None,
         warnings: Vec::new(),
     };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
@@ -148,6 +149,7 @@ struct Evaluator<'a, F> {
     callback: F,
     memo: BTreeMap<(QueryNodeId, i64), Value>,
     active: BTreeSet<(QueryNodeId, i64)>,
+    failed_node: Option<QueryNodeId>,
     warnings: Vec<String>,
 }
 impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'_, F> {
@@ -242,19 +244,22 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
         let value = match value {
             Ok(value) => value,
             Err(error) => {
-                match &error {
-                    EngineError::CapabilityMiss { .. } => {
-                        tracing::debug!(target: "asap_runtime_debug",
+                if self.failed_node.is_none() {
+                    self.failed_node = Some(id);
+                    match &error {
+                        EngineError::CapabilityMiss { .. } => {
+                            tracing::debug!(target: "asap_runtime_debug",
+                                query_id = %self.entry.query_id, node_id = ?id,
+                                elapsed_us = started.elapsed().as_micros() as u64, %error,
+                                "installed query node could not be served"
+                            )
+                        }
+                        _ => tracing::warn!(
                             query_id = %self.entry.query_id, node_id = ?id,
                             elapsed_us = started.elapsed().as_micros() as u64, %error,
-                            "installed query node could not be served"
-                        )
+                            "installed query node failed"
+                        ),
                     }
-                    _ => tracing::warn!(
-                        query_id = %self.entry.query_id, node_id = ?id,
-                        elapsed_us = started.elapsed().as_micros() as u64, %error,
-                        "installed query node failed"
-                    ),
                 }
                 return Err(error);
             }
