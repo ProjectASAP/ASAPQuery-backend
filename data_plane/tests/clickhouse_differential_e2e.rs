@@ -1,9 +1,9 @@
-//! Optional real-ClickHo#[path = "support/empty_streaming_config.rs"]
-mod empty_streaming_config;
-
-use protocol and Grafana smoke coverage.
+//! Optional real-ClickHouse protocol and Grafana smoke coverage.
 //!
 //! Set `CLICKHOUSE_URL` (for example `http://127.0.0.1:8123`) to run it.
+
+#[path = "support/empty_streaming_config.rs"]
+mod empty_streaming_config;
 
 use std::{
     collections::HashMap,
