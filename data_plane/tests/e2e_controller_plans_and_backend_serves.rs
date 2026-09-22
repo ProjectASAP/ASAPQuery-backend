@@ -146,7 +146,7 @@ async fn post_full_config(
 }
 
 use control_plane::types::WorkloadCharacteristics;
-use data_plane::storage_engines::types::HotReloadStreamingConfig;
+use data_plane::storage_engines::types::InstalledPrecomputePlanHandle;
 use serde_json::Value as JsonValue;
 
 use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -157,7 +157,7 @@ use asap_otel_proto::tonic::metrics::v1::{
     Metric, ResourceMetrics, ScopeMetrics,
 };
 use asap_sketchlib::proto::sketchlib::{
-    CountMinState, CountSketchState, CounterType, DdSketchState,
+    sketch_envelope, CountMinState, CountSketchState, CounterType, DdSketchState, SketchEnvelope,
 };
 use prost::Message;
 
@@ -222,7 +222,7 @@ fn _wc_anchor() -> WorkloadCharacteristics {
 
 /// Full test stack: PrecomputeEngine + SketchStoreSink + OtlpReceiver +
 /// HttpServer, all sharing the same `SketchStore` and
-/// `HotReloadStreamingConfig` so a controller-posted streaming-config
+/// `InstalledPrecomputePlanHandle` so a controller-posted streaming-config
 /// is visible to the engine's accumulator routing, the engine's window
 /// outputs land in `SketchStore`, and the query engine reads from the
 /// same store.
@@ -254,7 +254,7 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     let active = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
         physical_fixture::bootstrap(),
     );
-    let hot_reload = HotReloadStreamingConfig::from_active_physical_plan(active.clone());
+    let hot_reload = InstalledPrecomputePlanHandle::from_active_physical_plan(active.clone());
     let series_resolver = Arc::new(SeriesIdResolver::new());
 
     // SketchStoreSink writes precompute output back into SketchStore so
@@ -347,6 +347,15 @@ fn build_dd_sketch_state(alpha: f64, store_counts: Vec<u64>, store_offset: i32) 
         store_counts,
         store_offset,
     }
+}
+
+fn encode_dd_full_state(state: DdSketchState) -> Vec<u8> {
+    SketchEnvelope {
+        format_version: 1,
+        sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+        ..Default::default()
+    }
+    .encode_to_vec()
 }
 
 /// Build an OTLP `ExportMetricsServiceRequest` wrapping a single DDSketch
@@ -702,7 +711,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
 //   * Modified-OTLP `DdSketchDataPoint` wire encoding + the backend's
 //     OTLP HTTP receiver accept the payload (no 4xx/5xx).
 //   * The full stack (PrecomputeEngine + SketchStoreSink + OtlpReceiver
-//     + HttpServer all sharing SketchStore + HotReloadStreamingConfig)
+//     + HttpServer all sharing SketchStore + InstalledPrecomputePlanHandle)
 //     comes up and stays up under POST + query traffic.
 //   * The OTLP-ingested sketch lands in `SketchStore` keyed by the
 //     right `PolicyFingerprint` (or via the `instances_matching`
@@ -745,7 +754,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     // ── 3. POST the sketch DP via OTLP HTTP ────────────────────────────
     //
@@ -785,7 +794,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
         "http_latency_ms",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
@@ -877,7 +886,7 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
         .as_f64()
         .expect("planner sized a relative-accuracy quantile summary");
     let dd_state = build_dd_sketch_state(alpha, vec![5u64, 10, 15, 20], -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
@@ -897,7 +906,7 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
         "request_size_bytes",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
@@ -1725,7 +1734,7 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
@@ -1745,7 +1754,7 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
         "http_latency_ms",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
@@ -1835,7 +1844,7 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
@@ -1855,7 +1864,7 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
         "http_latency_ms",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;

@@ -1,7 +1,7 @@
 //! Authoritative descriptor snapshot for a compiled physical plan.
 //!
-//! Execution plans keep their compatibility fields during migration. This
-//! catalog owns semantic definitions, not producer placement or pane state.
+//! The catalog owns semantic definitions; executable plans own writer and
+//! reader bindings, while runtime inventory owns placement and pane state.
 
 use std::collections::BTreeMap;
 
@@ -10,30 +10,17 @@ use crate::sds::{
     SummaryDescriptor, SummaryDescriptorId,
 };
 use crate::PolicyFingerprint;
-use crate::WindowMaterializationLayout;
 use serde::{Deserialize, Serialize};
 
 pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 3;
 
-/// Stable materialization identity binds operator and population descriptors.
-/// Concrete intervals, groups and completeness belong to runtime instances.
+/// Canonical definition binds operator and population descriptors. Writer
+/// layout and concrete state belong to installed plans and runtime instances.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SummaryDefinitionIdentity {
+pub struct SummaryDefinition {
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
-    /// Backend-selected physical representation. It is catalog-visible so
-    /// producers, readers, lifecycle management, and recovery agree on the
-    /// concrete state being referenced.
-    pub window_layout: WindowMaterializationLayout,
-    /// Pane boundary selected from the shared consumer workload. Legacy
-    /// snapshots deserialize as unknown and fail closed at pane-only reads.
-    #[serde(
-        default,
-        alias = "paneOriginMs",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub pane_origin_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,7 +31,7 @@ pub struct SummaryCatalog {
     pub plan_version: u64,
     pub summary_descriptors: BTreeMap<SummaryDescriptorId, SummaryDescriptor>,
     pub data_descriptors: BTreeMap<DataDescriptorId, DataDescriptor>,
-    pub materializations: BTreeMap<SummaryDefinitionId, SummaryDefinitionIdentity>,
+    pub definitions: BTreeMap<SummaryDefinitionId, SummaryDefinition>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,9 +40,9 @@ pub enum SummaryCatalogError {
     SchemaVersion(u32),
     #[error("invalid summary catalog descriptor: {0}")]
     Descriptor(String),
-    #[error("materialization {0} has conflicting descriptor bindings")]
-    ConflictingMaterialization(u64),
-    #[error("materialization {0} references a missing descriptor")]
+    #[error("definition {0} has conflicting descriptor bindings")]
+    ConflictingDefinition(u64),
+    #[error("definition {0} references a missing descriptor")]
     MissingDescriptor(u64),
     #[error("catalog reference does not identify the supplied snapshot")]
     ReferenceMismatch,
@@ -123,53 +110,16 @@ impl SummaryCatalog {
                 .with_partitioning(config.partitioning)
                 .with_population_key_encoding(config.population_key_encoding)
                 .with_timestamp_column(config.table_timestamp_column.clone());
-                Ok((
-                    config.policy_fingerprint(),
-                    summary,
-                    data,
-                    config.window_layout.clone(),
-                    config.pane_origin_ms,
-                ))
+                Ok((config.policy_fingerprint(), summary, data))
             })
             .collect::<Result<Vec<_>, SummaryCatalogError>>()?;
-        Self::build_with_origins(plan_id, plan_version, entries)
+        Self::build(plan_id, plan_version, entries)
     }
 
     pub fn build(
         plan_id: u64,
         plan_version: u64,
-        entries: impl IntoIterator<
-            Item = (
-                PolicyFingerprint,
-                SummaryDescriptor,
-                DataDescriptor,
-                WindowMaterializationLayout,
-            ),
-        >,
-    ) -> Result<Self, SummaryCatalogError> {
-        Self::build_with_origins(
-            plan_id,
-            plan_version,
-            entries
-                .into_iter()
-                .map(|(fingerprint, summary, data, layout)| {
-                    (fingerprint, summary, data, layout, None)
-                }),
-        )
-    }
-
-    fn build_with_origins(
-        plan_id: u64,
-        plan_version: u64,
-        entries: impl IntoIterator<
-            Item = (
-                PolicyFingerprint,
-                SummaryDescriptor,
-                DataDescriptor,
-                WindowMaterializationLayout,
-                Option<i64>,
-            ),
-        >,
+        entries: impl IntoIterator<Item = (PolicyFingerprint, SummaryDescriptor, DataDescriptor)>,
     ) -> Result<Self, SummaryCatalogError> {
         let mut catalog = Self {
             schema_version: SUMMARY_CATALOG_SCHEMA_VERSION,
@@ -177,28 +127,26 @@ impl SummaryCatalog {
             plan_version,
             summary_descriptors: BTreeMap::new(),
             data_descriptors: BTreeMap::new(),
-            materializations: BTreeMap::new(),
+            definitions: BTreeMap::new(),
         };
-        for (fingerprint, summary, data, window_layout, pane_origin_ms) in entries {
-            let materialization = SummaryDefinitionId::from(fingerprint);
+        for (fingerprint, summary, data) in entries {
+            let definition = SummaryDefinitionId::from(fingerprint);
             summary
                 .validate()
                 .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
             data.validate()
                 .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
-            let binding = SummaryDefinitionIdentity {
+            let binding = SummaryDefinition {
                 summary_descriptor_id: summary.id().clone(),
                 data_descriptor_id: data.id().clone(),
-                window_layout,
-                pane_origin_ms,
             };
             if catalog
-                .materializations
-                .get(&materialization)
+                .definitions
+                .get(&definition)
                 .is_some_and(|old| old != &binding)
             {
-                return Err(SummaryCatalogError::ConflictingMaterialization(
-                    materialization.as_u64(),
+                return Err(SummaryCatalogError::ConflictingDefinition(
+                    definition.as_u64(),
                 ));
             }
             catalog
@@ -207,7 +155,7 @@ impl SummaryCatalog {
             catalog
                 .data_descriptors
                 .insert(binding.data_descriptor_id.clone(), data);
-            catalog.materializations.insert(materialization, binding);
+            catalog.definitions.insert(definition, binding);
         }
         catalog.validate()?;
         Ok(catalog)
@@ -237,7 +185,7 @@ impl SummaryCatalog {
                 ));
             }
         }
-        for (id, binding) in &self.materializations {
+        for (id, binding) in &self.definitions {
             if !self
                 .summary_descriptors
                 .contains_key(&binding.summary_descriptor_id)
@@ -259,13 +207,13 @@ impl SummaryCatalog {
         let mut pending = std::collections::BTreeMap::new();
         let mut consumers: std::collections::BTreeMap<_, Vec<_>> =
             std::collections::BTreeMap::new();
-        for (id, binding) in &self.materializations {
+        for (id, binding) in &self.definitions {
             let dependencies = match &self.data_descriptors[&binding.data_descriptor_id].source {
                 DataSourceIdentity::Derived { input } => input.inputs.clone(),
                 _ => Default::default(),
             };
             for source in &dependencies {
-                if !self.materializations.contains_key(source) {
+                if !self.definitions.contains_key(source) {
                     return Err(SummaryCatalogError::Descriptor(
                         "derived input references missing summary".into(),
                     ));
@@ -377,7 +325,7 @@ mod tests {
         let catalog =
             SummaryCatalog::from_materializations(1, 1, &[requests, errors, other_time]).unwrap();
         assert_eq!(catalog.data_descriptors.len(), 3);
-        assert_eq!(catalog.materializations.len(), 3);
+        assert_eq!(catalog.definitions.len(), 3);
     }
 
     #[test]
@@ -409,7 +357,7 @@ mod tests {
             SummaryCatalog::from_materializations(7, 2, &[one.clone(), two, one]).unwrap();
         assert_eq!(catalog.summary_descriptors.len(), 1);
         assert_eq!(catalog.data_descriptors.len(), 1);
-        assert_eq!(catalog.materializations.len(), 2);
+        assert_eq!(catalog.definitions.len(), 2);
         assert_eq!((catalog.plan_id, catalog.plan_version), (7, 2));
     }
 
@@ -441,7 +389,7 @@ mod tests {
         let catalog = SummaryCatalog::from_materializations(1, 1, &[a, b]).unwrap();
         assert_eq!(catalog.summary_descriptors.len(), 2);
         assert_eq!(catalog.data_descriptors.len(), 1);
-        assert_eq!(catalog.materializations.len(), 2);
+        assert_eq!(catalog.definitions.len(), 2);
     }
 
     // Construction order cannot affect the published snapshot bytes.
@@ -459,20 +407,23 @@ mod tests {
     }
 
     #[test]
-    fn catalog_persists_definition_pane_origin() {
+    fn catalog_definitions_do_not_store_writer_layout() {
         let mut materialization = config("requests", "", 60);
         materialization.pane_origin_ms = Some(7_000);
         let id = SummaryDefinitionId::from(materialization.policy_fingerprint());
         let catalog = SummaryCatalog::from_materializations(7, 2, &[materialization]).unwrap();
-        assert_eq!(catalog.materializations[&id].pane_origin_ms, Some(7_000));
+        assert!(catalog.definitions.contains_key(&id));
+        assert!(
+            !serde_json::to_value(&catalog).unwrap()["definitions"][id.as_u64().to_string()]
+                .as_object()
+                .unwrap()
+                .contains_key("pane_origin_ms")
+        );
 
-        let mut legacy = serde_json::to_value(&catalog).unwrap();
-        legacy["materializations"][id.as_u64().to_string()]
-            .as_object_mut()
-            .unwrap()
-            .remove("pane_origin_ms");
-        let decoded: SummaryCatalog = serde_json::from_value(legacy).unwrap();
-        assert_eq!(decoded.materializations[&id].pane_origin_ms, None);
+        let mut invalid = serde_json::to_value(&catalog).unwrap();
+        invalid["definitions"][id.as_u64().to_string()]["pane_origin_ms"] =
+            serde_json::json!(7_000);
+        assert!(serde_json::from_value::<SummaryCatalog>(invalid).is_err());
     }
 
     // The same materialization cannot silently rebind to another population.
@@ -492,24 +443,14 @@ mod tests {
             1,
             1,
             [
-                (
-                    first.policy_fingerprint(),
-                    summary.clone(),
-                    data[0].clone(),
-                    first.window_layout.clone(),
-                ),
-                (
-                    first.policy_fingerprint(),
-                    summary,
-                    data[1].clone(),
-                    first.window_layout.clone(),
-                ),
+                (first.policy_fingerprint(), summary.clone(), data[0].clone()),
+                (first.policy_fingerprint(), summary, data[1].clone()),
             ],
         )
         .unwrap_err();
         assert!(matches!(
             error,
-            SummaryCatalogError::ConflictingMaterialization(_)
+            SummaryCatalogError::ConflictingDefinition(_)
         ));
     }
 
@@ -557,7 +498,7 @@ mod tests {
     #[test]
     fn empty_catalog_is_valid() {
         let catalog = SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
-        assert!(catalog.materializations.is_empty());
+        assert!(catalog.definitions.is_empty());
         catalog.validate().unwrap();
     }
 }

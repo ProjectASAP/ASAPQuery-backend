@@ -1,22 +1,11 @@
-//! HTTP client that pushes a freshly-generated `StreamingConfig` YAML
-//! to the ASAPQuery-backend's `POST /api/v1/streaming-config` endpoint.
-//!
-//! This is the control-plane-side **producer** of the PR E phase 1 / phase 2
-//! hot-reload contract that landed in ASAPQuery-backend PRs #10 and #12.
-//! The replanner calls into this module immediately after generating a
-//! new plan so the backend's active `StreamingConfig` is updated without
-//! a restart and subsequent queries observe the new aggregation layout.
-//!
-//! The client is **fire-and-forget at the call site** — the replanner
-//! awaits the POST but doesn't block its own return on the outcome.
-//! Errors are logged at WARN; the control plane is expected to be tolerant
-//! of transient backend unavailability because the next replan cycle
-//! will try again with the latest plan.
+//! Publish and activate complete physical-plan generations on the backend.
 
 use std::time::Duration;
 
+#[cfg(test)]
 use anyhow::{Context, Result};
 use reqwest::Client;
+#[cfg(test)]
 use tracing::debug;
 #[cfg(test)]
 use tracing::warn;
@@ -92,7 +81,7 @@ fn classify_http_status(status: reqwest::StatusCode, body: String, what: &str) -
     }
 }
 
-/// Minimal HTTP client for ASAPQuery-backend's streaming-config endpoint.
+/// Minimal HTTP client for ASAPQuery-backend's physical-plan endpoint.
 /// Built once at control-plane startup from the
 /// `CONTROL_PLANE_BACKEND_ENDPOINT` environment variable and shared
 /// via `Arc` with the replanner.
@@ -105,7 +94,7 @@ pub struct BackendClient {
 impl BackendClient {
     /// Construct a client pointing at the backend's plan-push endpoint.
     /// `endpoint` should be the full URL, e.g.
-    /// `http://backend.svc:8088/api/v1/streaming-config`.
+    /// `http://backend.svc:8088/api/v1/physical-plan`.
     ///
     /// A 5-second timeout bounds the duration a slow or unreachable
     /// backend can stall the replanner — consistent with the symmetric
@@ -136,11 +125,12 @@ impl BackendClient {
         &self.endpoint
     }
 
-    /// POST the given `StreamingConfig` YAML to the backend. Returns
+    /// Test-only transport helper: POST the given YAML to the backend. Returns
     /// `Ok(())` on any 2xx status, otherwise an error carrying the
     /// status code and response body. The caller (typically
     /// [`Replanner::replan_metric`]) logs the error and moves on — the
     /// next replan cycle will retry with the latest plan.
+    #[cfg(test)]
     pub async fn push_streaming_config(&self, yaml: String) -> Result<()> {
         debug!(
             endpoint = %self.endpoint,
@@ -212,6 +202,7 @@ impl BackendClient {
     /// that don't need retry semantics keep their `anyhow::Result`
     /// shape. The retry layer in `emit::backend_push` uses this typed
     /// variant.
+    #[cfg(test)]
     pub async fn post_streaming_config_json_typed(
         &self,
         json: String,
@@ -245,7 +236,7 @@ impl BackendClient {
 
     #[cfg(test)]
     /// Post backend storage-routing JSON. Derive the URL by replacing the
-    /// `/api/v1/streaming-config` suffix with `/api/v1/storage_routing`; URLs
+    /// `/api/v1/physical-plan` suffix with `/api/v1/storage_routing`; URLs
     /// without that suffix are used verbatim.
     pub async fn post_storage_routing_json(&self, json: String) -> Result<()> {
         let url = derive_storage_routing_url(&self.endpoint);
@@ -277,12 +268,16 @@ impl BackendClient {
     }
 
     /// Publish one authoritative catalog generation and all plans that reference it.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = publication.transmission_plan.envelope.plan_id,
+            plan_version = publication.transmission_plan.envelope.plan_version))]
     pub async fn post_catalog_plan_typed(
         &self,
         publication: &crate::physical::publication::PhysicalPlanPublication,
         storage_routing: Option<serde_json::Value>,
         adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
+        tracing::debug!(target: "asap_runtime_debug", "backend plan stage request started");
         let body = publication
             .install_request(storage_routing, adaptation_evidence.to_vec())
             .map_err(|error| BackendPostError::Permanent(anyhow::anyhow!(error)))?;
@@ -294,6 +289,8 @@ impl BackendClient {
             .await
             .map_err(classify_reqwest_error)?;
         let status = response.status();
+        tracing::debug!(target: "asap_runtime_debug", http_status = %status,
+            "backend plan stage response received");
         if status.is_success() {
             Ok(())
         } else {
@@ -306,11 +303,18 @@ impl BackendClient {
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        target = "asap_runtime_debug",
+        skip_all,
+        fields(plan_id, plan_version)
+    )]
     pub async fn discard_staged_physical_plan(
         &self,
         plan_id: u64,
         plan_version: u64,
     ) -> std::result::Result<(), BackendPostError> {
+        tracing::debug!(target: "asap_runtime_debug", "staged backend plan cleanup requested");
         let response = self
             .http
             .post(format!(
@@ -333,11 +337,18 @@ impl BackendClient {
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        target = "asap_runtime_debug",
+        skip_all,
+        fields(plan_id, plan_version)
+    )]
     pub async fn activate_physical_plan(
         &self,
         plan_id: u64,
         plan_version: u64,
     ) -> std::result::Result<(), BackendPostError> {
+        tracing::debug!(target: "asap_runtime_debug", "backend plan activation request started");
         let url = format!("{}/activate", derive_physical_plan_url(&self.endpoint));
         let response = self
             .http
@@ -350,6 +361,8 @@ impl BackendClient {
             .await
             .map_err(classify_reqwest_error)?;
         let status = response.status();
+        tracing::debug!(target: "asap_runtime_debug", http_status = %status,
+            "backend plan activation response received");
         if status.is_success() {
             Ok(())
         } else {
@@ -364,25 +377,18 @@ impl BackendClient {
 }
 
 fn derive_physical_plan_url(endpoint: &str) -> String {
-    const DASH: &str = "/api/v1/streaming-config";
-    const UNDERSCORE: &str = "/api/v1/streaming_config";
-    const PHYSICAL: &str = "/api/v1/physical-plan";
-    endpoint
-        .strip_suffix(DASH)
-        .or_else(|| endpoint.strip_suffix(UNDERSCORE))
-        .map(|base| format!("{base}{PHYSICAL}"))
-        .unwrap_or_else(|| endpoint.to_string())
+    endpoint.to_string()
 }
 
-/// Map a streaming-config endpoint URL to the sibling storage-routing
+/// Map a physical-plan endpoint URL to the sibling storage-routing
 /// endpoint by rewriting the trailing path component. URLs that don't
-/// end with `/api/v1/streaming-config` (or `/api/v1/streaming_config` —
+/// end with `/api/v1/physical-plan` (or `/api/v1/physical_plan` —
 /// either spelling is supported) pass through unchanged so tests can
 /// inject a mock-server URL directly.
 #[cfg(test)]
 fn derive_storage_routing_url(endpoint: &str) -> String {
-    const STREAMING_PATH_DASH: &str = "/api/v1/streaming-config";
-    const STREAMING_PATH_UNDERSCORE: &str = "/api/v1/streaming_config";
+    const STREAMING_PATH_DASH: &str = "/api/v1/physical-plan";
+    const STREAMING_PATH_UNDERSCORE: &str = "/api/v1/physical_plan";
     const ROUTING_PATH: &str = "/api/v1/storage_routing";
     if let Some(stripped) = endpoint.strip_suffix(STREAMING_PATH_DASH) {
         return format!("{stripped}{ROUTING_PATH}");
@@ -429,7 +435,7 @@ mod tests {
     async fn start_mock_backend(sink: SharedSink, status: axum::http::StatusCode) -> String {
         let app = Router::new()
             .route(
-                "/api/v1/streaming-config",
+                "/api/v1/physical-plan",
                 post(
                     move |State(sink): State<SharedSink>, body: axum::body::Bytes| async move {
                         let yaml = String::from_utf8_lossy(&body).to_string();
@@ -445,7 +451,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        format!("http://{addr}/api/v1/streaming-config")
+        format!("http://{addr}/api/v1/physical-plan")
     }
 
     #[tokio::test]
@@ -481,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn push_or_log_swallows_errors() {
         // Point at an unreachable port so the request fails fast.
-        let client = BackendClient::new("http://127.0.0.1:1/api/v1/streaming-config");
+        let client = BackendClient::new("http://127.0.0.1:1/api/v1/physical-plan");
         // Must not panic or propagate — fire-and-forget semantics.
         push_or_log(&client, "cpu_usage", "content".to_string()).await;
     }
@@ -522,15 +528,15 @@ mod tests {
 
     /// storage-routing-URL derivation rewrites the path
     /// component when the configured endpoint ends in
-    /// `/api/v1/streaming-config`, leaving everything else untouched.
+    /// `/api/v1/physical-plan`, leaving everything else untouched.
     #[test]
     fn storage_routing_url_rewrites_streaming_path() {
         assert_eq!(
-            derive_storage_routing_url("http://backend:8088/api/v1/streaming-config"),
+            derive_storage_routing_url("http://backend:8088/api/v1/physical-plan"),
             "http://backend:8088/api/v1/storage_routing"
         );
         assert_eq!(
-            derive_storage_routing_url("http://backend:8088/api/v1/streaming_config"),
+            derive_storage_routing_url("http://backend:8088/api/v1/physical_plan"),
             "http://backend:8088/api/v1/storage_routing"
         );
     }
@@ -578,7 +584,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client = BackendClient::new(format!("http://{addr}/api/v1/streaming-config"));
+        let client = BackendClient::new(format!("http://{addr}/api/v1/physical-plan"));
         client
             .post_catalog_plan_typed(&publication, None, &[])
             .await
@@ -630,7 +636,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         // Return the streaming-config URL — the client will rewrite
         // the path before issuing the POST.
-        format!("http://{addr}/api/v1/streaming-config")
+        format!("http://{addr}/api/v1/physical-plan")
     }
 
     #[tokio::test]
@@ -702,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn typed_connection_refused_is_transient() {
         // Port 1 on loopback is reserved and refuses connections.
-        let client = BackendClient::new("http://127.0.0.1:1/api/v1/streaming-config");
+        let client = BackendClient::new("http://127.0.0.1:1/api/v1/physical-plan");
         let err = client
             .post_streaming_config_json_typed("{}".to_string())
             .await

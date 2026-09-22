@@ -334,7 +334,7 @@ impl PrecomputeMaterialization {
     }
 
     /// `PolicyFingerprint::as_u64()` — the u64-form handle used by the
-    /// policy-fingerprint-keyed call sites (e.g. `StreamingConfig`'s
+    /// policy-fingerprint-keyed call sites (e.g. `InstalledPrecomputePlan`'s
     /// `HashMap<u64, PrecomputeMaterialization>` keys). **Always** equal to
     /// `self.policy_fingerprint().as_u64()`. The value is content-
     /// addressed identity, NOT a controller-allocated counter id.

@@ -9,7 +9,7 @@ use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
-    AggregateCore, KeyByLabelValues, PrecomputedOutput, StreamingConfigHandle,
+    AggregateCore, InstalledPrecomputePlanHandle, KeyByLabelValues, PrecomputedOutput,
 };
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
@@ -39,6 +39,7 @@ use tracing::{debug, debug_span, info, warn};
 struct GroupState {
     program: Option<Arc<super::raw_dag::RawDagProgram>>,
     series_id: u64,
+    stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
     catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     input_revisions: BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     config: Arc<PrecomputeMaterialization>,
@@ -151,6 +152,10 @@ pub struct WorkerRuntimeConfig {
 /// `(metric, attrs_fingerprint, agg_kind_canonical)` identity contract on
 /// `SeriesIdResolver`, so one sid uniquely names one bucket.
 pub struct Worker {
+    maintenance_storage: Option<(
+        Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    )>,
     erp_observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
     current_input_revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
     current_catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
@@ -163,7 +168,7 @@ pub struct Worker {
     /// Hot-reload handle — workers read config directly from ArcSwap
     /// instead of holding a local copy. All components see the same
     /// config at the same time.
-    hot_reload: StreamingConfigHandle,
+    hot_reload: InstalledPrecomputePlanHandle,
     /// Allowed lateness in ms.
     allowed_lateness_ms: i64,
     /// When true, skip aggregation and pass raw samples through.
@@ -189,6 +194,47 @@ pub struct Worker {
 }
 
 impl Worker {
+    pub fn set_maintenance_storage(
+        &mut self,
+        store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    ) {
+        self.maintenance_storage = Some((store, resolver));
+    }
+
+    fn complete_dag(
+        &self,
+        plan: &crate::storage_engines::types::RuntimePhysicalPlan,
+    ) -> Result<(), String> {
+        if !plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .any(|output| output.derived_input.is_some())
+        {
+            return Ok(());
+        }
+        // The installed locality proof assigns derived graphs to one owner.
+        // Every raw input of this graph was routed to that same worker.
+        if plan.installed_precompute_plan.partitioning
+            != super::partitioning::DagPartitioning::SingleWorker
+        {
+            return Err("derived DAG has no validated local partitioning rule".into());
+        }
+        if self.id != 0 {
+            return Ok(());
+        }
+        let (store, resolver) = self
+            .maintenance_storage
+            .as_ref()
+            .ok_or("worker has no maintenance storage bindings")?;
+        super::maintenance_runtime::execute_finite_maintenance(
+            store,
+            resolver,
+            &plan.precompute_plan,
+        )
+    }
+
     pub fn set_erp_observer(
         &mut self,
         observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
@@ -200,7 +246,7 @@ impl Worker {
         id: usize,
         receiver: mpsc::Receiver<WorkerMessage>,
         output_sink: Arc<dyn OutputSink>,
-        hot_reload: StreamingConfigHandle,
+        hot_reload: InstalledPrecomputePlanHandle,
         runtime_config: WorkerRuntimeConfig,
         group_count: Arc<AtomicUsize>,
         worker_watermark: Arc<AtomicI64>,
@@ -215,6 +261,7 @@ impl Worker {
             wall_clock_max_open_grace_period_ms,
         } = runtime_config;
         Self {
+            maintenance_storage: None,
             erp_observer: None,
             current_input_revision: None,
             current_catalog_generation: None,
@@ -288,8 +335,11 @@ impl Worker {
                 } => {
                     let sample_count = samples.len();
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_group",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         sid,
                         policy_fp = %policy_fp,
                         group = %group_key,
@@ -299,12 +349,13 @@ impl Worker {
                     if let Err(e) = self.process_group_samples(sid, policy_fp, &group_key, samples)
                     {
                         processing_error = Some(e.to_string());
-                        warn!(
-                            "Worker {} error processing sid={} (policy_fp={}, group={}): {}",
-                            self.id, sid, policy_fp, group_key, e
-                        );
+                        warn!(worker_id = self.id, sid, policy_fp = %policy_fp,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker group processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete"
                     );
@@ -315,17 +366,24 @@ impl Worker {
                     ingest_received_at,
                 } => {
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_raw",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         series = %series_key,
                         sample_count = samples.len(),
                     )
                     .entered();
                     if let Err(e) = self.process_samples_raw(&series_key, samples) {
                         processing_error = Some(e.to_string());
-                        warn!("Worker {} raw error for {}: {}", self.id, series_key, e);
+                        warn!(worker_id = self.id, series = %series_key,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker raw processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete (raw)"
                     );
@@ -339,8 +397,11 @@ impl Worker {
                     ingest_received_at,
                 } => {
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_accumulator",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         sid,
                         policy_fp = %policy_fp,
                         group = %group_key,
@@ -356,12 +417,13 @@ impl Worker {
                         accumulator,
                     ) {
                         processing_error = Some(e.to_string());
-                        warn!(
-                            "Worker {} accumulator input error for sid={} (policy_fp={}, group={}): {}",
-                            self.id, sid, policy_fp, group_key, e
-                        );
+                        warn!(worker_id = self.id, sid, policy_fp = %policy_fp,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker accumulator processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete (accumulator)"
                     );
@@ -383,6 +445,16 @@ impl Worker {
                         processing_error = Some(error.clone());
                     }
                     let _ = reply.send(processing_error.clone().map_or(Ok(()), Err));
+                }
+                WorkerMessage::CompleteDag { plan, reply } => {
+                    let result = match &processing_error {
+                        Some(error) => Err(error.clone()),
+                        None => self.complete_dag(&plan),
+                    };
+                    if let Err(error) = &result {
+                        processing_error = Some(error.clone());
+                    }
+                    let _ = reply.send(result);
                 }
                 WorkerMessage::Shutdown => {
                     info!("Worker {} shutting down", self.id);
@@ -416,7 +488,7 @@ impl Worker {
     /// hot-reload snapshot the first time we see this sid; `group_key` is
     /// remembered on the `GroupState` for emit-time label rendering.
     ///
-    /// Reads config directly from the `StreamingConfigHandle`
+    /// Reads config directly from the `InstalledPrecomputePlanHandle`
     /// ArcSwap handle, so new policies from a config swap are visible
     /// immediately — no message passing, no delay.
     /// Returns None if `policy_fp` has no matching config (e.g. arrived
@@ -437,6 +509,7 @@ impl Worker {
             let gs = GroupState {
                 program,
                 series_id: sid,
+                stored_output_reference: snap.stored_output_reference(policy_fp.into()),
                 catalog_generation: self.current_catalog_generation.clone(),
                 input_revisions: BTreeMap::new(),
                 window_manager: WindowManager::with_layout(
@@ -470,6 +543,8 @@ impl Worker {
     /// `PrecomputeMaterialization` fingerprint used to resolve the bucket's
     /// config on first sight; `group_key` is held on the resulting
     /// `GroupState` for emit-time label rendering.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sid, policy_fp = %policy_fp, sample_count = samples.len()))]
     pub fn process_group_samples(
         &mut self,
         sid: u64,
@@ -477,6 +552,7 @@ impl Worker {
         group_key: &Arc<GroupKey>,
         samples: Vec<(String, i64, f64)>, // (series_key, timestamp_ms, value)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker group processing started");
         let input_revision = self.current_input_revision.clone();
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
@@ -494,6 +570,8 @@ impl Worker {
             return Ok(());
         }
         let state = self.group_states.get_mut(&sid).unwrap();
+        tracing::debug!(target: "asap_runtime_debug", worker_id = self.id, policy_fp = %agg_id,
+            "precompute update route resolved");
         #[cfg(not(test))]
         if state.program.is_none() {
             return Err("raw precompute requires an installed post-ASAP DAG producer".into());
@@ -659,6 +737,7 @@ impl Worker {
                                 &state.input_revisions,
                                 state.series_id,
                                 state.catalog_generation.as_ref(),
+                                state.stored_output_reference,
                             );
                             emit_batch.push((output, updater.take_accumulator()));
                             debug!(
@@ -735,6 +814,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -791,6 +871,8 @@ impl Worker {
     ///
     /// `policy_fp` / `group_key` carry the same semantics as on
     /// `process_group_samples` — policy lookup + emit-time label rendering.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sid, policy_fp = %policy_fp, timestamp_ms))]
     pub fn process_accumulator_input(
         &mut self,
         sid: u64,
@@ -799,6 +881,7 @@ impl Worker {
         timestamp_ms: i64,
         incoming: Box<dyn AggregateCore>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker accumulator processing started");
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
         let late_data_policy = self.late_data_policy;
@@ -817,6 +900,10 @@ impl Worker {
         let state = self.group_states.get_mut(&sid).unwrap();
 
         let previous_event_time = state.max_event_time_ms;
+        debug!(target: "asap_runtime_debug", aggregation_type = ?state.config.aggregation_type,
+            window_secs = state.config.window_size, slide_secs = state.config.slide_interval,
+            layout = ?state.config.window_layout,
+            "worker accumulator maintenance configuration selected");
         let current_event_time = if timestamp_ms > previous_event_time {
             timestamp_ms
         } else {
@@ -866,6 +953,7 @@ impl Worker {
                             &state.input_revisions,
                             state.series_id,
                             state.catalog_generation.as_ref(),
+                            state.stored_output_reference,
                         );
                         emit_batch.push((output, incoming.clone_boxed_core()));
                     }
@@ -914,6 +1002,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -932,6 +1021,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -958,11 +1048,14 @@ impl Worker {
     }
 
     /// Raw fast-path: emit each sample as a standalone `SumAccumulator`.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sample_count = samples.len()))]
     pub fn process_samples_raw(
         &self,
         series_key: &str,
         samples: Vec<(i64, f64)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker raw processing started");
         let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> =
             Vec::with_capacity(samples.len());
 
@@ -1034,7 +1127,10 @@ impl Worker {
         }
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, group_count = self.group_states.len()))]
     fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker flush started");
         if self.pass_raw_samples {
             return Ok(());
         }
@@ -1117,6 +1213,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1134,6 +1231,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1223,6 +1321,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1240,6 +1339,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1362,10 +1462,12 @@ fn precomputed_output_for_group(
     input_revisions: &BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     series_id: u64,
     catalog_generation: Option<&Arc<asap_types::sds::CatalogGeneration>>,
+    stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
 ) -> PrecomputedOutput {
     let mut output = PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
         .with_population_labels(population_labels_from_group_key(group_key));
-    output.series_id = Some(series_id);
+    output.storage_handle = Some(series_id);
+    output.stored_output_reference = stored_output_reference;
     output.catalog_generation = catalog_generation.cloned();
     output.input_revision = i64::try_from(start_timestamp)
         .ok()
@@ -1878,7 +1980,7 @@ mod tests {
     use crate::precompute_engine::operators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_sketchlib::KllSketch;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -1982,16 +2084,16 @@ mod tests {
         )
     }
 
-    /// Build a fresh `StreamingConfigHandle` from a map of agg_id
+    /// Build a fresh `InstalledPrecomputePlanHandle` from a map of agg_id
     /// → PrecomputeMaterialization. Worker::new takes this handle instead of
     /// the old `HashMap<u64, Arc<PrecomputeMaterialization>>`. Tests use this
     /// helper instead of constructing the handle inline at every
     /// callsite.
     fn make_hot_reload(
         configs: HashMap<u64, PrecomputeMaterialization>,
-    ) -> crate::storage_engines::types::StreamingConfigHandle {
-        crate::storage_engines::types::StreamingConfigHandle::new(
-            crate::storage_engines::types::StreamingConfig::new(configs),
+    ) -> crate::storage_engines::types::InstalledPrecomputePlanHandle {
+        crate::storage_engines::types::InstalledPrecomputePlanHandle::new(
+            crate::storage_engines::types::InstalledPrecomputePlan::new(configs),
         )
     }
 
@@ -2759,14 +2861,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: worker from streaming_config YAML
+    // Test: worker from installed_precompute_plan YAML
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_worker_rejects_flat_streaming_config_yaml() {
         let data =
             serde_yaml::from_str("aggregations: [{aggregationType: Sum, metric: m}]").unwrap();
-        assert!(StreamingConfig::from_yaml_data(&data).is_err());
+        assert!(
+            serde_yaml::from_value::<asap_types::precompute_plan::PrecomputePlan>(data).is_err()
+        );
     }
 
     #[test]
@@ -2828,6 +2932,7 @@ mod tests {
             &group,
             &BTreeMap::new(),
             1,
+            None,
             None,
         );
         assert_eq!(
@@ -4282,7 +4387,7 @@ mod dag_execution_tests {
     use super::*;
     use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_types::query_plan::ExactReadout;
 
     fn plan(query: &str) -> control_plane::physical::compiler::CompiledPhysicalPlan {
@@ -4297,6 +4402,110 @@ mod dag_execution_tests {
         crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap()
+    }
+
+    // Real router/engine queues preserve every partition's result as concurrency changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn installed_dag_results_match_with_one_and_four_workers() {
+        use crate::precompute_engine::{config::PrecomputeEngineConfig, engine::PrecomputeEngine};
+        async fn execute(query: &str, workers: usize) -> BTreeMap<(Vec<u8>, u64, u64), Vec<u8>> {
+            let physical = plan(query);
+            assert_eq!(
+                physical.precompute_plan.materializations.len(),
+                1,
+                "{query}"
+            );
+            let config = physical.precompute_plan.materializations[0].clone();
+            let runtime =
+                InstalledPrecomputePlan::from_precompute_plan(physical.precompute_plan).unwrap();
+            let rule = runtime.partitioning.clone();
+            let sink = Arc::new(CapturingOutputSink::new());
+            let engine = PrecomputeEngine::new(
+                PrecomputeEngineConfig {
+                    num_workers: workers,
+                    allowed_lateness_ms: 10_000,
+                    wall_clock_idle_grace_period_ms: 0,
+                    wall_clock_max_open_grace_period_ms: 0,
+                    ..Default::default()
+                },
+                InstalledPrecomputePlanHandle::new(runtime),
+                sink.clone(),
+                Arc::new(crate::drivers::ingest::series_resolver::SeriesIdResolver::new()),
+                Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            );
+            let ingest = engine.ingest_state();
+            let diagnostics = engine.diagnostics();
+            let running = tokio::spawn(engine.run());
+            let mut messages = Vec::new();
+            for population in 0..64 {
+                let label = format!("service-{population}");
+                messages.push(WorkerMessage::GroupSamples {
+                    sid: population + 1,
+                    policy_fp: config.policy_fingerprint(),
+                    group_key: Arc::new(GroupKey::new([("service", label.as_str())])),
+                    samples: [
+                        (1000, 10.0),
+                        (2000, 20.0),
+                        (3000, 3.0),
+                        (4000, 9.0),
+                        (5000, 12.0),
+                    ]
+                    .into_iter()
+                    .map(|(t, value)| {
+                        (
+                            format!("{}{{service=\"{}\"}}", config.metric, label),
+                            t,
+                            value,
+                        )
+                    })
+                    .collect(),
+                    ingest_received_at: std::time::Instant::now(),
+                });
+            }
+            ingest
+                .router
+                .route_group_batch(messages, std::time::Instant::now(), None)
+                .await
+                .unwrap();
+            ingest.router.drain().await.unwrap();
+            if workers > 1 && rule != super::super::partitioning::DagPartitioning::SingleWorker {
+                assert!(
+                    diagnostics
+                        .worker_group_counts
+                        .iter()
+                        .filter(|n| n.load(Ordering::Relaxed) > 0)
+                        .count()
+                        > 1,
+                    "the test must exercise multiple workers"
+                );
+            }
+            ingest.router.shutdown().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let mut records = BTreeMap::new();
+            for (output, state) in sink.drain() {
+                let key = (
+                    output.key.unwrap().serialize_to_bytes(),
+                    output.start_timestamp,
+                    output.end_timestamp,
+                );
+                assert!(
+                    records.insert(key, state.serialize_to_bytes()).is_none(),
+                    "duplicate output"
+                );
+            }
+            assert!(!records.is_empty());
+            records
+        }
+        for query in [
+            "sum_over_time(asap_demo_gauge[5s])",
+            "rate(asap_demo_counter_total[5s])",
+        ] {
+            assert_eq!(execute(query, 1).await, execute(query, 4).await, "{query}");
+        }
     }
 
     // A selected producer must govern updates, persisted family, and query readout.
@@ -4334,17 +4543,15 @@ mod dag_execution_tests {
                 .expect("ASAP producer required")
                 .clone();
             let fp = config.policy_fingerprint();
-            let streaming = StreamingConfig::from_precompute_plan(plan.precompute_plan).unwrap();
-            let doc = serde_json::to_value(&streaming).unwrap();
-            assert!(doc.get("aggregation_configs").is_none());
-            let streaming: StreamingConfig = serde_json::from_value(doc).unwrap();
+            let streaming =
+                InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan).unwrap();
             let sink = Arc::new(CapturingOutputSink::new());
             let (_tx, rx) = mpsc::channel(8);
             let mut worker = Worker::new(
                 0,
                 rx,
                 sink.clone(),
-                StreamingConfigHandle::new(streaming),
+                InstalledPrecomputePlanHandle::new(streaming),
                 WorkerRuntimeConfig {
                     max_buffer_per_series: 100,
                     allowed_lateness_ms: 10_000,
@@ -4416,13 +4623,15 @@ mod dag_execution_tests {
     // A flat config and a DAG whose producer no longer matches its binding cannot install.
     #[test]
     fn execution_requires_matching_dag_producer() {
-        assert!(serde_json::from_value::<StreamingConfig>(
-            serde_json::json!({"aggregation_configs":{}})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<asap_types::precompute_plan::PrecomputePlan>(
+                serde_json::json!({"aggregation_configs":{}})
+            )
+            .is_err()
+        );
         let mut plan = plan("rate(asap_demo_counter_total[5s])").precompute_plan;
         plan.executable_dags.clear();
-        assert!(StreamingConfig::from_precompute_plan(plan)
+        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
             .to_string()
             .contains("DAG producer"));
@@ -4446,7 +4655,9 @@ mod dag_execution_tests {
             &dag,
         )
         .unwrap();
-        assert!(StreamingConfig::from_precompute_plan(plan)
+        installed.document.schema_version =
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
             .to_string()
             .contains("update"));

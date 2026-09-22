@@ -626,7 +626,7 @@ fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> PhysicalExpr {
 }
 
 /// `quantile_over_time.yaml` — the asap-planner-rs `quantile_over_time`
-/// fixture maps to a KLL or DDSketch StreamingConfig row. The control plane
+/// fixture maps to a KLL or DDSketch InstalledPrecomputePlan row. The control plane
 /// path: L1 PromQL parse → L3 `Aggregate{Quantile{0.99}}` over `Window` →
 /// L4 bind picks Kll (default) or DDSketch. Either is functionally
 /// equivalent — both are quantile sketches.

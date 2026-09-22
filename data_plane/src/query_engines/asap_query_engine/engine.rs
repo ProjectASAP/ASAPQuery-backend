@@ -1,5 +1,40 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::debug;
+use std::time::Instant;
+use tracing::{debug, Instrument};
+
+static NEXT_QUERY_CALL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn query_call_id() -> u64 {
+    NEXT_QUERY_CALL_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn log_query_outcome<T>(
+    call_id: u64,
+    operation: &'static str,
+    started: Instant,
+    remote_stats: Option<(usize, usize)>,
+    result: &Result<T, crate::query_engines::EngineError>,
+) {
+    match result {
+        Ok(_) => match remote_stats {
+            Some((remote_evaluations, remote_rpcs)) => debug!(target: "asap_runtime_debug",
+                call_id, operation, elapsed_ms = started.elapsed().as_millis() as u64,
+                remote_evaluations, remote_rpcs, "query call completed"),
+            None => debug!(target: "asap_runtime_debug",
+                call_id, operation, elapsed_ms = started.elapsed().as_millis() as u64,
+                "query call completed"),
+        },
+        Err(error @ crate::query_engines::EngineError::CapabilityMiss { .. }) => {
+            debug!(target: "asap_runtime_debug",
+            call_id, operation, elapsed_ms = started.elapsed().as_millis() as u64,
+            %error, "query call could not be served by ASAP tier")
+        }
+        Err(error) => tracing::warn!(call_id, operation,
+            elapsed_ms = started.elapsed().as_millis() as u64, %error,
+            "query call failed"),
+    }
+}
 
 use asap_types::query_requirements::QueryRequirements;
 use asap_types::KeyByLabelNames;
@@ -190,27 +225,49 @@ impl ASAPQueryEngine {
         now_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
-        let physical = self.active_physical_plan_snapshot().ok_or_else(|| {
-            crate::query_engines::EngineError::capability_miss(
-                "query_plan",
-                "no active physical plan",
-            )
-        })?;
-        let planned = physical
-            .query_plan
-            .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
-            .map_err(|error| {
-                crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
+        let call_id = query_call_id();
+        let started = Instant::now();
+        let mut remote_stats = None;
+        debug!(target: "asap_runtime_debug",
+            call_id,
+            operation = "metricsql_instant",
+            evaluation_ms = now_ms,
+            "query call started"
+        );
+        let result = async {
+            let physical = self.active_physical_plan_snapshot().ok_or_else(|| {
+                crate::query_engines::EngineError::capability_miss(
+                    "query_plan",
+                    "no active physical plan",
+                )
             })?;
-        let leaves = self
-            .prepare_query_inputs(&physical, planned, &[now_ms])
-            .await?;
-        let (mut result, mut stats) =
-            self.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
-        stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
-        stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
-        annotate_logical_execution(&mut result, &stats);
-        Ok(result)
+            let planned = physical
+                .query_plan
+                .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
+                .map_err(|error| {
+                    crate::query_engines::EngineError::capability_miss(
+                        "query_plan",
+                        error.to_string(),
+                    )
+                })?;
+            debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %planned.query_id, evaluation_ms = now_ms,
+            "installed MetricsQL instant query selected");
+            let leaves = self
+                .prepare_query_inputs(&physical, planned, &[now_ms])
+                .await?;
+            let (mut result, mut stats) =
+                self.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
+            stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
+            stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
+            annotate_logical_execution(&mut result, &stats);
+            remote_stats = Some((stats.remote_evaluations, stats.remote_rpcs));
+            Ok(result)
+        }
+        .instrument(tracing::info_span!("query_call", call_id))
+        .await;
+        log_query_outcome(call_id, "metricsql_instant", started, remote_stats, &result);
+        result
     }
 
     pub async fn execute_metricsql_range(
@@ -221,20 +278,42 @@ impl ASAPQueryEngine {
         step_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
-        let physical = self.active_physical_plan_snapshot().ok_or_else(|| {
-            crate::query_engines::EngineError::capability_miss(
-                "query_plan",
-                "no active physical plan",
-            )
-        })?;
-        let planned = physical
-            .query_plan
-            .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
-            .map_err(|error| {
-                crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
+        let call_id = query_call_id();
+        let started = Instant::now();
+        debug!(target: "asap_runtime_debug",
+            call_id,
+            operation = "metricsql_range",
+            start_ms,
+            end_ms,
+            step_ms,
+            "query call started"
+        );
+        let result = async {
+            let physical = self.active_physical_plan_snapshot().ok_or_else(|| {
+                crate::query_engines::EngineError::capability_miss(
+                    "query_plan",
+                    "no active physical plan",
+                )
             })?;
-        self.execute_logical_range(&physical, planned, start_ms, end_ms, step_ms)
-            .await
+            let planned = physical
+                .query_plan
+                .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
+                .map_err(|error| {
+                    crate::query_engines::EngineError::capability_miss(
+                        "query_plan",
+                        error.to_string(),
+                    )
+                })?;
+            debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %planned.query_id, start_ms, end_ms, step_ms,
+            "installed MetricsQL range query selected");
+            self.execute_logical_range(&physical, planned, start_ms, end_ms, step_ms)
+                .await
+        }
+        .instrument(tracing::info_span!("query_call", call_id))
+        .await;
+        log_query_outcome(call_id, "metricsql_range", started, None, &result);
+        result
     }
 
     /// Construct the query executor. Runtime configuration is read only from
@@ -271,12 +350,16 @@ impl ASAPQueryEngine {
         self.query_forwarding_policy = policy;
         self
     }
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %entry.query_id, evaluation_count = times.len()))]
     async fn prepare_query_inputs(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
+        debug!(target: "asap_runtime_debug", "installed query input preparation started");
         super::catalog_resolver::validate_entry(
             physical.summary_catalog.as_deref(),
             entry,
@@ -333,7 +416,7 @@ impl ASAPQueryEngine {
                 )
             })
         {
-            debug!(
+            debug!(target: "asap_runtime_debug",
                 language = ?entry.language,
                 query_id = %entry.query_id,
                 "query forwarding disabled; external exact subquery blocked"
@@ -365,6 +448,9 @@ impl ASAPQueryEngine {
         .await
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %entry.query_id, evaluation_ms = at))]
     fn execute_logical_entry(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
@@ -545,6 +631,9 @@ impl ASAPQueryEngine {
         result
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %entry.query_id, start_ms = start, end_ms = end, step_ms = step))]
     async fn execute_logical_range(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
@@ -558,6 +647,7 @@ impl ASAPQueryEngine {
             query_result::{QueryResult, RangeVectorElement},
             EngineError,
         };
+        debug!(target: "asap_runtime_debug", "installed query range execution started");
         if step == 0 || start > end || (end - start) / step >= 11_000 {
             return Err(EngineError::capability_miss(
                 "installed_logical_dag",
@@ -748,11 +838,24 @@ impl ASAPQueryEngine {
         step_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
+        let call_id = query_call_id();
+        let started = Instant::now();
+        debug!(target: "asap_runtime_debug",
+            call_id,
+            operation = "promql_range",
+            start_ms,
+            end_ms,
+            step_ms,
+            "query call started"
+        );
+        let result = async {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
                 if entry.nodes.values().any(|node| {
                     matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
                 }) {
+                    debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                        query_id = %entry.query_id, "installed query DAG selected");
                     return self
                         .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
                         .await;
@@ -856,6 +959,9 @@ impl ASAPQueryEngine {
         // Complete coverage is a prerequisite above. Hybrid stitching is
         // retained for legacy/test callers without an active QueryPlan only.
         Ok(warm_qr)
+        }.instrument(tracing::info_span!("query_call", call_id)).await;
+        log_query_outcome(call_id, "promql_range", started, None, &result);
+        result
     }
 }
 
@@ -999,25 +1105,43 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         now_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
+        let call_id = query_call_id();
+        let started = Instant::now();
+        let mut remote_stats = None;
+        debug!(target: "asap_runtime_debug",
+            call_id,
+            operation = "promql_instant",
+            evaluation_ms = now_ms,
+            "query call started"
+        );
+        let result = async {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
+                debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                    query_id = %entry.query_id, evaluation_ms = now_ms,
+                    "installed query DAG selected");
                 let leaves = self
                     .prepare_query_inputs(&physical, entry, &[now_ms])
                     .await
                     .map_err(|error| {
-                        tracing::warn!(query, error = %error, "installed query DAG preparation failed");
+                        tracing::warn!(plan_id = physical.plan_id(),
+                            plan_version = physical.plan_version(), query_id = %entry.query_id,
+                            error = %error, "installed query DAG preparation failed");
                         error
                     })?;
                 let (mut result, mut stats) = self
                     .execute_logical_entry(&physical, entry, &leaves, now_ms)
                     .map_err(|error| {
-                        tracing::warn!(query, error = %error, "installed query DAG execution failed");
+                        tracing::warn!(plan_id = physical.plan_id(),
+                            plan_version = physical.plan_version(), query_id = %entry.query_id,
+                            error = %error, "installed query DAG execution failed");
                         error
                     })?;
                 stats.remote_evaluations =
                     leaves.values().map(|leaf| leaf.remote_evaluations).sum();
                 stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
                 annotate_logical_execution(&mut result, &stats);
+                remote_stats = Some((stats.remote_evaluations, stats.remote_rpcs));
                 return Ok(result);
             }
         }
@@ -1112,6 +1236,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
             format!("ASAPQueryEngine: no sketch index for `{query}` — failing over to archive"),
         ))
+        }.instrument(tracing::info_span!("query_call", call_id)).await;
+        log_query_outcome(call_id, "promql_instant", started, remote_stats, &result);
+        result
     }
 
     /// Range-query entry point for the [`EngineRouter`] failover loop.
@@ -1150,7 +1277,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
 
 #[cfg(test)]
 mod sketch_query_tests {
-    // use crate::storage_engines::types::{CleanupPolicy, StreamingConfig};
+    // use crate::storage_engines::types::{CleanupPolicy, InstalledPrecomputePlan};
     // use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     // use crate::storage_engines::promsketch_store::PromSketchStore;
     // use crate::storage_engines::TimestampedBucketsMap;
@@ -1216,13 +1343,13 @@ mod sketch_query_tests {
 
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
 
     //     ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         Some(ps),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     )
@@ -1292,11 +1419,11 @@ mod sketch_query_tests {
     //     // Engine with promsketch_store = None
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     //     let engine = ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     );
@@ -1363,11 +1490,11 @@ mod sketch_query_tests {
     // fn test_sketch_range_returns_none_without_store() {
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     //     let engine = ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     );
@@ -1467,11 +1594,11 @@ mod aux_pushdown_tests {
 
     fn make_engine() -> ASAPQueryEngine {
         use crate::storage_engines::types::{
-            CleanupPolicy, StreamingConfig, StreamingConfigHandle,
+            CleanupPolicy, InstalledPrecomputePlan, InstalledPrecomputePlanHandle,
         };
 
-        let sc = Arc::new(StreamingConfig::new(HashMap::new()));
-        let hr = StreamingConfigHandle::from_arc(sc.clone());
+        let sc = Arc::new(InstalledPrecomputePlan::new(HashMap::new()));
+        let hr = InstalledPrecomputePlanHandle::from_arc(sc.clone());
         let _ = sc;
         ASAPQueryEngine::new(60)
     }
@@ -1599,7 +1726,7 @@ mod asap_tier_classify_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchSampleState, SketchStore,
         SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{CleanupPolicy, StreamingConfigHandle};
+    use crate::storage_engines::types::{CleanupPolicy, InstalledPrecomputePlanHandle};
     use std::collections::{BTreeMap, BTreeSet};
 
     /// `sum by (zone) (http_requests_total)` end-to-end via the
@@ -1631,7 +1758,7 @@ mod asap_tier_classify_tests {
         for (i, zone) in zones.iter().enumerate() {
             let sid = 9000 + i as u64;
             idx.register(SummarySeriesMetadata {
-                sid,
+                storage_handle: sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -1722,7 +1849,7 @@ mod asap_tier_classify_tests {
         // Latest ASAPPlanner sizes an epsilon=0.01 KLL at k=269.
         let cfg = SketchConfig::Kll { k: 269 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
@@ -1760,7 +1887,7 @@ mod asap_tier_classify_tests {
         // Latest ASAPPlanner requires p=14 for a 1% HLL error target.
         let cfg = SketchConfig::Hll { precision: 14 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::CardinalityApprox),
@@ -2147,7 +2274,11 @@ mod asap_tier_classify_tests {
                 query: QueryReadout::Quantile { q: 0.99 },
             },
         );
-        let sids = idx.snapshot_instances().iter().map(|m| m.sid).collect();
+        let sids = idx
+            .snapshot_instances()
+            .iter()
+            .map(|m| m.storage_handle)
+            .collect();
         let engine = test_plan::engine(idx, config, sids, entry);
         engine.execute_at(query, now_ms).await.expect(
             "quantile_over_time over a Hit KLL sid must NOT capability-miss \
@@ -2277,7 +2408,7 @@ mod asap_tier_classify_tests {
         for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 14_000 + i as u64;
             idx.register(SummarySeriesMetadata {
-                sid,
+                storage_handle: sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -2373,7 +2504,7 @@ mod asap_tier_classify_tests {
         // Matches ControlPlaneCostModel's epsilon=0.01 CMS sizing.
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         idx.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -2488,7 +2619,7 @@ mod outer_agg_integration_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
         SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::StreamingConfigHandle;
+    use crate::storage_engines::types::InstalledPrecomputePlanHandle;
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::MessagePackCodec;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2509,7 +2640,7 @@ mod outer_agg_integration_tests {
             relative_accuracy: 0.01,
         };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -2616,7 +2747,7 @@ mod range_stitch_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
         SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{KeyByLabelValues, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlanHandle, KeyByLabelValues};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2650,7 +2781,7 @@ mod range_stitch_tests {
     fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
@@ -2775,7 +2906,7 @@ mod range_stitch_tests {
         .unwrap();
         active.envelope.expiry_unix_ms = None;
         let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(active);
-        let hot = StreamingConfigHandle::from_active_physical_plan(active.clone());
+        let hot = InstalledPrecomputePlanHandle::from_active_physical_plan(active.clone());
         let engine = ASAPQueryEngine::new(15).with_active_physical_plan(active);
         let error = engine
             .execute_metricsql_at(&identity, 1_000)

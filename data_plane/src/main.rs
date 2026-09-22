@@ -9,7 +9,6 @@ use data_plane::drivers::AdapterConfig;
 use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
 use data_plane::storage_engines::types::enums::{CleanupPolicy, LockStrategy};
-use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
     ASAPQueryEngine, HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig,
     PrecomputeEngine, PrecomputeEngineConfig, PrometheusRemoteWriteConfig,
@@ -41,9 +40,9 @@ struct Args {
     #[arg(long, value_enum, default_value = "distributed")]
     profile: RuntimeProfile,
 
-    /// Legacy bootstrap streaming config (distributed profile only).
+    /// Monitor coordinator settings, separate from executable computation plans.
     #[arg(long)]
-    streaming_config: Option<String>,
+    monitor_specs: Option<std::path::PathBuf>,
 
     /// JSON physical-plan artifact. Required by the backend-local profile;
     /// all runtime/query views are validated and installed as one snapshot.
@@ -67,7 +66,7 @@ struct Args {
     /// the e2e harness's 30s window. ASAPQueryEngine uses this as the
     /// instant-query lookback window — for tumbling-window
     /// aggregations it must be ≥ the window size in
-    /// `streaming-config`.
+    /// the installed precompute plan.
     #[arg(long, default_value = "30")]
     prometheus_scrape_interval: u64,
 
@@ -172,10 +171,6 @@ struct Args {
     #[arg(long, default_value = "/var/log/asap")]
     output_dir: String,
 
-    /// Log level
-    #[arg(long, default_value = "INFO")]
-    log_level: String,
-
     /// Enable profiling (currently unused, kept for compatibility)
     #[arg(long)]
     do_profiling: bool,
@@ -235,7 +230,7 @@ struct Args {
     otel_http_port: u16,
 
     /// Enable the continuous-monitoring (CDM) coordinator gRPC server. Serves
-    /// the `monitors:` specs from the streaming-config; no-op if that list is
+    /// the specs from `--monitor-specs`; no-op if that list is
     /// empty.
     #[arg(long)]
     enable_monitor_coordinator: bool,
@@ -378,7 +373,7 @@ struct Args {
     /// consulted by the HTTP query handler on every PromQL request to
     /// pick the right engine (`ASAPQueryEngine` for ASAP-tier
     /// sketches). Without
-    /// this flag the handler falls back to the streaming-config
+    /// this flag the handler falls back to the installed storage view
     /// single axis (always `SketchStore`) and the EngineRouter is
     /// effectively bypassed — the issue-46 v2 demo's criterion ⑤
     /// failure mode. Mirrors the `precompute_engine` binary's flag
@@ -422,19 +417,13 @@ fn validate_query_forwarding_configuration(
 fn validate_profile(args: &Args) -> Result<()> {
     validate_query_forwarding_configuration(args)?;
     if args.profile != RuntimeProfile::Asapquery {
-        if args.streaming_config.is_none() {
-            return Err("the distributed profile requires --streaming-config".into());
+        if args.physical_plan.is_none() {
+            return Err("the distributed profile requires --physical-plan".into());
         }
         if args.planning_snapshot.is_some() {
             return Err("--planning-snapshot is available only with --profile asapquery".into());
         }
         return Ok(());
-    }
-    if args.streaming_config.is_some() {
-        return Err(
-            "--profile asapquery rejects --streaming-config; use --planning-snapshot or --physical-plan"
-                .into(),
-        );
     }
     if args.physical_plan.is_some() == args.planning_snapshot.is_some() {
         return Err(
@@ -521,7 +510,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging similar to Python's create_loggers function
     // Keep the guard alive for the entire lifetime of the application
-    let _log_guard = setup_logging(&args.output_dir, &args.log_level)?;
+    let _log_guard = setup_logging(&args.output_dir)?;
 
     info!("Starting Query Engine Rust");
     info!("Output directory: {}", args.output_dir);
@@ -618,19 +607,12 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let streaming_config = match startup_physical_plan.as_ref() {
-        Some(active) => active.streaming_config.clone(),
-        None => Arc::new(read_streaming_config(
-            args.streaming_config
-                .as_deref()
-                .expect("validated distributed streaming config"),
-        )?),
-    };
+    let startup_physical_plan = startup_physical_plan.ok_or("startup requires a physical plan")?;
+    let installed_precompute_plan = startup_physical_plan.installed_precompute_plan.clone();
     info!(
-        "Loaded streaming config with {} entries",
-        streaming_config.materializations().len()
+        "Installed precompute DAG with {} stored outputs",
+        installed_precompute_plan.materializations().len()
     );
-    info!("Streaming config: {:?}", streaming_config);
 
     // Share a hot-reload handle with HTTP configuration endpoints and consumers.
 
@@ -667,12 +649,9 @@ async fn main() -> Result<()> {
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new())
     };
     let summary_store = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
-    if let Some(catalog) = startup_physical_plan
-        .as_ref()
-        .and_then(|plan| plan.summary_catalog.as_ref())
-    {
+    if let Some(catalog) = startup_physical_plan.summary_catalog.as_ref() {
         summary_store
-            .install_summary_catalog(Arc::clone(catalog))
+            .install_precompute_plan(Arc::clone(catalog), &startup_physical_plan.precompute_plan)
             .map_err(std::io::Error::other)?;
     }
 
@@ -727,65 +706,11 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Bootstrap projections share one immutable physical-plan envelope.
-    let initial_precompute_plan = asap_types::precompute_plan::PrecomputePlan {
-        summary_catalog: None,
-        envelope: asap_types::precompute_plan::PlanEnvelope {
-            plan_id: 0,
-            plan_version: 0,
-            generated_at_unix_ms: 0,
-            activation_unix_ms: 0,
-            expiry_unix_ms: None,
-            backend_compat: "bootstrap".into(),
-            planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
-            capability_snapshot_id: "bootstrap".into(),
-        },
-        ingest: asap_types::precompute_plan::IngestContract {
-            protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
-            endpoint_path: "/v1/metrics".into(),
-            timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
-            require_plan_identity: false,
-            require_summary_definition_identity: false,
-            require_registered_producer: false,
-        },
-        schemas: Vec::new(),
-        producers: Vec::new(),
-        materializations: streaming_config
-            .materializations_by_policy_fingerprint
-            .values()
-            .cloned()
-            .collect(),
-        executable_dags: Default::default(),
-    };
-    let initial_transmission_plan = asap_types::producer_plan::TransmissionPlan {
-        summary_catalog: None,
-        envelope: initial_precompute_plan.envelope.clone(),
-        frame_identity: asap_types::producer_plan::FrameIdentityContract {
-            identity_version: 1,
-            sequence_scope:
-                asap_types::producer_plan::SequenceScope::MaterializationSeriesProducerEpoch,
-            require_checkpoint_for_full: true,
-            require_base_checkpoint_for_delta: true,
-        },
-        rules: Vec::new(),
-    };
-    let initial_active_plan = startup_physical_plan.unwrap_or_else(|| {
-        data_plane::storage_engines::types::RuntimePhysicalPlan {
-            envelope: initial_precompute_plan.envelope.clone(),
-            summary_catalog: None,
-            precompute_plan: initial_precompute_plan,
-            transmission_plan: initial_transmission_plan,
-            streaming_config: streaming_config.clone(),
-            query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
-            storage_routing: Arc::new(
-                data_plane::storage_engines::types::BackendStorageRouting::empty(),
-            ),
-        }
-    });
+    let initial_active_plan = startup_physical_plan;
     let active_physical_plan =
         data_plane::storage_engines::types::ActivePhysicalPlanHandle::new(initial_active_plan);
     let hot_reload_config =
-        data_plane::storage_engines::types::StreamingConfigHandle::from_active_physical_plan(
+        data_plane::storage_engines::types::InstalledPrecomputePlanHandle::from_active_physical_plan(
             active_physical_plan.clone(),
         );
 
@@ -967,68 +892,22 @@ async fn main() -> Result<()> {
         use data_plane::update_sampling::{
             Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl,
         };
-        let specs: Vec<MonitorConfig> = streaming_config
-            .monitors()
-            .iter()
+        let monitor_specs: Vec<asap_types::MonitorSpec> = match &args.monitor_specs {
+            Some(path) => serde_yaml::from_slice(&fs::read(path)?)?,
+            None => Vec::new(),
+        };
+        let specs = monitor_specs
+            .into_iter()
             .map(|m| MonitorConfig {
                 agg_id: m.agg_id,
-                key: m.key.clone().into_bytes(),
+                key: m.key.into_bytes(),
                 tau: m.tau,
                 epsilon: m.epsilon,
                 window_ms: m.window_ms,
                 functional: Functional::from_name(&m.functional),
             })
             .collect();
-        if specs.is_empty() {
-            warn!("--enable-monitor-coordinator set but streaming-config has no `monitors:` yet — the coordinator will pick them up live when the control plane pushes a config (hot-reload)");
-        }
         let coord = MonitorCoordinator::new(specs);
-
-        // Hot-reload watcher: the coordinator reads `monitors:` once at boot, but
-        // the control plane pushes the real config slightly AFTER boot via the
-        // `/api/v1/streaming-config` POST (an ArcSwap in `hot_reload_config`).
-        // Without this, a monitor that arrives post-boot never reaches the
-        // coordinator and every edge registering for it is rejected as
-        // "unconfigured". Watch the ArcSwap and re-apply its `monitors:` to the
-        // live coordinator on each swap (cheap: an atomic load + pointer compare
-        // every 2s; `reconfigure` is a no-op unless the spec set actually
-        // changed). The same path covers controller-driven monitor add/remove.
-        {
-            let coord = coord.clone();
-            let hot = hot_reload_config.clone();
-            tokio::spawn(async move {
-                let mut last = hot.snapshot();
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let cur = hot.snapshot();
-                    if Arc::ptr_eq(&last, &cur) {
-                        continue;
-                    }
-                    last = cur.clone();
-                    let specs: Vec<MonitorConfig> = cur
-                        .monitors()
-                        .iter()
-                        .map(|m| MonitorConfig {
-                            agg_id: m.agg_id,
-                            key: m.key.clone().into_bytes(),
-                            tau: m.tau,
-                            epsilon: m.epsilon,
-                            window_ms: m.window_ms,
-                            functional: Functional::from_name(&m.functional),
-                        })
-                        .collect();
-                    let (added, changed, removed) = coord.reconfigure(specs).await;
-                    if added + changed + removed > 0 {
-                        info!(
-                            added,
-                            changed,
-                            removed,
-                            "CDM monitor coordinator hot-reloaded monitors from pushed streaming-config"
-                        );
-                    }
-                }
-            });
-        }
 
         let svc = MonitorServiceImpl::new(coord).into_server();
         let port = args.monitor_grpc_port;
@@ -1106,7 +985,7 @@ async fn main() -> Result<()> {
     // from `--backend-storage-routing` (or its env-var alias) so the
     // HTTP handler consults a per-metric `StorageBackend` map on
     // every PromQL query instead of bypassing the EngineRouter when
-    // the streaming-config single axis defaults to `SketchStore`.
+    // the installed storage view single axis defaults to `SketchStore`.
     //
     // even when no static YAML is loaded, install an
     // empty hot-reload handle so the control plane's first
@@ -1148,7 +1027,7 @@ async fn main() -> Result<()> {
             summary_catalog: current.summary_catalog.clone(),
             precompute_plan: current.precompute_plan.clone(),
             transmission_plan: current.transmission_plan.clone(),
-            streaming_config: current.streaming_config.clone(),
+            installed_precompute_plan: current.installed_precompute_plan.clone(),
             query_plan: current.query_plan.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });
@@ -1179,7 +1058,7 @@ async fn main() -> Result<()> {
         args.enable_backfill_worker,
         precompute_ingest_state.as_ref(),
     ) {
-        // Backfill uses the shared streaming-config snapshot and sketch store.
+        // Backfill uses the installed precompute plan and sketch store.
         let reader_factory = match args.clickhouse_backfill_table.as_ref() {
             Some(table) => data_plane::storage_engines::sketch_db::clickhouse_reader_factory(
                 data_plane::storage_engines::sketch_db::ClickHouseReaderConfig {
@@ -1436,16 +1315,10 @@ async fn spawn_memory_diagnostics(
     }
 }
 
-fn setup_logging(
-    output_dir: &str,
-    log_level: &str,
-) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+fn setup_logging(output_dir: &str) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-    // Create env filter that respects RUST_LOG, with fallback to command line arg
-    let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(log_level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Create file appender for logging to file
     let file_appender = tracing_appender::rolling::never(output_dir, "query_engine.log");
@@ -1483,6 +1356,13 @@ mod tests {
     use clap::Parser;
     use data_plane::drivers::AdapterConfig;
 
+    // Every profile must bootstrap from the same validated physical artifact.
+    #[test]
+    fn distributed_accepts_physical_plan_without_streaming_config() {
+        let args = Args::try_parse_from(["data_plane", "--physical-plan", "plan.json"]).unwrap();
+        assert!(validate_profile(&args).is_ok());
+    }
+
     #[test]
     fn asapquery_requires_atomic_physical_plan_not_streaming_config() {
         let valid = Args::try_parse_from([
@@ -1509,21 +1389,9 @@ mod tests {
             "a backend-local plan must be allowed to reject unsupported queries"
         );
 
-        let legacy = Args::try_parse_from([
-            "data_plane",
-            "--profile",
-            "asapquery",
-            "--streaming-config",
-            "streaming.yaml",
-            "--physical-plan",
-            "plan.json",
-            "--forward-unsupported-queries",
-        ])
-        .unwrap();
-        assert!(validate_profile(&legacy)
-            .unwrap_err()
-            .to_string()
-            .contains("rejects --streaming-config"));
+        assert!(
+            Args::try_parse_from(["data_plane", "--streaming-config", "streaming.yaml"]).is_err()
+        );
 
         let planned = Args::try_parse_from([
             "data_plane",
@@ -1581,7 +1449,7 @@ mod tests {
     fn disable_query_forwarding_rejects_conflicting_flags() {
         let args = Args::try_parse_from([
             "data_plane",
-            "--streaming-config",
+            "--physical-plan",
             "streaming.yaml",
             "--disable-query-forwarding",
             "--forward-unsupported-queries",
@@ -1597,7 +1465,7 @@ mod tests {
     fn disable_query_forwarding_rejects_forwarding_listeners() {
         let args = Args::try_parse_from([
             "data_plane",
-            "--streaming-config",
+            "--physical-plan",
             "streaming.yaml",
             "--disable-query-forwarding",
             "--victoriametrics-http-port",
@@ -1614,7 +1482,7 @@ mod tests {
     fn disable_query_forwarding_rejects_clickhouse_listener() {
         let clickhouse = Args::try_parse_from([
             "data_plane",
-            "--streaming-config",
+            "--physical-plan",
             "streaming.yaml",
             "--disable-query-forwarding",
             "--clickhouse-http-port",
