@@ -57,14 +57,116 @@ selection. V1 introduces no implicit cross-worker shuffle or merge. Scheduling
 work after complete input windows become available remains necessary even when
 all dependencies belong to one worker.
 
-### Configuration and implementation boundary
+### Configuration: plan, installed program, and engine settings
 
-`PrecomputePlan` is the sole executable precompute configuration: DAG, source
-and stored-output bindings, partition assignment, and the selected deployment
-guarantee and schedule/retention. Worker counts and queue capacities remain
-engine settings in `PrecomputeEngineConfig`. Runtime programs and routing
-indexes are derived from the installed plan. The target removes the independently
-installable `StreamingConfig` wrapper rather than creating another DAG format.
+The target replaces `StreamingConfig` with an internal
+`InstalledPrecomputePlan`. This is a change in responsibility, not just a type
+rename: there is one authoritative computation plan and no separately editable
+aggregation list or second DAG format.
+
+| Type | Responsibility | How it is supplied |
+| --- | --- | --- |
+| `PrecomputePlan` | The complete precompute sub-DAG: Planner node IDs, operator semantics, dependency edges, source and stored-output bindings, and the selected deployment guarantee and schedule/retention. | The compiler supplies it as part of the physical plan. |
+| `InstalledPrecomputePlan` | The validated, compiled runtime representation of that plan: dependency execution order, bound operators, node and routing indexes, and a partitioning rule proven to satisfy the entire subgraph. | The backend derives it during plan installation; it is not an independently serialized or installable configuration. |
+| `PrecomputeEngineConfig` | Execution resources and operational settings, such as worker count, queue capacity and flush polling interval. | Engine configuration; these settings cannot redefine DAG semantics or the selected schedule/retention. |
+
+`InstalledPrecomputePlan` is needed to validate and compile the DAG once rather
+than repeat that work for each input or worker. Its indexes and fused programs
+are derived implementation details. They must preserve the selected DAG's node
+identities, dependencies and semantics; a fusion cannot introduce a different
+backend aggregation family. The logical partitioning rule is validated against
+the DAG, and physical worker assignment also uses the configured worker count.
+
+Installation and execution follow this sequence:
+
+1. Validate the `PrecomputePlan` graph, supported operators, bindings and
+   deployment requirements. Reject invalid or unsupported plans before
+   activation.
+2. Compile dependency order and operator bindings, derive lookup indexes, and
+   choose a partitioning rule that keeps every required reduction local. Use
+   the single-worker fallback described above only when it satisfies the plan.
+3. Install one immutable `InstalledPrecomputePlan` shared by the router and all
+   workers. Routing and execution must use the same plan generation.
+4. Each worker allocates its own accumulator, window, ordering and intermediate
+   state. It executes the complete installed subgraph for its assigned data,
+   running ready nodes sequentially in dependency order. Waiting for complete
+   windows or input cohorts is part of this worker execution context.
+5. Reuse upstream results across all applicable sinks within the same execution
+   invocation, and publish completed outputs through the plan's
+   `StoredOutputReference` bindings to the shared `SummaryStore`.
+
+For example, with per-series Rate followed by Sum by service, all workers share
+one installed graph. Routing sends every series of a service to one worker.
+That worker keeps separate Rate state for each series, executes the service Sum
+when its inputs are ready, and writes the resulting stored output. Another
+worker can execute the same graph for a different service concurrently. Neither
+the router nor a separate aggregation configuration defines a replacement
+computation.
+
+A generation change must not mix old routing with new operators or bindings.
+Queued work retains its generation, and activation must drain or isolate old
+worker state before accepting work under an incompatible partition assignment.
+Changing worker count likewise requires a coordinated reassignment; it cannot
+silently move active state by changing a hash modulus.
+
+### Stored identity follows the selected subgraph outputs
+
+The [SDS contract](summary-catalog-sds-architecture.md#plan-and-storage-contract)
+is authoritative for storage identity. `InstalledPrecomputePlan` is an internal
+backend execution representation proposed here, not an additional plan or SDS
+object defined by that contract.
+
+Only outputs explicitly selected for persistence receive a compiler-assigned
+`stored_output_id`. Intermediate nodes remain worker-local unless the plan
+selects their outputs for storage. One precompute subgraph may therefore write
+several stored outputs; neither the whole subgraph nor every node becomes a
+single stored record.
+
+| Information | Owner in the target implementation |
+| --- | --- |
+| Input, Planner family, parameters, grouping and time semantics | `SummaryDefinition` in `SummaryStore.summary_definitions` |
+| Mapping from a selected DAG output to its definition | Plan-version-scoped `StoredOutputReference`, shared by writer and readers |
+| Computed state for an output, population and window | `StoredSummary` in `SummaryStore.stored_summaries`, containing definition ID, format, actual coverage and payload |
+| Execution order and worker assignment | Derived runtime information in `InstalledPrecomputePlan`; not a persistent summary identity |
+
+The concrete record key is
+`(plan_version, stored_output_id, population_key, window)`. Population keys
+preserve canonical label names and values, and windows preserve their boundary
+convention. A matching definition alone does not authorize reuse across plan
+versions. Both QueryPlan reads and derived precompute reads follow explicit
+output references and validate format and coverage before using a record.
+
+For example, if the plan stores per-series Rate and its downstream Sum by
+service, those are two distinct stored outputs with their own definitions and
+population/window records. If only the Sum is selected for storage, Rate remains
+an intermediate computation and has no independently stored output. In either
+case the partition rule keeps a service's series together; hashing an output ID
+or a legacy `sid` does not establish that property.
+
+The current resolver-generated `sid` must not serve as the new output identity,
+record key or partitioning rule. Replace its authoritative uses across routing,
+catalog registration, writes, recovery and reads with the corresponding plan
+bindings and composite keys. Do not cast or rename old IDs into the new fields.
+This v1 implementation targets the new format and rejects unsupported legacy
+artifacts; it does not retain a parallel legacy execution path. Existing payload
+encoding algorithms can be reused when their schema and encoding are explicitly
+validated under the new bindings.
+
+### Migration and implementation boundary
+
+Remove the `StreamingConfig` type and its standalone document/loading surface
+as callers migrate to the installed plan. The physical-plan installation path
+is the authority; the retired streaming-config update endpoint must not accept
+an alternative execution configuration. Production lookup tables are built
+from the validated DAG and bindings, not supplied as a hand-maintained list.
+Consumers that need execution lookups receive the installed plan, while
+worker resource settings remain in `PrecomputeEngineConfig`. Deployment settings
+unrelated to precompute execution do not become a second computation definition.
+
+The names and lifecycle above specify the target API. They do not claim that
+`InstalledPrecomputePlan` already exists in the code. In particular, replacing
+`StreamingConfig` while keeping separate per-producer and maintenance execution
+paths is not sufficient to implement this design.
 
 PR #763 does not yet implement this complete worker model. It currently routes
 individual stored-state `sid`s to workers, fuses supported raw producer paths,
