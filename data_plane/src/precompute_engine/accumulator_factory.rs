@@ -424,7 +424,7 @@ impl AccumulatorUpdater for MultipleSumAccumulatorUpdater {
 
     fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of::<MultipleSumAccumulator>()
-            + self.acc.sums.len() * (std::mem::size_of::<KeyByLabelValues>() + 8)
+            + self.acc.sums.len() * (std::mem::size_of::<KeyByLabelValues>() + 16)
     }
 }
 
@@ -1040,10 +1040,10 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
     let keyed = spec.grouping.is_some();
 
     match (&spec.family, keyed) {
-        (SummaryFamilyType::ExactAggregate(ExactKind::Sum, _), false) => {
+        (SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), false) => {
             Box::new(SumAccumulatorUpdater::new())
         }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Sum, _), true) => {
+        (SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), true) => {
             Box::new(MultipleSumAccumulatorUpdater::new())
         }
 
@@ -1065,10 +1065,10 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             Box::new(MultipleMaxAccumulatorUpdater::new())
         }
 
-        (SummaryFamilyType::ExactAggregate(ExactKind::Increase, _), false) => {
+        (SummaryFamilyType::ExactAggregate(ExactKind::Increase | ExactKind::Rate, _), false) => {
             Box::new(IncreaseAccumulatorUpdater::new())
         }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Increase, _), true) => {
+        (SummaryFamilyType::ExactAggregate(ExactKind::Increase | ExactKind::Rate, _), true) => {
             Box::new(MultipleIncreaseAccumulatorUpdater::new())
         }
 

@@ -204,10 +204,12 @@ impl GroupState {
             return None;
         };
         let stat = match agg_type {
-            AggregationType::Sum
-            | AggregationType::MultipleSum
-            | AggregationType::Increase
-            | AggregationType::MultipleIncrease => asap_types::Statistic::Sum,
+            AggregationType::Sum | AggregationType::MultipleSum => asap_types::Statistic::Sum,
+            AggregationType::Count => asap_types::Statistic::Count,
+            AggregationType::Increase | AggregationType::MultipleIncrease => {
+                asap_types::Statistic::Increase
+            }
+            AggregationType::Rate => asap_types::Statistic::Rate,
             _ => return None,
         };
         let mut merged: Option<Box<dyn AggregateCore>> = None;
@@ -224,9 +226,7 @@ impl GroupState {
             .ok()
     }
 
-    /// Finalize a compiler-declared exact readout. Rate and increase share
-    /// reset-aware Increase state physically, but remain distinct operations
-    /// in QueryPlan so serving never infers semantics from PromQL text.
+    /// Finalize the Planner-declared exact family with its matching readout.
     pub fn exact_value_for(
         &self,
         readout: asap_types::query_plan::ExactReadout,
@@ -238,7 +238,7 @@ impl GroupState {
             return None;
         };
         let stat = match (readout, agg_type) {
-            (asap_types::query_plan::ExactReadout::Count, AggregationType::Sum) => {
+            (asap_types::query_plan::ExactReadout::Count, AggregationType::Count) => {
                 asap_types::Statistic::Count
             }
             (
@@ -249,10 +249,9 @@ impl GroupState {
                 asap_types::query_plan::ExactReadout::Increase,
                 AggregationType::Increase | AggregationType::MultipleIncrease,
             ) => asap_types::Statistic::Increase,
-            (
-                asap_types::query_plan::ExactReadout::Rate,
-                AggregationType::Increase | AggregationType::MultipleIncrease,
-            ) => asap_types::Statistic::Rate,
+            (asap_types::query_plan::ExactReadout::Rate, AggregationType::Rate) => {
+                asap_types::Statistic::Rate
+            }
             (
                 asap_types::query_plan::ExactReadout::Min,
                 AggregationType::Min | AggregationType::MultipleMin,
@@ -269,7 +268,7 @@ impl GroupState {
         // instead of allocating a boxed trait object for every pane.
         if matches!(
             agg_type,
-            AggregationType::Increase | AggregationType::MultipleIncrease
+            AggregationType::Increase | AggregationType::Rate | AggregationType::MultipleIncrease
         ) {
             let accumulators = entries
                 .iter()
@@ -592,7 +591,9 @@ impl QueryExecutionContext<'_> {
                 Candidate::ExactAgg(agg_type) => {
                     if matches!(
                         agg_type,
-                        AggregationType::Increase | AggregationType::MultipleIncrease
+                        AggregationType::Increase
+                            | AggregationType::Rate
+                            | AggregationType::MultipleIncrease
                     ) {
                         // Counter pane statistics are sufficient for Prometheus
                         // extrapolatedRate only when no query boundary cuts a
@@ -666,7 +667,9 @@ impl QueryExecutionContext<'_> {
                     // remain contiguous because a missing pane is not zero.
                     if matches!(
                         agg_type,
-                        AggregationType::Sum | AggregationType::MultipleSum
+                        AggregationType::Sum
+                            | AggregationType::Count
+                            | AggregationType::MultipleSum
                     ) {
                         check_panes(windows.keys().copied().collect())?;
                     }
@@ -1255,17 +1258,10 @@ fn summary_family_matches_sketch(
 /// parameters, so this is a pure `ExactKind` identity check against the sid's
 /// `AggregationType`, mirroring the canonical `AggregationType ->
 /// ExactKind` mapping `asap_types::accumulator_spec` uses on the write
-/// side (`Sum|MultipleSum -> ExactKind::Sum`, `Increase|MultipleIncrease
-/// -> ExactKind::Increase` — confirmed against that module's own
-/// dispatch table rather than invented here).
+/// side. Count and Rate remain distinct families even though their runtime
+/// accumulators share implementations with Sum and Increase.
 ///
-/// `ExactKind::Count`/`Rate`/`Min`/`Max` are not matched by this legacy
-/// family-discovery path. For `Count`/`Rate` the final operation is ambiguous
-/// from the stored accumulator alone. `Min`/`Max` were excluded for a reason
-/// that no longer holds -- direction used to be unrecoverable once a summary
-/// reached `AggKind::ExactAgg`, and is now the family itself -- but admitting
-/// them here widens candidate discovery beyond the family split and is left
-/// as follow-up. Installed QueryPlans carry an explicit `ExactReadout`, and
+/// Installed QueryPlans carry an explicit `ExactReadout`, and
 /// `read_bound_materialization` serves those forms safely.
 fn summary_family_matches_exact(family: &SummaryFamilyType, agg_type: AggregationType) -> bool {
     matches!(
@@ -1274,8 +1270,14 @@ fn summary_family_matches_exact(family: &SummaryFamilyType, agg_type: Aggregatio
             SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
             AggregationType::Sum | AggregationType::MultipleSum,
         ) | (
+            SummaryFamilyType::ExactAggregate(ExactKind::Count, ExactParams::Count),
+            AggregationType::Count,
+        ) | (
             SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
             AggregationType::Increase | AggregationType::MultipleIncrease,
+        ) | (
+            SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate),
+            AggregationType::Rate,
         )
     )
 }

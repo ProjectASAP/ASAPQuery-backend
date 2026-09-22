@@ -717,6 +717,7 @@ fn route_messages(
                     && matches!(
                         config.aggregation_type,
                         asap_types::AggregationType::Increase
+                            | asap_types::AggregationType::Rate
                             | asap_types::AggregationType::MultipleIncrease
                             | asap_types::AggregationType::Min
                             | asap_types::AggregationType::Max

@@ -52,8 +52,10 @@ impl ResolvedMaterialization<'_> {
             &self.summary.operator,
             SummaryOperator::Configured {
                 aggregation_type: AggregationType::Sum
+                    | AggregationType::Count
                     | AggregationType::MultipleSum
                     | AggregationType::Increase
+                    | AggregationType::Rate
                     | AggregationType::MultipleIncrease
                     | AggregationType::Min
                     | AggregationType::Max
@@ -78,10 +80,9 @@ impl ResolvedMaterialization<'_> {
         match node {
             QueryPlanNode::ExactReadout { readout, .. } => match readout {
                 ExactReadout::Sum => matches!(aggregation_type, Sum | MultipleSum),
-                ExactReadout::Count => *aggregation_type == Sum,
-                ExactReadout::Increase | ExactReadout::Rate => {
-                    matches!(aggregation_type, Increase | MultipleIncrease)
-                }
+                ExactReadout::Count => *aggregation_type == Count,
+                ExactReadout::Increase => matches!(aggregation_type, Increase | MultipleIncrease),
+                ExactReadout::Rate => *aggregation_type == Rate,
                 // Direction is the family now -- no `aggregation_sub_type`
                 // cross-check, and a minimum summary can no longer be
                 // offered up for a maximum readout.
