@@ -341,7 +341,7 @@ pub enum PhysicalDeploymentTarget {
 }
 
 /// Startup and candidate-discovery input for backend-local planning.
-/// Version 2 is the sole supported schema; deployment always requires quotes.
+/// Version 2 is the sole supported schema; deployment compares complete workload costs.
 /// Query/data semantics use ASAPPlanner's canonical workload types directly;
 /// this wrapper adds only backend-owned implementation evidence and lifecycle
 /// identity required to choose a concrete physical realization.
@@ -350,7 +350,7 @@ pub enum PhysicalDeploymentTarget {
 pub struct BackendLocalPlanningInput {
     #[serde(rename = "snapshot_version", alias = "schema_version")]
     pub schema_version: u32,
-    /// May be absent during candidate discovery, never during deployment.
+    /// Optional complete provider override; absent evidence uses backend ERP/analytical workload costing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     #[serde(deserialize_with = "deserialize_snapshot_query_workload")]
@@ -732,23 +732,16 @@ impl BackendLocalPlanningInput {
         self,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
-        let evidence = self.workload_cost_evidence.clone().ok_or_else(|| {
-            CompileError::Snapshot(
-                "deployment requires complete workload cost evidence; export candidates and price them before compiling".into(),
-            )
-        })?;
+        let evidence = self.workload_cost_evidence.clone();
         let (request, environment) = self.into_physical_compilation_request()?;
         let candidates =
             super::workload_cost::enumerate_exact_and_materialized_candidates(request)?;
-        if frontend == QueryFrontend::MetricsQl {
-            super::workload_cost::select_lowest_cost_metricsql_candidate(
-                candidates,
-                environment,
-                &evidence,
-            )
-        } else {
-            super::workload_cost::select_lowest_cost_candidate(candidates, environment, &evidence)
-        }
+        super::workload_cost::select_candidates(
+            candidates,
+            environment,
+            evidence.as_ref(),
+            frontend,
+        )
     }
 
     /// Build Planner-authorized candidates for evidence collection without publishing.
@@ -2327,7 +2320,7 @@ pub fn select_logical_roots_for_queries(
     select_logical_roots_with_error_resource_profiles(queries, roots, evidence, exact_costs, None)
 }
 
-fn observed_population_matches_root(
+pub(crate) fn observed_population_matches_root(
     policy: &super::erp::ErpPlanningInput,
     root: &QueryExpr,
 ) -> bool {
@@ -3118,7 +3111,7 @@ pub(crate) fn estimated_state_bytes(
     }
 }
 
-fn retained_partition_count(
+pub(crate) fn retained_partition_count(
     materialization: &asap_types::PrecomputeMaterialization,
     input_cardinality: Option<u64>,
 ) -> u128 {
@@ -7914,8 +7907,13 @@ pub(crate) mod tests {
         assert_eq!(encoded, fixture);
 
         assert!(
-            snapshot.clone().compile_promql().is_err(),
-            "discovery fixtures must be priced before deployment"
+            snapshot
+                .clone()
+                .compile_promql()
+                .unwrap()
+                .cost_comparison
+                .is_some(),
+            "deployment computes complete workload costs automatically"
         );
         let (local, env) = snapshot
             .clone()
@@ -7954,8 +7952,13 @@ pub(crate) mod tests {
         let snapshot: BackendLocalPlanningInput =
             serde_json::from_str(source).expect("strict compatibility demo fixture");
         assert!(
-            snapshot.clone().compile_promql().is_err(),
-            "discovery fixtures must be priced before deployment"
+            snapshot
+                .clone()
+                .compile_promql()
+                .unwrap()
+                .cost_comparison
+                .is_some(),
+            "deployment computes complete workload costs automatically"
         );
         let (local, env) = snapshot
             .clone()
