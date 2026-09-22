@@ -96,7 +96,7 @@ fn expected_plan(name: &str) -> ExpectedPlan {
     }
 }
 
-fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) {
+fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) -> Option<String> {
     let expected = expected_plan(name);
     let artifact = serde_json::to_value(plan).unwrap();
     let entries = artifact["query_plan"]["entries"].as_object().unwrap();
@@ -117,7 +117,9 @@ fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) {
             materializations.is_empty(),
             "{name}: fallback cannot claim a summary"
         );
-        return;
+        return Some(format!(
+            "{name}: issue #754 requires an ASAP-local physical plan; exact fallback is not a correct answer"
+        ));
     };
     if let Some(operation) = expected.root_operation {
         assert_eq!(node["op"], "logical", "{name}: missing root operator");
@@ -205,6 +207,7 @@ fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) {
             "{name}: wrong PromQL range"
         );
     }
+    None
 }
 
 /// The same ten expressions used by level 2 must compile to typed, connected plans.
@@ -215,6 +218,7 @@ fn issue754_queries_have_valid_physical_plans() {
     ))
     .unwrap();
     assert_eq!(suite.queries.len(), 10, "the issue-754 contract changed");
+    let mut missing_local_plans = Vec::new();
     for case in suite.queries {
         let expected = expected_plan(&case.name);
         let mut snapshot: Value = serde_json::from_str(include_str!(
@@ -305,7 +309,9 @@ fn issue754_queries_have_valid_physical_plans() {
             .unwrap_or_else(|error| panic!("{} selected plan failed: {error}", case.name));
         let selected_entry = selected.query_plan.lookup(&case.expr).unwrap();
         assert!(selected_entry.nodes.contains_key(&selected_entry.root));
-        assert_selected_plan(&case.name, &selected);
+        if let Some(error) = assert_selected_plan(&case.name, &selected) {
+            missing_local_plans.push(error);
+        }
         if let Some(installed) = selected
             .precompute_plan
             .executable_dags
@@ -330,4 +336,9 @@ fn issue754_queries_have_valid_physical_plans() {
             .unwrap();
         }
     }
+    assert!(
+        missing_local_plans.is_empty(),
+        "{}",
+        missing_local_plans.join("\n")
+    );
 }
