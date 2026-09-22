@@ -8,7 +8,7 @@ use control_plane::physical::workload_cost::{
 };
 use control_plane::query_plan::QueryPlanNode;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Deserialize)]
 struct Suite {
@@ -21,13 +21,189 @@ struct Case {
     expr: String,
 }
 
-fn expected_summary(name: &str) -> Option<&'static str> {
+struct ExpectedPlan {
+    family: Option<&'static str>,
+    partitioning: &'static str,
+    readout: &'static str,
+    root_operation: Option<&'static str>,
+}
+
+// These are semantic contracts for the installed query DAG, not a snapshot of
+// generated node IDs or cost-dependent summary IDs.
+fn expected_plan(name: &str) -> ExpectedPlan {
     match name {
-        "spatial-sum" | "temporal-sum" | "grouped-temporal-sum" => Some("Sum"),
-        "spatial-quantile" | "temporal-quantile" => Some("DDSketch"),
-        "temporal-rate" | "grouped-rate" | "topk-rate" => Some("Increase"),
-        "spatial-topk" | "quantile-ratio" => None,
+        "spatial-sum" => ExpectedPlan {
+            family: Some("Sum"),
+            partitioning: "grouped",
+            readout: "sum",
+            root_operation: None,
+        },
+        "spatial-topk" => ExpectedPlan {
+            family: None,
+            partitioning: "",
+            readout: "",
+            root_operation: None,
+        },
+        "spatial-quantile" => ExpectedPlan {
+            family: Some("DDSketch"),
+            partitioning: "grouped",
+            readout: "quantile",
+            root_operation: None,
+        },
+        "temporal-sum" => ExpectedPlan {
+            family: Some("Sum"),
+            partitioning: "per_entity",
+            readout: "sum",
+            root_operation: None,
+        },
+        "temporal-quantile" => ExpectedPlan {
+            family: Some("DDSketch"),
+            partitioning: "per_entity",
+            readout: "quantile",
+            root_operation: None,
+        },
+        "temporal-rate" => ExpectedPlan {
+            family: Some("Increase"),
+            partitioning: "per_entity",
+            readout: "rate",
+            root_operation: None,
+        },
+        "grouped-rate" => ExpectedPlan {
+            family: Some("Increase"),
+            partitioning: "per_entity",
+            readout: "rate",
+            root_operation: Some("aggregate"),
+        },
+        "grouped-temporal-sum" => ExpectedPlan {
+            family: Some("Sum"),
+            partitioning: "per_entity",
+            readout: "sum",
+            root_operation: Some("aggregate"),
+        },
+        "topk-rate" => ExpectedPlan {
+            family: Some("Increase"),
+            partitioning: "per_entity",
+            readout: "rate",
+            root_operation: Some("top_k_selection"),
+        },
+        "quantile-ratio" => ExpectedPlan {
+            family: None,
+            partitioning: "",
+            readout: "",
+            root_operation: None,
+        },
         other => panic!("no level-1 plan expectation for {other}"),
+    }
+}
+
+fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) {
+    let expected = expected_plan(name);
+    let artifact = serde_json::to_value(plan).unwrap();
+    let entries = artifact["query_plan"]["entries"].as_object().unwrap();
+    assert_eq!(entries.len(), 1, "{name}: expected one query plan");
+    let entry = entries.values().next().unwrap();
+    let nodes = entry["nodes"].as_object().unwrap();
+    let mut node = &nodes[&entry["root"].as_u64().unwrap().to_string()];
+    let materializations = artifact["precompute_plan"]["materializations"]
+        .as_array()
+        .unwrap();
+    let Some(family) = expected.family else {
+        assert_eq!(nodes.len(), 1, "{name}: fallback must be the entire plan");
+        assert_eq!(
+            node["op"], "exact_fallback",
+            "{name}: ASAP plan is not implemented"
+        );
+        assert!(
+            materializations.is_empty(),
+            "{name}: fallback cannot claim a summary"
+        );
+        return;
+    };
+    if let Some(operation) = expected.root_operation {
+        assert_eq!(node["op"], "logical", "{name}: missing root operator");
+        assert_eq!(
+            node["operator"]["kind"], operation,
+            "{name}: wrong root operator"
+        );
+        if operation == "aggregate" {
+            assert_eq!(node["operator"]["operation"], "sum");
+        } else {
+            assert_eq!(node["operator"]["k"], 3, "{name}: wrong TopK limit");
+        }
+        assert_eq!(
+            node["operator"]["grouping"],
+            json!({"labels":["label_0"],"without":false}),
+            "{name}: wrong grouping"
+        );
+        let inputs = node["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1, "{name}: root must have one input");
+        node = &nodes[&inputs[0].to_string()];
+    }
+    assert_eq!(
+        nodes.len(),
+        if expected.root_operation.is_some() {
+            3
+        } else {
+            2
+        },
+        "{name}: unexpected DAG nodes"
+    );
+    if expected.readout == "quantile" {
+        assert_eq!(
+            node["op"], "summary_estimate",
+            "{name}: missing sketch readout"
+        );
+        assert_eq!(
+            node["query"],
+            json!({"kind":"quantile","q":0.9}),
+            "{name}: wrong quantile"
+        );
+    } else {
+        assert_eq!(node["op"], "exact_readout", "{name}: wrong readout node");
+        assert_eq!(node["readout"], expected.readout, "{name}: wrong readout");
+    }
+    let leaf = &nodes[&node["input"].to_string()];
+    assert_eq!(
+        leaf["op"], "read_materialization",
+        "{name}: missing summary read"
+    );
+    assert_eq!(
+        materializations.len(),
+        1,
+        "{name}: expected one summary producer"
+    );
+    let summary = &materializations[0];
+    assert_eq!(
+        summary["aggregation_type"], family,
+        "{name}: wrong summary family"
+    );
+    assert_eq!(summary["metric"], "data", "{name}: wrong source metric");
+    assert_eq!(
+        summary["partitioning"], expected.partitioning,
+        "{name}: wrong population partitioning"
+    );
+    let spatial = expected.partitioning == "grouped";
+    assert_eq!(
+        summary["window_size"],
+        if spatial { 5 } else { 60 },
+        "{name}: wrong summary window"
+    );
+    assert_eq!(
+        leaf["binding"]["output_grouping"]["mode"],
+        if spatial { "reduce" } else { "per_entity" },
+        "{name}: wrong read grouping"
+    );
+    if spatial {
+        assert_eq!(summary["grouping_labels"]["labels"], json!(["label_0"]));
+        assert_eq!(
+            leaf["binding"]["output_grouping"]["keys"],
+            json!(["label_0"])
+        );
+    } else {
+        assert_eq!(
+            leaf["binding"]["readout_lookback_ms"], 60_000,
+            "{name}: wrong PromQL range"
+        );
     }
 }
 
@@ -40,7 +216,7 @@ fn issue754_queries_have_valid_physical_plans() {
     .unwrap();
     assert_eq!(suite.queries.len(), 10, "the issue-754 contract changed");
     for case in suite.queries {
-        let expected = expected_summary(&case.name);
+        let expected = expected_plan(&case.name);
         let mut snapshot: Value = serde_json::from_str(include_str!(
             "../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -95,7 +271,7 @@ fn issue754_queries_have_valid_physical_plans() {
             "{} has no valid physical plan: {errors:?}",
             case.name
         );
-        if let Some(family) = expected {
+        if let Some(family) = expected.family {
             assert!(
                 valid_plans.iter().any(|plan| {
                     plan.precompute_plan
@@ -129,35 +305,7 @@ fn issue754_queries_have_valid_physical_plans() {
             .unwrap_or_else(|error| panic!("{} selected plan failed: {error}", case.name));
         let selected_entry = selected.query_plan.lookup(&case.expr).unwrap();
         assert!(selected_entry.nodes.contains_key(&selected_entry.root));
-        if let Some(family) = expected {
-            assert!(
-                selected
-                    .precompute_plan
-                    .materializations
-                    .iter()
-                    .any(|m| format!("{:?}", m.aggregation_type) == family),
-                "{} selected plan lost the expected {family} summary",
-                case.name
-            );
-            assert!(
-                !selected_entry
-                    .nodes
-                    .values()
-                    .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })),
-                "{} silently fell back despite a selected summary",
-                case.name
-            );
-        } else {
-            assert!(selected.precompute_plan.materializations.is_empty());
-            assert!(
-                matches!(
-                    selected_entry.nodes.get(&selected_entry.root),
-                    Some(QueryPlanNode::ExactFallback { .. })
-                ),
-                "{} must expose an explicit exact fallback",
-                case.name
-            );
-        }
+        assert_selected_plan(&case.name, &selected);
         if let Some(installed) = selected
             .precompute_plan
             .executable_dags
