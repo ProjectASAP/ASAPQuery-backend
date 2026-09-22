@@ -1582,8 +1582,7 @@ mod tests {
             asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue;
         policy.observed_populations = Some(observed.clone());
         policy.resolve_population_data_descriptor(Some(&catalog));
-        let expected =
-            &catalog.definitions[&observed.summary_definition_id].data_descriptor_id;
+        let expected = &catalog.definitions[&observed.summary_definition_id].data_descriptor_id;
         assert_eq!(
             &policy.resolved_data_descriptor.as_ref().unwrap().id,
             expected
