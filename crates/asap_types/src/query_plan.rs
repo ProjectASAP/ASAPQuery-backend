@@ -607,7 +607,8 @@ pub enum QueryPlanNode {
 
 impl QueryPlanNode {
     /// Operator label for logs: the serialized `op` tag, plus the residual
-    /// `kind` for logical nodes (e.g. `logical/temporal`).
+    /// `kind` for logical nodes, including the operation where applicable
+    /// (e.g. `logical/aggregate/sum`).
     pub fn op_label(&self) -> &'static str {
         use residual::ResidualQueryOperator as R;
         match self {
@@ -620,7 +621,13 @@ impl QueryPlanNode {
                 R::Scan { .. } => "logical/scan",
                 R::UnaryNegate => "logical/unary_negate",
                 R::VectorToScalar => "logical/vector_to_scalar",
-                R::Aggregate { .. } => "logical/aggregate",
+                R::Aggregate { operation, .. } => match operation {
+                    residual::Aggregation::Sum => "logical/aggregate/sum",
+                    residual::Aggregation::Max => "logical/aggregate/max",
+                    residual::Aggregation::Min => "logical/aggregate/min",
+                    residual::Aggregation::Avg => "logical/aggregate/avg",
+                    residual::Aggregation::Count => "logical/aggregate/count",
+                },
                 R::TopKSelection { .. } => "logical/top_k_selection",
                 R::Binary { .. } => "logical/binary",
                 R::Temporal { .. } => "logical/temporal",
@@ -633,7 +640,14 @@ impl QueryPlanNode {
             Self::ReduceSum { .. } => "reduce_sum",
             Self::ReadMaterialization { .. } => "read_materialization",
             Self::SummaryEstimate { .. } => "summary_estimate",
-            Self::ExactReadout { .. } => "exact_readout",
+            Self::ExactReadout { readout, .. } => match readout {
+                ExactReadout::Sum => "exact_readout/sum",
+                ExactReadout::Count => "exact_readout/count",
+                ExactReadout::Increase => "exact_readout/increase",
+                ExactReadout::Rate => "exact_readout/rate",
+                ExactReadout::Min => "exact_readout/min",
+                ExactReadout::Max => "exact_readout/max",
+            },
             Self::SummaryMerge { .. } => "summary_merge",
             Self::CandidateTopK { .. } => "candidate_top_k",
             Self::ExternalExact { .. } => "external_exact",
@@ -736,11 +750,47 @@ pub fn canonical_promql(query: &str) -> Result<String, QueryPlanError> {
 
 #[cfg(test)]
 mod contract_tests {
+    use super::{residual, QueryPlanNode};
+
     // Installed plans cross producer/query threads without Planner Rc state.
     #[test]
     fn installed_query_contract_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<super::QueryPlan>();
         assert_send_sync::<super::QueryPlanEntry>();
+    }
+
+    #[test]
+    fn aggregate_log_labels_identify_the_operation() {
+        for (operation, expected) in [
+            (residual::Aggregation::Sum, "logical/aggregate/sum"),
+            (residual::Aggregation::Count, "logical/aggregate/count"),
+            (residual::Aggregation::Avg, "logical/aggregate/avg"),
+        ] {
+            let node = QueryPlanNode::Logical {
+                operator: residual::ResidualQueryOperator::Aggregate {
+                    operation,
+                    grouping: residual::Grouping {
+                        labels: vec!["service".into()],
+                        without: false,
+                    },
+                },
+                inputs: vec![],
+            };
+            assert_eq!(node.op_label(), expected);
+        }
+        for (readout, expected) in [
+            (super::ExactReadout::Sum, "exact_readout/sum"),
+            (super::ExactReadout::Count, "exact_readout/count"),
+        ] {
+            assert_eq!(
+                QueryPlanNode::ExactReadout {
+                    input: super::QueryNodeId(1),
+                    readout,
+                }
+                .op_label(),
+                expected
+            );
+        }
     }
 }
