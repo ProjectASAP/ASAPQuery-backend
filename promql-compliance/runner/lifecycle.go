@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -77,6 +78,12 @@ func (l *ComposeLifecycle) compileSelectedPlan(ctx context.Context, environment 
 	command.Env = environment
 	output, err := command.Output()
 	if err != nil {
+		if failure, ok := err.(*exec.ExitError); ok {
+			if writeErr := os.WriteFile(l.SelectedPlan+".stderr", failure.Stderr, 0o644); writeErr != nil {
+				return fmt.Errorf("retain planner failure: %w (compile error: %v)", writeErr, err)
+			}
+			return fmt.Errorf("compile selected plan: %w: %s", err, strings.TrimSpace(string(failure.Stderr)))
+		}
 		return fmt.Errorf("compile selected plan: %w", err)
 	}
 	if err := os.WriteFile(l.SelectedPlan, output, 0o644); err != nil {
