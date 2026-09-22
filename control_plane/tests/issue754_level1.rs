@@ -123,7 +123,7 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
     for materialization in &plan.precompute_plan.materializations {
         let definition = plan
             .summary_catalog
-            .materializations
+            .definitions
             .get(&materialization.policy_fingerprint().into())
             .expect("precompute producer has no catalog definition");
         let descriptor =
