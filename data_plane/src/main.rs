@@ -1448,14 +1448,8 @@ fn setup_logging(
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
     // Create env filter that respects RUST_LOG, with fallback to command line arg
-    let runtime_debug_level = if std::env::var("ASAP_DEBUG").as_deref() == Ok("1") {
-        "debug"
-    } else {
-        "off"
-    };
-    let default_filter = format!("{log_level},asap_runtime_debug={runtime_debug_level}");
     let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(default_filter))
+        .or_else(|_| EnvFilter::try_new(log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Create file appender for logging to file

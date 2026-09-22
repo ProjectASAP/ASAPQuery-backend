@@ -53,15 +53,10 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let default_filter = if std::env::var("ASAP_DEBUG").as_deref() == Ok("1") {
-        "info,asap_runtime_debug=debug"
-    } else {
-        "info,asap_runtime_debug=off"
-    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_file(true)
         .with_line_number(true)
