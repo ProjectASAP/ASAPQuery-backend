@@ -171,7 +171,8 @@ func (s DatasetSeries) ExpandedSamples() []DatasetSample {
 	g := s.GeneratedSamples
 	count := int(math.Round((g.EndOffsetSeconds-g.StartOffsetSeconds)/g.StepSeconds)) + 1
 	samples := make([]DatasetSample, 0, count)
-	for offset := g.StartOffsetSeconds; offset <= g.EndOffsetSeconds+g.StepSeconds/1e9; offset += g.StepSeconds {
+	for index := 0; index < count; index++ {
+		offset := g.StartOffsetSeconds + float64(index)*g.StepSeconds
 		samples = append(samples, DatasetSample{OffsetSeconds: offset, Value: g.Multiplier * (g.Base + math.Mod(offset, g.Modulo))})
 	}
 	return samples
@@ -186,7 +187,8 @@ func (g GeneratedSamples) validate() error {
 	if g.EndOffsetSeconds < g.StartOffsetSeconds || g.StepSeconds <= 0 || g.Modulo <= 0 {
 		return fmt.Errorf("end must be at least start; step and modulo must be positive")
 	}
-	if math.Mod(g.EndOffsetSeconds-g.StartOffsetSeconds, g.StepSeconds) != 0 {
+	steps := (g.EndOffsetSeconds - g.StartOffsetSeconds) / g.StepSeconds
+	if math.Abs(steps-math.Round(steps)) > 1e-9 {
 		return fmt.Errorf("end must lie on the generated step grid")
 	}
 	return nil

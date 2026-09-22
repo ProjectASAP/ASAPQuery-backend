@@ -6,13 +6,13 @@ func TestCheckedInFixturesMeetStrictContracts(t *testing.T) {
 	for _, path := range []string{
 		"../datasets/single-rate.yaml", "../datasets/sparse-checkout.yaml",
 		"../datasets/aggregations.yaml", "../datasets/aggregations-dense-cadence.yaml",
-		"../datasets/issue-702-one-second.yaml",
+		"../datasets/issue-702-one-second.yaml", "../datasets/issue-754.yaml",
 	} {
 		if _, err := LoadDatasetFile(path); err != nil {
 			t.Fatalf("LoadDatasetFile(%q): %v", path, err)
 		}
 	}
-	for _, path := range []string{"../suites/temporal.yaml", "../suites/aggregations.yaml", "../suites/issue-702.yaml", "../suites/issue-702-one-second.yaml"} {
+	for _, path := range []string{"../suites/temporal.yaml", "../suites/aggregations.yaml", "../suites/issue-702.yaml", "../suites/issue-702-one-second.yaml", "../suites/issue-754.yaml"} {
 		if _, err := LoadSuiteFile(path); err != nil {
 			t.Fatalf("LoadSuiteFile(%q): %v", path, err)
 		}
@@ -147,5 +147,34 @@ series:
 	}
 	if got, want := decoded.Timeseries[0].Samples[1].Timestamp, int64(1_700_000_060_000); got != want {
 		t.Fatalf("timestamp = %d, want %d", got, want)
+	}
+}
+
+// The shared 100 ms fixture must retain its exact millisecond cadence in Remote Write.
+func TestIssue754DenseFixtureCadence(t *testing.T) {
+	dataset, err := LoadDatasetFile("../datasets/issue-754.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := EncodeRemoteWrite(1_700_000_000_000, dataset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeRemoteWrite(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Timeseries) != 4 {
+		t.Fatalf("series = %d, want 4", len(decoded.Timeseries))
+	}
+	for _, series := range decoded.Timeseries {
+		if len(series.Samples) != 1801 {
+			t.Fatalf("samples = %d, want 1801", len(series.Samples))
+		}
+		for i := 1; i < len(series.Samples); i++ {
+			if got := series.Samples[i].Timestamp - series.Samples[i-1].Timestamp; got != 100 {
+				t.Fatalf("sample %d cadence = %d ms, want 100", i, got)
+			}
+		}
 	}
 }

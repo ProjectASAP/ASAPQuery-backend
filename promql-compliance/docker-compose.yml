@@ -18,7 +18,7 @@ services:
     build:
       context: ..
       dockerfile: data_plane/Dockerfile
-    command: ["--profile", "asapquery", "--planning-snapshot", "/config/planning-snapshot.json", "--prometheus-server", "http://prometheus:9090", "--forward-unsupported-queries", "--http-port", "9091", "--output-dir", "/tmp/asap"]
+    command: ["--profile", "asapquery", "--planning-snapshot", "/config/planning-snapshot.json", "--prometheus-server", "http://prometheus:9090", "--http-port", "9091", "--output-dir", "/tmp/asap"]
     volumes:
       - ${ASAP_PLANNING_SNAPSHOT}:/config/planning-snapshot.json:ro
     ports: ["${BACKEND_PORT:-19091}:9091"]

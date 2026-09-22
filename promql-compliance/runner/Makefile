@@ -14,7 +14,8 @@ CASES := \
 	aggregations:../datasets/aggregations.yaml:../suites/aggregations.yaml \
 	aggregations-dense-cadence:../datasets/aggregations-dense-cadence.yaml:../suites/aggregations.yaml \
 	issue-702:../datasets/aggregations-dense-cadence.yaml:../suites/issue-702.yaml \
-	issue-702-one-second:../datasets/issue-702-one-second.yaml:../suites/issue-702-one-second.yaml
+	issue-702-one-second:../datasets/issue-702-one-second.yaml:../suites/issue-702-one-second.yaml \
+	issue-754:../datasets/issue-754.yaml:../suites/issue-754.yaml
 
 test:
 	go test ./...

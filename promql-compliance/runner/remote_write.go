@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -27,7 +28,7 @@ func EncodeRemoteWrite(baseTimeMs int64, dataset Dataset) ([]byte, error) {
 		expanded := series.ExpandedSamples()
 		samples := make([]prompb.Sample, 0, len(expanded))
 		for _, sample := range expanded {
-			samples = append(samples, prompb.Sample{Value: sample.Value, Timestamp: baseTimeMs + int64(sample.OffsetSeconds*1000)})
+			samples = append(samples, prompb.Sample{Value: sample.Value, Timestamp: baseTimeMs + int64(math.Round(sample.OffsetSeconds*1000))})
 		}
 		request.Timeseries = append(request.Timeseries, prompb.TimeSeries{Labels: labels, Samples: samples})
 	}
