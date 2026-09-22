@@ -151,6 +151,74 @@ are committed. No abstract payload locator is required by this design.
 | `StoredSummary` | One `SummaryStore` entry: instance metadata plus its associated summary payload | Runtime publishes a new or replacement partition or completed aggregate |
 | `StoredOutputReference` | A typed plan reference to a permitted stored producer output | A compiled reader/writer binding changes |
 
+### Example: `summary_definitions` describes what to compute
+
+One row says: summarize `request_latency_seconds` values separately for each
+service over a five-minute window using KLL with `k=200`. It applies to all
+services and evaluation windows; it contains no computed sketch bytes.
+The following examples illustrate the design, not a serialized Rust API.
+
+```yaml
+summary_definitions:
+  def-api-latency-kll:
+    input: {metric: request_latency_seconds, value: sample_value}
+    family: {kind: Sketch, algorithm: KLL, parameters: {k: 200}}
+    group_by: [service]
+    time_semantics: {range: 5m, bounds: "(start, end]"}
+    output_type: kll_state
+```
+
+`def-api-latency-kll` is the definition ID. A record for `service=worker` or a
+later five-minute window can refer to this same definition.
+
+### Example: `stored_summaries` contains an actual computed result
+
+After precompute finishes the `service=api` window `(12:00, 12:05]`, it publishes
+one committed record containing the identifying metadata and the encoded KLL
+payload. The placeholder below stands for real sketch bytes, not raw samples.
+
+```yaml
+stored_summaries:
+  - key:
+      plan_version: 42
+      stored_output_id: latency-kll
+      population_key: {service: api}
+      window: {start_exclusive: '12:00', end_inclusive: '12:05'}
+    definition_id: def-api-latency-kll
+    format: {schema: kll-v1, encoding: kll-binary-v1}
+    coverage: {start_exclusive: '12:00', end_inclusive: '12:05'}
+    payload: <encoded KLL state for these samples>
+```
+
+The `definition_id` connects this result to its meaning in `summary_definitions`.
+A result for `service=worker`, or for `(12:01, 12:06]`, is another record with a
+different key even if it uses the same definition and stored output.
+
+### Example: `StoredOutputReference` connects a reader to its writer
+
+Within installed plan version `42`, the writer and both percentile readers carry
+the following reference:
+
+```yaml
+reference:
+  stored_output_id: latency-kll
+  definition_id: def-api-latency-kll
+```
+
+This names the producer output and its definition; it does not contain a payload
+or select a concrete window. For a request at `12:05` for `service=api`, the
+reader's population and time selection completes the lookup key:
+
+```text
+(42, latency-kll, {service: api}, (12:00, 12:05])
+```
+
+The q50 and q99 QueryPlans can resolve that same stored record. Their downstream
+readouts use `quantile=0.50` and `quantile=0.99`, respectively. The reference is
+identical because a different readout does not require another KLL producer.
+The reader still checks the record's definition, format and actual coverage
+before using its payload.
+
 A definition includes every field needed to decide semantic equivalence: source
 and filters, input value, operation or sketch parameters, grouping, time
 semantics, accuracy fields that affect state, and output type. Display names,
