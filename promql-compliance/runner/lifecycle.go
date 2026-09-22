@@ -11,6 +11,7 @@ import (
 )
 
 type ComposeLifecycle struct {
+	AdditionalServices       []string
 	Files                    []string
 	Project                  string
 	LogsDirectory            string
@@ -43,6 +44,12 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	}
 	if err := l.runCompose(ctx, environment, "up", "-d", "--build", "data-plane"); err != nil {
 		return err
+	}
+	if len(l.AdditionalServices) > 0 {
+		args := append([]string{"up", "-d"}, l.AdditionalServices...)
+		if err := l.runCompose(ctx, environment, args...); err != nil {
+			return err
+		}
 	}
 	return nil
 }

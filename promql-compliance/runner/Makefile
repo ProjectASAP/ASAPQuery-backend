@@ -30,3 +30,14 @@ run-all:
 		echo "Running $$name"; \
 		if ! go run ./cmd/differential-runner --dataset "$$dataset" --suite "$$suite" --reference-url "$(REFERENCE_URL)" --test-url "$(BACKEND_URL)" --compose-file "$(COMPOSE_FILE)" --logs-dir "$(LOGS_DIR)/$$name" --output "$(REPORT_DIR)/$$name.json"; then result=1; fi; \
 	done; go run ./cmd/report-card --reports-dir "$(REPORT_DIR)"; exit $$result
+
+.PHONY: benefit
+benefit:
+	mkdir -p "$(REPORT_DIR)" "$(LOGS_DIR)"
+	go run ./cmd/benefit-runner \
+		--dataset ../datasets/issue-754.yaml \
+		--suite ../suites/issue-754.yaml \
+		--compose-file ../docker-compose.yml \
+		--compose-file ../docker-compose.benefit.yml \
+		--output "$(REPORT_DIR)/issue-754-benefit.json" \
+		--logs-dir "$(LOGS_DIR)/issue-754-benefit"
