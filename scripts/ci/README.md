@@ -1,9 +1,9 @@
 # Planner main updates
 
 The backend keeps reproducible Planner revisions in `Cargo.toml` and `Cargo.lock`.
-`Sync Planner main` checks upstream main hourly (or on manual dispatch), updates
+`Sync ASAPPlanner main` checks upstream main daily (or on manual dispatch), updates
 all four Planner dependencies together, and opens or refreshes
-`automation/planner-main` against backend main. GitHub scheduled runs can be delayed.
+`automation/sync-asapplanner-main` against backend main. GitHub scheduled runs can be delayed.
 
 The existing `ASAP_CI_REPO_TOKEN` secret must have read access to private dependency
 repositories and **Contents and Pull requests write** access to this backend repo.
@@ -19,9 +19,12 @@ Failed updates stay open and main retains its last verified version. Fix an
 upstream incompatibility separately, or let the next upstream update refresh the
 PR. An automation failure is visible in Actions; check token permissions there.
 
-Locally, run `python3 scripts/ci/update_planner.py` from the repository root,
+Locally, run `./scripts/sync-asapplanner-main.sh` from the repository root,
 then run the same checks as MVP CI. Updater unit tests run with:
 
 ```sh
 python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 ```
+
+The sync script and scheduled workflow are shared with PR #765, at the same paths
+and with the same automation branch; there is only one updater.

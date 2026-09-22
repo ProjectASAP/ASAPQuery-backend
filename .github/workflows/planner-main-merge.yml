@@ -24,7 +24,7 @@ jobs:
           script: |
             const {owner, repo} = context.repo;
             const run = context.payload.workflow_run;
-            const prs = await github.rest.pulls.list({owner, repo, state: 'open', base: 'main', head: `${owner}:automation/planner-main`});
+            const prs = await github.rest.pulls.list({owner, repo, state: 'open', base: 'main', head: `${owner}:automation/sync-asapplanner-main`});
             if (prs.data.length !== 1) return;
             const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: prs.data[0].number});
             if (pr.head.repo.full_name !== `${owner}/${repo}` || pr.head.sha !== run.head_sha || pr.draft) return;
