@@ -519,13 +519,9 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 /// `ONLY_SPATIAL` — `sum by (host) (m)`.
 /// Control plane path: `Aggregate{Sum, by=[host]}` over a bare `Scan`.
 ///
-/// The old locally-defined `AggregationType::MultipleSum` (keyed vs
-/// unkeyed sum) identity no longer exists at the L4 IR level —
-/// `SummaryKind::Sum` covers both; the keyed/unkeyed distinction now
-/// lives on `SummaryAgg::by` (non-empty ⇒ the old "MultipleSum" shape),
-/// per `emit::mod.rs`'s exact-accumulator classification notes.
+/// Family remains Sum; the reduction carries the grouping columns.
 #[test]
-fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
+fn phase_b_pattern_only_spatial_aggregate_binds_to_grouped_sum() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![1]), // service column
         measures: vec![AggIntent::Sum { col: None }],
@@ -546,7 +542,7 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
                 assert_eq!(
                     reduction.group_keys().map(|k| k.keys()),
                     Some(&[1][..]),
-                    "keyed sum must carry the group-by column (the MultipleSum-equivalent signal)"
+                    "Sum reduction must retain the group-by column"
                 );
             }
             other => panic!("expected SummaryAgg(Sum, by=[1]), got {other:?}"),

@@ -275,8 +275,7 @@ impl Capability {
     /// §5/§8 Step 4) — via [`resolve_handle`], which picks a concrete
     /// per-family stand-in for the `Any` wildcard since `SketchAlgorithm`
     /// has no wildcard concept of its own; family-matching subsumes it.
-    /// `ExactAgg` is intentionally NOT routed through this path — see
-    /// [`multi_pop_satisfies_single`]'s doc for why.
+    /// Exact families require identity; keyed layout is checked separately.
     pub fn is_satisfied_by(&self, indexed: &Capability) -> bool {
         match (self, indexed) {
             (Capability::QuantileApprox(req), Capability::QuantileApprox(have)) => {
@@ -313,22 +312,9 @@ impl Capability {
                     SketchAlgorithm::CmsWithHeap,
                 )
             }
-            // Exact-aggregation family: the agg_type must match
-            // exactly OR be the single-pop ⇆ multi-pop equivalent. A
-            // `MultipleSum` policy can serve a `Sum` query by
-            // re-aggregating across keys; the `find_matching_policies`
-            // group_by ⊆ policy_grouping_labels check is what
-            // ultimately decides whether the re-aggregation is
-            // semantically valid. The reverse direction (single-pop
-            // serving multi-pop) is NOT allowed — the single-pop
-            // policy has lost the key dimension and can't recover it.
-            //
-            // Exact counter summaries are a distinct state contract. A sum of
-            // cumulative sample values cannot reconstruct reset correction or
-            // Prometheus boundary extrapolation.
-            (Capability::ExactAgg(req), Capability::ExactAgg(have)) => {
-                req == have || multi_pop_satisfies_single(*req, *have)
-            }
+            // Exact family identity must match. Grouping compatibility is
+            // checked separately by population routing.
+            (Capability::ExactAgg(req), Capability::ExactAgg(have)) => req == have,
             _ => false,
         }
     }
@@ -346,23 +332,6 @@ fn sketch_algorithms_compatible(
     let required = required.as_ref().unwrap_or(&required_any_stand_in);
     let available = available.as_ref().unwrap_or(&available_any_stand_in);
     sketch_family_satisfied(required, available)
-}
-
-/// True when `available` is the multi-population equivalent of
-/// `required`'s single-population variant — i.e. a `MultipleSum`
-/// policy can serve a `Sum` query (via re-aggregation across keys),
-/// `MultipleIncrease` can serve `Increase`, `MultipleMax` can
-/// serve `Max`. Asymmetric: this returns `false` for the reverse
-/// direction (single-pop can't recover keys that have been collapsed
-/// away).
-fn multi_pop_satisfies_single(required: AggregationType, available: AggregationType) -> bool {
-    matches!(
-        (required, available),
-        (AggregationType::Sum, AggregationType::MultipleSum)
-            | (AggregationType::Increase, AggregationType::MultipleIncrease)
-            | (AggregationType::Min, AggregationType::MultipleMin)
-            | (AggregationType::Max, AggregationType::MultipleMax)
-    )
 }
 
 // ── AggIntent → Capability bridge ────────────────────────────────────────────
@@ -590,7 +559,7 @@ mod tests {
         assert!(!Capability::ExactAgg(AggregationType::Max)
             .is_satisfied_by(&Capability::ExactAgg(AggregationType::Min)));
         assert!(!Capability::ExactAgg(AggregationType::Min)
-            .is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleMax)));
+            .is_satisfied_by(&Capability::ExactAgg(AggregationType::Max)));
     }
 
     #[test]
@@ -846,10 +815,6 @@ mod tests {
             AggregationType::Min,
             AggregationType::Max,
             AggregationType::DatasketchesKLL,
-            AggregationType::MultipleSum,
-            AggregationType::MultipleIncrease,
-            AggregationType::MultipleMin,
-            AggregationType::MultipleMax,
             AggregationType::HydraKLL,
             AggregationType::CountMinSketch,
             AggregationType::CountMinSketchWithHeap,
@@ -870,21 +835,16 @@ mod tests {
     fn sum_family_cannot_impersonate_exact_counter_state() {
         let required = Capability::ExactAgg(AggregationType::Increase);
         assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
-        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
 
-        let required_multi = Capability::ExactAgg(AggregationType::MultipleIncrease);
-        assert!(
-            !required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum))
-        );
+        let required_multi = Capability::ExactAgg(AggregationType::Increase);
+        assert!(!required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
     }
 
     #[test]
     fn is_satisfied_by_sum_family_does_not_answer_required_multi_increase_from_single_sum() {
-        // Same single/multi-population direction as multi_pop_satisfies_single:
-        // a single-pop available (Sum) can't serve a multi-pop required
-        // capability (MultipleIncrease) -- it already lost the per-key
-        // breakdown a multi-pop caller needs.
-        let required = Capability::ExactAgg(AggregationType::MultipleIncrease);
+        // A different exact family cannot supply counter state.
+        let required = Capability::ExactAgg(AggregationType::Increase);
         assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
     }
 

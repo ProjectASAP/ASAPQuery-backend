@@ -37,7 +37,7 @@
 //!    the GET endpoint reflects the registered aggregation.
 //!  * Test 2 — same shape with `group_by_labels: ["zone"]`; verifies
 //!    #245's grouping plumb survives the round-trip into the backend's
-//!    `AggregationConfig.grouping_labels`.
+//!    `PrecomputeMaterialization.grouping_labels`.
 //!  * Test 3 — full controller-to-query roundtrip: harness simulates
 //!    the agent (builds DDSketch state with `asap_sketchlib`, encodes
 //!    as a modified-OTLP `DdSketchDataPoint`), POSTs sketches to the
@@ -45,7 +45,7 @@
 //!    PromQL, asserts the response is well-formed for the planned
 //!    metric.
 
-use asap_types::AggregationConfig;
+use asap_types::PrecomputeMaterialization;
 use std::sync::Arc;
 use std::time::Duration;
 #[path = "support/physical_fixture.rs"]
@@ -76,7 +76,7 @@ fn phase_aligned_now_ns() -> u64 {
 async fn post_full_config(
     client: &reqwest::Client,
     stack: &FullStack,
-    materializations: &[AggregationConfig],
+    materializations: &[PrecomputeMaterialization],
 ) {
     let mut configs = materializations.to_vec();
     // The transport payloads below carry one-second states, so pin the
@@ -171,7 +171,7 @@ use prost::Message;
 /// target and read back whichever family and parameters Planner committed to,
 /// rather than pinning a family. Family selection itself is covered by the
 /// control-plane compiler tests.
-fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<AggregationConfig> {
+fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMaterialization> {
     use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
 
     let mut fixture: JsonValue = serde_json::from_str(include_str!(
@@ -632,7 +632,7 @@ async fn controller_streaming_config_round_trips_through_backend_http() {
 // Verifies #245's grouping plumb survives the controller → backend
 // round-trip. The workload carries `group_by_labels: ["zone"]`; the
 // emitted JSON must surface `["zone"]` in `labels.grouping`, the
-// backend's parser must materialise it into `AggregationConfig.
+// backend's parser must materialise it into `PrecomputeMaterialization.
 // grouping_labels`, and the active-config snapshot must reflect that.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1252,7 +1252,7 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
 /// content match probes `parameters.w` and `parameters.d`).
 /// Sketch width/depth the planner sized this materialization to. The test
 /// payloads are built against these, never against pinned constants.
-fn extract_w_d(agg: &AggregationConfig) -> (u32, u32) {
+fn extract_w_d(agg: &PrecomputeMaterialization) -> (u32, u32) {
     let w = agg.parameters["w"]
         .as_u64()
         .expect("materialization must carry parameters.w") as u32;

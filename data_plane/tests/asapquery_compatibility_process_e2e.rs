@@ -851,7 +851,14 @@ async fn run_shared_dashboard(multi_pane: bool) {
     snapshot = serde_json::to_value(&typed).unwrap();
     let plan = typed.compile_promql().unwrap();
     assert!(plan.cost_comparison.is_some());
-    assert_eq!(plan.precompute_plan.materializations.len(), 1);
+    assert_eq!(plan.precompute_plan.materializations.len(), 2);
+    let families = plan
+        .precompute_plan
+        .materializations
+        .iter()
+        .map(|m| m.aggregation_type.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(families, std::collections::BTreeSet::from(["Sum", "Count"]));
     assert_eq!(plan.query_plan.entries.len(), 3);
     if multi_pane {
         assert!(plan.lifecycle_estimates[0]

@@ -249,14 +249,20 @@ impl GroupState {
             asap_types::query_plan::ExactReadout::Max => asap_types::Statistic::Max,
         };
 
+        let planner_state = entries.iter().flat_map(|w| w.values()).any(|a| {
+            a.as_any()
+                .is::<crate::precompute_engine::operators::exact_accumulator::ExactAccumulator>()
+        });
         // Temporal exact summaries are the hot path for long-window
         // dashboards. Merge their concrete, fixed-size states in one batch
         // instead of allocating a boxed trait object for every pane.
-        if matches!(
-            readout,
-            asap_types::query_plan::ExactReadout::Increase
-                | asap_types::query_plan::ExactReadout::Rate
-        ) {
+        if !planner_state
+            && matches!(
+                readout,
+                asap_types::query_plan::ExactReadout::Increase
+                    | asap_types::query_plan::ExactReadout::Rate
+            )
+        {
             let accumulators = entries
                 .iter()
                 .flat_map(|windows| windows.values())
@@ -272,7 +278,7 @@ impl GroupState {
             ]);
             return merged.query_statistic(stat, key, &query_kwargs).ok();
         }
-        if readout == asap_types::query_plan::ExactReadout::Min {
+        if !planner_state && readout == asap_types::query_plan::ExactReadout::Min {
             return entries
                 .iter()
                 .flat_map(|windows| windows.values())
@@ -285,7 +291,7 @@ impl GroupState {
                 .into_iter()
                 .reduce(f64::min);
         }
-        if readout == asap_types::query_plan::ExactReadout::Max {
+        if !planner_state && readout == asap_types::query_plan::ExactReadout::Max {
             return entries
                 .iter()
                 .flat_map(|windows| windows.values())

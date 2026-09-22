@@ -1,6 +1,6 @@
 //! `RoutingIndex` — a metric-bucketed structural index over a
 //! [`PolicyRegistry`]. It is sourced from the content-addressed view over a
-//! `StreamingConfig`'s `AggregationConfig`s, so it represents planned policy
+//! `StreamingConfig`'s `PrecomputeMaterialization`s, so it represents planned policy
 //! rather than a reconstruction from ingest side effects.
 //!
 //! **Tier 1** (exact `PolicyFingerprint` → config) is [`PolicyRegistry::get`]
@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::aggregation_config::AggregationConfig;
+use crate::aggregation_config::PrecomputeMaterialization;
 use crate::policy_fingerprint::PolicyFingerprint;
 use crate::policy_registry::PolicyRegistry;
 
@@ -62,7 +62,7 @@ impl RoutingIndex {
 
     /// Tier 1 — exact fingerprint lookup. Delegates to the underlying
     /// registry; see [`PolicyRegistry::get`].
-    pub fn get(&self, fp: PolicyFingerprint) -> Option<&AggregationConfig> {
+    pub fn get(&self, fp: PolicyFingerprint) -> Option<&PrecomputeMaterialization> {
         self.registry.get(fp)
     }
 
@@ -136,8 +136,8 @@ mod tests {
     use crate::KeyByLabelNames;
     use std::collections::HashMap as StdHashMap;
 
-    fn cfg(metric: &str) -> AggregationConfig {
-        AggregationConfig::new(
+    fn cfg(metric: &str) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             StdHashMap::new(),
@@ -172,7 +172,7 @@ mod tests {
     fn multiple_policies_for_the_same_metric_all_bucket_together() {
         // Same metric, distinct group-by shapes -> distinct fingerprints,
         // same bucket.
-        let a = AggregationConfig::new(
+        let a = PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             StdHashMap::new(),
@@ -220,8 +220,9 @@ mod tests {
 
     #[test]
     fn len_and_is_empty_match_registry() {
-        let idx =
-            RoutingIndex::build(PolicyRegistry::from_configs(Vec::<AggregationConfig>::new()));
+        let idx = RoutingIndex::build(PolicyRegistry::from_configs(
+            Vec::<PrecomputeMaterialization>::new(),
+        ));
         assert!(idx.is_empty());
         assert_eq!(idx.len(), 0);
 
@@ -234,7 +235,7 @@ mod tests {
     fn ddsketch_alpha_and_relative_accuracy_are_wire_compatible() {
         let mut parameters = StdHashMap::new();
         parameters.insert("alpha".to_string(), serde_json::json!(0.01));
-        let config = AggregationConfig::new(
+        let config = PrecomputeMaterialization::new(
             AggregationType::DDSketch,
             String::new(),
             parameters,

@@ -582,7 +582,7 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 }
 
 /// Resolve the bucket sid (and `policy_fp`) for a single data point
-/// against a single matching `AggregationConfig`.
+/// against a single matching `PrecomputeMaterialization`.
 ///
 /// B7.6 — sid is the bucket identity in the precompute engine; this
 /// helper folds `(config, grouping-label-values)` into a single u64 via
@@ -602,7 +602,7 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 /// their separate wire-level identity protocol.
 fn resolve_bucket_sid_for_agg_config(
     ingest_state: &Arc<IngestState>,
-    config: &asap_types::aggregation_config::AggregationConfig,
+    config: &asap_types::aggregation_config::PrecomputeMaterialization,
     point_labels: &HashMap<String, String>,
     captured_generation: Option<&asap_types::sds::CatalogGeneration>,
 ) -> Result<(u64, asap_types::PolicyFingerprint), String> {
@@ -1783,15 +1783,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // Detection is independent of the legacy dual-write
                     // (it only drives the routed/unconfigured accounting),
                     // so we walk it whether or not the worker push fires.
-                    let matching_configs: Vec<&asap_types::aggregation_config::AggregationConfig> =
-                        agg_configs
-                            .values()
-                            .filter(|config| {
-                                config.metric == canonical_name
-                                    || config.spatial_filter_normalized == canonical_name
-                                    || config.spatial_filter == canonical_name
-                            })
-                            .collect();
+                    let matching_configs: Vec<
+                        &asap_types::aggregation_config::PrecomputeMaterialization,
+                    > = agg_configs
+                        .values()
+                        .filter(|config| {
+                            config.metric == canonical_name
+                                || config.spatial_filter_normalized == canonical_name
+                                || config.spatial_filter == canonical_name
+                        })
+                        .collect();
                     let matched_any = !matching_configs.is_empty();
 
                     // CQ-2 — only pay the worker push (and the per-config
@@ -1869,7 +1870,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         routed += 1;
                     } else {
                         // CQ-6 — a decoded sketch that matched no
-                        // AggregationConfig in the running streaming config.
+                        // PrecomputeMaterialization in the running streaming config.
                         ingest_state
                             .observability
                             .dropped_unconfigured
@@ -1914,7 +1915,7 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// `AggregationType`. Inverse direction is in
 /// `sketch_algorithm_for` above. Used by
 /// [`derive_sketch_policy_fp`] to find the policy whose
-/// `AggregationConfig.aggregation_type` matches a freshly-ingested
+/// `PrecomputeMaterialization.aggregation_type` matches a freshly-ingested
 /// sketch.
 ///
 /// `Any` is a control-plane analysis-time wildcard — it doesn't
@@ -3466,7 +3467,7 @@ mod policy_fp_lookup_tests {
     fn sketch_config_to_params_uses_canonical_keys() {
         // The param-name vocabulary must match what the control plane
         // writes in streaming-config YAML (see
-        // `asap_types::aggregation_config::AggregationConfig::from_yaml_data`).
+        // `asap_types::aggregation_config::PrecomputeMaterialization::from_yaml_data`).
         // Drift surfaces as `find_policy_by_content` missing matches.
         let dd = sketch_config_to_params(&SketchConfig::DDSketch {
             relative_accuracy: 0.01,
@@ -4564,7 +4565,7 @@ mod sid_bucketing_tests {
         metric::Data, number_data_point::Value as NumberValue, Gauge as PbGauge,
         Metric as PbMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
     };
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -4581,8 +4582,8 @@ mod sid_bucketing_tests {
         }
     }
 
-    fn sum_agg_config(metric: &str, grouping: &[&str]) -> AggregationConfig {
-        AggregationConfig::new(
+    fn sum_agg_config(metric: &str, grouping: &[&str]) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             AggregationType::SingleSubpopulation,
             "Sum".to_string(),
             HashMap::new(),
