@@ -4,7 +4,9 @@
 //! data-plane executable, register, report different rates, and receive
 //! differentiated sampling grants over bidirectional gRPC streams.
 
-use std::io::Write;
+#[path = "support/empty_streaming_config.rs"]
+mod empty_streaming_config;
+
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -110,11 +112,12 @@ async fn production_coordinator_differentiates_edge_sampling_grants() {
     let monitor_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create output directory");
     let mut config = tempfile::NamedTempFile::new().expect("create monitor config");
-    write!(
-        config,
-        "aggregations: []\nmonitors:\n  - agg_id: 1\n    key: ''\n    tau: 5000.0\n    epsilon: 0.05\n    window_ms: 60000\n"
+    let mut runtime = empty_streaming_config::empty();
+    runtime.monitors = serde_yaml::from_str(
+        "- agg_id: 1\n  key: ''\n  tau: 5000.0\n  epsilon: 0.05\n  window_ms: 60000\n",
     )
-    .expect("write monitor config");
+    .unwrap();
+    serde_yaml::to_writer(&mut config, &runtime).expect("write monitor config");
 
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--streaming-config")

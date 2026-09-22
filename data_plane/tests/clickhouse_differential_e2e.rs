@@ -1,10 +1,12 @@
-//! Optional real-ClickHouse protocol and Grafana smoke coverage.
+//! Optional real-ClickHo#[path = "support/empty_streaming_config.rs"]
+mod empty_streaming_config;
+
+use protocol and Grafana smoke coverage.
 //!
 //! Set `CLICKHOUSE_URL` (for example `http://127.0.0.1:8123`) to run it.
 
 use std::{
     collections::HashMap,
-    io::Write,
     net::TcpListener,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -345,7 +347,7 @@ async fn run_mixed_aggregate(aggregate: &str) {
     let sql_port = unused_port();
     let output = tempfile::tempdir().unwrap();
     let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
-    writeln!(bootstrap, "aggregations: []").unwrap();
+    serde_yaml::to_writer(&mut bootstrap, &empty_streaming_config::empty()).unwrap();
     let _process = spawn_backend(
         &clickhouse_url,
         user.as_deref(),
@@ -540,7 +542,7 @@ async fn moving_windows_match_clickhouse_after_automatic_publication() {
     let sql_port = unused_port();
     let output = tempfile::tempdir().unwrap();
     let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
-    writeln!(bootstrap, "aggregations: []").unwrap();
+    serde_yaml::to_writer(&mut bootstrap, &empty_streaming_config::empty()).unwrap();
     let _process = spawn_backend(
         &clickhouse_url,
         user.as_deref(),
@@ -724,7 +726,7 @@ async fn collection_sql_executes_local_elements_after_typed_exact_leaf() {
     let sql_port = unused_port();
     let output = tempfile::tempdir().unwrap();
     let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
-    writeln!(bootstrap, "aggregations: []").unwrap();
+    serde_yaml::to_writer(&mut bootstrap, &empty_streaming_config::empty()).unwrap();
     let _process = spawn_backend(
         &clickhouse_url,
         user.as_deref(),

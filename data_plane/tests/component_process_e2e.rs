@@ -7,7 +7,6 @@
 #[path = "support/physical_fixture.rs"]
 mod physical_fixture;
 
-use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -120,30 +119,17 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create log directory");
     let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    write!(
-        config,
-        r#"aggregations:
-  - aggregationType: DDSketch
-    aggregationSubType: ''
-    labels:
-      grouping: [service]
-      rollup: []
-      aggregated: []
-    metric: component_process_e2e_latency_ms
-    parameters:
-      relative_accuracy: 0.01
-    windowSize: 1
-    windowType: tumbling
-    spatialFilter: ''
-"#
-    )
-    .expect("write streaming config");
-
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
-        &serde_yaml::from_slice(&std::fs::read(config.path()).unwrap()).unwrap(),
+    let install =
+        physical_fixture::artifact_from_materializations(vec![physical_fixture::materialization(
+            "component_process_e2e_latency_ms",
+            asap_types::AggregationType::DDSketch,
+            [("relative_accuracy".into(), serde_json::json!(0.01))].into(),
+        )]);
+    let runtime = data_plane::storage_engines::types::StreamingConfig::from_precompute_plan(
+        install.precompute_plan.clone(),
     )
     .unwrap();
-    let install = physical_fixture::artifact(&runtime);
+    serde_yaml::to_writer(&mut config, &runtime).unwrap();
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();
 

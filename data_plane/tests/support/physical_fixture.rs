@@ -8,6 +8,32 @@ use data_plane::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
+/// Imported-state fixtures bind explicit storage metadata, never a flat runtime config.
+#[allow(dead_code)]
+pub fn materialization(
+    metric: &str,
+    family: asap_types::AggregationType,
+    parameters: std::collections::HashMap<String, serde_json::Value>,
+) -> asap_types::PrecomputeMaterialization {
+    asap_types::PrecomputeMaterialization::new(
+        family,
+        String::new(),
+        parameters,
+        asap_types::KeyByLabelNames::new(vec!["service".into()]),
+        asap_types::KeyByLabelNames::empty(),
+        asap_types::KeyByLabelNames::empty(),
+        String::new(),
+        1,
+        1,
+        asap_types::enums::WindowKind::Tumbling,
+        String::new(),
+        metric.into(),
+        None,
+        None,
+        None,
+    )
+}
+
 pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
     artifact_from_materializations(
         config
