@@ -50,7 +50,7 @@ The migration produces:
 
 ```yaml
 plan_version: 42
-summary_catalog:
+summary_definitions:
   definition: {id: def-9, algorithm: kll, k: 200}
 
 precompute_plan:
@@ -124,8 +124,9 @@ Version the split representation. Do not reinterpret an old field under an
 unchanged schema version.
 
 Do not introduce a standalone catalog `Materialization` object. Keep definitions
-in the catalog, format/partition/writer configuration in executable bindings,
-and actual coverage/readiness with payloads in `SummaryStore`. Normalize legacy
+in `SummaryStore.summary_definitions`, format/partition/writer configuration in
+executable bindings, and actual coverage with payloads in
+`SummaryStore.stored_summaries`. Normalize legacy
 stored-output identities into version-scoped `stored_output_id` values;
 validate all consumers against the same writer configuration. The existing
 `BackendNodeBinding::Materialization` remains a placement marker for stored output.
