@@ -13,15 +13,18 @@ fn log_query_outcome<T>(
     call_id: u64,
     operation: &'static str,
     started: Instant,
+    remote_stats: Option<(usize, usize)>,
     result: &Result<T, crate::query_engines::EngineError>,
 ) {
     match result {
-        Ok(_) => debug!(target: "asap_runtime_debug",
-            call_id,
-            operation,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "query call completed"
-        ),
+        Ok(_) => match remote_stats {
+            Some((remote_evaluations, remote_rpcs)) => debug!(target: "asap_runtime_debug",
+                call_id, operation, elapsed_ms = started.elapsed().as_millis() as u64,
+                remote_evaluations, remote_rpcs, "query call completed"),
+            None => debug!(target: "asap_runtime_debug",
+                call_id, operation, elapsed_ms = started.elapsed().as_millis() as u64,
+                "query call completed"),
+        },
         Err(error @ crate::query_engines::EngineError::CapabilityMiss { .. }) => {
             debug!(target: "asap_runtime_debug",
             call_id, operation, elapsed_ms = started.elapsed().as_millis() as u64,
@@ -224,6 +227,7 @@ impl ASAPQueryEngine {
     {
         let call_id = query_call_id();
         let started = Instant::now();
+        let mut remote_stats = None;
         debug!(target: "asap_runtime_debug",
             call_id,
             operation = "metricsql_instant",
@@ -246,7 +250,7 @@ impl ASAPQueryEngine {
                         error.to_string(),
                     )
                 })?;
-            debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
             query_id = %planned.query_id, evaluation_ms = now_ms,
             "installed MetricsQL instant query selected");
             let leaves = self
@@ -257,14 +261,12 @@ impl ASAPQueryEngine {
             stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
             stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
             annotate_logical_execution(&mut result, &stats);
-            debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
-            query_id = %planned.query_id, remote_evaluations = stats.remote_evaluations,
-            remote_rpcs = stats.remote_rpcs, "installed MetricsQL instant query completed");
+            remote_stats = Some((stats.remote_evaluations, stats.remote_rpcs));
             Ok(result)
         }
         .instrument(tracing::info_span!("query_call", call_id))
         .await;
-        log_query_outcome(call_id, "metricsql_instant", started, &result);
+        log_query_outcome(call_id, "metricsql_instant", started, remote_stats, &result);
         result
     }
 
@@ -302,7 +304,7 @@ impl ASAPQueryEngine {
                         error.to_string(),
                     )
                 })?;
-            debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
             query_id = %planned.query_id, start_ms, end_ms, step_ms,
             "installed MetricsQL range query selected");
             self.execute_logical_range(&physical, planned, start_ms, end_ms, step_ms)
@@ -310,7 +312,7 @@ impl ASAPQueryEngine {
         }
         .instrument(tracing::info_span!("query_call", call_id))
         .await;
-        log_query_outcome(call_id, "metricsql_range", started, &result);
+        log_query_outcome(call_id, "metricsql_range", started, None, &result);
         result
     }
 
@@ -841,7 +843,7 @@ impl ASAPQueryEngine {
                 if entry.nodes.values().any(|node| {
                     matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
                 }) {
-                    debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                    debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
                         query_id = %entry.query_id, "installed query DAG selected");
                     return self
                         .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
@@ -947,7 +949,7 @@ impl ASAPQueryEngine {
         // retained for legacy/test callers without an active QueryPlan only.
         Ok(warm_qr)
         }.instrument(tracing::info_span!("query_call", call_id)).await;
-        log_query_outcome(call_id, "promql_range", started, &result);
+        log_query_outcome(call_id, "promql_range", started, None, &result);
         result
     }
 }
@@ -1094,6 +1096,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     {
         let call_id = query_call_id();
         let started = Instant::now();
+        let mut remote_stats = None;
         debug!(target: "asap_runtime_debug",
             call_id,
             operation = "promql_instant",
@@ -1103,14 +1106,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         let result = async {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                debug!(target: "asap_runtime_debug", plan_id = physical.plan_id(), plan_version = physical.plan_version(),
                     query_id = %entry.query_id, evaluation_ms = now_ms,
                     "installed query DAG selected");
                 let leaves = self
                     .prepare_query_inputs(&physical, entry, &[now_ms])
                     .await
                     .map_err(|error| {
-                        tracing::warn!(call_id, plan_id = physical.plan_id(),
+                        tracing::warn!(plan_id = physical.plan_id(),
                             plan_version = physical.plan_version(), query_id = %entry.query_id,
                             error = %error, "installed query DAG preparation failed");
                         error
@@ -1118,7 +1121,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 let (mut result, mut stats) = self
                     .execute_logical_entry(&physical, entry, &leaves, now_ms)
                     .map_err(|error| {
-                        tracing::warn!(call_id, plan_id = physical.plan_id(),
+                        tracing::warn!(plan_id = physical.plan_id(),
                             plan_version = physical.plan_version(), query_id = %entry.query_id,
                             error = %error, "installed query DAG execution failed");
                         error
@@ -1127,9 +1130,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     leaves.values().map(|leaf| leaf.remote_evaluations).sum();
                 stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
                 annotate_logical_execution(&mut result, &stats);
-                debug!(target: "asap_runtime_debug", call_id, plan_id = physical.plan_id(), plan_version = physical.plan_version(),
-                    query_id = %entry.query_id, remote_evaluations = stats.remote_evaluations,
-                    remote_rpcs = stats.remote_rpcs, "installed query DAG completed");
+                remote_stats = Some((stats.remote_evaluations, stats.remote_rpcs));
                 return Ok(result);
             }
         }
@@ -1225,7 +1226,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             format!("ASAPQueryEngine: no sketch index for `{query}` — failing over to archive"),
         ))
         }.instrument(tracing::info_span!("query_call", call_id)).await;
-        log_query_outcome(call_id, "promql_instant", started, &result);
+        log_query_outcome(call_id, "promql_instant", started, remote_stats, &result);
         result
     }
 
