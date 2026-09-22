@@ -32,28 +32,30 @@ Cost ranking, operator scheduling and transmission policy are outside SDS.
 
 The Summary Catalog stores `SummaryDefinition` entries. PrecomputePlan and
 QueryPlan carry matching state references and format/partition configuration.
-Runtime inventory records actual state instances; payload bytes live in the
-summary store.
+`SummaryMetadataStore` records metadata for actual state instances; payload
+bytes live in `SummaryPayloadStore`.
 There is no separate catalog `Materialization` object.
 
 The compiler/catalog authority registers a `SummaryDefinition` when installing
 the plan. The edges from both plans to that catalog are definition references
 validated by catalog reads at installation, not runtime writes or serving-time
 catalog searches. At runtime, PrecomputePlan writes summary payload bytes to
-the store and publishes each instance's metadata to the inventory. QueryPlan
-checks the inventory for a ready matching instance, then reads its payload from
-the store. SDS describes this combined contract; its metadata is not all stored
-in the Summary Catalog. Definition semantics live in the catalog,
-writer/reader constraints in the installed plans, and actual partition,
-coverage, format, readiness and location in runtime instance metadata.
+`SummaryPayloadStore` and publishes each instance's metadata to
+`SummaryMetadataStore`. QueryPlan checks `SummaryMetadataStore` for a ready
+matching instance, then reads its payload from `SummaryPayloadStore`. SDS spans
+three distinct locations: the Summary Catalog stores immutable
+`SummaryDefinition` semantics; installed plans store writer and reader
+constraints; `SummaryMetadataStore` stores each actual instance's partition,
+coverage, format, readiness and location. The metadata store does not hold
+definitions, and the catalog does not track runtime instances.
 
 ```mermaid
 flowchart LR
   C[Compiler/catalog authority] -->|register definition: write| D[Summary Catalog]
   P[PrecomputePlan] -->|validate definition: read at install| D
   Q[QueryPlan] -->|validate definition: read at install| D
-  P -->|write payload| S[Summary store]
-  P -->|publish instance metadata: write| I[Runtime instance inventory]
+  P -->|write payload| S[SummaryPayloadStore]
+  P -->|publish instance metadata: write| I[SummaryMetadataStore]
   Q -->|resolve ready instance: read| I
   Q -->|read payload| S
 ```
@@ -152,12 +154,12 @@ before installation. Repetition of format fields in the serialized plans does
 not authorize independent selection. The catalog does not need a second registry
 for those fields. The selected deployment guarantee and schedule/retention belong
 to Planner's deployment decision and the installed PrecomputePlan binding;
-observed readiness belongs to runtime inventory.
+observed readiness belongs to `SummaryMetadataStore`.
 
 A state instance records plan version, slot, definition, actual format and its
 partition key, coverage/completion, producer sequence
 where applicable, lifecycle status, location and integrity metadata. Payload
-bytes remain in the summary store, not in catalog descriptors.
+bytes remain in `SummaryPayloadStore`, not in catalog descriptors.
 
 ## Identity and reference rules
 
@@ -250,10 +252,10 @@ Compilation, installation, writes, recovery and reads enforce:
 7. Unknown schemas, malformed payloads and unauthorized updates fail closed.
 
 The current backend distributes these responsibilities across `asap_types`,
-control-plane publication and the summary store. Migration reuses authoritative
-IDs and metadata rather than creating a parallel registry. Legacy artifacts are
-normalized at the backend boundary and supported payloads retain versioned
-readers and fixtures.
+control-plane publication, `SummaryMetadataStore` and `SummaryPayloadStore`.
+Migration reuses authoritative IDs and metadata rather than creating a parallel
+registry. Legacy artifacts are normalized at the backend boundary and supported
+payloads retain versioned readers and fixtures.
 
 Remove the proposed `materializations` catalog collection and standalone object
 from new plan examples and schemas. Preserve the existing
