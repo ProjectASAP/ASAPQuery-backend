@@ -15,7 +15,7 @@ per-query p50/p95 latency samples. It fails if the backend does not improve CPU,
 peak memory, and each query's p95 latency against every exact baseline. The full
 JSON report and service logs are uploaded by the CI workflow even on failure.
 
-The checked-in CI fixture has four series at 100 ms cadence and a one-minute
+The checked-in CI fixture has eight series at 100 ms cadence and a one-minute
 window. It is a deterministic acceptance point, not a scalability claim across
 the full cardinality and time-range matrix in issue #754. Run larger matrix
 points separately using the same suite and dataset schema and retain the same
