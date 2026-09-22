@@ -27,7 +27,6 @@ services:
       "--prometheus-server", "http://{{ prometheus_host }}:{{ prometheus_port }}",
       "--prometheus-scrape-interval", "{{ prometheus_scrape_interval }}",
       "--delete-existing-db",
-      "--log-level", "{{ log_level }}",
       "--output-dir", "/app/outputs",
       "--streaming-engine", "{{ streaming_engine }}",
       "--query-language", "{{ query_language }}",
