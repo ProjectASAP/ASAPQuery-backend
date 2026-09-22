@@ -226,32 +226,50 @@ starts with the first complete post-restart window.
 | Activation | Stage/activate failure tests and readiness assertions |
 | Deployment | `./scripts/e2e.sh asapquery-demo` with no Collector |
 
-The E2E query matrix compares every backend result with the same Prometheus:
+The acceptance matrix extends the original demo with the repeated workloads from
+[issue #701](https://github.com/ProjectASAP/ASAPQuery-backend/issues/701) and
+[issue #702](https://github.com/ProjectASAP/ASAPQuery-backend/issues/702). It is
+required coverage, not a claim that the current demo already runs every row:
 
-| Case | Instant | Range |
-| --- | --- | --- |
-| `rate(counter[window])` | Required | Every returned step |
-| `increase(counter[window])` | Required | Every returned step |
-| Planned sum | Required | Required |
-| Planned sketch quantile | Required | Required |
-| Unsupported expression | Exact fallback | Exact fallback |
+| Query family | Required instant checks | Required range checks | Current evidence |
+| --- | --- | --- | --- |
+| Counter `rate` and `increase`, including resets | Compare each planned endpoint with Prometheus | Compare every returned step | Compatibility process test covers both endpoints |
+| `sum_over_time`, `count_over_time`, `min_over_time`, `max_over_time`, `avg_over_time`, and grouped sum readout | Confirm a warm result at successive evaluation times and exact semantics | Compare every step, including non-aligned endpoints | #701/#702 process test covers successive instant evaluations; complete range matrix remains to be added |
+| Instant `sum`, `count`, and `avg`, grouped by `job` and ungrouped | Compile or explicitly route to exact; compare series membership and values | Compare every step of a range request for the same expression | #702 process test covers successive instant evaluations; range comparison remains to be added |
+| `quantile_over_time` with 15m range every 1m and 5m range every 30s or 10s; instant `quantile by (job)` every 1s | Confirm shared producers, warm non-aligned endpoints and the declared accuracy guarantee | Compare every step, including endpoints between physical pane boundaries | #701/#702 process test covers successive instant evaluations; full range comparison remains to be added |
+| `topk` over temporal sum and count | Compare values, labels and changing Top-K membership | Compare membership and values at every step | Compatibility process test covers two range steps |
+| Quantile ratio and `avg_over_time`/quantile ratio | Check composed result when defined; require exact fallback when the denominator makes the promised error undefined | Apply the same rule at every step | #701/#702 process test covers instant composition and zero-denominator fallback; range comparison remains to be added |
+| Unplanned or unsupported expression | Forward the complete request to Prometheus | Forward the complete range request | Compatibility process test captures both fallback requests |
 
-Counter fixtures cover reset, irregular spacing and boundary samples. Assertions
-include values, labels, timestamps, result type and range-step count; HTTP success
-alone is insufficient. The run records workload/Planner artifacts, active IDs,
-route decisions, coverage, freshness, error, latency, CPU and memory.
+The same input must reach backend and Prometheus for a real differential run.
+Exact results compare values, labels, timestamps and result shape; approximate
+quantiles use their declared error guarantee rather than byte equality. A warm
+claim must be checked separately from numeric parity, and a fallback claim must
+be backed by a captured upstream request. Counter fixtures cover reset,
+irregular spacing and boundary samples. Range assertions include step count and
+every returned evaluation, not just the first and last.
+
+The current #701/#702 process fixture forces a fully warm candidate with
+synthetic correctness quotes. Its real Prometheus oracle runs only when
+`ASAP_CURRENT_SERIES_PROMETHEUS_URL` is set; otherwise it proves warm routing and
+fixture assertions without a real differential comparison. The Docker demo
+covers a smaller set of queries. Neither run alone satisfies this matrix.
+Record workload and Planner artifacts, active IDs, route decisions, coverage,
+freshness, error, latency, CPU and memory with the completed run.
 
 ## Completion and extensions
 
-The executable completion command is:
+The existing real-Prometheus demo command is:
 
 ```bash
 ./scripts/e2e.sh asapquery-demo
 ```
 
-It must fail when ingestion, planning, activation, coverage, accuracy, counter
-semantics, range equivalence or fallback evidence is missing. Starting components
-or exposing `/api/v1/write` alone is not completion.
+It exercises the original compatibility subset. Full completion also requires
+the #701/#702 workload suite with a real Prometheus oracle and the range checks
+identified above. Until those checks are wired into a required gate, the demo
+must not be reported as proof of the full matrix. Starting components or exposing
+`/api/v1/write` alone is not completion.
 
 SQL is the first intended query extension. It must translate into canonical
 Planner semantics and reuse the same catalog, readiness, store and fallback
