@@ -507,6 +507,10 @@ impl Worker {
             return Ok(());
         }
         let state = self.group_states.get_mut(&sid).unwrap();
+        debug!(target: "asap_runtime_debug", aggregation_type = ?state.config.aggregation_type,
+            window_secs = state.config.window_size, slide_secs = state.config.slide_interval,
+            layout = ?state.config.window_layout,
+            "worker group maintenance configuration selected");
 
         // Keep original timestamps inside accumulators (notably rate/increase),
         // shifting only pane membership and closure watermark for PromQL (a,b].
@@ -800,6 +804,10 @@ impl Worker {
         let state = self.group_states.get_mut(&sid).unwrap();
 
         let previous_event_time = state.max_event_time_ms;
+        debug!(target: "asap_runtime_debug", aggregation_type = ?state.config.aggregation_type,
+            window_secs = state.config.window_size, slide_secs = state.config.slide_interval,
+            layout = ?state.config.window_layout,
+            "worker accumulator maintenance configuration selected");
         let current_event_time = if timestamp_ms > previous_event_time {
             timestamp_ms
         } else {

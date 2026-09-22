@@ -221,11 +221,19 @@ impl SummaryDescriptorRegistry {
             }
         };
 
+        let catalog_generation = authoritative.map(|(_, generation)| generation);
+        tracing::debug!(target: "asap_runtime_debug", sid = metadata.sid,
+            policy_fp = %metadata.policy_fp,
+            summary_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(summary_descriptor.id().canonical().as_bytes(), 0)),
+            data_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(data_id.canonical().as_bytes(), 0)),
+            plan_id = catalog_generation.as_ref().map(|g| g.plan_id),
+            plan_version = catalog_generation.as_ref().map(|g| g.plan_version),
+            "SDS descriptor binding resolved");
         Ok(SdsBinding {
             metadata: Arc::new(metadata),
             summary_descriptor,
             data_descriptor,
-            catalog_generation: authoritative.map(|(_, generation)| generation),
+            catalog_generation,
         })
     }
 

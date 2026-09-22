@@ -51,6 +51,34 @@ pub enum ScheduleError<OperatorError, SinkError> {
     Sink(SinkError),
 }
 
+fn node_syntax(payload: &ExecutableOperatorPayload) -> String {
+    let details = match payload {
+        ExecutableOperatorPayload::Fallback { .. } => String::new(),
+        ExecutableOperatorPayload::Binary { timing, operator } => {
+            format!("operator={operator:?} timing={timing:?}")
+        }
+        ExecutableOperatorPayload::CandidateTopK { k, .. } => format!("k={k}"),
+        ExecutableOperatorPayload::Value { operation, timing } => {
+            format!("operation={operation:?} timing={timing:?}")
+        }
+        ExecutableOperatorPayload::RelationalJoin { join_kind, .. } => {
+            format!("join_kind={join_kind:?}")
+        }
+        ExecutableOperatorPayload::SummaryAgg {
+            family,
+            input,
+            reduction,
+            ..
+        } => format!("family={family:?} input={input:?} reduction={reduction:?}"),
+        ExecutableOperatorPayload::SummaryJoin { family, .. } => format!("family={family:?}"),
+        ExecutableOperatorPayload::SummarySubtract => String::new(),
+        ExecutableOperatorPayload::SummaryDelete { .. } => String::new(),
+        ExecutableOperatorPayload::SummaryEstimate { query } => format!("readout={query:?}"),
+        ExecutableOperatorPayload::SummaryMerge => String::new(),
+    };
+    details.chars().take(256).collect()
+}
+
 /// Execute one precompute sink and its transitive dependencies in topological
 /// order. Intermediates use `Arc`, so a shared upstream node is computed once
 /// without copying summary payloads. Only the sink is committed; upstream
@@ -67,6 +95,13 @@ where
     R: PrecomputeOperatorRegistry<V>,
     S: IdempotentCommitSink<V>,
 {
+    let _span = tracing::debug_span!(target: "asap_runtime_debug", "precompute_dag",
+        plan_id = key.plan_id, plan_version = key.plan_version,
+        sink_node_id = sink_node.0, summary_definition = key.summary_definition.as_u64(),
+        window_start_ms = key.window_start_ms, window_end_ms = key.window_end_ms)
+    .entered();
+    tracing::debug!(target: "asap_runtime_debug", node_count = dag.nodes.len(), edge_count = dag.edges.len(),
+        "precompute DAG execution started");
     if !matches!(binding.node(sink_node), Some(BackendNodeBinding::Materialization { summary_definition }) if *summary_definition == key.summary_definition)
     {
         return Err(ScheduleError::Invalid(format!(
@@ -86,6 +121,7 @@ where
         ));
     }
     if let Some(committed) = sink.get(&key).map_err(ScheduleError::Sink)? {
+        tracing::debug!(target: "asap_runtime_debug", "precompute DAG reused committed sink");
         return Ok(committed);
     }
     let nodes = dag
@@ -151,6 +187,7 @@ where
         let node = nodes
             .get(&id)
             .ok_or_else(|| ScheduleError::Invalid(format!("missing node {id}")))?;
+        let op = node.operator;
         if node.output_state == ExecutionDataState::READ_ROWS {
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
@@ -160,6 +197,8 @@ where
             .materialized_input(node)
             .map_err(ScheduleError::Operator)?
         {
+            tracing::debug!(target: "asap_runtime_debug", node_id = id, ?op,
+                "precompute node used materialized input");
             values.insert(id, Arc::new(value));
             active.remove(&id);
             return Ok(());
@@ -172,9 +211,21 @@ where
             .iter()
             .map(|child| Arc::clone(&values[child]))
             .collect::<Vec<_>>();
-        let value = registry
-            .execute(node, &child_values)
-            .map_err(ScheduleError::Operator)?;
+        let started = std::time::Instant::now();
+        tracing::debug!(target: "asap_runtime_debug", node_id = id, ?op,
+            syntax = %node_syntax(&node.payload), inputs = ?child_ids,
+            "precompute node started");
+        let value = registry.execute(node, &child_values).map_err(|error| {
+            tracing::warn!(
+                node_id = id,
+                ?op,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "precompute node failed"
+            );
+            ScheduleError::Operator(error)
+        })?;
+        tracing::debug!(target: "asap_runtime_debug", node_id = id, ?op,
+            elapsed_us = started.elapsed().as_micros() as u64, "precompute node completed");
         values.insert(id, Arc::new(value));
         active.remove(&id);
         Ok(())
@@ -187,8 +238,12 @@ where
         &mut values,
         registry,
     )?;
-    sink.commit_if_absent(key, values.remove(&sink_node.0).unwrap())
-        .map_err(ScheduleError::Sink)
+    let result = sink
+        .commit_if_absent(key, values.remove(&sink_node.0).unwrap())
+        .map_err(ScheduleError::Sink);
+    tracing::debug!(target: "asap_runtime_debug", success = result.is_ok(),
+        "precompute DAG sink commit completed");
+    result
 }
 
 #[cfg(test)]
