@@ -7,7 +7,6 @@
 #[path = "support/physical_fixture.rs"]
 mod physical_fixture;
 
-use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -18,7 +17,7 @@ use asap_otel_proto::tonic::metrics::v1::{
     metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_sketchlib::proto::sketchlib::DdSketchState;
+use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
 use prost::Message;
 
 struct ChildGuard(Child);
@@ -53,7 +52,12 @@ fn ddsketch_export(metric: &str, timestamp_ns: u64, counts: Vec<u64>) -> Vec<u8>
         }],
         start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
         time_unix_nano: timestamp_ns,
-        sketch: state.encode_to_vec(),
+        sketch: SketchEnvelope {
+            format_version: 1,
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+            ..Default::default()
+        }
+        .encode_to_vec(),
         encoding: DdSketchEncoding::DdsketchEncodingProto as i32,
         exemplars: Vec::new(),
         flags: 0,
@@ -119,39 +123,18 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create log directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    write!(
-        config,
-        r#"aggregations:
-  - aggregationType: DDSketch
-    aggregationSubType: ''
-    labels:
-      grouping: [service]
-      rollup: []
-      aggregated: []
-    metric: component_process_e2e_latency_ms
-    parameters:
-      relative_accuracy: 0.01
-    windowSize: 1
-    windowType: tumbling
-    spatialFilter: ''
-"#
-    )
-    .expect("write streaming config");
-
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
-        &serde_yaml::from_slice(&std::fs::read(config.path()).unwrap()).unwrap(),
-    )
-    .unwrap();
-    let install = physical_fixture::artifact(&runtime);
+    let install =
+        physical_fixture::artifact_from_materializations(vec![physical_fixture::materialization(
+            "component_process_e2e_latency_ms",
+            asap_types::AggregationType::DDSketch,
+            [("relative_accuracy".into(), serde_json::json!(0.01))].into(),
+        )]);
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--physical-plan")
         .arg(physical.path())
-        .arg("--streaming-config")
-        .arg(config.path())
         .arg("--http-port")
         .arg(query_port.to_string())
         .arg("--output-dir")

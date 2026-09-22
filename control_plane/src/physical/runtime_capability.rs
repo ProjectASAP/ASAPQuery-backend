@@ -101,7 +101,7 @@ pub enum Capability {
 /// * Sum-over-time requires archive execution because cumulative samples
 ///   cannot be reconstructed from delta state alone.
 ///
-/// Rate and Increase require the Increase capability; plain sum requires Sum.
+/// Rate and Increase have distinct exact-family capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OuterFn {
     /// No range-style counter function in the expression — bare selector,
@@ -275,8 +275,7 @@ impl Capability {
     /// §5/§8 Step 4) — via [`resolve_handle`], which picks a concrete
     /// per-family stand-in for the `Any` wildcard since `SketchAlgorithm`
     /// has no wildcard concept of its own; family-matching subsumes it.
-    /// `ExactAgg` is intentionally NOT routed through this path — see
-    /// [`multi_pop_satisfies_single`]'s doc for why.
+    /// Exact families require identity; keyed layout is checked separately.
     pub fn is_satisfied_by(&self, indexed: &Capability) -> bool {
         match (self, indexed) {
             (Capability::QuantileApprox(req), Capability::QuantileApprox(have)) => {
@@ -313,22 +312,9 @@ impl Capability {
                     SketchAlgorithm::CmsWithHeap,
                 )
             }
-            // Exact-aggregation family: the agg_type must match
-            // exactly OR be the single-pop ⇆ multi-pop equivalent. A
-            // `MultipleSum` policy can serve a `Sum` query by
-            // re-aggregating across keys; the `find_matching_policies`
-            // group_by ⊆ policy_grouping_labels check is what
-            // ultimately decides whether the re-aggregation is
-            // semantically valid. The reverse direction (single-pop
-            // serving multi-pop) is NOT allowed — the single-pop
-            // policy has lost the key dimension and can't recover it.
-            //
-            // Exact counter summaries are a distinct state contract. A sum of
-            // cumulative sample values cannot reconstruct reset correction or
-            // Prometheus boundary extrapolation.
-            (Capability::ExactAgg(req), Capability::ExactAgg(have)) => {
-                req == have || multi_pop_satisfies_single(*req, *have)
-            }
+            // Exact family identity must match. Grouping compatibility is
+            // checked separately by population routing.
+            (Capability::ExactAgg(req), Capability::ExactAgg(have)) => req == have,
             _ => false,
         }
     }
@@ -348,30 +334,12 @@ fn sketch_algorithms_compatible(
     sketch_family_satisfied(required, available)
 }
 
-/// True when `available` is the multi-population equivalent of
-/// `required`'s single-population variant — i.e. a `MultipleSum`
-/// policy can serve a `Sum` query (via re-aggregation across keys),
-/// `MultipleIncrease` can serve `Increase`, `MultipleMax` can
-/// serve `Max`. Asymmetric: this returns `false` for the reverse
-/// direction (single-pop can't recover keys that have been collapsed
-/// away).
-fn multi_pop_satisfies_single(required: AggregationType, available: AggregationType) -> bool {
-    matches!(
-        (required, available),
-        (AggregationType::Sum, AggregationType::MultipleSum)
-            | (AggregationType::Increase, AggregationType::MultipleIncrease)
-            | (AggregationType::Min, AggregationType::MultipleMin)
-            | (AggregationType::Max, AggregationType::MultipleMax)
-    )
-}
-
 // ── AggIntent → Capability bridge ────────────────────────────────────────────
 
 #[cfg(test)]
 /// Map a semantic [`AggIntent`] to the ASAP-tier [`Capability`] that can
-/// answer it. Returns `None` for intents that have no ASAP-tier sketch
-/// (Sum / Min / Max / Avg / Rate / Increase / every archive-only intent
-/// — see [`AggIntent::archive_only`]).
+/// answer it. Returns `None` when no deployed ASAP-tier capability can
+/// satisfy the intent.
 ///
 /// This is a runtime routing requirement, not a summary-selection rule.
 /// ASAPPlanner owns legal implementations and candidate enumeration; this
@@ -395,15 +363,17 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     }
     match intent {
         AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
+        AggIntent::Count { accuracy } if is_exact(accuracy) => {
+            Some(Capability::ExactAgg(AggregationType::Count))
+        }
         // Direction is part of the capability: a stored minimum cannot
         // answer `max_over_time` and vice versa, so these must not
         // collapse onto one `ExactAgg` the way they did while Planner
         // had a single `MinMax` accumulator.
         AggIntent::Min { .. } => Some(Capability::ExactAgg(AggregationType::Min)),
         AggIntent::Max { .. } => Some(Capability::ExactAgg(AggregationType::Max)),
-        AggIntent::Increase | AggIntent::Rate => {
-            Some(Capability::ExactAgg(AggregationType::Increase))
-        }
+        AggIntent::Increase => Some(Capability::ExactAgg(AggregationType::Increase)),
+        AggIntent::Rate => Some(Capability::ExactAgg(AggregationType::Rate)),
         AggIntent::Quantile { accuracy, .. } if !is_exact(accuracy) => {
             Some(Capability::QuantileApprox(None))
         }
@@ -532,18 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_count_exact_routes_to_archive() {
-        // `count_over_time` lowers to `Count{accuracy:Exact}`. The
-        // PR #200/#201 follow-up briefly routed this to
-        // `ExactAgg(Sum)`, but the data plane has no count
-        // accumulator — `SumAccumulator` returns its `sum` for both
-        // `Statistic::Sum` and `Statistic::Count`, so the result was
-        // sum-of-values, not sample-count. Reverted to `None` (archive
-        // routing) until a real `SumCountAccumulator` lands.
+    fn capability_for_count_exact_preserves_count_family() {
         let intent = AggIntent::Count {
             accuracy: AccuracyTarget::Exact,
         };
-        assert_eq!(capability_for(&intent), None);
+        assert_eq!(
+            capability_for(&intent),
+            Some(Capability::ExactAgg(AggregationType::Count))
+        );
     }
 
     #[test]
@@ -593,16 +559,16 @@ mod tests {
         assert!(!Capability::ExactAgg(AggregationType::Max)
             .is_satisfied_by(&Capability::ExactAgg(AggregationType::Min)));
         assert!(!Capability::ExactAgg(AggregationType::Min)
-            .is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleMax)));
+            .is_satisfied_by(&Capability::ExactAgg(AggregationType::Max)));
     }
 
     #[test]
-    fn capability_for_rate_increase_route_to_exact_agg_increase() {
-        // PR-6 follow-up: Rate and Increase route to ASAP-tier
-        // ExactAgg(Increase) — the counter-reset-aware exact precompute.
-        // Pre-follow-up this returned `None`.
+    fn capability_for_rate_and_increase_preserves_family() {
         let exact_inc = Some(Capability::ExactAgg(AggregationType::Increase));
-        assert_eq!(capability_for(&AggIntent::Rate), exact_inc);
+        assert_eq!(
+            capability_for(&AggIntent::Rate),
+            Some(Capability::ExactAgg(AggregationType::Rate))
+        );
         assert_eq!(capability_for(&AggIntent::Increase), exact_inc);
     }
 
@@ -849,10 +815,6 @@ mod tests {
             AggregationType::Min,
             AggregationType::Max,
             AggregationType::DatasketchesKLL,
-            AggregationType::MultipleSum,
-            AggregationType::MultipleIncrease,
-            AggregationType::MultipleMin,
-            AggregationType::MultipleMax,
             AggregationType::HydraKLL,
             AggregationType::CountMinSketch,
             AggregationType::CountMinSketchWithHeap,
@@ -873,21 +835,16 @@ mod tests {
     fn sum_family_cannot_impersonate_exact_counter_state() {
         let required = Capability::ExactAgg(AggregationType::Increase);
         assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
-        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
 
-        let required_multi = Capability::ExactAgg(AggregationType::MultipleIncrease);
-        assert!(
-            !required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum))
-        );
+        let required_multi = Capability::ExactAgg(AggregationType::Increase);
+        assert!(!required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
     }
 
     #[test]
     fn is_satisfied_by_sum_family_does_not_answer_required_multi_increase_from_single_sum() {
-        // Same single/multi-population direction as multi_pop_satisfies_single:
-        // a single-pop available (Sum) can't serve a multi-pop required
-        // capability (MultipleIncrease) -- it already lost the per-key
-        // breakdown a multi-pop caller needs.
-        let required = Capability::ExactAgg(AggregationType::MultipleIncrease);
+        // A different exact family cannot supply counter state.
+        let required = Capability::ExactAgg(AggregationType::Increase);
         assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
     }
 
@@ -905,30 +862,26 @@ mod tests {
     // ── capability_for: ExactAgg dormancy ────────────────────────────────
 
     #[test]
-    fn exact_agg_routing_covers_sum_rate_increase_only() {
-        // `Capability::ExactAgg` routing covers the three intents the
-        // data plane has a real accumulator for: `Sum` (SumAccumulator)
-        // and `Rate` / `Increase` (IncreaseAccumulator).
+    fn exact_agg_routing_keeps_sum_rate_and_increase_distinct() {
         assert_eq!(
             capability_for(&AggIntent::Sum { col: None }),
             Some(Capability::ExactAgg(AggregationType::Sum))
         );
         assert_eq!(
             capability_for(&AggIntent::Rate),
-            Some(Capability::ExactAgg(AggregationType::Increase))
+            Some(Capability::ExactAgg(AggregationType::Rate))
         );
         assert_eq!(
             capability_for(&AggIntent::Increase),
             Some(Capability::ExactAgg(AggregationType::Increase))
         );
-        // `Count{Exact}` (count_over_time) and `Avg` both need a real
-        // count accumulator that doesn't exist yet — they route to
-        // archive until `SumCountAccumulator` lands.
+        // Exact count follows the Planner Count family; Avg still needs
+        // its own composition contract.
         assert_eq!(
             capability_for(&AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
             }),
-            None
+            Some(Capability::ExactAgg(AggregationType::Count))
         );
         assert_eq!(capability_for(&AggIntent::Avg { col: None }), None);
     }

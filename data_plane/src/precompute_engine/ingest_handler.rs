@@ -1,7 +1,7 @@
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::StreamingConfigHandle;
-use asap_types::aggregation_config::AggregationConfig;
+use crate::storage_engines::types::InstalledPrecomputePlanHandle;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -28,11 +28,11 @@ pub struct IngestObservability {
     /// A full / delta frame failed to decode (or a delta failed to
     /// apply) and was dropped.
     pub dropped_decode_fail: AtomicU64,
-    /// A decoded sketch matched no `AggregationConfig` in the running
+    /// A decoded sketch matched no `PrecomputeMaterialization` in the running
     /// streaming config (legacy routing-side bucketing miss).
     pub dropped_unconfigured: AtomicU64,
     /// The output sink could not resolve a `policy_fp` to an
-    /// `AggregationConfig` (registry miss) and skipped the write.
+    /// `PrecomputeMaterialization` (registry miss) and skipped the write.
     pub dropped_policy_miss: AtomicU64,
     /// RES-1 — max number of distinct tumbling windows a per-series
     /// snapshot base may lag behind the newest observed `window_start`
@@ -120,8 +120,8 @@ pub struct IngestState {
     pub samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64,
     /// Hot-reloadable streaming config. On each ingest batch, the
     /// router snapshots the latest config to derive agg_configs.
-    /// This replaces the old frozen `Vec<Arc<AggregationConfig>>`.
-    pub hot_reload_config: StreamingConfigHandle,
+    /// This replaces the old frozen `Vec<Arc<PrecomputeMaterialization>>`.
+    pub hot_reload_config: InstalledPrecomputePlanHandle,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
     /// Per-series reconstructed sketch bases, keyed by series identity. Full frames
@@ -156,10 +156,10 @@ impl IngestState {
     /// configs from a `POST /api/v1/streaming-config` swap are
     /// visible immediately without restart.
     ///
-    /// Returns the shared `Arc<StreamingConfig>` — no cloning of
-    /// individual AggregationConfig objects, just an atomic refcount
+    /// Returns the shared `Arc<InstalledPrecomputePlan>` — no cloning of
+    /// individual PrecomputeMaterialization objects, just an atomic refcount
     /// increment (~5ns).
-    pub fn config_snapshot(&self) -> Arc<crate::storage_engines::types::StreamingConfig> {
+    pub fn config_snapshot(&self) -> Arc<crate::storage_engines::types::InstalledPrecomputePlan> {
         self.hot_reload_config.snapshot()
     }
 
@@ -247,7 +247,7 @@ impl IngestState {
     /// ingest sources (e.g. OTLP) can reuse it.
     pub fn extract_group_key_for(
         series_key: &str,
-        config: &AggregationConfig,
+        config: &PrecomputeMaterialization,
     ) -> Arc<crate::precompute_engine::group_key::GroupKey> {
         extract_group_key(series_key, config)
     }
@@ -261,7 +261,7 @@ impl IngestState {
     /// [`Self::extract_group_key_for`] does after the round-trip.
     pub fn extract_group_key_from_labels(
         labels: &std::collections::HashMap<String, String>,
-        config: &AggregationConfig,
+        config: &PrecomputeMaterialization,
     ) -> Arc<crate::precompute_engine::group_key::GroupKey> {
         crate::precompute_engine::group_key::intern_pairs(config.grouping_labels.iter().map(
             |name| {
@@ -278,7 +278,7 @@ impl IngestState {
 /// for a given series key and aggregation config.
 fn extract_group_key(
     series_key: &str,
-    config: &AggregationConfig,
+    config: &PrecomputeMaterialization,
 ) -> Arc<crate::precompute_engine::group_key::GroupKey> {
     let labels = parse_labels_from_series_key(series_key);
     crate::precompute_engine::group_key::intern_pairs(config.grouping_labels.iter().map(|name| {
@@ -293,19 +293,19 @@ fn extract_group_key(
 mod tests {
     use super::*;
     use crate::precompute_engine::series_router::SeriesRouter;
-    use crate::storage_engines::types::StreamingConfig;
-    use asap_types::aggregation_config::AggregationConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn make_config(_agg_id: u64, metric: &str) -> AggregationConfig {
+    fn make_config(_agg_id: u64, metric: &str) -> PrecomputeMaterialization {
         // `_agg_id` is unused after PR 5 — identity is content-addressed
         // via `PolicyFingerprint::from_config`. Kept as a parameter to
         // avoid churning the call sites below.
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             AggregationType::CountMinSketch,
             String::new(),
             std::collections::HashMap::new(),
@@ -336,9 +336,9 @@ mod tests {
 
         let mut map = std::collections::HashMap::new();
         map.insert(agg_id, make_config(agg_id, metric));
-        let streaming = StreamingConfig::new(map);
+        let streaming = InstalledPrecomputePlan::new(map);
         let hot_reload =
-            crate::storage_engines::types::StreamingConfigHandle::new(streaming.clone());
+            crate::storage_engines::types::InstalledPrecomputePlanHandle::new(streaming.clone());
 
         let state = Arc::new(IngestState {
             router,

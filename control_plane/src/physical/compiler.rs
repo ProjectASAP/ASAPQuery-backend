@@ -1270,10 +1270,7 @@ impl PhysicalPlanCompiler {
                     .with_window_implementation_costs(window_costs);
                 let metric = selected.metric.clone();
                 let aggregation_id = format!("{}:{ordinal}:{}", query.query_id, metric);
-                // Rate is a readout over the same reset-aware counter state
-                // as Increase. Keep that semantic distinction in QueryPlan,
-                // while the physical store binds both to Increase state.
-                let physical_family = physical_materialization_family(&selected.family);
+                let physical_family = selected.family.clone();
                 let physical_algorithm = match &physical_family {
                     SummaryFamilyType::ExactAggregate(kind, _) => {
                         format!("{kind:?}").to_ascii_lowercase()
@@ -1712,7 +1709,7 @@ impl PhysicalPlanCompiler {
                         .map_err(|error| crate::query_plan::QueryPlanError::Invalid(error.to_string()))?
                         .family;
                     let window_ms = materialization.window_size.saturating_mul(1_000);
-                    if materialization_family != physical_materialization_family(node_family)
+                    if materialization_family != *node_family
                         || window_ms == 0
                         || source_window.unwrap_or(query.query_lookback_seconds).saturating_mul(1_000)
                             % window_ms != 0
@@ -1727,6 +1724,7 @@ impl PhysicalPlanCompiler {
                             .then_some(materialization.slide_interval.saturating_mul(1_000)),
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
+                        stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(fingerprint.into()),
                         output_grouping: PhysicalGrouping::Reduce(
                             materialization.grouping_labels.names(),
                         ),
@@ -1864,10 +1862,11 @@ impl PhysicalPlanCompiler {
                 });
             }
         }
-        let query_plan = QueryPlan {
+        let mut query_plan = QueryPlan {
             plan_id,
             plan_version: envelope.plan_version,
             clickhouse_context: None,
+            selected_dags: BTreeMap::new(),
             entries: query_entries,
         };
         let mut installed_dags = BTreeMap::new();
@@ -1896,6 +1895,9 @@ impl PhysicalPlanCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
+            query_plan
+                .selected_dags
+                .insert(query_id.clone(), installed.document.clone());
             installed_dags.insert(query_id, installed);
         }
         for materialization in &mut materializations {
@@ -1947,6 +1949,18 @@ impl PhysicalPlanCompiler {
                 }
             })?;
         }
+        // QueryPlan already owns executable readout nodes. Persist only
+        // maintenance ancestors under PrecomputePlan.
+        installed_dags = installed_dags
+            .into_iter()
+            .filter(|(_, installed)| !installed.binding.precompute_sinks.is_empty())
+            .map(|(query_id, installed)| {
+                installed
+                    .maintenance_projection()
+                    .map(|projected| (query_id.clone(), projected))
+                    .map_err(|reason| CompileError::Query { query_id, reason })
+            })
+            .collect::<Result<_, _>>()?;
         let mut precompute_plan = match environment.target {
             PhysicalDeploymentTarget::DistributedCollectors => {
                 PrecomputePlan::build(envelope.clone(), materializations, &producer_ids).and_then(
@@ -2839,13 +2853,11 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
         A::HLL => 1u128 << parameter(&["precision", "p"], 14).min(24),
         A::DDSketch => 64 * 1024,
         A::Sum
+        | A::Count
         | A::Increase
+        | A::Rate
         | A::Min
         | A::Max
-        | A::MultipleSum
-        | A::MultipleIncrease
-        | A::MultipleMin
-        | A::MultipleMax
         | A::SingleSubpopulation
         | A::MultipleSubpopulation => 256,
     }
@@ -2863,7 +2875,7 @@ fn retained_partition_count(
     if materialization.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
         || matches!(
             materialization.aggregation_type,
-            A::Increase | A::MultipleIncrease | A::Min | A::Max | A::MultipleMin | A::MultipleMax
+            A::Increase | A::Rate | A::Min | A::Max
         )
         || !materialization.grouping_labels.names().is_empty()
     {
@@ -3110,7 +3122,7 @@ pub(crate) fn raw_materialization_input_contract(
     )
 }
 
-fn raw_time_series_input_contract(
+pub fn raw_time_series_input_contract(
     expr: &QueryExpr,
     exact: bool,
 ) -> Result<(String, Option<u64>, String), String> {
@@ -3281,7 +3293,7 @@ fn physical_aggregation(
     BackendAggregation {
         aggregation_id,
         metric_name: selected.metric.clone(),
-        family: physical_materialization_family(&selected.family),
+        family: selected.family.clone(),
         window_secs: selected.window_secs.unwrap_or(query.query_lookback_seconds),
         spatial_filter: selected.spatial_filter.clone(),
         grouping: selected
@@ -3691,26 +3703,6 @@ fn collect_selected_materializations(
     Ok(selected)
 }
 
-pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
-    match family {
-        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _) => {
-            // The SummaryStore Sum accumulator retains the observation count
-            // alongside its sum. Both logical states can share this producer.
-            SummaryFamilyType::ExactAggregate(
-                planner_types::post_asap::ExactKind::Sum,
-                planner_types::post_asap::ExactParams::Sum,
-            )
-        }
-        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Rate, _) => {
-            SummaryFamilyType::ExactAggregate(
-                planner_types::post_asap::ExactKind::Increase,
-                planner_types::post_asap::ExactParams::Increase,
-            )
-        }
-        _ => family.clone(),
-    }
-}
-
 fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
@@ -3915,8 +3907,8 @@ pub(crate) mod tests {
         assert_eq!(populations.len(), 1);
         let installed = serde_json::to_string(&plan.precompute_plan.executable_dags).unwrap();
         assert!(
-            installed.contains("MaintainPopulation"),
-            "shared state must originate in the installed Planner DAG"
+            !installed.contains("MaintainPopulation"),
+            "query-only population readout must not be executable maintenance"
         );
     }
 
@@ -4301,6 +4293,8 @@ pub(crate) mod tests {
             &dag,
         )
         .unwrap();
+        installed.document.schema_version =
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
         assert!(plan
             .precompute_plan
             .validate()
@@ -4551,8 +4545,7 @@ pub(crate) mod tests {
             .find(|materialization| {
                 matches!(
                     materialization.aggregation_type,
-                    asap_types::AggregationType::Increase
-                        | asap_types::AggregationType::MultipleIncrease
+                    asap_types::AggregationType::Rate
                 )
             })
             .expect("reset-aware exact counter");
@@ -4616,11 +4609,29 @@ pub(crate) mod tests {
             .precompute_plan
             .executable_dags
             .get(&entry.query_id)
-            .expect("compiled query retains its Planner DAG and backend placement");
-        installed.validate().expect("typed DAG document");
-        crate::physical::executable_binding::validate_query_plan(installed, entry)
-            .expect("query node bindings");
+            .expect("compiled query retains its maintenance projection");
+        installed
+            .validate()
+            .expect("typed maintenance DAG document");
+        assert_eq!(
+            installed.document.schema_version,
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+        );
+        assert!(installed
+            .document
+            .nodes
+            .iter()
+            .all(|node| node.output_state.timing
+                == planner_types::post_asap::ExecutionTiming::MaintenanceTime));
         assert_eq!(installed.binding.query_plan_sink, entry.root);
+        let mut mismatched = plan.to_publication_artifact().unwrap();
+        let projected = mismatched
+            .precompute_plan
+            .executable_dags
+            .get_mut(&entry.query_id)
+            .unwrap();
+        projected.binding.query_plan_sink = asap_types::executable_plan::QueryNodeId(u64::MAX);
+        assert!(mismatched.validate().is_err());
         assert!(installed.binding.nodes.values().any(|placement| matches!(
             placement,
             crate::physical::executable_binding::BackendNodeBinding::Materialization { .. }
@@ -5080,8 +5091,7 @@ pub(crate) mod tests {
             .iter()
             .all(|m| !matches!(
                 m.aggregation_type,
-                asap_types::AggregationType::Increase
-                    | asap_types::AggregationType::MultipleIncrease
+                asap_types::AggregationType::Increase | asap_types::AggregationType::Rate
             )));
         let entry = plan.query_plan.entries.values().next().unwrap();
         assert!(!entry.materialization_bindings().is_empty());
@@ -5421,7 +5431,7 @@ pub(crate) mod tests {
             .compile_promql(with_evidence, backend)
             .unwrap();
         assert!(
-            !plan.summary_catalog.materializations.is_empty(),
+            !plan.summary_catalog.definitions.is_empty(),
             "measured exact-composition evidence must expose the rate child as a SummaryStore binding"
         );
     }
@@ -5456,7 +5466,7 @@ pub(crate) mod tests {
         // ExactComposition candidate. The absence of evidence must therefore
         // leave that direct legal path intact rather than inventing a composed
         // cost or forcing an exact fallback.
-        assert!(!plan.summary_catalog.materializations.is_empty());
+        assert!(!plan.summary_catalog.definitions.is_empty());
         let entry = plan
             .query_plan
             .entries
@@ -5666,7 +5676,7 @@ pub(crate) mod tests {
                 .compile_promql(workload, env)
                 .expect("shared compile");
             assert_eq!(bundle.query_plan.entries.len(), 2);
-            assert_eq!(bundle.summary_catalog.materializations.len(), 1);
+            assert_eq!(bundle.summary_catalog.definitions.len(), 1);
             assert_eq!(bundle.precompute_plan.materializations.len(), 1);
             assert_eq!(bundle.precompute_plan.schemas.len(), 1);
             let bindings = bundle
@@ -5709,7 +5719,7 @@ pub(crate) mod tests {
         let bundle = PhysicalPlanCompiler
             .compile_promql(workload, environment(10_000))
             .unwrap();
-        assert_eq!(bundle.summary_catalog.materializations.len(), 2);
+        assert_eq!(bundle.summary_catalog.definitions.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         for collector in &bundle.collector_plans {
             assert_eq!(collector.materializations.len(), 2);
@@ -5717,7 +5727,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rate_and_increase_share_physical_counter_state() {
+    fn rate_and_increase_keep_planner_families_distinct() {
         let mut workload = request("rate", "rate(m[1m])");
         workload
             .queries
@@ -5726,10 +5736,14 @@ pub(crate) mod tests {
             .compile_promql(workload, environment(10_000))
             .unwrap();
         assert_eq!(bundle.query_plan.entries.len(), 2);
-        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         for collector in &bundle.collector_plans {
-            assert_eq!(collector.materializations.len(), 1);
-            assert_eq!(collector.materializations[0].algorithm, "increase");
+            let algorithms: std::collections::BTreeSet<_> = collector
+                .materializations
+                .iter()
+                .map(|materialization| materialization.algorithm.as_str())
+                .collect();
+            assert_eq!(algorithms, ["increase", "rate"].into());
         }
     }
 
@@ -5749,8 +5763,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn exact_dashboard_binds_sum_and_count_to_one_local_producer() {
-        // Both dashboard roots use one packed raw accumulator, with explicit readouts.
+    fn exact_dashboard_preserves_distinct_sum_and_count_producers() {
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -5766,7 +5779,7 @@ pub(crate) mod tests {
         entries.push(mean);
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
         let bundle = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
-        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         assert_eq!(bundle.query_plan.entries.len(), 2);
         for entry in bundle.query_plan.entries.values() {
             assert!(
@@ -5776,7 +5789,7 @@ pub(crate) mod tests {
                 )),
                 "{entry:?}"
             );
-            assert_eq!(entry.materialization_bindings().len(), 1);
+            assert!(!entry.materialization_bindings().is_empty());
         }
         assert!(bundle
             .query_plan
@@ -5956,7 +5969,7 @@ pub(crate) mod tests {
         let actual = bindings
             .iter()
             .map(|binding| {
-                let identity = &plan.summary_catalog.materializations[&binding.materialization];
+                let identity = &plan.summary_catalog.definitions[&binding.materialization];
                 let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
                 (
                     data.time_series_metric().unwrap(),
@@ -6855,7 +6868,7 @@ pub(crate) mod tests {
         let bound = bindings
             .iter()
             .map(|binding| {
-                let identity = &plan.summary_catalog.materializations[&binding.materialization];
+                let identity = &plan.summary_catalog.definitions[&binding.materialization];
                 let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
                 (
                     data.time_series_metric().unwrap(),
@@ -7031,6 +7044,39 @@ pub(crate) mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(bindings.len(), 1);
         query_plan.validate(&bindings).unwrap();
+        let stored_outputs = query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.materialization_bindings())
+            .map(|binding| binding.stored_output_reference)
+            .collect::<Vec<_>>();
+        assert_eq!(stored_outputs.len(), 2);
+        assert_eq!(stored_outputs[0], stored_outputs[1]);
+        assert_eq!(
+            stored_outputs[0],
+            bundle.precompute_plan.schemas[0].stored_output_reference
+        );
+        asap_types::plan_publication::validate_stored_output_references(
+            &bundle.precompute_plan,
+            &query_plan,
+        )
+        .unwrap();
+        // Output identity is independent of definition identity, but changing
+        // only the writer must still invalidate every unchanged reader binding.
+        let mut rebound_writer = bundle.precompute_plan.clone();
+        rebound_writer.schemas[0]
+            .stored_output_reference
+            .stored_output_id = asap_types::sds::StoredOutputId(123);
+        rebound_writer
+            .validate_against_catalog(&bundle.summary_catalog)
+            .unwrap();
+        assert!(
+            asap_types::plan_publication::validate_stored_output_references(
+                &rebound_writer,
+                &query_plan,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7133,7 +7179,7 @@ pub(crate) mod tests {
         assert_eq!(
             bundle
                 .summary_catalog
-                .materializations
+                .definitions
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>(),
@@ -7184,7 +7230,7 @@ pub(crate) mod tests {
             bundle.transmission_plan.validate_frame(&wrong_version),
             Err(TransmissionPlanError::InvalidFrame(_))
         ));
-        assert_eq!(bundle.summary_catalog.materializations.len(), 1);
+        assert_eq!(bundle.summary_catalog.definitions.len(), 1);
         assert_eq!(
             bundle
                 .query_plan
@@ -7435,9 +7481,9 @@ pub(crate) mod tests {
             bundle.precompute_plan.schemas[0].window.pane_origin_ms,
             Some(7_000)
         );
-        let definition = &bundle.summary_catalog.materializations
-            [&asap_types::sds::SummaryDefinitionId::from(config.policy_fingerprint())];
-        assert_eq!(definition.pane_origin_ms, Some(7_000));
+        assert!(bundle.summary_catalog.definitions.contains_key(
+            &asap_types::sds::SummaryDefinitionId::from(config.policy_fingerprint())
+        ));
         assert_eq!(
             bundle
                 .query_plan
@@ -7476,7 +7522,7 @@ pub(crate) mod tests {
             let compiled =
                 PhysicalPlanCompiler.compile_promql(request(query_id, promql), deployment);
             let plan = compiled.unwrap_or_else(|error| panic!("{promql} must compile: {error}"));
-            assert_eq!(plan.summary_catalog.materializations.len(), 1, "{promql}");
+            assert_eq!(plan.summary_catalog.definitions.len(), 1, "{promql}");
             assert_eq!(plan.query_plan.entries.len(), 1, "{promql}");
             assert!(plan.collector_plans.is_empty(), "{promql}");
             let entry = plan.query_plan.entries.values().next().unwrap();
@@ -7490,8 +7536,8 @@ pub(crate) mod tests {
                 assert_eq!(
                     materialization.accumulator_spec().unwrap().family,
                     SummaryFamilyType::ExactAggregate(
-                        planner_types::post_asap::ExactKind::Increase,
-                        planner_types::post_asap::ExactParams::Increase,
+                        planner_types::post_asap::ExactKind::Rate,
+                        planner_types::post_asap::ExactParams::Rate,
                     )
                 );
             }
@@ -7603,7 +7649,7 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(bundle.query_plan.entries.len(), 4);
-        assert_eq!(bundle.summary_catalog.materializations.len(), 1);
+        assert_eq!(bundle.summary_catalog.definitions.len(), 1);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.schemas.len(), 1);
         assert_eq!(bundle.precompute_plan.producers.len(), 2);
@@ -7645,7 +7691,7 @@ pub(crate) mod tests {
         let bundle = PhysicalPlanCompiler
             .compile_promql(compilation_request, environment(10_000))
             .expect("compile merged post-ASAP DAG");
-        assert_eq!(bundle.summary_catalog.materializations.len(), 2);
+        assert_eq!(bundle.summary_catalog.definitions.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         assert_eq!(
             bundle
@@ -7677,9 +7723,8 @@ pub(crate) mod tests {
             .values()
             .filter_map(|node| match node {
                 crate::query_plan::QueryPlanNode::ReadMaterialization { binding } => Some(
-                    bundle.summary_catalog.data_descriptors[&bundle
-                        .summary_catalog
-                        .materializations[&binding.materialization]
+                    bundle.summary_catalog.data_descriptors[&bundle.summary_catalog.definitions
+                        [&binding.materialization]
                         .data_descriptor_id]
                         .time_series_metric()
                         .unwrap(),
@@ -7973,7 +8018,7 @@ pub(crate) mod tests {
         let bundle = PhysicalPlanCompiler
             .compile_promql(request, environment(10_000))
             .expect("certified TopK compiles");
-        assert_eq!(bundle.summary_catalog.materializations.len(), 1);
+        assert_eq!(bundle.summary_catalog.definitions.len(), 1);
         assert_eq!(
             bundle.collector_plans[0].materializations[0]
                 .evidence_source

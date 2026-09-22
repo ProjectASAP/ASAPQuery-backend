@@ -154,8 +154,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                         .catalog
                         .as_ref()
                         .and_then(|catalog| {
-                            let definition =
-                                catalog.materializations.get(&binding.materialization)?;
+                            let definition = catalog.definitions.get(&binding.materialization)?;
                             catalog
                                 .data_descriptors
                                 .get(&definition.data_descriptor_id)?
@@ -759,7 +758,7 @@ mod tests {
         let mut group_by_keys = std::collections::BTreeSet::new();
         group_by_keys.insert("service".to_string());
         idx.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: "unique_users".to_string(),
             group_by_keys,
             capability: Some(Capability::CardinalityApprox),
@@ -801,7 +800,7 @@ mod tests {
             relative_accuracy: 0.01,
         };
         idx.register(SummarySeriesMetadata {
-            sid: 1,
+            storage_handle: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
@@ -883,6 +882,10 @@ mod tests {
                         binding: MaterializationBinding {
                             full_window_slide_ms: None,
                             materialization: config.policy_fingerprint().into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    config.policy_fingerprint().into(),
+                                ),
                             output_grouping: PhysicalGrouping::PerEntity,
                             item_labels: vec![],
                             window_ms: 1000,
@@ -1027,7 +1030,7 @@ mod tests {
         let idx = SketchStore::new();
         idx.register(
             crate::storage_engines::sketch_db::index::SummarySeriesMetadata {
-                sid: 1,
+                storage_handle: 1,
                 metric_name: "bytes_total".to_string(),
                 group_by_keys: std::collections::BTreeSet::new(),
                 capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1122,7 +1125,7 @@ mod tests {
                     }
                     let idx = SketchStore::new();
                     idx.register(SummarySeriesMetadata {
-                        sid: 7,
+                        storage_handle: 7,
                         metric_name: "a".into(),
                         group_by_keys: Default::default(),
                         capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1190,7 +1193,7 @@ mod tests {
         let policy = config.policy_fingerprint();
         let idx = SketchStore::new();
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "a".into(),
             group_by_keys: Default::default(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1264,7 +1267,7 @@ mod tests {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1314,6 +1317,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    policy.into(),
+                                ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
                             pane_origin_ms: Some(0),
@@ -1363,12 +1370,12 @@ mod tests {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
-            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Increase)),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),
             agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::AggregationType::Increase,
+                agg_type: asap_types::AggregationType::Rate,
                 parameters_canonical: String::new(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1411,6 +1418,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    policy.into(),
+                                ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
                             pane_origin_ms: Some(0),

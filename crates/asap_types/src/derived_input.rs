@@ -37,7 +37,11 @@ impl DerivedInputIdentity {
         root: PostAsapNodeId,
         frontiers: &BTreeMap<PostAsapNodeId, SummaryDefinitionId>,
     ) -> Result<Self, String> {
-        if document.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION {
+        if !matches!(
+            document.schema_version,
+            crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+                | crate::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+        ) {
             return Err("unsupported derived program document version".into());
         }
         let decoded = document.decode()?;
@@ -106,7 +110,7 @@ impl DerivedInputIdentity {
             }
             edges.sort();
             let bytes = serde_json::to_vec(&serde_json::json!({
-                "version": 1, "operator": node.operator, "payload": node.payload,
+                "version": 2, "payload": node.payload,
                 "state": node.output_state, "schema": node.output_schema,
                 "guarantee": node.guarantee, "inputs": edges,
             }))
@@ -168,7 +172,7 @@ mod tests {
         let a =
             SummaryCatalog::from_materializations(1, 1, &[raw.clone(), derived.clone()]).unwrap();
         let b = SummaryCatalog::from_materializations(2, 9, &[raw, derived.clone()]).unwrap();
-        assert_eq!(a.materializations, b.materializations);
+        assert_eq!(a.definitions, b.definitions);
         assert_eq!(a.data_descriptors, b.data_descriptors);
         let mut renamed = derived.clone();
         renamed.metric = "output_alias".into();
@@ -208,19 +212,17 @@ mod tests {
     fn program(source: u32, root: u32) -> OwnedPostAsapDag {
         use crate::executable_plan::{OwnedPostAsapEdge, OwnedPostAsapNode};
         use planner_types::post_asap::{
-            EdgeRole, ExecutableOperator, ExecutionDataState, GroupingEdgeCompatibility,
-            WindowEdgeCompatibility,
+            EdgeRole, ExecutionDataState, GroupingEdgeCompatibility, WindowEdgeCompatibility,
         };
         let state = ExecutionDataState::MAINTENANCE_SUMMARY;
         OwnedPostAsapDag {
-            schema_version: 1,
+            schema_version: crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
             query_id: "query-a".into(),
             root: PostAsapNodeId(root),
             nodes: [source, root]
                 .into_iter()
                 .map(|id| OwnedPostAsapNode {
                     id: PostAsapNodeId(id),
-                    operator: ExecutableOperator::SummaryMerge,
                     payload: serde_json::json!({"kind":"summary_merge"}),
                     output_state: state,
                     output_schema: serde_json::json!({"fields":[],"time_index":null}),
@@ -321,7 +323,6 @@ mod tests {
                 config.policy_fingerprint(),
                 SummaryDescriptor::from_config(&config).unwrap(),
                 data,
-                config.window_layout
             )]
         )
         .is_err());
@@ -353,13 +354,12 @@ mod tests {
     #[test]
     fn literal_leaves_are_hashed_without_inventing_materialization_references() {
         use planner_types::{
-            post_asap::{ExecutableOperator, ExecutableOperatorPayload},
+            post_asap::ExecutableOperatorPayload,
             pre_asap::{QueryExpr, ScalarValue},
         };
         let mut dag = program(1, 2);
         let mut literal = dag.nodes[0].clone();
         literal.id = PostAsapNodeId(3);
-        literal.operator = ExecutableOperator::Fallback;
         literal.payload = serde_json::to_value(ExecutableOperatorPayload::Fallback {
             expression: QueryExpr::Literal(ScalarValue::Int64(2)),
         })

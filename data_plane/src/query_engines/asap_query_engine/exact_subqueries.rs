@@ -906,12 +906,12 @@ mod tests {
         const MATERIALIZATION: asap_types::PolicyFingerprint = asap_types::PolicyFingerprint(9001);
         let store = crate::storage_engines::sketch_db::index::SketchStore::new();
         store.register(SummarySeriesMetadata {
-            sid: 41,
+            storage_handle: 41,
             metric_name: "http_requests_total".into(),
             group_by_keys: std::collections::BTreeSet::from(["job".into()]),
-            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Increase)),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),
             agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::AggregationType::Increase,
+                agg_type: asap_types::AggregationType::Rate,
                 parameters_canonical: String::new(),
                 spatial_filter_canonical: String::new(),
             },
@@ -967,6 +967,10 @@ mod tests {
                         full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: MATERIALIZATION.into(),
+                        stored_output_reference:
+                            asap_types::sds::StoredOutputReference::for_definition(
+                                MATERIALIZATION.into(),
+                            ),
                         output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
                         window_ms: AT,
                         pane_origin_ms: Some(0),

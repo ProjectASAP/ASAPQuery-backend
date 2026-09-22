@@ -87,8 +87,9 @@ impl WindowMaterializationLayout {
     }
 }
 
-/// Per-aggregation policy with content-derived [`PolicyFingerprint`] identity.
-/// An `aggregationId` field in input YAML is ignored for compatibility.
+/// Physical materialization metadata with content-derived identity.
+/// This descriptor cannot authorize execution: the enclosing PrecomputePlan
+/// must bind it to a compatible Planner DAG producer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputeMaterialization {
     pub aggregation_type: AggregationType,
@@ -195,10 +196,6 @@ pub struct AggregationIdInfo {
 }
 
 impl AggregationIdInfo {}
-
-/// Compatibility name for legacy streaming-config and precompute call sites.
-/// New CompiledPhysicalPlan code should use [`PrecomputeMaterialization`].
-pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {
     pub fn effective_value_projection(&self) -> &crate::sds::ValueProjectionIdentity {
@@ -337,8 +334,8 @@ impl PrecomputeMaterialization {
     }
 
     /// `PolicyFingerprint::as_u64()` — the u64-form handle used by the
-    /// policy-fingerprint-keyed call sites (e.g. `StreamingConfig`'s
-    /// `HashMap<u64, AggregationConfig>` keys). **Always** equal to
+    /// policy-fingerprint-keyed call sites (e.g. `InstalledPrecomputePlan`'s
+    /// `HashMap<u64, PrecomputeMaterialization>` keys). **Always** equal to
     /// `self.policy_fingerprint().as_u64()`. The value is content-
     /// addressed identity, NOT a controller-allocated counter id.
     pub fn policy_fp_u64(&self) -> u64 {
@@ -818,12 +815,18 @@ mod tests {
     /// SAME config as a fixture without it.
     #[test]
     fn explicit_aggregation_id_in_yaml_is_ignored() {
-        let with =
-            AggregationConfig::from_yaml_data(&sample_yaml(true), None, QueryLanguage::PromQl)
-                .expect("parse ok");
-        let without =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
-                .expect("parse ok");
+        let with = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(true),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .expect("parse ok");
+        let without = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .expect("parse ok");
         assert_eq!(
             with.policy_fingerprint(),
             without.policy_fingerprint(),
@@ -834,10 +837,18 @@ mod tests {
     /// Round-tripping the same content yields the same fingerprint.
     #[test]
     fn fingerprint_is_deterministic_per_content() {
-        let a = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
-            .expect("parse a");
-        let b = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
-            .expect("parse b");
+        let a = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .expect("parse a");
+        let b = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .expect("parse b");
         assert_eq!(a.policy_fingerprint(), b.policy_fingerprint());
         assert_ne!(
             a.policy_fingerprint().as_u64(),
@@ -862,37 +873,44 @@ mod tests {
         ] {
             yaml["windowLayout"] = serde_yaml::to_value(&layout).unwrap();
             let config =
-                AggregationConfig::from_yaml_data(&yaml, None, QueryLanguage::PromQl).unwrap();
+                PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::PromQl)
+                    .unwrap();
             assert_eq!(config.window_layout, layout);
             let mut wire = config.serialize_to_json();
             wire["groupingLabels"] = serde_json::to_value(&config.grouping_labels).unwrap();
             wire["aggregatedLabels"] =
                 serde_json::to_value(&config.aggregated_labels.labels).unwrap();
             wire["rollupLabels"] = serde_json::to_value(&config.rollup_labels.labels).unwrap();
-            let decoded = AggregationConfig::deserialize_from_json(&wire).unwrap();
+            let decoded = PrecomputeMaterialization::deserialize_from_json(&wire).unwrap();
             assert_eq!(decoded.window_layout, layout);
             assert_eq!(decoded.stored_window_ms(), config.stored_window_ms());
             assert_eq!(decoded.policy_fingerprint(), config.policy_fingerprint());
             wire["window_layout"] = wire["windowLayout"].clone();
-            assert!(AggregationConfig::deserialize_from_json(&wire).is_err());
+            assert!(PrecomputeMaterialization::deserialize_from_json(&wire).is_err());
         }
         yaml.as_mapping_mut()
             .unwrap()
             .remove(serde_yaml::Value::from("windowLayout"));
-        let legacy = AggregationConfig::from_yaml_data(&yaml, None, QueryLanguage::PromQl).unwrap();
+        let legacy =
+            PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::PromQl).unwrap();
         assert_eq!(
             legacy.window_layout,
             WindowMaterializationLayout::Pane { pane_secs: 10 }
         );
         yaml["window_layout"] = serde_yaml::from_str("{kind: pane, pane_secs: 7}").unwrap();
-        assert!(AggregationConfig::from_yaml_data(&yaml, None, QueryLanguage::PromQl).is_err());
+        assert!(
+            PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::PromQl).is_err()
+        );
     }
 
     #[test]
     fn pane_origin_round_trips_and_changes_definition_identity() {
-        let mut epoch =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
-                .expect("parse");
+        let mut epoch = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .expect("parse");
         let unknown = epoch.policy_fingerprint();
         epoch.pane_origin_ms = Some(7_000);
         let planned = epoch.policy_fingerprint();
@@ -910,13 +928,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("paneOriginMs".into(), origin);
-        let decoded: AggregationConfig = serde_json::from_value(derived.clone()).unwrap();
+        let decoded: PrecomputeMaterialization = serde_json::from_value(derived.clone()).unwrap();
         assert_eq!(decoded.pane_origin_ms, Some(7_000));
 
         let mut legacy = derived;
         legacy.as_object_mut().unwrap().remove("paneOriginMs");
         assert_eq!(
-            serde_json::from_value::<AggregationConfig>(legacy)
+            serde_json::from_value::<PrecomputeMaterialization>(legacy)
                 .expect("decode legacy wire")
                 .pane_origin_ms,
             None
@@ -926,18 +944,24 @@ mod tests {
     /// The `policy_fp_u64()` accessor is exactly the fingerprint u64.
     #[test]
     fn policy_fp_u64_accessor_equals_fingerprint_u64() {
-        let cfg =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
-                .expect("parse");
+        let cfg = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .expect("parse");
         assert_eq!(cfg.policy_fp_u64(), cfg.policy_fingerprint().as_u64());
     }
 
     /// PR 5: `serialize_to_json` no longer emits `aggregationId`.
     #[test]
     fn serialize_to_json_omits_aggregation_id() {
-        let cfg =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
-                .expect("parse");
+        let cfg = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .expect("parse");
         let json = cfg.serialize_to_json();
         assert!(
             json.get("aggregationId").is_none(),
@@ -949,9 +973,12 @@ mod tests {
     fn typed_projection_roundtrips_and_legacy_column_keeps_identity() {
         use crate::sds::ValueProjectionIdentity;
         use planner_types::pre_asap::ScalarValue;
-        let mut config =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
-                .unwrap();
+        let mut config = PrecomputeMaterialization::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::PromQl,
+        )
+        .unwrap();
         config.table_name = Some("telemetry".into());
         config.value_projection = Some(ValueProjectionIdentity::Column {
             name: "value".into(),
@@ -960,7 +987,7 @@ mod tests {
         let mut legacy = serde_json::to_value(&config).unwrap();
         legacy.as_object_mut().unwrap().remove("value_projection");
         legacy["value_column"] = serde_json::json!("value");
-        let decoded: AggregationConfig = serde_json::from_value(legacy).unwrap();
+        let decoded: PrecomputeMaterialization = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.policy_fingerprint(), column_identity);
         config.value_projection = Some(ValueProjectionIdentity::Constant {
             value: ScalarValue::Int64(1),
@@ -977,8 +1004,8 @@ mod tests {
             "rollup": config.rollup_labels.serialize_to_json(),
         });
         assert!(wire.get("valueColumn").is_none());
-        let json = AggregationConfig::deserialize_from_json(&wire).unwrap();
-        let yaml = AggregationConfig::from_yaml_data(
+        let json = PrecomputeMaterialization::deserialize_from_json(&wire).unwrap();
+        let yaml = PrecomputeMaterialization::from_yaml_data(
             &serde_yaml::to_value(&wire).unwrap(),
             None,
             QueryLanguage::ClickHouseSql,
@@ -994,8 +1021,8 @@ mod tests {
         );
         let mut conflicting = wire;
         conflicting["valueColumn"] = serde_json::json!("other_column");
-        assert!(AggregationConfig::deserialize_from_json(&conflicting).is_err());
-        assert!(AggregationConfig::from_yaml_data(
+        assert!(PrecomputeMaterialization::deserialize_from_json(&conflicting).is_err());
+        assert!(PrecomputeMaterialization::from_yaml_data(
             &serde_yaml::to_value(conflicting).unwrap(),
             None,
             QueryLanguage::ClickHouseSql

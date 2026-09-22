@@ -18,8 +18,7 @@ use planner_types::pre_asap::AggIntent;
 /// `http_requests_total`, which the MVP demo's `mvp-workload.yaml`
 /// registers three times (entries 2/3/4 of [`deploy/configs/mvp-workload.yaml`]):
 ///   * `sum by (zone) (http_requests_total)` → [`AggRole::Sum`]
-///   * `sum by (zone) (rate(http_requests_total[5m]))` → [`AggRole::Sum`]
-///     (rate binds to ExactAgg(Sum)-shaped capability)
+///   * `sum by (zone) (rate(http_requests_total[5m]))` → [`AggRole::Rate`]
 ///   * `count(http_requests_total{zone="z0"})` → [`AggRole::Count`]
 ///
 /// Before this enum: the `WorkloadStore` was keyed by metric name alone
@@ -30,7 +29,7 @@ use planner_types::pre_asap::AggIntent;
 /// shape).
 ///
 /// After: the store is keyed by `(metric, role)` so each shape gets its
-/// own plan, its own `AggregationConfig` on the backend's streaming
+/// own plan, its own `PrecomputeMaterialization` on the backend's streaming
 /// config, and its own routing-connector pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,15 +38,15 @@ pub enum AggRole {
     /// or workload entries with `sketch_family_override: DDSketch | KLL`.
     /// Routes to a quantile-shaped sketch (DDSketch / KLL).
     Quantile,
-    /// Bare counter selector, `sum(...)`, `sum_over_time(...)`,
-    /// `rate(...)`, `increase(...)`. All bind to ExactAgg(Sum)-shaped
-    /// capability on the data plane; the streaming-config emits an
-    /// `aggregation_type: Sum` rather than a sketch.
+    /// Bare selector or Sum-shaped exact aggregation.
     Sum,
+    /// Reset-aware per-second counter rate.
+    Rate,
+    /// Reset-aware counter increase over the selected window.
+    Increase,
     /// `count(...)`, `count_over_time(...)`, `count_distinct_over_time(...)`,
     /// or workload entries with `sketch_family_override: HLL`. Routes
-    /// to HLL when a sketch is appropriate, otherwise to a Sum-as-count
-    /// exact-aggregation.
+    /// to HLL when a sketch is appropriate, otherwise to exact Count.
     Count,
     /// `topk(...)`, or workload entries with
     /// `sketch_family_override: CountSketch | CountMinSketch`. Routes
@@ -70,6 +69,8 @@ impl AggRole {
         match self {
             AggRole::Quantile => "quantile",
             AggRole::Sum => "sum",
+            AggRole::Rate => "rate",
+            AggRole::Increase => "increase",
             AggRole::Count => "count",
             AggRole::Topk => "topk",
             AggRole::Other => "other",
@@ -97,15 +98,16 @@ impl std::fmt::Display for AggRole {
 ///    through the same canonical pipeline the live serving path uses
 ///    (`query_parser::parse_query_expr_canonical` →
 ///    `asap_tier_analysis::collect_agg_intents`), and the OUTERMOST
-///    intent (the one bound to the data-plane capability) is matched:
+///    intent is matched, except that a Sum wrapping a counter function
+///    keeps the inner Rate or Increase role:
 ///    * [`AggIntent::Quantile`] → [`AggRole::Quantile`]
 ///    * [`AggIntent::TopK`] → [`AggRole::Topk`]
 ///    * [`AggIntent::Cardinality`], [`AggIntent::Count`], or the
 ///      windowed-Count-as-Frequency extension
 ///      (`intent_algebra::as_frequency`) → [`AggRole::Count`]
 ///    * [`AggIntent::Sum`], [`AggIntent::Rate`], [`AggIntent::Increase`]
-///      → [`AggRole::Sum`]
-///    * Anything else recognised but not one of the four shapes above
+///      → their respective roles
+///    * Anything else recognised but not one of the listed shapes above
 ///      (`Min`/`Max`/`Avg`/`StdDev`/histogram accessors/…) →
 ///      [`AggRole::Other`].
 ///    * Bare metric selector (no `Aggregate` node at all) →
@@ -125,11 +127,7 @@ impl std::fmt::Display for AggRole {
 ///     semantics, whichever the lowerer picks). The Sum-shaped
 ///     alternative is rare in practice; users who want it write
 ///     `sum_over_time(count(...))` which classifies as Sum.
-///   * `rate` / `irate` / `increase` — Sum. `irate` folds onto
-///     `AggIntent::Rate` at L3 same as `rate`; both bind to
-///     ExactAgg(Increase) on the data plane (see
-///     `data_plane/src/precompute_engine/ingest_handler.rs`'s handling
-///     of `AggKind::ExactAgg { Increase }`).
+///   * `irate` currently folds onto `AggIntent::Rate` in the frontend.
 pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     // 1. `sketch_family_override` wins.
     if let Some(family) = entry.sketch_family_override.as_ref() {
@@ -167,11 +165,30 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     if crate::planner_selection::as_frequency(outer).is_some() {
         return AggRole::Count;
     }
+    // A spatial `sum by (...)` around a counter function still requires the
+    // counter family's state; using Sum as the registration key would let it
+    // overwrite a bare Sum workload for the same metric.
+    if matches!(outer, AggIntent::Sum { .. }) {
+        if intents
+            .iter()
+            .any(|intent| matches!(intent, AggIntent::Rate))
+        {
+            return AggRole::Rate;
+        }
+        if intents
+            .iter()
+            .any(|intent| matches!(intent, AggIntent::Increase))
+        {
+            return AggRole::Increase;
+        }
+    }
     match outer {
         AggIntent::Quantile { .. } => AggRole::Quantile,
         AggIntent::TopK { .. } => AggRole::Topk,
         AggIntent::Cardinality { .. } | AggIntent::Count { .. } => AggRole::Count,
-        AggIntent::Sum { .. } | AggIntent::Rate | AggIntent::Increase => AggRole::Sum,
+        AggIntent::Sum { .. } => AggRole::Sum,
+        AggIntent::Rate => AggRole::Rate,
+        AggIntent::Increase => AggRole::Increase,
         _ => AggRole::Other,
     }
 }
@@ -484,7 +501,7 @@ impl WorkloadRegistry {
     /// Inject (or replace, keyed by `metric_name`) a runtime workload entry.
     /// Used by the autonomous-allocation apply path to register a synthesized
     /// monitor so the next replan/repost emits it into the backend
-    /// `StreamingConfig` (the coordinator then derives the ε-floor `p`). Shared
+    /// `InstalledPrecomputePlan` (the coordinator then derives the ε-floor `p`). Shared
     /// across registry clones via the `Arc<RwLock<…>>` overlay.
     pub fn insert_runtime(&self, entry: WorkloadEntry) {
         let mut rt = self
@@ -970,18 +987,24 @@ mod tests {
 
     #[test]
     fn agg_role_sum_query_strings() {
-        for q in [
-            "sum by (zone) (m)",
-            "sum_over_time(m[5m])",
-            "rate(m[5m])",
-            "increase(m[5m])",
-            "sum by (zone) (rate(m[5m]))",
-        ] {
+        for q in ["sum by (zone) (m)", "sum_over_time(m[5m])"] {
             assert_eq!(
                 derive_agg_role(&entry("m", Some(q), None)),
                 AggRole::Sum,
                 "query `{q}` should classify as Sum"
             );
+        }
+    }
+
+    #[test]
+    fn counter_functions_have_distinct_workload_roles() {
+        for (query, expected) in [
+            ("rate(m[5m])", AggRole::Rate),
+            ("sum by (zone) (rate(m[5m]))", AggRole::Rate),
+            ("increase(m[5m])", AggRole::Increase),
+            ("sum by (zone) (increase(m[5m]))", AggRole::Increase),
+        ] {
+            assert_eq!(derive_agg_role(&entry("m", Some(query), None)), expected);
         }
     }
 
@@ -1095,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn three_synthetic_http_requests_total_entries_classify_to_two_distinct_roles() {
+    fn three_synthetic_http_requests_total_entries_keep_distinct_roles() {
         // Synthetic mirror of `deploy/configs/mvp-workload.yaml`
         // entries 2/3/4 — proves `derive_agg_role` produces distinct
         // roles for the three http_requests_total shapes. Pre-B2 the
@@ -1120,15 +1143,8 @@ mod tests {
             ),
         ];
         let roles: Vec<AggRole> = entries.iter().map(derive_agg_role).collect();
-        assert_eq!(roles, vec![AggRole::Sum, AggRole::Sum, AggRole::Count]);
-        // The store distinguishes Sum vs Count keys, so two of the
-        // three entries (the two Sum-shaped ones) still collide
-        // under (metric, role). That's the documented behaviour —
-        // two YAML entries with the SAME (metric, role) overwrite,
-        // which is the legitimate "operator updated their workload"
-        // path. The fix scope is collisions across DIFFERENT shapes,
-        // not idempotent re-registers.
+        assert_eq!(roles, vec![AggRole::Sum, AggRole::Rate, AggRole::Count]);
         let distinct: std::collections::HashSet<_> = roles.iter().copied().collect();
-        assert_eq!(distinct.len(), 2, "Sum + Count = 2 distinct roles");
+        assert_eq!(distinct.len(), 3);
     }
 }

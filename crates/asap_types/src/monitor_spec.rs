@@ -38,13 +38,13 @@ impl MonitorFunctional {
 /// (empty for Sum / whole-stream). See
 /// `ASAPCollector/docs/continuous-monitoring-tumbling-cost-analysis.md`.
 ///
-/// Stays here (unlike `data_plane::storage_engines::types::StreamingConfig`,
+/// Stays here (unlike `data_plane::storage_engines::types::InstalledPrecomputePlan`,
 /// which holds a `Vec<MonitorSpec>` field) because `control_plane` genuinely
-/// needs it: `emit/monitor.rs` builds the `StreamingConfig.monitors[]` JSON
+/// needs it: `emit/monitor.rs` builds the `InstalledPrecomputePlan.monitors[]` JSON
 /// entry by hand and has a regression test asserting that JSON deserializes
 /// into this exact type. `control_plane` cannot depend on `data_plane` (the
 /// dependency runs the other way), so this type has to live somewhere both
-/// sides can reach — same reasoning as `AggregationConfig`/`PolicyFingerprint`.
+/// sides can reach — same reasoning as `PrecomputeMaterialization`/`PolicyFingerprint`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSpec {
     pub agg_id: u64,

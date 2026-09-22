@@ -7,7 +7,8 @@ use super::*;
 use crate::storage_engines::types::AggregateCore;
 
 pub(crate) struct FrozenExactWindows {
-    pub(crate) sid: u64,
+    pub(crate) stored_output_reference: asap_types::sds::StoredOutputReference,
+    pub(crate) storage_handle: u64,
     pub(crate) definition: SummaryDefinitionId,
     pub(crate) generation: Arc<CatalogGeneration>,
     pub(crate) group: BTreeMap<String, String>,
@@ -122,12 +123,20 @@ impl SketchStore {
         let writer = metadata
             .as_ref()
             .ok_or("immutable population proof requires durable metadata")?;
+        // Retained populations remain a completeness fence even when their
+        // generation is no longer readable. Losing their binding cannot certify
+        // that a newly observed subset is the complete source population.
         Ok(writer
             .load_strict()
             .map_err(|error| error.to_string())?
             .into_iter()
-            .filter(|record| !record.removed && record.summary_definition_id == Some(definition))
-            .map(|record| record.sid)
+            .filter(|record| {
+                !record.removed
+                    && record.summary_definition_id == Some(definition)
+                    && record.stored_output_reference
+                        == self.descriptors.stored_output_reference(definition)
+            })
+            .map(|record| record.storage_handle)
             .collect())
     }
 
@@ -183,7 +192,12 @@ impl SketchStore {
         population_ids.extend(
             instances
                 .iter()
-                .filter(|(_, binding)| binding.metadata.policy_fp == definition.fingerprint())
+                .filter(|(_, binding)| {
+                    binding.metadata.policy_fp == definition.fingerprint()
+                        && binding.stored_output_reference
+                            == self.descriptors.stored_output_reference(definition)
+                        && binding.catalog_generation.as_deref() == Some(generation)
+                })
                 .map(|(sid, _)| *sid),
         );
         if !require_complete_population && population_ids.len() > 1 {
@@ -216,6 +230,8 @@ impl SketchStore {
         let mut coordinates = BTreeMap::new();
         for (sid, binding) in instances.iter() {
             if binding.metadata.policy_fp != definition.fingerprint()
+                || binding.stored_output_reference
+                    != self.descriptors.stored_output_reference(definition)
                 || binding.catalog_generation.as_deref() != Some(generation)
                 || !binding.metadata.is_writable()
             {
@@ -285,13 +301,15 @@ impl SketchStore {
             .admission
             .read()
             .map_err(|_| "admission registry poisoned")?;
-        let (keys, singleton_population_complete) = {
+        let (keys, singleton_population_complete, stored_output_reference) = {
             let bindings = self
                 .instances
                 .read()
                 .map_err(|_| "instance registry poisoned")?;
             let binding = bindings.get(&sid).ok_or("immutable input SID is absent")?;
             if binding.metadata.policy_fp != definition.fingerprint()
+                || binding.stored_output_reference
+                    != self.descriptors.stored_output_reference(definition)
                 || binding.catalog_generation.as_deref() != Some(generation.as_ref())
                 || binding.metadata.status() == AggStatus::Expired
             {
@@ -303,6 +321,9 @@ impl SketchStore {
                     .iter()
                     .filter(|(_, candidate)| {
                         candidate.metadata.policy_fp == definition.fingerprint()
+                            && candidate.stored_output_reference
+                                == self.descriptors.stored_output_reference(definition)
+                            && candidate.catalog_generation.as_deref() == Some(generation.as_ref())
                     })
                     .map(|(sid, _)| *sid),
             );
@@ -312,7 +333,13 @@ impl SketchStore {
                     asap_types::sds::DataSourceIdentity::Derived { .. }
                 )
                 && population_ids == BTreeSet::from([sid]);
-            (binding.metadata.group_by_keys.clone(), singleton)
+            (
+                binding.metadata.group_by_keys.clone(),
+                singleton,
+                binding
+                    .stored_output_reference
+                    .ok_or("immutable input has no stored-output binding")?,
+            )
         };
         drop(admission);
         if group.keys().cloned().collect::<BTreeSet<_>>() != keys {
@@ -371,7 +398,8 @@ impl SketchStore {
         }
         self.validate_routed_catalog_generation(Some(generation.as_ref()))?;
         Ok(FrozenExactWindows {
-            sid,
+            stored_output_reference,
+            storage_handle: sid,
             definition,
             generation: Arc::clone(generation),
             group: group.clone(),
@@ -406,16 +434,17 @@ impl SketchStore {
         let mut populations = BTreeSet::new();
         for source in sources {
             if &source.generation != generation
-                || !populations.insert((source.definition, source.sid, &source.group))
+                || !populations.insert((source.definition, source.storage_handle, &source.group))
             {
                 return Err(
                     "immutable publication input cohort has mixed generations or duplicates".into(),
                 );
             }
             let binding = instances
-                .get(&source.sid)
+                .get(&source.storage_handle)
                 .ok_or("immutable source was removed")?;
-            if binding.metadata.policy_fp != source.definition.fingerprint()
+            if binding.stored_output_reference != Some(source.stored_output_reference)
+                || binding.metadata.policy_fp != source.definition.fingerprint()
                 || binding.catalog_generation.as_deref() != Some(generation.as_ref())
                 || !binding.metadata.is_writable()
             {
@@ -440,14 +469,23 @@ impl SketchStore {
             supplied
                 .entry(input.definition)
                 .or_default()
-                .insert(input.sid);
+                .insert(input.storage_handle);
         }
         for (definition, supplied_sids) in supplied {
             let mut current = self.durable_maintenance_population_ids(definition)?;
             current.extend(
                 instances
                     .iter()
-                    .filter(|(_, binding)| binding.metadata.policy_fp == definition.fingerprint())
+                    .filter(|(_, binding)| {
+                        binding.metadata.policy_fp == definition.fingerprint()
+                            && binding.stored_output_reference
+                                == self.descriptors.stored_output_reference(definition)
+                            && binding.catalog_generation.as_deref()
+                                == cohort
+                                    .inputs()
+                                    .first()
+                                    .map(|input| input.generation.as_ref())
+                    })
                     .map(|(sid, _)| *sid),
             );
             if current != supplied_sids {
@@ -1042,7 +1080,7 @@ mod tests {
             .load_strict()
             .unwrap()
             .iter()
-            .any(|record| record.sid == 905));
+            .any(|record| record.storage_handle == 905));
         store.force_expire(901).unwrap();
         assert!(store
             .publish_frozen_maintenance_output(903, target, &output, &sum, &cohort, [42; 32])
@@ -1061,7 +1099,7 @@ mod tests {
             .load_strict()
             .unwrap()
             .iter()
-            .any(|record| record.sid == 903));
+            .any(|record| record.storage_handle == 903));
         let mut next = catalog;
         next.plan_version += 1;
         store.install_summary_catalog(Arc::new(next)).unwrap();
@@ -1377,7 +1415,7 @@ mod tests {
                 .load_strict()
                 .unwrap()
                 .into_iter()
-                .map(|record| (record.sid, serde_json::to_value(record).unwrap()))
+                .map(|record| (record.storage_handle, serde_json::to_value(record).unwrap()))
                 .collect::<BTreeMap<_, _>>()
         };
         let records_before = durable_records();
@@ -1468,7 +1506,10 @@ mod tests {
             .unwrap();
         assert!(!store.completed_windows.read().unwrap().contains_key(&601));
         let input = FrozenExactWindows {
-            sid: 600,
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                source_id,
+            ),
+            storage_handle: 600,
             definition: source_id,
             generation,
             group: BTreeMap::new(),

@@ -233,11 +233,7 @@ impl PrometheusRemoteWriteReceiver {
         if plan.precompute_plan.summary_catalog.as_ref() != Some(&generation) {
             return Err("finite maintenance generation changed during drain".into());
         }
-        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
-            &self.inner.ingest.summary_store,
-            &self.inner.ingest.series_resolver,
-            &plan.precompute_plan,
-        )?;
+        self.inner.ingest.router.complete_dag(plan).await?;
         if let Some(observer) = self.inner.ingest.router.erp_observer() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -676,7 +672,7 @@ fn route_messages(
         Arc<crate::precompute_engine::group_key::GroupKey>,
     );
     type RoutedSample = (String, i64, f64);
-    let snapshot = physical_plan.streaming_config.clone();
+    let snapshot = physical_plan.installed_precompute_plan.clone();
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest.summary_store.as_ref(),
         &snapshot,
@@ -717,11 +713,9 @@ fn route_messages(
                     && matches!(
                         config.aggregation_type,
                         asap_types::AggregationType::Increase
-                            | asap_types::AggregationType::MultipleIncrease
+                            | asap_types::AggregationType::Rate
                             | asap_types::AggregationType::Min
                             | asap_types::AggregationType::Max
-                            | asap_types::AggregationType::MultipleMin
-                            | asap_types::AggregationType::MultipleMax
                     ));
             let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
                 Vec::new()
@@ -768,30 +762,14 @@ fn route_messages(
                 &computed_attrs_fp
             };
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
-            // A sketch family is not a complete physical identity. Two
-            // materializations may use the same family and grouping while
-            // differing in update semantics (for example count- versus
-            // value-weighted Top-K). Keep those states on distinct SIDs.
-            let materialization_kind =
-                crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
             let sid = ingest
-                .series_resolver
-                .resolve_with_reactivation(&config.metric, attrs_fp, &materialization_kind, |sid| {
-                    ingest.summary_store.validate_routed_catalog_generation(
-                        physical_plan.precompute_plan.summary_catalog.as_ref(),
-                    )?;
-                    let activation = ingest
-                        .summary_store
-                        .authorize_series_reactivation(sid, policy_fp.into())?;
-                    if let Some(generation) = &activation {
-                        if physical_plan.precompute_plan.summary_catalog.as_ref()
-                            != Some(generation.as_ref())
-                        {
-                            return Err("stale routed generation cannot reactivate series".into());
-                        }
-                    }
-                    Ok(activation)
-                })
+                .summary_store
+                .resolve_output_storage_handle(
+                    &ingest.series_resolver,
+                    policy_fp.into(),
+                    attrs_fp,
+                    physical_plan.precompute_plan.summary_catalog.as_ref(),
+                )
                 .map_err(RemoteWriteError::SeriesIdentity)?;
             buckets
                 .entry(sid)
@@ -938,8 +916,8 @@ mod tests {
     use crate::precompute_engine::ingest_handler::IngestObservability;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::types::{
-        ActivePhysicalPlanHandle, BackendStorageRouting, RuntimePhysicalPlan, StreamingConfig,
-        StreamingConfigHandle,
+        ActivePhysicalPlanHandle, BackendStorageRouting, InstalledPrecomputePlan,
+        InstalledPrecomputePlanHandle, RuntimePhysicalPlan,
     };
     use tokio::sync::mpsc;
 
@@ -949,7 +927,7 @@ mod tests {
             .unwrap()
     }
 
-    fn physical_config(streaming: StreamingConfig) -> StreamingConfigHandle {
+    fn physical_config(streaming: InstalledPrecomputePlan) -> InstalledPrecomputePlanHandle {
         use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
             IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
@@ -1015,11 +993,13 @@ mod tests {
                 },
                 rules: Vec::new(),
             },
-            streaming_config: Arc::new(streaming),
+            installed_precompute_plan: Arc::new(streaming),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
-        StreamingConfigHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(active))
+        InstalledPrecomputePlanHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(
+            active,
+        ))
     }
 
     fn receiver(config: PrometheusRemoteWriteConfig) -> PrometheusRemoteWriteReceiver {
@@ -1028,7 +1008,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: physical_config(StreamingConfig::default()),
+            hot_reload_config: physical_config(InstalledPrecomputePlan::default()),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -1040,8 +1020,8 @@ mod tests {
 
     fn configured_receiver() -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
-        use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
-        let aggregation = AggregationConfig {
+        use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
+        let aggregation = PrecomputeMaterialization {
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
@@ -1068,7 +1048,7 @@ mod tests {
             value_source_column: None,
         };
         let policy_fp = aggregation.policy_fp_u64();
-        let streaming = StreamingConfig::new(HashMap::from([(policy_fp, aggregation)]));
+        let streaming = InstalledPrecomputePlan::new(HashMap::from([(policy_fp, aggregation)]));
         let (sender, receiver) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -1106,7 +1086,7 @@ mod tests {
         let mut config = snapshot.precompute_plan.materializations[0].clone();
         config.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
         config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
-        let hot = physical_config(StreamingConfig::new(HashMap::from([(
+        let hot = physical_config(InstalledPrecomputePlan::new(HashMap::from([(
             config.policy_fp_u64(),
             config.clone(),
         )])));
@@ -1165,10 +1145,10 @@ mod tests {
     #[test]
     fn global_topk_cms_routes_once_while_counters_remain_per_series() {
         use asap_types::enums::WindowKind;
-        use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
+        use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
 
-        let config =
-            |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| AggregationConfig {
+        let config = |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| {
+            PrecomputeMaterialization {
                 population_key_encoding: Default::default(),
                 aggregation_type,
                 aggregation_sub_type: String::new(),
@@ -1203,7 +1183,8 @@ mod tests {
                 table_timestamp_column: None,
                 partitioning: None,
                 value_source_column: None,
-            };
+            }
+        };
         let cms = config(
             AggregationType::CountMinSketchWithHeap,
             vec![],
@@ -1219,7 +1200,7 @@ mod tests {
         assert_ne!(kll_fp, pooled_kll_fp);
         let cms_fp = cms.policy_fingerprint();
         let counter_fp = counter.policy_fingerprint();
-        let streaming = StreamingConfig::new(HashMap::from([
+        let streaming = InstalledPrecomputePlan::new(HashMap::from([
             (cms_fp.0, cms),
             (counter_fp.0, counter),
             (kll_fp.0, kll),
@@ -1385,7 +1366,9 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: StreamingConfigHandle::new(StreamingConfig::default()),
+            hot_reload_config: InstalledPrecomputePlanHandle::new(
+                InstalledPrecomputePlan::default(),
+            ),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -1628,6 +1611,9 @@ mod tests {
         let binding = asap_types::query_plan::MaterializationBinding {
             full_window_slide_ms: None,
             materialization: asap_types::PolicyFingerprint(policy).into(),
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                asap_types::PolicyFingerprint(policy).into(),
+            ),
             output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
             item_labels: vec![],
             window_ms: 60_000,

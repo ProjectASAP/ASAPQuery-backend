@@ -1,10 +1,10 @@
 //! Content-addressed policy registry.
 //!
-//! Derived view over a collection of `AggregationConfig`s that maps
-//! [`PolicyFingerprint`] → [`AggregationConfig`]. This is the
+//! Derived view over a collection of `PrecomputeMaterialization`s that maps
+//! [`PolicyFingerprint`] → [`PrecomputeMaterialization`]. This is the
 //! merged-sid-identity-chain replacement for the controller-allocated
-//! `aggregation_id`-keyed `HashMap` that `data_plane`'s `StreamingConfig`
-//! carries (see `data_plane::storage_engines::types::streaming_config`'s
+//! `aggregation_id`-keyed `HashMap` that `data_plane`'s `InstalledPrecomputePlan`
+//! carries (see `data_plane::storage_engines::types::installed_precompute_plan`'s
 //! module doc for why that type lives there, not here).
 //!
 //! ## Dual-keyed transition
@@ -20,7 +20,7 @@
 //!
 //! ## Identity invariants
 //!
-//! Two `AggregationConfig`s that produce the same `PolicyFingerprint`
+//! Two `PrecomputeMaterialization`s that produce the same `PolicyFingerprint`
 //! ARE the same policy. The registry treats this as a *deduplication*
 //! invariant — if two distinct entries in the source `materializations_by_policy_fingerprint`
 //! map produce the same fingerprint, the later one wins (last-write
@@ -30,13 +30,13 @@
 
 use std::collections::HashMap;
 
-use crate::aggregation_config::AggregationConfig;
+use crate::aggregation_config::PrecomputeMaterialization;
 use crate::policy_fingerprint::PolicyFingerprint;
 
 /// Content-addressed lookup table for active aggregation policies.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyRegistry {
-    policies: HashMap<PolicyFingerprint, AggregationConfig>,
+    policies: HashMap<PolicyFingerprint, PrecomputeMaterialization>,
 }
 
 impl PolicyRegistry {
@@ -46,7 +46,7 @@ impl PolicyRegistry {
     /// them.
     pub fn from_configs<I>(configs: I) -> Self
     where
-        I: IntoIterator<Item = AggregationConfig>,
+        I: IntoIterator<Item = PrecomputeMaterialization>,
     {
         let mut policies = HashMap::new();
         for cfg in configs {
@@ -63,7 +63,7 @@ impl PolicyRegistry {
     /// surfacing.
     pub fn from_configs_with_collisions<I>(configs: I) -> (Self, usize)
     where
-        I: IntoIterator<Item = AggregationConfig>,
+        I: IntoIterator<Item = PrecomputeMaterialization>,
     {
         let mut policies = HashMap::new();
         let mut collisions = 0usize;
@@ -77,12 +77,12 @@ impl PolicyRegistry {
     }
 
     /// Look up the config for a fingerprint.
-    pub fn get(&self, fp: PolicyFingerprint) -> Option<&AggregationConfig> {
+    pub fn get(&self, fp: PolicyFingerprint) -> Option<&PrecomputeMaterialization> {
         self.policies.get(&fp)
     }
 
     /// Iterate fingerprint → config pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&PolicyFingerprint, &AggregationConfig)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&PolicyFingerprint, &PrecomputeMaterialization)> {
         self.policies.iter()
     }
 
@@ -110,11 +110,11 @@ mod tests {
     use crate::KeyByLabelNames;
     use std::collections::HashMap as StdHashMap;
 
-    fn cfg(_id: u64, metric: &str) -> AggregationConfig {
+    fn cfg(_id: u64, metric: &str) -> PrecomputeMaterialization {
         // `_id` is unused after PR 5 — identity is derived from
         // content. Kept as a parameter so existing call sites in the
         // tests below don't churn.
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             StdHashMap::new(),

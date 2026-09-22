@@ -10,9 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sds::SummaryDefinitionId;
 use planner_types::post_asap::{
-    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutableOperator,
-    ExecutionDataState, ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId,
-    WindowEdgeCompatibility,
+    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutionDataState,
+    ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId, WindowEdgeCompatibility,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +20,8 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct QueryNodeId(pub u64);
 
-pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 1;
+pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 2;
+pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 3;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
 /// Plan lifecycle belongs to the enclosing `PrecomputePlan`; this document
@@ -43,7 +43,6 @@ pub struct OwnedPostAsapDag {
 #[serde(deny_unknown_fields)]
 pub struct OwnedPostAsapNode {
     pub id: PostAsapNodeId,
-    pub operator: ExecutableOperator,
     pub payload: serde_json::Value,
     pub output_state: ExecutionDataState,
     pub output_schema: serde_json::Value,
@@ -70,7 +69,6 @@ impl OwnedPostAsapDag {
             .map(|node| {
                 Ok(OwnedPostAsapNode {
                     id: node.id,
-                    operator: node.operator,
                     payload: serde_json::to_value(&node.payload).map_err(|e| e.to_string())?,
                     output_state: node.output_state,
                     output_schema: serde_json::to_value(&node.output_schema)
@@ -138,15 +136,8 @@ impl OwnedPostAsapDag {
             .map(|node| {
                 let payload: planner_types::post_asap::ExecutableOperatorPayload =
                     serde_json::from_value(node.payload.clone()).map_err(|e| e.to_string())?;
-                if payload.operator() != node.operator {
-                    return Err(format!(
-                        "post-ASAP node {} operator disagrees with payload",
-                        node.id.0
-                    ));
-                }
                 Ok(ExecutableDagNode {
                     id: node.id,
-                    operator: node.operator,
                     payload,
                     output_state: node.output_state,
                     output_schema: serde_json::from_value(node.output_schema.clone())
@@ -193,12 +184,55 @@ pub struct InstalledPostAsapDag {
 
 impl InstalledPostAsapDag {
     pub fn validate(&self) -> Result<(), String> {
-        if self.document.schema_version != OWNED_POST_ASAP_DAG_SCHEMA_VERSION
-            || self.document.query_id.trim().is_empty()
-        {
+        if self.document.query_id.trim().is_empty() {
             return Err("invalid post-ASAP DAG document identity/version".into());
         }
-        self.binding.validate(&self.document.decode()?)
+        if self.document.schema_version != MAINTENANCE_DAG_SCHEMA_VERSION {
+            return Err("unsupported maintenance DAG document version".into());
+        }
+        self.binding.validate_maintenance(&self.document.decode()?)
+    }
+
+    /// Project the selected semantic DAG onto the maintenance ancestors of its
+    /// stored outputs.
+    pub fn maintenance_projection(mut self) -> Result<Self, String> {
+        if self.document.schema_version != OWNED_POST_ASAP_DAG_SCHEMA_VERSION {
+            return Err("selected DAG has an unsupported document version".into());
+        }
+        self.binding.validate(&self.document.decode()?)?;
+        if self.binding.precompute_sinks.is_empty() {
+            return Err("cannot project a DAG without maintenance sinks".into());
+        }
+        let mut included = self
+            .binding
+            .precompute_sinks
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut frontier = self.binding.precompute_sinks.clone();
+        while let Some(consumer) = frontier.pop() {
+            for edge in self
+                .document
+                .edges
+                .iter()
+                .filter(|edge| edge.consumer == consumer)
+            {
+                if included.insert(edge.producer) {
+                    frontier.push(edge.producer);
+                }
+            }
+        }
+        self.document
+            .nodes
+            .retain(|node| included.contains(&node.id));
+        self.document
+            .edges
+            .retain(|edge| included.contains(&edge.producer) && included.contains(&edge.consumer));
+        self.binding.nodes.retain(|id, _| included.contains(id));
+        self.document.root = *self.binding.precompute_sinks.first().unwrap();
+        self.document.schema_version = MAINTENANCE_DAG_SCHEMA_VERSION;
+        self.validate()?;
+        Ok(self)
     }
 }
 
@@ -232,6 +266,55 @@ pub enum BackendNodeBinding {
 impl BackendExecutableBinding {
     pub fn node(&self, id: PostAsapNodeId) -> Option<&BackendNodeBinding> {
         self.nodes.get(&id)
+    }
+
+    pub fn validate_maintenance(&self, dag: &ExecutableDag) -> Result<(), String> {
+        let ids = dag
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        if ids.is_empty() || self.nodes.keys().copied().collect::<BTreeSet<_>>() != ids {
+            return Err("maintenance binding does not cover its projected DAG".into());
+        }
+        if self.precompute_sinks.is_empty()
+            || self.precompute_sinks.iter().any(|id| !ids.contains(id))
+        {
+            return Err("maintenance projection has missing sinks".into());
+        }
+        if self.precompute_sinks.iter().any(|id| {
+            !matches!(
+                self.node(*id),
+                Some(BackendNodeBinding::Materialization { .. })
+            )
+        }) {
+            return Err("maintenance sink lacks a stored-output binding".into());
+        }
+        for node in &dag.nodes {
+            match (node.output_state.timing, self.node(node.id)) {
+                (
+                    ExecutionTiming::MaintenanceTime,
+                    Some(
+                        BackendNodeBinding::MaintenanceInput
+                        | BackendNodeBinding::Materialization { .. },
+                    ),
+                ) => {}
+                _ => {
+                    return Err(format!(
+                        "query-owned node {} in maintenance projection",
+                        node.id.0
+                    ))
+                }
+            }
+        }
+        if dag
+            .edges
+            .iter()
+            .any(|edge| !ids.contains(&edge.producer) || !ids.contains(&edge.consumer))
+        {
+            return Err("maintenance projection has dangling edges".into());
+        }
+        Ok(())
     }
 
     pub fn validate(&self, dag: &ExecutableDag) -> Result<(), String> {
@@ -287,10 +370,33 @@ mod tests {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<InstalledPostAsapDag>();
         let wire = serde_json::json!({
-            "schema_version": 1, "query_id": "q", "nodes": [], "edges": [], "root": 0
+            "schema_version": 2, "query_id": "q", "nodes": [], "edges": [], "root": 0
         });
         let document: OwnedPostAsapDag = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(document).unwrap(), wire);
         assert_eq!(serde_json::to_value(QueryNodeId(9)).unwrap(), 9);
+    }
+
+    #[test]
+    fn installed_maintenance_dag_rejects_complete_dag_version() {
+        let installed = InstalledPostAsapDag {
+            document: OwnedPostAsapDag {
+                schema_version: OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
+                query_id: "q".into(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                root: PostAsapNodeId(0),
+            },
+            binding: BackendExecutableBinding {
+                nodes: BTreeMap::new(),
+                query_sink: PostAsapNodeId(0),
+                query_plan_sink: QueryNodeId(0),
+                precompute_sinks: Vec::new(),
+            },
+        };
+        assert!(installed
+            .validate()
+            .unwrap_err()
+            .contains("unsupported maintenance DAG"));
     }
 }
