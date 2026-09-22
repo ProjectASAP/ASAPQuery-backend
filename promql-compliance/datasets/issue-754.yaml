@@ -2,13 +2,13 @@ name: issue-754
 series:
   - metric: data
     labels: {label_0: a, instance: a1}
-    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 120, step_seconds: 0.1, multiplier: 1, base: 10, modulo: 120}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 10, modulo: 120}
   - metric: data
     labels: {label_0: a, instance: a2}
-    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 120, step_seconds: 0.1, multiplier: 2, base: 20, modulo: 120}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 2, base: 20, modulo: 120}
   - metric: data
     labels: {label_0: b, instance: b1}
-    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 120, step_seconds: 0.1, multiplier: 3, base: 30, modulo: 120}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 3, base: 30, modulo: 120}
   - metric: data
     labels: {label_0: b, instance: b2}
-    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 120, step_seconds: 0.1, multiplier: 4, base: 40, modulo: 120}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 4, base: 40, modulo: 120}
