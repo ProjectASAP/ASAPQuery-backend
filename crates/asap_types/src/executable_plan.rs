@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub struct QueryNodeId(pub u64);
 
 pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 2;
-pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 2;
+pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 3;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
 /// Plan lifecycle belongs to the enclosing `PrecomputePlan`; this document
