@@ -91,7 +91,9 @@ fn derive_sketch_only(config: &AggregationConfig) -> AccuracyProfile {
         // `DeltaSetAggregator` exact-set-membership family lived
         // here too before its retirement.)
         AggregationType::Sum
+        | AggregationType::Count
         | AggregationType::Increase
+        | AggregationType::Rate
         | AggregationType::Min
         | AggregationType::Max
         | AggregationType::MultipleSum

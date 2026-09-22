@@ -14,7 +14,9 @@ use std::str::FromStr;
 pub enum AggregationType {
     // ---------- single-population (non-keyed) ----------
     Sum,
+    Count,
     Increase,
+    Rate,
     Min,
     Max,
     DatasketchesKLL,
@@ -41,7 +43,9 @@ impl AggregationType {
     pub fn as_str(self) -> &'static str {
         match self {
             AggregationType::Sum => "Sum",
+            AggregationType::Count => "Count",
             AggregationType::Increase => "Increase",
+            AggregationType::Rate => "Rate",
             AggregationType::Min => "Min",
             AggregationType::Max => "Max",
             AggregationType::DatasketchesKLL => "DatasketchesKLL",
@@ -93,7 +97,9 @@ impl FromStr for AggregationType {
         match s {
             // Canonical names
             "Sum" => Ok(AggregationType::Sum),
+            "Count" => Ok(AggregationType::Count),
             "Increase" => Ok(AggregationType::Increase),
+            "Rate" => Ok(AggregationType::Rate),
             "Min" => Ok(AggregationType::Min),
             "Max" => Ok(AggregationType::Max),
             "DatasketchesKLL" => Ok(AggregationType::DatasketchesKLL),
