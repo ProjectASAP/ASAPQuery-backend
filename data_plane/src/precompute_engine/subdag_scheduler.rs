@@ -114,7 +114,8 @@ where
     S: IdempotentCommitSink<V>,
 {
     let _span = tracing::debug_span!(target: "asap_runtime_debug", "precompute_dag",
-        output_count = outputs.len(), node_count = dag.nodes.len(), edge_count = dag.edges.len()).entered();
+        output_count = outputs.len(), node_count = dag.nodes.len(), edge_count = dag.edges.len())
+    .entered();
     tracing::debug!(target: "asap_runtime_debug", "precompute DAG execution started");
     let mut unique = BTreeSet::new();
     for (node, key) in outputs {
@@ -211,7 +212,19 @@ where
         let node = nodes
             .get(&id)
             .ok_or_else(|| ScheduleError::Invalid(format!("missing node {id}")))?;
-        let op = node.operator;
+        let op = match &node.payload {
+            ExecutableOperatorPayload::Fallback { .. } => "Fallback",
+            ExecutableOperatorPayload::Binary { .. } => "Binary",
+            ExecutableOperatorPayload::CandidateTopK { .. } => "CandidateTopK",
+            ExecutableOperatorPayload::Value { .. } => "Value",
+            ExecutableOperatorPayload::RelationalJoin { .. } => "RelationalJoin",
+            ExecutableOperatorPayload::SummaryAgg { .. } => "SummaryAgg",
+            ExecutableOperatorPayload::SummaryJoin { .. } => "SummaryJoin",
+            ExecutableOperatorPayload::SummarySubtract => "SummarySubtract",
+            ExecutableOperatorPayload::SummaryDelete { .. } => "SummaryDelete",
+            ExecutableOperatorPayload::SummaryEstimate { .. } => "SummaryEstimate",
+            ExecutableOperatorPayload::SummaryMerge => "SummaryMerge",
+        };
         if node.output_state == ExecutionDataState::READ_ROWS {
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
