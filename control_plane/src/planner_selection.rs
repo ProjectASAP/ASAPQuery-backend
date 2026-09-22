@@ -231,8 +231,10 @@ pub fn keep_pre_asap(expr: &QueryExpr) -> Result<Rc<SummaryNode>, SelectionError
     }))
 }
 
-/// Select the first legal candidate after the supplied deployment cost model
-/// has ranked Planner's exhaustive candidate set.
+/// Legacy single-site witness helper used by residual matching and examples.
+/// Deployment selection uses `select_workload_with_accuracy_model_and_trace`
+/// followed by physical compilation; this helper does not establish runtime
+/// support or authorize publication.
 pub fn select_summary(
     expr: &QueryExpr,
     cost_model: &dyn CostModel,
@@ -401,8 +403,40 @@ fn select_workload_impl(
         let groups = space.cost_sorted(cost_model).iter().enumerate().map(|(index, group)| {
             let chosen = selection.groups().find(|selected| Rc::ptr_eq(selected.target, group.target))
                 .and_then(|selected| selected.chosen);
-            let candidates = group.candidates.iter().zip(&group.costs).enumerate()
-                .map(|(rank, (candidate, cost))| serde_json::json!({
+            let target = TargetSubDAG::with_consumer_count(group.target, group.consumer_count);
+            let candidates = group.candidates.iter().enumerate()
+                .map(|(rank, candidate)| {
+                    let candidate_cost = cost_model.candidate_cost(candidate, &target);
+                    let accuracy_status = if candidate.has_missing_accuracy_evidence() {
+                        "unknown"
+                    } else {
+                        "known"
+                    };
+                    let runtime_support_status = match candidate.runtime_support_evidence(cost_model) {
+                        Some(true) => "supported",
+                        Some(false) => "unsupported",
+                        None => "unknown_pending_backend_binding",
+                    };
+                    let decision_reason = if candidate.has_missing_accuracy_evidence() {
+                        "missing_accuracy_evidence"
+                    } else if candidate.runtime_support_evidence(cost_model) == Some(false) {
+                        "unsupported_runtime_operation"
+                    } else if chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)) {
+                        if candidate_cost.is_some() {
+                            "planner_selected_pending_backend_binding"
+                        } else {
+                            "qualitative_selection_pending_backend_binding"
+                        }
+                    } else if candidate_cost.is_none() {
+                        "missing_comparable_cost"
+                    } else {
+                        "not_selected_by_planner"
+                    };
+                    let guarantee = match &candidate.replacement {
+                        Replacement::Summary(node) => node.guarantee.as_ref(),
+                        _ => None,
+                    };
+                    serde_json::json!({
                     "rank": rank,
                     "candidate_id": replacement_identity(group.target, &candidate.replacement, &accuracy),
                     "status": if chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)) { "selected" } else { "unselected" },
@@ -414,10 +448,14 @@ fn select_workload_impl(
                         Replacement::Rewrite(_) => "rewrite",
                         Replacement::ExactComposition(_) => "exact_composition",
                     },
-                    "estimated_cost": cost.is_finite().then_some(*cost),
-                    "estimated_cost_status": if cost.is_finite() { "available" } else { "not_reported_by_cost_model" },
+                    "accuracy_status": accuracy_status,
+                    "guarantee": guarantee,
+                    "runtime_support_status": runtime_support_status,
+                    "decision_reason": decision_reason,
+                    "estimated_cost": candidate_cost.map(|cost| cost.0),
+                    "estimated_cost_status": if candidate_cost.is_some() { "available" } else { "unavailable" },
                     "selected": chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)),
-                })).collect::<Vec<_>>();
+                })}).collect::<Vec<_>>();
             let rejected = space.groups().find(|memo| Rc::ptr_eq(&memo.target, group.target))
                 .into_iter().flat_map(|memo| &memo.rejected).map(|candidate| serde_json::json!({
                     "status": "rejected", "strategy": candidate.strategy,
@@ -540,6 +578,60 @@ mod workload_tests {
             a["roots"][0]["logical_root_id"],
             trace(AccuracyTarget::Epsilon(0.1))["roots"][0]["logical_root_id"]
         );
+    }
+
+    /// Explain availability from the candidate-cost API, even if a display
+    /// estimate exists, and never label an unknown guarantee as selected.
+    #[test]
+    fn explain_keeps_uncertified_and_uncosted_candidates_explicit() {
+        struct Uncosted;
+        impl CostModel for Uncosted {
+            fn rank_candidates(
+                &self,
+                _intent: &AggIntent,
+                candidates: &[planner_types::post_asap::SketchAlgorithm],
+            ) -> Vec<planner_types::post_asap::SketchAlgorithm> {
+                candidates.to_vec()
+            }
+
+            fn candidate_cost(
+                &self,
+                _candidate: &asap_aware_mapping::ReplacementSubDAG,
+                _target: &TargetSubDAG<'_>,
+            ) -> Option<asap_aware_mapping::cost_model::Cost> {
+                None
+            }
+        }
+
+        let accuracy = AccuracyTarget::Epsilon(0.05);
+        let root = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.9,m[1m]) / quantile_over_time(0.5,m[1m])",
+            accuracy.clone(),
+        )
+        .unwrap();
+        let (_, trace) = select_workload_with_accuracy_model_and_trace(
+            vec![(0, Rc::new(root))],
+            accuracy,
+            &Uncosted,
+            &asap_aware_mapping::NoAccuracyEvidence,
+            &asap_aware_mapping::DefaultAccuracyModel,
+        )
+        .unwrap();
+        let candidates = trace["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["candidates"].as_array().unwrap());
+        let mut saw_unknown = false;
+        for candidate in candidates {
+            assert_eq!(candidate["estimated_cost_status"], "unavailable");
+            assert!(candidate["estimated_cost"].is_null());
+            if candidate["accuracy_status"] == "unknown" {
+                saw_unknown = true;
+                assert_eq!(candidate["selected"], false);
+            }
+        }
+        assert!(saw_unknown);
     }
 
     // JSON must not alias NaN and infinity through its null representation.
@@ -687,12 +779,10 @@ mod workload_tests {
         );
     }
 
-    // HydraGroupingStrategy is registered, but a shared grid is only legal
-    // with a collision bound to compose: `QueryEvidence` (compiler.rs) reports
-    // none today, so the strategy correctly offers nothing rather than an
-    // unbounded guarantee. Pin both halves — the wiring and the missing input.
+    // Missing shared-grid evidence keeps Hydra candidates visible but
+    // uncertified. Supplying a certificate makes them eligible for selection.
     #[test]
-    fn hydra_candidates_wait_for_shared_grid_evidence() {
+    fn hydra_candidates_remain_visible_without_shared_grid_evidence() {
         use asap_aware_mapping::{AccuracyEvidenceProvider, PropagationStats};
         use planner_types::post_asap::{CompositionOperator, SketchQuery};
         use planner_types::pre_asap::query_expr::Source;
@@ -749,11 +839,18 @@ mod workload_tests {
                 evidence,
             )
             .replacements(&target)
-            .len()
         };
-        assert_eq!(hydra(&asap_aware_mapping::NoAccuracyEvidence), 0);
+        let unknown = hydra(&asap_aware_mapping::NoAccuracyEvidence);
+        assert_eq!(unknown.len(), 2);
+        assert!(unknown
+            .iter()
+            .all(|candidate| candidate.has_missing_accuracy_evidence()));
         // HydraCms over Cms and HydraCountSketch over CountSketch.
-        assert_eq!(hydra(&MeasuredSharedGrid), 2);
+        let certified = hydra(&MeasuredSharedGrid);
+        assert_eq!(certified.len(), 2);
+        assert!(certified
+            .iter()
+            .all(|candidate| !candidate.has_missing_accuracy_evidence()));
     }
 
     // A shared aggregate must keep the sketch plan an unshared one gets:

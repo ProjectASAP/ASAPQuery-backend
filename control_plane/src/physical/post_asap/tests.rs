@@ -735,17 +735,30 @@ fn phase_b_e2e_rate_falls_through_to_logical() {
     );
 }
 
-/// The legacy single-expression binder cannot choose a frequency sketch for
-/// value-ranked `topk(sum(rate(...)))` without membership evidence. The
-/// workload planner handles this query as query-time Sort+Limit over its
-/// recursively planned child; its coverage lives in `query_plan::residual`.
+/// Value-ranked TopK candidates with missing membership evidence remain
+/// inspectable but cannot be reported as certified selections.
 #[test]
-fn phase_b_legacy_topk_requires_membership_evidence() {
+fn value_ranked_topk_without_membership_evidence_is_not_certified() {
     let query = "topk(10, sum by (instance) (rate(http_requests_total[5m])))";
     let accuracy = AccuracyTarget::Epsilon(0.05);
     let expr = crate::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .expect("TopK parses");
-    assert!(bind_query_expr(&expr, accuracy).is_err());
+    let (_, trace) = crate::planner_selection::select_workload_with_accuracy_model_and_trace(
+        vec![(0, std::rc::Rc::new(expr))],
+        accuracy.clone(),
+        &crate::physical::post_asap::cost_model::ControlPlaneCostModel::new(accuracy),
+        &asap_aware_mapping::NoAccuracyEvidence,
+        &asap_aware_mapping::DefaultAccuracyModel,
+    )
+    .unwrap();
+    assert!(trace["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["candidates"].as_array().unwrap())
+        .any(
+            |candidate| candidate["accuracy_status"] == "unknown" && candidate["selected"] == false
+        ));
 }
 
 /// Archive-only routing through the full L1→L3→L4 pipeline. Asserts the
