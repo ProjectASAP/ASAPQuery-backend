@@ -231,8 +231,16 @@ impl AggregationConfig {
                 SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 false,
             ),
+            Count => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Count, ExactParams::Count),
+                false,
+            ),
             Increase => (
                 SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
+                false,
+            ),
+            Rate => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate),
                 false,
             ),
             Min => (

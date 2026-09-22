@@ -101,7 +101,7 @@ pub enum Capability {
 /// * Sum-over-time requires archive execution because cumulative samples
 ///   cannot be reconstructed from delta state alone.
 ///
-/// Rate and Increase require the Increase capability; plain sum requires Sum.
+/// Rate and Increase have distinct exact-family capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OuterFn {
     /// No range-style counter function in the expression — bare selector,
@@ -369,9 +369,8 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
 
 #[cfg(test)]
 /// Map a semantic [`AggIntent`] to the ASAP-tier [`Capability`] that can
-/// answer it. Returns `None` for intents that have no ASAP-tier sketch
-/// (Sum / Min / Max / Avg / Rate / Increase / every archive-only intent
-/// — see [`AggIntent::archive_only`]).
+/// answer it. Returns `None` when no deployed ASAP-tier capability can
+/// satisfy the intent.
 ///
 /// This is a runtime routing requirement, not a summary-selection rule.
 /// ASAPPlanner owns legal implementations and candidate enumeration; this
@@ -395,15 +394,17 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     }
     match intent {
         AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
+        AggIntent::Count { accuracy } if is_exact(accuracy) => {
+            Some(Capability::ExactAgg(AggregationType::Count))
+        }
         // Direction is part of the capability: a stored minimum cannot
         // answer `max_over_time` and vice versa, so these must not
         // collapse onto one `ExactAgg` the way they did while Planner
         // had a single `MinMax` accumulator.
         AggIntent::Min { .. } => Some(Capability::ExactAgg(AggregationType::Min)),
         AggIntent::Max { .. } => Some(Capability::ExactAgg(AggregationType::Max)),
-        AggIntent::Increase | AggIntent::Rate => {
-            Some(Capability::ExactAgg(AggregationType::Increase))
-        }
+        AggIntent::Increase => Some(Capability::ExactAgg(AggregationType::Increase)),
+        AggIntent::Rate => Some(Capability::ExactAgg(AggregationType::Rate)),
         AggIntent::Quantile { accuracy, .. } if !is_exact(accuracy) => {
             Some(Capability::QuantileApprox(None))
         }
@@ -532,18 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_count_exact_routes_to_archive() {
-        // `count_over_time` lowers to `Count{accuracy:Exact}`. The
-        // PR #200/#201 follow-up briefly routed this to
-        // `ExactAgg(Sum)`, but the data plane has no count
-        // accumulator — `SumAccumulator` returns its `sum` for both
-        // `Statistic::Sum` and `Statistic::Count`, so the result was
-        // sum-of-values, not sample-count. Reverted to `None` (archive
-        // routing) until a real `SumCountAccumulator` lands.
+    fn capability_for_count_exact_preserves_count_family() {
         let intent = AggIntent::Count {
             accuracy: AccuracyTarget::Exact,
         };
-        assert_eq!(capability_for(&intent), None);
+        assert_eq!(
+            capability_for(&intent),
+            Some(Capability::ExactAgg(AggregationType::Count))
+        );
     }
 
     #[test]
@@ -597,12 +594,12 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_rate_increase_route_to_exact_agg_increase() {
-        // PR-6 follow-up: Rate and Increase route to ASAP-tier
-        // ExactAgg(Increase) — the counter-reset-aware exact precompute.
-        // Pre-follow-up this returned `None`.
+    fn capability_for_rate_and_increase_preserves_family() {
         let exact_inc = Some(Capability::ExactAgg(AggregationType::Increase));
-        assert_eq!(capability_for(&AggIntent::Rate), exact_inc);
+        assert_eq!(
+            capability_for(&AggIntent::Rate),
+            Some(Capability::ExactAgg(AggregationType::Rate))
+        );
         assert_eq!(capability_for(&AggIntent::Increase), exact_inc);
     }
 
@@ -905,30 +902,26 @@ mod tests {
     // ── capability_for: ExactAgg dormancy ────────────────────────────────
 
     #[test]
-    fn exact_agg_routing_covers_sum_rate_increase_only() {
-        // `Capability::ExactAgg` routing covers the three intents the
-        // data plane has a real accumulator for: `Sum` (SumAccumulator)
-        // and `Rate` / `Increase` (IncreaseAccumulator).
+    fn exact_agg_routing_keeps_sum_rate_and_increase_distinct() {
         assert_eq!(
             capability_for(&AggIntent::Sum { col: None }),
             Some(Capability::ExactAgg(AggregationType::Sum))
         );
         assert_eq!(
             capability_for(&AggIntent::Rate),
-            Some(Capability::ExactAgg(AggregationType::Increase))
+            Some(Capability::ExactAgg(AggregationType::Rate))
         );
         assert_eq!(
             capability_for(&AggIntent::Increase),
             Some(Capability::ExactAgg(AggregationType::Increase))
         );
-        // `Count{Exact}` (count_over_time) and `Avg` both need a real
-        // count accumulator that doesn't exist yet — they route to
-        // archive until `SumCountAccumulator` lands.
+        // Exact count follows the Planner Count family; Avg still needs
+        // its own composition contract.
         assert_eq!(
             capability_for(&AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
             }),
-            None
+            Some(Capability::ExactAgg(AggregationType::Count))
         );
         assert_eq!(capability_for(&AggIntent::Avg { col: None }), None);
     }

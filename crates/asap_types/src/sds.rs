@@ -668,10 +668,19 @@ impl FidelityGuarantee {
                 (aggregation_type, self),
                 (A::UnivMon, UnivMonFrequency { .. })
                     | (
-                        A::Sum | A::MultipleSum | A::Min | A::Max | A::MultipleMin | A::MultipleMax,
+                        A::Sum
+                            | A::Count
+                            | A::MultipleSum
+                            | A::Min
+                            | A::Max
+                            | A::MultipleMin
+                            | A::MultipleMax,
                         Exact
                     )
-                    | (A::Increase | A::MultipleIncrease, ExactCounter { .. })
+                    | (
+                        A::Increase | A::Rate | A::MultipleIncrease,
+                        ExactCounter { .. }
+                    )
                     | (A::DatasketchesKLL | A::HydraKLL, KllRankError { .. })
                     | (A::DDSketch, DdSketchRelativeError { .. })
                     | (A::HLL, HllCardinalityError { .. })

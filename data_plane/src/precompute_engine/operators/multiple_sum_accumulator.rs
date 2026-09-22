@@ -13,20 +13,34 @@ use asap_types::Statistic;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipleSumAccumulator {
     pub sums: HashMap<KeyByLabelValues, f64>,
+    #[serde(default)]
+    pub counts: HashMap<KeyByLabelValues, u64>,
 }
 
 impl MultipleSumAccumulator {
     pub fn new() -> Self {
         Self {
             sums: HashMap::new(),
+            counts: HashMap::new(),
         }
     }
 
     pub fn update(&mut self, key: KeyByLabelValues, value: f64) {
-        *self.sums.entry(key).or_insert(0.0) += value;
+        let is_new = !self.sums.contains_key(&key);
+        *self.sums.entry(key.clone()).or_insert(0.0) += value;
+        if let Some(count) = self.counts.get(&key).copied() {
+            if let Some(next) = count.checked_add(1).filter(|next| *next != u64::MAX) {
+                self.counts.insert(key, next);
+            } else {
+                self.counts.remove(&key);
+            }
+        } else if is_new {
+            self.counts.insert(key, 1);
+        }
     }
 
     pub fn add_sum(&mut self, key: KeyByLabelValues, sum: f64) {
+        self.counts.remove(&key);
         self.sums.insert(key, sum);
     }
 
@@ -43,7 +57,19 @@ impl MultipleSumAccumulator {
             sums.insert(key, sum);
         }
 
-        Ok(Self { sums })
+        let mut counts = HashMap::new();
+        if let Some(counts_data) = data.get("counts").and_then(Value::as_object) {
+            for (key_str, value) in counts_data {
+                let key_json: Value = serde_json::from_str(key_str)?;
+                let key = KeyByLabelValues::deserialize_from_json(&key_json)?;
+                let count = value.as_u64().ok_or("Invalid count value")?;
+                if !sums.contains_key(&key) {
+                    return Err("Count key missing from sums".into());
+                }
+                counts.insert(key, count);
+            }
+        }
+        Ok(Self { sums, counts })
     }
 
     pub fn deserialize_from_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
@@ -62,6 +88,7 @@ impl MultipleSumAccumulator {
         offset += 4;
 
         let mut sums = HashMap::new();
+        let mut keys = Vec::new();
 
         for _ in 0..num_entries {
             // Read key length and data
@@ -99,10 +126,27 @@ impl MultipleSumAccumulator {
             ]);
             offset += 8;
 
+            keys.push(key.clone());
             sums.insert(key, sum);
         }
-
-        Ok(Self { sums })
+        let remaining = buffer.len() - offset;
+        let count_bytes = num_entries
+            .checked_mul(8)
+            .ok_or("Count section too large")?;
+        if remaining != 0 && remaining != count_bytes {
+            return Err("Invalid count section length".into());
+        }
+        let mut counts = HashMap::new();
+        if remaining != 0 {
+            for key in keys {
+                let count = u64::from_le_bytes(buffer[offset..offset + 8].try_into()?);
+                offset += 8;
+                if count != u64::MAX {
+                    counts.insert(key, count);
+                }
+            }
+        }
+        Ok(Self { sums, counts })
     }
 }
 
@@ -124,8 +168,15 @@ impl SerializableToSink for MultipleSumAccumulator {
             );
         }
 
+        let mut counts_obj = serde_json::Map::new();
+        for (key, count) in &self.counts {
+            let key_str = serde_json::to_string(&key.serialize_to_json()).unwrap();
+            counts_obj.insert(key_str, Value::from(*count));
+        }
+
         serde_json::json!({
-            "sums": sums_obj
+            "sums": sums_obj,
+            "counts": counts_obj
         })
     }
 
@@ -136,7 +187,9 @@ impl SerializableToSink for MultipleSumAccumulator {
         buffer.extend_from_slice(&(self.sums.len() as u32).to_le_bytes());
 
         // Write each key-value pair
+        let mut ordered_keys = Vec::with_capacity(self.sums.len());
         for (key, sum) in &self.sums {
+            ordered_keys.push(key);
             let key_bytes = key.serialize_to_bytes();
 
             // Write key length and data
@@ -145,6 +198,17 @@ impl SerializableToSink for MultipleSumAccumulator {
 
             // Write sum value
             buffer.extend_from_slice(&sum.to_le_bytes());
+        }
+
+        for key in ordered_keys {
+            buffer.extend_from_slice(
+                &self
+                    .counts
+                    .get(key)
+                    .copied()
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
         }
 
         buffer
@@ -200,7 +264,7 @@ impl AggregateCore for MultipleSumAccumulator {
     fn approx_memory_bytes(&self) -> usize {
         // HashMap<KeyByLabelValues, f64>. Label strings dominate; use a
         // conservative per-entry estimate plus HashMap overhead.
-        const BYTES_PER_ENTRY: usize = 96;
+        const BYTES_PER_ENTRY: usize = 112;
         std::mem::size_of::<Self>() + self.sums.len() * BYTES_PER_ENTRY
     }
 
@@ -230,11 +294,20 @@ impl MultipleSubpopulationAggregate for MultipleSumAccumulator {
         _query_kwargs: Option<&HashMap<String, String>>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         match statistic {
-            Statistic::Sum | Statistic::Count => self
+            Statistic::Sum => self
                 .sums
                 .get(key)
                 .copied()
                 .ok_or_else(|| "Key not found in MultipleSumAccumulator".to_string().into()),
+            Statistic::Count => self
+                .counts
+                .get(key)
+                .map(|count| *count as f64)
+                .ok_or_else(|| {
+                    "Sample count unavailable in MultipleSumAccumulator"
+                        .to_string()
+                        .into()
+                }),
             _ => Err(
                 format!("Unsupported statistic in MultipleSumAccumulator: {statistic:?}").into(),
             ),
@@ -257,6 +330,26 @@ impl MergeableAccumulator<MultipleSumAccumulator> for MultipleSumAccumulator {
         let mut result = MultipleSumAccumulator::new();
 
         for acc in accumulators {
+            for key in acc.sums.keys() {
+                match (
+                    result.counts.get(key).copied(),
+                    acc.counts.get(key).copied(),
+                ) {
+                    (None, Some(count)) if !result.sums.contains_key(key) => {
+                        result.counts.insert(key.clone(), count);
+                    }
+                    (Some(existing), Some(count)) => {
+                        if let Some(total) = existing.checked_add(count) {
+                            result.counts.insert(key.clone(), total);
+                        } else {
+                            result.counts.remove(key);
+                        }
+                    }
+                    _ => {
+                        result.counts.remove(key);
+                    }
+                }
+            }
             for (key, sum) in acc.sums {
                 *result.sums.entry(key).or_insert(0.0) += sum;
             }
@@ -292,6 +385,25 @@ mod tests {
 
         assert_eq!(acc.sums.get(&key1), Some(&15.0));
         assert_eq!(acc.sums.get(&key2), Some(&20.0));
+    }
+
+    #[test]
+    fn grouped_count_reads_sample_count_and_survives_merge_and_round_trip() {
+        let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
+        let mut first = MultipleSumAccumulator::new();
+        first.update(key.clone(), 10.0);
+        first.update(key.clone(), 20.0);
+        let mut second = MultipleSumAccumulator::new();
+        second.update(key.clone(), 7.0);
+        let merged = MultipleSumAccumulator::merge_accumulators(vec![first, second]).unwrap();
+        for acc in [
+            merged.clone(),
+            MultipleSumAccumulator::deserialize_from_json(&merged.serialize_to_json()).unwrap(),
+            MultipleSumAccumulator::deserialize_from_bytes(&merged.serialize_to_bytes()).unwrap(),
+        ] {
+            assert_eq!(acc.query(Statistic::Sum, &key, None).unwrap(), 37.0);
+            assert_eq!(acc.query(Statistic::Count, &key, None).unwrap(), 3.0);
+        }
     }
 
     #[test]

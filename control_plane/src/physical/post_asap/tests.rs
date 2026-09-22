@@ -556,14 +556,9 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
 }
 
 /// `ONE_TEMPORAL_ONE_SPATIAL` — `sum by (host) (rate(m[5m]))`.
-/// `bind_query_expr` (not `implement_tree` directly) rewrites
-/// `AggIntent::Rate` to `AggIntent::Increase` before binding (see
-/// `lower.rs`'s `rewrite_rate_to_increase` — this deployment's data
-/// plane has no Rate accumulator). The old
-/// `AggregationType::MultipleIncrease` identity is now
-/// `SummaryKind::Increase` with a non-empty `by`.
+/// Planner preserves the Rate family and the `by` reduction independently.
 #[test]
-fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
+fn phase_b_pattern_temporal_and_spatial_combined_preserves_rate() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![1]),
         measures: vec![AggIntent::Rate],
@@ -579,11 +574,11 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
             } => {
                 assert_eq!(
                     family,
-                    &SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase)
+                    &SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate)
                 );
                 assert_eq!(reduction.group_keys().map(|k| k.keys()), Some(&[1][..]));
             }
-            other => panic!("expected SummaryAgg(Increase, by=[1]), got {other:?}"),
+            other => panic!("expected SummaryAgg(Rate, by=[1]), got {other:?}"),
         },
         other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
@@ -716,12 +711,9 @@ fn phase_b_e2e_sum_by_preserves_grouping_label() {
     );
 }
 
-/// `rate_increase.yaml` — the legacy planner emits a MultipleIncrease
-/// (counter-reset adjusted) row. Control plane path: `Aggregate{Rate}` over
-/// `Window` → `bind_query_expr` rewrites `Rate` to `Increase` and binds an
-/// exact accumulator (`SummaryAgg{Increase}`) — no approximate summary
-/// family. Both paths produce a single non-summary streaming row; the L5
-/// emitter is the one that picks the actual MultipleIncrease processor.
+/// A Rate query keeps Planner's exact Rate family through binding. The
+/// physical emitter chooses the runtime processor without changing that
+/// family identity.
 #[test]
 fn phase_b_e2e_rate_falls_through_to_logical() {
     let bound = pipeline_l1_to_l4(

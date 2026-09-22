@@ -1004,8 +1004,10 @@ fn metric_has_exact_agg_sum_sid(
                     cap,
                     Capability::ExactAgg(
                         AggregationType::Sum
+                            | AggregationType::Count
                             | AggregationType::MultipleSum
                             | AggregationType::Increase
+                            | AggregationType::Rate
                             | AggregationType::MultipleIncrease
                     )
                 ) {

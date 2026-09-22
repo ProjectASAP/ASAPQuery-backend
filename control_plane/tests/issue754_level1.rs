@@ -1,12 +1,14 @@
 //! Issue #754 level 1: every shared workload query has a valid physical plan.
 use control_plane::physical::compiler::{
-    BackendLocalPlanningInput, PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
+    BackendLocalPlanningInput, CompiledPhysicalPlan, PhysicalPlanCompiler, BACKEND_REVISION,
+    PLANNER_REVISION,
 };
 use control_plane::physical::executable_binding::validate_query_plan;
 use control_plane::physical::workload_cost::{
     enumerate_exact_and_materialized_candidates, manifest, WorkloadCostEvidence, WorkloadQuote,
 };
 use control_plane::query_plan::QueryPlanNode;
+use planner_types::post_asap::{ExactKind, SketchAlgorithm, SummaryFamilyType};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -22,10 +24,15 @@ struct Case {
 }
 
 struct ExpectedPlan {
-    family: Option<&'static str>,
+    family: Option<ExpectedFamily>,
     partitioning: &'static str,
     readout: &'static str,
     root_operation: Option<&'static str>,
+}
+
+enum ExpectedFamily {
+    Exact(ExactKind),
+    QuantileSketch,
 }
 
 // These are semantic contracts for the installed query DAG, not a snapshot of
@@ -33,7 +40,7 @@ struct ExpectedPlan {
 fn expected_plan(name: &str) -> ExpectedPlan {
     match name {
         "spatial-sum" => ExpectedPlan {
-            family: Some("Sum"),
+            family: Some(ExpectedFamily::Exact(ExactKind::Sum)),
             partitioning: "grouped",
             readout: "sum",
             root_operation: None,
@@ -45,43 +52,43 @@ fn expected_plan(name: &str) -> ExpectedPlan {
             root_operation: None,
         },
         "spatial-quantile" => ExpectedPlan {
-            family: Some("QuantileSketch"),
+            family: Some(ExpectedFamily::QuantileSketch),
             partitioning: "grouped",
             readout: "quantile",
             root_operation: None,
         },
         "temporal-sum" => ExpectedPlan {
-            family: Some("Sum"),
+            family: Some(ExpectedFamily::Exact(ExactKind::Sum)),
             partitioning: "per_entity",
             readout: "sum",
             root_operation: None,
         },
         "temporal-quantile" => ExpectedPlan {
-            family: Some("QuantileSketch"),
+            family: Some(ExpectedFamily::QuantileSketch),
             partitioning: "per_entity",
             readout: "quantile",
             root_operation: None,
         },
         "temporal-rate" => ExpectedPlan {
-            family: Some("Increase"),
+            family: Some(ExpectedFamily::Exact(ExactKind::Rate)),
             partitioning: "per_entity",
             readout: "rate",
             root_operation: None,
         },
         "grouped-rate" => ExpectedPlan {
-            family: Some("Increase"),
+            family: Some(ExpectedFamily::Exact(ExactKind::Rate)),
             partitioning: "per_entity",
             readout: "rate",
             root_operation: Some("aggregate"),
         },
         "grouped-temporal-sum" => ExpectedPlan {
-            family: Some("Sum"),
+            family: Some(ExpectedFamily::Exact(ExactKind::Sum)),
             partitioning: "grouped",
             readout: "sum",
             root_operation: None,
         },
         "topk-rate" => ExpectedPlan {
-            family: Some("Increase"),
+            family: Some(ExpectedFamily::Exact(ExactKind::Rate)),
             partitioning: "per_entity",
             readout: "rate",
             root_operation: Some("top_k_selection"),
@@ -96,15 +103,22 @@ fn expected_plan(name: &str) -> ExpectedPlan {
     }
 }
 
-fn family_matches(expected: &str, actual: &str) -> bool {
-    if expected == "QuantileSketch" {
-        matches!(actual, "DDSketch" | "DatasketchesKLL" | "HydraKLL")
-    } else {
-        expected == actual
+fn family_matches(expected: &ExpectedFamily, actual: &SummaryFamilyType) -> bool {
+    match (expected, actual) {
+        (ExpectedFamily::Exact(expected), SummaryFamilyType::ExactAggregate(actual, _)) => {
+            expected == actual
+        }
+        (ExpectedFamily::QuantileSketch, SummaryFamilyType::Sketch(kind, _)) => {
+            matches!(
+                kind.algorithm(),
+                SketchAlgorithm::DDSketch | SketchAlgorithm::Kll
+            )
+        }
+        _ => false,
     }
 }
 
-fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) -> Option<String> {
+fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<String> {
     let expected = expected_plan(name);
     let artifact = serde_json::to_value(plan).unwrap();
     let entries = artifact["query_plan"]["entries"].as_object().unwrap();
@@ -156,17 +170,16 @@ fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) -> Option<Stri
             assert_eq!(leaf["binding"]["readout_lookback_ms"], 60_000);
         }
         assert!(!materializations.is_empty());
-        assert!(materializations.iter().all(|summary| {
+        assert!(plan.precompute_plan.materializations.iter().all(|summary| {
             family_matches(
-                "QuantileSketch",
-                summary["aggregation_type"].as_str().unwrap(),
-            ) && summary["metric"] == "data"
-                && summary["partitioning"] == "per_entity"
-                && summary["window_size"] == 60
+                &ExpectedFamily::QuantileSketch,
+                &summary.accumulator_spec().unwrap().family,
+            ) && summary.metric == "data"
+                && summary.window_size == 60
         }));
         return None;
     }
-    let Some(family) = expected.family else {
+    let Some(family) = expected.family.as_ref() else {
         panic!("{name}: no physical plan contract");
     };
     if let Some(operation) = expected.root_operation {
@@ -223,10 +236,13 @@ fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) -> Option<Stri
         "{name}: expected one summary producer"
     );
     let summary = &materializations[0];
+    let actual_family = plan.precompute_plan.materializations[0]
+        .accumulator_spec()
+        .unwrap()
+        .family;
     assert!(
-        family_matches(family, summary["aggregation_type"].as_str().unwrap()),
-        "{name}: wrong summary family: {}",
-        summary["aggregation_type"]
+        family_matches(family, &actual_family),
+        "{name}: wrong Planner family: {actual_family:?}"
     );
     assert_eq!(summary["metric"], "data", "{name}: wrong source metric");
     assert_eq!(
@@ -349,13 +365,13 @@ fn issue754_queries_have_valid_physical_plans() {
             "{} has no valid physical plan: {errors:?}",
             case.name
         );
-        if let Some(family) = expected.family {
+        if let Some(family) = expected.family.as_ref() {
             assert!(
                 valid_plans.iter().any(|plan| {
                     plan.precompute_plan
                         .materializations
                         .iter()
-                        .any(|m| family_matches(family, &format!("{:?}", m.aggregation_type)))
+                        .any(|m| family_matches(family, &m.accumulator_spec().unwrap().family))
                         && plan.query_plan.entries.values().all(|entry| {
                             entry.nodes.values().any(|node| {
                                 matches!(node, QueryPlanNode::ReadMaterialization { .. })
@@ -365,7 +381,7 @@ fn issue754_queries_have_valid_physical_plans() {
                                 .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. }))
                         })
                 }),
-                "{} lacks a readable {family} summary candidate: {errors:?}",
+                "{} lacks a readable summary candidate: {errors:?}",
                 case.name
             );
         }
