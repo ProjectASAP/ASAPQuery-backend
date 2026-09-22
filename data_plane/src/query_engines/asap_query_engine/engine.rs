@@ -1150,7 +1150,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
 
 #[cfg(test)]
 mod sketch_query_tests {
-    // use crate::storage_engines::types::{CleanupPolicy, StreamingConfig};
+    // use crate::storage_engines::types::{CleanupPolicy, InstalledPrecomputePlan};
     // use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     // use crate::storage_engines::promsketch_store::PromSketchStore;
     // use crate::storage_engines::TimestampedBucketsMap;
@@ -1216,13 +1216,13 @@ mod sketch_query_tests {
 
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
 
     //     ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         Some(ps),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     )
@@ -1292,11 +1292,11 @@ mod sketch_query_tests {
     //     // Engine with promsketch_store = None
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     //     let engine = ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     );
@@ -1363,11 +1363,11 @@ mod sketch_query_tests {
     // fn test_sketch_range_returns_none_without_store() {
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     //     let engine = ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     );
@@ -1467,11 +1467,11 @@ mod aux_pushdown_tests {
 
     fn make_engine() -> ASAPQueryEngine {
         use crate::storage_engines::types::{
-            CleanupPolicy, StreamingConfig, StreamingConfigHandle,
+            CleanupPolicy, InstalledPrecomputePlan, InstalledPrecomputePlanHandle,
         };
 
-        let sc = Arc::new(StreamingConfig::new(HashMap::new()));
-        let hr = StreamingConfigHandle::from_arc(sc.clone());
+        let sc = Arc::new(InstalledPrecomputePlan::new(HashMap::new()));
+        let hr = InstalledPrecomputePlanHandle::from_arc(sc.clone());
         let _ = sc;
         ASAPQueryEngine::new(60)
     }
@@ -1599,7 +1599,7 @@ mod asap_tier_classify_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchSampleState, SketchStore,
         SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{CleanupPolicy, StreamingConfigHandle};
+    use crate::storage_engines::types::{CleanupPolicy, InstalledPrecomputePlanHandle};
     use std::collections::{BTreeMap, BTreeSet};
 
     /// `sum by (zone) (http_requests_total)` end-to-end via the
@@ -2488,7 +2488,7 @@ mod outer_agg_integration_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
         SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::StreamingConfigHandle;
+    use crate::storage_engines::types::InstalledPrecomputePlanHandle;
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::MessagePackCodec;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2616,7 +2616,7 @@ mod range_stitch_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
         SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{KeyByLabelValues, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlanHandle, KeyByLabelValues};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2775,7 +2775,7 @@ mod range_stitch_tests {
         .unwrap();
         active.envelope.expiry_unix_ms = None;
         let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(active);
-        let hot = StreamingConfigHandle::from_active_physical_plan(active.clone());
+        let hot = InstalledPrecomputePlanHandle::from_active_physical_plan(active.clone());
         let engine = ASAPQueryEngine::new(15).with_active_physical_plan(active);
         let error = engine
             .execute_metricsql_at(&identity, 1_000)

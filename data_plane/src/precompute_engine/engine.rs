@@ -3,7 +3,7 @@ use crate::precompute_engine::ingest_handler::IngestState;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
 use crate::precompute_engine::worker::{Worker, WorkerRuntimeConfig};
-use crate::storage_engines::types::StreamingConfigHandle;
+use crate::storage_engines::types::InstalledPrecomputePlanHandle;
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -27,7 +27,7 @@ pub struct PrecomputeEngine {
     output_sink: Arc<dyn OutputSink>,
     diagnostics: Arc<PrecomputeWorkerDiagnostics>,
     ingest_state: Arc<IngestState>,
-    hot_reload_config: StreamingConfigHandle,
+    hot_reload_config: InstalledPrecomputePlanHandle,
     /// Worker receivers, one per worker. Taken by `run()` when spawning workers.
     receivers: Vec<mpsc::Receiver<WorkerMessage>>,
 }
@@ -35,7 +35,7 @@ pub struct PrecomputeEngine {
 impl PrecomputeEngine {
     pub fn new(
         config: PrecomputeEngineConfig,
-        hot_reload_config: StreamingConfigHandle,
+        hot_reload_config: InstalledPrecomputePlanHandle,
         output_sink: Arc<dyn OutputSink>,
         series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
         summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,

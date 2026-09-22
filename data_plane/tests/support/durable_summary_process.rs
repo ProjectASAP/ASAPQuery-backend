@@ -30,18 +30,14 @@ async fn persisted_summary_restarts_without_live_reregistration() {
     };
     let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join("plan.json");
-    let bootstrap = directory.path().join("bootstrap.json");
     let disk = directory.path().join("disk");
     std::fs::create_dir_all(&disk).unwrap();
     std::fs::write(&artifact, serde_json::to_vec(&install).unwrap()).unwrap();
-    std::fs::write(&bootstrap, b"{\"aggregations\":[]}").unwrap();
     let spawn = |port: u16| {
         ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_data_plane"))
                 .arg("--physical-plan")
                 .arg(&artifact)
-                .arg("--streaming-config")
-                .arg(&bootstrap)
                 .arg("--http-port")
                 .arg(port.to_string())
                 .arg("--output-dir")

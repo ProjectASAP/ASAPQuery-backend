@@ -4,8 +4,8 @@
 //! data-plane executable, register, report different rates, and receive
 //! differentiated sampling grants over bidirectional gRPC streams.
 
-#[path = "support/empty_streaming_config.rs"]
-mod empty_streaming_config;
+#[path = "support/empty_physical_plan.rs"]
+mod empty_physical_plan;
 
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -112,15 +112,18 @@ async fn production_coordinator_differentiates_edge_sampling_grants() {
     let monitor_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create output directory");
     let mut config = tempfile::NamedTempFile::new().expect("create monitor config");
-    let mut runtime = empty_streaming_config::empty();
-    runtime.monitors = serde_yaml::from_str(
-        "- agg_id: 1\n  key: ''\n  tau: 5000.0\n  epsilon: 0.05\n  window_ms: 60000\n",
+    std::io::Write::write_all(
+        &mut config,
+        b"- agg_id: 1\n  key: ''\n  tau: 5000.0\n  epsilon: 0.05\n  window_ms: 60000\n",
     )
     .unwrap();
-    serde_yaml::to_writer(&mut config, &runtime).expect("write monitor config");
+    let mut physical = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut physical, &empty_physical_plan::empty()).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
-        .arg("--streaming-config")
+        .arg("--physical-plan")
+        .arg(physical.path())
+        .arg("--monitor-specs")
         .arg(config.path())
         .arg("--http-port")
         .arg(query_port.to_string())

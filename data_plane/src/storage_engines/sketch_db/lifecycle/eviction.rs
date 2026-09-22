@@ -194,7 +194,7 @@ pub fn warn_if_retention_inverted(
 mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::storage_engines::types::{AggregationType, StreamingConfig};
+    use crate::storage_engines::types::{AggregationType, InstalledPrecomputePlan};
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::KeyByLabelNames;
@@ -233,7 +233,7 @@ mod tests {
     /// derived from each dummy_agg. Returns the config plus the
     /// marker_id → fingerprint mapping so callers can look up the
     /// right key.
-    fn make_streaming_config(ids: &[u64]) -> (Arc<StreamingConfig>, HashMap<u64, u64>) {
+    fn make_streaming_config(ids: &[u64]) -> (Arc<InstalledPrecomputePlan>, HashMap<u64, u64>) {
         let mut map = HashMap::new();
         let mut id_to_fp = HashMap::new();
         for &id in ids {
@@ -242,12 +242,12 @@ mod tests {
             id_to_fp.insert(id, fp);
             map.insert(fp, cfg);
         }
-        (Arc::new(StreamingConfig::new(map)), id_to_fp)
+        (Arc::new(InstalledPrecomputePlan::new(map)), id_to_fp)
     }
 
     fn write_one(
         summary_store: &SketchStore,
-        streaming_config: &StreamingConfig,
+        installed_precompute_plan: &InstalledPrecomputePlan,
         agg_id: u64,
         ts: u64,
     ) -> u64 {
@@ -260,7 +260,9 @@ mod tests {
             None,
             asap_types::PolicyFingerprint(agg_id),
         );
-        let agg_cfg = streaming_config.get_aggregation_config(agg_id).unwrap();
+        let agg_cfg = installed_precompute_plan
+            .get_aggregation_config(agg_id)
+            .unwrap();
         // Test-scoped resolver — each call mints fresh. Production
         // shares one resolver across all sinks; tests don't need that
         // because each fixture is isolated. Static-lifetime so multiple

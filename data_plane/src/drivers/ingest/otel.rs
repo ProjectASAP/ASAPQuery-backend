@@ -5,7 +5,7 @@
 //! engine via [`OtlpReceiver::with_ingest_state`] — routes both raw metric
 //! points and pre-built sketches through the precompute engine's worker
 //! pool. The precompute engine then performs window-aligned aggregation
-//! per `StreamingConfig` and writes results to `SketchStore`.
+//! per `InstalledPrecomputePlan` and writes results to `SketchStore`.
 //!
 //! Architectural flow:
 //! ```text
@@ -663,7 +663,7 @@ async fn route_otlp_to_precompute(
         .map(Arc::new);
     let snap = active_physical_plan_snapshot
         .as_ref()
-        .map(|plan| plan.streaming_config.clone())
+        .map(|plan| plan.installed_precompute_plan.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
     let agg_configs = snap.materializations();
     // Reconcile sid lifecycle using the current streaming-config snapshot.
@@ -914,7 +914,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     let active_physical_plan_snapshot = ingest_state.active_physical_plan_snapshot();
     let snap = active_physical_plan_snapshot
         .as_ref()
-        .map(|plan| plan.streaming_config.clone())
+        .map(|plan| plan.installed_precompute_plan.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
     let catalog_generation = active_physical_plan_snapshot
         .as_ref()
@@ -3626,7 +3626,7 @@ mod sid_resolution_tests {
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::sketch_db::index::SketchStore;
-    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlan, InstalledPrecomputePlanHandle};
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -3639,8 +3639,8 @@ mod sid_resolution_tests {
     async fn make_state() -> (Arc<IngestState>, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel(1024);
         let router = SeriesRouter::new(vec![tx]);
-        let streaming = StreamingConfig::new(std::collections::HashMap::new());
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(std::collections::HashMap::new());
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
         let state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
@@ -4558,7 +4558,7 @@ mod sid_bucketing_tests {
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
     use crate::storage_engines::sketch_db::index::SketchStore;
-    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlan, InstalledPrecomputePlanHandle};
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -4677,8 +4677,8 @@ mod sid_bucketing_tests {
         let policy_fp = asap_types::PolicyFingerprint(cfg.policy_fp_u64());
         let mut configs = HashMap::new();
         configs.insert(cfg.policy_fp_u64(), cfg.clone());
-        let streaming = StreamingConfig::new(configs);
-        let hot_reload = StreamingConfigHandle::new(streaming);
+        let streaming = InstalledPrecomputePlan::new(configs);
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming);
 
         let resolver = Arc::new(SeriesIdResolver::new());
         let state = Arc::new(IngestState {

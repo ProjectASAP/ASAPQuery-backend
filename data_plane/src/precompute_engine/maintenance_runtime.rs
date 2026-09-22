@@ -5,7 +5,9 @@ use super::subdag_scheduler::{
     execute_precompute_sink, execute_precompute_sinks, IdempotentCommitSink,
     MaterializationCommitKey, PrecomputeOperatorRegistry, ScheduleError,
 };
-use crate::storage_engines::types::{AggregateCore, PrecomputedOutput, StreamingConfigHandle};
+use crate::storage_engines::types::{
+    AggregateCore, InstalledPrecomputePlanHandle, PrecomputedOutput,
+};
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
 use planner_types::post_asap::{ExecutableDagNode, ExecutableOperatorPayload, PostAsapNodeId};
 use sha2::{Digest, Sha256};
@@ -1618,7 +1620,7 @@ struct CommitRegistry(Mutex<CommitRegistryState>);
 impl CommitRegistry {
     fn plan_snapshot(
         &self,
-        plans: &StreamingConfigHandle,
+        plans: &InstalledPrecomputePlanHandle,
     ) -> Result<Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>>, String> {
         let mut state = self.0.lock().map_err(|_| "commit registry poisoned")?;
         // Read the authoritative generation while holding the registry lock,
@@ -1786,13 +1788,13 @@ impl IdempotentCommitSink<MaintenanceValue> for CommitRegistry {
 /// With no matching DAG, the source output is forwarded unchanged.
 pub struct MaintenanceDagSink {
     inner: Arc<dyn OutputSink>,
-    plans: StreamingConfigHandle,
+    plans: InstalledPrecomputePlanHandle,
     commits: CommitRegistry,
     batch_guard: Mutex<()>,
 }
 
 impl MaintenanceDagSink {
-    pub fn new(inner: Arc<dyn OutputSink>, plans: StreamingConfigHandle) -> Self {
+    pub fn new(inner: Arc<dyn OutputSink>, plans: InstalledPrecomputePlanHandle) -> Self {
         Self {
             inner,
             plans,
@@ -3808,7 +3810,7 @@ mod tests {
     #[test]
     fn downstream_failure_does_not_acknowledge_maintenance_publication() {
         use crate::storage_engines::types::{
-            ActivePhysicalPlanHandle, RuntimePhysicalPlan, StreamingConfig,
+            ActivePhysicalPlanHandle, InstalledPrecomputePlan, RuntimePhysicalPlan,
         };
         use asap_types::executable_plan::{InstalledPostAsapDag, OwnedPostAsapDag};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3897,7 +3899,7 @@ mod tests {
             summary_catalog: Some(Arc::new(bundle.summary_catalog)),
             precompute_plan: bundle.precompute_plan,
             transmission_plan: bundle.transmission_plan,
-            streaming_config: Arc::new(StreamingConfig::new(Default::default())),
+            installed_precompute_plan: Arc::new(InstalledPrecomputePlan::new(Default::default())),
             query_plan: Arc::new(bundle.query_plan),
             storage_routing: Arc::new(Default::default()),
         };
@@ -3912,9 +3914,9 @@ mod tests {
             });
             let sink = MaintenanceDagSink::new(
                 downstream.clone(),
-                StreamingConfigHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(
-                    active.clone(),
-                )),
+                InstalledPrecomputePlanHandle::from_active_physical_plan(
+                    ActivePhysicalPlanHandle::new(active.clone()),
+                ),
             );
             let batch = || {
                 (0..count)

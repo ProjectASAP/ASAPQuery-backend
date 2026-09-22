@@ -57,7 +57,6 @@ struct Backend {
     client: reqwest::Client,
     query_base: String,
     otlp_url: String,
-    _config: tempfile::NamedTempFile,
     _output_dir: tempfile::TempDir,
 }
 
@@ -111,15 +110,9 @@ async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) 
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     let mut install =
         physical_fixture::artifact_from_materializations(vec![materialization.clone()]);
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_precompute_plan(
-        install.precompute_plan.clone(),
-    )
-    .unwrap();
-    serde_yaml::to_writer(&mut config, &runtime).unwrap();
     for rule in &mut install.transmission_plan.rules {
         if matches!(
             install
@@ -142,8 +135,6 @@ async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) 
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command
-        .arg("--streaming-config")
-        .arg(config.path())
         .arg("--physical-plan")
         .arg(physical.path())
         .arg("--http-port")
@@ -183,7 +174,6 @@ async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) 
                 client,
                 query_base,
                 otlp_url: format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"),
-                _config: config,
                 _output_dir: output_dir,
             };
         }

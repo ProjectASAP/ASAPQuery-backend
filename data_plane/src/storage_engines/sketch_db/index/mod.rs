@@ -674,10 +674,10 @@ pub struct SketchStore {
     /// registered sid (UNSET-policy sids included), since the query path
     /// keys candidate selection on metric name, not policy.
     metric_to_series_ids: RwLock<HashMap<String, BTreeSet<u64>>>,
-    /// Pointer (as `usize`) of the `Arc<StreamingConfig>` this store
+    /// Pointer (as `usize`) of the `Arc<InstalledPrecomputePlan>` this store
     /// last reconciled against. `reconcile_from_streaming_config` runs
     /// on every ingest batch, but the config is a lock-free
-    /// `Arc<ArcSwap<StreamingConfig>>` that only changes its `Arc`
+    /// `Arc<ArcSwap<InstalledPrecomputePlan>>` that only changes its `Arc`
     /// identity on a control-plane swap (rare). Gating the full
     /// catalog scan on a cheap pointer compare against this field lets
     /// the steady-state ingest path skip reconcile entirely.
@@ -2623,7 +2623,7 @@ impl SketchStore {
     }
 
     /// Record that the store has reconciled against the
-    /// `Arc<StreamingConfig>` identified by `config_ptr` (the value of
+    /// `Arc<InstalledPrecomputePlan>` identified by `config_ptr` (the value of
     /// `Arc::as_ptr(..) as usize`), returning `true` if this is a *new*
     /// config pointer (i.e. the caller should run a full reconcile) or
     /// `false` if the store already reconciled against this exact

@@ -1044,8 +1044,8 @@ mod tests {
         cfg.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
             name: "value".into(),
         });
-        let hot = crate::storage_engines::types::StreamingConfigHandle::from_arc(Arc::new(
-            crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
+        let hot = crate::storage_engines::types::InstalledPrecomputePlanHandle::from_arc(Arc::new(
+            crate::storage_engines::types::InstalledPrecomputePlan::new(HashMap::from([(
                 cfg.policy_fp_u64(),
                 cfg.clone(),
             )])),

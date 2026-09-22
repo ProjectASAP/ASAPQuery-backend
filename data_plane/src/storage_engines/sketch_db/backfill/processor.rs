@@ -21,7 +21,9 @@ use tracing::debug;
 use crate::drivers::ingest::population_attrs_fingerprint;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::{AggregateCore, KeyByLabelValues, StreamingConfigHandle};
+use crate::storage_engines::types::{
+    AggregateCore, InstalledPrecomputePlanHandle, KeyByLabelValues,
+};
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 
@@ -124,10 +126,10 @@ fn fallback_bucket_id(group_key: &str) -> u64 {
 /// without round-tripping through the worker.
 pub struct BackfillWindowProcessor {
     /// Live config source. The processor snapshots the latest
-    /// `StreamingConfig` at each window to find the
+    /// `InstalledPrecomputePlan` at each window to find the
     /// `PrecomputeMaterialization` for `agg_id`. The snapshot is cheap
     /// (Arc refcount bump) so we don't optimise further.
-    config: StreamingConfigHandle,
+    config: InstalledPrecomputePlanHandle,
     /// Destination for rebuilt windows. Tests may omit it to record registry
     /// provenance without storing payloads.
     summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
@@ -149,7 +151,7 @@ pub struct BackfillWindowProcessor {
 
 impl BackfillWindowProcessor {
     pub fn new(
-        config: StreamingConfigHandle,
+        config: InstalledPrecomputePlanHandle,
         registry: Arc<BackfillRegistry>,
         job_id: u64,
     ) -> Self {
@@ -208,7 +210,7 @@ impl WindowProcessor for BackfillWindowProcessor {
         let config = snapshot
             .get_aggregation_config(agg_id)
             .cloned()
-            .ok_or_else(|| format!("agg_id {agg_id} not in current StreamingConfig"))?;
+            .ok_or_else(|| format!("agg_id {agg_id} not in current InstalledPrecomputePlan"))?;
         let program = snapshot.raw_programs.get(&agg_id).cloned();
         #[cfg(not(test))]
         if program.is_none() {
@@ -373,7 +375,7 @@ mod tests {
     };
     use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
     use crate::storage_engines::sketch_db::backfill::BackfillSource;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -406,10 +408,10 @@ mod tests {
         )
     }
 
-    fn streaming_config_with(config: PrecomputeMaterialization) -> Arc<StreamingConfig> {
+    fn streaming_config_with(config: PrecomputeMaterialization) -> Arc<InstalledPrecomputePlan> {
         let mut map = std::collections::HashMap::new();
         map.insert(config.policy_fp_u64(), config);
-        Arc::new(StreamingConfig::new(map))
+        Arc::new(InstalledPrecomputePlan::new(map))
     }
 
     #[tokio::test]
@@ -417,7 +419,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -461,7 +463,7 @@ mod tests {
     async fn unknown_agg_id_fails_cleanly() {
         let cfg = sum_config(1, "m", vec![]);
         let streaming = streaming_config_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             999,
@@ -470,12 +472,14 @@ mod tests {
             1,
         );
         let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id);
-        // agg_id=999 isn't in the StreamingConfig.
+        // agg_id=999 isn't in the InstalledPrecomputePlan.
         let err = processor
             .process_window(999, (0, 10), vec![])
             .await
             .expect_err("unknown agg should fail");
-        assert!(err.to_string().contains("not in current StreamingConfig"));
+        assert!(err
+            .to_string()
+            .contains("not in current InstalledPrecomputePlan"));
         assert!(registry.windows_written_by(job_id).is_empty());
     }
 
@@ -484,7 +488,7 @@ mod tests {
         let cfg = sum_config(1, "m", vec![]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -505,7 +509,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -797,7 +801,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let summary_store = Arc::new(SketchStore::new());
         let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(

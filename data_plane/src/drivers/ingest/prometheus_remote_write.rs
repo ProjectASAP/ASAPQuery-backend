@@ -672,7 +672,7 @@ fn route_messages(
         Arc<crate::precompute_engine::group_key::GroupKey>,
     );
     type RoutedSample = (String, i64, f64);
-    let snapshot = physical_plan.streaming_config.clone();
+    let snapshot = physical_plan.installed_precompute_plan.clone();
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest.summary_store.as_ref(),
         &snapshot,
@@ -932,8 +932,8 @@ mod tests {
     use crate::precompute_engine::ingest_handler::IngestObservability;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::types::{
-        ActivePhysicalPlanHandle, BackendStorageRouting, RuntimePhysicalPlan, StreamingConfig,
-        StreamingConfigHandle,
+        ActivePhysicalPlanHandle, BackendStorageRouting, InstalledPrecomputePlan,
+        InstalledPrecomputePlanHandle, RuntimePhysicalPlan,
     };
     use tokio::sync::mpsc;
 
@@ -943,7 +943,7 @@ mod tests {
             .unwrap()
     }
 
-    fn physical_config(streaming: StreamingConfig) -> StreamingConfigHandle {
+    fn physical_config(streaming: InstalledPrecomputePlan) -> InstalledPrecomputePlanHandle {
         use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
             IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
@@ -1009,11 +1009,13 @@ mod tests {
                 },
                 rules: Vec::new(),
             },
-            streaming_config: Arc::new(streaming),
+            installed_precompute_plan: Arc::new(streaming),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
-        StreamingConfigHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(active))
+        InstalledPrecomputePlanHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(
+            active,
+        ))
     }
 
     fn receiver(config: PrometheusRemoteWriteConfig) -> PrometheusRemoteWriteReceiver {
@@ -1022,7 +1024,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: physical_config(StreamingConfig::default()),
+            hot_reload_config: physical_config(InstalledPrecomputePlan::default()),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -1062,7 +1064,7 @@ mod tests {
             value_source_column: None,
         };
         let policy_fp = aggregation.policy_fp_u64();
-        let streaming = StreamingConfig::new(HashMap::from([(policy_fp, aggregation)]));
+        let streaming = InstalledPrecomputePlan::new(HashMap::from([(policy_fp, aggregation)]));
         let (sender, receiver) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -1100,7 +1102,7 @@ mod tests {
         let mut config = snapshot.precompute_plan.materializations[0].clone();
         config.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
         config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
-        let hot = physical_config(StreamingConfig::new(HashMap::from([(
+        let hot = physical_config(InstalledPrecomputePlan::new(HashMap::from([(
             config.policy_fp_u64(),
             config.clone(),
         )])));
@@ -1214,7 +1216,7 @@ mod tests {
         assert_ne!(kll_fp, pooled_kll_fp);
         let cms_fp = cms.policy_fingerprint();
         let counter_fp = counter.policy_fingerprint();
-        let streaming = StreamingConfig::new(HashMap::from([
+        let streaming = InstalledPrecomputePlan::new(HashMap::from([
             (cms_fp.0, cms),
             (counter_fp.0, counter),
             (kll_fp.0, kll),
@@ -1380,7 +1382,9 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: StreamingConfigHandle::new(StreamingConfig::default()),
+            hot_reload_config: InstalledPrecomputePlanHandle::new(
+                InstalledPrecomputePlan::default(),
+            ),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),

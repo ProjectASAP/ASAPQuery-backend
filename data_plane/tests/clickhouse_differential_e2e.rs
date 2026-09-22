@@ -2,8 +2,8 @@
 //!
 //! Set `CLICKHOUSE_URL` (for example `http://127.0.0.1:8123`) to run it.
 
-#[path = "support/empty_streaming_config.rs"]
-mod empty_streaming_config;
+#[path = "support/empty_physical_plan.rs"]
+mod empty_physical_plan;
 
 use std::{
     collections::HashMap,
@@ -65,7 +65,7 @@ async fn spawn_backend(
     let client = reqwest::Client::new();
     let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command
-        .arg("--streaming-config")
+        .arg("--physical-plan")
         .arg(bootstrap)
         .arg("--http-port")
         .arg(api_port.to_string())
@@ -347,7 +347,7 @@ async fn run_mixed_aggregate(aggregate: &str) {
     let sql_port = unused_port();
     let output = tempfile::tempdir().unwrap();
     let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
-    serde_yaml::to_writer(&mut bootstrap, &empty_streaming_config::empty()).unwrap();
+    serde_json::to_writer(&mut bootstrap, &empty_physical_plan::empty()).unwrap();
     let _process = spawn_backend(
         &clickhouse_url,
         user.as_deref(),
@@ -542,7 +542,7 @@ async fn moving_windows_match_clickhouse_after_automatic_publication() {
     let sql_port = unused_port();
     let output = tempfile::tempdir().unwrap();
     let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
-    serde_yaml::to_writer(&mut bootstrap, &empty_streaming_config::empty()).unwrap();
+    serde_json::to_writer(&mut bootstrap, &empty_physical_plan::empty()).unwrap();
     let _process = spawn_backend(
         &clickhouse_url,
         user.as_deref(),
@@ -726,7 +726,7 @@ async fn collection_sql_executes_local_elements_after_typed_exact_leaf() {
     let sql_port = unused_port();
     let output = tempfile::tempdir().unwrap();
     let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
-    serde_yaml::to_writer(&mut bootstrap, &empty_streaming_config::empty()).unwrap();
+    serde_json::to_writer(&mut bootstrap, &empty_physical_plan::empty()).unwrap();
     let _process = spawn_backend(
         &clickhouse_url,
         user.as_deref(),

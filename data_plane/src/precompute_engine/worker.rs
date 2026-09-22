@@ -9,7 +9,7 @@ use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
-    AggregateCore, KeyByLabelValues, PrecomputedOutput, StreamingConfigHandle,
+    AggregateCore, InstalledPrecomputePlanHandle, KeyByLabelValues, PrecomputedOutput,
 };
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
@@ -167,7 +167,7 @@ pub struct Worker {
     /// Hot-reload handle — workers read config directly from ArcSwap
     /// instead of holding a local copy. All components see the same
     /// config at the same time.
-    hot_reload: StreamingConfigHandle,
+    hot_reload: InstalledPrecomputePlanHandle,
     /// Allowed lateness in ms.
     allowed_lateness_ms: i64,
     /// When true, skip aggregation and pass raw samples through.
@@ -215,7 +215,8 @@ impl Worker {
         }
         // The installed locality proof assigns derived graphs to one owner.
         // Every raw input of this graph was routed to that same worker.
-        if plan.streaming_config.partitioning != super::partitioning::DagPartitioning::SingleWorker
+        if plan.installed_precompute_plan.partitioning
+            != super::partitioning::DagPartitioning::SingleWorker
         {
             return Err("derived DAG has no validated local partitioning rule".into());
         }
@@ -244,7 +245,7 @@ impl Worker {
         id: usize,
         receiver: mpsc::Receiver<WorkerMessage>,
         output_sink: Arc<dyn OutputSink>,
-        hot_reload: StreamingConfigHandle,
+        hot_reload: InstalledPrecomputePlanHandle,
         runtime_config: WorkerRuntimeConfig,
         group_count: Arc<AtomicUsize>,
         worker_watermark: Arc<AtomicI64>,
@@ -471,7 +472,7 @@ impl Worker {
     /// hot-reload snapshot the first time we see this sid; `group_key` is
     /// remembered on the `GroupState` for emit-time label rendering.
     ///
-    /// Reads config directly from the `StreamingConfigHandle`
+    /// Reads config directly from the `InstalledPrecomputePlanHandle`
     /// ArcSwap handle, so new policies from a config swap are visible
     /// immediately — no message passing, no delay.
     /// Returns None if `policy_fp` has no matching config (e.g. arrived
@@ -1933,7 +1934,7 @@ mod tests {
     use crate::precompute_engine::operators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_sketchlib::KllSketch;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -2037,16 +2038,16 @@ mod tests {
         )
     }
 
-    /// Build a fresh `StreamingConfigHandle` from a map of agg_id
+    /// Build a fresh `InstalledPrecomputePlanHandle` from a map of agg_id
     /// → PrecomputeMaterialization. Worker::new takes this handle instead of
     /// the old `HashMap<u64, Arc<PrecomputeMaterialization>>`. Tests use this
     /// helper instead of constructing the handle inline at every
     /// callsite.
     fn make_hot_reload(
         configs: HashMap<u64, PrecomputeMaterialization>,
-    ) -> crate::storage_engines::types::StreamingConfigHandle {
-        crate::storage_engines::types::StreamingConfigHandle::new(
-            crate::storage_engines::types::StreamingConfig::new(configs),
+    ) -> crate::storage_engines::types::InstalledPrecomputePlanHandle {
+        crate::storage_engines::types::InstalledPrecomputePlanHandle::new(
+            crate::storage_engines::types::InstalledPrecomputePlan::new(configs),
         )
     }
 
@@ -2814,14 +2815,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: worker from streaming_config YAML
+    // Test: worker from installed_precompute_plan YAML
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_worker_rejects_flat_streaming_config_yaml() {
         let data =
             serde_yaml::from_str("aggregations: [{aggregationType: Sum, metric: m}]").unwrap();
-        assert!(StreamingConfig::from_yaml_data(&data).is_err());
+        assert!(
+            serde_yaml::from_value::<asap_types::precompute_plan::PrecomputePlan>(data).is_err()
+        );
     }
 
     #[test]
@@ -4337,7 +4340,7 @@ mod dag_execution_tests {
     use super::*;
     use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_types::query_plan::ExactReadout;
 
     fn plan(query: &str) -> control_plane::physical::compiler::CompiledPhysicalPlan {
@@ -4366,7 +4369,8 @@ mod dag_execution_tests {
                 "{query}"
             );
             let config = physical.precompute_plan.materializations[0].clone();
-            let runtime = StreamingConfig::from_precompute_plan(physical.precompute_plan).unwrap();
+            let runtime =
+                InstalledPrecomputePlan::from_precompute_plan(physical.precompute_plan).unwrap();
             let rule = runtime.partitioning.clone();
             let sink = Arc::new(CapturingOutputSink::new());
             let engine = PrecomputeEngine::new(
@@ -4377,7 +4381,7 @@ mod dag_execution_tests {
                     wall_clock_max_open_grace_period_ms: 0,
                     ..Default::default()
                 },
-                StreamingConfigHandle::new(runtime),
+                InstalledPrecomputePlanHandle::new(runtime),
                 sink.clone(),
                 Arc::new(crate::drivers::ingest::series_resolver::SeriesIdResolver::new()),
                 Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
@@ -4492,17 +4496,15 @@ mod dag_execution_tests {
                 .expect("ASAP producer required")
                 .clone();
             let fp = config.policy_fingerprint();
-            let streaming = StreamingConfig::from_precompute_plan(plan.precompute_plan).unwrap();
-            let doc = serde_json::to_value(&streaming).unwrap();
-            assert!(doc.get("aggregation_configs").is_none());
-            let streaming: StreamingConfig = serde_json::from_value(doc).unwrap();
+            let streaming =
+                InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan).unwrap();
             let sink = Arc::new(CapturingOutputSink::new());
             let (_tx, rx) = mpsc::channel(8);
             let mut worker = Worker::new(
                 0,
                 rx,
                 sink.clone(),
-                StreamingConfigHandle::new(streaming),
+                InstalledPrecomputePlanHandle::new(streaming),
                 WorkerRuntimeConfig {
                     max_buffer_per_series: 100,
                     allowed_lateness_ms: 10_000,
@@ -4574,13 +4576,15 @@ mod dag_execution_tests {
     // A flat config and a DAG whose producer no longer matches its binding cannot install.
     #[test]
     fn execution_requires_matching_dag_producer() {
-        assert!(serde_json::from_value::<StreamingConfig>(
-            serde_json::json!({"aggregation_configs":{}})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<asap_types::precompute_plan::PrecomputePlan>(
+                serde_json::json!({"aggregation_configs":{}})
+            )
+            .is_err()
+        );
         let mut plan = plan("rate(asap_demo_counter_total[5s])").precompute_plan;
         plan.executable_dags.clear();
-        assert!(StreamingConfig::from_precompute_plan(plan)
+        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
             .to_string()
             .contains("DAG producer"));
@@ -4604,7 +4608,7 @@ mod dag_execution_tests {
             &dag,
         )
         .unwrap();
-        assert!(StreamingConfig::from_precompute_plan(plan)
+        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
             .to_string()
             .contains("update"));

@@ -181,26 +181,18 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create log directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
     let install =
         physical_fixture::artifact_from_materializations(vec![physical_fixture::materialization(
             "differential_e2e_latency_ms",
             asap_types::AggregationType::DDSketch,
             [("relative_accuracy".into(), serde_json::json!(0.01))].into(),
         )]);
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_precompute_plan(
-        install.precompute_plan.clone(),
-    )
-    .unwrap();
-    serde_yaml::to_writer(&mut config, &runtime).unwrap();
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--physical-plan")
         .arg(physical.path())
-        .arg("--streaming-config")
-        .arg(config.path())
         .arg("--http-port")
         .arg(query_port.to_string())
         .arg("--output-dir")

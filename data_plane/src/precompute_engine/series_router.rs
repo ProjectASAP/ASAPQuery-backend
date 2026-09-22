@@ -152,7 +152,7 @@ pub struct SeriesRouter {
     erp_observer: std::sync::OnceLock<std::sync::Arc<super::erp_observer::RuntimeErpObserver>>,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     num_workers: usize,
-    plan: Option<crate::storage_engines::types::StreamingConfigHandle>,
+    plan: Option<crate::storage_engines::types::InstalledPrecomputePlanHandle>,
 }
 
 impl SeriesRouter {
@@ -166,7 +166,10 @@ impl SeriesRouter {
         }
     }
 
-    pub fn with_plan(mut self, plan: crate::storage_engines::types::StreamingConfigHandle) -> Self {
+    pub fn with_plan(
+        mut self,
+        plan: crate::storage_engines::types::InstalledPrecomputePlanHandle,
+    ) -> Self {
         self.plan = Some(plan);
         self
     }

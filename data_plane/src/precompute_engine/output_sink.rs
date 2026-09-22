@@ -1,7 +1,7 @@
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::ingest_handler::IngestObservability;
 use crate::storage_engines::sketch_db::index::SketchStore;
-use crate::storage_engines::types::hot_reload_config::StreamingConfigHandle;
+use crate::storage_engines::types::hot_reload_config::InstalledPrecomputePlanHandle;
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,7 +52,7 @@ fn consume_in_order<T>(items: Vec<T>, mut persist: impl FnMut(&T) -> bool) -> us
 /// each pane as soon as it is serialized.
 pub struct SketchStoreSink {
     summary_store: Arc<SketchStore>,
-    hot_reload: StreamingConfigHandle,
+    hot_reload: InstalledPrecomputePlanHandle,
     /// Single shared resolver across the ingest + precompute paths. Under
     /// the registry-allocated sid model (PR-1..3), this is the canonical
     /// mint authority — precompute sids share the same `next_sid` counter
@@ -73,7 +73,7 @@ pub struct SketchStoreSink {
 impl SketchStoreSink {
     pub fn new(
         summary_store: Arc<SketchStore>,
-        hot_reload: StreamingConfigHandle,
+        hot_reload: InstalledPrecomputePlanHandle,
         series_resolver: Arc<SeriesIdResolver>,
     ) -> Self {
         Self {
@@ -337,7 +337,7 @@ mod tests {
     use super::*;
     use crate::precompute_engine::operators::{DDSketchAccumulator, SumAccumulator};
     use crate::storage_engines::sketch_db::index::{AggKind, SeriesLookup};
-    use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
+    use crate::storage_engines::types::{InstalledPrecomputePlan, KeyByLabelValues};
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -425,8 +425,8 @@ mod tests {
         let agg_id = cfg.policy_fp_u64();
         let mut configs = HashMap::new();
         configs.insert(agg_id, cfg);
-        let streaming = StreamingConfig::new(configs);
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(configs);
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
 
         let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
@@ -494,7 +494,10 @@ mod tests {
             Arc::new(SeriesIdResolver::open(temporary.path().join("resolver.wal")).unwrap());
         let sink = SketchStoreSink::new(
             store.clone(),
-            StreamingConfigHandle::new(StreamingConfig::new(HashMap::from([(fingerprint.0, cfg)]))),
+            InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new(HashMap::from([(
+                fingerprint.0,
+                cfg,
+            )]))),
             resolver,
         );
         let original_generation = Arc::new(catalog.reference().unwrap());
@@ -573,8 +576,9 @@ mod tests {
         cfg.parameters
             .insert("alpha".into(), serde_json::json!(0.01));
         let policy_fp = cfg.policy_fp_u64();
-        let hot_reload =
-            StreamingConfigHandle::new(StreamingConfig::new(HashMap::from([(policy_fp, cfg)])));
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new(
+            HashMap::from([(policy_fp, cfg)]),
+        ));
         let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
             summary_store.clone(),
@@ -612,8 +616,8 @@ mod tests {
     fn sketch_index_sink_reports_unknown_policy_as_failure() {
         // Streaming config does NOT contain agg_id=99 — the sink
         // reports a recoverable error rather than acknowledging a lost write.
-        let streaming = StreamingConfig::new(HashMap::new());
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(HashMap::new());
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
         let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
             summary_store.clone(),
@@ -633,8 +637,8 @@ mod tests {
     /// handle wired in, the `dropped_policy_miss` counter must tick.
     #[test]
     fn sink_increments_policy_miss_counter_on_registry_miss() {
-        let streaming = StreamingConfig::new(HashMap::new());
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(HashMap::new());
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
         let summary_store = Arc::new(SketchStore::new());
         let obs = Arc::new(IngestObservability::new());
         let sink = SketchStoreSink::new(
