@@ -31,7 +31,9 @@ compatible grouping, coverage and accuracy.
 
 | Term | Meaning |
 | --- | --- |
-| Summary Catalog | Metadata registry of summary definitions; payload bytes live in the summary store. |
+| Summary Catalog | Registry of immutable `SummaryDefinition` semantics; it does not track runtime instances or hold payload bytes. |
+| `SummaryMetadataStore` | Runtime records for concrete summary instances, including coverage, format, readiness and payload location. |
+| `SummaryPayloadStore` | Stored summary payload bytes addressed through installed state references and instance metadata. |
 | SDS (Self-Describing Summary) | The description and metadata needed to interpret and validate stored summary state. It is not a separate execution engine or payload store. |
 | `SummaryDefinition` | What a summary represents: source/filter, input value, grouping, time semantics, algorithm and parameters. |
 | `state_slot_id` | Compiler-assigned identifier for a stored producer output within one plan version. Shared readers use the same slot; it has no independent catalog object. |
