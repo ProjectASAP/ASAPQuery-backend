@@ -258,10 +258,11 @@ Costs answer **which feasible candidate is preferable?**
 Costs include initialization, ingestion updates, overlapping/retained state,
 transmission, storage, merges, readouts, recurring queries, and shared producer
 construction once. Compare candidates over the same data and demand scope.
-Missing evidence is not zero cost. Explicit qualitative ranking may propose a
-logical candidate without a numeric candidate cost; publication still needs
-a complete workload quote. Stale or incomplete deployment evidence cannot
-justify admission.
+Missing evidence is not zero cost. The backend supplies candidate estimates
+through `candidate_cost()`, preferring applicable ERP benchmarks and otherwise
+using its analytical model. Unsupported estimates remain unavailable;
+publication still needs a complete workload quote. Stale or incomplete
+deployment evidence cannot justify admission.
 
 Runtime observations reference the concrete binding and selected semantic
 producer. Physical controls may vary only within already-authorized

@@ -80,17 +80,87 @@ compiler checks the executable DAG and runtime policy, and rejects summary
 readouts whose guarantee is absent or contains unknown terms. Unknown support
 must not be reported as deployment approval.
 
-Missing numerical cost remains unavailable, never zero. The backend explicitly
-permits qualitative logical ranking when a numeric candidate cost is absent;
-this only proposes a logical plan. Publication still requires a complete,
-applicable workload quote. A cheap candidate cannot bypass accuracy or runtime
-admission.
+Missing numerical cost remains unavailable, never zero. The backend implements
+Planner's `candidate_cost()` directly; it does not enable uncosted legacy
+selection. A cost estimate only supports logical selection. Publication still
+requires a complete, applicable workload quote. A cheap candidate cannot bypass
+accuracy or runtime admission.
 
 Explain records accuracy status and symbolic guarantee, runtime support status,
 cost availability, and the selection reason separately. A selected candidate
 is labelled as pending backend binding. Rejected candidates retain their
 reported reasons. This distinguishes missing proof, unsupported execution,
 missing comparable cost and a candidate that simply lost the ranking.
+
+## ERP and analytical cost models
+
+ERP is the benchmark source for this path. The existing ERP artifact and
+runtime-observation input feed both parameter planning and resource estimation;
+there is no separate benchmark upload contract for candidate costs.
+
+```mermaid
+flowchart TD
+    Profile[ERP benchmark artifact] --> Match[Match implementation, exact parameters and data population]
+    Observations[Declared distribution or validated runtime shape] --> Match
+    Candidate[Planner candidate with concrete parameters] --> Match
+    Match -->|Applicable profile| Measured[ERP resource estimate]
+    Match -->|No applicable profile| Analytical[Backend analytical resource estimate]
+    Measured --> Cost[Backend candidate_cost and source explanation]
+    Analytical --> Cost
+    Cost --> Selection[Planner logical selection]
+    Proof[Accuracy evidence and guarantee model] --> Selection
+    Selection --> Physical[Physical binding and complete workload costing]
+    Physical --> Admission[Deployment admission]
+```
+
+**Priority is applicable ERP, then analytical, then unavailable.** A larger
+measured value still overrides a smaller analytical estimate. ERP matching
+uses its existing implementation/runtime filters, exact sketch parameters,
+minimum trial count, distribution equality or configured bounded shape match.
+Catalog-scoped observations retain their existing population and freshness
+validation. A profile for another parameter point or implementation cannot be
+substituted. ERP v1 artifacts themselves have no per-record expiry field; do
+not confuse runtime-observation freshness with a benchmark expiry guarantee.
+
+Cost lookup does not certify empirical accuracy: measured resource usage can
+be useful even when observed error does not meet a target or cannot establish
+its failure probability. The cost path reuses ERP profile matching without an
+empirical-error threshold; the accuracy path separately checks the requested
+guarantee. In particular, an explicit confidence target must not erase ERP
+resource measurements merely because ERP v1 cannot prove that confidence.
+Existing empirical-only accuracy policy still applies to accuracy decisions.
+
+The first backend model, `backend_state_footprint_v1`, estimates **retained
+state bytes per partition** for local candidate selection. It uses ERP's
+`memory_bytes` when applicable; otherwise it reuses the backend's existing
+analytical retained-state formulas: matrix dimensions and heap capacity,
+KLL capacity, HLL registers, fixed accumulator allowance and the current
+DDSketch allowance. These are estimates, not measured limits or a complete
+workload cost. Reachable shared state nodes are counted once. For multiple
+observed populations the ERP proxy uses the largest matched partition, without
+pooling the populations. Shared-grid families need their own applicable model;
+an independent sketch profile is not a Hydra-grid measurement.
+
+The estimate excludes population counts, pane multiplicity, CPU, transmission
+and other deployment costs. An applicable ERP profile also ranks sketch-family
+candidates using the same byte estimates, with analytical estimates for the
+unmeasured peers. Without an applicable profile, existing family preference
+order remains the fallback policy.
+It does not mix ERP CPU seconds with analytical bytes or claim to minimize
+complete workload cost. Raw rewrites and exact compositions have no state-byte
+estimate here; exact composition retains its separate measured recurring-cost
+model. Unsupported shapes remain uncosted.
+
+Explain attaches the model, unit, source (`erp`, `analytical`, or `mixed`) and
+ERP record IDs to each available estimate. Final deployment selection still
+compares complete physical workload quotes over a common horizon, including
+all required resource components. Matching an ERP profile does not constitute
+such a quote and does not approve publication.
+
+Acceptance covers ERP precedence even when measured cost is higher, matching
+parameters/implementation/population, insufficient trials, invalid measurements,
+analytical fallback, unavailable shapes, explain provenance, and independent
+accuracy and publication gates.
 
 ## Example and acceptance behavior
 
