@@ -27,6 +27,10 @@ pub struct QueryPlan {
     pub plan_version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clickhouse_context: Option<ClickHousePlanningContext>,
+    /// Selected semantic roots retained for provenance; serving executes
+    /// `entries` and never reconstructs a plan from these documents.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selected_dags: BTreeMap<String, crate::executable_plan::OwnedPostAsapDag>,
     pub entries: BTreeMap<String, QueryPlanEntry>,
 }
 
@@ -55,6 +59,7 @@ impl QueryPlan {
             plan_id: 0,
             plan_version: 0,
             clickhouse_context: None,
+            selected_dags: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
     }
@@ -105,7 +110,7 @@ impl QueryPlan {
             ));
         }
         let available = catalog
-            .materializations
+            .definitions
             .keys()
             .copied()
             .map(Into::into)
@@ -114,7 +119,7 @@ impl QueryPlan {
         for entry in self.entries.values() {
             for binding in entry.materialization_bindings() {
                 let identity = catalog
-                    .materializations
+                    .definitions
                     .get(&binding.materialization)
                     .ok_or_else(|| {
                         QueryPlanError::Invalid(
@@ -127,20 +132,9 @@ impl QueryPlan {
                         "zero physical pane duration".into(),
                     ));
                 }
-                if binding.full_window_slide_ms.is_some()
-                    != matches!(
-                        identity.window_layout,
-                        crate::WindowMaterializationLayout::FullWindow
-                    )
-                    || binding.full_window_slide_ms == Some(0)
-                {
+                if binding.full_window_slide_ms == Some(0) {
                     return Err(QueryPlanError::Invalid(
-                        "query storage layout differs from catalog definition".into(),
-                    ));
-                }
-                if binding.pane_origin_ms != identity.pane_origin_ms {
-                    return Err(QueryPlanError::Invalid(
-                        "query pane origin differs from catalog definition".into(),
+                        "query full-window cadence must be nonzero".into(),
                     ));
                 }
             }
@@ -157,7 +151,7 @@ impl QueryPlan {
                         "counter readout must directly consume one catalog materialization".into(),
                     ));
                 };
-                let identity = &catalog.materializations[&binding.materialization];
+                let identity = &catalog.definitions[&binding.materialization];
                 let descriptor = &catalog.summary_descriptors[&identity.summary_descriptor_id];
                 if !matches!(
                     descriptor.fidelity,
@@ -180,6 +174,34 @@ impl QueryPlan {
             return Err(QueryPlanError::Invalid(
                 "non-bootstrap QueryPlan has zero plan_version".into(),
             ));
+        }
+        for (query_id, selected) in &self.selected_dags {
+            if query_id != &selected.query_id {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG map key `{query_id}` differs from document query ID `{}`",
+                    selected.query_id
+                )));
+            }
+            if selected.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+            {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` has unsupported schema version {}",
+                    selected.schema_version
+                )));
+            }
+            selected.decode().map_err(|error| {
+                QueryPlanError::Invalid(format!("selected DAG `{query_id}` is invalid: {error}"))
+            })?;
+            let matching_entries = self
+                .entries
+                .values()
+                .filter(|entry| entry.query_id == *query_id)
+                .count();
+            if matching_entries != 1 {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` must correspond to exactly one query entry; found {matching_entries}"
+                )));
+            }
         }
         if let Some(context) = &self.clickhouse_context {
             for (template, identities) in &context.window_templates {
@@ -403,6 +425,13 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
+                if binding.stored_output_reference.validate().is_err()
+                    || binding.stored_output_reference.definition_id != binding.materialization
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "read binding has invalid stored output or definition".into(),
+                    ));
+                }
                 if binding.readout_lookback_ms == Some(0) {
                     return Err(QueryPlanError::Invalid(
                         "zero semantic readout lookback".into(),
@@ -439,6 +468,8 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
+    #[serde(alias = "state_reference")]
+    pub stored_output_reference: crate::sds::StoredOutputReference,
     /// Complete-window storage advances independently of its stored extent.
     /// None denotes disjoint pane storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -606,6 +637,133 @@ pub enum QueryPlanNode {
 }
 
 impl QueryPlanNode {
+    /// Operator label for logs: the serialized `op` tag, plus the residual
+    /// `kind` for logical nodes, including the operation where applicable
+    /// (e.g. `logical/aggregate/sum`).
+    pub fn op_label(&self) -> &'static str {
+        use residual::ResidualQueryOperator as R;
+        match self {
+            Self::RelationalJoin { .. } => "relational_join",
+            Self::Relational { .. } => "relational",
+            Self::Logical { operator, .. } => match operator {
+                R::CurrentSeries { .. } => "logical/current_series",
+                R::ExactSubquery { .. } => "logical/exact_subquery",
+                R::CandidateExactSubquery { .. } => "logical/candidate_exact_subquery",
+                R::Scan { .. } => "logical/scan",
+                R::UnaryNegate => "logical/unary_negate",
+                R::VectorToScalar => "logical/vector_to_scalar",
+                R::Aggregate { operation, .. } => match operation {
+                    residual::Aggregation::Sum => "logical/aggregate/sum",
+                    residual::Aggregation::Max => "logical/aggregate/max",
+                    residual::Aggregation::Min => "logical/aggregate/min",
+                    residual::Aggregation::Avg => "logical/aggregate/avg",
+                    residual::Aggregation::Count => "logical/aggregate/count",
+                },
+                R::TopKSelection { .. } => "logical/top_k_selection",
+                R::Binary { .. } => "logical/binary",
+                R::Temporal { .. } => "logical/temporal",
+                R::Sort { .. } => "logical/sort",
+                R::HistogramQuantile => "logical/histogram_quantile",
+                R::Subquery { .. } => "logical/subquery",
+            },
+            Self::Scalar { .. } => "scalar",
+            Self::Binary { .. } => "binary",
+            Self::ReduceSum { .. } => "reduce_sum",
+            Self::ReadMaterialization { .. } => "read_materialization",
+            Self::SummaryEstimate { .. } => "summary_estimate",
+            Self::ExactReadout { readout, .. } => match readout {
+                ExactReadout::Sum => "exact_readout/sum",
+                ExactReadout::Count => "exact_readout/count",
+                ExactReadout::Increase => "exact_readout/increase",
+                ExactReadout::Rate => "exact_readout/rate",
+                ExactReadout::Min => "exact_readout/min",
+                ExactReadout::Max => "exact_readout/max",
+            },
+            Self::SummaryMerge { .. } => "summary_merge",
+            Self::CandidateTopK { .. } => "candidate_top_k",
+            Self::ExternalExact { .. } => "external_exact",
+            Self::ExactFallback { .. } => "exact_fallback",
+        }
+    }
+
+    /// Bounded, query-text-free operator arguments for execution logs.
+    /// The query ID links these details to the full installed plan when needed.
+    pub fn log_syntax(&self) -> String {
+        use residual::ResidualQueryOperator as R;
+        match self {
+            Self::RelationalJoin { join_kind, .. } => format!("join_kind={join_kind:?}"),
+            Self::Relational { .. } => String::new(),
+            Self::Logical { operator, .. } => match operator {
+                R::CurrentSeries { readout, .. } => format!("readout={readout:?}"),
+                R::ExactSubquery { .. } => String::new(),
+                R::CandidateExactSubquery { .. } => String::new(),
+                R::Scan {
+                    metric,
+                    matchers,
+                    range_ms,
+                    offset_ms,
+                } => format!(
+                    "metric={} matcher_count={} range_ms={range_ms:?} offset_ms={offset_ms}",
+                    metric
+                        .as_deref()
+                        .map(|name| name.chars().take(64).collect::<String>())
+                        .unwrap_or_default(),
+                    matchers.len(),
+                ),
+                R::UnaryNegate | R::VectorToScalar | R::HistogramQuantile => String::new(),
+                R::Aggregate {
+                    operation,
+                    grouping,
+                } => format!(
+                    "operation={operation:?} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
+                R::TopKSelection { k, grouping } => format!(
+                    "k={k} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
+                R::Binary {
+                    operation,
+                    return_bool,
+                } => format!("operation={operation:?} return_bool={return_bool}"),
+                R::Temporal { operation } => format!("operation={operation:?}"),
+                R::Sort { descending } => format!("descending={descending}"),
+                R::Subquery {
+                    range_ms,
+                    step_ms,
+                    offset_ms,
+                } => format!("range_ms={range_ms} step_ms={step_ms} offset_ms={offset_ms}"),
+            },
+            Self::Scalar { value } => format!("value={value}"),
+            Self::Binary { operator, .. } => format!("operation={operator:?}"),
+            Self::ReduceSum { grouping, .. } => match grouping {
+                PhysicalGrouping::PerEntity => "grouping=per_entity".into(),
+                PhysicalGrouping::Reduce(labels) => {
+                    format!("grouping=reduce({})", log_labels(labels))
+                }
+            },
+            Self::ReadMaterialization { binding } => format!(
+                "window_ms={} lookback_ms={:?}",
+                binding.window_ms, binding.readout_lookback_ms
+            ),
+            Self::SummaryEstimate { query, .. } => match query {
+                QueryReadout::FrequencyL2 => "readout=frequency_l2".into(),
+                QueryReadout::FrequencyEntropy => "readout=frequency_entropy".into(),
+                QueryReadout::Quantile { q } => format!("readout=quantile q={q}"),
+                QueryReadout::PointCount { .. } => "readout=point_count".into(),
+                QueryReadout::Cardinality => "readout=cardinality".into(),
+                QueryReadout::TopK { k } => format!("readout=top_k k={k}"),
+            },
+            Self::ExactReadout { readout, .. } => format!("readout={readout:?}"),
+            Self::SummaryMerge { .. } => String::new(),
+            Self::CandidateTopK { k, grouping, .. } => format!(
+                "k={k} grouping={}",
+                log_grouping(&grouping.labels, grouping.without)
+            ),
+            Self::ExternalExact { .. } | Self::ExactFallback { .. } => String::new(),
+        }
+    }
+
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
             Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
@@ -622,6 +780,26 @@ impl QueryPlanNode {
             Self::CandidateTopK { inputs, .. } => inputs,
         }
     }
+}
+
+fn log_labels(labels: &[String]) -> String {
+    let mut names = labels
+        .iter()
+        .take(8)
+        .map(|label| label.chars().take(64).collect::<String>())
+        .collect::<Vec<_>>();
+    if labels.len() > 8 {
+        names.push("...".into());
+    }
+    names.join(",")
+}
+
+fn log_grouping(labels: &[String], without: bool) -> String {
+    format!(
+        "{}({})",
+        if without { "without" } else { "by" },
+        log_labels(labels)
+    )
 }
 
 pub use planner_types::post_asap::CandidateCompleteness;
@@ -717,11 +895,73 @@ pub fn canonical_promql(query: &str) -> Result<String, QueryPlanError> {
 
 #[cfg(test)]
 mod contract_tests {
+    use super::{residual, QueryPlanNode};
+
     // Installed plans cross producer/query threads without Planner Rc state.
     #[test]
     fn installed_query_contract_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<super::QueryPlan>();
         assert_send_sync::<super::QueryPlanEntry>();
+    }
+
+    #[test]
+    fn aggregate_log_labels_identify_the_operation() {
+        for (operation, expected) in [
+            (residual::Aggregation::Sum, "logical/aggregate/sum"),
+            (residual::Aggregation::Count, "logical/aggregate/count"),
+            (residual::Aggregation::Avg, "logical/aggregate/avg"),
+        ] {
+            let node = QueryPlanNode::Logical {
+                operator: residual::ResidualQueryOperator::Aggregate {
+                    operation,
+                    grouping: residual::Grouping {
+                        labels: vec!["service".into()],
+                        without: false,
+                    },
+                },
+                inputs: vec![],
+            };
+            assert_eq!(node.op_label(), expected);
+            assert!(node.log_syntax().contains("grouping=by(service)"));
+        }
+        for (readout, expected) in [
+            (super::ExactReadout::Sum, "exact_readout/sum"),
+            (super::ExactReadout::Count, "exact_readout/count"),
+        ] {
+            assert_eq!(
+                QueryPlanNode::ExactReadout {
+                    input: super::QueryNodeId(1),
+                    readout,
+                }
+                .op_label(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn execution_log_syntax_identifies_operator_without_query_text() {
+        let binary = QueryPlanNode::Logical {
+            operator: residual::ResidualQueryOperator::Binary {
+                operation: residual::BinaryOperation::CheckedDiv,
+                return_bool: false,
+            },
+            inputs: vec![super::QueryNodeId(1), super::QueryNodeId(2)],
+        };
+        assert_eq!(binary.op_label(), "logical/binary");
+        assert_eq!(
+            binary.log_syntax(),
+            "operation=CheckedDiv return_bool=false"
+        );
+
+        let exact = QueryPlanNode::Logical {
+            operator: residual::ResidualQueryOperator::ExactSubquery {
+                query: "secret_metric{credential=\"secret\"}".into(),
+            },
+            inputs: vec![],
+        };
+        assert_eq!(exact.op_label(), "logical/exact_subquery");
+        assert!(exact.log_syntax().is_empty());
     }
 }

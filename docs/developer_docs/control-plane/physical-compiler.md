@@ -5,8 +5,8 @@
 
 ## Current implementation boundary
 
-The compiler consumes ASAPPlanner types pinned to the revision exposed as
-`physical::compiler::PLANNER_REVISION`, selects
+The compiler consumes ASAPPlanner types from `main`, with the resolved revision
+exposed as `physical::compiler::PLANNER_REVISION`, and selects
 from Planner's legal candidate space with backend-owned cost and evidence
 inputs, and emits one `CompiledPhysicalPlan`. The plan contains one SummaryCatalog plus
 CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan projections

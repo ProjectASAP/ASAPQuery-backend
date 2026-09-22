@@ -558,7 +558,7 @@ mod tests {
         config.pane_origin_ms = Some(0);
         config.table_timestamp_column = Some("timestamp_ms".into());
         let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
-        let materialization = *sds.materializations.keys().next().unwrap();
+        let materialization = *sds.definitions.keys().next().unwrap();
         let read = QueryNodeId(0);
         let readout = QueryNodeId(1);
         let input_schema = relation_schema(&[
@@ -590,6 +590,7 @@ mod tests {
                         binding: MaterializationBinding {
             full_window_slide_ms: None,
                             materialization,
+                            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(materialization),
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
                             item_labels: Vec::new(),
                             window_ms: 1_000,
@@ -728,6 +729,7 @@ mod tests {
                 tables,
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
+            selected_dags: Default::default(),
             entries: BTreeMap::from([(
                 QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &canonical_sql),
                 entry,
@@ -738,7 +740,7 @@ mod tests {
             .unwrap();
         if seed {
             store.register(SummarySeriesMetadata {
-                sid: 7,
+                storage_handle: 7,
                 metric_name: "requests".into(),
                 group_by_keys: BTreeSet::new(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -1044,8 +1046,8 @@ mod tests {
         cfg.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
             name: "value".into(),
         });
-        let hot = crate::storage_engines::types::StreamingConfigHandle::from_arc(Arc::new(
-            crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
+        let hot = crate::storage_engines::types::InstalledPrecomputePlanHandle::from_arc(Arc::new(
+            crate::storage_engines::types::InstalledPrecomputePlan::new(HashMap::from([(
                 cfg.policy_fp_u64(),
                 cfg.clone(),
             )])),

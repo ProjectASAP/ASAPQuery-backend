@@ -425,13 +425,21 @@ fn validate_binding_phase(
 
 impl QueryExecutionContext<'_> {
     /// Resolve exactly one compiler-bound materialization. This is the formal
-    /// QueryPlan path: fingerprint -> SID is the only lookup; metadata checks
-    /// are integrity checks and never broaden the candidate set.
+    /// QueryPlan path: the validated stored output resolves to its definition's
+    /// generation-scoped SID index. Metadata checks never broaden that set.
     pub fn read_bound_materialization(
         &self,
         binding: &asap_types::query_plan::MaterializationBinding,
     ) -> Result<Vec<(BTreeMap<String, String>, GroupState)>, SummaryExecutorError> {
         use asap_types::query_plan::PhysicalGrouping;
+
+        if binding.stored_output_reference.validate().is_err()
+            || binding.stored_output_reference.definition_id != binding.materialization
+        {
+            return Err(SummaryExecutorError::Unsupported(
+                "read binding has invalid stored output",
+            ));
+        }
 
         let inventory_revision = self.index.summary_update_revision();
         let query_range = asap_types::sds::HalfOpenTimeRange {
@@ -497,7 +505,7 @@ impl QueryExecutionContext<'_> {
         };
         let mut sids = self
             .index
-            .series_ids_for_policy(binding.materialization.fingerprint());
+            .storage_handles_for_output(binding.stored_output_reference);
         sids.sort_unstable();
         sids.dedup();
         let mut matched_metadata = 0usize;
@@ -1489,6 +1497,9 @@ mod tests {
             full_window_slide_ms: None,
             item_labels: Vec::new(),
             materialization: asap_types::PolicyFingerprint(7).into(),
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                asap_types::PolicyFingerprint(7).into(),
+            ),
             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
             window_ms: 60_000,
             pane_origin_ms: Some(7_000),
@@ -1626,7 +1637,7 @@ mod tests {
     fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Kll { k: 200 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -1649,7 +1660,7 @@ mod tests {
     fn hll_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Hll { precision: 10 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::CardinalityApprox),
@@ -1695,7 +1706,7 @@ mod tests {
     fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
@@ -1768,7 +1779,7 @@ mod tests {
     fn cms_with_heap_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::FrequencyTopk(Some(
@@ -1838,7 +1849,7 @@ mod tests {
 
     fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -1924,6 +1935,9 @@ mod tests {
         let binding = MaterializationBinding {
             full_window_slide_ms: Some(20_000),
             materialization: fp.into(),
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                fp.into(),
+            ),
             output_grouping: PhysicalGrouping::PerEntity,
             item_labels: vec![],
             window_ms: 60_000,
@@ -1990,6 +2004,9 @@ mod tests {
         let binding = MaterializationBinding {
             full_window_slide_ms: None,
             materialization: fp.into(),
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                fp.into(),
+            ),
             output_grouping: PhysicalGrouping::PerEntity,
             item_labels: vec![],
             window_ms: 1000,

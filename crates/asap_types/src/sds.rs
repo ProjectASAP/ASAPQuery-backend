@@ -1,5 +1,6 @@
-//! Shared SDS metadata contracts. Summary payload bytes remain storage-engine
-//! owned; catalogs and inventories contain identities and state references only.
+//! Shared contracts for summary definitions, stored-summary metadata, and plan
+//! output bindings. Payload bytes remain storage-engine owned and logically
+//! belong to the stored summary identified by this metadata.
 pub const TIMESTAMPED_OBSERVATION_SEMANTICS: &str = "asap.timestamped-observations.v2";
 
 use crate::{AggregationType, PrecomputeMaterialization};
@@ -50,6 +51,67 @@ impl From<crate::PolicyFingerprint> for SummaryDefinitionId {
 impl From<SummaryDefinitionId> for crate::PolicyFingerprint {
     fn from(value: SummaryDefinitionId) -> Self {
         value.0
+    }
+}
+
+/// Identity of one persisted producer output within an installed plan version.
+/// It is independent of the semantic definition shared by equivalent producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StoredOutputId(pub u64);
+
+/// Typed join key carried by both the writer and every bound reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredOutputReference {
+    #[serde(alias = "state_slot_id")]
+    pub stored_output_id: StoredOutputId,
+    pub definition_id: SummaryDefinitionId,
+}
+
+impl StoredOutputReference {
+    /// Default compiler allocation when one output is selected per definition.
+    pub fn for_definition(definition_id: SummaryDefinitionId) -> Self {
+        Self {
+            stored_output_id: StoredOutputId(definition_id.as_u64()),
+            definition_id,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if self.stored_output_id.0 != 0 && !self.definition_id.fingerprint().is_unset() {
+            Ok(())
+        } else {
+            Err(SdsError(
+                "stored output and definition identities must be set".into(),
+            ))
+        }
+    }
+}
+
+/// Canonical address of one stored DAG output for one population and window.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredSummaryKey {
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub output: StoredOutputReference,
+    pub population: BTreeMap<String, String>,
+    pub window: HalfOpenTimeRange,
+}
+
+impl StoredSummaryKey {
+    pub fn validate(&self) -> Result<(), SdsError> {
+        self.output.validate()?;
+        if self.window.start_ms >= self.window.end_ms {
+            return Err(SdsError("stored summary requires a nonempty window".into()));
+        }
+        Ok(())
+    }
+
+    pub fn storage_key(&self) -> Result<String, SdsError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|e| SdsError(e.to_string()))
     }
 }
 
@@ -275,6 +337,8 @@ pub enum InstanceLifecycle {
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstance {
     pub instance_id: SummaryInstanceId,
+    #[serde(alias = "state_slot_id")]
+    pub stored_output_id: StoredOutputId,
     #[serde(alias = "materialization_id")]
     pub summary_definition_id: SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
@@ -282,6 +346,10 @@ pub struct SummaryInstance {
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
     pub catalog_generation: CatalogGeneration,
+    /// Source generation selected by an explicit compatibility decision when
+    /// an unchanged definition reuses a committed payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_from_generation: Option<CatalogGeneration>,
     pub placement: SummaryPlacement,
     pub state_reference: SummaryStateReference,
     pub status: SummaryInstanceStatus,
@@ -292,6 +360,11 @@ pub struct SummaryInstance {
 
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
+        StoredOutputReference {
+            stored_output_id: self.stored_output_id,
+            definition_id: self.summary_definition_id,
+        }
+        .validate()?;
         if self.time_range.start_ms >= self.time_range.end_ms {
             return Err(SdsError(
                 "summary instance time range must be non-empty".into(),
@@ -309,9 +382,23 @@ impl SummaryInstance {
                 "summary instance placement must be resolved".into(),
             ));
         }
+        let payload_generation = if let Some(source) = &self.reused_from_generation {
+            validate_catalog_generation(source)?;
+            if source.plan_id != self.catalog_generation.plan_id
+                || source.plan_version >= self.catalog_generation.plan_version
+            {
+                return Err(SdsError(
+                    "stored summary has invalid reuse provenance".into(),
+                ));
+            }
+            source.plan_version
+        } else {
+            self.catalog_generation.plan_version
+        };
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
+            || self.state_reference.generation != payload_generation
         {
             return Err(SdsError(
                 "summary instance has invalid state reference".into(),
@@ -359,6 +446,38 @@ impl ObservedSummaryInventory {
             if instance.observed_at_ms > self.observed_at_ms {
                 return Err(SdsError(
                     "instance observation is newer than inventory".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &crate::summary_catalog::SummaryCatalog,
+    ) -> Result<(), SdsError> {
+        self.validate()?;
+        let generation = catalog
+            .reference()
+            .map_err(|error| SdsError(error.to_string()))?;
+        for instance in self.instances.values() {
+            if instance.catalog_generation != generation {
+                return Err(SdsError(
+                    "summary instance belongs to another plan generation".into(),
+                ));
+            }
+            let definition = catalog
+                .definitions
+                .get(&instance.summary_definition_id)
+                .ok_or_else(|| SdsError("summary instance has no catalog definition".into()))?;
+            if instance.summary_descriptor_id != definition.summary_descriptor_id
+                || instance.data_descriptor_id != definition.data_descriptor_id
+                || instance.state_reference.state_schema_version
+                    != catalog.summary_descriptors[&definition.summary_descriptor_id]
+                        .state_schema_version
+            {
+                return Err(SdsError(
+                    "summary instance differs from its catalog definition".into(),
                 ));
             }
         }
@@ -1240,6 +1359,7 @@ mod tests {
     fn observed_instance(lifecycle: InstanceLifecycle) -> SummaryInstance {
         SummaryInstance {
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
+            stored_output_id: StoredOutputId(7),
             summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
             summary_descriptor_id: descriptor(
                 200,
@@ -1262,6 +1382,7 @@ mod tests {
                 plan_version: 2,
                 snapshot_sha256: "abc".into(),
             },
+            reused_from_generation: None,
             placement: SummaryPlacement {
                 producer_id: "producer".into(),
                 storage_node_id: "store".into(),
@@ -1270,7 +1391,7 @@ mod tests {
                 store: "summary-store".into(),
                 key: "state/1".into(),
                 state_schema_version: 1,
-                generation: 1,
+                generation: 2,
                 sequence: 3,
                 checksum: None,
             },
@@ -1297,6 +1418,94 @@ mod tests {
             instances: BTreeMap::from([(instance.instance_id.clone(), instance)]),
         };
         inventory.validate().unwrap();
+    }
+
+    // Every component of the persisted output address participates in identity.
+    #[test]
+    fn stored_summary_key_binds_plan_output_population_and_window() {
+        let key = StoredSummaryKey {
+            plan_id: 1,
+            plan_version: 2,
+            output: StoredOutputReference {
+                stored_output_id: StoredOutputId(101),
+                definition_id: crate::PolicyFingerprint(7).into(),
+            },
+            population: BTreeMap::from([("service".into(), "api".into())]),
+            window: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 1000,
+            },
+        };
+        let mut variants = vec![key.clone(); 5];
+        variants[0].plan_id += 1;
+        variants[1].plan_version += 1;
+        variants[2].output.stored_output_id.0 += 1;
+        variants[3].population.insert("service".into(), "db".into());
+        variants[4].window.end_ms += 1;
+        let canonical = key.storage_key().unwrap();
+        for other in variants {
+            assert_ne!(canonical, other.storage_key().unwrap());
+        }
+        assert_eq!(
+            serde_json::from_str::<StoredSummaryKey>(&canonical).unwrap(),
+            key
+        );
+    }
+
+    // A DAG output has its own identity even when its definition is shared.
+    #[test]
+    fn stored_output_identity_is_independent_of_definition() {
+        let definition_id = SummaryDefinitionId::from(crate::PolicyFingerprint(7));
+        for stored_output_id in [StoredOutputId(101), StoredOutputId(102)] {
+            StoredOutputReference {
+                stored_output_id,
+                definition_id,
+            }
+            .validate()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn stored_output_and_payload_version_must_match_instance_definition() {
+        let mut instance = observed_instance(InstanceLifecycle::Persistent);
+        instance.stored_output_id = StoredOutputId(0);
+        assert!(instance.validate().is_err());
+        instance.stored_output_id = StoredOutputId(7);
+        instance.state_reference.generation = 3;
+        assert!(instance.validate().is_err());
+        let mut reference = StoredOutputReference::for_definition(instance.summary_definition_id);
+        reference.stored_output_id = StoredOutputId(0);
+        assert!(reference.validate().is_err());
+    }
+
+    #[test]
+    fn stored_output_reference_accepts_legacy_state_slot_field() {
+        let reference: StoredOutputReference = serde_json::from_value(json!({
+            "state_slot_id": 7,
+            "definition_id": 7
+        }))
+        .unwrap();
+        assert_eq!(reference.stored_output_id, StoredOutputId(7));
+        reference.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(reference).unwrap(),
+            json!({"stored_output_id": 7, "definition_id": 7})
+        );
+    }
+
+    #[test]
+    fn reused_payload_requires_an_older_compatible_plan_generation() {
+        let mut instance = observed_instance(InstanceLifecycle::Persistent);
+        let mut source = instance.catalog_generation.clone();
+        source.plan_version -= 1;
+        instance.reused_from_generation = Some(source.clone());
+        instance.state_reference.generation = source.plan_version;
+        instance.validate().unwrap();
+        instance.reused_from_generation.as_mut().unwrap().plan_id += 1;
+        assert!(instance.validate().is_err());
+        instance.reused_from_generation = Some(instance.catalog_generation.clone());
+        assert!(instance.validate().is_err());
     }
 
     #[test]
