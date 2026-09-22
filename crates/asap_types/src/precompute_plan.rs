@@ -1031,7 +1031,6 @@ mod source_window_cohort_tests {
         config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
         let mut node = ExecutableDagNode {
             id: PostAsapNodeId(1),
-            operator: ExecutableOperator::SummaryAgg,
             payload: ExecutableOperatorPayload::SummaryAgg {
                 family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 input: SummaryUpdate {

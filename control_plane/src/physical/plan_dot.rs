@@ -46,7 +46,15 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
             emit_node(
                 &mut dot,
                 &id,
-                &format!("{:?} #{}{}", node.operator, node.id.0, binding),
+                &format!(
+                    "{} #{}{}",
+                    node.payload
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    node.id.0,
+                    binding
+                ),
                 "",
             );
         }
