@@ -11,8 +11,8 @@ The Summary Catalog and Self-Describing Summary (SDS) model defines what persist
 summary state means. It connects PrecomputePlan writers to QueryPlan readers
 without requiring either runtime to reinterpret Planner IR.
 
-This document owns summary identity, schema, state references, instance readiness
-and state lifecycle. The [integration design](asapplanner-integration.md) owns
+This document owns summary identity, schema, state references and the conditions
+for reading an instance. The [integration design](asapplanner-integration.md) owns
 executable plan splitting; the [migration plan](asapplanner-migration-plan.md)
 owns delivery.
 Cost ranking, operator scheduling and transmission policy are outside SDS.
@@ -24,7 +24,7 @@ Cost ranking, operator scheduling and transmission policy are outside SDS.
 3. [Core objects](#core-objects)
 4. [Identity and reference rules](#identity-and-reference-rules)
 5. [Plan and storage contract](#plan-and-storage-contract)
-6. [Lifecycle and readiness](#lifecycle-and-readiness)
+6. [Read eligibility](#read-eligibility)
 7. [Validation and migration](#validation-and-migration)
 8. [Deferred work](#deferred-work)
 
@@ -161,7 +161,7 @@ observed readiness belongs to instance metadata in `SummaryStore`.
 
 A state instance records plan version, slot, definition, actual format and its
 partition key, coverage/completion, producer sequence
-where applicable, lifecycle status, location and integrity metadata. Payload
+where applicable, location and integrity metadata. Payload
 bytes remain in `SummaryStore`, not in catalog descriptors.
 
 ## Identity and reference rules
@@ -219,27 +219,19 @@ QueryPlan:      Read state B -> estimate -> result
 
 Source and destination are never represented as the same instance.
 
-## Lifecycle and readiness
+## Read eligibility
 
-These are conceptual phases, not one `SummaryStateInstance` status enum. `Desired`
-is demand from an installed plan; the other phases describe observed runtime
-state or its retirement.
+The immediate use case needs one decision: can this installed QueryPlan read the
+state bound by its `StateReference`? A read is eligible only when `SummaryStore`
+contains the referenced instance, its payload has been committed, and its plan
+version, definition, schema/encoding, partition and coverage satisfy the reader
+binding. Otherwise the query uses its configured exact fallback or reports that
+the result is unavailable.
 
-| Phase | View | Meaning |
-| --- | --- | --- |
-| `Desired` | Installed plan | The plan requires state for this slot and coverage |
-| `Building` | SummaryStore instance metadata | Required state is being produced or recovered |
-| `Ready` | SummaryStore instance metadata | Required schema and coverage are available |
-| `Draining` | SummaryStore instance metadata | New work has stopped while existing use completes |
-| `Retired` | SummaryStore instance metadata | New reads are prohibited; safe reclamation may follow |
-
-Atomic activation installs intent, not ready data. A QueryPlan read checks
-observed readiness and coverage, then follows its configured fallback or explicit
-unavailability behavior. Reactivation does not make stale instances current.
-
-Completed finite-input state is immutable. Additional writes require a new
-authorized plan version or replacement instance. Mutable streaming state publishes
-monotone coverage according to its installed contract.
+This design does not introduce a general instance lifecycle. Terms such as
+`Building`, `Draining` and `Retired` belong to existing runtime scheduling and
+cleanup mechanisms where needed; they are not new SDS states. Plan installation
+authorizes a binding but does not by itself make an instance readable.
 
 ## Validation and migration
 
@@ -277,5 +269,6 @@ the backend must not depend on ASAPCollector.
 ## Deferred work
 
 SDS does not define CollectorPlan, TransmissionPlan, distributed activation, a
-new checkpoint protocol, cost/ERP evidence or retention-policy selection. Those
-systems may reference SDS identities without becoming part of this model.
+new checkpoint protocol, a general instance lifecycle, cost/ERP evidence or
+retention-policy selection. Those systems may reference SDS identities without
+becoming part of this model.
