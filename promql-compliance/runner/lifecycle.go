@@ -11,6 +11,7 @@ import (
 )
 
 type ComposeLifecycle struct {
+	AutomaticWorkloadCost    bool
 	AdditionalServices       []string
 	Files                    []string
 	Project                  string
@@ -43,7 +44,11 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	if err := l.runCompose(ctx, environment, "build", "planner"); err != nil {
 		return fmt.Errorf("build workload cost planner: %w", err)
 	}
-	if err := l.runCompose(ctx, environment, "run", "--rm", "--no-deps", "planner"); err != nil {
+	if l.AutomaticWorkloadCost {
+		if err := CopyAutomaticSnapshot(l.PlanningSnapshotTemplate, l.PlanningSnapshot); err != nil {
+			return err
+		}
+	} else if err := l.runCompose(ctx, environment, "run", "--rm", "--no-deps", "planner"); err != nil {
 		return fmt.Errorf("derive workload cost evidence: %w", err)
 	}
 	if l.SelectedPlan != "" {
@@ -76,6 +81,11 @@ func (l *ComposeLifecycle) compileSelectedPlan(ctx context.Context, environment 
 	}
 	if err := os.WriteFile(l.SelectedPlan, output, 0o644); err != nil {
 		return err
+	}
+	if l.AutomaticWorkloadCost {
+		if err := ValidateAutomaticWorkloadCost(output); err != nil {
+			return fmt.Errorf("automatic workload cost gate: %w", err)
+		}
 	}
 	return ValidateLocalPlan(output)
 }

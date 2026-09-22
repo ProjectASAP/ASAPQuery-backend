@@ -40,6 +40,7 @@ type report struct {
 	Dataset       string                  `json:"dataset"`
 	BaseTimeMs    int64                   `json:"baseTimeMs"`
 	Warmups       int                     `json:"warmups"`
+	SelectedPlan  string                  `json:"selectedPlan"`
 	Trials        int                     `json:"trials"`
 	Targets       map[string]targetReport `json:"targets"`
 	BenefitPassed bool                    `json:"benefitPassed"`
@@ -92,7 +93,11 @@ func run() error {
 		return err
 	}
 	defer os.RemoveAll(directory)
-	snapshot, err := json.Marshal(runner.BuildPlanningSnapshot(suite, time.Now().UTC()))
+	costSnapshot, err := runner.BuildBenefitSnapshot(suite, dataset, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	snapshot, err := json.Marshal(costSnapshot)
 	if err != nil {
 		return err
 	}
@@ -105,7 +110,8 @@ func run() error {
 		return err
 	}
 	lifecycle := runner.ComposeLifecycle{
-		Files: files, Project: "issue754-benefit", LogsDirectory: *logs,
+		AutomaticWorkloadCost: true,
+		Files:                 files, Project: "issue754-benefit", LogsDirectory: *logs,
 		PlanningSnapshot: selected, PlanningSnapshotTemplate: template,
 		SelectedPlan:       strings.TrimSuffix(*output, ".json") + ".plan.json",
 		AdditionalServices: []string{"clickhouse", "victoria"},
@@ -152,7 +158,7 @@ func run() error {
 	}
 
 	result := report{Suite: suite.Name, Dataset: dataset.Name, BaseTimeMs: *baseMs,
-		Warmups: *warmups, Trials: *trials, Targets: map[string]targetReport{}, BenefitPassed: true}
+		SelectedPlan: lifecycle.SelectedPlan, Warmups: *warmups, Trials: *trials, Targets: map[string]targetReport{}, BenefitPassed: true}
 	targets := []struct {
 		name, service string
 		query         func(context.Context, runner.QueryCase, time.Time) error

@@ -14,7 +14,8 @@ func ValidateLocalPlan(encoded []byte) error {
 				Nodes map[string]struct {
 					Op       string `json:"op"`
 					Operator struct {
-						Op string `json:"op"`
+						Op   string `json:"op"`
+						Kind string `json:"kind"`
 					} `json:"operator"`
 				} `json:"nodes"`
 			} `json:"entries"`
@@ -31,7 +32,7 @@ func ValidateLocalPlan(encoded []byte) error {
 			return fmt.Errorf("%s has no query nodes", query)
 		}
 		for _, node := range entry.Nodes {
-			if node.Op == "exact_fallback" || node.Op == "external_exact" || node.Operator.Op == "exact_subquery" {
+			if node.Op == "exact_fallback" || node.Op == "external_exact" || node.Operator.Op == "exact_subquery" || node.Operator.Kind == "exact_subquery" || node.Operator.Kind == "candidate_exact_subquery" {
 				return fmt.Errorf("%s requires external exact execution (%s/%s)", query, node.Op, node.Operator.Op)
 			}
 		}

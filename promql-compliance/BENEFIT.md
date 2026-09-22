@@ -27,3 +27,36 @@ dependencies, and cgroup v2. Run from `promql-compliance/runner`:
 ```sh
 make benefit
 ```
+
+## PR 761 workload-cost gate
+
+This branch includes PR #761. The level-3 runner passes an **unquoted** snapshot
+to the normal backend compiler and startup path. It derives source cadence,
+input series count, sample volume and aggregate ingestion rate from the replay
+dataset; query recurrence comes from the shared suite. Data cadence retains
+100 ms precision; the backend physical-history sizing bound rounds up to its
+existing whole-second granularity. No synthetic complete
+quotes or forced winner are inserted.
+
+Before the local-execution and correctness gates, the runner verifies every
+priced candidate has an automatic resource breakdown, the selected component
+keys exactly cover its manifest, resource weights reproduce the totals, ERP
+provenance is explicit, and the selected candidate has the lowest available
+cost. The saved `.plan.json` contains all candidate estimates, assumptions and
+ERP IDs; the benchmark report links that plan. CI also runs the Rust workload
+cost tests, including ERP precedence and fallback to analytical estimates.
+The default level-3 fixture has no ERP artifact and exercises analytical costing;
+ERP-priority coverage is currently in the Rust contract tests.
+
+Analytical planning estimates are not the measured benefit result. Costing uses
+the declared 300-second planning horizon; timing measures the configured repeated
+query trial batch. The original local-only, semantic and measured-benefit gates
+remain mandatory: a correctly costed exact fallback still fails local-only
+acceptance and does not establish a performance improvement.
+
+Current acceptance blockers: using the fixture's actual 100 ms source cadence
+exposes the backend-local whole-second range restriction during workload
+lowering. Separately, the inherited level-1 test still rejects the grouped
+temporal Sum plan and the quantile-ratio exact fallback. These failures must be
+resolved before this fixture can establish an end-to-end performance benefit;
+the runner does not coarsen data cadence or weaken the local-execution gate.
