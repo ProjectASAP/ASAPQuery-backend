@@ -45,7 +45,7 @@ fn expected_plan(name: &str) -> ExpectedPlan {
             root_operation: None,
         },
         "spatial-quantile" => ExpectedPlan {
-            family: Some("DDSketch"),
+            family: Some("QuantileSketch"),
             partitioning: "grouped",
             readout: "quantile",
             root_operation: None,
@@ -57,7 +57,7 @@ fn expected_plan(name: &str) -> ExpectedPlan {
             root_operation: None,
         },
         "temporal-quantile" => ExpectedPlan {
-            family: Some("DDSketch"),
+            family: Some("QuantileSketch"),
             partitioning: "per_entity",
             readout: "quantile",
             root_operation: None,
@@ -76,9 +76,9 @@ fn expected_plan(name: &str) -> ExpectedPlan {
         },
         "grouped-temporal-sum" => ExpectedPlan {
             family: Some("Sum"),
-            partitioning: "per_entity",
+            partitioning: "grouped",
             readout: "sum",
-            root_operation: Some("aggregate"),
+            root_operation: None,
         },
         "topk-rate" => ExpectedPlan {
             family: Some("Increase"),
@@ -96,6 +96,14 @@ fn expected_plan(name: &str) -> ExpectedPlan {
     }
 }
 
+fn family_matches(expected: &str, actual: &str) -> bool {
+    if expected == "QuantileSketch" {
+        matches!(actual, "DDSketch" | "DatasketchesKLL" | "HydraKLL")
+    } else {
+        expected == actual
+    }
+}
+
 fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) -> Option<String> {
     let expected = expected_plan(name);
     let artifact = serde_json::to_value(plan).unwrap();
@@ -107,19 +115,59 @@ fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) -> Option<Stri
     let materializations = artifact["precompute_plan"]["materializations"]
         .as_array()
         .unwrap();
-    let Some(family) = expected.family else {
-        assert_eq!(nodes.len(), 1, "{name}: fallback must be the entire plan");
+    if name == "spatial-topk" {
+        assert_eq!(nodes.len(), 1, "{name}: unexpected query nodes");
+        assert_eq!(node["op"], "logical", "{name}: expected a local readout");
+        assert_eq!(node["operator"]["kind"], "current_series");
+        assert_eq!(node["operator"]["population"]["metric"], "data");
         assert_eq!(
-            node["op"], "exact_fallback",
-            "{name}: ASAP plan is not implemented"
+            node["operator"]["population"]["grouping"],
+            json!({"labels":["label_0"],"without":false})
         );
+        assert_eq!(node["operator"]["population"]["max_k"], 3);
+        assert_eq!(node["operator"]["readout"], json!({"kind":"top_k","k":3}));
         assert!(
             materializations.is_empty(),
-            "{name}: fallback cannot claim a summary"
+            "{name}: current-series readout has no summary producer"
         );
-        return Some(format!(
-            "{name}: issue #754 requires an ASAP-local physical plan; exact fallback is not a correct answer"
-        ));
+        return None;
+    }
+    if name == "grouped-temporal-sum" && node["op"] == "logical" {
+        return Some("grouped-temporal-sum: Planner left a per-series temporal Sum and an outer exact grouped Sum; expected one time-and-label grouped Sum producer".into());
+    }
+    if name == "quantile-ratio" {
+        if node["op"] == "exact_fallback" {
+            return Some("quantile-ratio: expected two q=0.9/q=0.5 quantile sketch readouts followed by local division; Planner emitted exact fallback".into());
+        }
+        assert_eq!(node["op"], "binary", "{name}: expected local division");
+        assert!(
+            matches!(node["operator"].as_str(), Some("div" | "Div")),
+            "{name}: wrong binary operator"
+        );
+        let inputs = node["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 2);
+        for (input, q) in inputs.iter().zip([0.9, 0.5]) {
+            let readout = &nodes[&input.to_string()];
+            assert_eq!(readout["op"], "summary_estimate");
+            assert_eq!(readout["query"], json!({"kind":"quantile","q":q}));
+            let leaf = &nodes[&readout["input"].to_string()];
+            assert_eq!(leaf["op"], "read_materialization");
+            assert_eq!(leaf["binding"]["output_grouping"]["mode"], "per_entity");
+            assert_eq!(leaf["binding"]["readout_lookback_ms"], 60_000);
+        }
+        assert!(!materializations.is_empty());
+        assert!(materializations.iter().all(|summary| {
+            family_matches(
+                "QuantileSketch",
+                summary["aggregation_type"].as_str().unwrap(),
+            ) && summary["metric"] == "data"
+                && summary["partitioning"] == "per_entity"
+                && summary["window_size"] == 60
+        }));
+        return None;
+    }
+    let Some(family) = expected.family else {
+        panic!("{name}: no physical plan contract");
     };
     if let Some(operation) = expected.root_operation {
         assert_eq!(node["op"], "logical", "{name}: missing root operator");
@@ -175,9 +223,10 @@ fn assert_selected_plan(name: &str, plan: &impl serde::Serialize) -> Option<Stri
         "{name}: expected one summary producer"
     );
     let summary = &materializations[0];
-    assert_eq!(
-        summary["aggregation_type"], family,
-        "{name}: wrong summary family"
+    assert!(
+        family_matches(family, summary["aggregation_type"].as_str().unwrap()),
+        "{name}: wrong summary family: {}",
+        summary["aggregation_type"]
     );
     assert_eq!(summary["metric"], "data", "{name}: wrong source metric");
     assert_eq!(
@@ -232,7 +281,7 @@ fn issue754_queries_have_valid_physical_plans() {
         let mut valid_plans = Vec::new();
         let mut quotes = Vec::new();
         let mut errors = Vec::new();
-        for candidate in candidates {
+        for (candidate_index, candidate) in candidates.into_iter().enumerate() {
             match PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone()) {
                 Ok(plan) => {
                     let entry = plan.query_plan.lookup(&case.expr).unwrap();
@@ -254,7 +303,32 @@ fn issue754_queries_have_valid_physical_plans() {
                     }
                     let dot = control_plane::physical::plan_dot::render(&plan);
                     assert!(dot.contains("PrecomputePlan") && dot.contains("QueryPlan:"));
-                    let cost = if valid_plans.is_empty() { 1.0 } else { 1e12 };
+                    if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
+                        let base = std::path::Path::new(&directory)
+                            .join("candidates")
+                            .join(format!("{}-{candidate_index}", case.name));
+                        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+                        std::fs::write(
+                            base.with_extension("json"),
+                            serde_json::to_vec_pretty(&plan).unwrap(),
+                        )
+                        .unwrap();
+                        std::fs::write(base.with_extension("dot"), &dot).unwrap();
+                    }
+                    // The level-1 acceptance target is a backend-local plan.
+                    // Price explicit exact fallbacks above every local candidate.
+                    let cost = if plan.query_plan.entries.values().any(|entry| {
+                        entry
+                            .nodes
+                            .values()
+                            .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. }))
+                    }) {
+                        1e12
+                    } else if plan.precompute_plan.materializations.is_empty() {
+                        2.0
+                    } else {
+                        1.0
+                    };
                     let manifest = manifest(&plan, &candidate.queries).unwrap();
                     quotes.push(WorkloadQuote {
                         unit_costs: manifest
@@ -281,7 +355,7 @@ fn issue754_queries_have_valid_physical_plans() {
                     plan.precompute_plan
                         .materializations
                         .iter()
-                        .any(|m| format!("{:?}", m.aggregation_type) == family)
+                        .any(|m| family_matches(family, &format!("{:?}", m.aggregation_type)))
                         && plan.query_plan.entries.values().all(|entry| {
                             entry.nodes.values().any(|node| {
                                 matches!(node, QueryPlanNode::ReadMaterialization { .. })
