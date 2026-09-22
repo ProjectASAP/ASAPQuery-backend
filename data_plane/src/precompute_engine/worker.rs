@@ -570,7 +570,7 @@ impl Worker {
             return Ok(());
         }
         let state = self.group_states.get_mut(&sid).unwrap();
-        tracing::debug!(target: "asap_runtime_debug", worker_id = self.id, policy_fp = %agg_id,
+        tracing::debug!(target: "asap_runtime_debug", worker_id = self.id, policy_fp = %policy_fp,
             "precompute update route resolved");
         #[cfg(not(test))]
         if state.program.is_none() {
