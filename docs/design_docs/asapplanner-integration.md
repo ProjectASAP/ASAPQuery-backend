@@ -49,14 +49,18 @@ materialization boundary:
 flowchart LR
   D[Selected post-ASAP DAG] --> C[Physical compiler]
   C --> P[PrecomputePlan]
-  C -->|register definition| S[Summary Catalog]
+  C -->|register definition| S[Summary Catalog snapshot]
   C --> Q[QueryPlan]
   P -->|definition reference: validate at install| S
   Q -->|definition reference: validate at install| S
-  P -->|publish instance metadata| I[Runtime inventory]
-  P -->|write state| Store[Summary store]
-  Q -->|resolve ready instance| I
-  Q -->|bound state read| Store
+  subgraph Store[SummaryStore: one runtime store]
+    I[Instance metadata and readiness]
+    B[Summary payload bytes]
+  end
+  P -->|write state| B
+  P -->|record instance after payload is available| I
+  Q -->|resolve bound ready instance; check format| I
+  Q -->|read payload| B
 ```
 
 SDS is the contract across these bindings, catalog definitions, runtime
@@ -368,10 +372,9 @@ that output a state slot and emits matching writer/reader bindings; see
 | Physical compiler | Concrete implementation, subgraph split, catalog bindings and plan version |
 | Precompute runtime | Installed maintenance nodes and state publication |
 | Query runtime | Bound state reads, query operators, exact residuals and fallback |
-| Catalog | Summary definitions |
+| Catalog snapshot | Summary definitions validated at plan installation |
 | Plan read/write bindings | State references, format, partition rules and writer ownership |
-| Runtime inventory | Actual state instances, coverage, readiness and payload locations |
-| Summary store | Encoded state payload bytes |
+| `SummaryStore` | Instance metadata (coverage, readiness, format and payload location) and encoded payload bytes in one runtime store |
 
 ## Compiler contract
 
