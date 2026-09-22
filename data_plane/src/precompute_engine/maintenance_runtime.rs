@@ -305,7 +305,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
             }
             payload => Err(format!(
                 "maintenance operator {:?} has no summary-state implementation",
-                payload.operator()
+                payload
             )),
         }
     }
@@ -2149,8 +2149,8 @@ mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
     use planner_types::post_asap::{
-        EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableOperator, GroupingEdgeCompatibility,
-        SummarySchema, WindowEdgeCompatibility,
+        EdgeRole, ExecutableDag, ExecutableDagEdge, GroupingEdgeCompatibility, SummarySchema,
+        WindowEdgeCompatibility,
     };
 
     fn definition(value: u64) -> asap_types::sds::SummaryDefinitionId {
@@ -2222,7 +2222,6 @@ mod tests {
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
             id: PostAsapNodeId(id),
-            operator: ExecutableOperator::SummaryMerge,
             payload: ExecutableOperatorPayload::SummaryMerge,
             output_state: planner_types::post_asap::ExecutionDataState::MAINTENANCE_SUMMARY,
             output_schema: SummarySchema {
@@ -2463,9 +2462,7 @@ mod tests {
             dtype: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
             nullable: false,
         }];
-        read.operator = read.payload.operator();
         read.output_state = planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS;
-        aggregate.operator = aggregate.payload.operator();
         aggregate.output_schema.fields = vec![SummaryField {
             name: "state".into(),
             dtype: configs[1].accumulator_spec().unwrap().family,
@@ -2880,7 +2877,6 @@ mod tests {
         second_node.id = PostAsapNodeId(5);
         let mut merge = second_node.clone();
         merge.id = PostAsapNodeId(6);
-        merge.operator = ExecutableOperator::SummaryMerge;
         merge.payload = ExecutableOperatorPayload::SummaryMerge;
         dag.nodes.extend([second_node, merge]);
         let original = dag
@@ -3559,7 +3555,6 @@ mod tests {
             configs: &[],
         };
         let mut aggregate = node(1);
-        aggregate.operator = ExecutableOperator::SummaryAgg;
         aggregate.payload = ExecutableOperatorPayload::SummaryAgg {
             family: SummaryFamilyType::ExactAggregate(ExactKind::Count, ExactParams::Count),
             input: SummaryUpdate::column(ColumnRef::SampleValue),
@@ -4046,7 +4041,6 @@ mod tests {
     #[test]
     fn unsupported_maintenance_operator_propagates_failure_without_commit() {
         let mut unsupported = node(1);
-        unsupported.operator = ExecutableOperator::SummarySubtract;
         unsupported.payload = ExecutableOperatorPayload::SummarySubtract;
         let mut query = node(2);
         query.output_state = planner_types::post_asap::ExecutionDataState::READ_ROWS;

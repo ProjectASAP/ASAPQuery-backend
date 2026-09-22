@@ -10,9 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sds::SummaryDefinitionId;
 use planner_types::post_asap::{
-    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutableOperator,
-    ExecutionDataState, ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId,
-    WindowEdgeCompatibility,
+    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutionDataState,
+    ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId, WindowEdgeCompatibility,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +20,7 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct QueryNodeId(pub u64);
 
-pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 1;
+pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 2;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
 /// Plan lifecycle belongs to the enclosing `PrecomputePlan`; this document
@@ -43,7 +42,6 @@ pub struct OwnedPostAsapDag {
 #[serde(deny_unknown_fields)]
 pub struct OwnedPostAsapNode {
     pub id: PostAsapNodeId,
-    pub operator: ExecutableOperator,
     pub payload: serde_json::Value,
     pub output_state: ExecutionDataState,
     pub output_schema: serde_json::Value,
@@ -70,7 +68,6 @@ impl OwnedPostAsapDag {
             .map(|node| {
                 Ok(OwnedPostAsapNode {
                     id: node.id,
-                    operator: node.operator,
                     payload: serde_json::to_value(&node.payload).map_err(|e| e.to_string())?,
                     output_state: node.output_state,
                     output_schema: serde_json::to_value(&node.output_schema)
@@ -138,15 +135,8 @@ impl OwnedPostAsapDag {
             .map(|node| {
                 let payload: planner_types::post_asap::ExecutableOperatorPayload =
                     serde_json::from_value(node.payload.clone()).map_err(|e| e.to_string())?;
-                if payload.operator() != node.operator {
-                    return Err(format!(
-                        "post-ASAP node {} operator disagrees with payload",
-                        node.id.0
-                    ));
-                }
                 Ok(ExecutableDagNode {
                     id: node.id,
-                    operator: node.operator,
                     payload,
                     output_state: node.output_state,
                     output_schema: serde_json::from_value(node.output_schema.clone())
@@ -287,7 +277,7 @@ mod tests {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<InstalledPostAsapDag>();
         let wire = serde_json::json!({
-            "schema_version": 1, "query_id": "q", "nodes": [], "edges": [], "root": 0
+            "schema_version": 2, "query_id": "q", "nodes": [], "edges": [], "root": 0
         });
         let document: OwnedPostAsapDag = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(document).unwrap(), wire);
