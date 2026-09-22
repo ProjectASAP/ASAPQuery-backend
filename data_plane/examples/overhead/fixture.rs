@@ -78,7 +78,10 @@ impl Fixture {
         let plan = physical_fixture::artifact_from_materializations(vec![config.clone()]);
         let store = Arc::new(SketchStore::new());
         store
-            .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+            .install_precompute_plan(
+                Arc::new(plan.summary_catalog.clone()),
+                &plan.precompute_plan,
+            )
             .map_err(anyhow::Error::msg)?;
         let skconfig = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
