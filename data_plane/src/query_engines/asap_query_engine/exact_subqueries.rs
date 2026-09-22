@@ -296,147 +296,154 @@ pub(super) async fn prepare_external(
     // Equivalent exact cuts at the same time share one actual remote request.
     let mut remote_cache = HashMap::<(QueryLanguage, String, i64), Value>::new();
     for ((id, at), leaf) in leaves(entry, times)? {
-        u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
-        let (language, query, candidate_input) = match &leaf {
-            ExactLeaf::Legacy(ResidualQueryOperator::ExactSubquery { query }) => {
-                (QueryLanguage::PromQl, query.clone(), None)
-            }
-            ExactLeaf::Legacy(ResidualQueryOperator::CandidateExactSubquery {
-                query,
-                item_label,
-            }) => (
-                QueryLanguage::PromQl,
-                query.clone(),
-                Some((entry.nodes[&id].inputs()[0], item_label.as_str())),
-            ),
-            ExactLeaf::External(request) => {
-                if !matches!(
-                    request.language,
-                    QueryLanguage::PromQl | QueryLanguage::MetricsQl
-                ) {
-                    return Err(miss(format!(
-                        "external exact language {:?} has no installed adapter",
-                        request.language
-                    )));
+        let result = async {
+            u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
+            let (language, query, candidate_input) = match &leaf {
+                ExactLeaf::Legacy(ResidualQueryOperator::ExactSubquery { query }) => {
+                    (QueryLanguage::PromQl, query.clone(), None)
                 }
-                let candidate = match request.input_contracts.as_slice() {
-                    [] => None,
-                    [ExternalExactInput::CandidateMembership { item_label }] => {
-                        Some((entry.nodes[&id].inputs()[0], item_label.as_str()))
+                ExactLeaf::Legacy(ResidualQueryOperator::CandidateExactSubquery {
+                    query,
+                    item_label,
+                }) => (
+                    QueryLanguage::PromQl,
+                    query.clone(),
+                    Some((entry.nodes[&id].inputs()[0], item_label.as_str())),
+                ),
+                ExactLeaf::External(request) => {
+                    if !matches!(
+                        request.language,
+                        QueryLanguage::PromQl | QueryLanguage::MetricsQl
+                    ) {
+                        return Err(miss(format!(
+                            "external exact language {:?} has no installed adapter",
+                            request.language
+                        )));
                     }
-                    _ => return Err(miss("unsupported external exact input contract")),
-                };
-                (request.language, request.expression.clone(), candidate)
-            }
-            _ => return Err(miss("prepared leaf is not an exact subtree")),
-        };
-        let (query, candidate_filtered) = if let Some((candidate_input, item_label)) =
-            candidate_input
-        {
-            if language == QueryLanguage::MetricsQl {
-                return Err(miss(
-                    "candidate-filtered MetricsQL exact subqueries are not implemented",
-                ));
-            }
-            let candidate = prepared
-                .get(&(candidate_input, at))
-                .ok_or_else(|| miss("candidate membership was not prepared"))?;
-            let Value::Vector(rows) = &candidate.value else {
-                return Err(miss("candidate membership is not an instant vector"));
+                    let candidate = match request.input_contracts.as_slice() {
+                        [] => None,
+                        [ExternalExactInput::CandidateMembership { item_label }] => {
+                            Some((entry.nodes[&id].inputs()[0], item_label.as_str()))
+                        }
+                        _ => return Err(miss("unsupported external exact input contract")),
+                    };
+                    (request.language, request.expression.clone(), candidate)
+                }
+                _ => return Err(miss("prepared leaf is not an exact subtree")),
             };
-            let mut values = rows
-                .iter()
-                .map(|(labels, _)| {
-                    labels.get(item_label).cloned().ok_or_else(|| {
-                        miss(format!(
-                            "candidate membership is missing item label {item_label}"
-                        ))
+            let (query, candidate_filtered) = if let Some((candidate_input, item_label)) =
+                candidate_input
+            {
+                if language == QueryLanguage::MetricsQl {
+                    return Err(miss(
+                        "candidate-filtered MetricsQL exact subqueries are not implemented",
+                    ));
+                }
+                let candidate = prepared
+                    .get(&(candidate_input, at))
+                    .ok_or_else(|| miss("candidate membership was not prepared"))?;
+                let Value::Vector(rows) = &candidate.value else {
+                    return Err(miss("candidate membership is not an instant vector"));
+                };
+                let mut values = rows
+                    .iter()
+                    .map(|(labels, _)| {
+                        labels.get(item_label).cloned().ok_or_else(|| {
+                            miss(format!(
+                                "candidate membership is missing item label {item_label}"
+                            ))
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            values.sort();
-            values.dedup();
-            if values.is_empty() {
-                prepared.insert(
-                    (id, at),
-                    PreparedLeaf {
+                    .collect::<Result<Vec<_>, _>>()?;
+                values.sort();
+                values.dedup();
+                if values.is_empty() {
+                    return Ok(PreparedLeaf {
                         value: Value::Vector(Vec::new()),
                         remote: true,
                         remote_evaluations: 0,
                         remote_rpcs: 0,
-                    },
-                );
-                continue;
-            }
-            if values.len() > MAX_CANDIDATE_VALUES {
-                return Err(miss(format!(
-                    "candidate set has {} values, exceeding limit {MAX_CANDIDATE_VALUES}",
-                    values.len()
-                )));
-            }
-            let restricted = inject_candidate_matcher(&query, item_label, &values)?;
-            if restricted.len() > MAX_CANDIDATE_QUERY_BYTES {
-                return Err(miss(format!(
-                        "candidate-filtered exact query has {} bytes, exceeding limit {MAX_CANDIDATE_QUERY_BYTES}",
-                        restricted.len()
-                    )));
-            }
-            (restricted, true)
-        } else {
-            (query, false)
-        };
-        let key = (language, query.clone(), at);
-        let cached = remote_cache.contains_key(&key);
-        let value = if let Some(value) = remote_cache.get(&key) {
-            value.clone()
-        } else {
-            let endpoint = match language {
-                QueryLanguage::PromQl => prometheus_endpoint
-                    .ok_or_else(|| miss("Prometheus exact endpoint unavailable"))?,
-                QueryLanguage::MetricsQl => metricsql_endpoint
-                    .ok_or_else(|| miss("VictoriaMetrics exact endpoint unavailable"))?,
-                QueryLanguage::ClickHouseSql => {
-                    return Err(miss("ClickHouse exact subquery needs its SQL adapter"))
+                    });
                 }
-            };
-            let url = format!("{}/api/v1/query", endpoint.trim_end_matches('/'));
-            let time = format!("{:.3}", at as f64 / 1000.0);
-            // Candidate sets can be large enough to exceed proxy URL limits;
-            // Prometheus accepts the instant-query parameters as an encoded
-            // form body. Static exact cuts keep their existing GET contract.
-            let request = if candidate_filtered {
-                client
-                    .post(url)
-                    .form(&[("query", query.as_str()), ("time", time.as_str())])
+                if values.len() > MAX_CANDIDATE_VALUES {
+                    return Err(miss(format!(
+                        "candidate set has {} values, exceeding limit {MAX_CANDIDATE_VALUES}",
+                        values.len()
+                    )));
+                }
+                let restricted = inject_candidate_matcher(&query, item_label, &values)?;
+                if restricted.len() > MAX_CANDIDATE_QUERY_BYTES {
+                    return Err(miss(format!(
+                            "candidate-filtered exact query has {} bytes, exceeding limit {MAX_CANDIDATE_QUERY_BYTES}",
+                            restricted.len()
+                        )));
+                }
+                (restricted, true)
             } else {
-                client
-                    .get(url)
-                    .query(&[("query", query.as_str()), ("time", time.as_str())])
+                (query, false)
             };
-            let response = request
-                .send()
-                .await
-                .map_err(|e| miss(format!("exact request failed: {e}")))?;
-            if !response.status().is_success() {
-                return Err(miss(format!("exact endpoint HTTP {}", response.status())));
-            }
-            let body: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| miss(format!("invalid exact response: {e}")))?;
-            let value = parse_result(&body, at)?;
-            remote_cache.insert(key, value.clone());
-            value
-        };
-        prepared.insert(
-            (id, at),
-            PreparedLeaf {
+            let key = (language, query.clone(), at);
+            let cached = remote_cache.contains_key(&key);
+            let value = if let Some(value) = remote_cache.get(&key) {
+                value.clone()
+            } else {
+                let endpoint = match language {
+                    QueryLanguage::PromQl => prometheus_endpoint
+                        .ok_or_else(|| miss("Prometheus exact endpoint unavailable"))?,
+                    QueryLanguage::MetricsQl => metricsql_endpoint
+                        .ok_or_else(|| miss("VictoriaMetrics exact endpoint unavailable"))?,
+                    QueryLanguage::ClickHouseSql => {
+                        return Err(miss("ClickHouse exact subquery needs its SQL adapter"))
+                    }
+                };
+                let url = format!("{}/api/v1/query", endpoint.trim_end_matches('/'));
+                let time = format!("{:.3}", at as f64 / 1000.0);
+                // Candidate sets can be large enough to exceed proxy URL limits;
+                // Prometheus accepts the instant-query parameters as an encoded
+                // form body. Static exact cuts keep their existing GET contract.
+                let request = if candidate_filtered {
+                    client
+                        .post(url)
+                        .form(&[("query", query.as_str()), ("time", time.as_str())])
+                } else {
+                    client
+                        .get(url)
+                        .query(&[("query", query.as_str()), ("time", time.as_str())])
+                };
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|e| miss(format!("exact request failed: {e}")))?;
+                if !response.status().is_success() {
+                    return Err(miss(format!("exact endpoint HTTP {}", response.status())));
+                }
+                let body: serde_json::Value = response
+                    .json()
+                    .await
+                    .map_err(|e| miss(format!("invalid exact response: {e}")))?;
+                let value = parse_result(&body, at)?;
+                remote_cache.insert(key, value.clone());
+                value
+            };
+            Ok(PreparedLeaf {
                 value,
                 remote: true,
                 remote_evaluations: usize::from(!cached),
                 remote_rpcs: usize::from(!cached),
-            },
-        );
+            })
+        }
+        .await;
+        match result {
+            Ok(leaf) => {
+                prepared.insert((id, at), leaf);
+            }
+            Err(error) => {
+                tracing::debug!(target: "asap_runtime_debug", query_id = %entry.query_id,
+                    node_id = ?id, op = entry.nodes[&id].op_label(), evaluation_ms = at, %error,
+                    "installed query exact leaf could not be prepared");
+                return Err(error);
+            }
+        }
     }
     Ok(prepared)
 }

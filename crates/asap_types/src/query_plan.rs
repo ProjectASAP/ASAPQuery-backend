@@ -606,6 +606,41 @@ pub enum QueryPlanNode {
 }
 
 impl QueryPlanNode {
+    /// Operator label for logs: the serialized `op` tag, plus the residual
+    /// `kind` for logical nodes (e.g. `logical/temporal`).
+    pub fn op_label(&self) -> &'static str {
+        use residual::ResidualQueryOperator as R;
+        match self {
+            Self::RelationalJoin { .. } => "relational_join",
+            Self::Relational { .. } => "relational",
+            Self::Logical { operator, .. } => match operator {
+                R::CurrentSeries { .. } => "logical/current_series",
+                R::ExactSubquery { .. } => "logical/exact_subquery",
+                R::CandidateExactSubquery { .. } => "logical/candidate_exact_subquery",
+                R::Scan { .. } => "logical/scan",
+                R::UnaryNegate => "logical/unary_negate",
+                R::VectorToScalar => "logical/vector_to_scalar",
+                R::Aggregate { .. } => "logical/aggregate",
+                R::TopKSelection { .. } => "logical/top_k_selection",
+                R::Binary { .. } => "logical/binary",
+                R::Temporal { .. } => "logical/temporal",
+                R::Sort { .. } => "logical/sort",
+                R::HistogramQuantile => "logical/histogram_quantile",
+                R::Subquery { .. } => "logical/subquery",
+            },
+            Self::Scalar { .. } => "scalar",
+            Self::Binary { .. } => "binary",
+            Self::ReduceSum { .. } => "reduce_sum",
+            Self::ReadMaterialization { .. } => "read_materialization",
+            Self::SummaryEstimate { .. } => "summary_estimate",
+            Self::ExactReadout { .. } => "exact_readout",
+            Self::SummaryMerge { .. } => "summary_merge",
+            Self::CandidateTopK { .. } => "candidate_top_k",
+            Self::ExternalExact { .. } => "external_exact",
+            Self::ExactFallback { .. } => "exact_fallback",
+        }
+    }
+
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
             Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {

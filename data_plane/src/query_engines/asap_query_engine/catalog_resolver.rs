@@ -143,40 +143,48 @@ pub(crate) fn validate_payload(
     let mut resolved = BTreeMap::new();
     for id in entry.topological_order().map_err(|e| miss(e.to_string()))? {
         let node = &entry.nodes[&id];
-        let state_ids = match node {
-            QueryPlanNode::ReadMaterialization { binding } => {
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    resolved.entry(binding.materialization)
-                {
-                    entry.insert(resolve(catalog, binding.materialization)?);
-                }
-                BTreeSet::from([binding.materialization])
-            }
-            QueryPlanNode::SummaryMerge { inputs } => {
-                let mut ids = BTreeSet::new();
-                for input in inputs {
-                    let children: &BTreeSet<SummaryDefinitionId> = states
-                        .get(input)
-                        .ok_or_else(|| miss("summary merge has no state input"))?;
-                    if children.is_empty() {
-                        return Err(miss("summary merge has value input"));
+        let state_ids = (|| -> Result<BTreeSet<SummaryDefinitionId>, EngineError> {
+            Ok(match node {
+                QueryPlanNode::ReadMaterialization { binding } => {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        resolved.entry(binding.materialization)
+                    {
+                        entry.insert(resolve(catalog, binding.materialization)?);
                     }
-                    ids.extend(children);
+                    BTreeSet::from([binding.materialization])
                 }
-                ids
-            }
-            QueryPlanNode::SummaryEstimate { input, .. }
-            | QueryPlanNode::ExactReadout { input, .. } => {
-                let ids: &BTreeSet<SummaryDefinitionId> = states
-                    .get(input)
-                    .ok_or_else(|| miss("readout has no state input"))?;
-                if ids.is_empty() || ids.iter().any(|id| !resolved[id].supports(node)) {
-                    return Err(miss("catalog descriptor cannot satisfy installed readout"));
+                QueryPlanNode::SummaryMerge { inputs } => {
+                    let mut ids = BTreeSet::new();
+                    for input in inputs {
+                        let children: &BTreeSet<SummaryDefinitionId> = states
+                            .get(input)
+                            .ok_or_else(|| miss("summary merge has no state input"))?;
+                        if children.is_empty() {
+                            return Err(miss("summary merge has value input"));
+                        }
+                        ids.extend(children);
+                    }
+                    ids
                 }
-                BTreeSet::new()
-            }
-            _ => BTreeSet::new(),
-        };
+                QueryPlanNode::SummaryEstimate { input, .. }
+                | QueryPlanNode::ExactReadout { input, .. } => {
+                    let ids: &BTreeSet<SummaryDefinitionId> = states
+                        .get(input)
+                        .ok_or_else(|| miss("readout has no state input"))?;
+                    if ids.is_empty() || ids.iter().any(|id| !resolved[id].supports(node)) {
+                        return Err(miss("catalog descriptor cannot satisfy installed readout"));
+                    }
+                    BTreeSet::new()
+                }
+                _ => BTreeSet::new(),
+            })
+        })()
+        .map_err(|error| {
+            tracing::debug!(target: "asap_runtime_debug", query_id = %entry.query_id,
+                node_id = ?id, op = node.op_label(), %error,
+                "installed query node failed catalog validation");
+            error
+        })?;
         states.insert(id, state_ids);
     }
     Ok(())

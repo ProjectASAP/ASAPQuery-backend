@@ -188,8 +188,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .get(&id)
             .ok_or_else(|| miss("missing installed node"))?
             .clone();
+        let op = node.op_label();
         let started = std::time::Instant::now();
-        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, evaluation_ms = at,
+        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, op, evaluation_ms = at,
             "installed query node started");
         let value = (|| -> Result<Value, EngineError> {
             Ok(match node {
@@ -249,13 +250,13 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                     match &error {
                         EngineError::CapabilityMiss { .. } => {
                             tracing::debug!(target: "asap_runtime_debug",
-                                query_id = %self.entry.query_id, node_id = ?id,
+                                query_id = %self.entry.query_id, node_id = ?id, op,
                                 elapsed_us = started.elapsed().as_micros() as u64, %error,
                                 "installed query node could not be served"
                             )
                         }
                         _ => tracing::warn!(
-                            query_id = %self.entry.query_id, node_id = ?id,
+                            query_id = %self.entry.query_id, node_id = ?id, op,
                             elapsed_us = started.elapsed().as_micros() as u64, %error,
                             "installed query node failed"
                         ),
@@ -264,7 +265,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 return Err(error);
             }
         };
-        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id,
+        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, op,
             elapsed_us = started.elapsed().as_micros() as u64,
             "installed query node completed");
         self.active.remove(&(id, at));
