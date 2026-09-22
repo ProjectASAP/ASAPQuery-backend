@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct QueryNodeId(pub u64);
 
-pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 1;
-pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 2;
+pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 2;
+pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 3;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
 /// Plan lifecycle belongs to the enclosing `PrecomputePlan`; this document
@@ -370,7 +370,7 @@ mod tests {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<InstalledPostAsapDag>();
         let wire = serde_json::json!({
-            "schema_version": 1, "query_id": "q", "nodes": [], "edges": [], "root": 0
+            "schema_version": 2, "query_id": "q", "nodes": [], "edges": [], "root": 0
         });
         let document: OwnedPostAsapDag = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(document).unwrap(), wire);

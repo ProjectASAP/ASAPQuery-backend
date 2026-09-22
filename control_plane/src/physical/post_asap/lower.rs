@@ -8,14 +8,6 @@
 //! variants when a binding rule fires; everything else stays inside
 //! `Logical(…)`."
 //!
-//! Two node shapes are rewritten *before* selecting a candidate, because
-//! the upstream strategy can produce summaries this deployment's data plane
-//! doesn't (or, deliberately, shouldn't) serve — not something the
-//! `CostModel` hook can reach, since the decision of *whether* to call
-//! into `rank_candidates`/`size_params` at all is made before the
-//! `CostModel` is ever consulted. See each helper's docs for the specific
-//! reason.
-//!
 //! `AggIntent::Extension` (the `Frequency` point-query) needs no such
 //! pre-pass anymore: `ControlPlaneCostModel::realize_extension`/
 //! `readout_extension` (ASAPController#150) now realize it as a real
@@ -143,41 +135,8 @@ fn bind_recursive(
             ))
         }
 
-        _ => {
-            let rewritten = rewrite_rate_to_increase(expr);
-            let node = crate::planner_selection::select_summary(&rewritten, cost_model)?;
-            Ok(PostAsapPlan::Summary(node))
-        }
-    }
-}
-
-/// Rewrite Rate to Increase along the aggregate spine traversed by Planner.
-/// This deployment computes rate by dividing the Increase readout by window
-/// seconds, rather than storing a separate Rate accumulator.
-fn rewrite_rate_to_increase(expr: &QueryExpr) -> QueryExpr {
-    match expr {
-        QueryExpr::Aggregate {
-            reduction,
-            measures: aggs,
-            output_names,
-            having,
-            child,
-        } => QueryExpr::Aggregate {
-            reduction: reduction.clone(),
-            measures: aggs
-                .iter()
-                .map(|intent| {
-                    if matches!(intent, AggIntent::Rate) {
-                        AggIntent::Increase
-                    } else {
-                        intent.clone()
-                    }
-                })
-                .collect(),
-            output_names: output_names.clone(),
-            having: having.clone(),
-            child: Rc::new(rewrite_rate_to_increase(child)),
-        },
-        other => other.clone(),
+        _ => Ok(PostAsapPlan::Summary(
+            crate::planner_selection::select_summary(expr, cost_model)?,
+        )),
     }
 }

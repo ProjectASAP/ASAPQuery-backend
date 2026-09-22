@@ -103,18 +103,14 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
         eprintln!("IMMUTABLE_PROCESS_ARTIFACT {}", directory.path().display());
         directory.disable_cleanup(true);
         let artifact = directory.path().join("plan.json");
-        let bootstrap = directory.path().join("bootstrap.json");
         let disk = directory.path().join("disk");
         std::fs::create_dir_all(&disk).unwrap();
         std::fs::write(&artifact, serde_json::to_vec(&install).unwrap()).unwrap();
-        std::fs::write(&bootstrap, b"{\"aggregations\":[]}").unwrap();
         let spawn = |port: u16| {
             ChildGuard(
                 Command::new(env!("CARGO_BIN_EXE_data_plane"))
                     .arg("--physical-plan")
                     .arg(&artifact)
-                    .arg("--streaming-config")
-                    .arg(&bootstrap)
                     .args(["--http-port", &port.to_string(), "--output-dir"])
                     .arg(directory.path())
                     .arg("--enable-remote-write")

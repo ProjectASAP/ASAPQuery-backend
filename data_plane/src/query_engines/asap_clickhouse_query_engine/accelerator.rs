@@ -740,7 +740,7 @@ mod tests {
             .unwrap();
         if seed {
             store.register(SummarySeriesMetadata {
-                sid: 7,
+                storage_handle: 7,
                 metric_name: "requests".into(),
                 group_by_keys: BTreeSet::new(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -1046,8 +1046,8 @@ mod tests {
         cfg.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
             name: "value".into(),
         });
-        let hot = crate::storage_engines::types::StreamingConfigHandle::from_arc(Arc::new(
-            crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
+        let hot = crate::storage_engines::types::InstalledPrecomputePlanHandle::from_arc(Arc::new(
+            crate::storage_engines::types::InstalledPrecomputePlan::new(HashMap::from([(
                 cfg.policy_fp_u64(),
                 cfg.clone(),
             )])),
