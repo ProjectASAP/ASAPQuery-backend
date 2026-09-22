@@ -669,6 +669,7 @@ mod tests {
                 plan_id,
                 plan_version,
                 clickhouse_context: None,
+                selected_dags: Default::default(),
                 entries: Default::default(),
             }),
             storage_routing: Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),

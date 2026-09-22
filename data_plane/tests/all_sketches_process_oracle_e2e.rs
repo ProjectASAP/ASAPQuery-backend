@@ -19,7 +19,9 @@ use asap_otel_proto::tonic::metrics::v1::{
     KllSketch as OtelKllSketch, KllSketchDataPoint, KllSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_sketchlib::proto::sketchlib::{HllVariant as ProtoHllVariant, HyperLogLogState, KllState};
+use asap_sketchlib::proto::sketchlib::{
+    sketch_envelope, HllVariant as ProtoHllVariant, HyperLogLogState, KllState, SketchEnvelope,
+};
 use asap_sketchlib::{CountMinSketch, CountSketch, HllSketch, HllVariant, MessagePackCodec};
 use prost::Message;
 use serde_json::Value;
@@ -306,7 +308,12 @@ fn kll_export(metric: &str, timestamp_ns: u64, raw: &[f64]) -> ExportMetricsServ
                 attributes: labels(),
                 start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
                 time_unix_nano: timestamp_ns,
-                sketch: state.encode_to_vec(),
+                sketch: SketchEnvelope {
+                    format_version: 1,
+                    sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
                 encoding: KllSketchEncoding::Proto as i32,
                 flags: 0,
                 series_id: 0,

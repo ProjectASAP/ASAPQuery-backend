@@ -389,7 +389,7 @@ impl ErpPlanningInput {
                 return Err("ERP evidence catalog differs from the active catalog".into());
             }
             let materialization = catalog
-                .materializations
+                .definitions
                 .get(&populations.summary_definition_id)
                 .ok_or("ERP evidence summary is absent from the active catalog")?;
             let summary = catalog
@@ -1467,14 +1467,13 @@ mod tests {
         .unwrap();
         let (mut policy, mut observed) = online_population_fixture();
         observed.catalog_generation = plan.summary_catalog.reference().unwrap();
-        observed.summary_definition_id =
-            *plan.summary_catalog.materializations.keys().next().unwrap();
+        observed.summary_definition_id = *plan.summary_catalog.definitions.keys().next().unwrap();
         observed.input_semantics =
             asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue;
         policy.observed_populations = Some(observed.clone());
         policy.resolve_population_data_descriptor(Some(&plan.summary_catalog));
-        let expected = &plan.summary_catalog.materializations[&observed.summary_definition_id]
-            .data_descriptor_id;
+        let expected =
+            &plan.summary_catalog.definitions[&observed.summary_definition_id].data_descriptor_id;
         assert_eq!(
             &policy.resolved_data_descriptor.as_ref().unwrap().id,
             expected

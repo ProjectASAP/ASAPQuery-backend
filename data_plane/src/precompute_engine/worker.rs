@@ -4608,6 +4608,8 @@ mod dag_execution_tests {
             &dag,
         )
         .unwrap();
+        installed.document.schema_version =
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
         assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
             .to_string()

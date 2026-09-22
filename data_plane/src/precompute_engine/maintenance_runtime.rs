@@ -313,8 +313,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 })
             }
             payload => Err(format!(
-                "maintenance operator {:?} has no summary-state implementation",
-                payload
+                "maintenance operator {payload:?} has no summary-state implementation"
             )),
         }
     }
@@ -2174,6 +2173,27 @@ mod tests {
         asap_types::PolicyFingerprint(value).into()
     }
 
+    fn maintenance_only(
+        mut dag: ExecutableDag,
+        mut binding: BackendExecutableBinding,
+    ) -> (ExecutableDag, BackendExecutableBinding) {
+        let retained = dag
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.output_state.timing
+                    == planner_types::post_asap::ExecutionTiming::MaintenanceTime
+            })
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        dag.nodes.retain(|node| retained.contains(&node.id));
+        dag.edges
+            .retain(|edge| retained.contains(&edge.producer) && retained.contains(&edge.consumer));
+        binding.nodes.retain(|id, _| retained.contains(id));
+        dag.root = binding.precompute_sinks[0];
+        (dag, binding)
+    }
+
     #[test]
     fn cohort_lineage_is_order_independent_and_binds_every_input() {
         use crate::storage_engines::sketch_db::index::FrozenExactWindows;
@@ -2517,6 +2537,7 @@ mod tests {
         );
         scheduled_binding.query_sink = PostAsapNodeId(4);
         scheduled_binding.query_plan_sink = control_plane::query_plan::QueryNodeId(4);
+        let (dag, scheduled_binding) = maintenance_only(dag, scheduled_binding);
         let scheduled_adapter = OperatorAdapter {
             binding: &scheduled_binding,
             ..adapter
@@ -2552,7 +2573,8 @@ mod tests {
             persistence::config::SketchStorePersistenceConfig, SketchStore,
         };
         use asap_types::executable_plan::{InstalledPostAsapDag, OwnedPostAsapDag};
-        let document = OwnedPostAsapDag::from_executable("immutable-chain".into(), &dag).unwrap();
+        let mut document =
+            OwnedPostAsapDag::from_executable("immutable-chain".into(), &dag).unwrap();
         let mut durable_configs = configs.to_vec();
         durable_configs[1].derived_input = Some(
             asap_types::derived_input::DerivedInputIdentity::from_dag(
@@ -2562,6 +2584,7 @@ mod tests {
             )
             .unwrap(),
         );
+        document.schema_version = asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
         let mut durable_binding = scheduled_binding.clone();
         durable_binding.nodes.insert(
             PostAsapNodeId(3),
@@ -2922,7 +2945,7 @@ mod tests {
                 planner_types::pre_asap::ColumnRef::SampleValue,
             );
         }
-        let document =
+        let mut document =
             OwnedPostAsapDag::from_executable("two-source-fixture".into(), &dag).unwrap();
         let mut target = configs[1].clone();
         if complete_groups {
@@ -2939,6 +2962,7 @@ mod tests {
             )
             .unwrap(),
         );
+        document.schema_version = asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
         let mut binding = binding.clone();
         for (node, summary_definition) in [
             (1, first_id),
@@ -3887,10 +3911,17 @@ mod tests {
             query_plan_sink: asap_types::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
+        let (dag, binding) = maintenance_only(dag, binding);
         bundle.precompute_plan.executable_dags = BTreeMap::from([(
             "retry".into(),
             InstalledPostAsapDag {
-                document: OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap(),
+                document: {
+                    let mut document =
+                        OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap();
+                    document.schema_version =
+                        asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+                    document
+                },
                 binding,
             },
         )]);
@@ -4016,6 +4047,7 @@ mod tests {
             query_plan_sink: asap_types::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(3)],
         };
+        let (dag, binding) = maintenance_only(dag, binding);
         let source = sum(2.0);
         let adapter = OperatorAdapter {
             binding: &binding,
@@ -4091,6 +4123,7 @@ mod tests {
             query_plan_sink: asap_types::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
+        let (dag, binding) = maintenance_only(dag, binding);
         let adapter = OperatorAdapter {
             binding: &binding,
             inputs: MaintenanceInputs::Live {

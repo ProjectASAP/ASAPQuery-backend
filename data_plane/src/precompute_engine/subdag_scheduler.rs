@@ -85,7 +85,6 @@ where
     R: PrecomputeOperatorRegistry<V>,
     S: IdempotentCommitSink<V>,
 {
-    binding.validate(dag).map_err(ScheduleError::Invalid)?;
     let mut unique = BTreeSet::new();
     for (node, key) in outputs {
         if !unique.insert(node.0)
@@ -115,6 +114,9 @@ where
             ));
         }
     }
+    binding
+        .validate_maintenance(dag)
+        .map_err(ScheduleError::Invalid)?;
     let nodes = dag
         .nodes
         .iter()
@@ -257,6 +259,28 @@ mod tests {
         }
     }
 
+    fn maintenance_only(
+        mut dag: ExecutableDag,
+        mut binding: BackendExecutableBinding,
+        sink: PostAsapNodeId,
+    ) -> (ExecutableDag, BackendExecutableBinding) {
+        let retained = dag
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.output_state.timing
+                    == planner_types::post_asap::ExecutionTiming::MaintenanceTime
+            })
+            .map(|node| node.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        dag.nodes.retain(|node| retained.contains(&node.id));
+        dag.edges
+            .retain(|edge| retained.contains(&edge.producer) && retained.contains(&edge.consumer));
+        binding.nodes.retain(|id, _| retained.contains(id));
+        dag.root = sink;
+        (dag, binding)
+    }
+
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
             id: PostAsapNodeId(id),
@@ -345,6 +369,7 @@ mod tests {
         };
         let mut bindings = binding();
         bindings.precompute_sinks = vec![PostAsapNodeId(2), PostAsapNodeId(3)];
+        let (dag, bindings) = maintenance_only(dag, bindings, PostAsapNodeId(3));
         let registry = Registry::default();
         let sink = Sink::default();
         execute_precompute_sinks(
@@ -405,9 +430,10 @@ mod tests {
             root: PostAsapNodeId(3),
         };
         let execute = |dag: &ExecutableDag| {
+            let (dag, binding) = maintenance_only(dag.clone(), binding(), PostAsapNodeId(3));
             execute_precompute_sink(
-                dag,
-                &binding(),
+                &dag,
+                &binding,
                 PostAsapNodeId(3),
                 key(3),
                 &Subtract,
@@ -442,27 +468,16 @@ mod tests {
         };
         let registry = Registry::default();
         let sink = Sink::default();
-        let first = execute_precompute_sink(
-            &dag,
-            &binding(),
-            PostAsapNodeId(3),
-            key(3),
-            &registry,
-            &sink,
-        )
-        .unwrap();
+        let (dag, binding) = maintenance_only(dag, binding(), PostAsapNodeId(3));
+        let first =
+            execute_precompute_sink(&dag, &binding, PostAsapNodeId(3), key(3), &registry, &sink)
+                .unwrap();
         assert_eq!(*first, 6);
         assert_eq!(registry.0.lock().unwrap().values().sum::<usize>(), 4);
 
-        let replay = execute_precompute_sink(
-            &dag,
-            &binding(),
-            PostAsapNodeId(3),
-            key(3),
-            &registry,
-            &sink,
-        )
-        .unwrap();
+        let replay =
+            execute_precompute_sink(&dag, &binding, PostAsapNodeId(3), key(3), &registry, &sink)
+                .unwrap();
         assert!(Arc::ptr_eq(&first, &replay));
         assert_eq!(registry.0.lock().unwrap().values().sum::<usize>(), 4);
     }
@@ -501,6 +516,7 @@ mod tests {
         bindings
             .nodes
             .insert(PostAsapNodeId(0), BackendNodeBinding::QueryInput);
+        let (dag, bindings) = maintenance_only(dag, bindings, PostAsapNodeId(3));
         let registry = FrontierRegistry(Registry::default());
         let sink = Sink::default();
         let result =
@@ -547,7 +563,7 @@ mod tests {
         };
         assert!(matches!(
             execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(1), &registry, &sink),
-            Err(ScheduleError::Invalid(message)) if message.contains("query-time node")
+            Err(ScheduleError::Invalid(message)) if message.contains("query-owned node")
         ));
         assert!(matches!(
             execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(0), &registry, &sink),

@@ -77,6 +77,7 @@ pub fn artifact_from_materializations(
         plan_id: 1,
         plan_version: 1,
         clickhouse_context: None,
+        selected_dags: Default::default(),
         entries: BTreeMap::new(),
     };
     for config in &precompute.materializations {
@@ -149,6 +150,10 @@ pub fn artifact_from_materializations(
                                 binding: MaterializationBinding {
                                     full_window_slide_ms: None,
                                     materialization: config.policy_fingerprint().into(),
+                                    stored_output_reference:
+                                        asap_types::sds::StoredOutputReference::for_definition(
+                                            config.policy_fingerprint().into(),
+                                        ),
                                     output_grouping,
                                     item_labels: config.aggregated_labels.labels.clone(),
                                     window_ms: config.slide_interval * 1000,

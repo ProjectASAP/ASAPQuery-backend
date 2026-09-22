@@ -339,7 +339,7 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         }
         assert!(plan
             .summary_catalog
-            .materializations
+            .definitions
             .contains_key(&observed.summary_definition_id));
         assert_eq!(
             observed.catalog_generation,

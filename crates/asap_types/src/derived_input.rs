@@ -37,7 +37,11 @@ impl DerivedInputIdentity {
         root: PostAsapNodeId,
         frontiers: &BTreeMap<PostAsapNodeId, SummaryDefinitionId>,
     ) -> Result<Self, String> {
-        if document.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION {
+        if !matches!(
+            document.schema_version,
+            crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+                | crate::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+        ) {
             return Err("unsupported derived program document version".into());
         }
         let decoded = document.decode()?;
@@ -106,7 +110,7 @@ impl DerivedInputIdentity {
             }
             edges.sort();
             let bytes = serde_json::to_vec(&serde_json::json!({
-                "version": 1, "payload": node.payload,
+                "version": 2, "payload": node.payload,
                 "state": node.output_state, "schema": node.output_schema,
                 "guarantee": node.guarantee, "inputs": edges,
             }))
@@ -168,7 +172,7 @@ mod tests {
         let a =
             SummaryCatalog::from_materializations(1, 1, &[raw.clone(), derived.clone()]).unwrap();
         let b = SummaryCatalog::from_materializations(2, 9, &[raw, derived.clone()]).unwrap();
-        assert_eq!(a.materializations, b.materializations);
+        assert_eq!(a.definitions, b.definitions);
         assert_eq!(a.data_descriptors, b.data_descriptors);
         let mut renamed = derived.clone();
         renamed.metric = "output_alias".into();
@@ -319,7 +323,6 @@ mod tests {
                 config.policy_fingerprint(),
                 SummaryDescriptor::from_config(&config).unwrap(),
                 data,
-                config.window_layout
             )]
         )
         .is_err());

@@ -39,7 +39,7 @@ pub fn install_selected_dag(
             precompute_sinks,
         },
     };
-    installed.validate()?;
+    installed.binding.validate(&installed.document.decode()?)?;
     Ok(installed)
 }
 
