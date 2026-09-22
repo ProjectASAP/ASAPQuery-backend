@@ -34,7 +34,11 @@ fields. `SummaryDefinition` retains its meaning. The former Summary Catalog is
 the internal `summary_definitions` table and its installation snapshot;
 `SummaryStateInstance` is now `StoredSummary`, and `StateReference` is now
 `StoredOutputReference`. The latter names a producer output, while the composite
-record key locates one population/window payload.
+record key locates one population/window payload. V1 stores only two kinds of
+objects: `SummaryDefinition` and `StoredSummary`. `StoredOutputReference` belongs
+to installed plan bindings, not a third storage table. Instance metadata and
+payload are both part of `StoredSummary`; their internal physical layout is an
+implementation detail.
 
 | Term | Meaning |
 | --- | --- |

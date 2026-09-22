@@ -32,7 +32,8 @@ Cost ranking, operator scheduling and transmission policy are outside SDS.
 
 ## Architecture at a glance
 
-One `SummaryStore` owns two logical tables:
+V1 has exactly two stored data objects: `SummaryDefinition` and `StoredSummary`.
+One `SummaryStore` owns their two logical tables:
 
 | Table | Row type | What it stores |
 | --- | --- | --- |
@@ -48,8 +49,15 @@ readers only after its metadata and payload are committed together logically.
 
 These are logical tables within the existing storage engine; this design does
 not require a new SQL database. The store may use separate files or indexes
-internally. There is no separate metadata store, payload store, or catalog
-`Materialization` object.
+internally. V1 introduces neither `SummaryMetadataStore` nor
+`SummaryPayloadStore`, nor a separate catalog `Materialization` object.
+
+Shared semantic metadata lives once in `SummaryDefinition`; each `StoredSummary`
+references it by `definition_id`. Instance-specific metadata (population, window,
+actual coverage and format) and payload together form that `StoredSummary`.
+Separating an internal index from payload files does not introduce a third data
+object. V1 reuses existing storage facilities without requiring either physical
+co-location or a new metadata/payload storage split.
 
 ```mermaid
 flowchart LR
@@ -149,7 +157,11 @@ are committed. No abstract payload locator is required by this design.
 | --- | --- | --- |
 | `SummaryDefinition` | Canonical input, operation, grouping, time semantics, algorithm and parameters | Summary semantics change |
 | `StoredSummary` | One `SummaryStore` entry: instance metadata plus its associated summary payload | Runtime publishes a new or replacement partition or completed aggregate |
-| `StoredOutputReference` | A typed plan reference to a permitted stored producer output | A compiled reader/writer binding changes |
+
+`StoredOutputReference` is a reader/writer binding inside an installed plan. It
+names a stored producer output and definition; it is not a third stored data
+object, table, or independently managed entity. The reference example below
+shows how plans locate the two-object storage model.
 
 ### Example: `summary_definitions` describes what to compute
 
