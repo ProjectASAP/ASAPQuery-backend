@@ -101,11 +101,10 @@ pub struct PlanEnvelope {
     pub capability_snapshot_id: String,
 }
 
-/// Backend-side materialization projection consumed by the streaming
-/// precompute engine. This is deliberately config-driven: it contains no
-/// PromQL string or ad-hoc scheduler job. The aggregation definitions are
-/// emitted to `/api/v1/streaming-config`, where the runtime matches incoming
-/// series, maintains windows, and writes content-addressed materializations.
+/// DAG-format precompute installation. Planner node payloads and dependency
+/// edges define execution; materializations attach storage/window placement.
+/// Raw source-to-SummaryAgg paths lower to streaming kernels. Derived paths
+/// execute through the maintenance DAG scheduler at stored-state frontiers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +154,8 @@ pub enum StateEncoding {
     SketchlibProtobufV1,
     SketchCoreMsgpackV1,
     ExactAccumulatorV1,
+    /// Persisted backend state with explicit Planner family and population layout.
+    PlannerExactAccumulatorV1,
     ExactCounterAccumulatorV2,
 }
 
@@ -904,8 +905,14 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
             planner_types::post_asap::ExactKind::Increase
             | planner_types::post_asap::ExactKind::Rate,
             _,
-        ) => vec![StateEncoding::ExactCounterAccumulatorV2],
-        SummaryFamilyType::ExactAggregate(..) => vec![StateEncoding::ExactAccumulatorV1],
+        ) => vec![
+            StateEncoding::ExactCounterAccumulatorV2,
+            StateEncoding::PlannerExactAccumulatorV1,
+        ],
+        SummaryFamilyType::ExactAggregate(..) => vec![
+            StateEncoding::ExactAccumulatorV1,
+            StateEncoding::PlannerExactAccumulatorV1,
+        ],
         SummaryFamilyType::Sketch(kind, _)
             if matches!(
                 kind.algorithm(),
@@ -1031,7 +1038,6 @@ mod source_window_cohort_tests {
         config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
         let mut node = ExecutableDagNode {
             id: PostAsapNodeId(1),
-            operator: ExecutableOperator::SummaryAgg,
             payload: ExecutableOperatorPayload::SummaryAgg {
                 family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 input: SummaryUpdate {

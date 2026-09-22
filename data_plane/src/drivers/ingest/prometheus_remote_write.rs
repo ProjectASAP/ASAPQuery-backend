@@ -718,11 +718,8 @@ fn route_messages(
                         config.aggregation_type,
                         asap_types::AggregationType::Increase
                             | asap_types::AggregationType::Rate
-                            | asap_types::AggregationType::MultipleIncrease
                             | asap_types::AggregationType::Min
                             | asap_types::AggregationType::Max
-                            | asap_types::AggregationType::MultipleMin
-                            | asap_types::AggregationType::MultipleMax
                     ));
             let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
                 Vec::new()
@@ -1041,8 +1038,8 @@ mod tests {
 
     fn configured_receiver() -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
-        use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
-        let aggregation = AggregationConfig {
+        use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
+        let aggregation = PrecomputeMaterialization {
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
@@ -1166,10 +1163,10 @@ mod tests {
     #[test]
     fn global_topk_cms_routes_once_while_counters_remain_per_series() {
         use asap_types::enums::WindowKind;
-        use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
+        use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
 
-        let config =
-            |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| AggregationConfig {
+        let config = |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| {
+            PrecomputeMaterialization {
                 population_key_encoding: Default::default(),
                 aggregation_type,
                 aggregation_sub_type: String::new(),
@@ -1204,7 +1201,8 @@ mod tests {
                 table_timestamp_column: None,
                 partitioning: None,
                 value_source_column: None,
-            };
+            }
+        };
         let cms = config(
             AggregationType::CountMinSketchWithHeap,
             vec![],
