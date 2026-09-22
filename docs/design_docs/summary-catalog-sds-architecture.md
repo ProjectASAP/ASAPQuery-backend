@@ -63,9 +63,10 @@ flowchart LR
   Q -->|read payload| B
 ```
 
-The compiler assigns a `state_slot_id` to a stored producer output within a plan
-version. This is a join key in compiled bindings, not another catalog entity with
-its own lifecycle. Multiple query readers can reference the same slot.
+The compiler assigns a `stored_output_id` to each PrecomputePlan DAG output that
+is persisted. The PrecomputePlan writer and QueryPlan readers use this ID to name
+the same output within one plan version. It is a binding ID, not a memory slot or
+a separate storage object.
 
 ## Worked example
 
@@ -78,58 +79,69 @@ separately; installing a plan version does not make its required state ready.
 Two queries request different percentiles from the same five-minute KLL summary:
 
 ```yaml
-plan_version: 42
-summary_definition:
-  id: def-api-latency-kll
-  input: request_latency_seconds
-  group_by: [service]
-  range: 5m
-  algorithm: {kind: kll, k: 200}
+installed_plan:
+  plan_version: 42
+  catalog_snapshot:
+    summary_definition:
+      id: def-api-latency-kll
+      input: request_latency_seconds
+      group_by: [service]
+      range: 5m
+      algorithm: {kind: kll, k: 200}
 
-precompute_plan:
-  write_state:
-    node_id: write-kll
-    reference: {state_slot_id: latency-kll, definition_id: def-api-latency-kll}
-    schema: kll-v1
-    encoding: kll-binary-v1
-    partition_by: [service, window_end]
+  precompute_plan:
+    write_state:
+      node_id: write-kll
+      reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
+      schema: kll-v1
+      encoding: kll-binary-v1
+      partition_by: [service, window_end]
 
-state_instances:
-  - id: state-api-1205
+  query_plans:
+    q50:
+      read_state:
+        reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
+        expected_schema: kll-v1
+        expected_encoding: kll-binary-v1
+        partition: {service: api, window_end: evaluation_time}
+      estimate: {quantile: 0.50}
+    q99:
+      read_state:
+        reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
+        expected_schema: kll-v1
+        expected_encoding: kll-binary-v1
+        partition: {service: api, window_end: evaluation_time}
+      estimate: {quantile: 0.99}
+
+runtime_summary_store:
+  - instance_id: state-api-1205
     plan_version: 42
-    state_slot_id: latency-kll
+    stored_output_id: latency-kll
     definition_id: def-api-latency-kll
-    schema: kll-v1
-    encoding: kll-binary-v1
+    format: {schema: kll-v1, encoding: kll-binary-v1}
     partition: {service: api, window_end: '12:05'}
     coverage: {start_exclusive: '12:00', end_inclusive: '12:05'}
-    location: opaque-store-locator
-    status: ready
-
-query_plans:
-  q50:
-    read_state: &shared_read
-      reference: {state_slot_id: latency-kll, definition_id: def-api-latency-kll}
-      expected_schema: kll-v1
-      expected_encoding: kll-binary-v1
-      partition: {service: api, window_end: evaluation_time}
-    estimate: {quantile: 0.50}
-  q99:
-    read_state: *shared_read
-    estimate: {quantile: 0.99}
+    ready: true
+    payload: <encoded KLL state>
 ```
 
 One shared PrecomputePlan producer writes the required state partitions. Both
-QueryPlans resolve the same bound slot and apply different readout parameters.
+QueryPlans resolve the same stored output and apply different readout parameters.
 They neither create duplicate producers nor search the catalog for alternatives
 at serving time.
+
+`runtime_summary_store` is observed runtime data, not part of the installed
+plan. Its example entry says that the `service=api` partition contains encoded
+KLL state covering `(12:00, 12:05]`. The format fields let the reader reject
+incompatible bytes, and `ready` becomes true only after that payload is
+committed. No abstract payload locator is required by this design.
 
 ## Core objects
 
 | Object | Meaning | Changes when |
 | --- | --- | --- |
 | `SummaryDefinition` | Canonical input, operation, grouping, time semantics, algorithm and parameters | Summary semantics change |
-| `SummaryStateInstance` | One stored partition, such as a series/pane or completed aggregate | Runtime publishes a new or replacement instance |
+| `SummaryStateInstance` | One `SummaryStore` entry: instance metadata plus its associated summary payload | Runtime publishes a new or replacement partition or completed aggregate |
 | `StateReference` | A typed plan reference to a permitted stored producer output | A compiled reader/writer binding changes |
 
 A definition includes every field needed to decide semantic equivalence: source
@@ -143,7 +155,7 @@ instance metadata. Their ownership is explicit below.
 
 | Former field | Owner in this design |
 | --- | --- |
-| Materialization ID | Replaced by a compiler-assigned `state_slot_id`, scoped to the plan version, in reader/writer references. |
+| Materialization ID | Replaced by a compiler-assigned `stored_output_id`, scoped to the plan version, in reader/writer references. |
 | Definition ID | `StateReference` points to the catalog's `SummaryDefinition`. |
 | Plan version | Installed plan bundle; persisted instance metadata repeats it for recovery validation. |
 | State family and algorithm parameters | `SummaryDefinition`. |
@@ -159,29 +171,32 @@ for those fields. The selected deployment guarantee and schedule/retention belon
 to Planner's deployment decision and the installed PrecomputePlan binding;
 observed readiness belongs to instance metadata in `SummaryStore`.
 
-A state instance records plan version, slot, definition, actual format and its
-partition key, coverage/completion, producer sequence
-where applicable, location and integrity metadata. Payload
-bytes remain in `SummaryStore`, not in catalog descriptors.
+A `SummaryStateInstance` means the complete logical entry in `SummaryStore`: its
+metadata and its associated payload. The metadata records plan version,
+stored-output ID, definition, actual format, partition key,
+coverage/completion, producer sequence where applicable, and integrity data.
+The payload bytes may be stored separately inside the `SummaryStore`
+implementation, but they are not a separate architecture component and never
+belong in catalog descriptors.
 
 ## Identity and reference rules
 
 | Identity | Answers |
 | --- | --- |
 | Definition ID | What semantics does the state represent? |
-| Plan version + state slot ID | Which installed producer output does this state belong to? |
+| Plan version + stored output ID | Which installed producer output does this state belong to? |
 | State-instance ID | Which concrete partition/payload is it? |
 | Plan version | With which atomic installation may it be used? |
 | Schema/encoding ID | How are its bytes interpreted? |
 
 Definition IDs come from the catalog authority, plan versions from the
-installation authority, state-slot IDs from the compiler, and state-instance IDs
+installation authority, stored-output IDs from the compiler, and state-instance IDs
 from the runtime. Schema/encoding IDs identify supported formats.
 Human-readable names are diagnostics, not join keys. Reuse across plan versions
 requires an explicit compatibility decision; a matching definition ID is
 insufficient.
 
-A `StateReference` identifies a state slot and definition within the enclosing
+A `StateReference` identifies a stored output and definition within the enclosing
 plan version. The reader/writer binding constrains acceptable partition, schema,
 plan version and coverage. A reader binding may select several instances, such
 as panes covering one range, but cannot broaden semantics or substitute another
@@ -192,24 +207,24 @@ exact indexed lookup, never serving-time candidate selection.
 
 ```text
 PrecomputePlan
-  Input -> BuildKLL -> Write(slot-17, kll-v1)
+  Input -> BuildKLL -> Write(output-17, kll-v1)
 
 SDS
   Catalog: def-9 -> KLL(k=200) and input semantics
-  Plan bundle: version 42; writer/reader bind slot-17 to def-9
-  SummaryStore: instance metadata indexed by plan version, slot and partition;
+  Plan bundle: version 42; writer/reader bind output-17 to def-9
+  SummaryStore: instance metadata indexed by plan version, stored output and partition;
                 encoded payload bytes reached through that metadata
 
 QueryPlan
-  Read(slot-17, kll-v1) -> SummaryEstimate -> Result
+  Read(output-17, kll-v1) -> SummaryEstimate -> Result
 ```
 
-Writer, instance metadata and reader must agree on slot, definition ID,
+Writer, instance metadata and reader must agree on stored-output ID, definition ID,
 schema/encoding, grouping, time partition and plan version. State family and
 parameters must match the referenced catalog definition.
 The query runtime follows the installed reference instead of scanning the catalog.
 
-A stored summary derived from existing state has a distinct destination slot and an explicit
+A stored summary derived from existing state has a distinct stored-output ID and an explicit
 reference to completed source state:
 
 ```text
@@ -237,8 +252,9 @@ authorizes a binding but does not by itself make an instance readable.
 
 Compilation, installation, writes, recovery and reads enforce:
 
-1. Each slot resolves to one definition and authorized producer binding within
-   its plan version; each instance identifies that version and slot.
+1. Each stored-output ID resolves to one definition and authorized producer
+   binding within its plan version; each instance identifies that version and
+   stored output.
 2. Instance metadata declares the payload's actual schema and encoding.
 3. References preserve definition semantics and compatible plan version.
 4. Writer and reader grouping, time partition, schema and coverage agree.
@@ -256,7 +272,7 @@ Remove the proposed `materializations` catalog collection and standalone object
 from new plan examples and schemas. Preserve the existing
 `BackendNodeBinding::Materialization` variant as the node-placement marker for
 stored output; it does not imply a catalog object. At the compatibility boundary,
-map legacy stored-output identifiers into version-scoped slots and copy their
+map legacy stored-output identifiers into version-scoped output IDs and copy their
 format/partition constraints into matching bindings. Preserve payload locators
 and reject unresolved or conflicting mappings; do not rename existing persisted
 IDs or reinterpret legacy wire fields in place. Legacy formats keep their

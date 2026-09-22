@@ -24,7 +24,7 @@ in the serialized API.
 
 For example, merging five compatible one-minute KLL summaries and storing the
 five-minute result produces derived summary state in a separate destination
-slot. Merging them only to answer a query is a query-time operation. Both require
+stored output. Merging them only to answer a query is a query-time operation. Both require
 compatible grouping, coverage and accuracy.
 
 ## State and identity
@@ -34,8 +34,8 @@ compatible grouping, coverage and accuracy.
 | Summary Catalog | Definition snapshot validated with the installed plan; it does not track runtime instances or hold payload bytes. |
 | SDS (Self-Describing Summary) | The description and metadata needed to interpret and validate stored summary state. It is not a separate execution engine or payload store. |
 | `SummaryDefinition` | What a summary represents: source/filter, input value, grouping, time semantics, algorithm and parameters. |
-| `state_slot_id` | Compiler-assigned identifier for a stored producer output within one plan version. Shared readers use the same slot; it has no independent catalog object. |
-| `StateReference` | Plan reference identifying a slot and summary definition within the enclosing plan version. Reader configuration selects the required state instances and constrains format and coverage. |
+| `stored_output_id` | Compiler-assigned binding ID for a persisted PrecomputePlan DAG output within one plan version. Writers and shared readers use it to name the same output; it is not a memory slot or independent catalog object. |
+| `StateReference` | Plan reference identifying a stored output and summary definition within the enclosing plan version. Reader configuration selects the required state instances and constrains format and coverage. |
 | `SummaryStateInstance` | A concrete stored state, such as one service's completed five-minute KLL snapshot, with partition, coverage, format and location metadata. |
 | `SummaryStore` | One runtime store for summary instance metadata and payload bytes. Its metadata indexes instances and records coverage, format, readiness and payload location. The current implementation is `SketchStore`; no separate metadata or payload service is required. |
 | `plan_version` | Version shared by an installed plan bundle and its catalog bindings. Creating or updating state instances does not itself change this version. |
