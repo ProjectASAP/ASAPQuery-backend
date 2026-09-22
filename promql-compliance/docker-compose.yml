@@ -5,15 +5,6 @@ services:
     image: prom/prometheus:v3.9.1
     ports: ["${PROMETHEUS_PORT:-19090}:9090"]
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-remote-write-receiver", "--storage.tsdb.path=/prometheus"]
-  planner:
-    build:
-      context: ..
-      dockerfile: control_plane/Dockerfile
-    entrypoint: ["/usr/local/bin/control_plane_quote_snapshot"]
-    command: ["/config/planning-snapshot-template.json", "/config/planning-snapshot.json"]
-    volumes:
-      - ${ASAP_PLANNING_SNAPSHOT_TEMPLATE}:/config/planning-snapshot-template.json:ro
-      - ${ASAP_PLANNING_SNAPSHOT}:/config/planning-snapshot.json
   data-plane:
     build:
       context: ..

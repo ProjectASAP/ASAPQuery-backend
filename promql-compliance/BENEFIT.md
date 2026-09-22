@@ -1,6 +1,6 @@
 # Issue 754 level-3 benefit test
 
-`make benefit` in `promql-compliance/runner` reuses the level-1 and level-2
+The Rust workspace binary `benefit-runner`, invoked by `make benefit` in `promql-compliance/runner` reuses the level-1 and level-2
 `issue-754.yaml` suite and dataset. It starts an isolated backend deployment,
 Prometheus, VictoriaMetrics, and ClickHouse; writes identical samples; checks
 backend results against Prometheus; checks the other exact baselines against
@@ -21,7 +21,7 @@ the full cardinality and time-range matrix in issue #754. Run larger matrix
 points separately using the same suite and dataset schema and retain the same
 semantic gates before interpreting performance.
 
-This test requires Docker Compose, access to the repository's image build
+This test requires Rust/Cargo, protoc, Docker Compose, access to the repository's image build
 dependencies, and cgroup v2. Run from `promql-compliance/runner`:
 
 ```sh
@@ -30,8 +30,8 @@ make benefit
 
 ## PR 761 workload-cost gate
 
-This branch includes PR #761. The level-3 runner passes an **unquoted** snapshot
-to the normal backend compiler and startup path. It derives source cadence,
+This branch includes PR #761. The level-3 Rust runner builds a typed **unquoted** snapshot, invokes the
+control-plane library directly and passes the same snapshot to backend startup. It derives source cadence,
 input series count, sample volume and aggregate ingestion rate from the replay
 dataset; query recurrence comes from the shared suite. Data cadence retains
 100 ms precision; the backend physical-history sizing bound rounds up to its
@@ -60,3 +60,10 @@ lowering. Separately, the inherited level-1 test still rejects the grouped
 temporal Sum plan and the quantile-ratio exact fallback. These failures must be
 resolved before this fixture can establish an end-to-end performance benefit;
 the runner does not coarsen data cadence or weaken the local-execution gate.
+
+The three workspace binaries (`differential-runner`, `benefit-runner`,
+`report-card`) and their contract/HTTP tests are Rust. CI uses Cargo and the
+shared backend types for plan/cost validation. No Go tooling is required.
+CPU deltas cover measured trials after warmups; memory is the container-lifetime
+cgroup peak. SQL comparison checks source/group labels as well as values, and
+fallback provenance is checked again during timed backend queries.

@@ -18,23 +18,23 @@ CASES := \
 	issue-754:../datasets/issue-754.yaml:../suites/issue-754.yaml
 
 test:
-	go test ./...
+	cargo test --locked -p promql-compliance
 
 run:
-	go run ./cmd/differential-runner --dataset $(DATASET) --suite $(SUITE) --reference-url $(REFERENCE_URL) --test-url $(BACKEND_URL) --compose-file $(COMPOSE_FILE) --logs-dir $(LOGS_DIR)
+	cargo run --locked -p promql-compliance --bin differential-runner -- --dataset $(DATASET) --suite $(SUITE) --reference-url $(REFERENCE_URL) --test-url $(BACKEND_URL) --compose-file $(COMPOSE_FILE) --logs-dir $(LOGS_DIR)
 
 run-all:
 	@set -eu; mkdir -p "$(REPORT_DIR)"; rm -f "$(REPORT_DIR)"/*.json "$(REPORT_DIR)"/summary.md; result=0; \
 	for test_case in $(CASES); do \
 		name="$${test_case%%:*}"; rest="$${test_case#*:}"; dataset="$${rest%%:*}"; suite="$${rest#*:}"; \
 		echo "Running $$name"; \
-		if ! go run ./cmd/differential-runner --dataset "$$dataset" --suite "$$suite" --reference-url "$(REFERENCE_URL)" --test-url "$(BACKEND_URL)" --compose-file "$(COMPOSE_FILE)" --logs-dir "$(LOGS_DIR)/$$name" --output "$(REPORT_DIR)/$$name.json"; then result=1; fi; \
-	done; go run ./cmd/report-card --reports-dir "$(REPORT_DIR)"; exit $$result
+		if ! cargo run --locked -p promql-compliance --bin differential-runner -- --dataset "$$dataset" --suite "$$suite" --reference-url "$(REFERENCE_URL)" --test-url "$(BACKEND_URL)" --compose-file "$(COMPOSE_FILE)" --logs-dir "$(LOGS_DIR)/$$name" --output "$(REPORT_DIR)/$$name.json"; then result=1; fi; \
+	done; cargo run --locked -p promql-compliance --bin report-card -- --reports-dir "$(REPORT_DIR)"; exit $$result
 
 .PHONY: benefit
 benefit:
 	mkdir -p "$(REPORT_DIR)" "$(LOGS_DIR)"
-	go run ./cmd/benefit-runner \
+	cargo run --locked -p promql-compliance --bin benefit-runner -- \
 		--dataset ../datasets/issue-754.yaml \
 		--suite ../suites/issue-754.yaml \
 		--compose-file ../docker-compose.yml \

@@ -24,9 +24,6 @@ jobs:
         with:
           repository: ProjectASAP/asap_sketchlib
           path: asap_sketchlib
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.8"
       - uses: dtolnay/rust-toolchain@stable
       - name: Validate PR 761 automatic workload costing
         working-directory: ASAPQuery-backend
@@ -38,7 +35,7 @@ jobs:
           cargo test --locked -p control_plane --lib --bins
       - name: Validate shared workload and SQL coverage
         working-directory: ASAPQuery-backend/promql-compliance/runner
-        run: go test ./...
+        run: cargo test --locked -p promql-compliance
       - name: Compare ASAPQuery with exact DB baselines
         working-directory: ASAPQuery-backend/promql-compliance/runner
         run: make benefit REPORT_DIR="$GITHUB_WORKSPACE/artifacts/reports" LOGS_DIR="$GITHUB_WORKSPACE/artifacts/logs"

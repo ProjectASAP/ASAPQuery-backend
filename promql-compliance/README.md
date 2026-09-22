@@ -1,6 +1,6 @@
 # PromQL compliance suite
 
-This developer harness sends one deterministic Remote Write fixture to Prometheus and ASAPQuery-backend, then compares their Prometheus API responses. It also derives the backend planning snapshot from the same suite queries.
+The Rust `promql-compliance` workspace crate sends one deterministic Remote Write fixture to Prometheus and ASAPQuery-backend, then compares their Prometheus API responses. It also derives the backend planning snapshot from the same suite queries.
 
 Run from `promql-compliance/runner`:
 
@@ -95,6 +95,23 @@ Use a distinct label set for each series of a metric. Ensure query windows have 
 
 There is no separate hand-written PhysicalPlan. `BuildPlanningSnapshot` derives a backend-local planning snapshot from every suite query; the control-plane helper enumerates candidates and supplies deterministic unit-cost evidence before the data plane starts.
 
-The suite query expression is the workload query. Dataset metric names are the ingested metric vocabulary and must cover every named metric referenced by a query. Current generated planning defaults are intentionally centralized in `runner/control_plane.go`: 60-second demand cadence for instant-only queries, range step for range queries, explicit 1% epsilon/delta accuracy, declared ingestion rate 100 samples/second, and 1-second scrape interval. Change those defaults there when the desired workload model changes, then run `go test ./...` and the relevant live case.
+The suite query expression is the workload query. Dataset metric names must cover
+its named sources. `runner/src/planning.rs` builds a typed backend planning input:
+60-second demand for instant-only queries, range step for range queries and
+explicit 1% epsilon/delta accuracy. Differential fixtures retain declared
+compatibility defaults (100 samples/second and 1-second cadence); the benefit
+fixture derives the actual population, cadence and rate from its dataset.
 
-`suites/issue-702.yaml` records all nine expressions manually reported in PR #741 against the 60-second aggregation fixture, including its known fallback ratio. `issue-702-one-second.yaml` and its matching dataset faithfully reproduce the PR's supported-query experiment: three `issue701_data` series, a one-second cadence from seconds 1–961, and the same values. Input sample cadence changes range-function results, so use this case—not the 60-second fixture—to verify that experiment.
+Both runners invoke the Rust control-plane compiler directly, with no external
+workload quotes. They validate automatic costs and the selected local plan before
+starting containers, then pass that same snapshot to backend startup. Planning
+failures produce a JSON report. The selected plan and input snapshot are saved
+beside successful planning reports. Docker Compose is needed only for live
+services; fixture, protocol, cost and comparison tests run with Cargo:
+
+```sh
+cargo test --locked -p promql-compliance
+cargo clippy --locked -p promql-compliance --all-targets -- -D warnings
+```
+
+There is no Go toolchain, runner, module or generated Go code in this harness.

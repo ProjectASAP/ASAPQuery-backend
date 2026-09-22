@@ -3033,6 +3033,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "promql-compliance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "asap_types",
+ "clap",
+ "control_plane",
+ "prost",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "snap",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "promql-parser"
 version = "0.10.0"
 source = "git+https://github.com/ProjectASAP/promql-parser?rev=9fede7eecca923c9882fe256484d00d37f8706cb#9fede7eecca923c9882fe256484d00d37f8706cb"
