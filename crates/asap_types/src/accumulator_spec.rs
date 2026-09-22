@@ -227,29 +227,10 @@ impl AggregationConfig {
             )
         };
         let (family, keyed) = match self.aggregation_type {
-            Sum => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
-                false,
-            ),
-            Count => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Count, ExactParams::Count),
-                false,
-            ),
-            Increase => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
-                false,
-            ),
-            Rate => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate),
-                false,
-            ),
-            Min => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min),
-                false,
-            ),
-            Max => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Max, ExactParams::Max),
-                false,
+            Sum | Count | Increase | Rate | Min | Max | MultipleSum | MultipleIncrease
+            | MultipleMin | MultipleMax => (
+                self.aggregation_type.planner_exact_family().unwrap(),
+                self.aggregation_type.is_keyed(),
             ),
             DatasketchesKLL => (
                 independent_sketch(
@@ -259,22 +240,6 @@ impl AggregationConfig {
                     },
                 ),
                 false,
-            ),
-            MultipleSum => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
-                true,
-            ),
-            MultipleIncrease => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
-                true,
-            ),
-            MultipleMin => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min),
-                true,
-            ),
-            MultipleMax => (
-                SummaryFamilyType::ExactAggregate(ExactKind::Max, ExactParams::Max),
-                true,
             ),
             HydraKLL => {
                 let k = kll_k_param(self) as u32;

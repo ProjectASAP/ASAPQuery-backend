@@ -40,6 +40,22 @@ pub enum AggregationType {
 }
 
 impl AggregationType {
+    /// Adapt a storage/processor tag to Planner's exact family. Keyed storage
+    /// changes the payload layout, not the semantic family.
+    pub fn planner_exact_family(self) -> Option<planner_types::post_asap::SummaryFamilyType> {
+        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
+        let (kind, params) = match self {
+            Self::Sum | Self::MultipleSum => (ExactKind::Sum, ExactParams::Sum),
+            Self::Count => (ExactKind::Count, ExactParams::Count),
+            Self::Increase | Self::MultipleIncrease => (ExactKind::Increase, ExactParams::Increase),
+            Self::Rate => (ExactKind::Rate, ExactParams::Rate),
+            Self::Min | Self::MultipleMin => (ExactKind::Min, ExactParams::Min),
+            Self::Max | Self::MultipleMax => (ExactKind::Max, ExactParams::Max),
+            _ => return None,
+        };
+        Some(SummaryFamilyType::ExactAggregate(kind, params))
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             AggregationType::Sum => "Sum",
@@ -172,5 +188,39 @@ impl<'de> Deserialize<'de> for AggregationType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
+
+    #[test]
+    fn storage_layout_tags_do_not_create_planner_families() {
+        for (storage, expected) in [
+            (AggregationType::Sum, ExactKind::Sum),
+            (AggregationType::MultipleSum, ExactKind::Sum),
+            (AggregationType::Count, ExactKind::Count),
+            (AggregationType::Increase, ExactKind::Increase),
+            (AggregationType::MultipleIncrease, ExactKind::Increase),
+            (AggregationType::Rate, ExactKind::Rate),
+        ] {
+            let family = storage.planner_exact_family().unwrap();
+            assert!(
+                matches!(family, SummaryFamilyType::ExactAggregate(kind, _) if kind == expected)
+            );
+        }
+        assert_eq!(
+            AggregationType::Rate.planner_exact_family(),
+            Some(SummaryFamilyType::ExactAggregate(
+                ExactKind::Rate,
+                ExactParams::Rate
+            ))
+        );
+        assert_ne!(
+            AggregationType::Rate.planner_exact_family(),
+            AggregationType::Increase.planner_exact_family()
+        );
     }
 }

@@ -13,7 +13,7 @@ use crate::PolicyFingerprint;
 use crate::WindowMaterializationLayout;
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 3;
 
 /// Stable materialization identity binds operator and population descriptors.
 /// Concrete intervals, groups and completeness belong to runtime instances.

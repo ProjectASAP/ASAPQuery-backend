@@ -1497,7 +1497,7 @@ pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
 /// For keyed accumulators (MultipleSum, CMS, HydraKLL), the key is extracted
 /// from the series' **aggregated_labels** — these are the labels that become
 /// the key dimension *inside* the sketch (e.g., which bucket in a CMS, which
-/// entry in a MultipleSumAccumulator's HashMap). This matches the Arroyo SQL
+/// entry in a KeyedSumCountAccumulator's HashMap). This matches the Arroyo SQL
 /// pattern: `udf(concat_ws(';', aggregated_labels), value)`.
 pub(crate) fn apply_sample(
     updater: &mut dyn AccumulatorUpdater,
@@ -1792,7 +1792,7 @@ mod tests {
 
     use crate::precompute_engine::config::LateDataPolicy;
     use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
-    use crate::precompute_engine::operators::multiple_sum_accumulator::MultipleSumAccumulator;
+    use crate::precompute_engine::operators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::StreamingConfig;
@@ -2452,7 +2452,7 @@ mod tests {
     #[test]
     fn test_keyed_accumulator_aggregated_labels() {
         // Like planner output for `sum by (host) (cpu)`:
-        // grouping=[] (empty), aggregated=[host] (key inside MultipleSumAccumulator)
+        // grouping=[] (empty), aggregated=[host] (key inside KeyedSumCountAccumulator)
         let config = make_agg_config_full(
             3,
             "cpu",
@@ -2504,10 +2504,10 @@ mod tests {
         let (_output, acc) = &captured[0];
         let ms_acc = acc
             .as_any()
-            .downcast_ref::<MultipleSumAccumulator>()
-            .expect("should be MultipleSumAccumulator");
+            .downcast_ref::<KeyedSumCountAccumulator>()
+            .expect("should be KeyedSumCountAccumulator");
 
-        // The MultipleSumAccumulator should have two internal keys: "A" and "B"
+        // The KeyedSumCountAccumulator should have two internal keys: "A" and "B"
         assert_eq!(ms_acc.sums.len(), 2, "two host keys inside one accumulator");
 
         let mut found_a = false;

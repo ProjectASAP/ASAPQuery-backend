@@ -637,6 +637,22 @@ pub enum ExactReadout {
     Max,
 }
 
+impl ExactReadout {
+    /// Planner family required by this installed DAG readout node.
+    pub fn planner_family(self) -> planner_types::post_asap::SummaryFamilyType {
+        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
+        let (kind, params) = match self {
+            Self::Sum => (ExactKind::Sum, ExactParams::Sum),
+            Self::Count => (ExactKind::Count, ExactParams::Count),
+            Self::Increase => (ExactKind::Increase, ExactParams::Increase),
+            Self::Rate => (ExactKind::Rate, ExactParams::Rate),
+            Self::Min => (ExactKind::Min, ExactParams::Min),
+            Self::Max => (ExactKind::Max, ExactParams::Max),
+        };
+        SummaryFamilyType::ExactAggregate(kind, params)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryReadout {
