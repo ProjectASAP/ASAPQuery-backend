@@ -175,6 +175,51 @@ input batch updates only the state for its assigned data partition. A scheduled
 evaluation identifies the logical window whose outputs are due. Nodes run when
 the inputs required for that evaluation are available.
 
+The following diagram expands the KLL example for one scheduled window. The
+router assigns partition work; each worker reads only its bound partition and
+executes every required node of the same installed precompute subgraph. Dashed
+arrows denote shared immutable program access; solid arrows denote work or data.
+
+```mermaid
+flowchart TB
+  D[Selected Planner DAG] --> C[Physical compiler: split at stored outputs]
+  C --> P[PrecomputePlan: Read -> Group -> KLL -> Write]
+  C --> QP[QueryPlans: Read stored KLL -> Estimate]
+  P --> IP[InstalledPrecomputePlan: shared immutable program]
+  T[Scheduled window and source partitions] --> R[Route by service]
+
+  subgraph W0[Worker 0: service=api]
+    direction TB
+    A0[Read partition input] --> A1[Group by service]
+    A1 --> A2[Build KLL: private state]
+    A2 --> A3[Write latency-kll for api and window]
+  end
+  subgraph W1[Worker 1: service=worker]
+    direction TB
+    B0[Read partition input] --> B1[Group by service]
+    B1 --> B2[Build KLL: private state]
+    B2 --> B3[Write latency-kll for worker and window]
+  end
+
+  IP -. same program .-> A0
+  IP -. same program .-> B0
+  R -->|api partition| A0
+  R -->|worker partition| B0
+  A3 --> S[SummaryStore: separate committed population/window records]
+  B3 --> S
+  S --> QR[Query engine: bound stored-state read]
+  QP -. query program .-> QR
+  QR --> E[Estimate p50 or p99 on each query]
+```
+
+Worker 0 and Worker 1 can run concurrently. Within each worker the arrows
+establish dependency order: KLL construction follows its input computation,
+and publication follows completion of the required state. Neither worker owns
+an exclusive operator stage; both execute Read, Group, KLL and Write. They share
+the program but not mutable KLL state. The two records use the same plan version,
+stored-output ID and definition, with different population keys. Query execution
+starts from the committed output rather than running this precompute path again.
+
 The selected maintenance mode determines how state is constructed. An
 incremental operator updates its window state as input arrives. A batch operator
 reads the bound range and builds its result at the scheduled endpoint. The
