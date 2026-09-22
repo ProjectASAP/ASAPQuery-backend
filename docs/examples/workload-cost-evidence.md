@@ -1,10 +1,16 @@
 # Complete workload cost evidence
 
 Planning snapshots use one schema, `snapshot_version: 2`. Version 1 is rejected.
-Candidate discovery may omit `workload_cost_evidence`; compiling a deployable
-snapshot requires complete, valid quotes and selects by complete workload cost.
-There is no unquoted snapshot deployment path. The checked-in JSON examples are
-discovery templates, not ready-to-deploy plans.
+Deployment automatically calculates workload costs when `workload_cost_evidence`
+is absent, using applicable ERP profiles and analytical estimates together with
+the workload's data facts, query frequency and physical layout. Inspect
+`cost_comparison` for candidate totals, resource breakdowns and assumptions.
+The checked-in examples can exercise this path at their recorded decision time;
+use current data/capability inputs for a live deployment.
+
+The following workflow is an **optional provider override** for deployments with
+calibrated complete quotes. See the [automatic calculation design](../design_docs/evidence-dependent-candidates.md#backend-owned-workload-calculation)
+for the default path.
 
 ## Workflow
 
@@ -65,7 +71,9 @@ can change which bound workload is committed, not rewrite its semantics.
 
 All quotes use one provider model's common cost units. A horizon quote includes
 the complete stated partition's work, data volume/cardinality, maintained
-groups and retention. Do not reuse a global ingestion rate as a per-metric rate.
+groups and retention. A calibrated provider should supply per-source demand rather than infer it from
+a global rate. The automatic reference model discloses conservative replication
+when only workload-level facts are available.
 Per-evaluation quotes exclude upkeep already charged in horizon components.
 Sunk infrastructure may explicitly cost zero under the provider's documented
 decision boundary; unknown costs may not.

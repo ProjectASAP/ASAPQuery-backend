@@ -379,7 +379,9 @@ construction once. Compare candidates over the same data and demand scope.
 Missing evidence is not zero cost. The backend supplies candidate estimates
 through `candidate_cost()`, preferring applicable ERP benchmarks and otherwise
 using its analytical model. Unsupported estimates remain unavailable;
-publication still needs a complete workload quote.
+the backend combines unit resources, data size, recurrence, and the bound
+physical DAG into complete workload costs before publication. See the
+[calculation model](evidence-dependent-candidates.md#backend-owned-workload-calculation).
 
 ## Compiler contract
 

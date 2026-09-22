@@ -726,7 +726,7 @@ fn compile_physical_plan_request(
                 )
             }
         },
-        None => frontend.compile(compilation_request, environment),
+        None => physical::workload_cost::select_candidates(candidates, environment, None, frontend),
     };
     let bundle = match compiled {
         Ok(bundle) => bundle,
@@ -979,6 +979,15 @@ mod api_tests {
         let (plan, collectors, _, _, _) =
             compile_physical_plan_request(request, false, QueryFrontend::PromQl).unwrap();
         let plan = plan.unwrap();
+        let report = plan
+            .cost_comparison
+            .as_ref()
+            .expect("HTTP must compare automatically priced candidates");
+        assert_eq!(report.model_version, "backend-workload-resources-v1");
+        assert!(report
+            .candidate_evaluations
+            .iter()
+            .any(|candidate| candidate.automatic_cost.is_some()));
         assert!(collectors.is_empty());
         assert!(plan.collector_plans.is_empty());
         assert_eq!(
