@@ -15,10 +15,10 @@ version = "0.1.0"
 [workspace.dependencies]
 # Keep Planner frontends, selection, and IR on the same immutable revision.
 # Alias upstream asap-types because this workspace also defines asap_types.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "2ec3fc80caa922c8e1f33aa05f60b7d787e73257" }
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "2ec3fc80caa922c8e1f33aa05f60b7d787e73257" }
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "2ec3fc80caa922c8e1f33aa05f60b7d787e73257" }
-asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "2ec3fc80caa922c8e1f33aa05f60b7d787e73257" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "851493116d42674d09cf9646dde59532003025e4" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "851493116d42674d09cf9646dde59532003025e4" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "851493116d42674d09cf9646dde59532003025e4" }
+asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "851493116d42674d09cf9646dde59532003025e4" }
 
 # Shared external deps (used by 2+ crates)
 serde = { version = "1.0", features = ["derive"] }
