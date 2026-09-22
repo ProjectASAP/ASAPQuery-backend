@@ -159,15 +159,12 @@ impl RelationDagExecutor<'_> {
                 if output_schema != expected_schema {
                     return Err("join output schema differs from its parent edge".into());
                 }
-                if !matches!(join_kind, planner_types::pre_asap::JoinKind::Inner) {
-                    return Err("only inner relational joins are executable".into());
-                }
                 let left = self.execute(inputs[0], left_schema)?;
                 let right = self.execute(inputs[1], right_schema)?;
                 let pred =
                     serde_json::from_value(pred.clone()).map_err(|error| error.to_string())?;
                 ClickHouseRelationalAdapter
-                    .apply_inner_equi_join(&pred, output_schema, left, right)
+                    .apply_join(join_kind, &pred, output_schema, left, right)
                     .map_err(|error| error.to_string())
             }
             Some(_) => {

@@ -54,6 +54,34 @@ All adapters start from a `QueryPlanEntry` node. The language adapters only
 represent different runtime value types. They cannot select a replacement
 definition or reconstruct an operator from the request text.
 
+## Planner physical-operator coverage
+
+The backend pins one ASAPPlanner `main` commit and treats its exported
+`ExecutableOperatorPayload` enum as the exhaustive physical-operator contract.
+Execution follows the `ExecutionDataState` assigned by Planner; a query engine
+must not replay a maintenance operator while serving a request.
+
+| Planner payload | Planner phase | Backend execution |
+| --- | --- | --- |
+| `Fallback` | Maintenance or query, from its validated edge state | Precompute input adapter, prepared `ExternalExact` leaf, or the entry's explicit whole-query fallback policy |
+| `Binary` | Maintenance or query, from `timing` | Maintenance runtime for `MaintenanceTime`; scalar/vector query operator for `ReadTime` |
+| `CandidateTopK` | Query | Candidate membership plus authoritative exact values, followed by grouped reranking |
+| `Value` | Maintenance or query, from `timing` | Maintenance population/update adapter, or query adapters for population readout, exact aggregate/finalization, projection, filter, sort and limit |
+| `RelationalJoin` | Maintenance or query rows, from its validated edge state | Precompute row adapter or ClickHouse relation adapter for inner, left, right, full, cross, semi and anti joins |
+| `SummaryAgg` | Maintenance | Precompute DAG operator ending at a stored-output boundary |
+| `SummaryJoin` | Maintenance | Precompute DAG operator |
+| `SummarySubtract` | Maintenance | Precompute DAG operator |
+| `SummaryDelete` | Maintenance | Precompute DAG operator |
+| `SummaryEstimate` | Query | Bound sketch readout |
+| `SummaryMerge` | Maintenance state | Precompute DAG operator; the QueryPlan state-merge node remains a physical read adapter for previously stored panes |
+
+The compiler either binds every query-phase node to a `QueryPlanNode`, absorbs
+an explicit boundary such as exact-accumulator finalization into its typed
+readout, or emits an exact node with a declared fallback policy. Unknown
+extensions and invalid phase crossings fail during compilation or installation.
+The match sites and coverage tests are exhaustive so a new Planner enum variant
+causes a backend compile failure until its phase and runtime adapter are chosen.
+
 ## StoredSummary reads
 
 A `ReadMaterialization` carries the exact `StoredOutputReference` published for
