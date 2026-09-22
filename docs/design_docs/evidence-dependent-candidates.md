@@ -3,18 +3,18 @@
 Status: design implemented by backend PR #761 against ASAPPlanner #455
 (`2ec3fc80`). This document defines the backend decision boundary for Planner
 issue #454 and backend issue #752. It does not claim that every retained
-alternative has a deployable implementation.
+candidate has a deployable implementation.
 
 ## Decision and ownership
 
-Keep constructible alternatives visible when external evidence is absent.
+Keep constructible candidates visible when external evidence is absent.
 Separate candidate existence, logical selection, and deployment admission:
-none implies the next. Otherwise the backend either loses an alternative it
+none implies the next. Otherwise the backend either loses a candidate it
 could prove valid or deploys one whose guarantee has never been established.
 
 | Decision | Owner | Required behavior |
 | --- | --- | --- |
-| Construct semantic alternatives | Planner | Preserve unknown guarantees; reject known-invalid evidence and impossible shapes |
+| Construct semantic candidates | Planner | Preserve unknown guarantees; reject known-invalid evidence and impossible shapes |
 | Supply external facts | Backend | Bind evidence to the query, data population, snapshot and validity period |
 | Derive accuracy and select logical roots | Planner, under backend models and policy | Respect the root accuracy target; missing proof is not certification |
 | Bind and admit a deployment | Backend | Verify concrete execution support and complete workload cost evidence |
@@ -31,7 +31,7 @@ API and cannot authorize deployment.
 flowchart TD
     Input[Queries, accuracy targets and optional backend evidence] --> Validate[Validate evidence scope and validity]
     Validate -->|Invalid supplied evidence| Error[Reject request with reason]
-    Validate -->|Valid or absent evidence| Search[Planner search retains constructible alternatives]
+    Validate -->|Valid or absent evidence| Search[Planner search retains constructible candidates]
     Search --> Inspect[Explain known and unknown candidate properties]
     Search --> Select[Planner global selection under backend policy]
     Select --> Exact[Explicit exact fallback when no certified summary is selected]
@@ -90,7 +90,7 @@ Explain records accuracy status and symbolic guarantee, runtime support status,
 cost availability, and the selection reason separately. A selected candidate
 is labelled as pending backend binding. Rejected candidates retain their
 reported reasons. This distinguishes missing proof, unsupported execution,
-missing comparable cost and an alternative that simply lost the ranking.
+missing comparable cost and a candidate that simply lost the ranking.
 
 ## Example and acceptance behavior
 
@@ -101,7 +101,7 @@ For `quantile_over_time(0.9, data[5m]) / quantile_over_time(0.5, data[5m])`:
 2. With valid, scoped operand contracts, Planner can derive the ratio guarantee
    and check the explicit root target. Valid evidence alone does not guarantee
    that the target is met or that this candidate wins selection.
-3. A selected alternative still needs physical support and a workload quote
+3. A selected candidate still needs physical support and a workload quote
    before publication. A stale or cross-query certificate rejects the request.
 
 Cross-family acceptance includes absent, partial, valid, invalid and stale
