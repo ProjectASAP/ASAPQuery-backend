@@ -107,6 +107,7 @@ func run() error {
 	lifecycle := runner.ComposeLifecycle{
 		Files: files, Project: "issue754-benefit", LogsDirectory: *logs,
 		PlanningSnapshot: selected, PlanningSnapshotTemplate: template,
+		SelectedPlan:       strings.TrimSuffix(*output, ".json") + ".plan.json",
 		AdditionalServices: []string{"clickhouse", "victoria"},
 	}
 	defer lifecycle.Stop()
