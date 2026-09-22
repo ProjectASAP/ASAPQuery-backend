@@ -39,9 +39,10 @@ Planner owns query semantics, summary families, parameters and candidate
 selection. ERP can affect supported evidence-based choices, but supplying an
 artifact does not prove that it was eligible or used. Freshness, source/update
 semantics, parameters and accuracy constraints still apply. The checked-in demo
-is not an empirical-ERP benchmark. For deployment, use the priced snapshot workflow in [execution calibration](../../tools/o11y-execution/CALIBRATION.md).
-`compile_workload_artifact` requires complete workload quotes; do not relabel
-demo costs as measured evidence.
+is not an empirical-ERP benchmark. For deployment, the backend automatically computes workload costs from ERP or
+analytical unit resources and physical demand. Optional calibrated overrides use
+the [cost evidence workflow](../examples/workload-cost-evidence.md). Do not relabel
+analytical demo costs as measured evidence.
 
 For the existing observation → ERP-selected KLL → installed HTTP correctness
 fixture, see [ERP process validation](../developer_docs/erp-process-validation.md):
@@ -73,12 +74,11 @@ dot -Tsvg target/physical-dag-inspection/selected.dot \
   -o target/physical-dag-inspection/selected.svg
 ```
 
-`compile_workload_artifact` calls the same evidence-required snapshot compiler
-used by startup. Set `ASAPQUERY_PLANNING_SNAPSHOT` to a priced snapshot prepared
-using the [cost evidence workflow](../examples/workload-cost-evidence.md).
-The checked-in unquoted templates support candidate discovery only. The output
-includes the selected plan, logical selection trace and complete cost comparison.
-MetricsQL compilation requires quotes collected for that frontend.
+`compile_workload_artifact` calls the same snapshot compiler used by startup.
+Set `ASAPQUERY_PLANNING_SNAPSHOT` to the workload snapshot. Without an explicit
+provider override it uses automatic ERP/analytical workload costing. The output
+includes the selected plan, logical selection trace, resource assumptions and
+complete cost comparison. Both PromQL and MetricsQL use this path.
 
 The compiler derives sibling plans from the selected post-ASAP DAG:
 

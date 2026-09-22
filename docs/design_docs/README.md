@@ -18,6 +18,12 @@ Proposals for shared-contract review:
 
 These proposals complement the canonical cross-component contracts above.
 
+Backend planning decisions:
+
+- [Evidence-dependent candidate selection](evidence-dependent-candidates.md)
+  defines evidence ownership, logical selection, physical admission, exact
+  fallback and the current HLL/ERP proof limits.
+
 Backend-specific operating profiles:
 
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md) defines
