@@ -175,6 +175,34 @@ impl QueryPlan {
                 "non-bootstrap QueryPlan has zero plan_version".into(),
             ));
         }
+        for (query_id, selected) in &self.selected_dags {
+            if query_id != &selected.query_id {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG map key `{query_id}` differs from document query ID `{}`",
+                    selected.query_id
+                )));
+            }
+            if selected.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+            {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` has unsupported schema version {}",
+                    selected.schema_version
+                )));
+            }
+            selected.decode().map_err(|error| {
+                QueryPlanError::Invalid(format!("selected DAG `{query_id}` is invalid: {error}"))
+            })?;
+            let matching_entries = self
+                .entries
+                .values()
+                .filter(|entry| entry.query_id == *query_id)
+                .count();
+            if matching_entries != 1 {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` must correspond to exactly one query entry; found {matching_entries}"
+                )));
+            }
+        }
         if let Some(context) = &self.clickhouse_context {
             for (template, identities) in &context.window_templates {
                 if !template.starts_with("moving-window-v1:") || identities.is_empty() {

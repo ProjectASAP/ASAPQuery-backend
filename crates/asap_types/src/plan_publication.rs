@@ -100,17 +100,23 @@ pub fn validate_stored_output_references(
         .collect::<std::collections::BTreeMap<crate::sds::SummaryDefinitionId, _>>();
     for entry in query.entries.values() {
         for binding in entry.materialization_bindings() {
-            let writer = writers
-                .get(&binding.materialization)
-                .ok_or("query binding has no precompute state writer")?;
+            let writer = writers.get(&binding.materialization).ok_or_else(|| {
+                format!(
+                    "query binding for definition {} has no precompute stored-summary writer",
+                    binding.materialization.as_u64()
+                )
+            })?;
             if binding.stored_output_reference != writer.stored_output_reference {
                 return Err(
                     "query read and precompute writer have different stored outputs".into(),
                 );
             }
-            let config = configs
-                .get(&binding.materialization)
-                .ok_or("query binding has no precompute definition")?;
+            let config = configs.get(&binding.materialization).ok_or_else(|| {
+                format!(
+                    "query binding for definition {} has no precompute configuration",
+                    binding.materialization.as_u64()
+                )
+            })?;
             let full_slide = matches!(
                 config.window_layout,
                 crate::WindowMaterializationLayout::FullWindow

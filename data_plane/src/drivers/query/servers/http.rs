@@ -6853,6 +6853,27 @@ mod catalog_install_tests {
     }
 
     #[test]
+    fn selected_dag_identity_is_validated_even_without_using_its_projection() {
+        let mut request = request();
+        let query_id = request
+            .query_plan
+            .selected_dags
+            .keys()
+            .next()
+            .cloned()
+            .expect("fixture has selected DAG provenance");
+        request
+            .query_plan
+            .selected_dags
+            .get_mut(&query_id)
+            .unwrap()
+            .query_id = "different-query".into();
+        assert!(install(request)
+            .unwrap_err()
+            .contains("differs from document query ID"));
+    }
+
+    #[test]
     fn invalid_clickhouse_entry_cannot_change_active_generation() {
         let active = install(request()).expect("baseline plan installs");
         let handle = crate::storage_engines::types::ActivePhysicalPlanHandle::new(active);
