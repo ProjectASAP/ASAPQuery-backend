@@ -45,7 +45,7 @@ flowchart TD
     Inputs -->|Planning request| Canonical
     Candidates -->|Implementation evaluation request| Evidence
     Evidence -->|Feasibility and cost evidence| Ranking
-    Ranking -->|Legal ranked post-ASAP alternatives| Commit
+    Ranking -->|Legal ranked post-ASAP candidates| Commit
     Bundle -->|CollectorPlan in distributed profile| Collector[ASAPCollector — external runtime]
     Collector -->|Planned data or summary frames| Precompute
     Clients[PromQL clients] --> Serve
@@ -58,7 +58,7 @@ plane and data plane.** Backend physical plans remain necessary, but must be
 traceable projections of that DAG, not independently optimized replacements
 for its dependencies, shared state, or query-result semantics.
 
-Planner provides reusable legal alternatives and ranking. The backend owns
+Planner provides reusable legal candidates and ranking. The backend owns
 deployment commitment, concrete realization, and operational policy. A
 deployment choice cannot silently change Planner-owned grouping, statistic,
 summary parameters, logical window, accuracy, or lifecycle: it must return to
@@ -74,7 +74,7 @@ dependency of this backend.
 | Responsibility | ASAPPlanner | ASAPQuery-backend |
 | --- | --- | --- |
 | Query semantics | Canonical expressions, equivalence, grouping and time semantics | PromQL API, workload registration and profile restrictions |
-| Optimization | CSE, legal sharing, rollup, decomposition, summary and accuracy alternatives | Feasibility evidence, deployment commitment and concrete assignments |
+| Optimization | CSE, legal sharing, rollup, decomposition, summary and accuracy candidates | Feasibility evidence, deployment commitment and concrete assignments |
 | Time and state | Logical windows, abstract window framework and maintenance lifecycle | Panes, retention layout, update implementation and placement |
 | Plan identity | Logical producer identities and result dependencies | Plan versions, physical materializations, SID bindings and runtime handles |
 | Execution | Deployment-independent semantic contract | Ingest, precompute, store, serving, readiness and fallback |
@@ -96,7 +96,7 @@ The baseline is merged code, not the completion of open PRs.
 
 | Area | Existing foundation | Consolidation needed |
 | --- | --- | --- |
-| Frontend and selection | Planner dependency, canonical query parsing, backend selection from Planner alternatives | Make workload-wide sharing and strategy composition explicit across supported entry points |
+| Frontend and selection | Planner dependency, canonical query parsing, backend selection from Planner candidates | Make workload-wide sharing and strategy composition explicit across supported entry points |
 | Physical compilation | One bundle with precompute, transmission, backend and query projections; Collector projections when applicable | Preserve all selected shared producers and provenance through every projection |
 | Serving | Bound QueryPlan execution, exact materialization identities and explicit fallback | Audit remaining compatibility paths; serving must not make a new summary choice |
 | Deployment | Versioned staging and activation, runtime capability and evidence checks | Verify profile-specific failure and readiness behavior end to end |
@@ -153,11 +153,11 @@ cross-query or cross-request sharing.
 
 1. **Register demand.** Collect canonical queries, evaluation cadence, time
    windows, accuracy scope, source arrival facts and optimization horizon.
-2. **Generate alternatives.** Planner applies legal rewrites and sharing,
-   choosing among summary, abstract-window and lifecycle alternatives.
+2. **Generate candidates.** Planner applies legal rewrites and sharing,
+   choosing among summary, abstract-window and lifecycle candidates.
 3. **Evaluate implementations.** The backend checks runtime feasibility and
    supplies complete, fresh costs over the same workload horizon.
-4. **Commit and bind.** The control plane selects a legal workload alternative,
+4. **Commit and bind.** The control plane selects a legal workload candidate,
    retains its concrete realization, and compiles one coherent plan bundle.
 5. **Publish.** Validate and stage matching projections. For distributed
    deployment, require the corresponding Collector application evidence
@@ -195,7 +195,7 @@ Q2 is deliberately not the unweighted mean of per-instance means. Its
 denominator counts actual observations, which matters when instances have
 different sample counts. These are gauge samples, not counter increases.
 
-A legal target alternative is:
+A legal target candidate is:
 
 ```text
 Selected samples and logical five-minute coverage
@@ -240,12 +240,12 @@ session-wide. Shared state also does not make separate errors independent.
 ## Capabilities, costs and feedback
 
 The [evidence-dependent candidate design](evidence-dependent-candidates.md)
-defines the #761 decision flow against Planner #455: retain unknown alternatives,
+defines the #761 decision flow against Planner #455: retain unknown candidates,
 validate backend-scoped evidence, perform logical selection, then require
 physical admission. Logical selection alone does not approve deployment.
 
-Capabilities answer **can this deployment faithfully execute this alternative?**
-Costs answer **which feasible alternative is preferable?**
+Capabilities answer **can this deployment faithfully execute this candidate?**
+Costs answer **which feasible candidate is preferable?**
 
 | Capability question | Why it constrains selection |
 | --- | --- |
@@ -257,9 +257,9 @@ Costs answer **which feasible alternative is preferable?**
 
 Costs include initialization, ingestion updates, overlapping/retained state,
 transmission, storage, merges, readouts, recurring queries, and shared producer
-construction once. Compare alternatives over the same data and demand scope.
+construction once. Compare candidates over the same data and demand scope.
 Missing evidence is not zero cost. Explicit qualitative ranking may propose a
-logical alternative without a numeric candidate cost; publication still needs
+logical candidate without a numeric candidate cost; publication still needs
 a complete workload quote. Stale or incomplete deployment evidence cannot
 justify admission.
 
@@ -273,8 +273,8 @@ to planning.
 | Scenario | Reusable Planner strategy | Application-specific responsibility |
 | --- | --- | --- |
 | Repeated dashboards (MetricsObservabilityQuery) | Shared aggregates and prepared/maintained state | PromQL semantics, freshness and serving |
-| Multiple dashboard resolutions | Legal rollup and window alternatives | Compatible retention and exact time coverage |
-| Distributed telemetry aggregation | Mergeable summary and grouping alternatives | Collector placement, transmission and activation |
+| Multiple dashboard resolutions | Legal rollup and window candidates | Compatible retention and exact time coverage |
+| Distributed telemetry aggregation | Mergeable summary and grouping candidates | Collector placement, transmission and activation |
 | DQC analytical workloads | CSE, aggregate fusion and rollup | DQC engine adapters and batch execution policy |
 
 General semantic rules belong in Planner. Backend-local metric-name fixtures,
@@ -289,10 +289,10 @@ implementation slices, dependencies, regression fixtures and completion gates.
 | Milestone | System outcome | Acceptance |
 | --- | --- | --- |
 | 1. Audit the shared contract and entry points | Current canonical compilation and compatibility paths have explicit ownership | Document supported operators, sharing scope, profile limits and true IR gaps |
-| 2. Complete one workload-wide semantic path | Registered queries use Planner alternatives with preserved shared producers | The two-query example has one selected producer and both result roots |
+| 2. Complete one workload-wide semantic path | Registered queries use Planner candidates with preserved shared producers | The two-query example has one selected producer and both result roots |
 | 3. Preserve bindings through all projections | Precompute, storage and serving implement the same selected decision | No duplicate maintenance; exact state/schema/window and generation agreement |
 | 4. Consolidate reusable strategies | Missing general fusion/rollup rules extend Planner | Rules work without backend metric names, SID objects or placement assumptions |
-| 5. Close capability and cost feedback | Only fully executable, properly costed alternatives are committed | Unsupported or stale evidence fails closed; estimated and observed costs are traceable |
+| 5. Close capability and cost feedback | Only fully executable, properly costed candidates are committed | Unsupported or stale evidence fails closed; estimated and observed costs are traceable |
 | 6. Validate profiles and retire redundant selection paths | Serving executes installed bindings without independent semantic planning | Prometheus parity, sharing, readiness, fallback and activation-failure tests pass |
 | 7. Broaden coverage (ProjectASAP-wide; not required for this repository) | Other applications, engines, sketches and lifecycles reuse the contract | Each participating provider demonstrates capability and semantic conformance |
 
