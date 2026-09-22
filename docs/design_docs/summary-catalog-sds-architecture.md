@@ -197,9 +197,13 @@ The registry holds weak references, so retiring the final SID also releases its
 descriptors. `SketchInstanceMetadata` remains the registration and persistence
 compatibility DTO while older sidecars are read.
 
-The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
-one derived `FidelityGuarantee`, and a numeric state-schema version. The
-implemented `DataDescriptor` contains typed source and value projections, a
+The implemented `SummaryDescriptor` contains one `SummaryOperator`,
+one derived `FidelityGuarantee`, and a numeric state-schema version. A configured
+operator carries Planner's `SummaryFamilyType` as its semantic identity. Its
+backend aggregation type and parameters describe the state codec and update
+implementation; keyed grouping remains in the Data Descriptor. Descriptor
+validation rejects a configured exact family that disagrees with its storage
+type. The implemented `DataDescriptor` contains typed source and value projections, a
 canonical population filter, typed grouping columns and versioned observation
 semantics. The shared contract now also
 defines `SummaryInstance`, `ObservedSummaryInventory`, placement, completeness,

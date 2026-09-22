@@ -7,19 +7,32 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use asap_types::Statistic;
+use planner_types::post_asap::ExactKind;
+
+fn sum_family() -> ExactKind {
+    ExactKind::Sum
+}
 
 /// Accumulator that maintains separate sum values for multiple keys
 /// Allows querying sums for specific label combinations
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MultipleSumAccumulator {
+pub struct KeyedSumCountAccumulator {
+    #[serde(default = "sum_family")]
+    pub family: ExactKind,
     pub sums: HashMap<KeyByLabelValues, f64>,
     #[serde(default)]
     pub counts: HashMap<KeyByLabelValues, u64>,
 }
 
-impl MultipleSumAccumulator {
+impl KeyedSumCountAccumulator {
     pub fn new() -> Self {
+        Self::for_family(ExactKind::Sum)
+    }
+
+    pub fn for_family(family: ExactKind) -> Self {
+        assert!(matches!(family, ExactKind::Sum | ExactKind::Count));
         Self {
+            family,
             sums: HashMap::new(),
             counts: HashMap::new(),
         }
@@ -69,7 +82,16 @@ impl MultipleSumAccumulator {
                 counts.insert(key, count);
             }
         }
-        Ok(Self { sums, counts })
+        let family = match data.get("family").and_then(Value::as_str) {
+            None | Some("Sum") => ExactKind::Sum,
+            Some("Count") => ExactKind::Count,
+            _ => return Err("Invalid keyed additive family".into()),
+        };
+        Ok(Self {
+            family,
+            sums,
+            counts,
+        })
     }
 
     pub fn deserialize_from_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
@@ -133,11 +155,11 @@ impl MultipleSumAccumulator {
         let count_bytes = num_entries
             .checked_mul(8)
             .ok_or("Count section too large")?;
-        if remaining != 0 && remaining != count_bytes {
+        if remaining != 0 && remaining != count_bytes && remaining != count_bytes + 1 {
             return Err("Invalid count section length".into());
         }
         let mut counts = HashMap::new();
-        if remaining != 0 {
+        if count_bytes != 0 && remaining >= count_bytes {
             for key in keys {
                 let count = u64::from_le_bytes(buffer[offset..offset + 8].try_into()?);
                 offset += 8;
@@ -146,17 +168,30 @@ impl MultipleSumAccumulator {
                 }
             }
         }
-        Ok(Self { sums, counts })
+        let family = if remaining == count_bytes + 1 {
+            match buffer[offset] {
+                0 => ExactKind::Sum,
+                1 => ExactKind::Count,
+                _ => return Err("Invalid keyed additive family tag".into()),
+            }
+        } else {
+            ExactKind::Sum
+        };
+        Ok(Self {
+            family,
+            sums,
+            counts,
+        })
     }
 }
 
-impl Default for MultipleSumAccumulator {
+impl Default for KeyedSumCountAccumulator {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SerializableToSink for MultipleSumAccumulator {
+impl SerializableToSink for KeyedSumCountAccumulator {
     fn serialize_to_json(&self) -> Value {
         let mut sums_obj = serde_json::Map::new();
         for (key, sum) in &self.sums {
@@ -175,6 +210,7 @@ impl SerializableToSink for MultipleSumAccumulator {
         }
 
         serde_json::json!({
+            "family": if self.family == ExactKind::Count { "Count" } else { "Sum" },
             "sums": sums_obj,
             "counts": counts_obj
         })
@@ -211,17 +247,23 @@ impl SerializableToSink for MultipleSumAccumulator {
             );
         }
 
+        buffer.push(if self.family == ExactKind::Count {
+            1
+        } else {
+            0
+        });
+
         buffer
     }
 }
 
-impl AggregateCore for MultipleSumAccumulator {
+impl AggregateCore for KeyedSumCountAccumulator {
     fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
         Box::new(self.clone())
     }
 
     fn type_name(&self) -> &'static str {
-        "MultipleSumAccumulator"
+        "KeyedSumCountAccumulator"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -236,20 +278,20 @@ impl AggregateCore for MultipleSumAccumulator {
         &self,
         other: &dyn AggregateCore,
     ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error + Send + Sync>> {
-        // Check if other is also a MultipleSumAccumulator
+        // Check if other is also a KeyedSumCountAccumulator
         if other.get_accumulator_type() != self.get_accumulator_type() {
             return Err(format!(
-                "Cannot merge MultipleSumAccumulator with {}",
+                "Cannot merge KeyedSumCountAccumulator with {}",
                 other.get_accumulator_type()
             )
             .into());
         }
 
-        // Downcast to MultipleSumAccumulator
+        // Downcast to KeyedSumCountAccumulator
         let other_multiple_sum = other
             .as_any()
-            .downcast_ref::<MultipleSumAccumulator>()
-            .ok_or("Failed to downcast to MultipleSumAccumulator")?;
+            .downcast_ref::<KeyedSumCountAccumulator>()
+            .ok_or("Failed to downcast to KeyedSumCountAccumulator")?;
 
         // Use the existing merge_accumulators method
         let merged = Self::merge_accumulators(vec![self.clone(), other_multiple_sum.clone()])?;
@@ -258,7 +300,11 @@ impl AggregateCore for MultipleSumAccumulator {
     }
 
     fn get_accumulator_type(&self) -> AggregationType {
-        AggregationType::MultipleSum
+        if self.family == ExactKind::Count {
+            AggregationType::Count
+        } else {
+            AggregationType::Sum
+        }
     }
 
     fn approx_memory_bytes(&self) -> usize {
@@ -281,35 +327,35 @@ impl AggregateCore for MultipleSumAccumulator {
         use crate::storage_engines::types::MultipleSubpopulationAggregate;
         let key_val = key
             .as_ref()
-            .ok_or("Key required for MultipleSumAccumulator")?;
+            .ok_or("Key required for KeyedSumCountAccumulator")?;
         self.query(statistic, key_val, Some(query_kwargs))
     }
 }
 
-impl MultipleSubpopulationAggregate for MultipleSumAccumulator {
+impl MultipleSubpopulationAggregate for KeyedSumCountAccumulator {
     fn query(
         &self,
         statistic: Statistic,
         key: &KeyByLabelValues,
         _query_kwargs: Option<&HashMap<String, String>>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        match statistic {
-            Statistic::Sum => self
-                .sums
-                .get(key)
-                .copied()
-                .ok_or_else(|| "Key not found in MultipleSumAccumulator".to_string().into()),
-            Statistic::Count => self
+        match (&self.family, statistic) {
+            (ExactKind::Sum, Statistic::Sum) => self.sums.get(key).copied().ok_or_else(|| {
+                "Key not found in KeyedSumCountAccumulator"
+                    .to_string()
+                    .into()
+            }),
+            (ExactKind::Count, Statistic::Count) => self
                 .counts
                 .get(key)
                 .map(|count| *count as f64)
                 .ok_or_else(|| {
-                    "Sample count unavailable in MultipleSumAccumulator"
+                    "Sample count unavailable in KeyedSumCountAccumulator"
                         .to_string()
                         .into()
                 }),
             _ => Err(
-                format!("Unsupported statistic in MultipleSumAccumulator: {statistic:?}").into(),
+                format!("Unsupported statistic in KeyedSumCountAccumulator: {statistic:?}").into(),
             ),
         }
     }
@@ -319,15 +365,19 @@ impl MultipleSubpopulationAggregate for MultipleSumAccumulator {
     }
 }
 
-impl MergeableAccumulator<MultipleSumAccumulator> for MultipleSumAccumulator {
+impl MergeableAccumulator<KeyedSumCountAccumulator> for KeyedSumCountAccumulator {
     fn merge_accumulators(
-        accumulators: Vec<MultipleSumAccumulator>,
-    ) -> Result<MultipleSumAccumulator, Box<dyn std::error::Error + Send + Sync>> {
+        accumulators: Vec<KeyedSumCountAccumulator>,
+    ) -> Result<KeyedSumCountAccumulator, Box<dyn std::error::Error + Send + Sync>> {
         if accumulators.is_empty() {
             return Err("No accumulators to merge".into());
         }
 
-        let mut result = MultipleSumAccumulator::new();
+        let family = accumulators[0].family.clone();
+        if accumulators.iter().any(|acc| acc.family != family) {
+            return Err("Cannot merge different keyed additive families".into());
+        }
+        let mut result = KeyedSumCountAccumulator::for_family(family);
 
         for acc in accumulators {
             for key in acc.sums.keys() {
@@ -366,14 +416,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_multiple_sum_accumulator_creation() {
-        let acc = MultipleSumAccumulator::new();
+    fn test_keyed_sum_count_accumulator_creation() {
+        let acc = KeyedSumCountAccumulator::new();
         assert!(acc.sums.is_empty());
     }
 
     #[test]
-    fn test_multiple_sum_accumulator_update() {
-        let mut acc = MultipleSumAccumulator::new();
+    fn test_keyed_sum_count_accumulator_update() {
+        let mut acc = KeyedSumCountAccumulator::new();
 
         let key1 = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
 
@@ -390,25 +440,35 @@ mod tests {
     #[test]
     fn grouped_count_reads_sample_count_and_survives_merge_and_round_trip() {
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
-        let mut first = MultipleSumAccumulator::new();
+        let mut first = KeyedSumCountAccumulator::for_family(ExactKind::Count);
         first.update(key.clone(), 10.0);
         first.update(key.clone(), 20.0);
-        let mut second = MultipleSumAccumulator::new();
+        let mut second = KeyedSumCountAccumulator::for_family(ExactKind::Count);
         second.update(key.clone(), 7.0);
-        let merged = MultipleSumAccumulator::merge_accumulators(vec![first, second]).unwrap();
+        let merged = KeyedSumCountAccumulator::merge_accumulators(vec![first, second]).unwrap();
         for acc in [
             merged.clone(),
-            MultipleSumAccumulator::deserialize_from_json(&merged.serialize_to_json()).unwrap(),
-            MultipleSumAccumulator::deserialize_from_bytes(&merged.serialize_to_bytes()).unwrap(),
+            KeyedSumCountAccumulator::deserialize_from_json(&merged.serialize_to_json()).unwrap(),
+            KeyedSumCountAccumulator::deserialize_from_bytes(&merged.serialize_to_bytes()).unwrap(),
         ] {
-            assert_eq!(acc.query(Statistic::Sum, &key, None).unwrap(), 37.0);
+            assert_eq!(acc.family, ExactKind::Count);
+            assert!(acc.query(Statistic::Sum, &key, None).is_err());
             assert_eq!(acc.query(Statistic::Count, &key, None).unwrap(), 3.0);
         }
     }
 
     #[test]
-    fn test_multiple_sum_accumulator_query() {
-        let mut acc = MultipleSumAccumulator::new();
+    fn keyed_additive_merge_rejects_different_planner_families() {
+        assert!(KeyedSumCountAccumulator::merge_accumulators(vec![
+            KeyedSumCountAccumulator::for_family(ExactKind::Sum),
+            KeyedSumCountAccumulator::for_family(ExactKind::Count),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_keyed_sum_count_accumulator_query() {
+        let mut acc = KeyedSumCountAccumulator::new();
 
         let key = KeyByLabelValues::new_with_labels(vec!["service".to_string()]);
 
@@ -427,8 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_sum_accumulator_get_keys() {
-        let mut acc = MultipleSumAccumulator::new();
+    fn test_keyed_sum_count_accumulator_get_keys() {
+        let mut acc = KeyedSumCountAccumulator::new();
 
         let key1 = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
 
@@ -444,9 +504,9 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_sum_accumulator_merge() {
-        let mut acc1 = MultipleSumAccumulator::new();
-        let mut acc2 = MultipleSumAccumulator::new();
+    fn test_keyed_sum_count_accumulator_merge() {
+        let mut acc1 = KeyedSumCountAccumulator::new();
+        let mut acc2 = KeyedSumCountAccumulator::new();
 
         let key1 = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
 
@@ -457,15 +517,15 @@ mod tests {
 
         acc2.add_sum(key1.clone(), 5.0); // Same key, different accumulator
 
-        let merged = <MultipleSumAccumulator as MergeableAccumulator<MultipleSumAccumulator>>::merge_accumulators(vec![acc1, acc2]).unwrap();
+        let merged = <KeyedSumCountAccumulator as MergeableAccumulator<KeyedSumCountAccumulator>>::merge_accumulators(vec![acc1, acc2]).unwrap();
 
         assert_eq!(merged.sums.get(&key1), Some(&15.0)); // Should be merged
         assert_eq!(merged.sums.get(&key2), Some(&20.0)); // Should be preserved
     }
 
     #[test]
-    fn test_multiple_sum_accumulator_serialization() {
-        let mut acc = MultipleSumAccumulator::new();
+    fn test_keyed_sum_count_accumulator_serialization() {
+        let mut acc = KeyedSumCountAccumulator::new();
 
         let key = KeyByLabelValues::new_with_labels(vec!["service".to_string()]);
 
@@ -473,18 +533,18 @@ mod tests {
 
         // Test JSON serialization
         let json = acc.serialize_to_json();
-        let deserialized = MultipleSumAccumulator::deserialize_from_json(&json).unwrap();
+        let deserialized = KeyedSumCountAccumulator::deserialize_from_json(&json).unwrap();
         assert_eq!(deserialized.sums.get(&key), Some(&42.5));
 
         // Test byte serialization
         let bytes = acc.serialize_to_bytes();
-        let deserialized_bytes = MultipleSumAccumulator::deserialize_from_bytes(&bytes).unwrap();
+        let deserialized_bytes = KeyedSumCountAccumulator::deserialize_from_bytes(&bytes).unwrap();
         assert_eq!(deserialized_bytes.sums.get(&key), Some(&42.5));
     }
 
     #[test]
     fn test_trait_object() {
-        let mut acc = MultipleSumAccumulator::new();
+        let mut acc = KeyedSumCountAccumulator::new();
 
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
 
@@ -493,6 +553,6 @@ mod tests {
         let trait_obj: Box<dyn AggregateCore> = Box::new(acc);
 
         // Test type name through trait object
-        assert_eq!(trait_obj.type_name(), "MultipleSumAccumulator");
+        assert_eq!(trait_obj.type_name(), "KeyedSumCountAccumulator");
     }
 }

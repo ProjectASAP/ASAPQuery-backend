@@ -1,9 +1,9 @@
 use crate::precompute_engine::operators::{
     CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
     CountSketchWithHeapAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
-    HydraKllSketchAccumulator, IncreaseAccumulator, MaxAccumulator, MinAccumulator,
-    MultipleIncreaseAccumulator, MultipleMaxAccumulator, MultipleMinAccumulator,
-    MultipleSumAccumulator, SumAccumulator,
+    HydraKllSketchAccumulator, IncreaseAccumulator, KeyedSumCountAccumulator, MaxAccumulator,
+    MinAccumulator, MultipleIncreaseAccumulator, MultipleMaxAccumulator, MultipleMinAccumulator,
+    SumAccumulator,
 };
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, Measurement,
@@ -379,28 +379,32 @@ impl AccumulatorUpdater for DDSketchAccumulatorUpdater {
 }
 
 // ---------------------------------------------------------------------------
-// MultipleSumAccumulatorUpdater
+// KeyedSumCountAccumulatorUpdater
 // ---------------------------------------------------------------------------
 
-pub struct MultipleSumAccumulatorUpdater {
-    acc: MultipleSumAccumulator,
+pub struct KeyedSumCountAccumulatorUpdater {
+    acc: KeyedSumCountAccumulator,
 }
 
-impl MultipleSumAccumulatorUpdater {
+impl KeyedSumCountAccumulatorUpdater {
     pub fn new() -> Self {
+        Self::for_family(ExactKind::Sum)
+    }
+
+    pub fn for_family(family: ExactKind) -> Self {
         Self {
-            acc: MultipleSumAccumulator::new(),
+            acc: KeyedSumCountAccumulator::for_family(family),
         }
     }
 }
 
-impl Default for MultipleSumAccumulatorUpdater {
+impl Default for KeyedSumCountAccumulatorUpdater {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AccumulatorUpdater for MultipleSumAccumulatorUpdater {
+impl AccumulatorUpdater for KeyedSumCountAccumulatorUpdater {
     fn update_single(&mut self, _value: f64, _timestamp_ms: i64) {
         debug_assert!(
             false,
@@ -415,7 +419,7 @@ impl AccumulatorUpdater for MultipleSumAccumulatorUpdater {
     impl_clone_accumulator_methods!(acc);
 
     fn reset(&mut self) {
-        self.acc = MultipleSumAccumulator::new();
+        self.acc = KeyedSumCountAccumulator::for_family(self.acc.family.clone());
     }
 
     fn is_keyed(&self) -> bool {
@@ -423,7 +427,7 @@ impl AccumulatorUpdater for MultipleSumAccumulatorUpdater {
     }
 
     fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of::<MultipleSumAccumulator>()
+        std::mem::size_of::<KeyedSumCountAccumulator>()
             + self.acc.sums.len() * (std::mem::size_of::<KeyByLabelValues>() + 16)
     }
 }
@@ -1026,7 +1030,7 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
                 "Unknown MultipleSubpopulation sub_type '{}', defaulting to Sum",
                 sub_type
             );
-            return Box::new(MultipleSumAccumulatorUpdater::new());
+            return Box::new(KeyedSumCountAccumulatorUpdater::new());
         }
         Err(AccumulatorSpecError::UnmappedAggregationType(other)) => {
             tracing::warn!(
@@ -1043,9 +1047,12 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         (SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), false) => {
             Box::new(SumAccumulatorUpdater::new())
         }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), true) => {
-            Box::new(MultipleSumAccumulatorUpdater::new())
+        (SummaryFamilyType::ExactAggregate(ExactKind::Sum, _), true) => {
+            Box::new(KeyedSumCountAccumulatorUpdater::for_family(ExactKind::Sum))
         }
+        (SummaryFamilyType::ExactAggregate(ExactKind::Count, _), true) => Box::new(
+            KeyedSumCountAccumulatorUpdater::for_family(ExactKind::Count),
+        ),
 
         // Direction comes off the family itself now. It used to be read
         // back out of `aggregation_sub_type` because Planner had one
@@ -1362,7 +1369,7 @@ mod tests {
 
     #[test]
     fn test_multiple_sum_updater() {
-        let mut updater = MultipleSumAccumulatorUpdater::new();
+        let mut updater = KeyedSumCountAccumulatorUpdater::new();
         assert!(updater.is_keyed());
 
         let key_a = KeyByLabelValues::new_with_labels(vec!["a".to_string()]);
@@ -1372,7 +1379,7 @@ mod tests {
         updater.update_keyed(&key_b, 2.0, 2000);
 
         let acc = updater.take_accumulator();
-        assert_eq!(acc.type_name(), "MultipleSumAccumulator");
+        assert_eq!(acc.type_name(), "KeyedSumCountAccumulator");
     }
 
     #[test]

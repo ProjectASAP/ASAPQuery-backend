@@ -92,8 +92,8 @@ fn reconstruct_exact_agg(
     bytes: &[u8],
 ) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
     use crate::precompute_engine::operators::{
-        IncreaseAccumulator, MaxAccumulator, MinAccumulator, MultipleIncreaseAccumulator,
-        MultipleSumAccumulator, SumAccumulator,
+        IncreaseAccumulator, KeyedSumCountAccumulator, MaxAccumulator, MinAccumulator,
+        MultipleIncreaseAccumulator, SumAccumulator,
     };
     use crate::storage_engines::types::AggregateCore;
     match type_name {
@@ -109,9 +109,11 @@ fn reconstruct_exact_agg(
         "MaxAccumulator" => MaxAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "MultipleSumAccumulator" => MultipleSumAccumulator::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
+        "KeyedSumCountAccumulator" | "MultipleSumAccumulator" => {
+            KeyedSumCountAccumulator::deserialize_from_bytes(bytes)
+                .ok()
+                .map(|a| Box::new(a) as Box<dyn AggregateCore>)
+        }
         "MultipleIncreaseAccumulator" => MultipleIncreaseAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),

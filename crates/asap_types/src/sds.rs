@@ -383,6 +383,9 @@ pub enum SummaryOperator {
     /// Complete planner materialization configuration, including heap/Hydra
     /// dimensions and readout/update subtype. Never equal to a legacy projection.
     Configured {
+        /// Planner-selected semantic family; grouping and pane layout live in
+        /// the data descriptor and summary definition, respectively.
+        family: planner_types::post_asap::SummaryFamilyType,
         aggregation_type: AggregationType,
         aggregation_sub_type: String,
         parameters: BTreeMap<String, Value>,
@@ -598,13 +601,48 @@ impl SummaryDescriptor {
             return Err(SdsError("state schema version must be positive".into()));
         }
         fidelity.validate()?;
+        if let SummaryOperator::Configured {
+            family,
+            aggregation_type,
+            ..
+        } = &operator
+        {
+            if let Some(expected) = aggregation_type.planner_exact_family() {
+                if family != &expected {
+                    return Err(SdsError(
+                        "configured storage type disagrees with Planner family".into(),
+                    ));
+                }
+            } else {
+                use AggregationType as A;
+                let expected = match aggregation_type {
+                    A::DatasketchesKLL | A::HydraKLL => Some(SketchAlgorithm::Kll),
+                    A::CountMinSketch => Some(SketchAlgorithm::Cms),
+                    A::CountMinSketchWithHeap => Some(SketchAlgorithm::CmsWithHeap),
+                    A::CountSketch => Some(SketchAlgorithm::CountSketch),
+                    A::CountSketchWithHeap => Some(SketchAlgorithm::CountSketchWithHeap),
+                    A::DDSketch => Some(SketchAlgorithm::DDSketch),
+                    A::HLL => Some(SketchAlgorithm::Hll),
+                    A::UnivMon => Some(SketchAlgorithm::UnivMon),
+                    _ => None,
+                };
+                if let Some(expected) = expected {
+                    if !matches!(family, planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) if kind.algorithm() == &expected)
+                    {
+                        return Err(SdsError(
+                            "configured sketch storage disagrees with Planner family".into(),
+                        ));
+                    }
+                }
+            }
+        }
         if !fidelity.is_compatible_with(&operator) {
             return Err(SdsError(
                 "summary operator and fidelity guarantee are incompatible".into(),
             ));
         }
         let content = json!({"operator":operator,"fidelity":fidelity,"state_schema_version":state_schema_version});
-        let id = SummaryDescriptorId(format!("summary:v2:{}", canonical(&content)));
+        let id = SummaryDescriptorId(format!("summary:v3:{}", canonical(&content)));
         Ok(Self {
             id,
             operator,
@@ -640,6 +678,10 @@ impl SummaryDescriptor {
         };
         Self::new(
             SummaryOperator::Configured {
+                family: config
+                    .accumulator_spec()
+                    .map_err(|error| SdsError(error.to_string()))?
+                    .family,
                 aggregation_type: config.aggregation_type,
                 aggregation_sub_type: config.aggregation_sub_type.clone(),
                 parameters: config
@@ -1453,6 +1495,7 @@ mod tests {
         .is_err());
         assert!(SummaryDescriptor::new(
             SummaryOperator::Configured {
+                family: AggregationType::Sum.planner_exact_family().unwrap(),
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: BTreeMap::new(),
@@ -1474,6 +1517,24 @@ mod tests {
                 model: "rank.v1".into(),
             },
             1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn configured_descriptor_rejects_family_storage_disagreement() {
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Configured {
+                family: AggregationType::Rate.planner_exact_family().unwrap(),
+                aggregation_type: AggregationType::Increase,
+                aggregation_sub_type: String::new(),
+                parameters: BTreeMap::new(),
+            },
+            FidelityGuarantee::ExactCounter {
+                model: "prometheus.extrapolated-rate.v1".into(),
+                full_pane_coverage_required: true,
+            },
+            2,
         )
         .is_err());
     }
@@ -1533,11 +1594,13 @@ mod tests {
     #[test]
     fn canonical_nested_parameters_and_model_versions_are_identity() {
         let a = SummaryOperator::Configured {
+            family: AggregationType::Sum.planner_exact_family().unwrap(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: BTreeMap::from([("nested".into(), json!({"z":1,"a":2}))]),
         };
         let b = SummaryOperator::Configured {
+            family: AggregationType::Sum.planner_exact_family().unwrap(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: BTreeMap::from([("nested".into(), json!({"a":2,"z":1}))]),
