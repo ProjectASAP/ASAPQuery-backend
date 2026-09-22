@@ -105,7 +105,6 @@ The baseline is merged code, not the completion of open PRs.
 Evidence:
 [selection adapter](../../control_plane/src/planner_selection.rs),
 [physical compiler](../../control_plane/src/physical/compiler.rs),
-[legacy workload adapter](../../control_plane/src/physical/workload_planner.rs),
 [shared QueryPlan](../../crates/asap_types/src/query_plan.rs),
 [query lowering](../../control_plane/src/query_plan.rs), and
 [bound serving executor](../../data_plane/src/query_engines/asap_query_engine/post_asap_readout.rs).
@@ -240,6 +239,11 @@ session-wide. Shared state also does not make separate errors independent.
 
 ## Capabilities, costs and feedback
 
+The [evidence-dependent candidate design](evidence-dependent-candidates.md)
+defines the #761 decision flow against Planner #455: retain unknown alternatives,
+validate backend-scoped evidence, perform logical selection, then require
+physical admission. Logical selection alone does not approve deployment.
+
 Capabilities answer **can this deployment faithfully execute this alternative?**
 Costs answer **which feasible alternative is preferable?**
 
@@ -254,8 +258,10 @@ Costs answer **which feasible alternative is preferable?**
 Costs include initialization, ingestion updates, overlapping/retained state,
 transmission, storage, merges, readouts, recurring queries, and shared producer
 construction once. Compare alternatives over the same data and demand scope.
-Missing evidence is not zero cost; stale or incomplete implementation evidence
-cannot justify selection.
+Missing evidence is not zero cost. Explicit qualitative ranking may propose a
+logical alternative without a numeric candidate cost; publication still needs
+a complete workload quote. Stale or incomplete deployment evidence cannot
+justify admission.
 
 Runtime observations reference the concrete binding and selected semantic
 producer. Physical controls may vary only within already-authorized

@@ -22,7 +22,14 @@ than publishing a biased partial snapshot. Profiles with too few benchmark
 events, poor fit, ambiguous confidence, or excessive cardinality/parameter
 distance are misses.
 
-On a hit, empirical parameters and measured atomic costs are used. On a miss,
+On a hit, empirical parameters and measured atomic costs inform planning, but
+do not independently certify accuracy. Under the
+[evidence-dependent admission policy](evidence-dependent-candidates.md), ERP v1
+observed errors lack a calibrated failure probability, and HLL RSE alone is not
+a tail bound. Readouts without an independent valid guarantee use exact
+execution. Shape matching cannot waive this requirement.
+
+On a miss,
 malformed evidence, or drift, Hybrid mode retains the theoretical parameters;
 if the runtime cannot deploy them or they exceed its memory limit, compilation
 chooses exact execution. Empirical-only mode fails closed.
