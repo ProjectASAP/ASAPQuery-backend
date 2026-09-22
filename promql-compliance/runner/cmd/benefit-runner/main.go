@@ -132,8 +132,19 @@ func run() error {
 	backend := runner.HTTPQueryTarget{BaseURL: *backendURL, BackendTarget: true}
 	vm := runner.HTTPQueryTarget{BaseURL: *vmURL}
 	level2 := runner.CompareSuite(ctx, prom, backend, suite, dataset.Name, base)
+	if err := os.MkdirAll(filepath.Dir(*output), 0o755); err != nil {
+		return err
+	}
+	semanticPath := strings.TrimSuffix(*output, ".json") + ".semantic.json"
+	semanticJSON, err := json.MarshalIndent(level2, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(semanticPath, semanticJSON, 0o644); err != nil {
+		return err
+	}
 	if !level2.Passed {
-		return fmt.Errorf("level-2 semantic comparison failed; benchmark invalid")
+		return fmt.Errorf("level-2 semantic comparison failed; inspect %s", semanticPath)
 	}
 	if err := verifyBaselines(ctx, suite, base, prom, vm, *chURL); err != nil {
 		return err
