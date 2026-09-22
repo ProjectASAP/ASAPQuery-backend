@@ -4,6 +4,35 @@ Audience: backend developers and reviewers of issue #762 / PR #763.
 
 The selected ASAPPlanner post-ASAP DAG owns computation semantics. The backend installs physical bindings and executes two projections: raw-source producers in streaming workers, and maintenance subgraphs over materialized inputs. **Current parallelism is across worker-owned state partitions. A single maintenance subgraph executes its nodes sequentially in dependency order. There is no general parallel DAG task scheduler in this implementation.**
 
+## Relationship to the v1 design in PR #737
+
+This implementation is stacked on the [plan split design](asapplanner-integration.md)
+and [SDS storage design](summary-catalog-sds-architecture.md). Those documents
+own the target contract; this document describes the runtime implemented by
+PR #763 and its remaining migration boundaries.
+
+V1 has two stored data objects: `SummaryDefinition` (shared semantics) and
+`StoredSummary` (instance metadata plus payload). One `SummaryStore` owns the
+logical `summary_definitions` and `stored_summaries` tables. There is no separate
+`SummaryMetadataStore` or `SummaryPayloadStore`. `StoredOutputReference` belongs
+to the installed plan and names a persisted producer output; it is not a third
+stored object. The target concrete record key is
+`(plan_version, stored_output_id, population_key, window)`.
+
+| #737 target | #763 implementation and boundary |
+| --- | --- |
+| Planner family is preserved from producer through stored state and readout | Implemented for the supported paths: exact families remain distinct, and incompatible state/readout bindings fail. |
+| One store owns definitions and stored records | Reuses the existing `SketchStore` and its catalog, indexes and payload persistence. It adds no independent metadata/payload stores. Existing descriptor structures have not yet been collapsed into the target two-table representation. |
+| Matching writer/reader output references | Uses existing definition/node bindings, catalog generations, physical `sid`s and window keys. These are current implementation identities, not aliases for the target `stored_output_id` or composite record key. Their migration requires explicit binding changes. |
+| Separate executable PrecomputePlan and QueryPlan subgraphs | Raw producers and maintenance sinks are executed through validated bindings, and query execution follows its query projection. The installed precompute artifact still carries selected DAG documents that can include query-only nodes; execution excludes those nodes, but the artifact split required by #737 / issue #740 is not completed here. |
+
+`PrecomputeMaterialization` below is current physical binding metadata, not a
+third SDS record type. The existing `BackendNodeBinding::Materialization` marker
+means that a DAG output is stored. Do not infer completion of the #737 storage
+or plan-artifact migration from those current Rust names or from catalog schema
+version 3. This PR supplies the precompute execution/family foundation, not the
+entire v1 implementation.
+
 ## 1. What is installed
 
 `PrecomputePlan` contains the selected executable DAG documents, Planner node IDs, dependency edges, operator payloads, and `BackendExecutableBinding` records. Bindings identify stored summary definitions and precompute sinks; physical materializations attach window, population, routing, and storage metadata. Query execution uses the corresponding query projection and reads stored summaries at these explicit boundaries.
