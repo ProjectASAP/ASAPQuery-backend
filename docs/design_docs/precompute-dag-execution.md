@@ -8,12 +8,29 @@ stored outputs consumed by query plans. The [plan split](asapplanner-integration
 and [SDS contract](summary-catalog-sds-architecture.md) define the compiler and
 storage contracts used here.
 
-## 1. Intuition: compute once, store the selected outputs, read them later
+## 1. Intuition: compute once, reuse across queries, amortize the cost
 
-Consider two queries asking for p50 and p99 request latency by service over the
-same five-minute range. If Planner selects one shared KLL producer, precompute
-builds that KLL state once per service and scheduled window. The query engine
-reads the same stored state and applies the requested percentile readout.
+Precompute performs shared work ahead of query execution and stores its selected
+outputs. Later queries reuse those outputs repeatedly, amortizing the cost of
+constructing and maintaining them across the queries they serve. The purpose is
+to reduce both total resource cost and query latency: repeated queries avoid
+repeating expensive input scans and computation, while the work left on the
+query path is a stored-state read and the remaining query operators.
+
+For example, repeated p50 and p99 requests for request latency by service over
+the same five-minute range can share one Planner-selected KLL producer.
+Precompute builds the KLL state once per service and scheduled window. Every
+compatible request then reads that stored state and applies its percentile
+readout, rather than scanning the samples and rebuilding the summary for each
+request. Reuse applies both to repeated executions of a query and to different
+queries that share the selected output.
+
+Over a workload, the resource cost is the cost of construction, maintenance and
+storage plus the reads and remaining query computation. Reuse must save enough
+repeated work to offset those costs; this is what makes precomputation worthwhile.
+Once the required output is ready, query latency excludes its construction work.
+“Compute once” refers to a particular output, population and window: subsequent
+windows still require construction or updates under the selected schedule.
 
 The physical compiler splits the selected DAG at its stored outputs:
 
