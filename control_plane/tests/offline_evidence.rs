@@ -79,7 +79,7 @@ fn offline_frequency_error_budget_changes_configuration() {
     let AggIntent::Extension { ext_kind, payload } = &intent else {
         unreachable!()
     };
-    let asap_aware_mapping::Implementation::Sketch(selected) =
+    let asap_aware_mapping::Realization::Sketch(selected) =
         empirical.realize_extension(ext_kind, payload)
     else {
         panic!(
@@ -157,7 +157,7 @@ fn offline_frequency_comparison_falls_back_when_inapplicable() {
         assert!(
             matches!(
                 empirical.realize_extension(&ext_kind, &payload),
-                asap_aware_mapping::Implementation::PassThrough
+                asap_aware_mapping::Realization::PassThrough
             ),
             "{scenario}"
         );

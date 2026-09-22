@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::debug;
 
 use asap_types::query_requirements::QueryRequirements;
 use asap_types::KeyByLabelNames;
@@ -64,6 +65,95 @@ mod readiness_coverage_tests {
 }
 
 #[cfg(test)]
+mod forwarding_policy_tests {
+    use super::ASAPQueryEngine;
+    use crate::query_engines::asap_query_engine::test_plan;
+    use crate::query_engines::routing::query_engine_routing::QueryEngine;
+    use crate::query_engines::{EngineError, QueryForwardingPolicy};
+    use crate::storage_engines::sketch_db::index::SketchStore;
+    use asap_types::query_plan::{
+        ExternalExactOutput, ExternalExactRequest, FallbackPolicy, InstantExecution, QueryLanguage,
+        QueryNodeId, QueryPlanEntry, QueryPlanNode,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn disabled_policy_blocks_an_installed_exact_plan_before_http() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/query",
+            axum::routing::get(move || {
+                let captured = captured.clone();
+                async move {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "status":"success",
+                        "data":{"resultType":"vector","result":[]}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let query = "sum(rate(m[5m]))";
+        let canonical = asap_types::query_plan::canonical_promql(query).unwrap();
+        let entry = QueryPlanEntry {
+            language: QueryLanguage::PromQl,
+            query_id: canonical.clone(),
+            canonical_query: canonical,
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([(
+                QueryNodeId(0),
+                QueryPlanNode::ExternalExact {
+                    request: ExternalExactRequest {
+                        language: QueryLanguage::PromQl,
+                        expression: query.into(),
+                        output: ExternalExactOutput::InstantVector,
+                        parameters: BTreeMap::new(),
+                        start_parameter: None,
+                        end_parameter: None,
+                        input_contracts: vec![],
+                    },
+                    inputs: vec![],
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let index = Arc::new(SketchStore::new());
+        let active = test_plan::install(&index, &[], vec![entry]);
+        let enabled = ASAPQueryEngine::new(15_000)
+            .with_active_physical_plan(active.clone())
+            .with_exact_subquery_endpoint(endpoint.clone());
+        enabled.execute_at(query, 1_000).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let engine = ASAPQueryEngine::new(15_000)
+            .with_active_physical_plan(active)
+            .with_exact_subquery_endpoint(endpoint)
+            .with_query_forwarding_policy(QueryForwardingPolicy::Disabled);
+        let result = engine.execute_at(query, 1_000).await;
+        assert!(
+            matches!(result, Err(EngineError::CapabilityMiss { .. })),
+            "{result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+}
+
+#[cfg(test)]
 use crate::storage_engines::types::KeyByLabelValues;
 #[cfg(test)]
 use crate::AggregateCore;
@@ -89,6 +179,7 @@ pub struct ASAPQueryEngine {
     active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
     exact_subquery_endpoint: Option<String>,
     metricsql_exact_subquery_endpoint: Option<String>,
+    query_forwarding_policy: crate::query_engines::QueryForwardingPolicy,
     exact_subquery_client: reqwest::Client,
 }
 
@@ -155,6 +246,7 @@ impl ASAPQueryEngine {
             active_physical_plan: None,
             exact_subquery_endpoint: None,
             metricsql_exact_subquery_endpoint: None,
+            query_forwarding_policy: crate::query_engines::QueryForwardingPolicy::Enabled,
             exact_subquery_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
@@ -169,6 +261,14 @@ impl ASAPQueryEngine {
 
     pub fn with_metricsql_exact_subquery_endpoint(mut self, endpoint: String) -> Self {
         self.metricsql_exact_subquery_endpoint = Some(endpoint);
+        self
+    }
+
+    pub fn with_query_forwarding_policy(
+        mut self,
+        policy: crate::query_engines::QueryForwardingPolicy,
+    ) -> Self {
+        self.query_forwarding_policy = policy;
         self
     }
     async fn prepare_query_inputs(
@@ -225,11 +325,40 @@ impl ASAPQueryEngine {
                 },
             );
         }
+        if !self.query_forwarding_policy.allows_external_queries()
+            && entry.nodes.values().any(|node| {
+                matches!(
+                    node,
+                    asap_types::query_plan::QueryPlanNode::ExternalExact { .. }
+                )
+            })
+        {
+            debug!(
+                language = ?entry.language,
+                query_id = %entry.query_id,
+                "query forwarding disabled; external exact subquery blocked"
+            );
+            crate::drivers::query::servers::metrics::record_query_forwarding_blocked(
+                match entry.language {
+                    asap_types::QueryLanguage::MetricsQl => "victoriametrics",
+                    _ => "prometheus",
+                },
+                "exact_subquery",
+            );
+        }
         super::exact_subqueries::prepare_external(
             entry,
             times,
-            self.exact_subquery_endpoint.as_deref(),
-            self.metricsql_exact_subquery_endpoint.as_deref(),
+            if self.query_forwarding_policy.allows_external_queries() {
+                self.exact_subquery_endpoint.as_deref()
+            } else {
+                None
+            },
+            if self.query_forwarding_policy.allows_external_queries() {
+                self.metricsql_exact_subquery_endpoint.as_deref()
+            } else {
+                None
+            },
             &self.exact_subquery_client,
             prepared,
         )

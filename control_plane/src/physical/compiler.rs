@@ -3426,9 +3426,9 @@ fn shared_pane_origin_ms(
                 "shared pane-only summary consumer {index} has unknown evaluation phase"
             ));
         };
-        let binding = planner_types::post_asap::plan_pane_phase(demand, pane_width_ms)
+        let layout = planner_types::post_asap::plan_pane_phase(demand, pane_width_ms)
             .map_err(|error| format!("invalid pane phase for consumer {index}: {error:?}"))?;
-        let origin = binding.pane_origin_ms.ok_or_else(|| {
+        let origin = layout.pane_origin_ms.ok_or_else(|| {
             format!("shared pane-only summary consumer {index} has unknown evaluation phase")
         })?;
         let phase = origin.rem_euclid(pane_width);

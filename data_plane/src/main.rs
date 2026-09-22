@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use std::fs;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::signal;
 use tracing::{error, info, warn};
 
@@ -154,6 +155,10 @@ struct Args {
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
     forward_unsupported_queries: bool,
+
+    /// Disable all external query forwarding for isolated tests.
+    #[arg(long)]
+    disable_query_forwarding: bool,
 
     /// Database path (currently unused, kept for compatibility)
     #[arg(long, default_value = "sketchdb.db")]
@@ -382,7 +387,40 @@ struct Args {
     backend_storage_routing: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Error)]
+enum QueryForwardingConfigError {
+    #[error("--disable-query-forwarding conflicts with --forward-unsupported-queries")]
+    ConflictingFlags,
+    #[error("--profile asapquery requires query forwarding and cannot be combined with --disable-query-forwarding")]
+    AsapqueryRequiresForwarding,
+    #[error("--disable-query-forwarding cannot be combined with --victoriametrics-http-port")]
+    VictoriaMetricsListenerConfigured,
+    #[error("--disable-query-forwarding cannot be combined with --clickhouse-http-port")]
+    ClickHouseListenerConfigured,
+}
+
+fn validate_query_forwarding_configuration(
+    args: &Args,
+) -> std::result::Result<(), QueryForwardingConfigError> {
+    if args.disable_query_forwarding {
+        if args.forward_unsupported_queries {
+            return Err(QueryForwardingConfigError::ConflictingFlags);
+        }
+        if args.profile == RuntimeProfile::Asapquery {
+            return Err(QueryForwardingConfigError::AsapqueryRequiresForwarding);
+        }
+        if args.victoriametrics_http_port.is_some() {
+            return Err(QueryForwardingConfigError::VictoriaMetricsListenerConfigured);
+        }
+        if args.clickhouse_http_port.is_some() {
+            return Err(QueryForwardingConfigError::ClickHouseListenerConfigured);
+        }
+    }
+    Ok(())
+}
+
 fn validate_profile(args: &Args) -> Result<()> {
+    validate_query_forwarding_configuration(args)?;
     if args.profile != RuntimeProfile::Asapquery {
         if args.streaming_config.is_none() {
             return Err("the distributed profile requires --streaming-config".into());
@@ -757,9 +795,18 @@ async fn main() -> Result<()> {
     // query engine so SeriesLookup classification drives the Phase 6 archive
     // failover via EngineError::CapabilityMiss when the ASAP tier is empty /
     // ghost / unknown.
+    let query_forwarding_policy = if args.disable_query_forwarding {
+        data_plane::query_engines::QueryForwardingPolicy::Disabled
+    } else {
+        data_plane::query_engines::QueryForwardingPolicy::Enabled
+    };
+    if !query_forwarding_policy.allows_external_queries() {
+        info!("query forwarding disabled for this process");
+    }
     let engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
         .with_sketch_index(summary_store.clone())
         .with_active_physical_plan(active_physical_plan.clone())
+        .with_query_forwarding_policy(query_forwarding_policy)
         .with_exact_subquery_endpoint(args.prometheus_server.clone())
         .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
 
@@ -1013,7 +1060,8 @@ async fn main() -> Result<()> {
     let adapter_config = AdapterConfig::prometheus_promql(
         args.prometheus_server.clone(),
         args.forward_unsupported_queries,
-    );
+    )
+    .with_query_forwarding_policy(query_forwarding_policy);
 
     let http_config = HttpServerConfig {
         port: args.http_port,
@@ -1527,5 +1575,72 @@ mod tests {
             cfg.fallback.is_some(),
             "forward_unsupported=true must install the Prom fallback",
         );
+    }
+
+    #[test]
+    fn disable_query_forwarding_rejects_conflicting_flags() {
+        let args = Args::try_parse_from([
+            "data_plane",
+            "--streaming-config",
+            "streaming.yaml",
+            "--disable-query-forwarding",
+            "--forward-unsupported-queries",
+        ])
+        .unwrap();
+        assert!(validate_profile(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts"));
+    }
+
+    #[test]
+    fn disable_query_forwarding_rejects_forwarding_listeners() {
+        let args = Args::try_parse_from([
+            "data_plane",
+            "--streaming-config",
+            "streaming.yaml",
+            "--disable-query-forwarding",
+            "--victoriametrics-http-port",
+            "8429",
+        ])
+        .unwrap();
+        assert!(validate_profile(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("victoriametrics-http-port"));
+    }
+
+    #[test]
+    fn disable_query_forwarding_rejects_clickhouse_listener() {
+        let clickhouse = Args::try_parse_from([
+            "data_plane",
+            "--streaming-config",
+            "streaming.yaml",
+            "--disable-query-forwarding",
+            "--clickhouse-http-port",
+            "8124",
+        ])
+        .unwrap();
+        assert!(validate_profile(&clickhouse)
+            .unwrap_err()
+            .to_string()
+            .contains("clickhouse-http-port"));
+    }
+
+    #[test]
+    fn disable_query_forwarding_rejects_asapquery_profile() {
+        let args = Args::try_parse_from([
+            "data_plane",
+            "--profile",
+            "asapquery",
+            "--physical-plan",
+            "plan.json",
+            "--disable-query-forwarding",
+        ])
+        .unwrap();
+        assert!(validate_profile(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("requires query forwarding"));
     }
 }
