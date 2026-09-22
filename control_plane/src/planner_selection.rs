@@ -100,7 +100,7 @@ fn summary_identity(node: &SummaryNode) -> Option<String> {
         let hash = explain_identity(
             "summary_node",
             &serde_json::json!({
-            "operator": node.operator, "payload": node.payload, "state": node.output_state,
+            "payload": node.payload, "state": node.output_state,
             "schema": node.output_schema, "guarantee": node.guarantee, "inputs": inputs}),
         );
         memo.insert(id, hash.clone());

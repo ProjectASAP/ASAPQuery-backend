@@ -7074,6 +7074,17 @@ pub(crate) mod tests {
             &query_plan,
         )
         .unwrap();
+        // A valid plan-local slot cannot be read until its query binding agrees.
+        let mut rebound_writer = bundle.precompute_plan.clone();
+        rebound_writer.schemas[0].state_reference.state_slot_id = asap_types::sds::StateSlotId(123);
+        rebound_writer
+            .validate_against_catalog(&bundle.summary_catalog)
+            .unwrap();
+        assert!(asap_types::plan_publication::validate_state_references(
+            &rebound_writer,
+            &query_plan,
+        )
+        .is_err());
     }
 
     #[test]

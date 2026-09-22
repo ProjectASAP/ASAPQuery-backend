@@ -305,8 +305,7 @@ mod tests {
             0
         )
         .is_err());
-        quote.framework =
-            SummaryWindowFramework::Extension("backend.exact-hierarchical-rollup.v1".into());
+        quote.framework = SummaryWindowFramework::ExponentialHistogram;
         quote.layout = WindowMaterializationLayout::HierarchicalRollup {
             base_pane_secs: 10,
             levels_secs: vec![30],

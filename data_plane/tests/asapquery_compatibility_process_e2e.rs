@@ -211,7 +211,6 @@ fn is_warm(response: &Value) -> bool {
 // Measured ERP parameters must reach the real accumulator and answer held-out
 // raw samples through the installed QueryPlan, without native fallback.
 #[tokio::test]
-#[ignore = "fixture has stale physical lifecycle evidence"]
 async fn erp_measured_kll_state_to_query_oracle() {
     use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
@@ -236,6 +235,7 @@ async fn erp_measured_kll_state_to_query_oracle() {
         "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
     });
     let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+    let window_model = snapshot.physical_inputs.window_cost_model.clone();
     let (mut request, mut environment) = snapshot.into_physical_compilation_request().unwrap();
     request.allow_mixed_summary_and_exact_execution = false;
     request.queries[0].group_by_labels = vec!["service".into()];
@@ -250,6 +250,13 @@ async fn erp_measured_kll_state_to_query_oracle() {
     environment.target =
         control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
     environment.target_collector_ids = vec!["erp-collector".into()];
+    control_plane::physical::compiler::prepare_window_implementations(
+        &mut request.queries[0],
+        &window_model,
+        environment.target,
+        request.query_retention_margin_ms,
+    )
+    .unwrap();
     let plan = PhysicalPlanCompiler
         .compile_promql(request, environment)
         .unwrap();

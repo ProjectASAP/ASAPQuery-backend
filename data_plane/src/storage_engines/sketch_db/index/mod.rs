@@ -1245,7 +1245,7 @@ impl SketchStore {
         &self,
         reporter_id: &str,
         storage_node_id: &str,
-        producers: &BTreeMap<SummaryDefinitionId, String>,
+        producers: &BTreeMap<SummaryDefinitionId, (asap_types::sds::StateSlotId, String)>,
         inventory_version: u64,
         observed_at_ms: i64,
     ) -> Result<ObservedSummaryInventory, String> {
@@ -1278,10 +1278,8 @@ impl SketchStore {
             {
                 continue;
             }
-            let producer_id = producers
-                .get(&summary_definition_id)
-                .map(String::as_str)
-                .ok_or_else(|| {
+            let (state_slot_id, producer_id) =
+                producers.get(&summary_definition_id).ok_or_else(|| {
                     format!(
                         "materialization {} has no producer in the active PrecomputePlan",
                         summary_definition_id.as_u64()
@@ -1321,10 +1319,7 @@ impl SketchStore {
                 .map_err(|error| error.to_string())?;
                 let instance = SummaryInstance {
                     instance_id: instance_id.clone(),
-                    state_slot_id: asap_types::sds::StateReference::for_definition(
-                        summary_definition_id,
-                    )
-                    .state_slot_id,
+                    state_slot_id: *state_slot_id,
                     summary_definition_id,
                     summary_descriptor_id: binding.summary_descriptor.id().clone(),
                     data_descriptor_id: binding.data_descriptor.id().clone(),
@@ -1333,7 +1328,7 @@ impl SketchStore {
                     catalog_generation: generation.clone(),
                     reused_from_generation: reused_from_generation.clone(),
                     placement: SummaryPlacement {
-                        producer_id: producer_id.into(),
+                        producer_id: producer_id.clone(),
                         storage_node_id: storage_node_id.into(),
                     },
                     state_reference: SummaryStateReference {
@@ -3846,7 +3841,7 @@ mod tests {
 
         let producers = BTreeMap::from([(
             SummaryDefinitionId::from(fingerprint),
-            "producer-a".to_string(),
+            (asap_types::sds::StateSlotId(99), "producer-a".to_string()),
         )]);
         let inventory = store
             .observed_summary_inventory("backend-a", "store-a", &producers, 1, 100)
@@ -3855,11 +3850,7 @@ mod tests {
         assert_eq!(inventory.instances.len(), 2);
         let instance = inventory.instances.values().next().unwrap();
         assert_eq!(instance.summary_definition_id.fingerprint(), fingerprint);
-        assert_eq!(
-            instance.state_slot_id,
-            asap_types::sds::StateReference::for_definition(instance.summary_definition_id)
-                .state_slot_id
-        );
+        assert_eq!(instance.state_slot_id, asap_types::sds::StateSlotId(99));
         assert_eq!(instance.status, SummaryInstanceStatus::Ready);
         assert_eq!(instance.completeness, InstanceCompleteness::Unknown);
         assert!(!instance.group_values.is_empty());
@@ -3912,7 +3903,10 @@ mod tests {
         store.register(meta_with_policy(42, fingerprint));
         let producers = BTreeMap::from([(
             SummaryDefinitionId::from(fingerprint),
-            "producer-a".to_string(),
+            (
+                asap_types::sds::StateReference::for_definition(fingerprint.into()).state_slot_id,
+                "producer-a".to_string(),
+            ),
         )]);
         let inventory = store
             .observed_summary_inventory("backend-a", "store-a", &producers, 1, 100)
@@ -5122,7 +5116,14 @@ mod tests {
             .observed_summary_inventory(
                 "backend-a",
                 "store-a",
-                &BTreeMap::from([(SummaryDefinitionId::from(fingerprint), "producer-a".into())]),
+                &BTreeMap::from([(
+                    SummaryDefinitionId::from(fingerprint),
+                    (
+                        asap_types::sds::StateReference::for_definition(fingerprint.into())
+                            .state_slot_id,
+                        "producer-a".into(),
+                    ),
+                )]),
                 1,
                 100,
             )
@@ -5308,7 +5309,13 @@ mod tests {
         assert!(!store.completed_windows.read().unwrap().contains_key(&850));
         std::fs::remove_dir(writer.path()).unwrap();
         store.seal_finite_summary_input(&generation).unwrap();
-        let producers = BTreeMap::from([(fingerprint.into(), "producer".to_string())]);
+        let producers = BTreeMap::from([(
+            fingerprint.into(),
+            (
+                asap_types::sds::StateReference::for_definition(fingerprint.into()).state_slot_id,
+                "producer".to_string(),
+            ),
+        )]);
         let inventory = store
             .observed_summary_inventory("backend", "store", &producers, 1, 30_000)
             .unwrap();
@@ -5544,7 +5551,13 @@ mod tests {
             .unwrap();
         let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
         let definition_id = SummaryDefinitionId::from(fingerprint);
-        let producers = BTreeMap::from([(definition_id, "producer-a".to_string())]);
+        let producers = BTreeMap::from([(
+            definition_id,
+            (
+                asap_types::sds::StateReference::for_definition(definition_id).state_slot_id,
+                "producer-a".to_string(),
+            ),
+        )]);
         let tmp = tempfile::TempDir::new().unwrap();
         let disk = tmp.path().to_path_buf();
         let mut metadata = meta_with_policy(506, fingerprint);

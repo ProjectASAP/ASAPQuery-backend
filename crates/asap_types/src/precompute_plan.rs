@@ -788,9 +788,11 @@ impl PrecomputePlan {
             }
         }
         let mut schema_ids = BTreeSet::new();
+        let mut state_slots = BTreeSet::new();
         for schema in &self.schemas {
             if schema.schema_id.trim().is_empty()
                 || !schema_ids.insert(schema.schema_id.as_str())
+                || !state_slots.insert(schema.state_reference.state_slot_id)
                 || schema.schema_version == 0
                 || schema.encodings.is_empty()
                 || schema.state_reference.validate().is_err()
@@ -1034,7 +1036,6 @@ mod source_window_cohort_tests {
         config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
         let mut node = ExecutableDagNode {
             id: PostAsapNodeId(1),
-            operator: ExecutableOperator::SummaryAgg,
             payload: ExecutableOperatorPayload::SummaryAgg {
                 family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 input: SummaryUpdate {

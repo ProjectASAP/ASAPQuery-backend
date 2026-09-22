@@ -68,6 +68,8 @@ pub struct StateReference {
 }
 
 impl StateReference {
+    /// Deterministic slot allocation for a shared producer keyed by its
+    /// definition. Validation also permits other compiler-assigned slots.
     pub fn for_definition(definition_id: SummaryDefinitionId) -> Self {
         Self {
             state_slot_id: StateSlotId(definition_id.as_u64()),
@@ -76,12 +78,10 @@ impl StateReference {
     }
 
     pub fn validate(&self) -> Result<(), SdsError> {
-        if *self == Self::for_definition(self.definition_id) {
+        if self.state_slot_id.0 != 0 {
             Ok(())
         } else {
-            Err(SdsError(
-                "state slot differs from its definition binding".into(),
-            ))
+            Err(SdsError("state slot must be nonzero".into()))
         }
     }
 }
@@ -330,9 +330,7 @@ pub struct SummaryInstance {
 
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
-        if self.state_slot_id
-            != StateReference::for_definition(self.summary_definition_id).state_slot_id
-        {
+        if self.state_slot_id.0 == 0 {
             return Err(SdsError(
                 "summary instance has an invalid state slot".into(),
             ));
@@ -1354,16 +1352,21 @@ mod tests {
     }
 
     #[test]
-    fn state_slot_and_plan_version_must_match_instance_definition() {
+    fn state_slot_is_plan_scoped_and_payload_version_must_match_instance() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
-        instance.state_slot_id = StateSlotId(8);
+        instance.state_slot_id = StateSlotId(0);
         assert!(instance.validate().is_err());
+        instance.state_slot_id = StateSlotId(7);
+        instance.state_slot_id = StateSlotId(8);
+        instance.validate().unwrap();
         instance.state_slot_id = StateSlotId(7);
         instance.state_reference.generation = 3;
         assert!(instance.validate().is_err());
         let mut reference = StateReference::for_definition(instance.summary_definition_id);
-        reference.state_slot_id = StateSlotId(8);
+        reference.state_slot_id = StateSlotId(0);
         assert!(reference.validate().is_err());
+        reference.state_slot_id = StateSlotId(8);
+        reference.validate().unwrap();
     }
 
     #[test]

@@ -6018,12 +6018,30 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
         .producers
         .iter()
         .map(|producer| {
-            (
-                asap_types::sds::SummaryDefinitionId::from(producer.materialization),
-                producer.producer_id.clone(),
-            )
+            let definition = asap_types::sds::SummaryDefinitionId::from(producer.materialization);
+            active
+                .precompute_plan
+                .schemas
+                .iter()
+                .find(|schema| schema.materialization == definition)
+                .map(|schema| {
+                    (
+                        definition,
+                        (
+                            schema.state_reference.state_slot_id,
+                            producer.producer_id.clone(),
+                        ),
+                    )
+                })
         })
-        .collect();
+        .collect::<Option<std::collections::BTreeMap<_, _>>>();
+    let Some(producers) = producers else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"status":"error","error":"precompute producer has no state-slot binding"})),
+        )
+            .into_response();
+    };
     let reporter = std::env::var("HOSTNAME").unwrap_or_else(|_| "asapquery-backend".into());
     match state.summary_store.observed_summary_inventory(
         &reporter,

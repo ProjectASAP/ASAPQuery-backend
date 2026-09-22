@@ -10,9 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sds::SummaryDefinitionId;
 use planner_types::post_asap::{
-    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutableOperator,
-    ExecutionDataState, ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId,
-    WindowEdgeCompatibility,
+    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutionDataState,
+    ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId, WindowEdgeCompatibility,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +43,6 @@ pub struct OwnedPostAsapDag {
 #[serde(deny_unknown_fields)]
 pub struct OwnedPostAsapNode {
     pub id: PostAsapNodeId,
-    pub operator: ExecutableOperator,
     pub payload: serde_json::Value,
     pub output_state: ExecutionDataState,
     pub output_schema: serde_json::Value,
@@ -71,7 +69,6 @@ impl OwnedPostAsapDag {
             .map(|node| {
                 Ok(OwnedPostAsapNode {
                     id: node.id,
-                    operator: node.operator,
                     payload: serde_json::to_value(&node.payload).map_err(|e| e.to_string())?,
                     output_state: node.output_state,
                     output_schema: serde_json::to_value(&node.output_schema)
@@ -139,15 +136,8 @@ impl OwnedPostAsapDag {
             .map(|node| {
                 let payload: planner_types::post_asap::ExecutableOperatorPayload =
                     serde_json::from_value(node.payload.clone()).map_err(|e| e.to_string())?;
-                if payload.operator() != node.operator {
-                    return Err(format!(
-                        "post-ASAP node {} operator disagrees with payload",
-                        node.id.0
-                    ));
-                }
                 Ok(ExecutableDagNode {
                     id: node.id,
-                    operator: node.operator,
                     payload,
                     output_state: node.output_state,
                     output_schema: serde_json::from_value(node.output_schema.clone())

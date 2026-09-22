@@ -198,8 +198,8 @@ mod tests {
     use super::*;
     use planner_types::post_asap::{EdgeRole, ExecutionDataState};
     use planner_types::post_asap::{
-        ExecutableDagEdge, ExecutableOperator, ExecutableOperatorPayload,
-        GroupingEdgeCompatibility, SummarySchema, WindowEdgeCompatibility,
+        ExecutableDagEdge, ExecutableOperatorPayload, GroupingEdgeCompatibility, SummarySchema,
+        WindowEdgeCompatibility,
     };
     use std::sync::Mutex;
 
@@ -253,7 +253,6 @@ mod tests {
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
             id: PostAsapNodeId(id),
-            operator: ExecutableOperator::SummarySubtract,
             payload: ExecutableOperatorPayload::SummarySubtract,
             output_state: ExecutionDataState::MAINTENANCE_SUMMARY,
             output_schema: SummarySchema {
@@ -348,7 +347,6 @@ mod tests {
             }
         }
         let mut binary = node(3);
-        binary.operator = ExecutableOperator::Binary;
         binary.payload = ExecutableOperatorPayload::Binary {
             timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
             operator: BinaryOperator {
