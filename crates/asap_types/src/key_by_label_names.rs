@@ -2,7 +2,7 @@
 //!
 //! Formerly `promql_utilities::data_model::key_by_label_names` — moved
 //! here for the same reason as [`crate::Statistic`]: `asap_types`
-//! (`AggregationConfig::grouping_labels`, `PolicyFingerprint`,
+//! (`PrecomputeMaterialization::grouping_labels`, `PolicyFingerprint`,
 //! `PolicyRegistry`, `capability_matching`) is its real center of
 //! gravity and the shared foundation both `control_plane`'s ecosystem
 //! and `data_plane` can depend on without a cycle. Closer to a runtime

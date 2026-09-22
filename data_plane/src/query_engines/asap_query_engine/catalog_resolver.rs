@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use asap_types::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
 use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor, SummaryOperator};
 use asap_types::summary_catalog::SummaryCatalog;
-use asap_types::AggregationType;
+use planner_types::post_asap::{SketchAlgorithm, SummaryFamilyType};
 
 use crate::query_engines::EngineError;
 
@@ -51,64 +51,40 @@ impl ResolvedMaterialization<'_> {
         matches!(
             &self.summary.operator,
             SummaryOperator::Configured {
-                aggregation_type: AggregationType::Sum
-                    | AggregationType::MultipleSum
-                    | AggregationType::Increase
-                    | AggregationType::MultipleIncrease
-                    | AggregationType::Min
-                    | AggregationType::Max
-                    | AggregationType::MultipleMin
-                    | AggregationType::MultipleMax,
+                family: SummaryFamilyType::ExactAggregate(..),
                 ..
             }
         )
     }
 
     fn supports(&self, node: &QueryPlanNode) -> bool {
-        let SummaryOperator::Configured {
-            aggregation_type,
-            aggregation_sub_type,
-            ..
-        } = &self.summary.operator
-        else {
+        let SummaryOperator::Configured { family, .. } = &self.summary.operator else {
             // Partial legacy descriptors cannot attest a configured capability.
             return false;
         };
-        use AggregationType::*;
         match node {
-            QueryPlanNode::ExactReadout { readout, .. } => match readout {
-                ExactReadout::Sum => matches!(aggregation_type, Sum | MultipleSum),
-                ExactReadout::Count => *aggregation_type == Sum,
-                ExactReadout::Increase | ExactReadout::Rate => {
-                    matches!(aggregation_type, Increase | MultipleIncrease)
-                }
-                // Direction is the family now -- no `aggregation_sub_type`
-                // cross-check, and a minimum summary can no longer be
-                // offered up for a maximum readout.
-                ExactReadout::Min => matches!(aggregation_type, Min | MultipleMin),
-                ExactReadout::Max => matches!(aggregation_type, Max | MultipleMax),
-            },
+            QueryPlanNode::ExactReadout { readout, .. } => family == &readout.planner_family(),
             QueryPlanNode::SummaryEstimate { query, .. } => match query {
                 QueryReadout::Quantile { q } => {
                     q.is_finite()
                         && (0.0..=1.0).contains(q)
-                        && matches!(aggregation_type, DatasketchesKLL | HydraKLL | DDSketch)
+                        && matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), SketchAlgorithm::Kll | SketchAlgorithm::DDSketch))
                 }
-                QueryReadout::Cardinality => matches!(aggregation_type, HLL | UnivMon),
+                QueryReadout::Cardinality => {
+                    matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), SketchAlgorithm::Hll | SketchAlgorithm::UnivMon))
+                }
                 QueryReadout::FrequencyL2 | QueryReadout::FrequencyEntropy => {
-                    *aggregation_type == UnivMon
+                    matches!(family, SummaryFamilyType::Sketch(kind, _) if kind.algorithm() == &SketchAlgorithm::UnivMon)
                 }
-                QueryReadout::PointCount { value: None, .. } if *aggregation_type == UnivMon => {
+                QueryReadout::PointCount { value: None, .. } if matches!(family, SummaryFamilyType::Sketch(kind, _) if kind.algorithm() == &SketchAlgorithm::UnivMon) => {
                     true
                 }
-                QueryReadout::PointCount { .. } => matches!(
-                    aggregation_type,
-                    CountMinSketch | CountMinSketchWithHeap | CountSketch | CountSketchWithHeap
-                ),
-                QueryReadout::TopK { .. } => matches!(
-                    aggregation_type,
-                    CountMinSketchWithHeap | CountSketchWithHeap
-                ),
+                QueryReadout::PointCount { .. } => {
+                    matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap))
+                }
+                QueryReadout::TopK { .. } => {
+                    matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
+                }
             },
             _ => false,
         }

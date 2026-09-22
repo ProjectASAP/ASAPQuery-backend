@@ -378,7 +378,7 @@ fn materialize_selected_sql(
     let aggregation = BackendAggregation {
         aggregation_id: String::new(),
         metric_name: format!("{table}.{}", value.column().unwrap_or("constant")),
-        family: crate::physical::compiler::physical_materialization_family(family),
+        family: family.clone(),
         window_secs,
         spatial_filter: String::new(),
         grouping: grouping.names(),
@@ -591,7 +591,7 @@ fn bind_selected_node(
         ..
     } = clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)
         .map_err(crate::query_plan::QueryPlanError::Invalid)?;
-    let expected = crate::physical::compiler::physical_materialization_family(family);
+    let expected = family.clone();
     let selected = select_materialization(
         &request.precompute_plan.materializations,
         &table_ref,

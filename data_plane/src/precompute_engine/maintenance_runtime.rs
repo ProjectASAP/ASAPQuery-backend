@@ -122,7 +122,7 @@ fn frozen_population_value(
 struct OperatorAdapter<'a> {
     binding: &'a BackendExecutableBinding,
     inputs: MaintenanceInputs<'a>,
-    configs: &'a [asap_types::aggregation_config::AggregationConfig],
+    configs: &'a [asap_types::aggregation_config::PrecomputeMaterialization],
 }
 
 impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
@@ -193,7 +193,12 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 }
                 finalize_exact(node, inputs)
             }
-            ExecutableOperatorPayload::SummaryAgg { family, input, .. } => {
+            ExecutableOperatorPayload::SummaryAgg {
+                family,
+                input,
+                grouping,
+                ..
+            } => {
                 let [value] = inputs else {
                     return Err("maintenance SummaryAgg requires exactly one row input".into());
                 };
@@ -251,7 +256,9 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                         "keyed maintenance updates require explicit row identity routing".into(),
                     );
                 }
-                let mut updater = super::accumulator_factory::create_accumulator_updater(config);
+                let mut updater = super::accumulator_factory::create_planner_accumulator(
+                    family, input, grouping,
+                )?;
                 if updater.is_keyed() {
                     return Err("keyed maintenance accumulator requires an item expression".into());
                 }

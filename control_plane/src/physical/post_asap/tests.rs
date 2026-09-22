@@ -519,13 +519,9 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 /// `ONLY_SPATIAL` — `sum by (host) (m)`.
 /// Control plane path: `Aggregate{Sum, by=[host]}` over a bare `Scan`.
 ///
-/// The old locally-defined `AggregationType::MultipleSum` (keyed vs
-/// unkeyed sum) identity no longer exists at the L4 IR level —
-/// `SummaryKind::Sum` covers both; the keyed/unkeyed distinction now
-/// lives on `SummaryAgg::by` (non-empty ⇒ the old "MultipleSum" shape),
-/// per `emit::mod.rs`'s exact-accumulator classification notes.
+/// Family remains Sum; the reduction carries the grouping columns.
 #[test]
-fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
+fn phase_b_pattern_only_spatial_aggregate_binds_to_grouped_sum() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![1]), // service column
         measures: vec![AggIntent::Sum { col: None }],
@@ -546,7 +542,7 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
                 assert_eq!(
                     reduction.group_keys().map(|k| k.keys()),
                     Some(&[1][..]),
-                    "keyed sum must carry the group-by column (the MultipleSum-equivalent signal)"
+                    "Sum reduction must retain the group-by column"
                 );
             }
             other => panic!("expected SummaryAgg(Sum, by=[1]), got {other:?}"),
@@ -556,14 +552,9 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
 }
 
 /// `ONE_TEMPORAL_ONE_SPATIAL` — `sum by (host) (rate(m[5m]))`.
-/// `bind_query_expr` (not `implement_tree` directly) rewrites
-/// `AggIntent::Rate` to `AggIntent::Increase` before binding (see
-/// `lower.rs`'s `rewrite_rate_to_increase` — this deployment's data
-/// plane has no Rate accumulator). The old
-/// `AggregationType::MultipleIncrease` identity is now
-/// `SummaryKind::Increase` with a non-empty `by`.
+/// Planner preserves the Rate family and the `by` reduction independently.
 #[test]
-fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
+fn phase_b_pattern_temporal_and_spatial_combined_preserves_rate() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![1]),
         measures: vec![AggIntent::Rate],
@@ -579,11 +570,11 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
             } => {
                 assert_eq!(
                     family,
-                    &SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase)
+                    &SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate)
                 );
                 assert_eq!(reduction.group_keys().map(|k| k.keys()), Some(&[1][..]));
             }
-            other => panic!("expected SummaryAgg(Increase, by=[1]), got {other:?}"),
+            other => panic!("expected SummaryAgg(Rate, by=[1]), got {other:?}"),
         },
         other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
@@ -716,12 +707,9 @@ fn phase_b_e2e_sum_by_preserves_grouping_label() {
     );
 }
 
-/// `rate_increase.yaml` — the legacy planner emits a MultipleIncrease
-/// (counter-reset adjusted) row. Control plane path: `Aggregate{Rate}` over
-/// `Window` → `bind_query_expr` rewrites `Rate` to `Increase` and binds an
-/// exact accumulator (`SummaryAgg{Increase}`) — no approximate summary
-/// family. Both paths produce a single non-summary streaming row; the L5
-/// emitter is the one that picks the actual MultipleIncrease processor.
+/// A Rate query keeps Planner's exact Rate family through binding. The
+/// physical emitter chooses the runtime processor without changing that
+/// family identity.
 #[test]
 fn phase_b_e2e_rate_falls_through_to_logical() {
     let bound = pipeline_l1_to_l4(
