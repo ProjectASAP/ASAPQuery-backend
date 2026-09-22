@@ -31,15 +31,13 @@ compatible grouping, coverage and accuracy.
 
 | Term | Meaning |
 | --- | --- |
-| Summary Catalog | Registry of immutable `SummaryDefinition` semantics; it does not track runtime instances or hold payload bytes. |
-| `SummaryMetadataStore` | Runtime records for concrete summary instances, including coverage, format, readiness and payload location. |
-| `SummaryPayloadStore` | Stored summary payload bytes addressed through installed state references and instance metadata. |
+| Summary Catalog | Definition snapshot validated with the installed plan; it does not track runtime instances or hold payload bytes. |
 | SDS (Self-Describing Summary) | The description and metadata needed to interpret and validate stored summary state. It is not a separate execution engine or payload store. |
 | `SummaryDefinition` | What a summary represents: source/filter, input value, grouping, time semantics, algorithm and parameters. |
 | `state_slot_id` | Compiler-assigned identifier for a stored producer output within one plan version. Shared readers use the same slot; it has no independent catalog object. |
 | `StateReference` | Plan reference identifying a slot and summary definition within the enclosing plan version. Reader configuration selects the required state instances and constrains format and coverage. |
 | `SummaryStateInstance` | A concrete stored state, such as one service's completed five-minute KLL snapshot, with partition, coverage, format and location metadata. |
-| Summary store | Storage for actual summary payloads. Runtime inventory records their existence, coverage and readiness. |
+| `SummaryStore` | One runtime store for summary instance metadata and payload bytes. Its metadata indexes instances and records coverage, format, readiness and payload location. The current implementation is `SketchStore`; no separate metadata or payload service is required. |
 | `plan_version` | Version shared by an installed plan bundle and its catalog bindings. Creating or updating state instances does not itself change this version. |
 | Schema / encoding | Schema describes the state structure; encoding describes how that structure is represented as bytes. |
 | Provenance | Mapping from physical plan operations back to the selected Planner computation. |

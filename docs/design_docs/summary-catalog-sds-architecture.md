@@ -30,34 +30,37 @@ Cost ranking, operator scheduling and transmission policy are outside SDS.
 
 ## Architecture at a glance
 
-The Summary Catalog stores `SummaryDefinition` entries. PrecomputePlan and
-QueryPlan carry matching state references and format/partition configuration.
-`SummaryMetadataStore` records metadata for actual state instances; payload
-bytes live in `SummaryPayloadStore`.
-There is no separate catalog `Materialization` object.
+The Summary Catalog is the definition snapshot validated when a plan is
+installed. PrecomputePlan and QueryPlan carry matching state references and
+format/partition configuration. One runtime `SummaryStore` holds both instance
+metadata and payload bytes; these are two kinds of data within the store, not
+separate storage components. There is no separate catalog `Materialization`
+object.
 
 The compiler/catalog authority registers a `SummaryDefinition` when installing
 the plan. The edges from both plans to that catalog are definition references
 validated by catalog reads at installation, not runtime writes or serving-time
-catalog searches. At runtime, PrecomputePlan writes summary payload bytes to
-`SummaryPayloadStore` and publishes each instance's metadata to
-`SummaryMetadataStore`. QueryPlan checks `SummaryMetadataStore` for a ready
-matching instance, then reads its payload from `SummaryPayloadStore`. SDS spans
-three distinct locations: the Summary Catalog stores immutable
-`SummaryDefinition` semantics; installed plans store writer and reader
-constraints; `SummaryMetadataStore` stores each actual instance's partition,
-coverage, format, readiness and location. The metadata store does not hold
-definitions, and the catalog does not track runtime instances.
+catalog searches. At runtime, PrecomputePlan writes a payload to
+`SummaryStore` and records its instance metadata there. QueryPlan uses its
+installed state reference to look up a matching instance in that same store,
+checks readiness, coverage and format, then reads the payload. The catalog
+holds definition semantics, the installed plans hold writer and reader
+constraints, and the runtime store holds observed instances. These are logical
+responsibilities; they do not require three independent services or databases.
 
 ```mermaid
 flowchart LR
-  C[Compiler/catalog authority] -->|register definition: write| D[Summary Catalog]
-  P[PrecomputePlan] -->|validate definition: read at install| D
-  Q[QueryPlan] -->|validate definition: read at install| D
-  P -->|write payload| S[SummaryPayloadStore]
-  P -->|publish instance metadata: write| I[SummaryMetadataStore]
-  Q -->|resolve ready instance: read| I
-  Q -->|read payload| S
+  C[Compiler/catalog authority] -->|register definition| D[Summary Catalog snapshot]
+  P[PrecomputePlan] -->|validate definition at install| D
+  Q[QueryPlan] -->|validate definition at install| D
+  subgraph S[SummaryStore: one runtime store]
+    I[Instance metadata and readiness]
+    B[Summary payload bytes]
+  end
+  P -->|write payload| B
+  P -->|record instance after payload is available| I
+  Q -->|lookup bound instance; check ready and format| I
+  Q -->|read payload| B
 ```
 
 The compiler assigns a `state_slot_id` to a stored producer output within a plan
@@ -154,12 +157,12 @@ before installation. Repetition of format fields in the serialized plans does
 not authorize independent selection. The catalog does not need a second registry
 for those fields. The selected deployment guarantee and schedule/retention belong
 to Planner's deployment decision and the installed PrecomputePlan binding;
-observed readiness belongs to `SummaryMetadataStore`.
+observed readiness belongs to instance metadata in `SummaryStore`.
 
 A state instance records plan version, slot, definition, actual format and its
 partition key, coverage/completion, producer sequence
 where applicable, lifecycle status, location and integrity metadata. Payload
-bytes remain in `SummaryPayloadStore`, not in catalog descriptors.
+bytes remain in `SummaryStore`, not in catalog descriptors.
 
 ## Identity and reference rules
 
@@ -194,8 +197,8 @@ PrecomputePlan
 SDS
   Catalog: def-9 -> KLL(k=200) and input semantics
   Plan bundle: version 42; writer/reader bind slot-17 to def-9
-  Runtime inventory: instances indexed by plan version, slot and partition
-  Summary store: encoded payload bytes located by instance metadata
+  SummaryStore: instance metadata indexed by plan version, slot and partition;
+                encoded payload bytes reached through that metadata
 
 QueryPlan
   Read(slot-17, kll-v1) -> SummaryEstimate -> Result
@@ -225,10 +228,10 @@ state or its retirement.
 | Phase | View | Meaning |
 | --- | --- | --- |
 | `Desired` | Installed plan | The plan requires state for this slot and coverage |
-| `Building` | Runtime inventory | Required state is being produced or recovered |
-| `Ready` | Runtime inventory | Required schema and coverage are available |
-| `Draining` | Runtime inventory | New work has stopped while existing use completes |
-| `Retired` | Runtime inventory | New reads are prohibited; safe reclamation may follow |
+| `Building` | SummaryStore instance metadata | Required state is being produced or recovered |
+| `Ready` | SummaryStore instance metadata | Required schema and coverage are available |
+| `Draining` | SummaryStore instance metadata | New work has stopped while existing use completes |
+| `Retired` | SummaryStore instance metadata | New reads are prohibited; safe reclamation may follow |
 
 Atomic activation installs intent, not ready data. A QueryPlan read checks
 observed readiness and coverage, then follows its configured fallback or explicit
@@ -252,10 +255,10 @@ Compilation, installation, writes, recovery and reads enforce:
 7. Unknown schemas, malformed payloads and unauthorized updates fail closed.
 
 The current backend distributes these responsibilities across `asap_types`,
-control-plane publication, `SummaryMetadataStore` and `SummaryPayloadStore`.
-Migration reuses authoritative IDs and metadata rather than creating a parallel
-registry. Legacy artifacts are normalized at the backend boundary and supported
-payloads retain versioned readers and fixtures.
+control-plane publication and the existing `SketchStore`. Migration reuses its
+authoritative IDs, instance metadata and payload storage rather than creating a
+parallel store. Legacy artifacts are normalized at the backend boundary and
+supported payloads retain versioned readers and fixtures.
 
 Remove the proposed `materializations` catalog collection and standalone object
 from new plan examples and schemas. Preserve the existing
