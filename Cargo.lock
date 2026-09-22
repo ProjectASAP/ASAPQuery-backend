@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=2ec3fc80caa922c8e1f33aa05f60b7d787e73257#2ec3fc80caa922c8e1f33aa05f60b7d787e73257"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=10d93846f0ef9f06ab19e599701d699d9cdd15af#10d93846f0ef9f06ab19e599701d699d9cdd15af"
 dependencies = [
  "asap-types",
  "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib)",
@@ -376,7 +376,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=2ec3fc80caa922c8e1f33aa05f60b7d787e73257#2ec3fc80caa922c8e1f33aa05f60b7d787e73257"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=10d93846f0ef9f06ab19e599701d699d9cdd15af#10d93846f0ef9f06ab19e599701d699d9cdd15af"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0 (git+https://github.com/ProjectASAP/promql-parser?rev=9fede7eecca923c9882fe256484d00d37f8706cb)",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=2ec3fc80caa922c8e1f33aa05f60b7d787e73257#2ec3fc80caa922c8e1f33aa05f60b7d787e73257"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=10d93846f0ef9f06ab19e599701d699d9cdd15af#10d93846f0ef9f06ab19e599701d699d9cdd15af"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -408,12 +408,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=2ec3fc80caa922c8e1f33aa05f60b7d787e73257#2ec3fc80caa922c8e1f33aa05f60b7d787e73257"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=10d93846f0ef9f06ab19e599701d699d9cdd15af#10d93846f0ef9f06ab19e599701d699d9cdd15af"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=2ec3fc80caa922c8e1f33aa05f60b7d787e73257#2ec3fc80caa922c8e1f33aa05f60b7d787e73257"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=10d93846f0ef9f06ab19e599701d699d9cdd15af#10d93846f0ef9f06ab19e599701d699d9cdd15af"
 dependencies = [
  "serde",
  "serde_json",
@@ -2305,6 +2305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2615,7 +2624,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3075,7 +3084,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -3095,7 +3104,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3496,7 +3505,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4466,7 +4475,7 @@ version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 dependencies = [
- "rand 0.10.2",
+ "rand 0.9.5",
 ]
 
 [[package]]
@@ -4802,6 +4811,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]
