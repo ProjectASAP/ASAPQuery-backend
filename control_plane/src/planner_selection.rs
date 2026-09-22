@@ -6,6 +6,7 @@
 
 use std::rc::Rc;
 
+use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
 use crate::types::AccuracyTarget;
 use asap_aware_mapping::{
     AccuracyBudgetAllocator, AccuracyEvidenceProvider, AccuracyModel, CostModel, Replacement,
@@ -302,7 +303,15 @@ pub fn select_workload_with_accuracy_model(
     evidence: &dyn AccuracyEvidenceProvider,
     accuracy_model: &dyn AccuracyModel,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
-    select_workload_impl(roots, accuracy, cost_model, evidence, accuracy_model, None)
+    select_workload_impl(
+        roots,
+        accuracy,
+        cost_model,
+        evidence,
+        accuracy_model,
+        None,
+        None,
+    )
 }
 
 /// Return the candidate ranking and committed choices from the same search
@@ -310,7 +319,7 @@ pub fn select_workload_with_accuracy_model(
 pub fn select_workload_with_accuracy_model_and_trace(
     roots: Vec<(usize, Rc<QueryExpr>)>,
     accuracy: AccuracyTarget,
-    cost_model: &dyn CostModel,
+    cost_model: &ControlPlaneCostModel,
     evidence: &dyn AccuracyEvidenceProvider,
     accuracy_model: &dyn AccuracyModel,
 ) -> Result<(Vec<(usize, Rc<SummaryNode>)>, serde_json::Value), SelectionError> {
@@ -322,6 +331,7 @@ pub fn select_workload_with_accuracy_model_and_trace(
         evidence,
         accuracy_model,
         Some(&mut trace),
+        Some(cost_model),
     )?;
     Ok((selected, trace))
 }
@@ -388,6 +398,7 @@ fn select_workload_impl(
     evidence: &dyn AccuracyEvidenceProvider,
     accuracy_model: &dyn AccuracyModel,
     mut trace: Option<&mut serde_json::Value>,
+    backend_cost_model: Option<&ControlPlaneCostModel>,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
     let strategies = replacement_strategies(cost_model, evidence, accuracy_model);
     let space = asap_aware_mapping::search_workload_with_targets(
@@ -422,11 +433,7 @@ fn select_workload_impl(
                     } else if candidate.runtime_support_evidence(cost_model) == Some(false) {
                         "unsupported_runtime_operation"
                     } else if chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)) {
-                        if candidate_cost.is_some() {
-                            "planner_selected_pending_backend_binding"
-                        } else {
-                            "qualitative_selection_pending_backend_binding"
-                        }
+                        "planner_selected_pending_backend_binding"
                     } else if candidate_cost.is_none() {
                         "missing_comparable_cost"
                     } else {
@@ -454,6 +461,7 @@ fn select_workload_impl(
                     "decision_reason": decision_reason,
                     "estimated_cost": candidate_cost.map(|cost| cost.0),
                     "estimated_cost_status": if candidate_cost.is_some() { "available" } else { "unavailable" },
+                    "cost_estimate": backend_cost_model.and_then(|model| model.candidate_cost_estimate(candidate)),
                     "selected": chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)),
                 })}).collect::<Vec<_>>();
             let rejected = space.groups().find(|memo| Rc::ptr_eq(&memo.target, group.target))
@@ -609,12 +617,15 @@ mod workload_tests {
             accuracy.clone(),
         )
         .unwrap();
-        let (_, trace) = select_workload_with_accuracy_model_and_trace(
+        let mut trace = serde_json::Value::Null;
+        select_workload_impl(
             vec![(0, Rc::new(root))],
             accuracy,
             &Uncosted,
             &asap_aware_mapping::NoAccuracyEvidence,
             &asap_aware_mapping::DefaultAccuracyModel,
+            Some(&mut trace),
+            None,
         )
         .unwrap();
         let candidates = trace["groups"]

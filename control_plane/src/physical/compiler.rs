@@ -2453,13 +2453,8 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
         }
     }
     for (accuracy, scope, roots) in cohorts {
-        // ERP v1 has no calibrated failure probability. Preserve explicit
-        // confidence requirements through theoretical/exact fallback.
         let scoped_erp = erp.map(|policy| {
             let mut policy = policy.clone();
-            if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
-                policy.artifact.records.clear();
-            }
             if policy.observed_populations.is_some()
                 && !roots
                     .iter()
@@ -2482,7 +2477,15 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
             });
             policy
         });
-        let erp = scoped_erp.as_ref();
+        // Confidence limitations invalidate an empirical accuracy decision,
+        // not the independently matched resource measurements.
+        let accuracy_erp = scoped_erp.clone().map(|mut policy| {
+            if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
+                policy.artifact.records.clear();
+            }
+            policy
+        });
+        let erp = accuracy_erp.as_ref();
         let mut model = ControlPlaneCostModel::new(accuracy.clone()).with_exact_composition_costs(
             scope
                 .as_ref()
@@ -2492,6 +2495,9 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
         );
         if let Some(erp) = erp {
             model = model.with_erp(erp.clone());
+        }
+        if let Some(costs) = &scoped_erp {
+            model = model.with_erp_costs(costs.clone());
         }
         let certificate = scope.as_ref().and_then(|id| evidence.get(id));
         let scoped_certificate = scope.as_ref().and_then(|id| scoped_evidence.get(id));
@@ -3077,20 +3083,25 @@ pub(super) fn retained_state_count(
 /// cells use two words here, covering the counter plus observed serialization
 /// overhead. Heap and exact-state estimates include container slack.
 fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization) -> u128 {
+    estimated_state_bytes(
+        &materialization.aggregation_type,
+        &materialization.parameters,
+    )
+}
+
+pub(crate) fn estimated_state_bytes(
+    aggregation_type: &asap_types::AggregationType,
+    parameters: &HashMap<String, Value>,
+) -> u128 {
     use asap_types::AggregationType as A;
 
     let parameter = |names: &[&str], fallback: u64| {
         names
             .iter()
-            .find_map(|name| {
-                materialization
-                    .parameters
-                    .get(*name)
-                    .and_then(Value::as_u64)
-            })
+            .find_map(|name| parameters.get(*name).and_then(Value::as_u64))
             .unwrap_or(fallback) as u128
     };
-    match materialization.aggregation_type {
+    match aggregation_type {
         A::CountMinSketch | A::CountSketch => {
             parameter(&["width", "w", "col_num", "col"], 1)
                 * parameter(&["depth", "d", "row_num", "row"], 1)
@@ -4009,7 +4020,7 @@ pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> Sum
     }
 }
 
-fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
+pub(crate) fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
         P::UnivMon {
@@ -6197,6 +6208,18 @@ pub(crate) mod tests {
             Query("sum by (service) (sum_over_time(m[1m]) / count_over_time(m[1m]))".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
         let (mut request, _) = snapshot.into_physical_compilation_request().unwrap();
+        // The analytical model cannot price an invalid executable DAG, so
+        // normal selection already keeps exact execution. Directly supplied
+        // witness candidates must still be canonicalized by the physical gate.
+        assert!(matches!(
+            request.queries[0].selected_plan_root.expr,
+            SummaryExpr::KeepPreAsap(_)
+        ));
+        request.queries[0].selected_plan_root = crate::planner_selection::select_summary(
+            &request.canonical_roots[0],
+            &ControlPlaneCostModel::new(AccuracyTarget::Exact),
+        )
+        .unwrap();
         assert!(!matches!(
             request.queries[0].selected_plan_root.expr,
             SummaryExpr::KeepPreAsap(_)
@@ -6626,6 +6649,29 @@ pub(crate) mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap()
+    }
+
+    /// ERP memory remains usable under an explicit confidence target, even
+    /// though ERP v1 error observations cannot certify that target.
+    #[test]
+    fn erp_resource_costs_survive_confidence_target() {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("quantile_over_time(0.9,m[1m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::EpsilonDelta {
+            epsilon: 0.1,
+            delta: 0.01,
+        });
+        snapshot.physical_inputs.erp =
+            Some(crate::physical::post_asap::cost_model::tests::erp_cost_fixture());
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        assert!(request
+            .planner_selection_trace
+            .iter()
+            .flat_map(|trace| trace["groups"].as_array().unwrap())
+            .flat_map(|group| group["candidates"].as_array().unwrap())
+            .any(|candidate| candidate["cost_estimate"]["source"] == "erp"
+                && candidate["estimated_cost"] == 7777.0));
     }
 
     fn derived_query_window_secs(query: &str) -> u64 {

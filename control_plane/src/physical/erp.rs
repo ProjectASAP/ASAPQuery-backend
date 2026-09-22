@@ -575,6 +575,64 @@ impl ErpParameterDecision {
 }
 
 impl ErpPlanningInput {
+    /// Match ERP resource measurements for an already-sized candidate. Error
+    /// magnitudes only identify existing records here: no accuracy target is
+    /// certified by this cost lookup. Reuse ERP's implementation, population,
+    /// shape, minimum-trial and runtime checks rather than a second matcher.
+    pub(crate) fn candidate_memory_bytes(
+        &self,
+        algorithm: &SketchAlgorithm,
+        params: &SketchParams,
+    ) -> Option<(f64, Vec<String>)> {
+        self.artifact.validate().ok()?;
+        let metrics = self
+            .artifact
+            .records
+            .iter()
+            .flat_map(|row| row.error_metrics.keys().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        metrics
+            .into_iter()
+            .filter_map(|metric| {
+                let ErpParameterDecision::Empirical {
+                    record_id,
+                    params: selected,
+                    ..
+                } = self.select_metric(
+                    algorithm.clone(),
+                    &metric,
+                    f64::MAX,
+                    params.clone(),
+                    Some(params),
+                )
+                else {
+                    return None;
+                };
+                if &selected != params {
+                    return None;
+                }
+                let mut ids = if self.artifact.records.iter().any(|row| row.id == record_id) {
+                    vec![record_id]
+                } else {
+                    serde_json::from_str::<Vec<String>>(&record_id).ok()?
+                };
+                if ids.is_empty() {
+                    return None;
+                }
+                // The logical proxy is per partition. For population-specific
+                // profiles use the largest matched partition, not a pooled sketch.
+                let mut bytes = 0.0_f64;
+                for id in &ids {
+                    let row = self.artifact.records.iter().find(|row| &row.id == id)?;
+                    bytes = bytes.max(row.resources.memory_bytes);
+                }
+                ids.sort();
+                ids.dedup();
+                Some((bytes, ids))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+    }
+
     pub fn select(
         &self,
         algorithm: SketchAlgorithm,
@@ -1444,6 +1502,15 @@ mod tests {
         assert!(invalid.populations.is_empty());
         assert!(invalid.invalid_reason.as_deref().unwrap().contains("stale"));
         assert!(policy.observed_shape.is_none());
+        assert!(policy
+            .candidate_memory_bytes(
+                &SketchAlgorithm::Cms,
+                &SketchParams::Cms {
+                    width: 512,
+                    depth: 3
+                }
+            )
+            .is_none());
     }
 
     /// Only the activated catalog may supply a candidate's data contract.
@@ -1605,6 +1672,16 @@ mod tests {
             minimum_confidence: 0.9,
             minimum_confidence_margin: 0.05,
         });
+        assert_eq!(
+            policy.candidate_memory_bytes(
+                &SketchAlgorithm::Cms,
+                &SketchParams::Cms {
+                    width: 512,
+                    depth: 3
+                }
+            ),
+            Some((12_288.0, vec!["cms-512".into()]))
+        );
         assert!(matches!(
             policy.select(
                 SketchAlgorithm::Cms,
@@ -1648,6 +1725,15 @@ mod tests {
             policy.select(SketchAlgorithm::Cms, 0.01, theory.clone()),
             ErpParameterDecision::TheoreticalFallback { params, .. } if params == theory
         ));
+        assert!(policy
+            .candidate_memory_bytes(
+                &SketchAlgorithm::Cms,
+                &SketchParams::Cms {
+                    width: 512,
+                    depth: 3
+                }
+            )
+            .is_none());
     }
 
     #[test]
