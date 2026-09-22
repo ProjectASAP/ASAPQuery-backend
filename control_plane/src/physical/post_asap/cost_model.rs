@@ -427,6 +427,13 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
 }
 
 impl CostModel for ControlPlaneCostModel {
+    fn allow_uncosted_legacy_selection(&self) -> bool {
+        // Local Planner ranking retains the existing summary candidate set.
+        // Deployment still requires a complete, comparable physical workload
+        // quote before any candidate can be published.
+        true
+    }
+
     fn value_operation_capabilities(&self) -> ValueOperationCapabilities {
         ValueOperationCapabilities {
             read_time: true,
@@ -777,6 +784,10 @@ impl ForcedFamilyCostModel {
 }
 
 impl CostModel for ForcedFamilyCostModel {
+    fn allow_uncosted_legacy_selection(&self) -> bool {
+        self.inner.allow_uncosted_legacy_selection()
+    }
+
     fn rank_candidates(
         &self,
         intent: &AggIntent,

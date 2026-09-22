@@ -203,7 +203,11 @@ struct CompileAndPublishPhysicalPlanRequest {
     target_collector_ids: Vec<String>,
     capability_snapshot_id: String,
     #[serde(default)]
+    data_snapshot_id: Option<String>,
+    #[serde(default)]
     evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
+    #[serde(default)]
+    accuracy_evidence: HashMap<String, physical::compiler::ScopedAccuracyEvidence>,
     #[serde(default)]
     exact_composition_costs:
         HashMap<String, Vec<physical::post_asap::cost_model::ExactCompositionCostEvidence>>,
@@ -597,16 +601,54 @@ fn compile_physical_plan_request(
         });
     }
 
-    let planner_selection_trace = match physical::compiler::select_logical_roots_with_trace(
-        &mut queries,
-        canonical_roots.clone(),
-        &request.evidence,
-        &request.exact_composition_costs,
-        request.erp.as_ref(),
-    ) {
-        Ok(trace) => trace,
-        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
-    };
+    let scoped_snapshot_id = request.data_snapshot_id.as_deref().or_else(|| {
+        request
+            .workload_cost_evidence
+            .as_ref()
+            .map(|evidence| evidence.data_snapshot_id.as_str())
+    });
+    if request.data_snapshot_id.as_ref().is_some_and(|id| {
+        request
+            .workload_cost_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.data_snapshot_id != *id)
+    }) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "accuracy evidence data snapshot differs from workload cost evidence".into(),
+        ));
+    }
+    for (query_id, evidence) in &request.accuracy_evidence {
+        let Some(query) = queries.iter().find(|query| &query.query_id == query_id) else {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("accuracy evidence names unknown query {query_id}").into(),
+            ));
+        };
+        evidence
+            .validate(
+                query_id,
+                &query.query_string,
+                &request.data_workload,
+                scoped_snapshot_id,
+                now,
+                request.max_evidence_age_ms,
+            )
+            .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
+    }
+    let planner_selection_trace =
+        match physical::compiler::select_logical_roots_with_scoped_evidence_and_trace(
+            &mut queries,
+            canonical_roots.clone(),
+            &request.evidence,
+            &request.accuracy_evidence,
+            &request.exact_composition_costs,
+            request.erp.as_ref(),
+            now,
+        ) {
+            Ok(trace) => trace,
+            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
+        };
 
     for (query, model) in queries.iter_mut().zip(window_models) {
         physical::compiler::prepare_window_implementations(query, &model, request.target, 0)
