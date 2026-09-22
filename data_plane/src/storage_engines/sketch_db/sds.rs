@@ -117,8 +117,16 @@ impl SummaryDescriptorRegistry {
         &self,
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
     ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
-        catalog.validate()?;
-        let reference = catalog.reference()?;
+        catalog.validate().map_err(|error| {
+            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
+                %error, "storage descriptor catalog validation failed");
+            error
+        })?;
+        let reference = catalog.reference().map_err(|error| {
+            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
+                %error, "storage descriptor catalog reference failed");
+            error
+        })?;
         let generation = Arc::new(asap_types::sds::CatalogGeneration {
             schema_version: reference.schema_version,
             plan_id: reference.plan_id,

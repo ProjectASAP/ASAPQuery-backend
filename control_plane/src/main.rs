@@ -18,9 +18,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
+
+static NEXT_PLAN_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
 use opamp::OpampServer;
 use physical::deployment_cost::online as online_cost_model;
@@ -270,11 +273,15 @@ async fn compile_and_publish_physical_plan(
     mut request: CompileAndPublishPhysicalPlanRequest,
     frontend: QueryFrontend,
 ) -> Response {
+    let call_id = NEXT_PLAN_CALL_ID.fetch_add(1, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    tracing::debug!(call_id, ?frontend, "physical plan compilation requested");
     // Serialize typed activations so an older response cannot overwrite the
     // catalog recorded after a newer backend activation.
     let mut active_catalog = st.active_summary_catalog.lock().await;
     if let Some(erp) = &mut request.erp {
         if let Err(error) = erp.hydrate_observed_shape(&st.runtime_samples) {
+            tracing::warn!(call_id, %error, "ERP observation hydration failed");
             return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
         }
         let catalog = active_catalog.clone();
@@ -286,15 +293,21 @@ async fn compile_and_publish_physical_plan(
                 (bundle, ids, timeout, adaptation, manifests)
             }
             Ok((None, ..)) => {
+                tracing::error!(call_id, "physical plan compilation selected no plan");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "publication requires a selected plan",
                 )
-                    .into_response()
+                    .into_response();
             }
-            Err(response) => return physical_compile_failure(response),
+            Err(response) => {
+                tracing::warn!(call_id, status = %response.0, error = %response.1,
+                    "physical plan compilation failed");
+                return physical_compile_failure(response);
+            }
         };
     info!(
+        call_id,
         plan_id = bundle.envelope.plan_id,
         plan_version = bundle.envelope.plan_version,
         collector_count = bundle.collector_plans.len(),
@@ -302,6 +315,12 @@ async fn compile_and_publish_physical_plan(
     );
 
     let Some(backend) = st.backend_client.as_ref() else {
+        tracing::warn!(
+            call_id,
+            plan_id = bundle.envelope.plan_id,
+            plan_version = bundle.envelope.plan_version,
+            "backend endpoint is unavailable"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "CONTROLLER_BACKEND_ENDPOINT is required for physical-plan publication".to_string(),
@@ -313,7 +332,7 @@ async fn compile_and_publish_physical_plan(
         .ensure_collector_plan_targets(&bundle.collector_plans, apply_timeout)
         .await
     {
-        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+        tracing::warn!(call_id, plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
             %error, "collector plan preflight failed");
         return (
             StatusCode::BAD_GATEWAY,
@@ -324,11 +343,14 @@ async fn compile_and_publish_physical_plan(
     let publication = match bundle.to_publication_artifact() {
         Ok(publication) => publication,
         Err(error) => {
+            tracing::error!(call_id, plan_id = bundle.envelope.plan_id,
+                plan_version = bundle.envelope.plan_version, %error,
+                "catalog publication artifact failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("invalid catalog publication: {error}"),
             )
-                .into_response()
+                .into_response();
         }
     };
     if let Err(error) = backend
@@ -339,7 +361,7 @@ async fn compile_and_publish_physical_plan(
         )
         .await
     {
-        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+        tracing::warn!(call_id, plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
             %error, "backend plan staging failed");
         return (
             StatusCode::BAD_GATEWAY,
@@ -348,6 +370,7 @@ async fn compile_and_publish_physical_plan(
             .into_response();
     }
     info!(
+        call_id,
         plan_id = bundle.envelope.plan_id,
         plan_version = bundle.envelope.plan_version,
         "backend physical plan staged"
@@ -357,7 +380,7 @@ async fn compile_and_publish_physical_plan(
         .publish_collector_plans(&bundle.collector_plans, apply_timeout)
         .await
     {
-        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+        tracing::warn!(call_id, plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
             %error, "collector plan publication failed");
         let cleanup = backend
             .discard_staged_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
@@ -369,6 +392,7 @@ async fn compile_and_publish_physical_plan(
             .into_response();
     }
     info!(
+        call_id,
         plan_id = bundle.envelope.plan_id,
         plan_version = bundle.envelope.plan_version,
         "collector plans published"
@@ -379,6 +403,14 @@ async fn compile_and_publish_physical_plan(
         .as_millis() as u64;
     let activation_wait = bundle.envelope.activation_unix_ms.saturating_sub(now);
     if activation_wait > apply_timeout.as_millis() as u64 {
+        tracing::warn!(
+            call_id,
+            plan_id = bundle.envelope.plan_id,
+            plan_version = bundle.envelope.plan_version,
+            activation_wait_ms = activation_wait,
+            timeout_ms = apply_timeout.as_millis() as u64,
+            "physical plan activation time exceeds timeout"
+        );
         return (
             StatusCode::GATEWAY_TIMEOUT,
             "activation time exceeds apply_timeout_ms; backend remains staged".to_string(),
@@ -392,7 +424,7 @@ async fn compile_and_publish_physical_plan(
         .activate_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
         .await
     {
-        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+        tracing::warn!(call_id, plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
             %error, "backend plan activation failed");
         return (
             StatusCode::BAD_GATEWAY,
@@ -403,8 +435,10 @@ async fn compile_and_publish_physical_plan(
 
     *active_catalog = Some(Arc::new(bundle.summary_catalog));
     info!(
+        call_id,
         plan_id = bundle.envelope.plan_id,
         plan_version = bundle.envelope.plan_version,
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "physical plan active"
     );
 

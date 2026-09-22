@@ -9,10 +9,13 @@ use axum::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
+
+static NEXT_PLAN_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::drivers::query::adapters::{AdapterConfig, HttpProtocolAdapter, PrometheusHttpAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
@@ -5825,13 +5828,25 @@ async fn handle_post_physical_plan(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    let call_id = NEXT_PLAN_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let requested_plan_id = request.transmission_plan.envelope.plan_id;
+    let requested_plan_version = request.transmission_plan.envelope.plan_version;
     tracing::debug!(
-        plan_id = request.transmission_plan.envelope.plan_id,
-        plan_version = request.transmission_plan.envelope.plan_version,
+        call_id,
+        plan_id = requested_plan_id,
+        plan_version = requested_plan_version,
         "physical plan staging requested"
     );
 
     let Some(active_handle) = state.active_physical_plan.as_ref() else {
+        tracing::warn!(
+            call_id,
+            plan_id = requested_plan_id,
+            plan_version = requested_plan_version,
+            error = "physical-plan hot-reload handles are not attached",
+            "physical plan staging failed"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -5841,6 +5856,13 @@ async fn handle_post_physical_plan(
             .into_response();
     };
     let Some(lifecycle) = state.physical_plan_lifecycle.as_ref() else {
+        tracing::warn!(
+            call_id,
+            plan_id = requested_plan_id,
+            plan_version = requested_plan_version,
+            error = "physical-plan lifecycle is not attached",
+            "physical plan staging failed"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -5856,8 +5878,8 @@ async fn handle_post_physical_plan(
             &request.adaptation_evidence,
             unix_time_ms(),
         ) {
-            tracing::warn!(plan_id = request.transmission_plan.envelope.plan_id,
-                plan_version = request.transmission_plan.envelope.plan_version,
+            tracing::warn!(call_id, plan_id = requested_plan_id,
+                plan_version = requested_plan_version,
                 %error, "physical plan successor rejected");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -5873,7 +5895,9 @@ async fn handle_post_physical_plan(
     let active = match validate_and_build_runtime_plan(request, current.storage_routing.clone()) {
         Ok(active) => active,
         Err(error) => {
-            tracing::warn!(%error, "physical plan validation failed");
+            tracing::warn!(call_id, plan_id = requested_plan_id,
+                plan_version = requested_plan_version, %error,
+                "physical plan validation failed");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(serde_json::json!({"status": "error", "error": error})),
@@ -5889,6 +5913,13 @@ async fn handle_post_physical_plan(
             )
             || active.precompute_plan.ingest.endpoint_path != "/api/v1/write")
     {
+        tracing::warn!(
+            call_id,
+            plan_id = requested_plan_id,
+            plan_version = requested_plan_version,
+            error = "Remote Write listener requires a non-bootstrap prometheus_remote_write_v1 plan at /api/v1/write",
+            "physical plan staging failed"
+        );
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             axum::Json(serde_json::json!({
@@ -5915,7 +5946,7 @@ async fn handle_post_physical_plan(
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
-        tracing::warn!(plan_id, plan_version, %error, "physical plan staging failed");
+        tracing::warn!(call_id, plan_id, plan_version, %error, "physical plan staging failed");
         return (
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({"status": "error", "error": error.to_string()})),
@@ -5923,8 +5954,10 @@ async fn handle_post_physical_plan(
             .into_response();
     }
     tracing::info!(
+        call_id,
         plan_id,
         plan_version,
+        elapsed_ms = started.elapsed().as_millis() as u64,
         materialization_count,
         metricsql_query_count,
         clickhouse_plan_count,
@@ -5954,7 +5987,10 @@ async fn handle_activate_physical_plan(
     axum::Json(request): axum::Json<ActivatePhysicalPlanRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let call_id = NEXT_PLAN_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
     tracing::debug!(
+        call_id,
         plan_id = request.plan_id,
         plan_version = request.plan_version,
         "physical plan activation requested"
@@ -5963,6 +5999,13 @@ async fn handle_activate_physical_plan(
         state.physical_plan_lifecycle.as_ref(),
         state.active_physical_plan.as_ref(),
     ) else {
+        tracing::warn!(
+            call_id,
+            plan_id = request.plan_id,
+            plan_version = request.plan_version,
+            error = "physical-plan lifecycle is not attached",
+            "physical plan activation failed"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -5995,7 +6038,7 @@ async fn handle_activate_physical_plan(
     ) {
         Ok(old) => old,
         Err(error) => {
-            tracing::warn!(plan_id = request.plan_id, plan_version = request.plan_version,
+            tracing::warn!(call_id, plan_id = request.plan_id, plan_version = request.plan_version,
                 %error, "physical plan activation failed");
             return (
                 StatusCode::CONFLICT,
@@ -6008,8 +6051,10 @@ async fn handle_activate_physical_plan(
     };
     let activated = active_handle.active_snapshot();
     tracing::info!(
+        call_id,
         plan_id = request.plan_id,
         plan_version = request.plan_version,
+        elapsed_ms = started.elapsed().as_millis() as u64,
         previous_plan_id = old.plan_id(),
         previous_plan_version = old.plan_version(),
         "physical plan activated; summary catalog installed"

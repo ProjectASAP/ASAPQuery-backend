@@ -289,6 +289,8 @@ impl Worker {
                     let _span = debug_span!(
                         "worker_process_group",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         sid,
                         policy_fp = %policy_fp,
                         group = %group_key,
@@ -298,10 +300,10 @@ impl Worker {
                     if let Err(e) = self.process_group_samples(sid, policy_fp, &group_key, samples)
                     {
                         processing_error = Some(e.to_string());
-                        warn!(
-                            "Worker {} error processing sid={} (policy_fp={}, group={}): {}",
-                            self.id, sid, policy_fp, group_key, e
-                        );
+                        warn!(worker_id = self.id, sid, policy_fp = %policy_fp,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker group processing failed");
                     }
                     debug!(
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
@@ -316,13 +318,18 @@ impl Worker {
                     let _span = debug_span!(
                         "worker_process_raw",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         series = %series_key,
                         sample_count = samples.len(),
                     )
                     .entered();
                     if let Err(e) = self.process_samples_raw(&series_key, samples) {
                         processing_error = Some(e.to_string());
-                        warn!("Worker {} raw error for {}: {}", self.id, series_key, e);
+                        warn!(worker_id = self.id, series = %series_key,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker raw processing failed");
                     }
                     debug!(
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
@@ -340,6 +347,8 @@ impl Worker {
                     let _span = debug_span!(
                         "worker_process_accumulator",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         sid,
                         policy_fp = %policy_fp,
                         group = %group_key,
@@ -355,10 +364,10 @@ impl Worker {
                         accumulator,
                     ) {
                         processing_error = Some(e.to_string());
-                        warn!(
-                            "Worker {} accumulator input error for sid={} (policy_fp={}, group={}): {}",
-                            self.id, sid, policy_fp, group_key, e
-                        );
+                        warn!(worker_id = self.id, sid, policy_fp = %policy_fp,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker accumulator processing failed");
                     }
                     debug!(
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,

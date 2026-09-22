@@ -154,6 +154,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
     fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
         if let Some(value) = self.memo.get(&(id, at)) {
             self.stats.memo_hits += 1;
+            tracing::debug!(query_id = %self.entry.query_id, node_id = ?id,
+                evaluation_ms = at, "installed query node memo hit");
             return Ok(value.clone());
         }
         if let Some(leaf) = self.leaves.get(&(id, at)) {
@@ -165,6 +167,10 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 self.stats.summary_readout_evaluations += 1;
             }
             let value = leaf.value.clone();
+            tracing::debug!(query_id = %self.entry.query_id, node_id = ?id,
+                evaluation_ms = at, remote = leaf.remote,
+                remote_evaluations = leaf.remote_evaluations, remote_rpcs = leaf.remote_rpcs,
+                "installed query prepared leaf used");
             self.memo.insert((id, at), value.clone());
             return Ok(value);
         }
@@ -180,54 +186,80 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .get(&id)
             .ok_or_else(|| miss("missing installed node"))?
             .clone();
-        let value = match node {
-            QueryPlanNode::Scalar { value } => Value::Scalar(value),
-            QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::CurrentSeries { .. },
-                ..
-            } => {
-                self.stats.summary_readout_evaluations += 1;
-                from_result((self.callback)(
-                    id,
-                    u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
-                )?)?
-            }
-            QueryPlanNode::Logical { operator, inputs } => {
-                if matches!(
-                    operator,
-                    ResidualQueryOperator::Scan { .. }
-                        | ResidualQueryOperator::ExactSubquery { .. }
-                        | ResidualQueryOperator::CandidateExactSubquery { .. }
-                ) {
-                    return Err(miss(
+        let started = std::time::Instant::now();
+        tracing::debug!(query_id = %self.entry.query_id, node_id = ?id, evaluation_ms = at,
+            "installed query node started");
+        let value = (|| -> Result<Value, EngineError> {
+            Ok(match node {
+                QueryPlanNode::Scalar { value } => Value::Scalar(value),
+                QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::CurrentSeries { .. },
+                    ..
+                } => {
+                    self.stats.summary_readout_evaluations += 1;
+                    from_result((self.callback)(
+                        id,
+                        u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
+                    )?)?
+                }
+                QueryPlanNode::Logical { operator, inputs } => {
+                    if matches!(
+                        operator,
+                        ResidualQueryOperator::Scan { .. }
+                            | ResidualQueryOperator::ExactSubquery { .. }
+                            | ResidualQueryOperator::CandidateExactSubquery { .. }
+                    ) {
+                        return Err(miss(
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
                     ));
+                    }
+                    self.logical(operator, &inputs, at)?
                 }
-                self.logical(operator, &inputs, at)?
-            }
-            QueryPlanNode::CandidateTopK {
-                inputs,
-                k,
-                grouping,
-                completeness,
-            } => {
-                let candidates = vector(self.eval(inputs[0], at)?)?;
-                let values = vector(self.eval(inputs[1], at)?)?;
-                let (selected, warning) =
-                    candidate_topk(k, &grouping, candidates, values, &completeness)?;
-                if let Some(warning) = warning {
-                    self.warnings.push(warning);
+                QueryPlanNode::CandidateTopK {
+                    inputs,
+                    k,
+                    grouping,
+                    completeness,
+                } => {
+                    let candidates = vector(self.eval(inputs[0], at)?)?;
+                    let values = vector(self.eval(inputs[1], at)?)?;
+                    let (selected, warning) =
+                        candidate_topk(k, &grouping, candidates, values, &completeness)?;
+                    if let Some(warning) = warning {
+                        self.warnings.push(warning);
+                    }
+                    Value::Vector(selected)
                 }
-                Value::Vector(selected)
-            }
-            _ => {
-                self.stats.summary_readout_evaluations += 1;
-                from_result((self.callback)(
-                    id,
-                    u64::try_from(at).map_err(|_| miss("summary timestamp predates epoch"))?,
-                )?)?
+                _ => {
+                    self.stats.summary_readout_evaluations += 1;
+                    from_result((self.callback)(
+                        id,
+                        u64::try_from(at).map_err(|_| miss("summary timestamp predates epoch"))?,
+                    )?)?
+                }
+            })
+        })();
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                match &error {
+                    EngineError::CapabilityMiss { .. } => tracing::debug!(
+                        query_id = %self.entry.query_id, node_id = ?id,
+                        elapsed_us = started.elapsed().as_micros() as u64, %error,
+                        "installed query node could not be served"
+                    ),
+                    _ => tracing::warn!(
+                        query_id = %self.entry.query_id, node_id = ?id,
+                        elapsed_us = started.elapsed().as_micros() as u64, %error,
+                        "installed query node failed"
+                    ),
+                }
+                return Err(error);
             }
         };
+        tracing::debug!(query_id = %self.entry.query_id, node_id = ?id,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "installed query node completed");
         self.active.remove(&(id, at));
         self.memo.insert((id, at), value.clone());
         Ok(value)
