@@ -2,7 +2,7 @@ use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::{ASAPQueryEngine, QueryForwardingPolicy};
 #[cfg(test)]
-use crate::storage_engines::types::{QueryLanguage, StreamingConfig};
+use crate::storage_engines::types::{InstalledPrecomputePlan, QueryLanguage};
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::{
@@ -110,7 +110,7 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
         ),
     };
 
-    let streaming_config = Arc::new(StreamingConfig::default());
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
     let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
@@ -190,7 +190,7 @@ async fn test_forwarding_disabled() {
         ),
     };
 
-    let streaming_config = Arc::new(StreamingConfig::default());
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
     let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
@@ -278,7 +278,7 @@ async fn test_prometheus_server_unreachable() {
         ),
     };
 
-    let streaming_config = Arc::new(StreamingConfig::default());
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
     let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());

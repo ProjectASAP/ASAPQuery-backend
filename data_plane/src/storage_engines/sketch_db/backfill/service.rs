@@ -58,7 +58,7 @@ use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
 use crate::storage_engines::sketch_db::backfill::{
     BackfillRegistry, BackfillSource, BackfillStatus,
 };
-use crate::storage_engines::types::StreamingConfigHandle;
+use crate::storage_engines::types::InstalledPrecomputePlanHandle;
 
 /// Given a `BackfillSource`, return a reader that can read raw
 /// samples from it. Used by the service to pick a concrete reader
@@ -103,7 +103,7 @@ pub struct BackfillService {
     /// Shared sid mint authority — wired alongside `sketch_index` so
     /// backfilled precompute sids share the namespace with live ingest.
     series_resolver: Option<Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>>,
-    config_source: StreamingConfigHandle,
+    config_source: InstalledPrecomputePlanHandle,
     reader_factory: ReaderFactory,
     service_config: BackfillServiceConfig,
 }
@@ -111,7 +111,7 @@ pub struct BackfillService {
 impl BackfillService {
     pub fn new(
         registry: Arc<BackfillRegistry>,
-        config_source: StreamingConfigHandle,
+        config_source: InstalledPrecomputePlanHandle,
         reader_factory: ReaderFactory,
         service_config: BackfillServiceConfig,
     ) -> Self {
@@ -341,7 +341,7 @@ mod tests {
     use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{
         MockRawSampleReader, RawSample,
     };
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -369,10 +369,10 @@ mod tests {
         )
     }
 
-    fn streaming_with(cfg: PrecomputeMaterialization) -> Arc<StreamingConfig> {
+    fn streaming_with(cfg: PrecomputeMaterialization) -> Arc<InstalledPrecomputePlan> {
         let mut m = std::collections::HashMap::new();
         m.insert(cfg.policy_fp_u64(), cfg);
-        Arc::new(StreamingConfig::new(m))
+        Arc::new(InstalledPrecomputePlan::new(m))
     }
 
     async fn wait_for_status(
@@ -405,7 +405,7 @@ mod tests {
         let mut cfg = sum_config(1, "latency");
         cfg.table_name = Some("expected_table".into());
         let agg_fp = cfg.policy_fp_u64();
-        let hot = StreamingConfigHandle::from_arc(streaming_with(cfg));
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming_with(cfg));
         let registry = Arc::new(BackfillRegistry::new());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let called = calls.clone();
@@ -441,7 +441,7 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         // Factory returns a fresh mock reader per call — seeded with a
@@ -488,7 +488,7 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         let service = BackfillService::new(
@@ -522,7 +522,7 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         // Factory records the order in which it's invoked.
@@ -584,7 +584,7 @@ mod tests {
     async fn service_shutdown_stops_the_loop() {
         let cfg = sum_config(1, "m");
         let streaming = streaming_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
 
         let service = BackfillService::new(

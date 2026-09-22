@@ -111,6 +111,7 @@ where
         stats: ExecutionStats::default(),
         memo: BTreeMap::new(),
         active: BTreeSet::new(),
+        failed_node: None,
         warnings: Vec::new(),
     };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
@@ -148,12 +149,17 @@ struct Evaluator<'a, F> {
     callback: F,
     memo: BTreeMap<(QueryNodeId, i64), Value>,
     active: BTreeSet<(QueryNodeId, i64)>,
+    failed_node: Option<QueryNodeId>,
     warnings: Vec<String>,
 }
 impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'_, F> {
     fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
         if let Some(value) = self.memo.get(&(id, at)) {
             self.stats.memo_hits += 1;
+            let node = self.entry.nodes.get(&id);
+            tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id,
+                op = node.map(QueryPlanNode::op_label).unwrap_or("unknown"),
+                evaluation_ms = at, "installed query node memo hit");
             return Ok(value.clone());
         }
         if let Some(leaf) = self.leaves.get(&(id, at)) {
@@ -165,6 +171,12 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 self.stats.summary_readout_evaluations += 1;
             }
             let value = leaf.value.clone();
+            let node = self.entry.nodes.get(&id);
+            tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id,
+                op = node.map(QueryPlanNode::op_label).unwrap_or("unknown"),
+                evaluation_ms = at, remote = leaf.remote,
+                remote_evaluations = leaf.remote_evaluations, remote_rpcs = leaf.remote_rpcs,
+                "installed query prepared leaf used");
             self.memo.insert((id, at), value.clone());
             return Ok(value);
         }
@@ -180,54 +192,90 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .get(&id)
             .ok_or_else(|| miss("missing installed node"))?
             .clone();
-        let value = match node {
-            QueryPlanNode::Scalar { value } => Value::Scalar(value),
-            QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::CurrentSeries { .. },
-                ..
-            } => {
-                self.stats.summary_readout_evaluations += 1;
-                from_result((self.callback)(
-                    id,
-                    u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
-                )?)?
-            }
-            QueryPlanNode::Logical { operator, inputs } => {
-                if matches!(
-                    operator,
-                    ResidualQueryOperator::Scan { .. }
-                        | ResidualQueryOperator::ExactSubquery { .. }
-                        | ResidualQueryOperator::CandidateExactSubquery { .. }
-                ) {
-                    return Err(miss(
+        let op = node.op_label();
+        let started = std::time::Instant::now();
+        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, op,
+            syntax = %node.log_syntax(), inputs = ?node.inputs(), evaluation_ms = at,
+            "installed query node started");
+        let value = (|| -> Result<Value, EngineError> {
+            Ok(match node {
+                QueryPlanNode::Scalar { value } => Value::Scalar(value),
+                QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::CurrentSeries { .. },
+                    ..
+                } => {
+                    self.stats.summary_readout_evaluations += 1;
+                    from_result((self.callback)(
+                        id,
+                        u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
+                    )?)?
+                }
+                QueryPlanNode::Logical { operator, inputs } => {
+                    if matches!(
+                        operator,
+                        ResidualQueryOperator::Scan { .. }
+                            | ResidualQueryOperator::ExactSubquery { .. }
+                            | ResidualQueryOperator::CandidateExactSubquery { .. }
+                    ) {
+                        return Err(miss(
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
                     ));
+                    }
+                    self.logical(operator, &inputs, at)?
                 }
-                self.logical(operator, &inputs, at)?
-            }
-            QueryPlanNode::CandidateTopK {
-                inputs,
-                k,
-                grouping,
-                completeness,
-            } => {
-                let candidates = vector(self.eval(inputs[0], at)?)?;
-                let values = vector(self.eval(inputs[1], at)?)?;
-                let (selected, warning) =
-                    candidate_topk(k, &grouping, candidates, values, &completeness)?;
-                if let Some(warning) = warning {
-                    self.warnings.push(warning);
+                QueryPlanNode::CandidateTopK {
+                    inputs,
+                    k,
+                    grouping,
+                    completeness,
+                } => {
+                    let candidates = vector(self.eval(inputs[0], at)?)?;
+                    let values = vector(self.eval(inputs[1], at)?)?;
+                    let (selected, warning) =
+                        candidate_topk(k, &grouping, candidates, values, &completeness)?;
+                    if let Some(warning) = warning {
+                        self.warnings.push(warning);
+                    }
+                    Value::Vector(selected)
                 }
-                Value::Vector(selected)
-            }
-            _ => {
-                self.stats.summary_readout_evaluations += 1;
-                from_result((self.callback)(
-                    id,
-                    u64::try_from(at).map_err(|_| miss("summary timestamp predates epoch"))?,
-                )?)?
+                _ => {
+                    self.stats.summary_readout_evaluations += 1;
+                    from_result((self.callback)(
+                        id,
+                        u64::try_from(at).map_err(|_| miss("summary timestamp predates epoch"))?,
+                    )?)?
+                }
+            })
+        })();
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                if self.failed_node.is_none() {
+                    self.failed_node = Some(id);
+                    match &error {
+                        EngineError::CapabilityMiss { .. } => {
+                            tracing::debug!(target: "asap_runtime_debug",
+                                query_id = %self.entry.query_id, node_id = ?id, op,
+                                syntax = %self.entry.nodes[&id].log_syntax(),
+                                elapsed_us = started.elapsed().as_micros() as u64, %error,
+                                "installed query node could not be served"
+                            )
+                        }
+                        _ => tracing::warn!(
+                            query_id = %self.entry.query_id, node_id = ?id, op,
+                            syntax = %self.entry.nodes[&id].log_syntax(),
+                            elapsed_us = started.elapsed().as_micros() as u64, %error,
+                            "installed query node failed"
+                        ),
+                    }
+                }
+                return Err(error);
             }
         };
+        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, op,
+            syntax = %self.entry.nodes[&id].log_syntax(),
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "installed query node completed");
         self.active.remove(&(id, at));
         self.memo.insert((id, at), value.clone());
         Ok(value)

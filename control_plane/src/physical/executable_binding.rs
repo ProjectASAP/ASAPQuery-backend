@@ -2,6 +2,47 @@
 
 pub use asap_types::executable_plan::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperatorExecution {
+    Maintenance,
+    Query,
+}
+
+/// Keep the backend's ownership decision exhaustive over Planner's physical IR.
+/// Adding a payload variant upstream must therefore choose an executor here.
+fn operator_execution(
+    node: &planner_types::post_asap::ExecutableDagNode,
+) -> Result<OperatorExecution, String> {
+    use planner_types::post_asap::{ExecutableOperatorPayload as Payload, ExecutionTiming};
+
+    let declared = match &node.payload {
+        Payload::Binary { timing, .. } | Payload::Value { timing, .. } => *timing,
+        Payload::CandidateTopK { .. } | Payload::SummaryEstimate { .. } => {
+            ExecutionTiming::ReadTime
+        }
+        Payload::SummaryAgg { .. }
+        | Payload::SummaryJoin { .. }
+        | Payload::SummarySubtract
+        | Payload::SummaryDelete { .. }
+        | Payload::SummaryMerge => ExecutionTiming::MaintenanceTime,
+        // These operators can be placed on either side of the stored-state
+        // boundary. Planner's validated output state is authoritative.
+        Payload::Fallback { .. } | Payload::RelationalJoin { .. } => node.output_state.timing,
+    };
+    if declared != node.output_state.timing {
+        return Err(format!(
+            "post-ASAP node {:?} has operator timing {} but output state {}",
+            node.id,
+            declared.as_str(),
+            node.output_state
+        ));
+    }
+    Ok(match declared {
+        ExecutionTiming::MaintenanceTime => OperatorExecution::Maintenance,
+        ExecutionTiming::ReadTime => OperatorExecution::Query,
+    })
+}
+
 /// Assign backend phases to a selected semantic DAG without changing its nodes.
 pub fn install_selected_dag(
     query_id: String,
@@ -15,12 +56,11 @@ pub fn install_selected_dag(
     let mut nodes = std::collections::BTreeMap::new();
     let mut precompute_sinks = Vec::new();
     for node in &dag.nodes {
+        let execution = operator_execution(node)?;
         let binding = if let Some(summary_definition) = materialization(node.id) {
             precompute_sinks.push(node.id);
             BackendNodeBinding::Materialization { summary_definition }
-        } else if node.output_state.timing
-            == planner_types::post_asap::ExecutionTiming::MaintenanceTime
-        {
+        } else if execution == OperatorExecution::Maintenance {
             BackendNodeBinding::MaintenanceInput
         } else {
             query_node(node.id).map_or(BackendNodeBinding::QueryInput, |query_node| {
@@ -39,7 +79,7 @@ pub fn install_selected_dag(
             precompute_sinks,
         },
     };
-    installed.validate()?;
+    installed.binding.validate(&installed.document.decode()?)?;
     Ok(installed)
 }
 

@@ -5,7 +5,7 @@
 //! engine via [`OtlpReceiver::with_ingest_state`] — routes both raw metric
 //! points and pre-built sketches through the precompute engine's worker
 //! pool. The precompute engine then performs window-aligned aggregation
-//! per `StreamingConfig` and writes results to `SketchStore`.
+//! per `InstalledPrecomputePlan` and writes results to `SketchStore`.
 //!
 //! Architectural flow:
 //! ```text
@@ -621,27 +621,11 @@ fn resolve_bucket_sid_for_agg_config(
         config.population_key_encoding,
         &grouping_pairs,
     )?;
-    let agg_kind_canonical =
-        crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-    let sid = ingest_state.series_resolver.resolve_with_reactivation(
-        &config.metric,
+    let sid = ingest_state.summary_store.resolve_output_storage_handle(
+        &ingest_state.series_resolver,
+        config.policy_fingerprint().into(),
         &fp,
-        &agg_kind_canonical,
-        |sid| {
-            ingest_state
-                .summary_store
-                .validate_routed_catalog_generation(captured_generation)?;
-            let activation = ingest_state
-                .summary_store
-                .authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
-            if activation
-                .as_deref()
-                .is_some_and(|generation| Some(generation) != captured_generation)
-            {
-                return Err("stale OTLP generation cannot reactivate series".into());
-            }
-            Ok(activation)
-        },
+        captured_generation,
     )?;
     let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
     Ok((sid, policy_fp))
@@ -663,7 +647,7 @@ async fn route_otlp_to_precompute(
         .map(Arc::new);
     let snap = active_physical_plan_snapshot
         .as_ref()
-        .map(|plan| plan.streaming_config.clone())
+        .map(|plan| plan.installed_precompute_plan.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
     let agg_configs = snap.materializations();
     // Reconcile sid lifecycle using the current streaming-config snapshot.
@@ -914,7 +898,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     let active_physical_plan_snapshot = ingest_state.active_physical_plan_snapshot();
     let snap = active_physical_plan_snapshot
         .as_ref()
-        .map(|plan| plan.streaming_config.clone())
+        .map(|plan| plan.installed_precompute_plan.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
     let catalog_generation = active_physical_plan_snapshot
         .as_ref()
@@ -1221,7 +1205,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // because `fp=""` is a perfectly good mint/lookup key.
                     let resolved_sid: Option<u64> = if dp.series_id != 0 && attrs_pairs.is_empty() {
                         let sid = dp.series_id;
-                        if ingest_state.summary_store.instance(sid).is_some() {
+                        if ingest_state.summary_store.is_current_storage_handle(sid) {
                             Some(sid)
                         } else {
                             unknown_sids.push(sid);
@@ -1249,45 +1233,36 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // frames would mint distinct sids and the upgrade
                         // could never fire (the analyzer would also see two
                         // candidates for one logical series).
-                        let algorithm_for_sid = base_sketch_algorithm(sketch_algorithm_for(&dp));
-                        let agg_kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
-                            algorithm: algorithm_for_sid,
-                            config: dp.container_config.clone(),
-                            // OTel-ingest path: no per-DP spatial filter applies
-                            // at this layer (the agent has already filtered
-                            // before emitting the sketch). The empty filter is
-                            // the canonical value for "no filter on this sid's
-                            // policy".
-                            spatial_filter_canonical: String::new(),
-                        };
-                        let agg_kind_canonical = agg_kind.canonical_string();
                         let definition = frame_identity
                             .as_ref()
                             .map(|frame| frame.materialization)
                             .unwrap_or_else(|| asap_types::PolicyFingerprint(0).into());
-                        let assigned = match ingest_state.series_resolver.resolve_with_reactivation(
-                            &canonical_name,
+                        let resolved = ingest_state.summary_store.resolve_output_storage_handle(
+                            &ingest_state.series_resolver,
+                            definition,
                             &fp,
-                            &agg_kind_canonical,
-                            |sid| {
-                                ingest_state
-                                    .summary_store
-                                    .validate_routed_catalog_generation(
-                                        catalog_generation.as_deref(),
-                                    )?;
-                                let activation = ingest_state
-                                    .summary_store
-                                    .authorize_series_reactivation(sid, definition)?;
-                                if activation.as_deref().is_some_and(|generation| {
-                                    Some(generation) != catalog_generation.as_deref()
-                                }) {
-                                    return Err(
-                                        "stale OTLP generation cannot reactivate series".into()
-                                    );
-                                }
-                                Ok(activation)
-                            },
-                        ) {
+                            catalog_generation.as_deref(),
+                        );
+                        // Codec-only unit fixtures have no installed plan. Production
+                        // accepts stored summaries only through an installed output.
+                        #[cfg(test)]
+                        let resolved = if catalog_generation.is_none()
+                            && definition.fingerprint().is_unset()
+                        {
+                            let kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
+                                algorithm: base_sketch_algorithm(sketch_algorithm_for(&dp)),
+                                config: dp.container_config.clone(),
+                                spatial_filter_canonical: String::new(),
+                            };
+                            Ok(ingest_state.series_resolver.resolve(
+                                &canonical_name,
+                                &fp,
+                                &kind.canonical_string(),
+                            ))
+                        } else {
+                            resolved
+                        };
+                        let assigned = match resolved {
                             Ok(sid) => sid,
                             Err(error) => {
                                 if dp.series_id != 0 {
@@ -1436,7 +1411,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     .map(|s| s.to_string())
                             };
                             ingest_state.summary_store.register(SummarySeriesMetadata {
-                                sid,
+                                storage_handle: sid,
                                 metric_name: canonical_name.clone(),
                                 group_by_keys,
                                 capability: Some(cap),
@@ -2566,71 +2541,20 @@ fn decode_modified_otlp_sketch_bytes(
 
     match encoding {
         ENCODING_PROTO => match algorithm {
-            // Phase 3 step 3: DDSketch and KLL envelope-parsing /
-            // sketch reconstruction route through the shared
-            // `edge_runtime_adapter`, which delegates to
-            // `asap-precompute-rs`'s `Sketch` trait. Backend's
-            // accumulator wraps the result. Byte parity with Go is
-            // covered by `asap_sketchlib` PRs #40 (DDSketch) and #41
-            // (KLL).
-            //
-            // HLL / CountSketch / CountMinSketch byte parity is
-            // tracked under ProjectASAP/ASAPCollector#243 — until it
-            // lands those three sketches keep using the backend's
-            // existing per-accumulator decoder.
+            // The neutral codec accepts both full envelopes and supported bare
+            // states. Query accumulators retain their family-specific readouts.
             SketchAlgorithm::DDSketch => {
-                use crate::precompute_engine::operators::edge_runtime_adapter::{
-                    reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
+                let (inner, sample_p) = asap_sketch_codec::reconstruct_ddsketch(bytes)?;
+                let sample_p = if sample_p.is_finite() && sample_p > 0.0 && sample_p < 1.0 {
+                    sample_p
+                } else {
+                    1.0
                 };
-                // Prefer the asap-precompute-rs runtime path (envelope-
-                // wrapped bytes, the canonical edge-framework wire format).
-                // If the input is a bare `DdSketchState` (as some unit-test
-                // / pre-envelope agent payloads still emit, mirrored by the
-                // PR #14 contract on `from_sketchlib_proto_bytes`), the
-                // adapter returns an error decoding the envelope — fall
-                // back to the backend's native decoder which already
-                // accepts both shapes.
-                match reconstruct_via_runtime(RtSketchType::DDSketch, bytes) {
-                    Ok(ReconstructedSketch::DdSketch(inner)) => {
-                        // The runtime reconstruction discards the envelope's
-                        // sample_p; re-read it from the same full-frame bytes
-                        // so a sampled series rescales its Count by 1/p.
-                        let sample_p = DDSketchAccumulator::sample_p_from_envelope_bytes(bytes);
-                        Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
-                    }
-                    Ok(_) => {
-                        Err("edge_runtime_adapter returned non-DDSketch reconstruction".into())
-                    }
-                    Err(_) => Ok(Box::new(DDSketchAccumulator::from_sketchlib_proto_bytes(
-                        bytes,
-                    )?)),
-                }
+                Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
             }
-            SketchAlgorithm::Kll => {
-                use crate::precompute_engine::operators::edge_runtime_adapter::{
-                    reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
-                };
-                // Same envelope-vs-bare-state handling as DDSketch above.
-                // Backend's KLL accumulator owns the wire-format-aligned
-                // `KllSketch` rather than the high-throughput `KLL<f64>`
-                // that asap-precompute-rs's `KLLWrapper` wraps internally
-                // — when the adapter succeeds, bridge by re-feeding the
-                // wrapper's snapshot bytes through backend's existing
-                // decoder. The envelope work (decode + state extraction
-                // + reconstruction) has already happened in the runtime
-                // adapter; this final step just reshapes into backend's
-                // accumulator type. On envelope-decode failure (bare
-                // state bytes) fall through to the native decoder.
-                match reconstruct_via_runtime(RtSketchType::KLLSketch, bytes) {
-                    Ok(ReconstructedSketch::Kll { snapshot_bytes }) => Ok(Box::new(
-                        DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&snapshot_bytes)?,
-                    )),
-                    Ok(_) => Err("edge_runtime_adapter returned non-KLL reconstruction".into()),
-                    Err(_) => Ok(Box::new(
-                        DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
-                    )),
-                }
-            }
+            SketchAlgorithm::Kll => Ok(Box::new(
+                DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
+            )),
             SketchAlgorithm::Cms => Ok(Box::new(
                 CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
             )),
@@ -3626,7 +3550,7 @@ mod sid_resolution_tests {
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::sketch_db::index::SketchStore;
-    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlan, InstalledPrecomputePlanHandle};
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -3639,8 +3563,8 @@ mod sid_resolution_tests {
     async fn make_state() -> (Arc<IngestState>, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel(1024);
         let router = SeriesRouter::new(vec![tx]);
-        let streaming = StreamingConfig::new(std::collections::HashMap::new());
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(std::collections::HashMap::new());
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
         let state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
@@ -3850,7 +3774,7 @@ mod sid_resolution_tests {
     async fn delta_apply_rotates_per_series_base_at_window_boundary() {
         use crate::precompute_engine::operators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
-        use asap_sketchlib::proto::sketchlib::DdSketchState;
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -3882,10 +3806,13 @@ mod sid_resolution_tests {
         );
 
         // ── Window 1: full frame. Base buckets [10, 0, 5]. ──
-        let full_w1 = DdSketchState {
-            alpha: 0.01,
-            store_counts: vec![10, 0, 5],
-            store_offset: 0,
+        let full_w1 = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(DdSketchState {
+                alpha: 0.01,
+                store_counts: vec![10, 0, 5],
+                store_offset: 0,
+            })),
+            ..Default::default()
         }
         .encode_to_vec();
         route_modified_otlp_sketches_to_precompute(
@@ -4558,7 +4485,7 @@ mod sid_bucketing_tests {
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
     use crate::storage_engines::sketch_db::index::SketchStore;
-    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlan, InstalledPrecomputePlanHandle};
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -4677,8 +4604,8 @@ mod sid_bucketing_tests {
         let policy_fp = asap_types::PolicyFingerprint(cfg.policy_fp_u64());
         let mut configs = HashMap::new();
         configs.insert(cfg.policy_fp_u64(), cfg.clone());
-        let streaming = StreamingConfig::new(configs);
-        let hot_reload = StreamingConfigHandle::new(streaming);
+        let streaming = InstalledPrecomputePlan::new(configs);
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming);
 
         let resolver = Arc::new(SeriesIdResolver::new());
         let state = Arc::new(IngestState {
@@ -4773,7 +4700,10 @@ mod sid_bucketing_tests {
             };
             let fp =
                 crate::drivers::ingest::canonical_attrs_fingerprint(&[("zone", zone_for_bucket)]);
-            let resolved = resolver.lookup(metric, &fp, &agg_kind_canonical);
+            let resolved = state
+                .summary_store
+                .resolve_output_storage_handle(&resolver, policy_fp.into(), &fp, None)
+                .ok();
             assert_eq!(
                 resolved,
                 Some(*sid),

@@ -1,6 +1,8 @@
 //! The production CLI's no-forwarding mode keeps query traffic inside the backend.
 
-use std::io::Write;
+#[path = "support/empty_physical_plan.rs"]
+mod empty_physical_plan;
+
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -61,12 +63,12 @@ async fn cli_mode_blocks_instant_and_range_forwarding() {
     });
 
     let mut config = tempfile::NamedTempFile::new().unwrap();
-    writeln!(config, "aggregations: []").unwrap();
+    serde_json::to_writer(&mut config, &empty_physical_plan::empty()).unwrap();
     let output = tempfile::tempdir().unwrap();
     let port = unused_port();
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_data_plane"))
-            .arg("--streaming-config")
+            .arg("--physical-plan")
             .arg(config.path())
             .args([
                 "--disable-query-forwarding",

@@ -41,8 +41,12 @@ pub trait AsyncQueryNodeRuntime {
 pub enum DagExecutionError<E> {
     #[error("invalid physical query graph: {0}")]
     InvalidGraph(String),
-    #[error("query node {node_id} failed")]
-    Node { node_id: u64, source: E },
+    #[error("query `{query_id}` node {node_id} failed")]
+    Node {
+        query_id: String,
+        node_id: u64,
+        source: E,
+    },
 }
 
 /// Execute each reachable node exactly once. A diamond-shaped DAG therefore
@@ -59,9 +63,9 @@ pub fn execute_from<R: QueryNodeRuntime>(
     root: QueryNodeId,
     runtime: &R,
 ) -> Result<R::Output, DagExecutionError<R::Error>> {
-    let order = entry
-        .topological_order_from(root)
-        .map_err(|error| DagExecutionError::InvalidGraph(error.to_string()))?;
+    let order = entry.topological_order_from(root).map_err(|error| {
+        DagExecutionError::InvalidGraph(format!("query `{}`: {error}", entry.query_id))
+    })?;
     let mut outputs = BTreeMap::<QueryNodeId, R::Output>::new();
     for id in order {
         let node = entry
@@ -84,6 +88,7 @@ pub fn execute_from<R: QueryNodeRuntime>(
             runtime
                 .execute_node(id, node, &inputs)
                 .map_err(|source| DagExecutionError::Node {
+                    query_id: entry.query_id.clone(),
                     node_id: id.0,
                     source,
                 })?;
@@ -107,9 +112,9 @@ pub async fn execute_from_async<R: AsyncQueryNodeRuntime + Sync>(
     root: QueryNodeId,
     runtime: &R,
 ) -> Result<R::Output, DagExecutionError<R::Error>> {
-    let order = entry
-        .topological_order_from(root)
-        .map_err(|error| DagExecutionError::InvalidGraph(error.to_string()))?;
+    let order = entry.topological_order_from(root).map_err(|error| {
+        DagExecutionError::InvalidGraph(format!("query `{}`: {error}", entry.query_id))
+    })?;
     let mut outputs = BTreeMap::<QueryNodeId, R::Output>::new();
     for id in order {
         let node = entry
@@ -132,6 +137,7 @@ pub async fn execute_from_async<R: AsyncQueryNodeRuntime + Sync>(
             .execute_node(id, node, &inputs)
             .await
             .map_err(|source| DagExecutionError::Node {
+                query_id: entry.query_id.clone(),
                 node_id: id.0,
                 source,
             })?;
@@ -152,6 +158,22 @@ mod tests {
     use super::*;
 
     struct CountingRuntime(RefCell<BTreeMap<QueryNodeId, usize>>);
+
+    struct FailingRuntime;
+
+    impl QueryNodeRuntime for FailingRuntime {
+        type Output = usize;
+        type Error = &'static str;
+
+        fn execute_node(
+            &self,
+            _id: QueryNodeId,
+            _node: &QueryPlanNode,
+            _inputs: &[usize],
+        ) -> Result<usize, Self::Error> {
+            Err("broken read")
+        }
+    }
 
     impl QueryNodeRuntime for CountingRuntime {
         type Output = usize;
@@ -221,6 +243,32 @@ mod tests {
         let runtime = CountingRuntime(RefCell::new(BTreeMap::new()));
         assert_eq!(execute(&entry, &runtime).unwrap(), 5);
         assert!(runtime.0.borrow().values().all(|count| *count == 1));
+    }
+
+    #[test]
+    fn node_failure_identifies_the_installed_query_and_node() {
+        let entry = QueryPlanEntry {
+            language: asap_types::query_plan::QueryLanguage::PromQl,
+            query_id: "latency-p50".into(),
+            canonical_query: "latency".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(7),
+            nodes: BTreeMap::from([(
+                QueryNodeId(7),
+                QueryPlanNode::ExactFallback {
+                    reason: "fixture".into(),
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::Reject,
+        };
+
+        let error = execute(&entry, &FailingRuntime).unwrap_err().to_string();
+        assert!(error.contains("query `latency-p50` node 7 failed"));
     }
 
     struct AsyncCountingRuntime(tokio::sync::Mutex<BTreeMap<QueryNodeId, usize>>);

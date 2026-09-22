@@ -464,8 +464,8 @@ fn select_workload_impl(
                     "cost_estimate": backend_cost_model.and_then(|model| model.candidate_cost_estimate(candidate)),
                     "selected": chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)),
                 })}).collect::<Vec<_>>();
-            let rejected = space.target_subdag_candidates().find(|candidates| Rc::ptr_eq(&candidates.target, group.target))
-                .into_iter().flat_map(|candidates| &candidates.rejected).map(|candidate| serde_json::json!({
+            let rejected = space.target_subdag_candidates().find(|memo| Rc::ptr_eq(&memo.target, group.target))
+                .into_iter().flat_map(|memo| &memo.rejected).map(|candidate| serde_json::json!({
                     "status": "rejected", "strategy": candidate.strategy,
                     "description": candidate.description, "reason": candidate.error.to_string()
                 })).collect::<Vec<_>>();

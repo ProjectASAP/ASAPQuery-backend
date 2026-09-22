@@ -371,8 +371,9 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
 pub struct ClickHouseRelationalAdapter;
 
 impl ClickHouseRelationalAdapter {
-    pub fn apply_inner_equi_join(
+    pub fn apply_join(
         &self,
+        kind: &planner_types::pre_asap::JoinKind,
         pred: &planner_types::pre_asap::Predicate,
         output_schema: &SummarySchema,
         left: ClickHouseRelation,
@@ -390,12 +391,49 @@ impl ClickHouseRelationalAdapter {
         fields.extend(right.fields.clone());
         let schema = scalar_schema(&fields);
         let mut rows = Vec::new();
+        let mut right_matched = vec![false; right.rows.len()];
         for left_row in &left.rows {
-            for right_row in &right.rows {
+            let mut left_matched = false;
+            for (right_index, right_row) in right.rows.iter().enumerate() {
                 let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
                 joined.extend(left_row.iter().cloned());
                 joined.extend(right_row.iter().cloned());
-                if matches!(eval(&pred.0, &joined, &schema)?, Cell::Bool(true)) {
+                let matches = matches!(kind, planner_types::pre_asap::JoinKind::Cross)
+                    || matches!(eval(&pred.0, &joined, &schema)?, Cell::Bool(true));
+                if matches {
+                    left_matched = true;
+                    right_matched[right_index] = true;
+                    match kind {
+                        planner_types::pre_asap::JoinKind::Semi => {
+                            rows.push(left_row.clone());
+                            break;
+                        }
+                        planner_types::pre_asap::JoinKind::Anti => break,
+                        _ => rows.push(joined),
+                    }
+                }
+            }
+            if !left_matched {
+                match kind {
+                    planner_types::pre_asap::JoinKind::Left
+                    | planner_types::pre_asap::JoinKind::Full => {
+                        let mut joined = left_row.clone();
+                        joined.resize(left_row.len() + right.fields.len(), Cell::Null);
+                        rows.push(joined);
+                    }
+                    planner_types::pre_asap::JoinKind::Anti => rows.push(left_row.clone()),
+                    _ => {}
+                }
+            }
+        }
+        if matches!(
+            kind,
+            planner_types::pre_asap::JoinKind::Right | planner_types::pre_asap::JoinKind::Full
+        ) {
+            for (matched, right_row) in right_matched.into_iter().zip(&right.rows) {
+                if !matched {
+                    let mut joined = vec![Cell::Null; left.fields.len()];
+                    joined.extend(right_row.iter().cloned());
                     rows.push(joined);
                 }
             }
@@ -1672,7 +1710,13 @@ mod tests {
             right: Rc::new(QueryExpr::Column(2)),
         }));
         let joined = ClickHouseRelationalAdapter
-            .apply_inner_equi_join(&pred, &joined_schema, left, right)
+            .apply_join(
+                &planner_types::pre_asap::JoinKind::Inner,
+                &pred,
+                &joined_schema,
+                left,
+                right,
+            )
             .unwrap();
         let output_schema = schema(&[("service", DataType::Utf8), ("ratio", DataType::Float64)]);
         let projected = ClickHouseRelationalAdapter
@@ -1710,6 +1754,58 @@ mod tests {
                 .unwrap()
                 .value(0),
             0.2
+        );
+    }
+
+    // Every standardized Planner join kind has concrete row semantics.
+    #[test]
+    fn executes_all_post_asap_relational_join_kinds() {
+        use planner_types::pre_asap::JoinKind;
+
+        let side_schema = schema(&[("key", DataType::Int64)]);
+        let relation = |values: &[i64]| ClickHouseRelation {
+            rows: values
+                .iter()
+                .map(|value| vec![Cell::Int64(*value)])
+                .collect(),
+            fields: fields_from_schema(&side_schema),
+            coverage: Some((0, 10)),
+        };
+        let joined_schema = schema(&[("left", DataType::Int64), ("right", DataType::Int64)]);
+        let pred = Predicate(Rc::new(QueryExpr::Compare {
+            left: Rc::new(QueryExpr::Column(0)),
+            op: CompareOpKind::Eq,
+            right: Rc::new(QueryExpr::Column(1)),
+        }));
+        let adapter = ClickHouseRelationalAdapter;
+        let execute = |kind, output_schema: &SummarySchema| {
+            adapter
+                .apply_join(
+                    &kind,
+                    &pred,
+                    output_schema,
+                    relation(&[1, 2]),
+                    relation(&[2, 3]),
+                )
+                .unwrap()
+                .rows
+        };
+
+        assert_eq!(
+            execute(JoinKind::Inner, &joined_schema),
+            vec![vec![Cell::Int64(2), Cell::Int64(2)]]
+        );
+        assert_eq!(execute(JoinKind::Left, &joined_schema).len(), 2);
+        assert_eq!(execute(JoinKind::Right, &joined_schema).len(), 2);
+        assert_eq!(execute(JoinKind::Full, &joined_schema).len(), 3);
+        assert_eq!(execute(JoinKind::Cross, &joined_schema).len(), 4);
+        assert_eq!(
+            execute(JoinKind::Semi, &side_schema),
+            vec![vec![Cell::Int64(2)]]
+        );
+        assert_eq!(
+            execute(JoinKind::Anti, &side_schema),
+            vec![vec![Cell::Int64(1)]]
         );
     }
 }

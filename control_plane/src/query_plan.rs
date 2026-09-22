@@ -1031,6 +1031,10 @@ mod catalog_binding_tests {
                         full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: config.policy_fingerprint().into(),
+                        stored_output_reference:
+                            asap_types::sds::StoredOutputReference::for_definition(
+                                config.policy_fingerprint().into(),
+                            ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 10_000,
                         pane_origin_ms: Some(0),
@@ -1050,6 +1054,7 @@ mod catalog_binding_tests {
                 plan_id: 7,
                 plan_version: 2,
                 clickhouse_context: None,
+                selected_dags: Default::default(),
                 entries: BTreeMap::from([(entry.canonical_query.clone(), entry)]),
             },
             catalog,
@@ -1159,6 +1164,10 @@ mod catalog_binding_tests {
             SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
         let (mut counter_plan, _) = fixture();
         binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
+        binding(&mut counter_plan).stored_output_reference =
+            asap_types::sds::StoredOutputReference::for_definition(
+                counter.policy_fingerprint().into(),
+            );
         as_rate_plan(counter_plan)
             .validate_against_catalog(&counter_catalog)
             .unwrap();
@@ -1201,6 +1210,10 @@ mod tests {
                     Ok(MaterializationBinding {
                         full_window_slide_ms: None,
                         materialization: PolicyFingerprint(7).into(),
+                        stored_output_reference:
+                            asap_types::sds::StoredOutputReference::for_definition(
+                                PolicyFingerprint(7).into(),
+                            ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
                         pane_origin_ms: Some(0),
@@ -1328,6 +1341,7 @@ mod tests {
                 tables: Default::default(),
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
+            selected_dags: Default::default(),
             entries: [base, metricsql, clickhouse]
                 .into_iter()
                 .map(|entry| (QueryPlan::catalog_key(entry.language, "shared"), entry))
