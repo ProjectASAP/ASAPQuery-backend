@@ -20,3 +20,5 @@ pub mod worker;
 
 pub use engine::{PrecomputeEngine, PrecomputeWorkerDiagnostics};
 pub use ingest_handler::IngestState;
+
+pub mod partitioning;

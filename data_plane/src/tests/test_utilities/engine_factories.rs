@@ -119,6 +119,7 @@ pub fn create_engine_single_pop_with_aggregated(
     materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
+        partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
         materializations_by_policy_fingerprint,
@@ -237,6 +238,7 @@ pub fn create_engine_dual_input(
     materializations_by_policy_fingerprint.insert(keys_id, keys_agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
+        partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
         materializations_by_policy_fingerprint,
@@ -363,6 +365,7 @@ pub fn create_engine_two_metrics(
     materializations_by_policy_fingerprint.insert(id_b, agg_config_b);
 
     let streaming_config = Arc::new(StreamingConfig {
+        partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
         materializations_by_policy_fingerprint,
@@ -472,6 +475,7 @@ pub fn create_engine_three_metrics(
     }
 
     let streaming_config = Arc::new(StreamingConfig {
+        partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
         materializations_by_policy_fingerprint,
@@ -554,6 +558,7 @@ pub fn create_engine_multi_timestamp(
     materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
+        partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
         materializations_by_policy_fingerprint,
@@ -630,6 +635,7 @@ pub fn create_engine_multi_timestamp_with_window(
     materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
+        partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
         materializations_by_policy_fingerprint,

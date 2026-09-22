@@ -422,8 +422,8 @@ fn validate_query_forwarding_configuration(
 fn validate_profile(args: &Args) -> Result<()> {
     validate_query_forwarding_configuration(args)?;
     if args.profile != RuntimeProfile::Asapquery {
-        if args.streaming_config.is_none() {
-            return Err("the distributed profile requires --streaming-config".into());
+        if args.streaming_config.is_none() && args.physical_plan.is_none() {
+            return Err("the distributed profile requires --physical-plan".into());
         }
         if args.planning_snapshot.is_some() {
             return Err("--planning-snapshot is available only with --profile asapquery".into());
@@ -1487,6 +1487,13 @@ mod tests {
     use super::{validate_profile, Args};
     use clap::Parser;
     use data_plane::drivers::AdapterConfig;
+
+    // Every profile must bootstrap from the same validated physical artifact.
+    #[test]
+    fn distributed_accepts_physical_plan_without_streaming_config() {
+        let args = Args::try_parse_from(["data_plane", "--physical-plan", "plan.json"]).unwrap();
+        assert!(validate_profile(&args).is_ok());
+    }
 
     #[test]
     fn asapquery_requires_atomic_physical_plan_not_streaming_config() {

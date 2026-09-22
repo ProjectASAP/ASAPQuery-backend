@@ -67,26 +67,53 @@ where
     R: PrecomputeOperatorRegistry<V>,
     S: IdempotentCommitSink<V>,
 {
-    if !matches!(binding.node(sink_node), Some(BackendNodeBinding::Materialization { summary_definition }) if *summary_definition == key.summary_definition)
-    {
-        return Err(ScheduleError::Invalid(format!(
-            "commit key materialization {:?} does not match sink {}",
-            key.summary_definition, sink_node.0
-        )));
-    }
+    let mut outputs = execute_precompute_sinks(dag, binding, &[(sink_node, key)], registry, sink)?;
+    Ok(outputs.remove(0))
+}
+
+/// Evaluate all selected stored outputs with one dependency cache. Keys must
+/// describe the same input revision and window; only their output identity may
+/// differ. Validation finishes before executing or committing any output.
+pub fn execute_precompute_sinks<V, R, S>(
+    dag: &ExecutableDag,
+    binding: &BackendExecutableBinding,
+    outputs: &[(PostAsapNodeId, MaterializationCommitKey)],
+    registry: &R,
+    sink: &S,
+) -> Result<Vec<Arc<V>>, ScheduleError<R::Error, S::Error>>
+where
+    R: PrecomputeOperatorRegistry<V>,
+    S: IdempotentCommitSink<V>,
+{
     binding.validate(dag).map_err(ScheduleError::Invalid)?;
-    if !binding.precompute_sinks.contains(&sink_node)
-        || !matches!(
-            binding.node(sink_node),
-            Some(BackendNodeBinding::Materialization { .. })
-        )
-    {
-        return Err(ScheduleError::Invalid(
-            "node is not a precompute sink".into(),
-        ));
-    }
-    if let Some(committed) = sink.get(&key).map_err(ScheduleError::Sink)? {
-        return Ok(committed);
+    let mut unique = BTreeSet::new();
+    for (node, key) in outputs {
+        if !unique.insert(node.0)
+            || !binding.precompute_sinks.contains(node)
+            || !matches!(binding.node(*node), Some(BackendNodeBinding::Materialization { summary_definition }) if *summary_definition == key.summary_definition)
+        {
+            return Err(ScheduleError::Invalid(
+                "commit key does not match a unique stored output binding".into(),
+            ));
+        }
+        let first = &outputs[0].1;
+        if (
+            key.plan_id,
+            key.plan_version,
+            key.window_start_ms,
+            key.window_end_ms,
+            &key.input_lineage,
+        ) != (
+            first.plan_id,
+            first.plan_version,
+            first.window_start_ms,
+            first.window_end_ms,
+            &first.input_lineage,
+        ) {
+            return Err(ScheduleError::Invalid(
+                "stored outputs require one evaluation window and input revision".into(),
+            ));
+        }
     }
     let nodes = dag
         .nodes
@@ -179,16 +206,20 @@ where
         active.remove(&id);
         Ok(())
     }
-    visit(
-        sink_node.0,
-        &nodes,
-        &inputs,
-        &mut active,
-        &mut values,
-        registry,
-    )?;
-    sink.commit_if_absent(key, values.remove(&sink_node.0).unwrap())
-        .map_err(ScheduleError::Sink)
+    let mut results = Vec::with_capacity(outputs.len());
+    for (node, key) in outputs {
+        if let Some(committed) = sink.get(key).map_err(ScheduleError::Sink)? {
+            values.insert(node.0, Arc::clone(&committed));
+            results.push(committed);
+            continue;
+        }
+        visit(node.0, &nodes, &inputs, &mut active, &mut values, registry)?;
+        let value = sink
+            .commit_if_absent(key.clone(), Arc::clone(&values[&node.0]))
+            .map_err(ScheduleError::Sink)?;
+        results.push(value);
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -300,6 +331,34 @@ mod tests {
             window_end_ms: 20,
             input_lineage: b"checkpoint:3".to_vec(),
         }
+    }
+
+    // Two stored sinks in one evaluation reuse their shared upstream work.
+    #[test]
+    fn stored_sinks_share_one_evaluation() {
+        let mut query = node(4);
+        query.output_state = ExecutionDataState::READ_ROWS;
+        let dag = ExecutableDag {
+            nodes: vec![node(0), node(1), node(2), node(3), query],
+            edges: vec![edge(0, 1), edge(1, 2), edge(1, 3)],
+            root: PostAsapNodeId(4),
+        };
+        let mut bindings = binding();
+        bindings.precompute_sinks = vec![PostAsapNodeId(2), PostAsapNodeId(3)];
+        let registry = Registry::default();
+        let sink = Sink::default();
+        execute_precompute_sinks(
+            &dag,
+            &bindings,
+            &[(PostAsapNodeId(2), key(2)), (PostAsapNodeId(3), key(3))],
+            &registry,
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(
+            *registry.0.lock().unwrap(),
+            BTreeMap::from([(0, 1), (1, 1), (2, 1), (3, 1)])
+        );
     }
 
     #[test]

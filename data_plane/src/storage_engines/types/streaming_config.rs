@@ -16,6 +16,8 @@ use super::storage_backend::StorageBackend;
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamingConfig {
     #[serde(skip)]
+    pub(crate) partitioning: crate::precompute_engine::partitioning::DagPartitioning,
+    #[serde(skip)]
     pub(crate) raw_programs:
         HashMap<u64, std::sync::Arc<crate::precompute_engine::raw_dag::RawDagProgram>>,
     /// Authoritative execution configuration: Planner DAGs and physical bindings.
@@ -62,6 +64,7 @@ impl StreamingConfig {
         materializations_by_policy_fingerprint: HashMap<u64, PrecomputeMaterialization>,
     ) -> Self {
         Self {
+            partitioning: Default::default(),
             raw_programs: HashMap::new(),
             precompute_plan: None,
             materializations_by_policy_fingerprint,
@@ -85,6 +88,8 @@ impl StreamingConfig {
             programs.insert(config.policy_fp_u64(), std::sync::Arc::new(program));
         }
         let mut view = Self::new(materializations);
+        view.partitioning =
+            crate::precompute_engine::partitioning::DagPartitioning::from_plan(&plan);
         view.precompute_plan = Some(plan);
         view.raw_programs = programs;
         Ok(view)
@@ -103,6 +108,7 @@ impl StreamingConfig {
         storage_backend: StorageBackend,
     ) -> Self {
         Self {
+            partitioning: Default::default(),
             raw_programs: HashMap::new(),
             precompute_plan: None,
             materializations_by_policy_fingerprint,

@@ -233,11 +233,7 @@ impl PrometheusRemoteWriteReceiver {
         if plan.precompute_plan.summary_catalog.as_ref() != Some(&generation) {
             return Err("finite maintenance generation changed during drain".into());
         }
-        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
-            &self.inner.ingest.summary_store,
-            &self.inner.ingest.series_resolver,
-            &plan.precompute_plan,
-        )?;
+        self.inner.ingest.router.complete_dag(plan).await?;
         if let Some(observer) = self.inner.ingest.router.erp_observer() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

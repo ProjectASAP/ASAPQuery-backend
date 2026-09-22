@@ -151,6 +151,10 @@ pub struct WorkerRuntimeConfig {
 /// `(metric, attrs_fingerprint, agg_kind_canonical)` identity contract on
 /// `SeriesIdResolver`, so one sid uniquely names one bucket.
 pub struct Worker {
+    maintenance_storage: Option<(
+        Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    )>,
     erp_observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
     current_input_revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
     current_catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
@@ -189,6 +193,46 @@ pub struct Worker {
 }
 
 impl Worker {
+    pub fn set_maintenance_storage(
+        &mut self,
+        store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    ) {
+        self.maintenance_storage = Some((store, resolver));
+    }
+
+    fn complete_dag(
+        &self,
+        plan: &crate::storage_engines::types::RuntimePhysicalPlan,
+    ) -> Result<(), String> {
+        if !plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .any(|output| output.derived_input.is_some())
+        {
+            return Ok(());
+        }
+        // The installed locality proof assigns derived graphs to one owner.
+        // Every raw input of this graph was routed to that same worker.
+        if plan.streaming_config.partitioning != super::partitioning::DagPartitioning::SingleWorker
+        {
+            return Err("derived DAG has no validated local partitioning rule".into());
+        }
+        if self.id != 0 {
+            return Ok(());
+        }
+        let (store, resolver) = self
+            .maintenance_storage
+            .as_ref()
+            .ok_or("worker has no maintenance storage bindings")?;
+        super::maintenance_runtime::execute_finite_maintenance(
+            store,
+            resolver,
+            &plan.precompute_plan,
+        )
+    }
+
     pub fn set_erp_observer(
         &mut self,
         observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
@@ -215,6 +259,7 @@ impl Worker {
             wall_clock_max_open_grace_period_ms,
         } = runtime_config;
         Self {
+            maintenance_storage: None,
             erp_observer: None,
             current_input_revision: None,
             current_catalog_generation: None,
@@ -383,6 +428,16 @@ impl Worker {
                         processing_error = Some(error.clone());
                     }
                     let _ = reply.send(processing_error.clone().map_or(Ok(()), Err));
+                }
+                WorkerMessage::CompleteDag { plan, reply } => {
+                    let result = match &processing_error {
+                        Some(error) => Err(error.clone()),
+                        None => self.complete_dag(&plan),
+                    };
+                    if let Err(error) = &result {
+                        processing_error = Some(error.clone());
+                    }
+                    let _ = reply.send(result);
                 }
                 WorkerMessage::Shutdown => {
                     info!("Worker {} shutting down", self.id);
@@ -4297,6 +4352,109 @@ mod dag_execution_tests {
         crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap()
+    }
+
+    // Real router/engine queues preserve every partition's result as concurrency changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn installed_dag_results_match_with_one_and_four_workers() {
+        use crate::precompute_engine::{config::PrecomputeEngineConfig, engine::PrecomputeEngine};
+        async fn execute(query: &str, workers: usize) -> BTreeMap<(Vec<u8>, u64, u64), Vec<u8>> {
+            let physical = plan(query);
+            assert_eq!(
+                physical.precompute_plan.materializations.len(),
+                1,
+                "{query}"
+            );
+            let config = physical.precompute_plan.materializations[0].clone();
+            let runtime = StreamingConfig::from_precompute_plan(physical.precompute_plan).unwrap();
+            let rule = runtime.partitioning.clone();
+            let sink = Arc::new(CapturingOutputSink::new());
+            let engine = PrecomputeEngine::new(
+                PrecomputeEngineConfig {
+                    num_workers: workers,
+                    allowed_lateness_ms: 10_000,
+                    wall_clock_idle_grace_period_ms: 0,
+                    wall_clock_max_open_grace_period_ms: 0,
+                    ..Default::default()
+                },
+                StreamingConfigHandle::new(runtime),
+                sink.clone(),
+                Arc::new(crate::drivers::ingest::series_resolver::SeriesIdResolver::new()),
+                Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            );
+            let ingest = engine.ingest_state();
+            let diagnostics = engine.diagnostics();
+            let running = tokio::spawn(engine.run());
+            let mut messages = Vec::new();
+            for population in 0..64 {
+                let label = format!("service-{population}");
+                messages.push(WorkerMessage::GroupSamples {
+                    sid: population + 1,
+                    policy_fp: config.policy_fingerprint(),
+                    group_key: Arc::new(GroupKey::new([("service", label.as_str())])),
+                    samples: [
+                        (1000, 10.0),
+                        (2000, 20.0),
+                        (3000, 3.0),
+                        (4000, 9.0),
+                        (5000, 12.0),
+                    ]
+                    .into_iter()
+                    .map(|(t, value)| {
+                        (
+                            format!("{}{{service=\"{}\"}}", config.metric, label),
+                            t,
+                            value,
+                        )
+                    })
+                    .collect(),
+                    ingest_received_at: std::time::Instant::now(),
+                });
+            }
+            ingest
+                .router
+                .route_group_batch(messages, std::time::Instant::now(), None)
+                .await
+                .unwrap();
+            ingest.router.drain().await.unwrap();
+            if workers > 1 && rule != super::super::partitioning::DagPartitioning::SingleWorker {
+                assert!(
+                    diagnostics
+                        .worker_group_counts
+                        .iter()
+                        .filter(|n| n.load(Ordering::Relaxed) > 0)
+                        .count()
+                        > 1,
+                    "the test must exercise multiple workers"
+                );
+            }
+            ingest.router.shutdown().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let mut records = BTreeMap::new();
+            for (output, state) in sink.drain() {
+                let key = (
+                    output.key.unwrap().serialize_to_bytes(),
+                    output.start_timestamp,
+                    output.end_timestamp,
+                );
+                assert!(
+                    records.insert(key, state.serialize_to_bytes()).is_none(),
+                    "duplicate output"
+                );
+            }
+            assert!(!records.is_empty());
+            records
+        }
+        for query in [
+            "sum_over_time(asap_demo_gauge[5s])",
+            "rate(asap_demo_counter_total[5s])",
+        ] {
+            assert_eq!(execute(query, 1).await, execute(query, 4).await, "{query}");
+        }
     }
 
     // A selected producer must govern updates, persisted family, and query readout.

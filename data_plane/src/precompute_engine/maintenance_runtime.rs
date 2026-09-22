@@ -2,8 +2,8 @@
 
 use super::output_sink::OutputSink;
 use super::subdag_scheduler::{
-    execute_precompute_sink, IdempotentCommitSink, MaterializationCommitKey,
-    PrecomputeOperatorRegistry, ScheduleError,
+    execute_precompute_sink, execute_precompute_sinks, IdempotentCommitSink,
+    MaterializationCommitKey, PrecomputeOperatorRegistry, ScheduleError,
 };
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput, StreamingConfigHandle};
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
@@ -1855,6 +1855,8 @@ impl MaintenanceDagSink {
                 },
                 configs: &plan.precompute_plan.materializations,
             };
+            let mut selected_outputs = Vec::new();
+            let mut horizons = Vec::new();
             for sink_node in &installed.binding.precompute_sinks {
                 // Derived summaries consume complete immutable windows at the
                 // completion barrier, never additive worker fragments.
@@ -1937,15 +1939,21 @@ impl MaintenanceDagSink {
                 if self.commits.is_published(&key)? {
                     continue;
                 }
-                let value = execute_precompute_sink(
-                    &dag,
-                    &installed.binding,
-                    *sink_node,
-                    key.clone(),
-                    &adapter,
-                    &self.commits,
-                )
-                .map_err(schedule_error)?;
+                selected_outputs.push((*sink_node, key));
+                horizons.push(horizon_ms);
+            }
+            let values = execute_precompute_sinks(
+                &dag,
+                &installed.binding,
+                &selected_outputs,
+                &adapter,
+                &self.commits,
+            )
+            .map_err(schedule_error)?;
+            for (((_, key), horizon_ms), value) in
+                selected_outputs.into_iter().zip(horizons).zip(values)
+            {
+                let target = key.summary_definition;
                 let mut target_output = output.clone();
                 target_output.policy_fp = target.into();
                 target_output.series_id = None;
