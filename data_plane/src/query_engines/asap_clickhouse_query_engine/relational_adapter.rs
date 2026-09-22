@@ -61,6 +61,9 @@ fn json_cell(
         ))
     };
     match dtype {
+        DataType::Interval | DataType::Date => Err(ClickHouseRelationalError::Unsupported(
+            "temporal value transport".into(),
+        )),
         DataType::Null if value.is_null() => Ok(Cell::Null),
         DataType::Null => Err(invalid()),
         DataType::List { element } => {
@@ -330,6 +333,7 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
         return false;
     }
     match expected {
+        DataType::Interval | DataType::Date => false,
         DataType::Null => actual == "Nothing",
         DataType::List { element } => {
             !nullable
@@ -573,6 +577,11 @@ fn eval(
                 ))
         }
         QueryExpr::Literal(value) => Ok(match value {
+            ScalarValue::Interval { .. } => {
+                return Err(ClickHouseRelationalError::Unsupported(
+                    "interval literal".into(),
+                ))
+            }
             ScalarValue::Int64(value) => Cell::Int64(*value),
             ScalarValue::Float64(value) => Cell::Float64(*value),
             ScalarValue::Utf8(value) => Cell::Utf8(value.clone()),
@@ -752,6 +761,11 @@ fn default_collection_element(
         return Ok(Cell::Null);
     }
     Ok(match dtype {
+        DataType::Interval | DataType::Date => {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "temporal value transport".into(),
+            ))
+        }
         DataType::Null => Cell::Null,
         DataType::Int64 => Cell::Int64(0),
         DataType::Float64 => Cell::Float64(0.0),
@@ -955,6 +969,8 @@ fn cell_cmp(left: &Cell, right: &Cell) -> Option<Ordering> {
 
 fn arrow_type(dtype: &DataType) -> ArrowDataType {
     match dtype {
+        DataType::Date => ArrowDataType::Date32,
+        DataType::Interval => ArrowDataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
         DataType::Null => ArrowDataType::Null,
         DataType::List { element } => ArrowDataType::List(Arc::new(Field::new(
             &element.name,
@@ -1015,6 +1031,11 @@ fn build_array(
         }};
     }
     Ok(match dtype {
+        DataType::Interval | DataType::Date => {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "temporal value transport".into(),
+            ))
+        }
         DataType::Null => {
             if rows
                 .iter()

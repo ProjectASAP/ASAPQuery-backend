@@ -18,21 +18,15 @@
         "predictability": { "predictable": { "known_at": null } },
         "time_selection": {
           "scope": "real_time",
-          "lookback": 60000,
+          "lookback": null,
           "as_of": null
         }
       }
-    ],
-    "data_workload": {
-      "arrival": "continuously_ingesting",
-      "ingestion_volume": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
-      "ingestion_rate": { "value": 100.0, "source": "declared", "observed_at_ms": null, "valid_for_ms": null },
-      "input_cardinality": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
-      "distribution": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null }
-    }
+    ]
   },
   "data_workload": {
     "arrival": "continuously_ingesting",
+    "data_ingestion_interval": { "value": 5000, "source": "declared", "observed_at_ms": null, "valid_for_ms": null },
     "ingestion_volume": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
     "ingestion_rate": { "value": 100.0, "source": "declared", "observed_at_ms": null, "valid_for_ms": null },
     "input_cardinality": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
@@ -64,7 +58,8 @@
         "source_scan_bytes": 0,
         "weighted_cost": 1.0
       }
-    }
+    },
+    "scrape_interval_ms": 5000
   },
   "environment": {
     "target": "backend_local_remote_write",

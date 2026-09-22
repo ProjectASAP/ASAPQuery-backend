@@ -10,15 +10,9 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
-import re
 import time
 import math
 from replay import iter_samples
-
-
-def duration_ms(text):
-    units = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000, "d": 86400000, "w": 604800000, "y": 31536000000}
-    return sum(int(n) * units[u] for n, u in re.findall(r"(\d+)(ms|[smhdwy])", text))
 
 
 def main():
@@ -67,8 +61,6 @@ def main():
     registrations, query_audit = [], []
     frequencies = Counter(row["query"] for row in corpus["queries"])
     for query in dict.fromkeys(row["query"] for row in corpus["queries"]):
-        windows = [duration_ms(x) for x in re.findall(r"\[([0-9a-z]+)(?::[^\]]*)?\]", query)]
-        lookback = max(windows, default=300000)
         if args.interval_ms % frequencies[query]:
             raise ValueError("base interval must divide exactly by query occurrence frequency")
         interval = args.interval_ms // frequencies[query]
@@ -79,17 +71,25 @@ def main():
         registrations.append({"query": query, "demand": {"fixed_interval_at": {"interval": interval, "evaluation_phase": phase}},
                               "requirements": {"accuracy": {"explicit": "Exact"}, "response_latency": "unspecified"},
                               "predictability": {"predictable": {"known_at": None}},
-                              "time_selection": {"scope": "real_time", "lookback": lookback, "as_of": None}})
-        query_audit.append({"query": query, "window_lookback_ms": lookback,
+                              "time_selection": {"scope": "real_time", "lookback": None, "as_of": None}})
+        query_audit.append({"query": query,
                             "occurrence_count": frequencies[query], "expected_evaluations": frequencies[query] * args.repetitions,
                             "declared_interval_ms": interval, "evaluation_phase_ms": phase,
-                            "lookback_method": "largest explicit range; instant selector defaults to Prometheus 5m; original offsets/subqueries preserved in query"})
-    snapshot["query_workload"].update(repeating_queries=registrations, data_workload=data, query_batch=None)
+                            "lookback_method": "derived by the backend compiler from PromQL and the declared scrape cadence"})
+    snapshot["query_workload"].update(repeating_queries=registrations, query_batch=None)
     snapshot["snapshot_version"] = 2
     snapshot.pop("workload_cost_evidence", None)
     implementation = snapshot["implementation"]
-    if source_sample_interval_ms:
-        implementation["source_sample_interval_ms"] = source_sample_interval_ms
+    implementation.pop("source_sample_interval_ms", None)
+    # Prefer the observed cadence; retain the declared template cadence when
+    # the input has no repeated series from which to infer it.
+    scrape_interval_ms = source_sample_interval_ms or implementation.get("scrape_interval_ms")
+    if not isinstance(scrape_interval_ms, int) or scrape_interval_ms <= 0 or scrape_interval_ms % 1000:
+        raise ValueError("scrape_interval_ms must be a positive whole number of seconds")
+    implementation["scrape_interval_ms"] = scrape_interval_ms
+    data["data_ingestion_interval"] = evidence(scrape_interval_ms)
+    if source_sample_interval_ms is None:
+        data["data_ingestion_interval"]["source"] = "declared"
     # Finite replay evaluates the oldest repetition first after loading the
     # complete input. Preserve that admitted historical-query span separately
     # from each query's PromQL range selector.

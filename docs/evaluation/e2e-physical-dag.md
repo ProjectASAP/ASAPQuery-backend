@@ -63,11 +63,14 @@ substituting a preferred sketch family:
 ```bash
 cargo run --locked -p control_plane --example compile_workload_artifact -- \
   "$ASAPQUERY_PLANNING_SNAPSHOT" \
+  --dot target/physical-dag-inspection/selected.dot \
   > target/physical-dag-inspection/selected.json
-jq '.install_request' target/physical-dag-inspection/selected.json \
+jq '{summary_catalog, precompute_plan, query_plan}' target/physical-dag-inspection/selected.json \
   > target/physical-dag-inspection/physical-plan.json
-jq '.install_request | {summary_catalog, precompute_plan, query_plan}' \
+jq '{summary_catalog, precompute_plan, query_plan}' \
   target/physical-dag-inspection/selected.json
+dot -Tsvg target/physical-dag-inspection/selected.dot \
+  -o target/physical-dag-inspection/selected.svg
 ```
 
 `compile_workload_artifact` calls the same evidence-required snapshot compiler
@@ -150,7 +153,7 @@ outer state's version or assume new routing has been activated by this guide.
 ## d. Precompute subDAG and completion
 
 ```bash
-jq '.install_request.precompute_plan | {materializations, executable_dags}' \
+jq '.precompute_plan | {materializations, executable_dags}' \
   target/physical-dag-inspection/selected.json
 ```
 
@@ -184,7 +187,7 @@ remote-write automatically supplies this proof.
 ## e. QueryPlan → physical DAG → SID-bound readout
 
 ```bash
-jq '.install_request.query_plan.entries' target/physical-dag-inspection/selected.json
+jq '.query_plan.entries' target/physical-dag-inspection/selected.json
 curl -sS -D target/physical-dag-inspection/query.headers --get \
   http://127.0.0.1:9091/api/v1/query \
   --data-urlencode 'query=sum(sum_over_time(asap_demo_gauge[5s]))' \

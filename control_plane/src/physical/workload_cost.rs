@@ -807,12 +807,16 @@ fn materialization_alternatives(
     let mut exact = request.clone();
     exact.allow_mixed_summary_and_exact_execution = false;
     exact.enabled_materialization_keys = None;
-    for query in &mut exact.queries {
-        let parsed = crate::query_parser::parse_query_expr_canonical(
-            &query.query_string,
-            query.accuracy_target.clone(),
-        )
-        .map_err(|error| invalid(error.to_string()))?;
+    for (index, query) in exact.queries.iter_mut().enumerate() {
+        let parsed = if let Some(root) = request.canonical_roots.get(index) {
+            root.as_ref().clone()
+        } else {
+            crate::query_parser::parse_query_expr_canonical(
+                &query.query_string,
+                query.accuracy_target.clone(),
+            )
+            .map_err(|error| invalid(error.to_string()))?
+        };
         query.selected_plan_root = crate::planner_selection::keep_pre_asap(&parsed)
             .map_err(|error| invalid(error.to_string()))?;
     }
@@ -1101,7 +1105,6 @@ mod tests {
         entries[0].requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
             planner_types::types::AccuracyTarget::Exact,
         );
-        entries[0].time_selection.lookback = Some(planner_types::workload::DurationMs(21_600_000));
         let mut second = entries[0].clone();
         second.query = planner_types::workload::Query(
             "max_over_time(service_retry_queue_depth{job=\"order-service\"}[6h])".into(),

@@ -88,6 +88,15 @@ ASAPPlanner, compiles matching SummaryCatalog/PrecomputePlan/QueryPlan views, an
 installs the resulting immutable snapshot before accepting traffic. It does
 not create or wait for a CollectorPlan.
 
+Supply data evidence only in the top-level `data_workload`; nesting it inside
+`query_workload` is no longer accepted. `data_ingestion_interval` declares the
+instant-selector horizon in milliseconds. Snapshot planning checks its freshness
+at `environment.observed_at_unix_ms`; HTTP physical planning checks it at the
+current planning time and requires the same top-level data evidence.
+Current-series plans retain this horizon for membership expiry, and their input
+lag allowance never exceeds it. Missing cadence in a legacy snapshot is derived
+from its explicit scrape interval; expired or invalid supplied evidence is rejected.
+
 `implementation.max_retained_summary_bytes` limits the estimated total encoded
 summary footprint across every retained pane and partition. It defaults to 2
 GiB for older snapshots and is clamped to `--persistence-memory-limit-mb` at
@@ -137,7 +146,12 @@ coverage is a capability miss, never a partial warm success. Inspect the
 per-materialization state and observed coverage through
 `GET /api/v1/physical-plan/status`.
 
-Snapshot schema version `1` currently accepts fixed-interval repeating PromQL
-queries with explicit whole-second lookbacks and fresh ingestion-rate
-evidence. Unsupported snapshot semantics fail startup rather than silently
-inventing cost or placement evidence.
+Snapshot schema version `2` accepts fixed-interval repeating PromQL queries
+with `implementation.scrape_interval_ms` and fresh ingestion-rate evidence.
+Range selectors derive their own lookback; each rangeless source uses the
+scrape interval for backend-local planning. This default window is distinct
+from Prometheus's instant-selector lookback delta and does not configure it.
+Omit `time_selection.lookback` or set it to `null`. Ranges and offsets must be
+whole seconds; unsupported fractional durations fail startup instead of
+silently shortening the window. Unsupported snapshot semantics fail startup
+rather than silently inventing cost or placement evidence.

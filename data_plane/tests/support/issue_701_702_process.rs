@@ -71,24 +71,17 @@ fn queries() -> Vec<(String, u64, u64)> {
         300,
         30,
     ));
-    queries.push((
-        "quantile_over_time(0.9, issue701_data[5m]) / quantile_over_time(0.5, issue701_data[5m])"
-            .into(),
-        300,
-        60,
-    ));
-    queries.push((
-        "avg_over_time(issue701_data[5m]) / quantile_over_time(0.5, issue701_data[5m])".into(),
-        300,
-        30,
-    ));
     queries
 }
 
 // A single mixed workload covers moving windows, current series, minimum/average,
-// and ratio accuracy. Optional native URL adds a real Prometheus differential oracle.
+// without uncertified ratios. Optional native URL adds a real Prometheus differential oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue_workloads_execute_warm_at_successive_evaluations() {
+    run_warm_workload(queries()).await;
+}
+
+async fn run_warm_workload(queries: Vec<(String, u64, u64)>) {
     let native = std::env::var("ASAP_CURRENT_SERIES_PROMETHEUS_URL").ok();
     if let Some(url) = &native {
         let info: Value = reqwest::get(format!("{url}/api/v1/status/buildinfo"))
@@ -116,20 +109,19 @@ async fn issue_workloads_execute_warm_at_successive_evaluations() {
         .await
         .unwrap();
     });
-    let queries = queries();
     let mut fixture: Value = serde_json::from_str(include_str!(
         "../../../docs/examples/asapquery-planning-snapshot.json"
     ))
     .unwrap();
-    fixture["implementation"]["source_sample_interval_ms"] = 1000.into();
+    fixture["implementation"]["scrape_interval_ms"] = 1000.into();
+    fixture["data_workload"]["data_ingestion_interval"]["value"] = 1000.into();
     fixture["implementation"]["horizon_seconds"] = 3600.into();
     let template = fixture["query_workload"]["repeating_queries"][0].clone();
     fixture["query_workload"]["repeating_queries"] = queries
         .iter()
-        .map(|(query, lookback, cadence)| {
+        .map(|(query, _lookback, cadence)| {
             let mut entry = template.clone();
             entry["query"] = query.clone().into();
-            entry["time_selection"]["lookback"] = (lookback * 1000).into();
             entry["demand"]["fixed_interval_at"]["interval"] = (cadence * 1000).into();
             if !query.contains("quantile") {
                 entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
@@ -148,7 +140,8 @@ async fn issue_workloads_execute_warm_at_successive_evaluations() {
             control_plane::query_plan::QueryPlanNode::ExactFallback { .. }
             | control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
             | control_plane::query_plan::QueryPlanNode::Logical {
-                operator: control_plane::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }, ..
+                operator: control_plane::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
+                    | control_plane::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }, ..
             }
         )))
     };
@@ -254,6 +247,14 @@ async fn issue_workloads_execute_warm_at_successive_evaluations() {
             )
             .await;
             assert!(is_warm(&actual), "{query}: {actual}");
+            assert!(
+                actual["infos"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|info| info == "execution: asap"),
+                "{query}: {actual}"
+            );
             if let Some(url) = &native {
                 let expected: Value = client
                     .get(format!("{url}/api/v1/query"))
@@ -298,46 +299,60 @@ async fn issue_workloads_execute_warm_at_successive_evaluations() {
             }
         }
     }
-    if let Some(url) = &native {
-        let wire = WriteRequest {
-            timeseries: [("a", "api"), ("b", "api"), ("c", "db")]
-                .into_iter()
-                .map(|(pod, job)| {
-                    let samples: Vec<_> = (962..=1261).map(|i| (origin + i * 1000, 0.0)).collect();
-                    series_with_labels("issue701_data", &[("pod", pod), ("job", job)], &samples)
-                })
-                .collect(),
-        };
-        assert_eq!(remote_write(&client, url, &wire).await, 204);
-        assert_eq!(remote_write(&client, &backend, &wire).await, 204);
-        let at = (origin + 1260 * 1000) as f64 / 1000.0;
-        for (query, _, _) in queries.iter().filter(|(q, _, _)| q.contains(" / ")) {
-            let params = [("query", query.clone()), ("time", at.to_string())];
-            let expected: Value = client
-                .get(format!("{url}/api/v1/query"))
-                .query(&params)
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
+}
+
+// Each supported #702 query must independently compile and execute without an exact service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_702_individual_queries_execute_without_fallback() {
+    for query in [
+        "quantile by (job) (0.9, issue701_data)",
+        "sum by (job) (issue701_data)",
+        "sum(issue701_data)",
+        "avg_over_time(issue701_data[5m])",
+        "count by (job) (issue701_data)",
+        "count(issue701_data)",
+        "avg by (job) (issue701_data)",
+        "sum by (job) (sum_over_time(issue701_data[5m]))",
+    ] {
+        eprintln!("Checking acceleration: {query}");
+        let temporal = query.contains('[');
+        run_warm_workload(vec![(
+            query.into(),
+            if temporal { 300 } else { 1 },
+            if temporal { 30 } else { 1 },
+        )])
+        .await;
+    }
+}
+
+// Rank-error guarantees do not certify division; keep this limitation explicit in CI.
+#[test]
+fn issue_701_702_uncertified_ratios_require_exact_fallback() {
+    for query in [
+        "quantile_over_time(0.9, issue701_data[5m]) / quantile_over_time(0.5, issue701_data[5m])",
+        "avg_over_time(issue701_data[5m]) / quantile_over_time(0.5, issue701_data[5m])",
+    ] {
+        let mut fixture: Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        fixture["query_workload"]["repeating_queries"][0]["query"] = query.into();
+        fixture["data_workload"]["data_ingestion_interval"]["value"] = 1000.into();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let candidates = workload_cost::with_exact_alternative(request).unwrap();
+        assert!(!candidates.is_empty());
+        for candidate in candidates {
+            let plan = PhysicalCompiler
+                .compile_promql(candidate, environment.clone())
                 .unwrap();
-            let actual: Value = client
-                .get(format!("{backend}/api/v1/query"))
-                .query(&params)
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            assert!(plan.precompute_plan.materializations.is_empty(), "{query}");
             assert!(
-                !is_warm(&actual),
-                "undefined relative error must fall back: {query}"
-            );
-            assert_eq!(
-                actual["data"], expected["data"],
-                "zero denominator: {query}"
+                plan.query_plan.entries.values().all(|entry| matches!(
+                    entry.nodes.get(&entry.root),
+                    Some(control_plane::query_plan::QueryPlanNode::ExactFallback { .. })
+                )),
+                "{query}"
             );
         }
     }
@@ -359,13 +374,12 @@ async fn temporal_average_overflow_falls_back_after_state_is_warm() {
         "../../../docs/examples/asapquery-planning-snapshot.json"
     ))
     .unwrap();
-    fixture["implementation"]["source_sample_interval_ms"] = 1000.into();
+    fixture["implementation"]["scrape_interval_ms"] = 1000.into();
     let template = fixture["query_workload"]["repeating_queries"][0].clone();
     fixture["query_workload"]["repeating_queries"] = ["avg", "sum", "count"]
         .map(|op| {
             let mut entry = template.clone();
             entry["query"] = format!("{op}_over_time(average_overflow[5s])").into();
-            entry["time_selection"]["lookback"] = 5000.into();
             entry["demand"]["fixed_interval_at"]["interval"] = 1000.into();
             entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
             entry

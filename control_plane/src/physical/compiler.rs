@@ -26,7 +26,7 @@ use planner_types::workload::{
     Predictability, Query, QueryLanguage, QueryRecurrence, QueryRequirements, QueryTimeScope,
     QueryWorkload, Rate, RepeatedDemand, RepeatingEntry, RepetitionInterval, TimeSelection,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -163,6 +163,10 @@ pub struct PhysicalCompilationRequest {
     pub enabled_materialization_keys: Option<BTreeSet<String>>,
     /// Original dashboard demand, in the same order as queries. None is legacy input.
     pub query_workload: Option<QueryWorkload>,
+    /// Source evidence supplied independently from query demand.
+    pub data_workload: Option<DataWorkload>,
+    /// Workload-lowered roots retained across physical alternative enumeration.
+    pub canonical_roots: Vec<Rc<QueryExpr>>,
     pub queries: Vec<QueryCompilationInput>,
     pub topk_membership_evidence_by_query_id: HashMap<String, TopKMembershipEvidence>,
     /// Fresh measured costs for Planner exact/summary composition sites,
@@ -172,9 +176,8 @@ pub struct PhysicalCompilationRequest {
     /// mode falls back to theoretical sizing and then exact execution.
     pub erp: Option<super::erp::ErpPlanningInput>,
     pub planner_revision: String,
-    /// Observed cadence of source samples. Exact temporal panes must divide
-    /// both this cadence and the repeated-query evaluation interval.
-    pub source_sample_interval_ms: Option<u64>,
+    /// Source cadence used to bound current-series input lag.
+    pub scrape_interval_ms: Option<u64>,
     /// How far behind the newest ingested sample an admitted query may be
     /// evaluated. This extends physical retention only; it never changes the
     /// PromQL range selector used for readout.
@@ -228,6 +231,7 @@ pub struct BackendLocalPlanningInput {
     /// May be absent during candidate discovery, never during deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
+    #[serde(deserialize_with = "deserialize_snapshot_query_workload")]
     pub query_workload: QueryWorkload,
     pub data_workload: DataWorkload,
     #[serde(rename = "implementation", alias = "physical_inputs")]
@@ -243,8 +247,10 @@ pub struct BackendLocalPhysicalInputs {
     pub evidence_valid_for_ms: u64,
     pub horizon_seconds: f64,
     pub window_cost_model: WindowCostModel,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_sample_interval_ms: Option<u64>,
+    /// Prometheus source scrape cadence. Rangeless instant-vector expressions
+    /// use this as their derived readout window. This backend-local planning
+    /// default is distinct from Prometheus instant-selector lookback delta.
+    pub scrape_interval_ms: u64,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     #[serde(
         rename = "query_staleness_margin_ms",
@@ -273,6 +279,33 @@ pub struct BackendLocalPhysicalInputs {
     pub exact_composition_costs: HashMap<String, Vec<ExactCompositionCostEvidence>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub erp: Option<super::erp::ErpPlanningInput>,
+}
+
+/// Snapshot lookback is derived from PromQL and the declared scrape interval;
+/// accepting it here would silently restore the competing legacy input.
+fn deserialize_snapshot_query_workload<'de, D>(deserializer: D) -> Result<QueryWorkload, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let has_legacy_lookback = value
+        .get("repeating_queries")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("time_selection")
+                    .and_then(Value::as_object)
+                    .and_then(|selection| selection.get("lookback"))
+                    .is_some_and(|lookback| !lookback.is_null())
+            })
+        });
+    if has_legacy_lookback {
+        return Err(D::Error::custom(
+            "query_workload.repeating_queries[].time_selection.lookback is not supported; it is derived from PromQL",
+        ));
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -421,7 +454,11 @@ pub fn build_transmission_plan(
 
 /// Complete physical projection of one post-ASAP planning decision.
 /// All three child plans share the same envelope and are compiled together.
-#[derive(Debug, Clone)]
+/// Complete selected physical plan, serializable for developer inspection.
+///
+/// The serialized form is an inspection artifact emitted by
+/// `compile_workload_artifact`; it is not an input accepted by the compiler.
+#[derive(Debug, Clone, Serialize)]
 pub struct CompiledPhysicalPlan {
     pub envelope: PlanEnvelope,
     pub summary_catalog: super::summary_catalog::SummaryCatalog,
@@ -550,15 +587,21 @@ impl BackendLocalPlanningInput {
                 "compatibility workload requires backend_local_remote_write target".into(),
             ));
         }
-        let mut workload = self.query_workload;
-        if let Some(embedded) = &workload.data_workload {
-            if embedded != &self.data_workload {
-                return Err(CompileError::Snapshot(
-                    "embedded and standalone DataWorkload snapshots disagree".into(),
-                ));
-            }
+        let workload = self.query_workload;
+        let mut data_workload = self.data_workload.clone();
+        if data_workload.data_ingestion_interval.value.is_none()
+            && self.physical_inputs.scrape_interval_ms > 0
+        {
+            data_workload.data_ingestion_interval = Evidence {
+                value: Some(DurationMs(self.physical_inputs.scrape_interval_ms)),
+                source: EvidenceSource::Declared,
+                observed_at_ms: None,
+                valid_for_ms: None,
+            };
         }
-        workload.data_workload = Some(self.data_workload.clone());
+        data_workload
+            .validate()
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?;
         workload
             .validate()
             .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -567,8 +610,7 @@ impl BackendLocalPlanningInput {
                 "ASAPQuery compatibility profile accepts PromQL workloads only".into(),
             ));
         }
-        let ingestion_rate = self
-            .data_workload
+        let ingestion_rate = data_workload
             .ingestion_rate
             .value_at(self.environment.observed_at_unix_ms)
             .copied()
@@ -581,10 +623,18 @@ impl BackendLocalPlanningInput {
                 "QueryWorkload must contain at least one query".into(),
             ));
         }
+        let canonical_queries = asap_frontend_promql::lower_promql_workload(
+            &planner_types::workload::PlanningWorkload {
+                query_workload: workload.clone(),
+                data_workload: Some(data_workload.clone()),
+            },
+            self.environment.observed_at_unix_ms,
+        )
+        .map_err(|error| CompileError::Snapshot(error.to_string()))?;
         let mut queries = Vec::with_capacity(entries.len());
         let mut canonical_roots = Vec::with_capacity(entries.len());
         let mut topk_evidence_by_id = HashMap::new();
-        for (index, entry) in entries.into_iter().enumerate() {
+        for (index, (entry, parsed)) in entries.into_iter().zip(canonical_queries).enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
                 QueryRecurrence::Repeated(RepeatedDemand::FixedIntervalAt {
                     interval, ..
@@ -595,22 +645,20 @@ impl BackendLocalPlanningInput {
                     )))
                 }
             };
-            let lookback_ms = entry
-                .time_selection
-                .lookback
-                .ok_or_else(|| {
-                    CompileError::Snapshot(format!("query {index} requires an explicit lookback"))
-                })?
-                .0;
-            if lookback_ms == 0 || lookback_ms % 1_000 != 0 {
-                return Err(CompileError::Snapshot(format!(
-                    "query {index} lookback must be a positive whole number of seconds"
-                )));
+            if self.physical_inputs.scrape_interval_ms == 0
+                || !self
+                    .physical_inputs
+                    .scrape_interval_ms
+                    .is_multiple_of(1_000)
+            {
+                return Err(CompileError::Snapshot(
+                    "scrape_interval_ms must be a positive whole number of seconds".into(),
+                ));
             }
             let accuracy = entry.requirements.accuracy.target();
             let query_string = entry.query.0;
-            let parsed =
-                crate::query_parser::parse_query_expr_canonical(&query_string, accuracy.clone())
+            let lookback_ms =
+                query_history_window_ms(&parsed, self.physical_inputs.scrape_interval_ms)
                     .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             let metadata = crate::query_parser::qe_to_parsed_query(&parsed);
             let source_metrics = super::workload_cost::exact_source_metrics(&parsed)?;
@@ -670,7 +718,7 @@ impl BackendLocalPlanningInput {
         }
         let planner_selection_trace = select_logical_roots_with_trace(
             &mut queries,
-            canonical_roots,
+            canonical_roots.clone(),
             &topk_evidence_by_id,
             &exact_costs_by_id,
             self.physical_inputs.erp.as_ref(),
@@ -690,12 +738,14 @@ impl BackendLocalPlanningInput {
                 allow_mixed_summary_and_exact_execution: true,
                 enabled_materialization_keys: None,
                 query_workload: Some(workload),
+                data_workload: Some(data_workload),
+                canonical_roots,
                 queries,
                 topk_membership_evidence_by_query_id: topk_evidence_by_id,
                 exact_composition_costs: exact_costs_by_id,
                 erp: self.physical_inputs.erp,
                 planner_revision: PLANNER_REVISION.into(),
-                source_sample_interval_ms: self.physical_inputs.source_sample_interval_ms,
+                scrape_interval_ms: Some(self.physical_inputs.scrape_interval_ms),
                 query_retention_margin_ms: self.physical_inputs.query_retention_margin_ms,
                 retained_summary_memory_budget_bytes: Some(
                     self.physical_inputs.retained_summary_memory_budget_bytes,
@@ -771,11 +821,30 @@ fn has_unsafe_raw_entity_leaf(
     }
 }
 
+fn original_root(
+    query: &QueryCompilationInput,
+    index: usize,
+    roots: &[Rc<QueryExpr>],
+) -> Result<QueryExpr, CompileError> {
+    if let Some(root) = roots.get(index) {
+        return Ok(root.as_ref().clone());
+    }
+    crate::query_parser::parse_query_expr_canonical(
+        &query.query_string,
+        query.accuracy_target.clone(),
+    )
+    .map_err(|error| CompileError::Query {
+        query_id: query.query_id.clone(),
+        reason: error.to_string(),
+    })
+}
+
 /// Preserve native execution for raw states that cannot preserve source semantics.
 fn preserve_native_unsafe_raw_roots(
     queries: &mut [QueryCompilationInput],
+    canonical_roots: &[Rc<QueryExpr>],
 ) -> Result<(), CompileError> {
-    for query in queries {
+    for (index, query) in queries.iter_mut().enumerate() {
         let selected = collect_selected_materializations(&query.selected_plan_root, false)
             .map_err(|reason| CompileError::Query {
                 query_id: query.query_id.clone(),
@@ -791,14 +860,7 @@ fn preserve_native_unsafe_raw_roots(
         let unsafe_entities =
             has_unsafe_raw_entity_leaf(&query.selected_plan_root, &selected_nodes, false);
         if unsafe_entities {
-            let parsed = crate::query_parser::parse_query_expr_canonical(
-                &query.query_string,
-                query.accuracy_target.clone(),
-            )
-            .map_err(|error| CompileError::Query {
-                query_id: query.query_id.clone(),
-                reason: error.to_string(),
-            })?;
+            let parsed = original_root(query, index, canonical_roots)?;
             query.selected_plan_root =
                 crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
                     CompileError::Query {
@@ -817,9 +879,10 @@ fn preserve_native_unsafe_raw_roots(
 /// maintenance DAG), but the original query remains a valid exact plan.
 fn preserve_invalid_exact_fallback_roots(
     queries: &mut [QueryCompilationInput],
+    canonical_roots: &[Rc<QueryExpr>],
     composable: bool,
 ) -> Result<(), CompileError> {
-    for query in queries {
+    for (index, query) in queries.iter_mut().enumerate() {
         let selected = collect_selected_materializations(&query.selected_plan_root, composable)
             .map_err(|reason| CompileError::Query {
                 query_id: query.query_id.clone(),
@@ -830,14 +893,7 @@ fn preserve_invalid_exact_fallback_roots(
         if invalid_executable
             && !matches!(query.selected_plan_root.expr, SummaryExpr::KeepPreAsap(_))
         {
-            let parsed = crate::query_parser::parse_query_expr_canonical(
-                &query.query_string,
-                query.accuracy_target.clone(),
-            )
-            .map_err(|error| CompileError::Query {
-                query_id: query.query_id.clone(),
-                reason: error.to_string(),
-            })?;
+            let parsed = original_root(query, index, canonical_roots)?;
             query.selected_plan_root =
                 crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
                     CompileError::Query {
@@ -856,9 +912,10 @@ fn preserve_invalid_exact_fallback_roots(
 /// summaries and let residual lowering cut only the counter branches.
 fn preserve_metricsql_counter_only_roots(
     queries: &mut [QueryCompilationInput],
+    canonical_roots: &[Rc<QueryExpr>],
     composable: bool,
 ) -> Result<(), CompileError> {
-    for query in queries {
+    for (index, query) in queries.iter_mut().enumerate() {
         let selected = collect_selected_materializations(&query.selected_plan_root, composable)
             .map_err(|reason| CompileError::Query {
                 query_id: query.query_id.clone(),
@@ -878,14 +935,7 @@ fn preserve_metricsql_counter_only_roots(
         {
             continue;
         }
-        let parsed = crate::query_parser::parse_query_expr_canonical(
-            &query.query_string,
-            query.accuracy_target.clone(),
-        )
-        .map_err(|error| CompileError::Query {
-            query_id: query.query_id.clone(),
-            reason: error.to_string(),
-        })?;
+        let parsed = original_root(query, index, canonical_roots)?;
         query.selected_plan_root =
             crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
                 CompileError::Query {
@@ -920,6 +970,10 @@ impl PhysicalPlanCompiler {
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
+        if let Some(data) = &request.data_workload {
+            data.validate()
+                .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        }
         if super::maintained_population::supported(&request)
             && (frontend != QueryFrontend::PromQl
                 || environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite)
@@ -975,18 +1029,20 @@ impl PhysicalPlanCompiler {
         if frontend == QueryFrontend::MetricsQl {
             preserve_metricsql_counter_only_roots(
                 &mut request.queries,
+                &request.canonical_roots,
                 request.allow_mixed_summary_and_exact_execution,
             )?;
         }
         preserve_invalid_exact_fallback_roots(
             &mut request.queries,
+            &request.canonical_roots,
             request.allow_mixed_summary_and_exact_execution,
         )?;
 
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
             && !request.allow_mixed_summary_and_exact_execution
         {
-            preserve_native_unsafe_raw_roots(&mut request.queries)?;
+            preserve_native_unsafe_raw_roots(&mut request.queries, &request.canonical_roots)?;
         }
 
         let roots = request
@@ -1276,10 +1332,13 @@ impl PhysicalPlanCompiler {
                     &model,
                     &environment,
                     &state_consumers,
-                    request
-                        .query_workload
-                        .as_ref()
-                        .map(|workload| (workload, consumer_indices.clone())),
+                    request.query_workload.as_ref().map(|workload| {
+                        (
+                            workload,
+                            request.data_workload.as_ref(),
+                            consumer_indices.clone(),
+                        )
+                    }),
                 )?;
                 let window_implementation = query.window_realization_candidates.iter()
                     .find(|candidate| candidate.realization_id == planner_selection.window_realization_id
@@ -1678,14 +1737,7 @@ impl PhysicalPlanCompiler {
             // Retain its native boundary without discarding other workload roots.
             let native_root = request.allow_mixed_summary_and_exact_execution
                 && if let SummaryExpr::KeepPreAsap(expr) = &query.selected_plan_root.expr {
-                    let original = crate::query_parser::parse_query_expr_canonical(
-                        &query.query_string,
-                        query.accuracy_target.clone(),
-                    )
-                    .map_err(|error| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason: error.to_string(),
-                    })?;
+                    let original = original_root(query, query_index, &request.canonical_roots)?;
                     expr.as_ref() == &original
                         && crate::query_plan::residual::compile_logical(
                             query.query_id.clone(),
@@ -1859,9 +1911,8 @@ impl PhysicalPlanCompiler {
         validate_retained_summary_footprint(
             &materializations,
             request
-                .query_workload
+                .data_workload
                 .as_ref()
-                .and_then(|workload| workload.data_workload.as_ref())
                 .and_then(|data| {
                     data.input_cardinality
                         .value_at(environment.observed_at_unix_ms)
@@ -2489,12 +2540,97 @@ pub(super) fn derived_window_cost(
     }
 }
 
+/// The furthest point in the past that evaluating `expr` can read, in ms.
+///
+/// A range selector and a subquery each evaluate their child over prior
+/// history; a positive offset moves that history further back. The result is a
+/// lower-bound horizon, not a claim that the entire interval is read. For
+/// example, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
+fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<u64, CompileError> {
+    fn duration_ms(duration: std::time::Duration) -> Result<u64, CompileError> {
+        if duration.subsec_nanos() != 0 {
+            return Err(CompileError::Snapshot(
+                "PromQL ranges must be a whole number of seconds in the backend-local profile"
+                    .into(),
+            ));
+        }
+        u64::try_from(duration.as_millis())
+            .map_err(|_| CompileError::Snapshot("PromQL range exceeds supported history".into()))
+    }
+
+    fn add(left: u64, right: u64) -> Result<u64, CompileError> {
+        left.checked_add(right).ok_or_else(|| {
+            CompileError::Snapshot("PromQL history exceeds supported duration".into())
+        })
+    }
+
+    fn visit(
+        expr: &QueryExpr,
+        scrape_interval_ms: u64,
+        in_range: bool,
+    ) -> Result<u64, CompileError> {
+        match expr {
+            // A subquery evaluates instant expressions at earlier timestamps;
+            // those leaves still need their own default readout window.
+            QueryExpr::PromqlSubquery { range, child, .. } => add(
+                duration_ms(*range)?,
+                visit(child, scrape_interval_ms, false)?,
+            ),
+            QueryExpr::TimeRange { range, child } => add(
+                duration_ms(*range)?,
+                visit(child, scrape_interval_ms, true)?,
+            ),
+            QueryExpr::TimeShift { shift, child } => {
+                if !shift.offset_ms.unsigned_abs().is_multiple_of(1_000) {
+                    return Err(CompileError::Snapshot(
+                        "PromQL offsets must be a whole number of seconds in the backend-local profile".into(),
+                    ));
+                }
+                add(
+                    shift.offset_ms.max(0) as u64,
+                    visit(child, scrape_interval_ms, in_range)?,
+                )
+            }
+            QueryExpr::PromqlScalarBridge(child)
+            | QueryExpr::PromqlVectorFromScalar(child)
+            | QueryExpr::PromqlScalarFromVector(child)
+            | QueryExpr::PromqlRelabel { child, .. }
+            | QueryExpr::PromqlSeriesSample { child, .. }
+            | QueryExpr::Filter { child, .. }
+            | QueryExpr::Project { child, .. }
+            | QueryExpr::Aggregate { child, .. }
+            | QueryExpr::Dedup { child, .. }
+            | QueryExpr::Sort { child, .. }
+            | QueryExpr::Limit { child, .. } => visit(child, scrape_interval_ms, in_range),
+            QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            }
+            | QueryExpr::Join { left, right, .. }
+            | QueryExpr::SetOp { left, right, .. } => Ok(visit(
+                left,
+                scrape_interval_ms,
+                in_range,
+            )?
+            .max(visit(right, scrape_interval_ms, in_range)?)),
+            QueryExpr::Concat { children, .. } => children.iter().try_fold(0, |history, child| {
+                Ok(history.max(visit(child, scrape_interval_ms, in_range)?))
+            }),
+            QueryExpr::Scan { .. } if !in_range => Ok(scrape_interval_ms),
+            _ => Ok(0),
+        }
+    }
+
+    visit(expr, scrape_interval_ms, false)
+}
+
 /// Every distinct range-selector window in `expr`, as seconds.
 ///
 /// A single query can carry several. `sum(sum_over_time(a[1m])) / sum(sum_over_time(b[5m]))`
 /// has two, and each one becomes its own materialization with its own window.
-/// `time_selection.lookback` is the workload's declared range and is not
-/// required to equal any of them.
+/// These are materialization contracts. Enclosing subquery ranges and offsets
+/// affect a query's furthest lookback but do not change a leaf contract.
 #[cfg(test)]
 fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
     fn visit(expr: &QueryExpr, windows: &mut BTreeSet<u64>) {
@@ -2538,8 +2674,7 @@ fn range_selector_windows_secs(expr: &QueryExpr) -> BTreeSet<u64> {
 }
 
 /// Derive and price one implementation per supported layout for each range.
-/// Explicit snapshot candidates bypass this path. After logical selection,
-/// derived maintenance cohorts are restricted to their supported full windows;
+/// Derived maintenance cohorts are restricted to their supported full windows;
 /// raw additive pane producers may subsequently be shared by Planner.
 #[cfg(test)]
 fn derived_window_candidates(
@@ -2769,7 +2904,7 @@ fn select_lifecycle(
     model: &ControlPlaneCostModel,
     environment: &PhysicalDeploymentContext,
     consumers: &[&QueryCompilationInput],
-    original_workload: Option<(&QueryWorkload, Vec<usize>)>,
+    original_workload: Option<(&QueryWorkload, Option<&DataWorkload>, Vec<usize>)>,
 ) -> Result<PlannerPhysicalSelection, CompileError> {
     // Current lifecycle evidence is per producer with one unit read cost.
     // Conflicting source/rate/horizon/cost snapshots cannot be averaged into
@@ -2818,34 +2953,35 @@ fn select_lifecycle(
                 })
                 .collect(),
         ),
-        data_workload: Some(DataWorkload {
-            arrival: DataArrival::ContinuouslyIngesting,
-            ingestion_rate: Evidence {
-                value: Some(Rate(
-                    query.summary_lifecycle_inputs.ingestion_rate_per_second,
-                )),
-                source: EvidenceSource::Observed,
-                observed_at_ms: Some(query.summary_lifecycle_inputs.evidence_observed_at_unix_ms),
-                valid_for_ms: Some(query.summary_lifecycle_inputs.evidence_valid_for_ms),
-            },
-            ..DataWorkload::default()
-        }),
     };
-    let (workload, indices) = match original_workload {
-        Some((original, indices)) => {
-            let mut original = original.clone();
-            // HTTP demand carries phases and requirements; its per-state source
-            // evidence comes from the same lifecycle input as window pricing.
-            if original.data_workload.is_none() {
-                original.data_workload = workload.data_workload;
-            }
-            (original, indices)
-        }
-        None => (workload, (0..consumers.len()).collect()),
+    let fallback_data = DataWorkload {
+        arrival: DataArrival::ContinuouslyIngesting,
+        // This workload is an internal lifecycle projection, not a
+        // plan-ready query input. Use the compatibility profile cadence
+        // when there is no original workload to carry source evidence.
+        data_ingestion_interval: Evidence {
+            value: Some(DurationMs(1_000)),
+            source: EvidenceSource::Declared,
+            observed_at_ms: None,
+            valid_for_ms: None,
+        },
+        ingestion_rate: Evidence {
+            value: Some(Rate(
+                query.summary_lifecycle_inputs.ingestion_rate_per_second,
+            )),
+            source: EvidenceSource::Observed,
+            observed_at_ms: Some(query.summary_lifecycle_inputs.evidence_observed_at_unix_ms),
+            valid_for_ms: Some(query.summary_lifecycle_inputs.evidence_valid_for_ms),
+        },
+        ..DataWorkload::default()
+    };
+    let (workload, data, indices) = match original_workload {
+        Some((original, data, indices)) => (original, data.unwrap_or(&fallback_data), indices),
+        None => (&workload, &fallback_data, (0..consumers.len()).collect()),
     };
     let plan = plan_summary_maintenance_lifecycles(
         Rc::new(node.clone()),
-        WorkloadDemand::new(&workload, &indices),
+        WorkloadDemand::new_with_data(workload, data, &indices),
         environment.observed_at_unix_ms,
         Some(Horizon(query.summary_lifecycle_inputs.horizon_seconds)),
         SummaryMaintenanceLifecycleCapabilities {
@@ -3290,9 +3426,9 @@ fn shared_pane_origin_ms(
                 "shared pane-only summary consumer {index} has unknown evaluation phase"
             ));
         };
-        let binding = planner_types::post_asap::plan_pane_phase(demand, pane_width_ms)
+        let layout = planner_types::post_asap::plan_pane_phase(demand, pane_width_ms)
             .map_err(|error| format!("invalid pane phase for consumer {index}: {error:?}"))?;
-        let origin = binding.pane_origin_ms.ok_or_else(|| {
+        let origin = layout.pane_origin_ms.ok_or_else(|| {
             format!("shared pane-only summary consumer {index} has unknown evaluation phase")
         })?;
         let phase = origin.rem_euclid(pane_width);
@@ -3710,6 +3846,7 @@ pub(crate) mod tests {
         ))
         .unwrap();
         snapshot.schema_version = 2;
+        snapshot.data_workload.data_ingestion_interval.value = Some(DurationMs(1_000));
         let template = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0].clone();
         let queries = [
             "quantile by (job) (0.5, a)",
@@ -3755,6 +3892,9 @@ pub(crate) mod tests {
                     ..
                 } = node
                 {
+                    // A longer scrape cadence cannot extend the declared selector horizon.
+                    assert_eq!(population.max_input_lag_ms, 1_000);
+                    assert_eq!(population.lookback_ms, 1_000);
                     assert_eq!(population.max_k, 5);
                     assert!(population.quantiles);
                     populations.insert(population.key());
@@ -3813,6 +3953,10 @@ pub(crate) mod tests {
         let planner_types::pre_asap::QueryExpr::Aggregate { child, .. } = &mut root else {
             unreachable!()
         };
+        // SQL rows have no PromQL instant-selector time range.
+        if let QueryExpr::TimeRange { child: scan, .. } = child.as_ref() {
+            *child = Rc::clone(scan);
+        }
         let planner_types::pre_asap::QueryExpr::Scan { source, schema, .. } = Rc::make_mut(child)
         else {
             unreachable!()
@@ -4012,13 +4156,11 @@ pub(crate) mod tests {
         for text in [
             "avg_over_time(data[5m])",
             "min_over_time(data[5m])",
-            "quantile_over_time(0.9,data[5m])/quantile_over_time(0.5,data[5m])",
-            "avg_over_time(data[5m])/quantile_over_time(0.5,data[5m])",
+            "quantile_over_time(0.9,data[5m])",
         ] {
             let mut snapshot = planning_snapshot();
             let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
             entry.query = Query(text.into());
-            entry.time_selection.lookback = Some(DurationMs(300_000));
             if !text.contains("quantile") {
                 entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
             }
@@ -4043,6 +4185,34 @@ pub(crate) mod tests {
                     }
                 }),
                 "no warm candidate for {text}: {reasons:?}"
+            );
+        }
+    }
+
+    // Quantile rank error does not certify relative error of a quotient.
+    #[test]
+    fn uncertified_quantile_ratios_retain_exact_execution() {
+        for text in [
+            "quantile_over_time(0.9,data[5m])/quantile_over_time(0.5,data[5m])",
+            "avg_over_time(data[5m])/quantile_over_time(0.5,data[5m])",
+        ] {
+            let mut snapshot = planning_snapshot();
+            snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+                Query(text.into());
+            let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+            let plan = PhysicalPlanCompiler
+                .compile_promql(request, environment)
+                .unwrap();
+            assert!(plan.precompute_plan.materializations.is_empty(), "{text}");
+            assert!(
+                plan.query_plan
+                    .entries
+                    .values()
+                    .all(|entry| entry.nodes.values().any(|node| matches!(
+                        node,
+                        crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                    ))),
+                "{text}"
             );
         }
     }
@@ -4133,7 +4303,8 @@ pub(crate) mod tests {
         for query in [
             "sum_over_time(m[1m])",
             "quantile_over_time(0.99, m[1m])",
-            "sum_over_time(m[1m]) / count_over_time(m[1m])",
+            // Planner's certified sum/count decomposition, including its division guard.
+            "avg_over_time(m[1m])",
         ] {
             let mut environment = environment(10_000);
             environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
@@ -4585,9 +4756,11 @@ pub(crate) mod tests {
         }
         Ok(PhysicalCompilationRequest {
             planner_selection_trace: Vec::new(),
+            canonical_roots: Vec::new(),
             allow_mixed_summary_and_exact_execution: false,
             enabled_materialization_keys: None,
             query_workload: None,
+            data_workload: None,
             queries: vec![QueryCompilationInput {
                 query_id: query_id.into(),
                 query_string: promql.into(),
@@ -4625,7 +4798,7 @@ pub(crate) mod tests {
             erp: None,
             exact_composition_costs: HashMap::new(),
             planner_revision: PLANNER_REVISION.into(),
-            source_sample_interval_ms: None,
+            scrape_interval_ms: None,
             query_retention_margin_ms: 0,
             retained_summary_memory_budget_bytes: None,
         })
@@ -4919,7 +5092,8 @@ pub(crate) mod tests {
         let query = "mad_over_time(m[1m])";
         let mut workload = request("vm-q", "last_over_time(m[1m])");
         let accuracy = workload.queries[0].accuracy_target.clone();
-        let canonical = asap_frontend_promql::lower_promql(query, accuracy.clone()).unwrap();
+        let canonical =
+            crate::query_parser::parse_query_expr_canonical(query, accuracy.clone()).unwrap();
         workload.queries[0].query_string = query.into();
         workload.queries[0].selected_plan_root =
             crate::planner_selection::keep_pre_asap(&canonical).unwrap();
@@ -5304,7 +5478,6 @@ pub(crate) mod tests {
                     })
                     .collect(),
             ),
-            data_workload: None,
         }
     }
 
@@ -5623,7 +5796,8 @@ pub(crate) mod tests {
             SummaryExpr::KeepPreAsap(_)
         ));
 
-        preserve_invalid_exact_fallback_roots(&mut request.queries, true).unwrap();
+        preserve_invalid_exact_fallback_roots(&mut request.queries, &request.canonical_roots, true)
+            .unwrap();
 
         assert!(matches!(
             request.queries[0].selected_plan_root.expr,
@@ -5802,7 +5976,6 @@ pub(crate) mod tests {
             value["query_workload"]["repeating_queries"][0]["query"] =
                 json!("quantile(0.9, sum_over_time(m[1m]))");
             value["data_workload"]["ingestion_rate"]["value"] = json!(rate);
-            value["query_workload"]["data_workload"]["ingestion_rate"]["value"] = json!(rate);
             let snapshot: BackendLocalPlanningInput = serde_json::from_value(value).unwrap();
             let (request, env) = snapshot.into_physical_compilation_request().unwrap();
             let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
@@ -6047,6 +6220,169 @@ pub(crate) mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap()
+    }
+
+    fn derived_query_window_secs(query: &str) -> u64 {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query(query.into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        snapshot
+            .into_physical_compilation_request()
+            .unwrap()
+            .0
+            .queries[0]
+            .query_lookback_seconds
+    }
+
+    fn set_data_ingestion_interval(
+        snapshot: &mut BackendLocalPlanningInput,
+        interval_ms: Option<u64>,
+    ) {
+        let evidence = Evidence {
+            value: interval_ms.map(DurationMs),
+            source: EvidenceSource::Declared,
+            observed_at_ms: None,
+            valid_for_ms: None,
+        };
+        snapshot.data_workload.data_ingestion_interval = evidence;
+    }
+
+    // Plan-ready lowering uses workload cadence, not the backend-local migration field.
+    #[test]
+    fn instant_aggregate_uses_data_ingestion_interval() {
+        let mut snapshot = planning_snapshot();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum(data)".into());
+        set_data_ingestion_interval(&mut snapshot, Some(1_000));
+
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        assert_eq!(request.queries[0].query_lookback_seconds, 1);
+    }
+
+    // Snapshot lowering must use the environment clock for cadence freshness.
+    #[test]
+    fn snapshot_rejects_unavailable_cadence_evidence() {
+        for (observed, valid_for) in [
+            (Some(0), Some(0)),
+            (Some(u64::MAX), None),
+            (None, Some(100)),
+        ] {
+            let mut snapshot = planning_snapshot();
+            snapshot
+                .data_workload
+                .data_ingestion_interval
+                .observed_at_ms = observed;
+            snapshot.data_workload.data_ingestion_interval.valid_for_ms = valid_for;
+            let error = snapshot.into_physical_compilation_request().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("evidence is unavailable at planning time"),
+                "{error}"
+            );
+        }
+    }
+
+    // Legacy snapshots migrate their explicit scrape cadence into DataWorkload.
+    #[test]
+    fn missing_data_ingestion_interval_migrates_scrape_interval() {
+        let mut snapshot = planning_snapshot();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum(data)".into());
+        set_data_ingestion_interval(&mut snapshot, None);
+
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        assert_eq!(
+            request.data_workload.unwrap().data_ingestion_interval.value,
+            Some(DurationMs(5_000))
+        );
+        assert_eq!(request.queries[0].query_lookback_seconds, 5);
+    }
+
+    // An explicitly invalid interval must not be replaced by the migration value.
+    #[test]
+    fn zero_data_ingestion_interval_is_rejected() {
+        let mut snapshot = planning_snapshot();
+        set_data_ingestion_interval(&mut snapshot, Some(0));
+
+        let error = snapshot
+            .into_physical_compilation_request()
+            .expect_err("zero interval must fail")
+            .to_string();
+        assert!(error.contains("data_ingestion_interval must be greater than zero"));
+    }
+
+    // Every concatenated histogram result contributes its source history.
+    #[test]
+    fn derived_history_visits_concat_branches() {
+        assert_eq!(derived_query_window_secs(
+            "histogram_quantiles(rate(request_duration_seconds_bucket[5m]), \"quantile\", 0.5, 0.9)"
+        ), 300);
+    }
+
+    // A short ranged sibling must not suppress a raw selector's default window.
+    #[test]
+    fn derived_history_applies_cadence_at_each_rangeless_source() {
+        assert_eq!(
+            derived_query_window_secs("sum(a) + sum(sum_over_time(b[1s]))"),
+            5
+        );
+        assert_eq!(derived_query_window_secs("sum(a offset 1h)"), 3605);
+        assert_eq!(derived_query_window_secs("sum_over_time(a[1s])"), 1);
+    }
+
+    // The seconds-based backend must fail explicitly instead of shrinking history.
+    #[test]
+    fn derived_history_rejects_fractional_seconds() {
+        for query in [
+            "sum_over_time(a[1500ms])",
+            "sum_over_time(a[500ms])",
+            "sum_over_time(a[1500ms] offset 500ms)",
+            "sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))",
+            "avg_over_time((sum(a))[1500ms:])",
+            "sum(a offset 500ms)",
+        ] {
+            let mut snapshot = planning_snapshot();
+            snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+                Query(query.into());
+            let error = snapshot
+                .into_physical_compilation_request()
+                .expect_err(query)
+                .to_string();
+            assert!(
+                error.contains("whole number of seconds"),
+                "{query}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_manual_lookback() {
+        let mut wire = serde_json::to_value(planning_snapshot()).unwrap();
+        wire["query_workload"]["repeating_queries"][0]["time_selection"]["lookback"] =
+            60_000.into();
+        let error = serde_json::from_value::<BackendLocalPlanningInput>(wire)
+            .expect_err("manual lookback must not be accepted")
+            .to_string();
+        assert!(error.contains("lookback is not supported"), "{error}");
+    }
+
+    #[test]
+    fn subquery_range_derives_the_query_window() {
+        assert_eq!(
+            derived_query_window_secs("avg_over_time((sum(a))[6h:])"),
+            6 * 60 * 60 + 5
+        );
+    }
+
+    #[test]
+    fn offset_extends_the_query_furthest_lookback() {
+        // Evaluated at t, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
+        assert_eq!(
+            derived_query_window_secs("sum_over_time(a[1m] offset 1h)"),
+            61 * 60
+        );
     }
 
     // A workload evaluated more often than its window is wide must advance its
@@ -6453,7 +6789,6 @@ pub(crate) mod tests {
         {
             let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
             entry.query = Query("quantile_over_time(0.5, data[5m])".into());
-            entry.time_selection.lookback = Some(DurationMs(300_000));
             entry.demand = RepeatedDemand::FixedIntervalAt {
                 interval: RepetitionInterval(30_000),
                 evaluation_phase: planner_types::workload::TimestampMs(0),
@@ -7001,11 +7336,10 @@ pub(crate) mod tests {
                 predictability: Predictability::Predictable { known_at: None },
                 time_selection: TimeSelection {
                     scope: QueryTimeScope::RealTime,
-                    lookback: Some(DurationMs(60_000)),
+                    lookback: None,
                     as_of: None,
                 },
             }]),
-            data_workload: Some(data_workload.clone()),
         };
         let mut environment = environment(10_000);
         environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
@@ -7028,7 +7362,7 @@ pub(crate) mod tests {
                     cost: template.window_realization_candidates[0].cost.clone(),
                     quotes: Vec::new(),
                 },
-                source_sample_interval_ms: None,
+                scrape_interval_ms: 1_000,
                 query_retention_margin_ms: 0,
                 retained_summary_memory_budget_bytes: DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
                 topk_evidence: HashMap::new(),
