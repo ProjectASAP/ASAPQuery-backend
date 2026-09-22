@@ -56,7 +56,7 @@ impl RuntimeErpObserver {
         &self,
         generation: &CatalogGeneration,
         coordinates: SummaryInstanceCoordinates,
-        config: &asap_types::AggregationConfig,
+        config: &asap_types::PrecomputeMaterialization,
         timestamp_ms: i64,
         value: f64,
     ) {
@@ -264,8 +264,8 @@ impl RuntimeErpObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (CatalogGeneration, asap_types::AggregationConfig) {
-        let config = asap_types::AggregationConfig::new(
+    fn fixture() -> (CatalogGeneration, asap_types::PrecomputeMaterialization) {
+        let config = asap_types::PrecomputeMaterialization::new(
             asap_types::AggregationType::HLL,
             String::new(),
             Default::default(),

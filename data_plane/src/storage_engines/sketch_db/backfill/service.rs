@@ -342,15 +342,15 @@ mod tests {
         MockRawSampleReader, RawSample,
     };
     use crate::storage_engines::types::StreamingConfig;
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::sync::Mutex;
 
-    fn sum_config(_agg_id: u64, metric: &str) -> AggregationConfig {
+    fn sum_config(_agg_id: u64, metric: &str) -> PrecomputeMaterialization {
         // `_agg_id` is unused after PR 5 — identity is content-addressed.
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             std::collections::HashMap::new(),
@@ -369,7 +369,7 @@ mod tests {
         )
     }
 
-    fn streaming_with(cfg: AggregationConfig) -> Arc<StreamingConfig> {
+    fn streaming_with(cfg: PrecomputeMaterialization) -> Arc<StreamingConfig> {
         let mut m = std::collections::HashMap::new();
         m.insert(cfg.policy_fp_u64(), cfg);
         Arc::new(StreamingConfig::new(m))

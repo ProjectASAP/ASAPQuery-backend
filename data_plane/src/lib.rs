@@ -37,9 +37,9 @@ pub mod utils;
 
 // Re-export commonly used types to avoid glob import conflicts
 pub use storage_engines::types::{
-    AggregateCore, AggregationConfig, KeyByLabelValues, Measurement, MergeableAccumulator,
-    MultipleSubpopulationAggregate, PrecomputedOutput, SerializableToSink,
-    SingleSubpopulationAggregate,
+    AggregateCore, KeyByLabelValues, Measurement, MergeableAccumulator,
+    MultipleSubpopulationAggregate, PrecomputeMaterialization, PrecomputedOutput,
+    SerializableToSink, SingleSubpopulationAggregate,
 };
 
 pub use precompute_engine::operators::{

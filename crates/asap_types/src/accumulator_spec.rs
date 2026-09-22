@@ -1,68 +1,12 @@
-//! Typed accumulator dispatch derived from legacy streaming config.
+//! Validate stored materialization descriptors against Planner summary families.
 //!
-//! The semantic identity is ASAPPlanner's [`SummaryFamilyType`]. This module
-//! only adds the backend execution concern of keyed versus unkeyed state and
-//! adapts the stable legacy wire fields into that canonical representation.
-//!
-//! ## This is an additive representation, not a replacement (yet)
-//!
-//! `AggregationConfig` keeps its `aggregation_type` / `aggregation_sub_type`
-//! / `parameters` fields untouched. Two hard constraints ruled out full
-//! removal in this pass:
-//!
-//! 1. **`PolicyFingerprint` hash stability.** [`crate::policy_fingerprint`]
-//!    hashes `aggregation_type` / `aggregation_sub_type` / `parameters`
-//!    directly, and its own module doc is explicit that the byte layout
-//!    it produces is a stability *contract* ("Don't reorder fields...
-//!    any such change invalidates every deployed fingerprint and forces
-//!    a cold-start rebuild"). Changing what feeds that hash — even by
-//!    routing it through an equivalent typed shape — risks producing a
-//!    different byte sequence for the same logical policy, which strands
-//!    on-disk sids after a deploy. `policy_fingerprint.rs` is
-//!    deliberately **not touched** by this module; it keeps reading the
-//!    original three fields, unchanged.
-//! 2. **Consumer fan-out.** `AggregationType` is read by ~40 files across
-//!    `data_plane` and `asap_types` — persistence (`sid_metadata.json`
-//!    round-trip), query-time capability matching
-//!    (`capability_matching.rs`, unrelated to accumulator dispatch),
-//!    the query engine, reconciliation, index maintenance — not just
-//!    `accumulator_factory.rs` (the single highest-risk consumer, and
-//!    the one this module targets). Migrating all of them in one PR was
-//!    judged too large to land and review safely; that's tracked as
-//!    follow-up, not done here.
-//!
-//! So: `AccumulatorSpec` is *computed from* `AggregationConfig`'s
-//! existing fields via [`AggregationConfig::accumulator_spec`], and
-//! consumed by `data_plane::precompute_engine::accumulator_factory`
-//! instead of the raw fields. The wire format (`aggregationType` /
-//! `aggregationSubType` / `parameters` JSON/YAML keys) is completely
-//! unaffected — nothing here changes how `AggregationConfig::from_yaml`
-//! / `from_json` parse or how `serialize_to_json` emits.
-//!
-//! Backend-specific execution details remain deliberately separate:
-//!
-//! - **Min/max direction.** Direction is part of the family now, not a
-//!   string riding alongside it: `AggregationType::{Min, Max}` (and the
-//!   keyed `{MultipleMin, MultipleMax}`) map to `ExactKind::Min` and
-//!   `ExactKind::Max` respectively — upstream still spells its
-//!   maximum accumulator `MinMax`, but it is a maximum. Nothing reads
-//!   `AggregationConfig::aggregation_sub_type` for the direction any
-//!   more, so a min state can no longer content-address onto a max one.
-//! - **HydraKLL's `(row, col)` tiling.** `SketchParams::Kll` carries
-//!   only `k` — upstream has no concept of the CMS-like grid-of-KLL-cells
-//!   layout `HydraKllSketchAccumulator` uses to parallelize a keyed KLL
-//!   across many populations. `accumulator_factory.rs` calls
-//!   [`cms_params`] directly for keyed KLL execution
-//!   arm, same extraction the plain CMS arms use, because `w`/`d` are
-//!   genuinely the same wire keys for both.
-//! - **Top-k ranking mode (`weight_mode`).** Not a sketch structural
-//!   parameter — a data_plane-only "what to accumulate" axis
-//!   (`accumulator_factory::TopkWeight`) with no upstream equivalent.
-//!   Stays a raw-`parameters`-reading helper in `accumulator_factory.rs`.
+//! This projection supports catalog identity and imported state metadata. It is
+//! not an execution program. Raw and maintenance execution dispatch directly
+//! on the selected post-ASAP DAG payload; the descriptor must agree with it.
 
 use serde_json::Value;
 
-use crate::aggregation_config::AggregationConfig;
+use crate::aggregation_config::PrecomputeMaterialization;
 use crate::key_by_label_names::KeyByLabelNames;
 use crate::AggregationType;
 use planner_types::post_asap::{
@@ -75,8 +19,8 @@ use planner_types::post_asap::{
 /// accumulator to run (`kind`), with what tuning (`params`), and
 /// whether it's keyed by a group-by label set (`grouping`).
 ///
-/// Computed on demand from an [`AggregationConfig`] via
-/// [`AggregationConfig::accumulator_spec`] — not stored on the config
+/// Computed on demand from an [`PrecomputeMaterialization`] via
+/// [`PrecomputeMaterialization::accumulator_spec`] — not stored on the config
 /// itself, so there is exactly one source of truth for the fields that
 /// feed [`crate::policy_fingerprint::PolicyFingerprint`].
 #[derive(Debug, Clone, PartialEq)]
@@ -85,10 +29,7 @@ pub struct AccumulatorSpec {
     /// validated `SketchKind` (category + algorithm + params), following the
     /// ASAP-aware-mapping vocabulary.
     pub family: SummaryFamilyType,
-    /// `Some(labels)` for a keyed (multi-population) accumulator,
-    /// `None` for a single-population one. This is the axis
-    /// `AggregationType` wrongly folded into identity (`Sum` vs
-    /// `MultipleSum`) — here it's a sibling field instead.
+    /// Physical keyed-state layout, independent of semantic family.
     pub grouping: Option<KeyByLabelNames>,
 }
 
@@ -96,8 +37,8 @@ pub struct AccumulatorSpec {
 ///
 /// This is execution semantics, separate from the summary family: the same
 /// CMS-with-heap state can count events, sum sample values, or sum reset-aware
-/// counter deltas. Legacy streaming artifacts still encode the rule in
-/// `parameters`; callers use [`AggregationConfig::sample_update_rule`] so the
+/// counter deltas. Stored descriptors encode the rule in
+/// `parameters`; callers use [`PrecomputeMaterialization::sample_update_rule`] so the
 /// runtime does not branch on ad-hoc strings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SampleUpdateRule {
@@ -134,7 +75,7 @@ pub fn is_scalar_sample_value(update: &planner_types::post_asap::SummaryUpdate) 
         )
 }
 
-impl AggregationConfig {
+impl PrecomputeMaterialization {
     pub fn sample_update_rule(&self) -> SampleUpdateRule {
         let scale = self
             .parameters
@@ -157,23 +98,14 @@ impl AggregationConfig {
     }
 }
 
-/// Why [`AggregationConfig::accumulator_spec`] couldn't resolve a config
-/// into an [`AccumulatorSpec`]. Each variant matches one of the three
-/// distinct fallback paths `accumulator_factory::create_accumulator_updater`
-/// took pre-Step-5 — preserved verbatim (including which default
-/// updater and which warning text each one produced) so this refactor
-/// changes *how* the dispatch is expressed, not what it does for any
-/// input.
+/// A storage descriptor cannot be resolved to a supported Planner family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulatorSpecError {
     /// `aggregation_type` was `SingleSubpopulation` with an
     /// `aggregation_sub_type` string not in the recognized alias list.
-    /// Pre-Step-5 this defaulted to `SumAccumulatorUpdater`.
     UnknownSingleSubpopulationSubType(String),
     /// `aggregation_type` was `MultipleSubpopulation` with an
-    /// unrecognized `aggregation_sub_type`. Pre-Step-5 this defaulted
-    /// to `MultipleSumAccumulatorUpdater` (note: a *different* default
-    /// than the `SingleSubpopulation` case).
+    /// unrecognized `aggregation_sub_type`.
     UnknownMultipleSubpopulationSubType(String),
     /// `aggregation_type` itself has no accumulator-dispatch mapping.
     /// Also returned for an invalid HLL precision. A resolved family identifies
@@ -185,36 +117,24 @@ impl std::fmt::Display for AccumulatorSpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownSingleSubpopulationSubType(s) => {
-                write!(
-                    f,
-                    "Unknown SingleSubpopulation sub_type '{s}', defaulting to Sum"
-                )
+                write!(f, "Unknown SingleSubpopulation sub_type '{s}'")
             }
             Self::UnknownMultipleSubpopulationSubType(s) => {
-                write!(
-                    f,
-                    "Unknown MultipleSubpopulation sub_type '{s}', defaulting to Sum"
-                )
+                write!(f, "Unknown MultipleSubpopulation sub_type '{s}'")
             }
-            Self::UnmappedAggregationType(t) => write!(
-                f,
-                "Unknown aggregation_type '{t:?}', defaulting to SingleSubpopulation Sum"
-            ),
+            Self::UnmappedAggregationType(t) => write!(f, "Unknown aggregation_type '{t:?}'"),
         }
     }
 }
 
 impl std::error::Error for AccumulatorSpecError {}
 
-impl AggregationConfig {
+impl PrecomputeMaterialization {
     /// Resolve this config's `(aggregation_type, aggregation_sub_type,
     /// parameters)` triple into a typed [`AccumulatorSpec`].
     ///
-    /// Mirrors `accumulator_factory::create_accumulator_updater`'s
-    /// pre-Step-5 dispatch exactly — same sub_type alias lists, same
-    /// numeric defaults, same three fallback paths (see
-    /// [`AccumulatorSpecError`]) — just re-expressed as data instead of
-    /// as a 14-arm match baked into the accumulator constructor.
+    /// Unsupported descriptors return an error; this projection never chooses
+    /// a fallback family and cannot authorize DAG execution.
     pub fn accumulator_spec(&self) -> Result<AccumulatorSpec, AccumulatorSpecError> {
         use AggregationType::*;
 
@@ -227,10 +147,9 @@ impl AggregationConfig {
             )
         };
         let (family, keyed) = match self.aggregation_type {
-            Sum | Count | Increase | Rate | Min | Max | MultipleSum | MultipleIncrease
-            | MultipleMin | MultipleMax => (
+            Sum | Count | Increase | Rate | Min | Max => (
                 self.aggregation_type.planner_exact_family().unwrap(),
-                self.aggregation_type.is_keyed(),
+                !self.aggregated_labels.is_empty(),
             ),
             DatasketchesKLL => (
                 independent_sketch(
@@ -470,7 +389,7 @@ impl AggregationConfig {
 /// Extract the KLL `k` parameter. Capital `"K"` takes precedence over
 /// lowercase `"k"` to match the convention used by the top-level
 /// aggregation type arms. Defaults to 200.
-pub fn kll_k_param(config: &AggregationConfig) -> u16 {
+pub fn kll_k_param(config: &PrecomputeMaterialization) -> u16 {
     config
         .parameters
         .get("K")
@@ -486,7 +405,7 @@ pub fn kll_k_param(config: &AggregationConfig) -> u16 {
 /// matches what the control plane's `sketch_params_to_json` emits and
 /// what `sketch_config_to_params` uses for OTLP policy_fp content
 /// matching. Defaults to `(4, 1000)`.
-pub fn cms_params(config: &AggregationConfig) -> (usize, usize) {
+pub fn cms_params(config: &PrecomputeMaterialization) -> (usize, usize) {
     let row_num = config
         .parameters
         .get("d")
@@ -503,7 +422,7 @@ pub fn cms_params(config: &AggregationConfig) -> (usize, usize) {
 /// Top-k heap size for the `*WithHeap` configs. Reads `heap_size` / `k`
 /// from `parameters`; defaults to 20 (the heap holds the top-k
 /// candidates — it must be >= the largest `k` a query asks for).
-pub fn heap_size_param(config: &AggregationConfig) -> usize {
+pub fn heap_size_param(config: &PrecomputeMaterialization) -> usize {
     config
         .parameters
         .get("heap_size")
@@ -518,7 +437,7 @@ pub fn heap_size_param(config: &AggregationConfig) -> usize {
 /// Pull `relativeAccuracy` (or canonical aliases) out of a
 /// streaming-config aggregation entry. Defaults to 0.01 (1% rel-err,
 /// the same default the agent's `ddsketchprocessor` uses).
-pub fn ddsketch_alpha_param(config: &AggregationConfig) -> f64 {
+pub fn ddsketch_alpha_param(config: &PrecomputeMaterialization) -> f64 {
     let parsed = param_f64(config, "relativeAccuracy")
         .or_else(|| param_f64(config, "relative_accuracy"))
         .or_else(|| param_f64(config, "alpha"))
@@ -534,7 +453,7 @@ pub fn ddsketch_alpha_param(config: &AggregationConfig) -> f64 {
     }
 }
 
-fn param_f64(config: &AggregationConfig, key: &str) -> Option<f64> {
+fn param_f64(config: &PrecomputeMaterialization, key: &str) -> Option<f64> {
     config.parameters.get(key).and_then(Value::as_f64)
 }
 
@@ -572,8 +491,8 @@ mod tests {
         sub_type: &str,
         params: HashMap<String, Value>,
         grouping_labels: Vec<&str>,
-    ) -> AggregationConfig {
-        AggregationConfig::new(
+    ) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             agg_type,
             sub_type.to_string(),
             params,
@@ -603,13 +522,9 @@ mod tests {
     }
 
     #[test]
-    fn multiple_sum_is_keyed_sum() {
-        let cfg = make_config(
-            AggregationType::MultipleSum,
-            "",
-            HashMap::new(),
-            vec!["zone"],
-        );
+    fn keyed_layout_preserves_sum_family() {
+        let mut cfg = make_config(AggregationType::Sum, "", HashMap::new(), vec!["zone"]);
+        cfg.aggregated_labels = KeyByLabelNames::new(vec!["host".into()]);
         let spec = cfg.accumulator_spec().expect("resolves");
         assert_exact(&spec, ExactKind::Sum);
         assert_eq!(
@@ -835,16 +750,16 @@ mod tests {
         assert_eq!(
             AccumulatorSpecError::UnknownSingleSubpopulationSubType("Bogus".to_string())
                 .to_string(),
-            "Unknown SingleSubpopulation sub_type 'Bogus', defaulting to Sum"
+            "Unknown SingleSubpopulation sub_type 'Bogus'"
         );
         assert_eq!(
             AccumulatorSpecError::UnknownMultipleSubpopulationSubType("Bogus".to_string())
                 .to_string(),
-            "Unknown MultipleSubpopulation sub_type 'Bogus', defaulting to Sum"
+            "Unknown MultipleSubpopulation sub_type 'Bogus'"
         );
         assert_eq!(
             AccumulatorSpecError::UnmappedAggregationType(AggregationType::HLL).to_string(),
-            "Unknown aggregation_type 'HLL', defaulting to SingleSubpopulation Sum"
+            "Unknown aggregation_type 'HLL'"
         );
     }
 
@@ -878,7 +793,7 @@ mod tests {
     // ---- PolicyFingerprint stability guard ---------------------------
 
     /// `accumulator_spec()` must be a pure, additional *read* of
-    /// `AggregationConfig` — it must not change what
+    /// `PrecomputeMaterialization` — it must not change what
     /// `PolicyFingerprint::from_config` hashes. This locks in a fixed
     /// fingerprint for a fixed config as a tripwire: if this test ever
     /// needs its expected constant updated, `policy_fingerprint.rs`

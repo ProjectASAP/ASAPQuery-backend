@@ -137,7 +137,7 @@ pub enum AggKind {
 /// Complete resolver identity for a configured materialization. All live and
 /// replay paths must include policy semantics, not just the sketch family.
 pub(crate) fn materialization_kind_for_config(
-    config: &asap_types::aggregation_config::AggregationConfig,
+    config: &asap_types::aggregation_config::PrecomputeMaterialization,
 ) -> String {
     format!(
         "{}|{}",
@@ -149,7 +149,9 @@ pub(crate) fn materialization_kind_for_config(
 /// Resolve the physical state family produced by a precompute policy. This is
 /// shared by SID minting and store registration so a sketch policy can never
 /// be minted as `ExactAgg` and later registered as `Sketch` (or vice versa).
-pub fn agg_kind_for_config(config: &asap_types::aggregation_config::AggregationConfig) -> AggKind {
+pub fn agg_kind_for_config(
+    config: &asap_types::aggregation_config::PrecomputeMaterialization,
+) -> AggKind {
     use planner_types::post_asap::{SketchAlgorithm as Algorithm, SketchParams, SummaryFamilyType};
 
     // HLL is intentionally absent from raw-value accumulator dispatch because
@@ -592,7 +594,7 @@ mod tests {
 
     #[test]
     fn hll_envelope_config_is_registered_as_a_sketch() {
-        let config = asap_types::aggregation_config::AggregationConfig::new(
+        let config = asap_types::aggregation_config::PrecomputeMaterialization::new(
             AggregationType::HLL,
             String::new(),
             HashMap::from([("precision".to_string(), serde_json::json!(12))]),

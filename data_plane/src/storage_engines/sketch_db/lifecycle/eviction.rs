@@ -195,13 +195,13 @@ mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
     use crate::storage_engines::types::{AggregationType, StreamingConfig};
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
 
-    fn sum_agg_config(id: u64) -> AggregationConfig {
-        AggregationConfig {
+    fn sum_agg_config(id: u64) -> PrecomputeMaterialization {
+        PrecomputeMaterialization {
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),

@@ -27,7 +27,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
-use asap_types::aggregation_config::AggregationConfig;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::enums::WindowKind;
 use asap_types::AggregationType;
 use asap_types::KeyByLabelNames;
@@ -35,8 +35,8 @@ use serde_json::{json, Value};
 
 use crate::storage_engines::sketch_db::accuracy::{derive, AccuracyKind};
 
-fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> AggregationConfig {
-    AggregationConfig::new(
+fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> PrecomputeMaterialization {
+    PrecomputeMaterialization::new(
         agg_type,
         String::new(),
         params,

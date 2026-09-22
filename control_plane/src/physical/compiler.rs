@@ -2830,10 +2830,6 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
         | A::Rate
         | A::Min
         | A::Max
-        | A::MultipleSum
-        | A::MultipleIncrease
-        | A::MultipleMin
-        | A::MultipleMax
         | A::SingleSubpopulation
         | A::MultipleSubpopulation => 256,
     }
@@ -2851,13 +2847,7 @@ fn retained_partition_count(
     if materialization.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
         || matches!(
             materialization.aggregation_type,
-            A::Increase
-                | A::Rate
-                | A::MultipleIncrease
-                | A::Min
-                | A::Max
-                | A::MultipleMin
-                | A::MultipleMax
+            A::Increase | A::Rate | A::Min | A::Max
         )
         || !materialization.grouping_labels.names().is_empty()
     {
@@ -3104,7 +3094,7 @@ pub(crate) fn raw_materialization_input_contract(
     )
 }
 
-fn raw_time_series_input_contract(
+pub fn raw_time_series_input_contract(
     expr: &QueryExpr,
     exact: bool,
 ) -> Result<(String, Option<u64>, String), String> {
@@ -5053,9 +5043,7 @@ pub(crate) mod tests {
             .iter()
             .all(|m| !matches!(
                 m.aggregation_type,
-                asap_types::AggregationType::Increase
-                    | asap_types::AggregationType::Rate
-                    | asap_types::AggregationType::MultipleIncrease
+                asap_types::AggregationType::Increase | asap_types::AggregationType::Rate
             )));
         let entry = plan.query_plan.entries.values().next().unwrap();
         assert!(!entry.materialization_bindings().is_empty());

@@ -29,7 +29,7 @@ use planner_types::pre_asap::AggIntent;
 /// shape).
 ///
 /// After: the store is keyed by `(metric, role)` so each shape gets its
-/// own plan, its own `AggregationConfig` on the backend's streaming
+/// own plan, its own `PrecomputeMaterialization` on the backend's streaming
 /// config, and its own routing-connector pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

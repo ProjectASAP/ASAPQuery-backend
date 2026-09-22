@@ -100,7 +100,7 @@ fn summary_identity(node: &SummaryNode) -> Option<String> {
         let hash = explain_identity(
             "summary_node",
             &serde_json::json!({
-            "operator": node.operator, "payload": node.payload, "state": node.output_state,
+            "payload": node.payload, "state": node.output_state,
             "schema": node.output_schema, "guarantee": node.guarantee, "inputs": inputs}),
         );
         memo.insert(id, hash.clone());
@@ -399,7 +399,7 @@ fn select_workload_impl(
     let selection = space.global_selection(cost_model);
     if let Some(trace) = trace.as_deref_mut() {
         let groups = space.cost_sorted(cost_model).iter().enumerate().map(|(index, group)| {
-            let chosen = selection.groups().find(|selected| Rc::ptr_eq(selected.target, group.target))
+            let chosen = selection.target_selections().find(|selected| Rc::ptr_eq(selected.target, group.target))
                 .and_then(|selected| selected.chosen);
             let candidates = group.candidates.iter().zip(&group.costs).enumerate()
                 .map(|(rank, (candidate, cost))| serde_json::json!({
@@ -418,8 +418,8 @@ fn select_workload_impl(
                     "estimated_cost_status": if cost.is_finite() { "available" } else { "not_reported_by_cost_model" },
                     "selected": chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)),
                 })).collect::<Vec<_>>();
-            let rejected = space.groups().find(|memo| Rc::ptr_eq(&memo.target, group.target))
-                .into_iter().flat_map(|memo| &memo.rejected).map(|candidate| serde_json::json!({
+            let rejected = space.target_subdag_candidates().find(|candidates| Rc::ptr_eq(&candidates.target, group.target))
+                .into_iter().flat_map(|candidates| &candidates.rejected).map(|candidate| serde_json::json!({
                     "status": "rejected", "strategy": candidate.strategy,
                     "description": candidate.description, "reason": candidate.error.to_string()
                 })).collect::<Vec<_>>();
@@ -434,7 +434,7 @@ fn select_workload_impl(
         .iter()
         .map(|(id, root)| {
             selection
-                .materialize(root)
+                .assemble_selected_dag(root)
                 .map_err(|error| SelectionError::Workload(error.to_string()))?
                 .map(|node| (*id, node))
                 .ok_or_else(|| SelectionError::Workload(format!("missing query root {id}")))

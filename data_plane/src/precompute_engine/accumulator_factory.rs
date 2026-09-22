@@ -1,30 +1,19 @@
 use crate::precompute_engine::operators::{
     CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
     CountSketchWithHeapAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
-    HydraKllSketchAccumulator, IncreaseAccumulator, KeyedSumCountAccumulator, MaxAccumulator,
-    MinAccumulator, MultipleIncreaseAccumulator, MultipleMaxAccumulator, MultipleMinAccumulator,
-    SumAccumulator,
+    HydraKllSketchAccumulator, IncreaseAccumulator, KeyedCounterState, KeyedMaxState,
+    KeyedMinState, KeyedSumCountAccumulator, MaxAccumulator, MinAccumulator, SumAccumulator,
 };
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, Measurement,
 };
-use asap_types::aggregation_config::AggregationConfig;
-// Step 5 (sketch-identity unification, see
-// scratchpad/artifacts/enum-unification-plan.md): dispatch below is
-// driven by `AccumulatorSpec` (SummaryFamilyType + typed family parameters +
-// keyed-axis grouping) instead of raw `AggregationType` +
-// `aggregation_sub_type` string matching. Numeric params come straight
-// off the committed family's typed params (no HashMap lookups) except
-// `cms_params`, kept as a raw-`parameters` read for the one case Planner's
-// family parameters have no field for: HydraKLL's `(row, col)` tiling grid (see
-// `asap_types::accumulator_spec`'s module doc for why). `cms_params`
-// now lives there — the only place that still needs the other three
-// former local helpers (`kll_k_param`, `heap_size_param`,
-// `ddsketch_alpha_param`) is that module's own `AccumulatorSpec`
-// construction, so they aren't re-imported here.
+use asap_types::aggregation_config::PrecomputeMaterialization;
+// Production dispatch consumes Planner SummaryAgg payloads directly. The
+// config adapter below is compiled only for isolated historical kernel tests.
 use super::operators::hll_sketch_accumulator::HllSketchAccumulator;
 use super::operators::univmon_accumulator::UnivMonAccumulator;
-use asap_types::accumulator_spec::{cms_params, AccumulatorSpecError};
+#[cfg(test)]
+use asap_types::accumulator_spec::cms_params;
 use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
 
 /// Generate the two boilerplate clone-based `AccumulatorUpdater` methods
@@ -433,7 +422,7 @@ impl AccumulatorUpdater for KeyedSumCountAccumulatorUpdater {
 }
 
 // ---------------------------------------------------------------------------
-// MultipleMinAccumulatorUpdater / MultipleMaxAccumulatorUpdater
+// KeyedMinStateUpdater / KeyedMaxStateUpdater
 // ---------------------------------------------------------------------------
 
 macro_rules! multiple_extremum_updater {
@@ -479,32 +468,32 @@ macro_rules! multiple_extremum_updater {
     };
 }
 
-multiple_extremum_updater!(MultipleMinAccumulatorUpdater, MultipleMinAccumulator);
-multiple_extremum_updater!(MultipleMaxAccumulatorUpdater, MultipleMaxAccumulator);
+multiple_extremum_updater!(KeyedMinStateUpdater, KeyedMinState);
+multiple_extremum_updater!(KeyedMaxStateUpdater, KeyedMaxState);
 
 // ---------------------------------------------------------------------------
-// MultipleIncreaseAccumulatorUpdater
+// KeyedCounterStateUpdater
 // ---------------------------------------------------------------------------
 
-pub struct MultipleIncreaseAccumulatorUpdater {
-    acc: MultipleIncreaseAccumulator,
+pub struct KeyedCounterStateUpdater {
+    acc: KeyedCounterState,
 }
 
-impl MultipleIncreaseAccumulatorUpdater {
+impl KeyedCounterStateUpdater {
     pub fn new() -> Self {
         Self {
-            acc: MultipleIncreaseAccumulator::new(),
+            acc: KeyedCounterState::new(),
         }
     }
 }
 
-impl Default for MultipleIncreaseAccumulatorUpdater {
+impl Default for KeyedCounterStateUpdater {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AccumulatorUpdater for MultipleIncreaseAccumulatorUpdater {
+impl AccumulatorUpdater for KeyedCounterStateUpdater {
     fn update_single(&mut self, _value: f64, _timestamp_ms: i64) {
         debug_assert!(
             false,
@@ -532,7 +521,7 @@ impl AccumulatorUpdater for MultipleIncreaseAccumulatorUpdater {
     impl_clone_accumulator_methods!(acc);
 
     fn reset(&mut self) {
-        self.acc = MultipleIncreaseAccumulator::new();
+        self.acc = KeyedCounterState::new();
     }
 
     fn is_keyed(&self) -> bool {
@@ -540,7 +529,7 @@ impl AccumulatorUpdater for MultipleIncreaseAccumulatorUpdater {
     }
 
     fn memory_usage_bytes(&self) -> usize {
-        std::mem::size_of::<MultipleIncreaseAccumulator>()
+        std::mem::size_of::<KeyedCounterState>()
             + self.acc.increases.len()
                 * (std::mem::size_of::<KeyByLabelValues>()
                     + std::mem::size_of::<IncreaseAccumulator>())
@@ -903,27 +892,20 @@ impl AccumulatorUpdater for HydraKllAccumulatorUpdater {
 /// **Contract:** this must agree with every concrete `AccumulatorUpdater::is_keyed()`
 /// implementation. When a new accumulator type is added, update both here and
 /// in the corresponding struct.
-pub fn config_is_keyed(config: &AggregationConfig) -> bool {
-    matches!(
-        config.aggregation_type,
-        AggregationType::MultipleSubpopulation
-            | AggregationType::MultipleSum
-            | AggregationType::MultipleIncrease
-            | AggregationType::MultipleMin
-            | AggregationType::MultipleMax
-            | AggregationType::CountMinSketch
-            | AggregationType::CountMinSketchWithHeap
-            | AggregationType::CountSketch
-            | AggregationType::CountSketchWithHeap
-            | AggregationType::HydraKLL
-    )
+pub fn config_is_keyed(config: &PrecomputeMaterialization) -> bool {
+    config
+        .accumulator_spec()
+        .expect("valid fixture")
+        .grouping
+        .is_some()
 }
 
 /// Top-k ranking quantity, selected by `weight_mode` or its alias `topk_weight`.
 ///
 /// * `value` / `sum`: sum values per key (default).
 /// * `count` / `frequency` / `freq`: count occurrences per key.
-fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
+#[cfg(test)]
+fn topk_weight_param(config: &PrecomputeMaterialization) -> TopkWeight {
     match config.sample_update_rule() {
         asap_types::SampleUpdateRule::Count => TopkWeight::Count,
         asap_types::SampleUpdateRule::Value { .. }
@@ -931,7 +913,8 @@ fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
     }
 }
 
-fn topk_weight_scale_param(config: &AggregationConfig) -> f64 {
+#[cfg(test)]
+fn topk_weight_scale_param(config: &PrecomputeMaterialization) -> f64 {
     match config.sample_update_rule() {
         asap_types::SampleUpdateRule::Value { scale } => scale,
         asap_types::SampleUpdateRule::CounterDelta { scale } => scale,
@@ -947,6 +930,7 @@ fn topk_weight_scale_param(config: &AggregationConfig) -> f64 {
 /// always builds a `SketchKind` whose `SketchAlgorithm::Kll` is paired with
 /// `SketchParams::Kll`, so the
 /// other arm is unreachable from a `spec` this module builds itself.
+#[cfg(test)]
 fn kll_k(params: &SketchParams) -> u16 {
     match params {
         // Lossless: `accumulator_spec()` only ever stores a value that
@@ -959,12 +943,12 @@ fn kll_k(params: &SketchParams) -> u16 {
     }
 }
 
-/// Read `(width, depth)` out of `SketchParams::Cms` or `::CountSketch`
+/// Read `(rows = depth, columns = width)` out of `SketchParams::Cms` or `::CountSketch`
 /// — same shape, different variant per bare-sketch identity.
 fn cms_dims(params: &SketchParams) -> (usize, usize) {
     match params {
         SketchParams::Cms { width, depth } | SketchParams::CountSketch { width, depth } => {
-            (*width as usize, *depth as usize)
+            (*depth as usize, *width as usize)
         }
         other => unreachable!(
             "accumulator_spec() paired SketchAlgorithm::Cms/CountSketch with unexpected params: {other:?}"
@@ -972,7 +956,7 @@ fn cms_dims(params: &SketchParams) -> (usize, usize) {
     }
 }
 
-/// Read `(width, depth, heap_size)` out of `SketchParams::CmsWithHeap`
+/// Read `(rows = depth, columns = width, heap_size)` out of `SketchParams::CmsWithHeap`
 /// or `::CountSketchWithHeap`.
 fn cms_heap_dims(params: &SketchParams) -> (usize, usize, usize) {
     match params {
@@ -985,7 +969,7 @@ fn cms_heap_dims(params: &SketchParams) -> (usize, usize, usize) {
             width,
             depth,
             heap_size,
-        } => (*width as usize, *depth as usize, *heap_size as usize),
+        } => (*depth as usize, *width as usize, *heap_size as usize),
         other => unreachable!(
             "accumulator_spec() paired a WithHeap SketchAlgorithm with unexpected params: {other:?}"
         ),
@@ -993,6 +977,7 @@ fn cms_heap_dims(params: &SketchParams) -> (usize, usize, usize) {
 }
 
 /// Read the DDSketch relative-accuracy `alpha` out of `SketchParams::DDSketch`.
+#[cfg(test)]
 fn ddsketch_alpha(params: &SketchParams) -> f64 {
     match params {
         SketchParams::DDSketch { alpha } => *alpha,
@@ -1002,44 +987,15 @@ fn ddsketch_alpha(params: &SketchParams) -> f64 {
     }
 }
 
-/// Create an appropriate `AccumulatorUpdater` from an `AggregationConfig`.
-///
-/// Dispatches on [`asap_types::AccumulatorSpec`] — `SummaryFamilyType` identity
-/// plus the keyed/unkeyed `grouping` axis — instead of the pre-Step-5
-/// `AggregationType` + `aggregation_sub_type` string combo. See
-/// `asap_types::accumulator_spec`'s module doc for why min/max direction,
-/// HydraKLL's `(row, col)` tiling, and top-k `weight_mode` still read
-/// `config` directly rather than going through Planner family parameters —
-/// none of those three have a field in the Planner-owned types.
-pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn AccumulatorUpdater> {
-    let spec = match config.accumulator_spec() {
-        Ok(spec) => spec,
-        // Three fallback paths, preserved verbatim from the pre-Step-5
-        // dispatch: same warning text, same default updater per case
-        // (Single- and MultipleSubpopulation default to *different*
-        // updaters — see `AccumulatorSpecError`'s doc).
-        Err(AccumulatorSpecError::UnknownSingleSubpopulationSubType(sub_type)) => {
-            tracing::warn!(
-                "Unknown SingleSubpopulation sub_type '{}', defaulting to Sum",
-                sub_type
-            );
-            return Box::new(SumAccumulatorUpdater::new());
-        }
-        Err(AccumulatorSpecError::UnknownMultipleSubpopulationSubType(sub_type)) => {
-            tracing::warn!(
-                "Unknown MultipleSubpopulation sub_type '{}', defaulting to Sum",
-                sub_type
-            );
-            return Box::new(KeyedSumCountAccumulatorUpdater::new());
-        }
-        Err(AccumulatorSpecError::UnmappedAggregationType(other)) => {
-            tracing::warn!(
-                "Unknown aggregation_type '{:?}', defaulting to SingleSubpopulation Sum",
-                other
-            );
-            return Box::new(SumAccumulatorUpdater::new());
-        }
-    };
+/// Construct isolated payload fixtures for kernel/storage unit tests.
+/// Production execution requires a validated Planner DAG program.
+#[cfg(test)]
+pub fn create_fixture_accumulator(
+    config: &PrecomputeMaterialization,
+) -> Box<dyn AccumulatorUpdater> {
+    let spec = config
+        .accumulator_spec()
+        .expect("invalid isolated kernel fixture");
 
     let keyed = spec.grouping.is_some();
 
@@ -1063,20 +1019,20 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             Box::new(MinAccumulatorUpdater::new())
         }
         (SummaryFamilyType::ExactAggregate(ExactKind::Min, _), true) => {
-            Box::new(MultipleMinAccumulatorUpdater::new())
+            Box::new(KeyedMinStateUpdater::new())
         }
         (SummaryFamilyType::ExactAggregate(ExactKind::Max, _), false) => {
             Box::new(MaxAccumulatorUpdater::new())
         }
         (SummaryFamilyType::ExactAggregate(ExactKind::Max, _), true) => {
-            Box::new(MultipleMaxAccumulatorUpdater::new())
+            Box::new(KeyedMaxStateUpdater::new())
         }
 
         (SummaryFamilyType::ExactAggregate(ExactKind::Increase | ExactKind::Rate, _), false) => {
             Box::new(IncreaseAccumulatorUpdater::new())
         }
         (SummaryFamilyType::ExactAggregate(ExactKind::Increase | ExactKind::Rate, _), true) => {
-            Box::new(MultipleIncreaseAccumulatorUpdater::new())
+            Box::new(KeyedCounterStateUpdater::new())
         }
 
         (SummaryFamilyType::Sketch(kind, _), false)
@@ -1194,14 +1150,8 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             })
         }
 
-        // Other unsupported families retain the legacy warning fallback.
         (other_family, keyed) => {
-            tracing::warn!(
-                "SummaryFamilyType {:?} (keyed={}) has no accumulator_factory mapping, defaulting to Sum",
-                other_family,
-                keyed
-            );
-            Box::new(SumAccumulatorUpdater::new())
+            panic!("unsupported isolated kernel fixture {other_family:?}, keyed={keyed}")
         }
     }
 }
@@ -1278,7 +1228,7 @@ mod tests {
     #[test]
     fn hll_and_univmon_raw_updates_share_value_identity() {
         for family in [AggregationType::HLL, AggregationType::UnivMon] {
-            let config = AggregationConfig::new(
+            let config = PrecomputeMaterialization::new(
                 family,
                 String::new(),
                 Default::default(),
@@ -1295,7 +1245,7 @@ mod tests {
                 None,
                 None,
             );
-            let mut updater = create_accumulator_updater(&config);
+            let mut updater = create_fixture_accumulator(&config);
             for value in [0.0, -0.0, 2.0, 2.0, f64::NAN] {
                 updater.update_single(value, 1000);
             }
@@ -1431,7 +1381,7 @@ mod tests {
         use std::collections::HashMap;
 
         let make_config = |agg_type: AggregationType, sub_type: &str| {
-            AggregationConfig::new(
+            PrecomputeMaterialization::new(
                 agg_type,
                 sub_type.to_string(),
                 HashMap::new(),
@@ -1470,18 +1420,15 @@ mod tests {
             AggregationType::MultipleSubpopulation,
             "Sum"
         )));
-        assert!(config_is_keyed(&make_config(
-            AggregationType::MultipleSum,
-            ""
-        )));
-        assert!(config_is_keyed(&make_config(
-            AggregationType::MultipleIncrease,
-            ""
-        )));
-        assert!(config_is_keyed(&make_config(
-            AggregationType::MultipleMax,
-            ""
-        )));
+        let mut keyed = make_config(AggregationType::Sum, "");
+        keyed.aggregated_labels = asap_types::KeyByLabelNames::new(vec!["host".into()]);
+        assert!(config_is_keyed(&keyed));
+        let mut keyed = make_config(AggregationType::Increase, "");
+        keyed.aggregated_labels = asap_types::KeyByLabelNames::new(vec!["host".into()]);
+        assert!(config_is_keyed(&keyed));
+        let mut keyed = make_config(AggregationType::Max, "");
+        keyed.aggregated_labels = asap_types::KeyByLabelNames::new(vec!["host".into()]);
+        assert!(config_is_keyed(&keyed));
         assert!(config_is_keyed(&make_config(
             AggregationType::CountMinSketch,
             ""
@@ -1504,12 +1451,12 @@ mod tests {
         for (agg_type, sub_type) in &[
             (AggregationType::SingleSubpopulation, "Sum"),
             (AggregationType::MultipleSubpopulation, "Sum"),
-            (AggregationType::MultipleSum, ""),
+            (AggregationType::Sum, ""),
             (AggregationType::DatasketchesKLL, ""),
             (AggregationType::CountMinSketch, ""),
         ] {
             let config = make_config(*agg_type, sub_type);
-            let updater = create_accumulator_updater(&config);
+            let updater = create_fixture_accumulator(&config);
             assert_eq!(
                 config_is_keyed(&config),
                 updater.is_keyed(),
@@ -1525,7 +1472,7 @@ mod tests {
         use std::collections::HashMap;
         let mut params = HashMap::new();
         params.insert("K".to_string(), serde_json::Value::from(50_u64));
-        let config = AggregationConfig::new(
+        let config = PrecomputeMaterialization::new(
             AggregationType::SingleSubpopulation,
             "DatasketchesKLL".to_string(),
             params,
@@ -1542,7 +1489,7 @@ mod tests {
             None,
             None,
         );
-        let updater = create_accumulator_updater(&config);
+        let updater = create_fixture_accumulator(&config);
         let acc = updater.snapshot_accumulator();
         let kll = acc
             .as_any()
@@ -1562,7 +1509,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("d".to_string(), serde_json::Value::from(7_u64));
         params.insert("w".to_string(), serde_json::Value::from(2048_u64));
-        let config = AggregationConfig::new(
+        let config = PrecomputeMaterialization::new(
             AggregationType::CountMinSketch,
             String::new(),
             params,
@@ -1582,7 +1529,7 @@ mod tests {
         assert_eq!(super::cms_params(&config), (7, 2048));
 
         // Empty params — defaults `(4, 1000)`.
-        let empty_config = AggregationConfig::new(
+        let empty_config = PrecomputeMaterialization::new(
             AggregationType::CountMinSketch,
             String::new(),
             HashMap::new(),
@@ -1608,7 +1555,10 @@ mod tests {
 
     /// Build a `*WithHeap` config keyed by group-by label `host`, with the
     /// given `weight_mode` param (None → default = value-weighted).
-    fn topk_config(agg_type: AggregationType, weight_mode: Option<&str>) -> AggregationConfig {
+    fn topk_config(
+        agg_type: AggregationType,
+        weight_mode: Option<&str>,
+    ) -> PrecomputeMaterialization {
         use std::collections::HashMap;
         let mut params = HashMap::new();
         // Small, deterministic geometry; heap big enough to hold all hosts.
@@ -1618,7 +1568,7 @@ mod tests {
         if let Some(m) = weight_mode {
             params.insert("weight_mode".to_string(), serde_json::Value::from(m));
         }
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             agg_type,
             String::new(),
             params,
@@ -1706,7 +1656,7 @@ mod tests {
     fn value_weighted_topk_ranks_hosts_by_sum_of_value() {
         // DEFAULT mode (no weight_mode param) must be value-weighted.
         let config = topk_config(AggregationType::CountMinSketchWithHeap, None);
-        let mut updater = create_accumulator_updater(&config);
+        let mut updater = create_fixture_accumulator(&config);
         assert!(updater.is_keyed());
 
         feed_stream(&mut *updater);
@@ -1732,14 +1682,24 @@ mod tests {
 
     #[test]
     fn counter_delta_scale_preserves_sub_unit_membership_weights() {
-        let mut config = topk_config(
-            AggregationType::CountMinSketchWithHeap,
-            Some("counter_delta"),
-        );
-        config
-            .parameters
-            .insert("weight_scale".into(), serde_json::json!(1_000_000));
-        let mut updater = create_accumulator_updater(&config);
+        use planner_types::post_asap::{
+            EntityIdentity, NonNegativeWeightProof, SummaryInputExpr, SummaryUpdate, WeightDomain,
+        };
+        let config = topk_config(AggregationType::CountMinSketchWithHeap, None);
+        let family = config.accumulator_spec().unwrap().family;
+        let input = SummaryUpdate {
+            item: Some(SummaryInputExpr::Column(
+                planner_types::pre_asap::ColumnRef::Named("host".into()),
+            )),
+            weight: SummaryInputExpr::ResetAwareCounterDelta {
+                value: planner_types::pre_asap::ColumnRef::SampleValue,
+                series: EntityIdentity::PromqlLabelSet { excluding: vec![] },
+            },
+            weight_domain: WeightDomain::NonNegative {
+                proof: NonNegativeWeightProof::ResetAwareCounterDerivative,
+            },
+        };
+        let mut updater = create_planner_accumulator(&family, &input, &Default::default()).unwrap();
         updater.update_keyed(&host_key("payment"), 0.004, 1_000);
         updater.update_keyed(&host_key("order"), 0.002, 1_000);
         let ranked = ranked_topk(&*updater.take_accumulator());
@@ -1751,7 +1711,7 @@ mod tests {
     fn count_weighted_topk_still_ranks_by_occurrence_frequency() {
         // Opt-in frequency-top-k: weight_mode=count must rank by event count.
         let config = topk_config(AggregationType::CountMinSketchWithHeap, Some("count"));
-        let mut updater = create_accumulator_updater(&config);
+        let mut updater = create_fixture_accumulator(&config);
         feed_stream(&mut *updater);
         let acc = updater.take_accumulator();
 
@@ -1771,7 +1731,7 @@ mod tests {
         // (real median-of-signed-rows math) — same value-weighted default
         // as the CMS-family heap path, but no longer conflated with it.
         let config = topk_config(AggregationType::CountSketchWithHeap, None);
-        let mut updater = create_accumulator_updater(&config);
+        let mut updater = create_fixture_accumulator(&config);
         feed_stream(&mut *updater);
         let acc = updater.take_accumulator();
         assert_eq!(acc.type_name(), "CountSketchWithHeapAccumulator");
@@ -1804,6 +1764,281 @@ mod tests {
                 )),
                 TopkWeight::Count,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod planner_family_regression {
+    use super::*;
+    use asap_types::{enums::WindowKind, KeyByLabelNames};
+
+    // Every installed exact producer must retain its family in runtime state.
+    #[test]
+    fn exact_state_identity_survives_factory_and_reset() {
+        for kind in [
+            AggregationType::Sum,
+            AggregationType::Count,
+            AggregationType::Rate,
+            AggregationType::Increase,
+            AggregationType::Min,
+            AggregationType::Max,
+        ] {
+            let config = PrecomputeMaterialization::new(
+                kind,
+                String::new(),
+                Default::default(),
+                KeyByLabelNames::empty(),
+                KeyByLabelNames::empty(),
+                KeyByLabelNames::empty(),
+                String::new(),
+                60,
+                60,
+                WindowKind::Tumbling,
+                String::new(),
+                "metric".into(),
+                None,
+                None,
+                None,
+            );
+            let mut updater = create_planner_accumulator(
+                &config.accumulator_spec().unwrap().family,
+                &planner_types::post_asap::SummaryUpdate::column(
+                    planner_types::pre_asap::ColumnRef::SampleValue,
+                ),
+                &Default::default(),
+            )
+            .unwrap();
+            updater.update_single(4.0, 1000);
+            updater.update_single(7.0, 2000);
+            assert_eq!(updater.take_accumulator().get_accumulator_type(), kind);
+            assert_eq!(updater.snapshot_accumulator().get_accumulator_type(), kind);
+        }
+    }
+}
+
+/// Construct the kernel declared by a Planner SummaryAgg. No backend config
+/// tags participate in this dispatch and unsupported payloads are errors.
+pub fn create_planner_accumulator(
+    family: &SummaryFamilyType,
+    input: &planner_types::post_asap::SummaryUpdate,
+    grouping: &planner_types::post_asap::GroupingStrategy,
+) -> Result<Box<dyn AccumulatorUpdater>, String> {
+    use planner_types::post_asap::GroupingStrategy;
+    if grouping != &GroupingStrategy::PerSubpopulationInstance {
+        return Err("shared summary grouping requires a supported Planner Hydra kernel".into());
+    }
+    if matches!(family, SummaryFamilyType::ExactAggregate(..)) {
+        return Ok(Box::new(PlannerExactUpdater {
+            acc: super::operators::exact_accumulator::ExactAccumulator::new(
+                family.clone(),
+                input.item.is_some(),
+            )?,
+        }));
+    }
+    let SummaryFamilyType::Sketch(kind, family_grouping) = family else {
+        return Err(format!("unsupported Planner summary family {family:?}"));
+    };
+    if family_grouping != grouping {
+        return Err("Planner family and operator grouping disagree".into());
+    }
+    // Heap counters use fixed-point storage for fractional counter deltas.
+    // This encodes the selected update; it does not choose another family.
+    let weight_scale = if matches!(
+        input.weight,
+        planner_types::post_asap::SummaryInputExpr::ResetAwareCounterDelta { .. }
+    ) {
+        1_000_000.0
+    } else {
+        1.0
+    };
+    let updater: Box<dyn AccumulatorUpdater> = match (kind.algorithm(), kind.params()) {
+        (SketchAlgorithm::Kll, SketchParams::Kll { k }) => Box::new(KllAccumulatorUpdater::new(
+            u16::try_from(*k).map_err(|_| "KLL k exceeds runtime bound")?,
+        )),
+        (SketchAlgorithm::DDSketch, SketchParams::DDSketch { alpha }) => {
+            Box::new(DDSketchAccumulatorUpdater::new(*alpha))
+        }
+        (SketchAlgorithm::Cms, params @ SketchParams::Cms { .. }) => {
+            let (r, c) = cms_dims(params);
+            Box::new(CmsAccumulatorUpdater::new(r, c))
+        }
+        (SketchAlgorithm::CountSketch, params @ SketchParams::CountSketch { .. }) => {
+            let (r, c) = cms_dims(params);
+            Box::new(CountSketchAccumulatorUpdater::new(r, c))
+        }
+        (SketchAlgorithm::CmsWithHeap, params @ SketchParams::CmsWithHeap { .. }) => {
+            let (r, c, h) = cms_heap_dims(params);
+            Box::new(CmsHeapAccumulatorUpdater::with_weight_scale(
+                r,
+                c,
+                h,
+                TopkWeight::Value,
+                weight_scale,
+            ))
+        }
+        (
+            SketchAlgorithm::CountSketchWithHeap,
+            params @ SketchParams::CountSketchWithHeap { .. },
+        ) => {
+            let (r, c, h) = cms_heap_dims(params);
+            Box::new(CountSketchWithHeapAccumulatorUpdater::with_weight_scale(
+                r,
+                c,
+                h,
+                TopkWeight::Value,
+                weight_scale,
+            ))
+        }
+        (SketchAlgorithm::Hll, SketchParams::Hll { precision }) => Box::new(HllUpdater {
+            acc: HllSketchAccumulator::new(
+                asap_sketchlib::HllVariant::Regular,
+                u32::from(*precision),
+            ),
+        }),
+        (
+            SketchAlgorithm::UnivMon,
+            SketchParams::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            },
+        ) => Box::new(UnivMonUpdater {
+            acc: UnivMonAccumulator::new(
+                *heap_size as usize,
+                *sketch_rows as usize,
+                *sketch_cols as usize,
+                *layers as usize,
+            )
+            .map_err(|e| e.to_string())?,
+        }),
+        _ => {
+            return Err(format!(
+                "unsupported Planner algorithm/parameters: {kind:?}"
+            ))
+        }
+    };
+    if updater.is_keyed() != input.item.is_some()
+        && !asap_types::accumulator_spec::is_unit_sample_frequency(input)
+    {
+        return Err("Planner item expression does not match the selected kernel layout".into());
+    }
+    Ok(updater)
+}
+
+struct PlannerExactUpdater {
+    acc: super::operators::exact_accumulator::ExactAccumulator,
+}
+impl AccumulatorUpdater for PlannerExactUpdater {
+    fn update_single(&mut self, value: f64, timestamp: i64) {
+        self.acc.update(None, value, timestamp);
+    }
+    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, timestamp: i64) {
+        self.acc.update(Some(key), value, timestamp);
+    }
+    impl_clone_accumulator_methods!(acc);
+    fn reset(&mut self) {
+        self.acc = super::operators::exact_accumulator::ExactAccumulator::new(
+            self.acc.family().clone(),
+            self.acc.is_keyed(),
+        )
+        .expect("installed exact family");
+    }
+    fn is_keyed(&self) -> bool {
+        self.acc.is_keyed()
+    }
+    fn memory_usage_bytes(&self) -> usize {
+        self.acc.approx_memory_bytes()
+    }
+}
+
+#[cfg(test)]
+mod planner_parameter_regression {
+    use super::*;
+    use planner_types::post_asap::{SketchKind, SummaryInputExpr, SummaryUpdate};
+
+    // Planner width is the bucket count; depth is the independent hash-row count.
+    #[test]
+    fn planner_sketch_dimensions_are_not_transposed() {
+        for (algorithm, params) in [
+            (
+                SketchAlgorithm::Cms,
+                SketchParams::Cms {
+                    width: 128,
+                    depth: 3,
+                },
+            ),
+            (
+                SketchAlgorithm::CountSketch,
+                SketchParams::CountSketch {
+                    width: 128,
+                    depth: 3,
+                },
+            ),
+            (
+                SketchAlgorithm::CmsWithHeap,
+                SketchParams::CmsWithHeap {
+                    width: 128,
+                    depth: 3,
+                    heap_size: 8,
+                },
+            ),
+            (
+                SketchAlgorithm::CountSketchWithHeap,
+                SketchParams::CountSketchWithHeap {
+                    width: 128,
+                    depth: 3,
+                    heap_size: 8,
+                },
+            ),
+        ] {
+            let family = SummaryFamilyType::Sketch(
+                SketchKind::new(algorithm.clone(), params),
+                Default::default(),
+            );
+            let update = SummaryUpdate {
+                item: Some(SummaryInputExpr::Column(
+                    planner_types::pre_asap::ColumnRef::Named("host".into()),
+                )),
+                weight: SummaryInputExpr::Constant(1.0),
+                weight_domain: Default::default(),
+            };
+            let state = create_planner_accumulator(&family, &update, &Default::default())
+                .unwrap()
+                .snapshot_accumulator();
+            let dims = match algorithm {
+                SketchAlgorithm::Cms => {
+                    let s = state
+                        .as_any()
+                        .downcast_ref::<CountMinSketchAccumulator>()
+                        .unwrap();
+                    (s.inner.rows(), s.inner.cols())
+                }
+                SketchAlgorithm::CountSketch => {
+                    let s = state
+                        .as_any()
+                        .downcast_ref::<CountSketchAccumulator>()
+                        .unwrap();
+                    (s.inner.rows, s.inner.cols)
+                }
+                SketchAlgorithm::CmsWithHeap => {
+                    let s = state
+                        .as_any()
+                        .downcast_ref::<CountMinSketchWithHeapAccumulator>()
+                        .unwrap();
+                    (s.inner.rows(), s.inner.cols())
+                }
+                SketchAlgorithm::CountSketchWithHeap => {
+                    let s = state
+                        .as_any()
+                        .downcast_ref::<CountSketchWithHeapAccumulator>()
+                        .unwrap();
+                    (s.inner.rows(), s.inner.cols())
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(dims, (3, 128), "{algorithm:?}");
         }
     }
 }

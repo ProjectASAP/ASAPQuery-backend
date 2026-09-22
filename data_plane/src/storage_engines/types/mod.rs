@@ -25,7 +25,7 @@ pub use streaming_config::*;
 pub use traits::*;
 
 // Cross-module re-export of asap_types data types so callers can
-// write `crate::storage_engines::types::AggregationConfig` instead of
+// write `crate::storage_engines::types::PrecomputeMaterialization` instead of
 // reaching across crates.
 pub use asap_types::aggregation_config::*;
 
