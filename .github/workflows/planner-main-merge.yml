@@ -1,0 +1,42 @@
+name: Merge verified Planner update
+
+on:
+  workflow_run:
+    workflows: ['MVP CI']
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: planner-main-merge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # Never check out or execute PR content in this privileged workflow.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const run = context.payload.workflow_run;
+            const prs = await github.rest.pulls.list({owner, repo, state: 'open', base: 'main', head: `${owner}:automation/planner-main`});
+            if (prs.data.length !== 1) return;
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: prs.data[0].number});
+            if (pr.head.repo.full_name !== `${owner}/${repo}` || pr.head.sha !== run.head_sha || pr.draft) return;
+            const testedPr = run.pull_requests.find(p => p.number === pr.number);
+            if (!testedPr || testedPr.base.sha !== pr.base.sha) {
+              core.info('Main changed since this CI run; wait for the next updater refresh.');
+              return;
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {owner, repo, pull_number: pr.number});
+            if (!files.length || files.some(f => !['Cargo.toml', 'Cargo.lock'].includes(f.filename))) {
+              core.setFailed('Planner automation may only change Cargo.toml and Cargo.lock');
+              return;
+            }
+            // Required branch protection checks still apply; sha prevents merging a newer, untested head.
+            await github.rest.pulls.merge({owner, repo, pull_number: pr.number, sha: run.head_sha, merge_method: 'squash'});
