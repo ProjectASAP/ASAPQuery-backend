@@ -164,8 +164,8 @@ func TestIssue754DenseFixtureCadence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded.Timeseries) != 4 {
-		t.Fatalf("series = %d, want 4", len(decoded.Timeseries))
+	if len(decoded.Timeseries) != 8 {
+		t.Fatalf("series = %d, want 8", len(decoded.Timeseries))
 	}
 	for _, series := range decoded.Timeseries {
 		if len(series.Samples) != 1801 {
