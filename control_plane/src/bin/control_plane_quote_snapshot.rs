@@ -31,12 +31,18 @@ fn quote_snapshot(
             let plan = PhysicalPlanCompiler
                 .compile_promql(candidate.clone(), environment.clone())
                 .ok()?;
+            // This execution suite must exercise maintained candidates when legal.
+            let unit_cost = if plan.precompute_plan.materializations.is_empty() {
+                1e12
+            } else {
+                1.0
+            };
             let manifest = manifest(&plan, &candidate.queries).ok()?;
             Some(WorkloadQuote {
                 unit_costs: manifest
                     .components
                     .keys()
-                    .map(|key| (key.clone(), 1.0))
+                    .map(|key| (key.clone(), unit_cost))
                     .collect::<BTreeMap<_, _>>(),
                 manifest,
                 executable: true,
@@ -90,6 +96,16 @@ mod tests {
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(fixture).unwrap();
         snapshot.workload_cost_evidence = None;
         let quoted = quote_snapshot(snapshot).unwrap();
-        assert!(!quoted.workload_cost_evidence.unwrap().quotes.is_empty());
+        assert!(!quoted
+            .workload_cost_evidence
+            .as_ref()
+            .unwrap()
+            .quotes
+            .is_empty());
+        let plan = quoted.compile_promql().unwrap();
+        assert!(
+            !plan.precompute_plan.materializations.is_empty(),
+            "deterministic compliance quotes should select a maintained candidate"
+        );
     }
 }

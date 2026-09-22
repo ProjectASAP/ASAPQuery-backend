@@ -76,7 +76,8 @@ func run() error {
 		return err
 	}
 	log.Printf("wrote suite-derived planning snapshot template to %s", snapshotTemplatePath)
-	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory, PlanningSnapshot: snapshotPath, PlanningSnapshotTemplate: snapshotTemplatePath}
+	selectedPlanPath := filepath.Join(filepath.Dir(*reportPath), dataset.Name+"-"+suite.Name+"-selected-plan.json")
+	lifecycle := runner.ComposeLifecycle{Files: composeFiles, Project: *composeProject, LogsDirectory: *logsDirectory, PlanningSnapshot: snapshotPath, PlanningSnapshotTemplate: snapshotTemplatePath, SelectedPlan: selectedPlanPath}
 	if len(composeFiles) > 0 {
 		log.Printf("building and starting Compose services; the first run may take several minutes")
 	}
