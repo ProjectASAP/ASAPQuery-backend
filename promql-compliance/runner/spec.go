@@ -28,14 +28,26 @@ type Dataset struct {
 }
 
 type DatasetSeries struct {
-	Metric  string            `yaml:"metric"`
-	Labels  map[string]string `yaml:"labels"`
-	Samples []DatasetSample   `yaml:"samples"`
+	Metric           string            `yaml:"metric"`
+	Labels           map[string]string `yaml:"labels"`
+	Samples          []DatasetSample   `yaml:"samples"`
+	GeneratedSamples *GeneratedSamples `yaml:"generated_samples"`
 }
 
 type DatasetSample struct {
 	OffsetSeconds float64 `yaml:"offset_seconds"`
 	Value         float64 `yaml:"value"`
+}
+
+// GeneratedSamples keeps dense deterministic fixtures compact. Its value at
+// offset t is multiplier * (base + (t mod modulo)); all offsets are included.
+type GeneratedSamples struct {
+	StartOffsetSeconds float64 `yaml:"start_offset_seconds"`
+	EndOffsetSeconds   float64 `yaml:"end_offset_seconds"`
+	StepSeconds        float64 `yaml:"step_seconds"`
+	Multiplier         float64 `yaml:"multiplier"`
+	Base               float64 `yaml:"base"`
+	Modulo             float64 `yaml:"modulo"`
 }
 
 type QueryCase struct {
@@ -122,16 +134,24 @@ func LoadDataset(contents []byte) (Dataset, error) {
 	}
 	seen := make(map[string]struct{}, len(dataset.Series))
 	for index, series := range dataset.Series {
-		if series.Metric == "" || len(series.Samples) == 0 {
-			return Dataset{}, fmt.Errorf("series %d requires metric and samples", index)
+		if series.Metric == "" || (len(series.Samples) == 0 && series.GeneratedSamples == nil) {
+			return Dataset{}, fmt.Errorf("series %d requires metric and samples or generated_samples", index)
+		}
+		if len(series.Samples) > 0 && series.GeneratedSamples != nil {
+			return Dataset{}, fmt.Errorf("series %q cannot have samples and generated_samples", series.Metric)
 		}
 		key := series.Metric + "\x00" + canonicalLabels(series.Labels)
 		if _, duplicate := seen[key]; duplicate {
 			return Dataset{}, fmt.Errorf("dataset has duplicate series %q", series.Metric)
 		}
 		seen[key] = struct{}{}
+		if series.GeneratedSamples != nil {
+			if err := series.GeneratedSamples.validate(); err != nil {
+				return Dataset{}, fmt.Errorf("series %q generated_samples: %w", series.Metric, err)
+			}
+		}
 		var previous float64
-		for sampleIndex, sample := range series.Samples {
+		for sampleIndex, sample := range series.ExpandedSamples() {
 			if !finite(sample.OffsetSeconds) || !finite(sample.Value) {
 				return Dataset{}, fmt.Errorf("series %q sample %d is non-finite", series.Metric, sampleIndex)
 			}
@@ -142,6 +162,34 @@ func LoadDataset(contents []byte) (Dataset, error) {
 		}
 	}
 	return dataset, nil
+}
+
+func (s DatasetSeries) ExpandedSamples() []DatasetSample {
+	if s.GeneratedSamples == nil {
+		return s.Samples
+	}
+	g := s.GeneratedSamples
+	count := int(math.Round((g.EndOffsetSeconds-g.StartOffsetSeconds)/g.StepSeconds)) + 1
+	samples := make([]DatasetSample, 0, count)
+	for offset := g.StartOffsetSeconds; offset <= g.EndOffsetSeconds+g.StepSeconds/1e9; offset += g.StepSeconds {
+		samples = append(samples, DatasetSample{OffsetSeconds: offset, Value: g.Multiplier * (g.Base + math.Mod(offset, g.Modulo))})
+	}
+	return samples
+}
+
+func (g GeneratedSamples) validate() error {
+	for _, value := range []float64{g.StartOffsetSeconds, g.EndOffsetSeconds, g.StepSeconds, g.Multiplier, g.Base, g.Modulo} {
+		if !finite(value) {
+			return fmt.Errorf("values must be finite")
+		}
+	}
+	if g.EndOffsetSeconds < g.StartOffsetSeconds || g.StepSeconds <= 0 || g.Modulo <= 0 {
+		return fmt.Errorf("end must be at least start; step and modulo must be positive")
+	}
+	if math.Mod(g.EndOffsetSeconds-g.StartOffsetSeconds, g.StepSeconds) != 0 {
+		return fmt.Errorf("end must lie on the generated step grid")
+	}
+	return nil
 }
 
 func LoadSuiteFile(path string) (Suite, error) {

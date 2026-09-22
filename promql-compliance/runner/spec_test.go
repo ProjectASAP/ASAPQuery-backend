@@ -6,15 +6,52 @@ func TestCheckedInFixturesMeetStrictContracts(t *testing.T) {
 	for _, path := range []string{
 		"../datasets/single-rate.yaml", "../datasets/sparse-checkout.yaml",
 		"../datasets/aggregations.yaml", "../datasets/aggregations-dense-cadence.yaml",
+		"../datasets/issue-702-one-second.yaml",
 	} {
 		if _, err := LoadDatasetFile(path); err != nil {
 			t.Fatalf("LoadDatasetFile(%q): %v", path, err)
 		}
 	}
-	for _, path := range []string{"../suites/temporal.yaml", "../suites/aggregations.yaml"} {
+	for _, path := range []string{"../suites/temporal.yaml", "../suites/aggregations.yaml", "../suites/issue-702.yaml", "../suites/issue-702-one-second.yaml"} {
 		if _, err := LoadSuiteFile(path); err != nil {
 			t.Fatalf("LoadSuiteFile(%q): %v", path, err)
 		}
+	}
+}
+
+func TestEncodeRemoteWriteExpandsGeneratedSamples(t *testing.T) {
+	dataset, err := LoadDataset([]byte(`name: generated
+series:
+  - metric: data
+    labels: {host: a}
+    generated_samples:
+      start_offset_seconds: 1
+      end_offset_seconds: 3
+      step_seconds: 1
+      multiplier: 2
+      base: 1
+      modulo: 3
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := EncodeRemoteWrite(1_700_000_000_000, dataset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeRemoteWrite(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples := decoded.Timeseries[0].Samples
+	if got, want := len(samples), 3; got != want {
+		t.Fatalf("samples = %d, want %d", got, want)
+	}
+	if got, want := samples[0].Value, 4.0; got != want {
+		t.Fatalf("first value = %v, want %v", got, want)
+	}
+	if got, want := samples[2].Value, 2.0; got != want {
+		t.Fatalf("last value = %v, want %v", got, want)
 	}
 }
 

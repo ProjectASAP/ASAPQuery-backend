@@ -24,8 +24,9 @@ func EncodeRemoteWrite(baseTimeMs int64, dataset Dataset) ([]byte, error) {
 			labels = append(labels, prompb.Label{Name: name, Value: value})
 		}
 		sort.Slice(labels, func(left, right int) bool { return labels[left].Name < labels[right].Name })
-		samples := make([]prompb.Sample, 0, len(series.Samples))
-		for _, sample := range series.Samples {
+		expanded := series.ExpandedSamples()
+		samples := make([]prompb.Sample, 0, len(expanded))
+		for _, sample := range expanded {
 			samples = append(samples, prompb.Sample{Value: sample.Value, Timestamp: baseTimeMs + int64(sample.OffsetSeconds*1000)})
 		}
 		request.Timeseries = append(request.Timeseries, prompb.TimeSeries{Labels: labels, Samples: samples})

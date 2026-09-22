@@ -13,7 +13,8 @@ CASES := \
 	sparse-checkout-temporal:../datasets/sparse-checkout.yaml:../suites/temporal.yaml \
 	aggregations:../datasets/aggregations.yaml:../suites/aggregations.yaml \
 	aggregations-dense-cadence:../datasets/aggregations-dense-cadence.yaml:../suites/aggregations.yaml \
-	issue-702:../datasets/aggregations-dense-cadence.yaml:../suites/issue-702.yaml
+	issue-702:../datasets/aggregations-dense-cadence.yaml:../suites/issue-702.yaml \
+	issue-702-one-second:../datasets/issue-702-one-second.yaml:../suites/issue-702-one-second.yaml
 
 test:
 	go test ./...
