@@ -36,11 +36,14 @@ func (l *ComposeLifecycle) Start(ctx context.Context) error {
 	if err := l.runCompose(ctx, environment, "down", "--volumes", "--remove-orphans"); err != nil {
 		return fmt.Errorf("reset Compose services: %w", err)
 	}
-	if err := l.runCompose(ctx, environment, "up", "-d", "--build", "prometheus", "planner"); err != nil {
+	if err := l.runCompose(ctx, environment, "up", "-d", "--build", "prometheus"); err != nil {
 		return err
 	}
 	l.started = true
-	if err := l.runCompose(ctx, environment, "wait", "planner"); err != nil {
+	if err := l.runCompose(ctx, environment, "build", "planner"); err != nil {
+		return fmt.Errorf("build workload cost planner: %w", err)
+	}
+	if err := l.runCompose(ctx, environment, "run", "--rm", "--no-deps", "planner"); err != nil {
 		return fmt.Errorf("derive workload cost evidence: %w", err)
 	}
 	if l.SelectedPlan != "" {
