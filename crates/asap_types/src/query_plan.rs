@@ -655,6 +655,84 @@ impl QueryPlanNode {
         }
     }
 
+    /// Bounded, query-text-free operator arguments for execution logs.
+    /// The query ID links these details to the full installed plan when needed.
+    pub fn log_syntax(&self) -> String {
+        use residual::ResidualQueryOperator as R;
+        match self {
+            Self::RelationalJoin { join_kind, .. } => format!("join_kind={join_kind:?}"),
+            Self::Relational { .. } => String::new(),
+            Self::Logical { operator, .. } => match operator {
+                R::CurrentSeries { readout, .. } => format!("readout={readout:?}"),
+                R::ExactSubquery { .. } => String::new(),
+                R::CandidateExactSubquery { .. } => String::new(),
+                R::Scan {
+                    metric,
+                    matchers,
+                    range_ms,
+                    offset_ms,
+                } => format!(
+                    "metric={} matcher_count={} range_ms={range_ms:?} offset_ms={offset_ms}",
+                    metric
+                        .as_deref()
+                        .map(|name| name.chars().take(64).collect::<String>())
+                        .unwrap_or_default(),
+                    matchers.len(),
+                ),
+                R::UnaryNegate | R::VectorToScalar | R::HistogramQuantile => String::new(),
+                R::Aggregate {
+                    operation,
+                    grouping,
+                } => format!(
+                    "operation={operation:?} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
+                R::TopKSelection { k, grouping } => format!(
+                    "k={k} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
+                R::Binary {
+                    operation,
+                    return_bool,
+                } => format!("operation={operation:?} return_bool={return_bool}"),
+                R::Temporal { operation } => format!("operation={operation:?}"),
+                R::Sort { descending } => format!("descending={descending}"),
+                R::Subquery {
+                    range_ms,
+                    step_ms,
+                    offset_ms,
+                } => format!("range_ms={range_ms} step_ms={step_ms} offset_ms={offset_ms}"),
+            },
+            Self::Scalar { value } => format!("value={value}"),
+            Self::Binary { operator, .. } => format!("operation={operator:?}"),
+            Self::ReduceSum { grouping, .. } => match grouping {
+                PhysicalGrouping::PerEntity => "grouping=per_entity".into(),
+                PhysicalGrouping::Reduce(labels) => {
+                    format!("grouping=reduce({})", log_labels(labels))
+                }
+            },
+            Self::ReadMaterialization { binding } => format!(
+                "window_ms={} lookback_ms={:?}",
+                binding.window_ms, binding.readout_lookback_ms
+            ),
+            Self::SummaryEstimate { query, .. } => match query {
+                QueryReadout::FrequencyL2 => "readout=frequency_l2".into(),
+                QueryReadout::FrequencyEntropy => "readout=frequency_entropy".into(),
+                QueryReadout::Quantile { q } => format!("readout=quantile q={q}"),
+                QueryReadout::PointCount { .. } => "readout=point_count".into(),
+                QueryReadout::Cardinality => "readout=cardinality".into(),
+                QueryReadout::TopK { k } => format!("readout=top_k k={k}"),
+            },
+            Self::ExactReadout { readout, .. } => format!("readout={readout:?}"),
+            Self::SummaryMerge { .. } => String::new(),
+            Self::CandidateTopK { k, grouping, .. } => format!(
+                "k={k} grouping={}",
+                log_grouping(&grouping.labels, grouping.without)
+            ),
+            Self::ExternalExact { .. } | Self::ExactFallback { .. } => String::new(),
+        }
+    }
+
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
             Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
@@ -671,6 +749,26 @@ impl QueryPlanNode {
             Self::CandidateTopK { inputs, .. } => inputs,
         }
     }
+}
+
+fn log_labels(labels: &[String]) -> String {
+    let mut names = labels
+        .iter()
+        .take(8)
+        .map(|label| label.chars().take(64).collect::<String>())
+        .collect::<Vec<_>>();
+    if labels.len() > 8 {
+        names.push("...".into());
+    }
+    names.join(",")
+}
+
+fn log_grouping(labels: &[String], without: bool) -> String {
+    format!(
+        "{}({})",
+        if without { "without" } else { "by" },
+        log_labels(labels)
+    )
 }
 
 pub use planner_types::post_asap::CandidateCompleteness;
@@ -778,6 +876,7 @@ mod contract_tests {
                 inputs: vec![],
             };
             assert_eq!(node.op_label(), expected);
+            assert!(node.log_syntax().contains("grouping=by(service)"));
         }
         for (readout, expected) in [
             (super::ExactReadout::Sum, "exact_readout/sum"),
@@ -792,5 +891,30 @@ mod contract_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn execution_log_syntax_identifies_operator_without_query_text() {
+        let binary = QueryPlanNode::Logical {
+            operator: residual::ResidualQueryOperator::Binary {
+                operation: residual::BinaryOperation::CheckedDiv,
+                return_bool: false,
+            },
+            inputs: vec![super::QueryNodeId(1), super::QueryNodeId(2)],
+        };
+        assert_eq!(binary.op_label(), "logical/binary");
+        assert_eq!(
+            binary.log_syntax(),
+            "operation=CheckedDiv return_bool=false"
+        );
+
+        let exact = QueryPlanNode::Logical {
+            operator: residual::ResidualQueryOperator::ExactSubquery {
+                query: "secret_metric{credential=\"secret\"}".into(),
+            },
+            inputs: vec![],
+        };
+        assert_eq!(exact.op_label(), "logical/exact_subquery");
+        assert!(exact.log_syntax().is_empty());
     }
 }

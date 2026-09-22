@@ -156,7 +156,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
     fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
         if let Some(value) = self.memo.get(&(id, at)) {
             self.stats.memo_hits += 1;
+            let node = self.entry.nodes.get(&id);
             tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id,
+                op = node.map(QueryPlanNode::op_label).unwrap_or("unknown"),
                 evaluation_ms = at, "installed query node memo hit");
             return Ok(value.clone());
         }
@@ -169,7 +171,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 self.stats.summary_readout_evaluations += 1;
             }
             let value = leaf.value.clone();
+            let node = self.entry.nodes.get(&id);
             tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id,
+                op = node.map(QueryPlanNode::op_label).unwrap_or("unknown"),
                 evaluation_ms = at, remote = leaf.remote,
                 remote_evaluations = leaf.remote_evaluations, remote_rpcs = leaf.remote_rpcs,
                 "installed query prepared leaf used");
@@ -190,7 +194,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .clone();
         let op = node.op_label();
         let started = std::time::Instant::now();
-        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, op, evaluation_ms = at,
+        tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, op,
+            syntax = %node.log_syntax(), inputs = ?node.inputs(), evaluation_ms = at,
             "installed query node started");
         let value = (|| -> Result<Value, EngineError> {
             Ok(match node {
@@ -251,12 +256,14 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         EngineError::CapabilityMiss { .. } => {
                             tracing::debug!(target: "asap_runtime_debug",
                                 query_id = %self.entry.query_id, node_id = ?id, op,
+                                syntax = %self.entry.nodes[&id].log_syntax(),
                                 elapsed_us = started.elapsed().as_micros() as u64, %error,
                                 "installed query node could not be served"
                             )
                         }
                         _ => tracing::warn!(
                             query_id = %self.entry.query_id, node_id = ?id, op,
+                            syntax = %self.entry.nodes[&id].log_syntax(),
                             elapsed_us = started.elapsed().as_micros() as u64, %error,
                             "installed query node failed"
                         ),
@@ -266,6 +273,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             }
         };
         tracing::debug!(target: "asap_runtime_debug", query_id = %self.entry.query_id, node_id = ?id, op,
+            syntax = %self.entry.nodes[&id].log_syntax(),
             elapsed_us = started.elapsed().as_micros() as u64,
             "installed query node completed");
         self.active.remove(&(id, at));
