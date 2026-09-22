@@ -1719,7 +1719,7 @@ impl PhysicalPlanCompiler {
                             .then_some(materialization.slide_interval.saturating_mul(1_000)),
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
-                        state_reference: asap_types::sds::StateReference::for_definition(fingerprint.into()),
+                        stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(fingerprint.into()),
                         output_grouping: PhysicalGrouping::Reduce(
                             materialization.grouping_labels.names(),
                         ),
@@ -7057,34 +7057,32 @@ pub(crate) mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(bindings.len(), 1);
         query_plan.validate(&bindings).unwrap();
-        let state_slots = query_plan
+        let stored_outputs = query_plan
             .entries
             .values()
             .flat_map(|entry| entry.materialization_bindings())
-            .map(|binding| binding.state_reference)
+            .map(|binding| binding.stored_output_reference)
             .collect::<Vec<_>>();
-        assert_eq!(state_slots.len(), 2);
-        assert_eq!(state_slots[0], state_slots[1]);
+        assert_eq!(stored_outputs.len(), 2);
+        assert_eq!(stored_outputs[0], stored_outputs[1]);
         assert_eq!(
-            state_slots[0],
-            bundle.precompute_plan.schemas[0].state_reference
+            stored_outputs[0],
+            bundle.precompute_plan.schemas[0].stored_output_reference
         );
-        asap_types::plan_publication::validate_state_references(
+        asap_types::plan_publication::validate_stored_output_references(
             &bundle.precompute_plan,
             &query_plan,
         )
         .unwrap();
-        // A valid plan-local slot cannot be read until its query binding agrees.
+        // V1 has one stored output per definition; arbitrary output IDs are
+        // rejected before writer/reader agreement is considered.
         let mut rebound_writer = bundle.precompute_plan.clone();
-        rebound_writer.schemas[0].state_reference.state_slot_id = asap_types::sds::StateSlotId(123);
-        rebound_writer
+        rebound_writer.schemas[0]
+            .stored_output_reference
+            .stored_output_id = asap_types::sds::StoredOutputId(123);
+        assert!(rebound_writer
             .validate_against_catalog(&bundle.summary_catalog)
-            .unwrap();
-        assert!(asap_types::plan_publication::validate_state_references(
-            &rebound_writer,
-            &query_plan,
-        )
-        .is_err());
+            .is_err());
     }
 
     #[test]

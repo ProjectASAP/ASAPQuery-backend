@@ -1628,7 +1628,7 @@ mod tests {
         let binding = asap_types::query_plan::MaterializationBinding {
             full_window_slide_ms: None,
             materialization: asap_types::PolicyFingerprint(policy).into(),
-            state_reference: asap_types::sds::StateReference::for_definition(
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
                 asap_types::PolicyFingerprint(policy).into(),
             ),
             output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),

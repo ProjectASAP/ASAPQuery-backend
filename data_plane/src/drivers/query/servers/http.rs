@@ -5736,7 +5736,7 @@ pub fn validate_and_build_runtime_plan(
             .validate_against_catalog(&request.summary_catalog)
             .map_err(|error| format!("CollectorPlan catalog validation error: {error}"))?;
     }
-    asap_types::plan_publication::validate_state_references(
+    asap_types::plan_publication::validate_stored_output_references(
         &request.precompute_plan,
         &request.query_plan,
     )?;
@@ -6028,7 +6028,7 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
                     (
                         definition,
                         (
-                            schema.state_reference.state_slot_id,
+                            schema.stored_output_reference.stored_output_id,
                             producer.producer_id.clone(),
                         ),
                     )
@@ -6038,7 +6038,7 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
     let Some(producers) = producers else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({"status":"error","error":"precompute producer has no state-slot binding"})),
+            axum::Json(serde_json::json!({"status":"error","error":"precompute producer has no stored-output binding"})),
         )
             .into_response();
     };

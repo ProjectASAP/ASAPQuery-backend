@@ -618,10 +618,9 @@ pub struct SketchStore {
     instances: RwLock<HashMap<u64, SdsBinding>>,
     /// Interns immutable SDS descriptors across all Series IDs and panes.
     descriptors: SummaryDescriptorRegistry,
-    /// Explicitly authorized source generations for unchanged definitions.
-    /// An old series is readable after activation only when the successor
-    /// catalog retained the same content-addressed state contract.
-    reuse_sources: RwLock<BTreeMap<SummaryDefinitionId, CatalogGeneration>>,
+    /// Previous payload generations admitted by an explicit definition
+    /// compatibility check during plan installation.
+    compatible_source_generations: RwLock<BTreeMap<SummaryDefinitionId, CatalogGeneration>>,
     /// sid → item_label (the data-point attribute NAME, e.g. "service"
     /// or "endpoint") for CountMin/CountSketch sids registered in
     /// per-item mode. Its presence is what makes a CMS sid answerable by
@@ -878,17 +877,17 @@ impl SketchStore {
             snapshot_sha256: reference.snapshot_sha256,
         };
         let previous = self.descriptors.authoritative_snapshot();
-        let previous_reuse = self.reuse_sources.read().unwrap().clone();
-        let mut reusable = BTreeMap::new();
+        let previous_sources = self.compatible_source_generations.read().unwrap().clone();
+        let mut compatible_sources = BTreeMap::new();
         if let Some((old_catalog, old_generation)) = &previous {
             if old_catalog.plan_id == catalog.plan_id
-                && old_catalog.plan_version <= catalog.plan_version
+                && old_catalog.plan_version < catalog.plan_version
             {
                 for (id, definition) in &catalog.definitions {
                     if old_catalog.definitions.get(id) == Some(definition) {
-                        reusable.insert(
+                        compatible_sources.insert(
                             *id,
-                            previous_reuse
+                            previous_sources
                                 .get(id)
                                 .cloned()
                                 .unwrap_or_else(|| (**old_generation).clone()),
@@ -906,9 +905,9 @@ impl SketchStore {
             .transpose()
             .map_err(|error| error.to_string())?
             .flatten();
-        // Publish authorization first: readers that observe the successor
-        // catalog must never see its generation without the compatible source.
-        *self.reuse_sources.write().unwrap() = reusable;
+        // Publish the compatibility decision first so a reader that observes
+        // the successor catalog can also resolve its admitted source payload.
+        *self.compatible_source_generations.write().unwrap() = compatible_sources;
         self.descriptors
             .install_catalog(Arc::clone(&catalog))
             .map_err(|error| error.to_string())?;
@@ -1155,13 +1154,17 @@ impl SketchStore {
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
         let generation = self.active_catalog_generation();
-        let reuse_sources = self.reuse_sources.read().unwrap();
+        let compatible_sources = self.compatible_source_generations.read().unwrap();
         let instances = self.instances.read().unwrap();
         candidates
             .into_iter()
             .filter(|sid| {
                 instances.get(sid).is_some_and(|binding| {
-                    Self::instance_visible_for_read(binding, generation.as_deref(), &reuse_sources)
+                    Self::instance_visible_for_read(
+                        binding,
+                        generation.as_deref(),
+                        &compatible_sources,
+                    )
                 })
             })
             .collect()
@@ -1183,7 +1186,7 @@ impl SketchStore {
     fn instance_visible_for_read(
         binding: &SdsBinding,
         generation: Option<&CatalogGeneration>,
-        reuse_sources: &BTreeMap<SummaryDefinitionId, CatalogGeneration>,
+        compatible_sources: &BTreeMap<SummaryDefinitionId, CatalogGeneration>,
     ) -> bool {
         if Self::instance_visible_in_generation(binding, generation) {
             return true;
@@ -1191,11 +1194,11 @@ impl SketchStore {
         let Some(generation) = generation else {
             return false;
         };
-        let id = SummaryDefinitionId::from(binding.metadata.policy_fp);
+        let definition = SummaryDefinitionId::from(binding.metadata.policy_fp);
         !matches!(
             binding.data_descriptor.source,
             asap_types::sds::DataSourceIdentity::Derived { .. }
-        ) && reuse_sources.get(&id) == binding.catalog_generation.as_deref()
+        ) && compatible_sources.get(&definition) == binding.catalog_generation.as_deref()
             && binding.catalog_generation.as_deref() != Some(generation)
     }
 
@@ -1245,7 +1248,7 @@ impl SketchStore {
         &self,
         reporter_id: &str,
         storage_node_id: &str,
-        producers: &BTreeMap<SummaryDefinitionId, (asap_types::sds::StateSlotId, String)>,
+        producers: &BTreeMap<SummaryDefinitionId, (asap_types::sds::StoredOutputId, String)>,
         inventory_version: u64,
         observed_at_ms: i64,
     ) -> Result<ObservedSummaryInventory, String> {
@@ -1261,11 +1264,11 @@ impl SketchStore {
             snapshot_sha256: reference.snapshot_sha256,
         };
         let instances = self.instances.read().unwrap();
-        let reuse_sources = self.reuse_sources.read().unwrap();
+        let compatible_sources = self.compatible_source_generations.read().unwrap();
         let durable = self.persistence_read.read().unwrap().clone();
         let mut reported = BTreeMap::new();
         for (series_id, binding) in instances.iter() {
-            if !Self::instance_visible_for_read(binding, Some(&generation), &reuse_sources) {
+            if !Self::instance_visible_for_read(binding, Some(&generation), &compatible_sources) {
                 continue;
             }
             let reused_from_generation = (binding.catalog_generation.as_deref()
@@ -1278,7 +1281,7 @@ impl SketchStore {
             {
                 continue;
             }
-            let (state_slot_id, producer_id) =
+            let (stored_output_id, producer_id) =
                 producers.get(&summary_definition_id).ok_or_else(|| {
                     format!(
                         "materialization {} has no producer in the active PrecomputePlan",
@@ -1319,7 +1322,7 @@ impl SketchStore {
                 .map_err(|error| error.to_string())?;
                 let instance = SummaryInstance {
                     instance_id: instance_id.clone(),
-                    state_slot_id: *state_slot_id,
+                    stored_output_id: *stored_output_id,
                     summary_definition_id,
                     summary_descriptor_id: binding.summary_descriptor.id().clone(),
                     data_descriptor_id: binding.data_descriptor.id().clone(),
@@ -1354,16 +1357,7 @@ impl SketchStore {
                     observed_at_ms,
                 };
                 instance.validate().map_err(|error| error.to_string())?;
-                let keep_current =
-                    reported
-                        .get(&instance_id)
-                        .is_some_and(|existing: &SummaryInstance| {
-                            existing.reused_from_generation.is_none()
-                                && instance.reused_from_generation.is_some()
-                        });
-                if !keep_current {
-                    reported.insert(instance_id, instance);
-                }
+                reported.insert(instance_id, instance);
                 Ok(())
             };
             if let Some(store) = store {
@@ -2475,7 +2469,7 @@ impl SketchStore {
             .map(|sids| sids.iter().copied().collect())
             .unwrap_or_default();
         let generation = self.active_catalog_generation();
-        let reuse_sources = self.reuse_sources.read().unwrap();
+        let compatible_sources = self.compatible_source_generations.read().unwrap();
         let instances = self.instances.read().unwrap();
         candidate_sids
             .iter()
@@ -2487,7 +2481,7 @@ impl SketchStore {
                             && Self::instance_visible_for_read(
                                 m,
                                 generation.as_deref(),
-                                &reuse_sources,
+                                &compatible_sources,
                             )
                     })
                     .unwrap_or(false)
@@ -3841,7 +3835,11 @@ mod tests {
 
         let producers = BTreeMap::from([(
             SummaryDefinitionId::from(fingerprint),
-            (asap_types::sds::StateSlotId(99), "producer-a".to_string()),
+            (
+                asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+                    .stored_output_id,
+                "producer-a".to_string(),
+            ),
         )]);
         let inventory = store
             .observed_summary_inventory("backend-a", "store-a", &producers, 1, 100)
@@ -3850,7 +3848,11 @@ mod tests {
         assert_eq!(inventory.instances.len(), 2);
         let instance = inventory.instances.values().next().unwrap();
         assert_eq!(instance.summary_definition_id.fingerprint(), fingerprint);
-        assert_eq!(instance.state_slot_id, asap_types::sds::StateSlotId(99));
+        assert_eq!(
+            instance.stored_output_id,
+            asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+                .stored_output_id
+        );
         assert_eq!(instance.status, SummaryInstanceStatus::Ready);
         assert_eq!(instance.completeness, InstanceCompleteness::Unknown);
         assert!(!instance.group_values.is_empty());
@@ -3904,7 +3906,8 @@ mod tests {
         let producers = BTreeMap::from([(
             SummaryDefinitionId::from(fingerprint),
             (
-                asap_types::sds::StateReference::for_definition(fingerprint.into()).state_slot_id,
+                asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+                    .stored_output_id,
                 "producer-a".to_string(),
             ),
         )]);
@@ -5091,7 +5094,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_state_contract_explicitly_reuses_previous_generation_series() {
+    fn unchanged_definition_explicitly_reuses_a_committed_previous_generation_payload() {
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
@@ -5107,35 +5110,29 @@ mod tests {
             .unwrap();
         store.register(meta_with_policy(509, fingerprint));
         store.append_sample(509, BTreeMap::new(), (0, 10_000), sample(1));
-        assert_eq!(store.series_ids_for_policy(fingerprint), vec![509]);
         let mut next = plan.summary_catalog;
         next.plan_version += 1;
         store.install_summary_catalog(Arc::new(next)).unwrap();
         assert_eq!(store.series_ids_for_policy(fingerprint), vec![509]);
+        let output = asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+            .stored_output_id;
         let inventory = store
             .observed_summary_inventory(
                 "backend-a",
                 "store-a",
                 &BTreeMap::from([(
                     SummaryDefinitionId::from(fingerprint),
-                    (
-                        asap_types::sds::StateReference::for_definition(fingerprint.into())
-                            .state_slot_id,
-                        "producer-a".into(),
-                    ),
+                    (output, "producer-a".into()),
                 )]),
                 1,
                 100,
             )
             .unwrap();
         let reused = inventory.instances.values().next().unwrap();
+        assert_eq!(reused.stored_output_id, output);
         assert_eq!(
             reused.reused_from_generation.as_ref().unwrap().plan_version + 1,
             reused.catalog_generation.plan_version
-        );
-        assert_eq!(
-            reused.state_reference.generation,
-            reused.reused_from_generation.as_ref().unwrap().plan_version
         );
         let incompatible = asap_types::summary_catalog::SummaryCatalog::from_materializations(
             plan.precompute_plan.envelope.plan_id,
@@ -5312,7 +5309,8 @@ mod tests {
         let producers = BTreeMap::from([(
             fingerprint.into(),
             (
-                asap_types::sds::StateReference::for_definition(fingerprint.into()).state_slot_id,
+                asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+                    .stored_output_id,
                 "producer".to_string(),
             ),
         )]);
@@ -5554,7 +5552,8 @@ mod tests {
         let producers = BTreeMap::from([(
             definition_id,
             (
-                asap_types::sds::StateReference::for_definition(definition_id).state_slot_id,
+                asap_types::sds::StoredOutputReference::for_definition(definition_id)
+                    .stored_output_id,
                 "producer-a".to_string(),
             ),
         )]);

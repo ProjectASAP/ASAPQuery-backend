@@ -960,9 +960,10 @@ mod tests {
                         full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: MATERIALIZATION.into(),
-                        state_reference: asap_types::sds::StateReference::for_definition(
-                            MATERIALIZATION.into(),
-                        ),
+                        stored_output_reference:
+                            asap_types::sds::StoredOutputReference::for_definition(
+                                MATERIALIZATION.into(),
+                            ),
                         output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
                         window_ms: AT,
                         pane_origin_ms: Some(0),

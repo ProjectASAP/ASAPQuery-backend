@@ -130,8 +130,8 @@ pub fn artifact_from_materializations(
                                 binding: MaterializationBinding {
                                     full_window_slide_ms: None,
                                     materialization: config.policy_fingerprint().into(),
-                                    state_reference:
-                                        asap_types::sds::StateReference::for_definition(
+                                    stored_output_reference:
+                                        asap_types::sds::StoredOutputReference::for_definition(
                                             config.policy_fingerprint().into(),
                                         ),
                                     output_grouping,

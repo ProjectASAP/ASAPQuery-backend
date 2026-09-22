@@ -268,7 +268,7 @@ pub async fn compile_automatic_clickhouse_workload(
                 )
                 .then_some(config.slide_interval.saturating_mul(1_000)),
                 materialization: config.policy_fingerprint().into(),
-                state_reference: asap_types::sds::StateReference::for_definition(
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
                     config.policy_fingerprint().into(),
                 ),
                 output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
@@ -631,7 +631,7 @@ fn bind_selected_node(
         )
         .then_some(selected.slide_interval.saturating_mul(1_000)),
         materialization: selected.policy_fingerprint().into(),
-        state_reference: asap_types::sds::StateReference::for_definition(
+        stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
             selected.policy_fingerprint().into(),
         ),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),

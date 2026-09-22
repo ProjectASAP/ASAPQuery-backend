@@ -590,7 +590,7 @@ mod tests {
                         binding: MaterializationBinding {
             full_window_slide_ms: None,
                             materialization,
-                            state_reference: asap_types::sds::StateReference::for_definition(materialization),
+                            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(materialization),
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
                             item_labels: Vec::new(),
                             window_ms: 1_000,

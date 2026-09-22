@@ -397,11 +397,11 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
-                if binding.state_reference.validate().is_err()
-                    || binding.state_reference.definition_id != binding.materialization
+                if binding.stored_output_reference.validate().is_err()
+                    || binding.stored_output_reference.definition_id != binding.materialization
                 {
                     return Err(QueryPlanError::Invalid(
-                        "read binding has invalid state slot or definition".into(),
+                        "read binding has invalid stored output or definition".into(),
                     ));
                 }
                 if binding.readout_lookback_ms == Some(0) {
@@ -440,7 +440,8 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
-    pub state_reference: crate::sds::StateReference,
+    #[serde(alias = "state_reference")]
+    pub stored_output_reference: crate::sds::StoredOutputReference,
     /// Complete-window storage advances independently of its stored extent.
     /// None denotes disjoint pane storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
