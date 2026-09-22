@@ -55,14 +55,13 @@ impl From<SummaryDefinitionId> for crate::PolicyFingerprint {
 }
 
 /// Identity of one persisted producer output within an installed plan version.
-/// V1 derives it from the definition ID because the runtime index is keyed by
-/// definition; a future schema may allocate independent output IDs.
+/// It is independent of the semantic definition shared by equivalent producers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StoredOutputId(pub u64);
 
 /// Typed join key carried by both the writer and every bound reader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredOutputReference {
     #[serde(alias = "state_slot_id")]
@@ -71,7 +70,7 @@ pub struct StoredOutputReference {
 }
 
 impl StoredOutputReference {
-    /// V1 binding for the single stored output of a definition.
+    /// Default compiler allocation when one output is selected per definition.
     pub fn for_definition(definition_id: SummaryDefinitionId) -> Self {
         Self {
             stored_output_id: StoredOutputId(definition_id.as_u64()),
@@ -80,13 +79,39 @@ impl StoredOutputReference {
     }
 
     pub fn validate(&self) -> Result<(), SdsError> {
-        if *self == Self::for_definition(self.definition_id) {
+        if self.stored_output_id.0 != 0 && !self.definition_id.fingerprint().is_unset() {
             Ok(())
         } else {
             Err(SdsError(
-                "stored output differs from its V1 definition binding".into(),
+                "stored output and definition identities must be set".into(),
             ))
         }
+    }
+}
+
+/// Canonical address of one stored DAG output for one population and window.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredSummaryKey {
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub output: StoredOutputReference,
+    pub population: BTreeMap<String, String>,
+    pub window: HalfOpenTimeRange,
+}
+
+impl StoredSummaryKey {
+    pub fn validate(&self) -> Result<(), SdsError> {
+        self.output.validate()?;
+        if self.window.start_ms >= self.window.end_ms {
+            return Err(SdsError("stored summary requires a nonempty window".into()));
+        }
+        Ok(())
+    }
+
+    pub fn storage_key(&self) -> Result<String, SdsError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|e| SdsError(e.to_string()))
     }
 }
 
@@ -335,13 +360,11 @@ pub struct SummaryInstance {
 
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
-        if self.stored_output_id
-            != StoredOutputReference::for_definition(self.summary_definition_id).stored_output_id
-        {
-            return Err(SdsError(
-                "summary instance has an invalid stored output".into(),
-            ));
+        StoredOutputReference {
+            stored_output_id: self.stored_output_id,
+            definition_id: self.summary_definition_id,
         }
+        .validate()?;
         if self.time_range.start_ms >= self.time_range.end_ms {
             return Err(SdsError(
                 "summary instance time range must be non-empty".into(),
@@ -1397,16 +1420,62 @@ mod tests {
         inventory.validate().unwrap();
     }
 
+    // Every component of the persisted output address participates in identity.
+    #[test]
+    fn stored_summary_key_binds_plan_output_population_and_window() {
+        let key = StoredSummaryKey {
+            plan_id: 1,
+            plan_version: 2,
+            output: StoredOutputReference {
+                stored_output_id: StoredOutputId(101),
+                definition_id: crate::PolicyFingerprint(7).into(),
+            },
+            population: BTreeMap::from([("service".into(), "api".into())]),
+            window: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 1000,
+            },
+        };
+        let mut variants = vec![key.clone(); 5];
+        variants[0].plan_id += 1;
+        variants[1].plan_version += 1;
+        variants[2].output.stored_output_id.0 += 1;
+        variants[3].population.insert("service".into(), "db".into());
+        variants[4].window.end_ms += 1;
+        let canonical = key.storage_key().unwrap();
+        for other in variants {
+            assert_ne!(canonical, other.storage_key().unwrap());
+        }
+        assert_eq!(
+            serde_json::from_str::<StoredSummaryKey>(&canonical).unwrap(),
+            key
+        );
+    }
+
+    // A DAG output has its own identity even when its definition is shared.
+    #[test]
+    fn stored_output_identity_is_independent_of_definition() {
+        let definition_id = SummaryDefinitionId::from(crate::PolicyFingerprint(7));
+        for stored_output_id in [StoredOutputId(101), StoredOutputId(102)] {
+            StoredOutputReference {
+                stored_output_id,
+                definition_id,
+            }
+            .validate()
+            .unwrap();
+        }
+    }
+
     #[test]
     fn stored_output_and_payload_version_must_match_instance_definition() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
-        instance.stored_output_id = StoredOutputId(8);
+        instance.stored_output_id = StoredOutputId(0);
         assert!(instance.validate().is_err());
         instance.stored_output_id = StoredOutputId(7);
         instance.state_reference.generation = 3;
         assert!(instance.validate().is_err());
         let mut reference = StoredOutputReference::for_definition(instance.summary_definition_id);
-        reference.stored_output_id = StoredOutputId(8);
+        reference.stored_output_id = StoredOutputId(0);
         assert!(reference.validate().is_err());
     }
 

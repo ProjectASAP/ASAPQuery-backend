@@ -39,6 +39,7 @@ use tracing::{debug, debug_span, info, warn};
 struct GroupState {
     program: Option<Arc<super::raw_dag::RawDagProgram>>,
     series_id: u64,
+    stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
     catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     input_revisions: BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     config: Arc<PrecomputeMaterialization>,
@@ -493,6 +494,7 @@ impl Worker {
             let gs = GroupState {
                 program,
                 series_id: sid,
+                stored_output_reference: snap.stored_output_reference(policy_fp.into()),
                 catalog_generation: self.current_catalog_generation.clone(),
                 input_revisions: BTreeMap::new(),
                 window_manager: WindowManager::with_layout(
@@ -715,6 +717,7 @@ impl Worker {
                                 &state.input_revisions,
                                 state.series_id,
                                 state.catalog_generation.as_ref(),
+                                state.stored_output_reference,
                             );
                             emit_batch.push((output, updater.take_accumulator()));
                             debug!(
@@ -791,6 +794,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -922,6 +926,7 @@ impl Worker {
                             &state.input_revisions,
                             state.series_id,
                             state.catalog_generation.as_ref(),
+                            state.stored_output_reference,
                         );
                         emit_batch.push((output, incoming.clone_boxed_core()));
                     }
@@ -970,6 +975,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -988,6 +994,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -1173,6 +1180,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1190,6 +1198,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1279,6 +1288,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1296,6 +1306,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1418,10 +1429,12 @@ fn precomputed_output_for_group(
     input_revisions: &BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     series_id: u64,
     catalog_generation: Option<&Arc<asap_types::sds::CatalogGeneration>>,
+    stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
 ) -> PrecomputedOutput {
     let mut output = PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
         .with_population_labels(population_labels_from_group_key(group_key));
-    output.series_id = Some(series_id);
+    output.storage_handle = Some(series_id);
+    output.stored_output_reference = stored_output_reference;
     output.catalog_generation = catalog_generation.cloned();
     output.input_revision = i64::try_from(start_timestamp)
         .ok()
@@ -2886,6 +2899,7 @@ mod tests {
             &group,
             &BTreeMap::new(),
             1,
+            None,
             None,
         );
         assert_eq!(

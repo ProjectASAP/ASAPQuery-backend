@@ -89,22 +89,26 @@ fn resolve_backfill_bucket_sid(
         .map(|name| (name.as_str(), *labels.get(name.as_str()).unwrap_or(&"")))
         .collect();
     let attrs_fp = population_attrs_fingerprint(config.population_key_encoding, &grouping_pairs)?;
-    let agg_kind_canonical =
-        crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-    resolver.resolve_with_reactivation(&config.metric, &attrs_fp, &agg_kind_canonical, |sid| {
-        store.map_or(Ok(None), |store| {
-            store.validate_routed_catalog_generation(captured_generation)?;
-            let activation =
-                store.authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
-            if activation
-                .as_deref()
-                .is_some_and(|generation| Some(generation) != captured_generation)
-            {
-                return Err("stale backfill job cannot reactivate series".into());
-            }
-            Ok(activation)
-        })
-    })
+    if let Some(store) = store {
+        return store.resolve_output_storage_handle(
+            resolver,
+            config.policy_fingerprint().into(),
+            &attrs_fp,
+            captured_generation,
+        );
+    }
+    #[cfg(test)]
+    {
+        let store = crate::storage_engines::sketch_db::index::SketchStore::new();
+        store.resolve_output_storage_handle(
+            resolver,
+            config.policy_fingerprint().into(),
+            &attrs_fp,
+            captured_generation,
+        )
+    }
+    #[cfg(not(test))]
+    Err("backfill output requires an installed SummaryStore".into())
 }
 
 /// Fallback bucket id for the resolver-less code path (registry-only
@@ -314,7 +318,9 @@ impl WindowProcessor for BackfillWindowProcessor {
                 self.job_id,
                 PolicyFingerprint::from_config(&config),
             );
-            output.series_id = Some(sid);
+            output.storage_handle = Some(sid);
+            output.stored_output_reference =
+                snapshot.stored_output_reference(config.policy_fingerprint().into());
             output.catalog_generation = self.catalog_generation.clone();
             batch.push((sid, output, accumulator));
         }
@@ -331,13 +337,39 @@ impl WindowProcessor for BackfillWindowProcessor {
                     // to the same sid (the resolver is idempotent),
                     // but the round-trip is redundant now that we hold
                     // the value.
-                    for (sid, output, accumulator) in &batch {
-                        idx.ingest_precompute_with_series_id(
-                            *sid,
-                            &config,
-                            output,
-                            accumulator.as_ref(),
-                        )
+                    for (_handle, output, accumulator) in &batch {
+                        let reference = output
+                            .stored_output_reference
+                            .ok_or("backfill has no selected stored output")?;
+                        let (plan_id, plan_version) = self
+                            .catalog_generation
+                            .as_deref()
+                            .map(|generation| (generation.plan_id, generation.plan_version))
+                            .unwrap_or((0, 0));
+                        let address = asap_types::sds::StoredSummaryKey {
+                            plan_id,
+                            plan_version,
+                            output: reference,
+                            population: config
+                                .grouping_labels
+                                .iter()
+                                .cloned()
+                                .zip(output.key.clone().unwrap_or_default().labels)
+                                .collect(),
+                            window: asap_types::sds::HalfOpenTimeRange {
+                                start_ms: i64::try_from(output.start_timestamp)?,
+                                end_ms: i64::try_from(output.end_timestamp)?,
+                            },
+                        };
+                        idx.publish_unadmitted_summary_update(|writer| {
+                            writer.write_stored_summary(
+                                &address,
+                                _resolver,
+                                &config,
+                                output,
+                                accumulator.as_ref(),
+                            )
+                        })
                         .ok_or("backfill summary state publication rejected")?;
                     }
                 }
@@ -867,10 +899,23 @@ mod tests {
         // `SeriesIdResolver::lookup` would return for the same
         // `(metric, grouping-values, agg_kind)` tuple — i.e. live
         // ingest and backfill share one sid namespace.
-        let sid_a =
-            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\"}", None, None).unwrap();
-        let sid_b =
-            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}", None, None).unwrap();
+        let generation = summary_store.active_catalog_generation().unwrap();
+        let sid_a = resolve_backfill_bucket_sid(
+            &resolver,
+            &cfg,
+            "latency{svc=\"a\"}",
+            Some(&summary_store),
+            Some(&generation),
+        )
+        .unwrap();
+        let sid_b = resolve_backfill_bucket_sid(
+            &resolver,
+            &cfg,
+            "latency{svc=\"b\"}",
+            Some(&summary_store),
+            Some(&generation),
+        )
+        .unwrap();
         assert_ne!(sid_a, sid_b, "distinct svc values mint distinct sids");
         assert_eq!(summary_store.classify(sid_a), SeriesLookup::Hit);
         assert_eq!(summary_store.classify(sid_b), SeriesLookup::Hit);
@@ -909,11 +954,10 @@ mod tests {
         );
         let attrs =
             population_attrs_fingerprint(encoding, &[("svc", "a"), ("zone", "z0")]).unwrap();
-        let expected_sid = resolver.resolve(
-            &cfg.metric,
-            &attrs,
-            &crate::storage_engines::sketch_db::data::materialization_kind_for_config(&cfg),
-        );
+        let store = crate::storage_engines::sketch_db::index::SketchStore::new();
+        let expected_sid = store
+            .resolve_output_storage_handle(&resolver, cfg.policy_fingerprint().into(), &attrs, None)
+            .unwrap();
         if encoding.is_legacy() {
             assert_eq!(backfill_result.unwrap(), expected_sid);
         } else {
@@ -939,7 +983,16 @@ mod tests {
             crate::precompute_engine::operators::sum_accumulator::SumAccumulator::with_sum(1.0);
         let live_sid = store
             .ingest_precompute_for_agg_config(
-                |metric, attrs, kind| resolver.resolve(metric, attrs, kind),
+                |_metric, attrs, _kind| {
+                    store
+                        .resolve_output_storage_handle(
+                            &resolver,
+                            cfg.policy_fingerprint().into(),
+                            attrs,
+                            None,
+                        )
+                        .ok()
+                },
                 &cfg,
                 &output,
                 &acc,

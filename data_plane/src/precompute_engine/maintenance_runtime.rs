@@ -653,31 +653,33 @@ fn frozen_cohort_lineage(
     }
     let mut ordered: Vec<_> = inputs.iter().collect();
     ordered.sort_by(|left, right| {
-        (left.definition, left.sid, &left.group).cmp(&(right.definition, right.sid, &right.group))
+        (left.stored_output_reference, &left.group)
+            .cmp(&(right.stored_output_reference, &right.group))
     });
     if ordered.windows(2).any(|pair| {
-        (pair[0].definition, pair[0].sid, &pair[0].group)
-            == (pair[1].definition, pair[1].sid, &pair[1].group)
+        (pair[0].stored_output_reference, &pair[0].group)
+            == (pair[1].stored_output_reference, &pair[1].group)
     }) {
-        return Err("immutable lineage repeats a physical population".into());
+        return Err("immutable lineage repeats a stored-output population".into());
     }
     let multiple = ordered.len() > 1;
     let mut lineage = Sha256::new();
-    if multiple {
-        lineage.update(b"immutable-maintenance-input-v2");
-        lineage.update((ordered.len() as u64).to_be_bytes());
-    } else {
-        // Preserve the existing durable single-input receipt identity.
-        lineage.update(b"immutable-maintenance-input-v1");
-    }
+    lineage.update(b"immutable-stored-output-input-v3");
+    lineage.update((ordered.len() as u64).to_be_bytes());
     for input in ordered {
         if &input.generation != generation || input.windows.is_empty() {
             return Err("immutable lineage has mixed generations or empty windows".into());
         }
-        lineage.update(input.sid.to_be_bytes());
-        let metadata =
-            serde_json::to_vec(&(&input.definition, &input.generation, &input.group, expected))
-                .map_err(|error| error.to_string())?;
+        if input.stored_output_reference.definition_id != input.definition {
+            return Err("immutable input output differs from its definition".into());
+        }
+        let metadata = serde_json::to_vec(&(
+            &input.stored_output_reference,
+            &input.generation,
+            &input.group,
+            expected,
+        ))
+        .map_err(|error| error.to_string())?;
         if multiple {
             lineage.update((metadata.len() as u64).to_be_bytes());
         }
@@ -1200,19 +1202,8 @@ fn execute_finite_source_cohort(
             config.population_key_encoding,
             &pairs,
         )?;
-        let kind = crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
         let target_sid =
-            resolver.resolve_with_reactivation(&config.metric, &attrs, &kind, |sid| {
-                store.validate_routed_catalog_generation(Some(generation))?;
-                let activation = store.authorize_series_reactivation(sid, *target)?;
-                if activation
-                    .as_deref()
-                    .is_some_and(|actual| actual != generation)
-                {
-                    return Err("finite maintenance generation changed".into());
-                }
-                Ok(activation)
-            })?;
+            store.resolve_output_storage_handle(resolver, *target, &attrs, Some(generation))?;
         if existing
             .get(&target_sid)
             .and_then(|groups| groups.get(&output_group))
@@ -1356,20 +1347,8 @@ fn execute_finite_complete_populations(
             config.population_key_encoding,
             &[],
         )?;
-        let kind = crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-        let target_sid = resolver
-            .resolve_with_reactivation(&config.metric, &attrs, &kind, |sid| {
-                store.validate_routed_catalog_generation(Some(generation))?;
-                let activation = store.authorize_series_reactivation(sid, target)?;
-                if activation
-                    .as_deref()
-                    .is_some_and(|actual| actual != generation.as_ref())
-                {
-                    return Err("complete maintenance generation changed".into());
-                }
-                Ok(activation)
-            })
-            .map_err(|error| error.to_string())?;
+        let target_sid =
+            store.resolve_output_storage_handle(resolver, target, &attrs, Some(generation))?;
         if store
             .completed_maintenance_coordinates(target, generation)?
             .get(&target_sid)
@@ -1511,25 +1490,11 @@ pub(crate) fn execute_finite_maintenance(
                         config.population_key_encoding,
                         &pairs,
                     )?;
-                    let kind =
-                        crate::storage_engines::sketch_db::data::materialization_kind_for_config(
-                            config,
-                        );
-                    let target_sid = resolver.resolve_with_reactivation(
-                        &config.metric,
+                    let target_sid = store.resolve_output_storage_handle(
+                        resolver,
+                        *target,
                         &attrs,
-                        &kind,
-                        |sid| {
-                            store.validate_routed_catalog_generation(Some(generation))?;
-                            let activation = store.authorize_series_reactivation(sid, *target)?;
-                            if activation
-                                .as_deref()
-                                .is_some_and(|actual| actual != generation)
-                            {
-                                return Err("finite maintenance generation changed".into());
-                            }
-                            Ok(activation)
-                        },
+                        Some(generation),
                     )?;
                     for (start, _) in &windows {
                         if (*start as i128 - config.pane_origin_ms.unwrap_or(0) as i128)
@@ -1957,7 +1922,7 @@ impl MaintenanceDagSink {
                 let target = key.summary_definition;
                 let mut target_output = output.clone();
                 target_output.policy_fp = target.into();
-                target_output.series_id = None;
+                target_output.storage_handle = None;
                 derived.push((
                     Some((key, horizon_ms)),
                     target_output,
@@ -2201,7 +2166,10 @@ mod tests {
             let mut state = crate::precompute_engine::operators::SumAccumulator::new();
             state.update(value);
             FrozenExactWindows {
-                sid,
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                    definition(id),
+                ),
+                storage_handle: sid,
                 definition: definition(id),
                 generation: Arc::new(asap_types::sds::CatalogGeneration {
                     schema_version: 2,
@@ -2220,6 +2188,13 @@ mod tests {
         };
         let baseline =
             frozen_cohort_lineage(&[make(10, 1, 3.0), make(20, 2, 5.0)], &expected).unwrap();
+        let mut relocated = make(20, 2, 5.0);
+        relocated.storage_handle = 999;
+        assert_eq!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), relocated], &expected).unwrap(),
+            "local row relocation must not change stored-output lineage"
+        );
         assert_eq!(
             baseline,
             frozen_cohort_lineage(&[make(20, 2, 5.0), make(10, 1, 3.0)], &expected).unwrap()
@@ -2231,6 +2206,12 @@ mod tests {
         assert_ne!(
             baseline,
             frozen_cohort_lineage(&[make(10, 1, 3.0), make(21, 2, 5.0)], &expected).unwrap()
+        );
+        let mut changed_output = make(20, 2, 5.0);
+        changed_output.stored_output_reference.stored_output_id.0 += 100;
+        assert_ne!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), changed_output], &expected).unwrap()
         );
         let mut changed = make(20, 2, 5.0);
         changed.group.insert("instance".into(), "other".into());
@@ -2294,7 +2275,10 @@ mod tests {
     fn frozen_adapter_resolves_each_materialized_frontier_without_aliasing() {
         use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
         let make = |id| crate::storage_engines::sketch_db::index::FrozenExactWindows {
-            sid: id,
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                definition(id),
+            ),
+            storage_handle: id,
             definition: definition(id),
             generation: Arc::new(asap_types::sds::CatalogGeneration {
                 schema_version: 2,
@@ -2433,7 +2417,10 @@ mod tests {
         };
         let frozen_inputs = [
             crate::storage_engines::sketch_db::index::FrozenExactWindows {
-                sid: 1,
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                    source_definition,
+                ),
+                storage_handle: 1,
                 definition: source_definition,
                 generation: Arc::new(asap_types::sds::CatalogGeneration {
                     schema_version: 2,
@@ -3125,7 +3112,7 @@ mod tests {
                 .load_strict()
                 .unwrap()
                 .iter()
-                .all(|record| record.sid != 1));
+                .all(|record| record.storage_handle != 1));
             persistence.shutdown();
             return;
         }
@@ -3308,7 +3295,7 @@ mod tests {
             .load_strict()
             .unwrap()
             .iter()
-            .all(|record| record.sid != 2));
+            .all(|record| record.storage_handle != 2));
         persistence.shutdown();
     }
 

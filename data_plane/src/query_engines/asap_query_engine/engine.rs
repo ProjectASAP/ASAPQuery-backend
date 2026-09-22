@@ -1631,7 +1631,7 @@ mod asap_tier_classify_tests {
         for (i, zone) in zones.iter().enumerate() {
             let sid = 9000 + i as u64;
             idx.register(SummarySeriesMetadata {
-                sid,
+                storage_handle: sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -1722,7 +1722,7 @@ mod asap_tier_classify_tests {
         // Latest ASAPPlanner sizes an epsilon=0.01 KLL at k=269.
         let cfg = SketchConfig::Kll { k: 269 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
@@ -1760,7 +1760,7 @@ mod asap_tier_classify_tests {
         // Latest ASAPPlanner requires p=14 for a 1% HLL error target.
         let cfg = SketchConfig::Hll { precision: 14 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::CardinalityApprox),
@@ -2147,7 +2147,11 @@ mod asap_tier_classify_tests {
                 query: QueryReadout::Quantile { q: 0.99 },
             },
         );
-        let sids = idx.snapshot_instances().iter().map(|m| m.sid).collect();
+        let sids = idx
+            .snapshot_instances()
+            .iter()
+            .map(|m| m.storage_handle)
+            .collect();
         let engine = test_plan::engine(idx, config, sids, entry);
         engine.execute_at(query, now_ms).await.expect(
             "quantile_over_time over a Hit KLL sid must NOT capability-miss \
@@ -2277,7 +2281,7 @@ mod asap_tier_classify_tests {
         for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 14_000 + i as u64;
             idx.register(SummarySeriesMetadata {
-                sid,
+                storage_handle: sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -2373,7 +2377,7 @@ mod asap_tier_classify_tests {
         // Matches ControlPlaneCostModel's epsilon=0.01 CMS sizing.
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         idx.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -2509,7 +2513,7 @@ mod outer_agg_integration_tests {
             relative_accuracy: 0.01,
         };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -2650,7 +2654,7 @@ mod range_stitch_tests {
     fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),

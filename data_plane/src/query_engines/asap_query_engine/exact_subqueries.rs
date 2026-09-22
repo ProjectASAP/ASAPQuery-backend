@@ -899,7 +899,7 @@ mod tests {
         const MATERIALIZATION: asap_types::PolicyFingerprint = asap_types::PolicyFingerprint(9001);
         let store = crate::storage_engines::sketch_db::index::SketchStore::new();
         store.register(SummarySeriesMetadata {
-            sid: 41,
+            storage_handle: 41,
             metric_name: "http_requests_total".into(),
             group_by_keys: std::collections::BTreeSet::from(["job".into()]),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),

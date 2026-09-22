@@ -621,27 +621,11 @@ fn resolve_bucket_sid_for_agg_config(
         config.population_key_encoding,
         &grouping_pairs,
     )?;
-    let agg_kind_canonical =
-        crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-    let sid = ingest_state.series_resolver.resolve_with_reactivation(
-        &config.metric,
+    let sid = ingest_state.summary_store.resolve_output_storage_handle(
+        &ingest_state.series_resolver,
+        config.policy_fingerprint().into(),
         &fp,
-        &agg_kind_canonical,
-        |sid| {
-            ingest_state
-                .summary_store
-                .validate_routed_catalog_generation(captured_generation)?;
-            let activation = ingest_state
-                .summary_store
-                .authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
-            if activation
-                .as_deref()
-                .is_some_and(|generation| Some(generation) != captured_generation)
-            {
-                return Err("stale OTLP generation cannot reactivate series".into());
-            }
-            Ok(activation)
-        },
+        captured_generation,
     )?;
     let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
     Ok((sid, policy_fp))
@@ -1221,7 +1205,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // because `fp=""` is a perfectly good mint/lookup key.
                     let resolved_sid: Option<u64> = if dp.series_id != 0 && attrs_pairs.is_empty() {
                         let sid = dp.series_id;
-                        if ingest_state.summary_store.instance(sid).is_some() {
+                        if ingest_state.summary_store.is_current_storage_handle(sid) {
                             Some(sid)
                         } else {
                             unknown_sids.push(sid);
@@ -1249,45 +1233,36 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // frames would mint distinct sids and the upgrade
                         // could never fire (the analyzer would also see two
                         // candidates for one logical series).
-                        let algorithm_for_sid = base_sketch_algorithm(sketch_algorithm_for(&dp));
-                        let agg_kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
-                            algorithm: algorithm_for_sid,
-                            config: dp.container_config.clone(),
-                            // OTel-ingest path: no per-DP spatial filter applies
-                            // at this layer (the agent has already filtered
-                            // before emitting the sketch). The empty filter is
-                            // the canonical value for "no filter on this sid's
-                            // policy".
-                            spatial_filter_canonical: String::new(),
-                        };
-                        let agg_kind_canonical = agg_kind.canonical_string();
                         let definition = frame_identity
                             .as_ref()
                             .map(|frame| frame.materialization)
                             .unwrap_or_else(|| asap_types::PolicyFingerprint(0).into());
-                        let assigned = match ingest_state.series_resolver.resolve_with_reactivation(
-                            &canonical_name,
+                        let resolved = ingest_state.summary_store.resolve_output_storage_handle(
+                            &ingest_state.series_resolver,
+                            definition,
                             &fp,
-                            &agg_kind_canonical,
-                            |sid| {
-                                ingest_state
-                                    .summary_store
-                                    .validate_routed_catalog_generation(
-                                        catalog_generation.as_deref(),
-                                    )?;
-                                let activation = ingest_state
-                                    .summary_store
-                                    .authorize_series_reactivation(sid, definition)?;
-                                if activation.as_deref().is_some_and(|generation| {
-                                    Some(generation) != catalog_generation.as_deref()
-                                }) {
-                                    return Err(
-                                        "stale OTLP generation cannot reactivate series".into()
-                                    );
-                                }
-                                Ok(activation)
-                            },
-                        ) {
+                            catalog_generation.as_deref(),
+                        );
+                        // Codec-only unit fixtures have no installed plan. Production
+                        // accepts stored summaries only through an installed output.
+                        #[cfg(test)]
+                        let resolved = if catalog_generation.is_none()
+                            && definition.fingerprint().is_unset()
+                        {
+                            let kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
+                                algorithm: base_sketch_algorithm(sketch_algorithm_for(&dp)),
+                                config: dp.container_config.clone(),
+                                spatial_filter_canonical: String::new(),
+                            };
+                            Ok(ingest_state.series_resolver.resolve(
+                                &canonical_name,
+                                &fp,
+                                &kind.canonical_string(),
+                            ))
+                        } else {
+                            resolved
+                        };
+                        let assigned = match resolved {
                             Ok(sid) => sid,
                             Err(error) => {
                                 if dp.series_id != 0 {
@@ -1436,7 +1411,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     .map(|s| s.to_string())
                             };
                             ingest_state.summary_store.register(SummarySeriesMetadata {
-                                sid,
+                                storage_handle: sid,
                                 metric_name: canonical_name.clone(),
                                 group_by_keys,
                                 capability: Some(cap),
@@ -4725,7 +4700,10 @@ mod sid_bucketing_tests {
             };
             let fp =
                 crate::drivers::ingest::canonical_attrs_fingerprint(&[("zone", zone_for_bucket)]);
-            let resolved = resolver.lookup(metric, &fp, &agg_kind_canonical);
+            let resolved = state
+                .summary_store
+                .resolve_output_storage_handle(&resolver, policy_fp.into(), &fp, None)
+                .ok();
             assert_eq!(
                 resolved,
                 Some(*sid),

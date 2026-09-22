@@ -282,13 +282,20 @@ object.
 A concrete stored record has the key:
 
 ```text
-(plan_version, stored_output_id, population_key, window)
+(plan_id, plan_version, stored_output_id, population_key, window)
 ```
 
 `population_key` preserves canonical label names and values. `window` identifies
 the intended time partition and its boundary convention; actual coverage is
 validated separately. Worker IDs and transient runtime handles are not record
-identities.
+identities. A store may use a local numeric row handle for indexing or wire
+compression; that handle cannot select another output, definition or plan
+version. The writer supplies a `StoredSummaryKey` and the reader supplies the
+same selected `StoredOutputReference` within its installed plan version.
+Durable metadata retains this binding so recovery validates it before exposing
+payloads. V1 does not implicitly reuse records from another plan version.
+The durable binding format is version 4; earlier SID metadata is rejected rather
+than inferred to refer to a selected output.
 
 Before publication, validate that the output matches its bound definition,
 format, population and window. Payload and identifying metadata become visible

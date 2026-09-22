@@ -660,7 +660,7 @@ async fn main() -> Result<()> {
     let summary_store = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
     if let Some(catalog) = startup_physical_plan.summary_catalog.as_ref() {
         summary_store
-            .install_summary_catalog(Arc::clone(catalog))
+            .install_precompute_plan(Arc::clone(catalog), &startup_physical_plan.precompute_plan)
             .map_err(std::io::Error::other)?;
     }
 

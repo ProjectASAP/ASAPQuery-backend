@@ -740,7 +740,7 @@ mod tests {
             .unwrap();
         if seed {
             store.register(SummarySeriesMetadata {
-                sid: 7,
+                storage_handle: 7,
                 metric_name: "requests".into(),
                 group_by_keys: BTreeSet::new(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),

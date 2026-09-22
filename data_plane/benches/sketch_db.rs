@@ -111,7 +111,7 @@ fn sketch_meta(
     config: SketchConfig,
 ) -> SummarySeriesMetadata {
     SummarySeriesMetadata {
-        sid,
+        storage_handle: sid,
         metric_name: "bench_metric".into(),
         group_by_keys: BTreeSet::new(),
         capability: Some(match algorithm {
@@ -133,7 +133,7 @@ fn sketch_meta(
 
 fn precompute_meta(sid: u64, metric: &str, agg_type: AggregationType) -> SummarySeriesMetadata {
     SummarySeriesMetadata {
-        sid,
+        storage_handle: sid,
         metric_name: metric.to_string(),
         group_by_keys: BTreeSet::new(),
         capability: None,

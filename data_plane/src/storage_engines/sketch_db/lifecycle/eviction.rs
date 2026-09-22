@@ -115,7 +115,7 @@ impl SchemaEvictionService {
         let _ = &self.backfill;
 
         for meta in expired {
-            let sid = meta.sid;
+            let sid = meta.storage_handle;
             let metric = meta.metric_name.clone();
 
             if self.config.dry_run {

@@ -304,7 +304,7 @@ mod tests {
     ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,
@@ -410,7 +410,7 @@ mod tests {
     ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,

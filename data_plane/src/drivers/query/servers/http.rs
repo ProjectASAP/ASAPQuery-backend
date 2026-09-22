@@ -2926,7 +2926,7 @@ mod tests {
         use std::collections::BTreeSet;
         let group_by_keys: BTreeSet<String> = group_by.iter().map(|s| s.to_string()).collect();
         store.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,
@@ -2981,11 +2981,11 @@ mod tests {
         assert_eq!(body["count"], 2);
         let entries = body["schemas"].as_array().unwrap();
         // Sorted by sid — first is active, second is retired.
-        assert_eq!(entries[0]["sid"], 1);
+        assert_eq!(entries[0]["storage_handle"], 1);
         assert_eq!(entries[0]["status"], "active");
         assert_eq!(entries[0]["metric_name"], "m1");
         assert!(entries[0]["retired_at_ms"].is_null());
-        assert_eq!(entries[1]["sid"], 2);
+        assert_eq!(entries[1]["storage_handle"], 2);
         assert_eq!(entries[1]["status"], "retired");
         assert!(entries[1]["retired_at_ms"].is_u64());
 
@@ -2999,7 +2999,7 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["count"], 1);
-        assert_eq!(body["schemas"][0]["sid"], 1);
+        assert_eq!(body["schemas"][0]["storage_handle"], 1);
 
         // Filter: retired only.
         let resp = client
@@ -3011,7 +3011,7 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["count"], 1);
-        assert_eq!(body["schemas"][0]["sid"], 2);
+        assert_eq!(body["schemas"][0]["storage_handle"], 2);
 
         // Bogus filter → 400.
         let resp = client
@@ -3078,7 +3078,7 @@ mod tests {
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
-        assert_eq!(body["schema"]["sid"], 11);
+        assert_eq!(body["schema"]["storage_handle"], 11);
         assert_eq!(body["schema"]["status"], "retired");
         assert_eq!(
             summary_store.instance(11).unwrap().status(),
@@ -3096,7 +3096,7 @@ mod tests {
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
-        assert_eq!(body["schema"]["sid"], 22);
+        assert_eq!(body["schema"]["storage_handle"], 22);
         assert_eq!(body["schema"]["status"], "expired");
         assert_eq!(
             summary_store.instance(22).unwrap().status(),
@@ -5513,7 +5513,7 @@ async fn handle_activate_physical_plan(
         move |plan| match plan.summary_catalog.as_ref() {
             Some(catalog) => {
                 store
-                    .install_summary_catalog(Arc::clone(catalog))
+                    .install_precompute_plan(Arc::clone(catalog), &plan.precompute_plan)
                     .map_err(|error| format!("SummaryCatalog install error: {error}"))?;
                 if let Some(receiver) = &remote_write {
                     receiver.install_erp_observation_generation(
@@ -5862,11 +5862,23 @@ async fn handle_get_schemas(
         .iter()
         .filter(|m| allowed.contains(&m.status()))
         .map(|metadata| {
-            let descriptors = state.summary_store.descriptors_for_series_id(metadata.sid);
-            sid_instance_to_json(metadata, descriptors.as_ref())
+            let descriptors = state
+                .summary_store
+                .descriptors_for_series_id(metadata.storage_handle);
+            stored_output_instance_to_json(
+                metadata,
+                descriptors.as_ref(),
+                state
+                    .summary_store
+                    .stored_output_for_handle(metadata.storage_handle),
+            )
         })
         .collect();
-    entries.sort_by_key(|v| v.get("sid").and_then(|x| x.as_u64()).unwrap_or(0));
+    entries.sort_by_key(|v| {
+        v.get("storage_handle")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+    });
 
     let body = serde_json::json!({
         "status": "success",
@@ -5885,17 +5897,19 @@ fn status_str(s: crate::storage_engines::sketch_db::AggStatus) -> &'static str {
 }
 
 /// Encode sid metadata, including identity, lifecycle timestamps, and status.
-fn sid_instance_to_json(
+fn stored_output_instance_to_json(
     m: &crate::storage_engines::sketch_db::index::SummarySeriesMetadata,
     descriptors: Option<&(
         std::sync::Arc<crate::storage_engines::sketch_db::SummaryDescriptor>,
         std::sync::Arc<crate::storage_engines::sketch_db::DataDescriptor>,
     )>,
+    output: Option<asap_types::sds::StoredOutputReference>,
 ) -> serde_json::Value {
     let summary_descriptor_id = descriptors.map(|(summary, _)| summary.id.canonical());
     let data_descriptor_id = descriptors.map(|(_, data)| data.id.canonical());
     serde_json::json!({
-        "sid": m.sid,
+        "storage_handle": m.storage_handle,
+        "stored_output_reference": output,
         "metric_name": m.metric_name,
         "status": status_str(m.status()),
         "first_seen_unix_ms": m.first_seen_unix_ms,
@@ -5925,7 +5939,7 @@ async fn handle_post_schema_retire(
             let descriptors = state.summary_store.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
-                "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
+                "schema": stored_output_instance_to_json(&meta, descriptors.as_ref(), state.summary_store.stored_output_for_handle(meta.storage_handle))});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
@@ -5951,7 +5965,7 @@ async fn handle_post_schema_expire(
             let descriptors = state.summary_store.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
-                "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
+                "schema": stored_output_instance_to_json(&meta, descriptors.as_ref(), state.summary_store.stored_output_for_handle(meta.storage_handle))});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {

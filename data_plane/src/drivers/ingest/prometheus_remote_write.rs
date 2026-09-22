@@ -762,30 +762,14 @@ fn route_messages(
                 &computed_attrs_fp
             };
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
-            // A sketch family is not a complete physical identity. Two
-            // materializations may use the same family and grouping while
-            // differing in update semantics (for example count- versus
-            // value-weighted Top-K). Keep those states on distinct SIDs.
-            let materialization_kind =
-                crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
             let sid = ingest
-                .series_resolver
-                .resolve_with_reactivation(&config.metric, attrs_fp, &materialization_kind, |sid| {
-                    ingest.summary_store.validate_routed_catalog_generation(
-                        physical_plan.precompute_plan.summary_catalog.as_ref(),
-                    )?;
-                    let activation = ingest
-                        .summary_store
-                        .authorize_series_reactivation(sid, policy_fp.into())?;
-                    if let Some(generation) = &activation {
-                        if physical_plan.precompute_plan.summary_catalog.as_ref()
-                            != Some(generation.as_ref())
-                        {
-                            return Err("stale routed generation cannot reactivate series".into());
-                        }
-                    }
-                    Ok(activation)
-                })
+                .summary_store
+                .resolve_output_storage_handle(
+                    &ingest.series_resolver,
+                    policy_fp.into(),
+                    attrs_fp,
+                    physical_plan.precompute_plan.summary_catalog.as_ref(),
+                )
                 .map_err(RemoteWriteError::SeriesIdentity)?;
             buckets
                 .entry(sid)

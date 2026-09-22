@@ -505,7 +505,7 @@ impl QueryExecutionContext<'_> {
         };
         let mut sids = self
             .index
-            .series_ids_for_policy(binding.materialization.fingerprint());
+            .storage_handles_for_output(binding.stored_output_reference);
         sids.sort_unstable();
         sids.dedup();
         let mut matched_metadata = 0usize;
@@ -1637,7 +1637,7 @@ mod tests {
     fn kll_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Kll { k: 200 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -1660,7 +1660,7 @@ mod tests {
     fn hll_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::Hll { precision: 10 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::CardinalityApprox),
@@ -1706,7 +1706,7 @@ mod tests {
     fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
@@ -1779,7 +1779,7 @@ mod tests {
     fn cms_with_heap_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::FrequencyTopk(Some(
@@ -1849,7 +1849,7 @@ mod tests {
 
     fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SummarySeriesMetadata {
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
