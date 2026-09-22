@@ -49,18 +49,15 @@ materialization boundary:
 flowchart LR
   D[Selected post-ASAP DAG] --> C[Physical compiler]
   C --> P[PrecomputePlan]
-  C -->|register definition| S[Summary Catalog snapshot]
   C --> Q[QueryPlan]
-  P -->|definition reference: validate at install| S
-  Q -->|definition reference: validate at install| S
-  subgraph Store[SummaryStore: one runtime store]
-    I[Instance metadata and readiness]
-    B[Summary payload bytes]
+  C -->|definitions snapshot for installation| Def
+  subgraph Store[SummaryStore: one storage engine]
+    Def[summary_definitions]
+    Rows[stored_summaries: metadata and payload]
+    Rows -->|definition_id| Def
   end
-  P -->|write state| B
-  P -->|record instance after payload is available| I
-  Q -->|resolve bound ready instance; check format| I
-  Q -->|read payload| B
+  P -->|publish committed record| Rows
+  Q -->|lookup bound record; validate coverage and format| Rows
 ```
 
 SDS is the contract across these bindings, catalog definitions, runtime
@@ -275,7 +272,7 @@ installation_context:
 ### Compiler output
 
 ```yaml
-summary_catalog:
+summary_definitions:
   definitions:
     - id: def-api-latency-kll
       input: request_latency_seconds
@@ -372,9 +369,9 @@ that output a `stored_output_id` and emits matching writer/reader bindings; see
 | Physical compiler | Concrete implementation, subgraph split, catalog bindings and plan version |
 | Precompute runtime | Installed maintenance nodes and state publication |
 | Query runtime | Bound state reads, query operators, exact residuals and fallback |
-| Catalog snapshot | Summary definitions validated at plan installation |
+| Definitions snapshot | Compiler-supplied rows validated and registered in `SummaryStore.summary_definitions` at installation |
 | Plan read/write bindings | State references, format, partition rules and writer ownership |
-| `SummaryStore` | Instance metadata (coverage, readiness, format and payload location) and encoded payload bytes in one runtime store |
+| `SummaryStore` | Owns `summary_definitions` and `stored_summaries`; the latter holds committed metadata and payload together |
 
 ## Compiler contract
 
@@ -393,7 +390,7 @@ support.
 
 | Output | Responsibility |
 | --- | --- |
-| Catalog entries | Summary definitions referenced by the plans |
+| Definition rows | `summary_definitions` rows referenced by the plans |
 | PrecomputePlan | Maintenance subgraphs ending in state writes |
 | QueryPlan | Bound state reads, query operators and exact residuals |
 | Provenance | Physical-to-semantic node mapping |

@@ -1,14 +1,16 @@
-# Summary Catalog and Self-Describing Summary architecture
+# Summary storage and Self-Describing Summary architecture
 
-Status: proposed contract with current-backend migration notes. Audience:
+Status: proposed contract with current-backend migration notes. The names below
+are design vocabulary; existing Rust types and persisted wire fields are not
+renamed by this documentation change. Audience:
 developers compiling, storing, recovering or reading summary state.
 
 Terminology: [Planner/backend glossary](planner-backend-glossary.md).
 
 ## Purpose and scope
 
-The Summary Catalog and Self-Describing Summary (SDS) model defines what persisted
-summary state means. It connects PrecomputePlan writers to QueryPlan readers
+The Self-Describing Summary (SDS) model defines the meaning and representation
+of summary records in one `SummaryStore`. It connects PrecomputePlan writers to QueryPlan readers
 without requiring either runtime to reinterpret Planner IR.
 
 This document owns summary identity, schema, state references and the conditions
@@ -30,37 +32,35 @@ Cost ranking, operator scheduling and transmission policy are outside SDS.
 
 ## Architecture at a glance
 
-The Summary Catalog is the definition snapshot validated when a plan is
-installed. PrecomputePlan and QueryPlan carry matching state references and
-format/partition configuration. One runtime `SummaryStore` holds both instance
-metadata and payload bytes; these are two kinds of data within the store, not
-separate storage components. There is no separate catalog `Materialization`
-object.
+One `SummaryStore` owns two logical tables:
 
-The compiler/catalog authority registers a `SummaryDefinition` when installing
-the plan. The edges from both plans to that catalog are definition references
-validated by catalog reads at installation, not runtime writes or serving-time
-catalog searches. At runtime, PrecomputePlan writes a payload to
-`SummaryStore` and records its instance metadata there. QueryPlan uses its
-installed state reference to look up a matching instance in that same store,
-checks readiness, coverage and format, then reads the payload. The catalog
-holds definition semantics, the installed plans hold writer and reader
-constraints, and the runtime store holds observed instances. These are logical
-responsibilities; they do not require three independent services or databases.
+| Table | Row type | What it stores |
+| --- | --- | --- |
+| `summary_definitions` | `SummaryDefinition` | Definition ID → source/filter, input value, family, parameters, grouping and time semantics |
+| `stored_summaries` | `StoredSummary` | Concrete record key → definition ID, actual format, coverage and payload |
+
+The compiler supplies a definitions snapshot with the plan bundle. Installation
+validates it and registers its rows in `summary_definitions`. The snapshot is an
+installation artifact, not another storage service. Precompute execution writes
+complete records to `stored_summaries`; query execution reads those records using
+its installed output reference and partition selection. A row is visible to
+readers only after its metadata and payload are committed together logically.
+
+These are logical tables within the existing storage engine; this design does
+not require a new SQL database. The store may use separate files or indexes
+internally. There is no separate metadata store, payload store, or catalog
+`Materialization` object.
 
 ```mermaid
 flowchart LR
-  C[Compiler/catalog authority] -->|register definition| D[Summary Catalog snapshot]
-  P[PrecomputePlan] -->|validate definition at install| D
-  Q[QueryPlan] -->|validate definition at install| D
-  subgraph S[SummaryStore: one runtime store]
-    I[Instance metadata and readiness]
-    B[Summary payload bytes]
+  C[Compiler and plan installation] -->|register definitions| D
+  P[PrecomputePlan writer] -->|publish committed record| R
+  Q[QueryPlan reader] -->|lookup and validate record| R
+  subgraph S[SummaryStore: one storage engine]
+    D[summary_definitions: summary meaning]
+    R[stored_summaries: metadata and payload]
+    R -->|definition_id| D
   end
-  P -->|write payload| B
-  P -->|record instance after payload is available| I
-  Q -->|lookup bound instance; check ready and format| I
-  Q -->|read payload| B
 ```
 
 The compiler assigns a `stored_output_id` to each PrecomputePlan DAG output that
@@ -81,7 +81,7 @@ Two queries request different percentiles from the same five-minute KLL summary:
 ```yaml
 installed_plan:
   plan_version: 42
-  catalog_snapshot:
+  definitions_snapshot:
     summary_definition:
       id: def-api-latency-kll
       input: request_latency_seconds
@@ -114,15 +114,22 @@ installed_plan:
       estimate: {quantile: 0.99}
 
 runtime_summary_store:
-  - instance_id: state-api-1205
-    plan_version: 42
-    stored_output_id: latency-kll
-    definition_id: def-api-latency-kll
-    format: {schema: kll-v1, encoding: kll-binary-v1}
-    partition: {service: api, window_end: '12:05'}
-    coverage: {start_exclusive: '12:00', end_inclusive: '12:05'}
-    ready: true
-    payload: <encoded KLL state>
+  summary_definitions:
+    def-api-latency-kll:
+      input: request_latency_seconds
+      group_by: [service]
+      range: 5m
+      algorithm: {kind: kll, k: 200}
+  stored_summaries:
+    - key:
+        plan_version: 42
+        stored_output_id: latency-kll
+        population_key: {service: api}
+        window: {start_exclusive: '12:00', end_inclusive: '12:05'}
+      definition_id: def-api-latency-kll
+      format: {schema: kll-v1, encoding: kll-binary-v1}
+      coverage: {start_exclusive: '12:00', end_inclusive: '12:05'}
+      payload: <encoded KLL state>
 ```
 
 One shared PrecomputePlan producer writes the required state partitions. Both
@@ -133,16 +140,16 @@ at serving time.
 `runtime_summary_store` is observed runtime data, not part of the installed
 plan. Its example entry says that the `service=api` partition contains encoded
 KLL state covering `(12:00, 12:05]`. The format fields let the reader reject
-incompatible bytes, and `ready` becomes true only after that payload is
-committed. No abstract payload locator is required by this design.
+incompatible bytes. The row becomes visible only after its payload and metadata
+are committed. No abstract payload locator is required by this design.
 
 ## Core objects
 
 | Object | Meaning | Changes when |
 | --- | --- | --- |
 | `SummaryDefinition` | Canonical input, operation, grouping, time semantics, algorithm and parameters | Summary semantics change |
-| `SummaryStateInstance` | One `SummaryStore` entry: instance metadata plus its associated summary payload | Runtime publishes a new or replacement partition or completed aggregate |
-| `StateReference` | A typed plan reference to a permitted stored producer output | A compiled reader/writer binding changes |
+| `StoredSummary` | One `SummaryStore` entry: instance metadata plus its associated summary payload | Runtime publishes a new or replacement partition or completed aggregate |
+| `StoredOutputReference` | A typed plan reference to a permitted stored producer output | A compiled reader/writer binding changes |
 
 A definition includes every field needed to decide semantic equivalence: source
 and filters, input value, operation or sketch parameters, grouping, time
@@ -156,7 +163,7 @@ instance metadata. Their ownership is explicit below.
 | Former field | Owner in this design |
 | --- | --- |
 | Materialization ID | Replaced by a compiler-assigned `stored_output_id`, scoped to the plan version, in reader/writer references. |
-| Definition ID | `StateReference` points to the catalog's `SummaryDefinition`. |
+| Definition ID | `StoredOutputReference` points to `SummaryDefinition` in `summary_definitions`. |
 | Plan version | Installed plan bundle; persisted instance metadata repeats it for recovery validation. |
 | State family and algorithm parameters | `SummaryDefinition`. |
 | Schema and encoding | Writer configuration and matching reader expectations; instances declare the actual payload format. |
@@ -171,13 +178,13 @@ for those fields. The selected deployment guarantee and schedule/retention belon
 to Planner's deployment decision and the installed PrecomputePlan binding;
 observed readiness belongs to instance metadata in `SummaryStore`.
 
-A `SummaryStateInstance` means the complete logical entry in `SummaryStore`: its
+A `StoredSummary` means the complete logical entry in `SummaryStore`: its
 metadata and its associated payload. The metadata records plan version,
 stored-output ID, definition, actual format, partition key,
 coverage/completion, producer sequence where applicable, and integrity data.
 The payload bytes may be stored separately inside the `SummaryStore`
 implementation, but they are not a separate architecture component and never
-belong in catalog descriptors.
+belong in definition rows.
 
 ## Identity and reference rules
 
@@ -185,18 +192,29 @@ belong in catalog descriptors.
 | --- | --- |
 | Definition ID | What semantics does the state represent? |
 | Plan version + stored output ID | Which installed producer output does this state belong to? |
-| State-instance ID | Which concrete partition/payload is it? |
+| Stored-summary key | Which concrete population/window record is it? |
 | Plan version | With which atomic installation may it be used? |
 | Schema/encoding ID | How are its bytes interpreted? |
 
-Definition IDs come from the catalog authority, plan versions from the
-installation authority, stored-output IDs from the compiler, and state-instance IDs
-from the runtime. Schema/encoding IDs identify supported formats.
+Definition IDs identify rows in `summary_definitions`; plan versions come from
+installation and stored-output IDs from the compiler. The runtime addresses a
+`StoredSummary` by the composite key:
+
+```text
+(plan_version, stored_output_id, population_key, window)
+```
+
+`population_key` contains canonical label names and values. `window` identifies
+the intended time partition, including its boundary convention; actual coverage
+must still satisfy the reader. V1 needs no additional instance UUID. A
+`StoredOutputReference` identifies the output across its records, not a pointer
+to one payload; reader partition/time selection supplies the rest of the lookup.
+Schema/encoding IDs identify supported formats.
 Human-readable names are diagnostics, not join keys. Reuse across plan versions
 requires an explicit compatibility decision; a matching definition ID is
 insufficient.
 
-A `StateReference` identifies a stored output and definition within the enclosing
+A `StoredOutputReference` identifies a stored output and definition within the enclosing
 plan version. The reader/writer binding constrains acceptable partition, schema,
 plan version and coverage. A reader binding may select several instances, such
 as panes covering one range, but cannot broaden semantics or substitute another
@@ -210,10 +228,9 @@ PrecomputePlan
   Input -> BuildKLL -> Write(output-17, kll-v1)
 
 SDS
-  Catalog: def-9 -> KLL(k=200) and input semantics
+  SummaryStore.summary_definitions: def-9 -> KLL(k=200) and input semantics
   Plan bundle: version 42; writer/reader bind output-17 to def-9
-  SummaryStore: instance metadata indexed by plan version, stored output and partition;
-                encoded payload bytes reached through that metadata
+  SummaryStore.stored_summaries: key -> definition, format, coverage and payload
 
 QueryPlan
   Read(output-17, kll-v1) -> SummaryEstimate -> Result
@@ -221,7 +238,7 @@ QueryPlan
 
 Writer, instance metadata and reader must agree on stored-output ID, definition ID,
 schema/encoding, grouping, time partition and plan version. State family and
-parameters must match the referenced catalog definition.
+parameters must match the referenced `summary_definitions` row.
 The query runtime follows the installed reference instead of scanning the catalog.
 
 A stored summary derived from existing state has a distinct stored-output ID and an explicit
@@ -237,7 +254,7 @@ Source and destination are never represented as the same instance.
 ## Read eligibility
 
 The immediate use case needs one decision: can this installed QueryPlan read the
-state bound by its `StateReference`? A read is eligible only when `SummaryStore`
+state bound by its `StoredOutputReference`? A read is eligible only when `SummaryStore`
 contains the referenced instance, its payload has been committed, and its plan
 version, definition, schema/encoding, partition and coverage satisfy the reader
 binding. Otherwise the query uses its configured exact fallback or reports that
