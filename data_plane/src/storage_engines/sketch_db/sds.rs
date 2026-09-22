@@ -75,12 +75,12 @@ fn legacy_summary(kind: &AggKind) -> SummaryDescriptor {
     })
 }
 
-/// Runtime foreign-key binding from one SeriesId to shared descriptors. Every pane
-/// row stored under the SeriesId is a Summary Instance: `(binding, interval,
-/// group-values, state)`. Descriptor references are normalized here instead of
-/// copied into every pane row.
+/// Normalized stored-output binding shared by its population/window records.
+/// The selected output and catalog generation are durable identity; metadata's
+/// numeric handle only locates the physical rows in this store.
 #[derive(Debug, Clone)]
 pub struct SdsBinding {
+    pub stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
     pub metadata: Arc<SummarySeriesMetadata>,
     pub summary_descriptor: Arc<SummaryDescriptor>,
     pub data_descriptor: Arc<DataDescriptor>,
@@ -108,24 +108,58 @@ pub struct SummaryDescriptorRegistry {
         Option<(
             Arc<asap_types::summary_catalog::SummaryCatalog>,
             Arc<asap_types::sds::CatalogGeneration>,
+            std::collections::BTreeMap<
+                asap_types::sds::SummaryDefinitionId,
+                asap_types::sds::StoredOutputReference,
+            >,
         )>,
     >,
 }
 
 impl SummaryDescriptorRegistry {
+    #[cfg(test)]
     pub fn install_catalog(
         &self,
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
     ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
-        catalog.validate()?;
-        let reference = catalog.reference()?;
+        let outputs = catalog
+            .definitions
+            .keys()
+            .map(|id| {
+                (
+                    *id,
+                    asap_types::sds::StoredOutputReference::for_definition(*id),
+                )
+            })
+            .collect();
+        self.install_catalog_with_outputs(catalog, outputs)
+    }
+
+    pub fn install_catalog_with_outputs(
+        &self,
+        catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
+        outputs: std::collections::BTreeMap<
+            asap_types::sds::SummaryDefinitionId,
+            asap_types::sds::StoredOutputReference,
+        >,
+    ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
+        catalog.validate().inspect_err(|error| {
+            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
+                %error, "storage descriptor catalog validation failed");
+        })?;
+        let reference = catalog.reference().inspect_err(|error| {
+            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
+                %error, "storage descriptor catalog reference failed");
+        })?;
         let generation = Arc::new(asap_types::sds::CatalogGeneration {
             schema_version: reference.schema_version,
             plan_id: reference.plan_id,
             plan_version: reference.plan_version,
             snapshot_sha256: reference.snapshot_sha256,
         });
-        *self.authoritative_catalog.write().unwrap() = Some((catalog, generation));
+        *self.authoritative_catalog.write().unwrap() = Some((catalog, generation, outputs));
+        tracing::info!(plan_id = reference.plan_id, plan_version = reference.plan_version,
+            "storage descriptor catalog installed");
         Ok(())
     }
 
@@ -136,7 +170,7 @@ impl SummaryDescriptorRegistry {
             .read()
             .unwrap()
             .as_ref()
-            .map(|(catalog, _)| Arc::clone(catalog))
+            .map(|(catalog, _, _)| Arc::clone(catalog))
     }
 
     pub fn authoritative_snapshot(
@@ -145,12 +179,38 @@ impl SummaryDescriptorRegistry {
         Arc<asap_types::summary_catalog::SummaryCatalog>,
         Arc<asap_types::sds::CatalogGeneration>,
     )> {
-        self.authoritative_catalog.read().unwrap().clone()
+        self.authoritative_catalog
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|(catalog, generation, _)| (Arc::clone(catalog), Arc::clone(generation)))
+    }
+
+    pub fn stored_output_reference(
+        &self,
+        definition: asap_types::sds::SummaryDefinitionId,
+    ) -> Option<asap_types::sds::StoredOutputReference> {
+        let installed = self.authoritative_catalog.read().unwrap();
+        match installed.as_ref() {
+            Some((_, _, outputs)) => outputs.get(&definition).copied(),
+            None => (!definition.fingerprint().is_unset())
+                .then(|| asap_types::sds::StoredOutputReference::for_definition(definition)),
+        }
     }
 
     pub fn bind(&self, metadata: SummarySeriesMetadata) -> Result<SdsBinding, String> {
-        let authoritative = self.authoritative_snapshot();
-        let configured = if let Some((catalog, _)) = authoritative.as_ref() {
+        let authoritative = self.authoritative_catalog.read().unwrap().clone();
+        let stored_output_reference = match &authoritative {
+            Some((_, _, outputs)) => Some(
+                *outputs
+                    .get(&metadata.policy_fp.into())
+                    .ok_or("definition has no selected stored output")?,
+            ),
+            None => (!metadata.policy_fp.is_unset()).then(|| {
+                asap_types::sds::StoredOutputReference::for_definition(metadata.policy_fp.into())
+            }),
+        };
+        let configured = if let Some((catalog, _, _)) = authoritative.as_ref() {
             if metadata.policy_fp.is_unset() {
                 return Err(
                     "materialization identity is required by the installed SummaryCatalog".into(),
@@ -205,11 +265,20 @@ impl SummaryDescriptorRegistry {
             }
         };
 
+        let catalog_generation = authoritative.as_ref().map(|(_, generation, _)| generation.clone());
+        tracing::debug!(target: "asap_runtime_debug", sid = metadata.sid,
+            policy_fp = %metadata.policy_fp,
+            summary_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(summary_descriptor.id().canonical().as_bytes(), 0)),
+            data_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(data_id.canonical().as_bytes(), 0)),
+            plan_id = catalog_generation.as_ref().map(|g| g.plan_id),
+            plan_version = catalog_generation.as_ref().map(|g| g.plan_version),
+            "SDS descriptor binding resolved");
         Ok(SdsBinding {
+            stored_output_reference,
             metadata: Arc::new(metadata),
             summary_descriptor,
             data_descriptor,
-            catalog_generation: authoritative.map(|(_, generation)| generation),
+            catalog_generation: authoritative.map(|(_, generation, _)| generation),
         })
     }
 
@@ -300,7 +369,7 @@ mod tests {
         policy: u64,
     ) -> SummarySeriesMetadata {
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.into(),
             group_by_keys: BTreeSet::from(["job".into()]),
             capability: None,

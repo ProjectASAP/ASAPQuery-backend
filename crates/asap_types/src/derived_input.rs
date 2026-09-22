@@ -216,7 +216,7 @@ mod tests {
         };
         let state = ExecutionDataState::MAINTENANCE_SUMMARY;
         OwnedPostAsapDag {
-            schema_version: 1,
+            schema_version: crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
             query_id: "query-a".into(),
             root: PostAsapNodeId(root),
             nodes: [source, root]

@@ -13,11 +13,11 @@ use std::time::Duration;
 /// clock crosses `expires_at_ms`, without any state mutation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggStatus {
-    /// Sid is reachable from the current `StreamingConfig`. Writes
+    /// Sid is reachable from the current `InstalledPrecomputePlan`. Writes
     /// accepted; queries see live data.
     Active,
     /// Sid's signature no longer appears in the current
-    /// `StreamingConfig` but its data is still within retention.
+    /// `InstalledPrecomputePlan` but its data is still within retention.
     /// Writes rejected by the §6.3 sid-level ingest barrier
     /// (`SketchStore::ingest_precompute_for_agg_config` returns
     /// `None`); reads allowed for queries that reference the

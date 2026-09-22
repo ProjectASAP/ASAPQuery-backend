@@ -44,7 +44,9 @@ pub struct PrecomputedOutput {
     /// Physical lifetime chosen before execution; never re-resolve a queued
     /// fragment against a newer logical-series mapping.
     #[serde(skip)]
-    pub series_id: Option<u64>,
+    pub storage_handle: Option<u64>,
+    #[serde(skip)]
+    pub stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
     #[serde(skip)]
     pub catalog_generation: Option<std::sync::Arc<asap_types::sds::CatalogGeneration>>,
     #[serde(skip)]
@@ -62,7 +64,7 @@ pub struct PrecomputedOutput {
     #[serde(default)]
     pub origin: Origin,
     /// Content-addressed policy identity. The data plane's only handle
-    /// on which source `AggregationConfig` produced this output.
+    /// on which source `PrecomputeMaterialization` produced this output.
     /// `#[serde(default)]` on read preserves forward-compat with
     /// PR-3 / PR-4-era records that may not have carried the field;
     /// sinks treat `PolicyFingerprint::UNSET` as "skip this output"
@@ -75,7 +77,7 @@ impl PrecomputedOutput {
     /// Construct a `Native` precompute.
     ///
     /// `policy_fp` is the content-addressed handle on the source
-    /// [`asap_types::AggregationConfig`]; sinks use it to look up the
+    /// [`asap_types::PrecomputeMaterialization`]; sinks use it to look up the
     /// config via `PolicyRegistry::get(policy_fp)`. Construction sites
     /// that lack a source config (raw-mode fast-path) pass
     /// [`PolicyFingerprint::UNSET`]; sinks then skip the output.
@@ -86,7 +88,8 @@ impl PrecomputedOutput {
         policy_fp: PolicyFingerprint,
     ) -> Self {
         Self {
-            series_id: None,
+            storage_handle: None,
+            stored_output_reference: None,
             catalog_generation: None,
             input_revision: None,
             start_timestamp,
@@ -115,7 +118,8 @@ impl PrecomputedOutput {
         policy_fp: PolicyFingerprint,
     ) -> Self {
         Self {
-            series_id: None,
+            storage_handle: None,
+            stored_output_reference: None,
             catalog_generation: None,
             input_revision: None,
             start_timestamp,

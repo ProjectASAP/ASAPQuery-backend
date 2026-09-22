@@ -10,8 +10,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::storage_engines::types::StreamingConfig;
-use asap_types::aggregation_config::AggregationConfig;
+use crate::storage_engines::types::InstalledPrecomputePlan;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 
 use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
 use crate::storage_engines::sketch_db::index::SketchStore;
@@ -22,7 +22,7 @@ use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 pub struct SidReconcileSummary {
     /// Sids that transitioned `Active → Retired` because their
     /// content signature is no longer present in the new
-    /// `StreamingConfig`. Already-Retired or already-Expired sids
+    /// `InstalledPrecomputePlan`. Already-Retired or already-Expired sids
     /// are not re-touched.
     pub retired: Vec<u64>,
 }
@@ -35,14 +35,14 @@ pub struct SidReconcileSummary {
 /// behavior.
 /// Ingest-path entry point: reconcile only when `config` is a config
 /// the store has not yet reconciled against. The streaming config is a
-/// lock-free `Arc<ArcSwap<StreamingConfig>>` whose `Arc` identity only
+/// lock-free `Arc<ArcSwap<InstalledPrecomputePlan>>` whose `Arc` identity only
 /// changes on a (rare) control-plane swap, so in steady state every
 /// ingest batch hands us the *same* `Arc`. Gating on the `Arc` data
 /// pointer collapses the per-batch reconcile to a single relaxed atomic
 /// load in that common case, skipping the full catalog scan + any
 /// signature derivation.
 ///
-/// Pass the same `Arc<StreamingConfig>` the ingest batch snapshotted so
+/// Pass the same `Arc<InstalledPrecomputePlan>` the ingest batch snapshotted so
 /// the pointer is stable; the snapshot is held alive for the call's
 /// duration, so the pointer cannot be reused by a concurrently-dropped
 /// config (no ABA hazard within a batch).
@@ -51,7 +51,7 @@ pub struct SidReconcileSummary {
 /// `Some(summary)` with the retired sids when a reconcile actually ran.
 pub fn reconcile_if_config_changed(
     store: &SketchStore,
-    config: &Arc<StreamingConfig>,
+    config: &Arc<InstalledPrecomputePlan>,
     retention: Duration,
 ) -> Option<SidReconcileSummary> {
     let config_ptr = Arc::as_ptr(config) as usize;
@@ -63,7 +63,7 @@ pub fn reconcile_if_config_changed(
 
 pub fn reconcile_from_streaming_config(
     store: &SketchStore,
-    config: &StreamingConfig,
+    config: &InstalledPrecomputePlan,
     retention: Duration,
 ) -> SidReconcileSummary {
     let live_signatures = build_live_signature_set(config);
@@ -87,7 +87,7 @@ pub fn reconcile_from_streaming_config(
         }
         // `live_signatures` is built exclusively from
         // `signature_from_agg_config`, which canonicalizes every
-        // streaming-config `AggregationConfig` to an `AggKind::ExactAgg`
+        // streaming-config `PrecomputeMaterialization` to an `AggKind::ExactAgg`
         // signature (`P`-prefixed). An `AggKind::Sketch` sid (OTLP
         // modified-sketch ingest path: KLL / HLL / DDSketch / CMS /
         // CountSketch) always produces an `S`-prefixed signature, so it
@@ -166,7 +166,7 @@ fn signature_into(
     }
 }
 
-fn signature_from_agg_config(cfg: &AggregationConfig) -> Vec<u8> {
+fn signature_from_agg_config(cfg: &PrecomputeMaterialization) -> Vec<u8> {
     let agg_kind = AggKind::ExactAgg {
         agg_type: cfg.aggregation_type,
         parameters_canonical: canonical_parameters(&cfg.parameters),
@@ -176,7 +176,7 @@ fn signature_from_agg_config(cfg: &AggregationConfig) -> Vec<u8> {
     signature_bytes(&cfg.metric, &agg_kind, &group_by_keys)
 }
 
-fn build_live_signature_set(config: &StreamingConfig) -> HashSet<Vec<u8>> {
+fn build_live_signature_set(config: &InstalledPrecomputePlan) -> HashSet<Vec<u8>> {
     config
         .materializations()
         .values()
@@ -264,7 +264,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -276,8 +276,8 @@ mod tests {
         metric: &str,
         agg_type: AggregationType,
         group_by: Vec<&str>,
-    ) -> AggregationConfig {
-        AggregationConfig::new(
+    ) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             agg_type,
             String::new(),
             HashMap::new(),
@@ -304,7 +304,7 @@ mod tests {
     ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,
@@ -321,12 +321,12 @@ mod tests {
         }
     }
 
-    fn streaming(configs: Vec<AggregationConfig>) -> StreamingConfig {
+    fn streaming(configs: Vec<PrecomputeMaterialization>) -> InstalledPrecomputePlan {
         let mut map = HashMap::new();
         for (i, c) in configs.into_iter().enumerate() {
             map.insert(i as u64 + 1, c);
         }
-        StreamingConfig::new(map)
+        InstalledPrecomputePlan::new(map)
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
     ) -> SummarySeriesMetadata {
         let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,

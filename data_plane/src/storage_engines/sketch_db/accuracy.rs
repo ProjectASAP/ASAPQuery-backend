@@ -1,5 +1,5 @@
 //! `AccuracyProfile` — derived error / confidence bound for each
-//! `AggregationConfig`.
+//! `PrecomputeMaterialization`.
 //!
 //! Implements backend accuracy metadata consumed through SummaryCatalog and QueryPlan. Logical
 //! guarantees are owned by ASAPPlanner and family bounds by summary libraries.
@@ -12,7 +12,7 @@
 //!
 //! ## Scope of this module
 //!
-//! Pure derivation: `derive(&AggregationConfig)`
+//! Pure derivation: `derive(&PrecomputeMaterialization)`
 //! looks at `aggregation_type` and the relevant entries in
 //! `config.parameters` and returns an `AccuracyProfile`. No
 //! runtime measurement, no sampling — just the textbook bound.
@@ -31,14 +31,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use asap_types::aggregation_config::AggregationConfig;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::AggregationType;
 
 pub use asap_types::accuracy::{AccuracyKind, AccuracyProfile};
 use planner_types::post_asap::SketchParams as PlannerParams;
 
 /// Derive an [`AccuracyProfile`] from a pinned
-/// [`AggregationConfig`]. Reads `aggregation_type` and any
+/// [`PrecomputeMaterialization`]. Reads `aggregation_type` and any
 /// necessary entries in `parameters`; falls back to exact for
 /// unknown / legacy variants (harmless — the caller just gets
 /// "0 error" rather than a panic).
@@ -52,7 +52,7 @@ use planner_types::post_asap::SketchParams as PlannerParams;
 /// ε_st`; the random parts compose in quadrature but the staleness part is
 /// adversarial, so linear addition is the honest envelope). δ is
 /// unchanged (staleness is not probabilistic).
-pub fn derive(config: &AggregationConfig) -> AccuracyProfile {
+pub fn derive(config: &PrecomputeMaterialization) -> AccuracyProfile {
     let mut profile = derive_sketch_only(config);
     let eps_st = config
         .parameters
@@ -67,20 +67,20 @@ pub fn derive(config: &AggregationConfig) -> AccuracyProfile {
 
 /// Source adapter for installed aggregation configs.
 pub trait BackendAccuracyProfile {
-    fn derive(config: &AggregationConfig) -> Self;
-    fn derive_sketch_only(config: &AggregationConfig) -> Self;
+    fn derive(config: &PrecomputeMaterialization) -> Self;
+    fn derive_sketch_only(config: &PrecomputeMaterialization) -> Self;
 }
 impl BackendAccuracyProfile for AccuracyProfile {
-    fn derive(config: &AggregationConfig) -> Self {
+    fn derive(config: &PrecomputeMaterialization) -> Self {
         derive(config)
     }
-    fn derive_sketch_only(config: &AggregationConfig) -> Self {
+    fn derive_sketch_only(config: &PrecomputeMaterialization) -> Self {
         derive_sketch_only(config)
     }
 }
 
 /// The sketch's own theoretical bound, without the GOS staleness term.
-fn derive_sketch_only(config: &AggregationConfig) -> AccuracyProfile {
+fn derive_sketch_only(config: &PrecomputeMaterialization) -> AccuracyProfile {
     match config.aggregation_type {
         AggregationType::UnivMon => AccuracyProfile {
             epsilon: f64::MAX,
@@ -91,13 +91,11 @@ fn derive_sketch_only(config: &AggregationConfig) -> AccuracyProfile {
         // `DeltaSetAggregator` exact-set-membership family lived
         // here too before its retirement.)
         AggregationType::Sum
+        | AggregationType::Count
         | AggregationType::Increase
+        | AggregationType::Rate
         | AggregationType::Min
-        | AggregationType::Max
-        | AggregationType::MultipleSum
-        | AggregationType::MultipleIncrease
-        | AggregationType::MultipleMin
-        | AggregationType::MultipleMax => AccuracyProfile::exact(),
+        | AggregationType::Max => AccuracyProfile::exact(),
 
         AggregationType::CountMinSketch => {
             let (rows, cols) = cms_params(config);
@@ -220,7 +218,7 @@ fn shared_profile(params: PlannerParams) -> AccuracyProfile {
 // authority on *accuracy*, not on *construction*.
 
 /// Read canonical depth `d` and width `w` parameters.
-fn cms_params(config: &AggregationConfig) -> (u64, u64) {
+fn cms_params(config: &PrecomputeMaterialization) -> (u64, u64) {
     let rows = config
         .parameters
         .get("d")
@@ -234,7 +232,7 @@ fn cms_params(config: &AggregationConfig) -> (u64, u64) {
     (rows, cols)
 }
 
-fn hll_precision(config: &AggregationConfig) -> u32 {
+fn hll_precision(config: &PrecomputeMaterialization) -> u32 {
     config
         .parameters
         .get("precision")
@@ -244,7 +242,7 @@ fn hll_precision(config: &AggregationConfig) -> u32 {
         .unwrap_or(14)
 }
 
-fn kll_k(config: &AggregationConfig) -> u32 {
+fn kll_k(config: &PrecomputeMaterialization) -> u32 {
     config
         .parameters
         .get("K")
@@ -254,7 +252,7 @@ fn kll_k(config: &AggregationConfig) -> u32 {
         .unwrap_or(200)
 }
 
-fn ddsketch_alpha(config: &AggregationConfig) -> f64 {
+fn ddsketch_alpha(config: &PrecomputeMaterialization) -> f64 {
     config
         .parameters
         .get("alpha")
@@ -266,7 +264,7 @@ fn ddsketch_alpha(config: &AggregationConfig) -> f64 {
 /// from `parameters["heap_size"]` with a default of 100 —
 /// matches the default the control plane's planner uses when the
 /// caller didn't override.
-fn cms_heap_size(config: &AggregationConfig) -> u64 {
+fn cms_heap_size(config: &PrecomputeMaterialization) -> u64 {
     config
         .parameters
         .get("heap_size")
@@ -373,8 +371,11 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
-    fn base_config(agg_type: AggregationType, params: HashMap<String, Value>) -> AggregationConfig {
-        AggregationConfig::new(
+    fn base_config(
+        agg_type: AggregationType,
+        params: HashMap<String, Value>,
+    ) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             agg_type,
             String::new(),
             params,

@@ -299,7 +299,7 @@ mod tests {
         expires: Option<u64>,
     ) -> SummarySeriesMetadata {
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.into(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),

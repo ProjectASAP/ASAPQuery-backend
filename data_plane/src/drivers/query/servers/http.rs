@@ -9,10 +9,13 @@ use axum::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
+
+static NEXT_PLAN_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::drivers::query::adapters::{AdapterConfig, HttpProtocolAdapter, PrometheusHttpAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
@@ -134,7 +137,7 @@ pub struct HttpServer {
     /// `QueryEngine`) and extended via [`Self::with_query_engine`] —
     /// e.g. to plug in a `GorillaQueryEngine` for the cold archive
     /// tier. Instant-query dispatch consults this for metrics whose
-    /// `StreamingConfig::storage_backend()` is anything other than
+    /// `InstalledPrecomputePlan::storage_backend()` is anything other than
     /// `SketchStore`; ASAP-tier queries still take the direct
     /// `ASAPQueryEngine::handle_query` path so they keep the
     /// `KeyByLabelNames` Prometheus needs to populate the `metric`
@@ -142,9 +145,9 @@ pub struct HttpServer {
     query_router: Arc<EngineRouter>,
     /// Sketch storage for runtime diagnostics.
     summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
-    /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
+    /// Hot-reloadable `InstalledPrecomputePlan` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
-    hot_reload_config: Option<crate::storage_engines::types::StreamingConfigHandle>,
+    hot_reload_config: Option<crate::storage_engines::types::InstalledPrecomputePlanHandle>,
     /// Per-metric storage-backend routing table consulted by the HTTP
     /// instant-query handler at request time. When `Some(..)` and the
     /// query parses, the handler extracts the metric name from the
@@ -201,7 +204,7 @@ struct AppState {
     summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
-    hot_reload_config: Option<crate::storage_engines::types::StreamingConfigHandle>,
+    hot_reload_config: Option<crate::storage_engines::types::InstalledPrecomputePlanHandle>,
     /// See [`HttpServer::backend_storage_routing`].
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
     /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
@@ -289,13 +292,11 @@ impl HttpServer {
         self
     }
 
-    /// Attach a `StreamingConfigHandle` handle so the
-    /// `GET/POST /api/v1/streaming-config` endpoints can read and
-    /// swap the currently active config. Without this handle the
-    /// endpoints return `503 Service Unavailable`.
+    /// Attach the precompute projection used by installed-plan consumers.
+    /// Computation changes are published through the complete physical plan.
     pub fn with_hot_reload_config(
         mut self,
-        handle: crate::storage_engines::types::StreamingConfigHandle,
+        handle: crate::storage_engines::types::InstalledPrecomputePlanHandle,
     ) -> Self {
         self.hot_reload_config = Some(handle);
         self
@@ -328,7 +329,7 @@ impl HttpServer {
     /// and dispatches through `EngineRouter` for any per-metric
     /// override. Without the wrapper the handler falls back to the
     /// pre-Phase-5 single-axis behaviour driven by
-    /// `StreamingConfig::storage_backend()`.
+    /// `InstalledPrecomputePlan::storage_backend()`.
     pub fn with_backend_storage_routing(
         mut self,
         routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
@@ -484,17 +485,6 @@ impl HttpServer {
                 "/api/v1/db/backfill/jobs/:job_id",
                 get(handle_get_backfill_job).delete(handle_delete_backfill_job),
             );
-        // Legacy partial configuration is available only when the distributed
-        // profile explicitly supplies its hot-reload handle. The ASAPQuery
-        // profile exposes only generation-scoped physical-plan publication.
-        let app = if app_state.hot_reload_config.is_some() {
-            app.route(
-                "/api/v1/streaming-config",
-                get(handle_get_streaming_config).post(handle_post_streaming_config),
-            )
-        } else {
-            app
-        };
         let app = if adapter.query_language() == asap_types::QueryLanguage::MetricsQl {
             app.route(
                 "/select/:tenant/prometheus/api/v1/query",
@@ -610,14 +600,6 @@ impl HttpServer {
                 "/api/v1/db/backfill/jobs/:job_id",
                 get(handle_get_backfill_job).delete(handle_delete_backfill_job),
             );
-        let app = if app_state.hot_reload_config.is_some() {
-            app.route(
-                "/api/v1/streaming-config",
-                get(handle_get_streaming_config).post(handle_post_streaming_config),
-            )
-        } else {
-            app
-        };
         let app = if adapter.query_language() == asap_types::QueryLanguage::MetricsQl {
             app.route(
                 "/select/:tenant/prometheus/api/v1/query",
@@ -783,7 +765,7 @@ async fn process_query_request(
     //       AST and looked up in the table. This is the production
     //       path the issue-46 MVP relies on so non-default metrics
     //       actually route through the `EngineRouter`.
-    //   (b) Single-axis `StreamingConfig::storage_backend()` from the
+    //   (b) Single-axis `InstalledPrecomputePlan::storage_backend()` from the
     //       hot-reload config (the pre-Phase-5 fallback). Pre-control-plane
     //       deploys ride this path; it always lands on `SketchStore`
     //       unless the YAML was hand-patched.
@@ -961,12 +943,12 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                     return backend;
                 }
                 debug!(
-                    "resolve_metric_storage: PromQL parsed but no metric name found in AST; falling back to streaming-config axis",
+                    "resolve_metric_storage: PromQL parsed but no metric name found in AST; falling back to installed storage axis",
                 );
             }
             Err(e) => {
                 debug!(
-                    "resolve_metric_storage: PromQL parse failed ({}); falling back to streaming-config axis",
+                    "resolve_metric_storage: PromQL parse failed ({}); falling back to installed storage axis",
                     e,
                 );
             }
@@ -1004,9 +986,9 @@ fn metric_has_exact_agg_sum_sid(
                     cap,
                     Capability::ExactAgg(
                         AggregationType::Sum
-                            | AggregationType::MultipleSum
+                            | AggregationType::Count
                             | AggregationType::Increase
-                            | AggregationType::MultipleIncrease
+                            | AggregationType::Rate
                     )
                 ) {
                     return true;
@@ -1379,7 +1361,7 @@ async fn process_via_named_engine(
 /// pinned by the request:
 ///
 /// * `query` — straight from the parsed request.
-/// * `metric_storage` — looked up from the hot-reload `StreamingConfig`
+/// * `metric_storage` — looked up from the hot-reload `InstalledPrecomputePlan`
 ///   by the caller.
 ///
 /// `Statistic` remains a shape-derived follow-up. `AccuracyTarget` is
@@ -2007,7 +1989,7 @@ async fn handle_runtime_info(
     let mut forwarding_headers = HashMap::new();
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
-            debug!("Found Authorization header for runtime info: {}", auth_str);
+            debug!("Found Authorization header for runtime info");
             forwarding_headers.insert("Authorization".to_string(), auth_str.to_string());
         }
     } else {
@@ -2480,7 +2462,7 @@ mod tests {
     use crate::precompute_engine::ingest_handler::{IngestObservability, IngestState};
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::query_engines::ASAPQueryEngine;
-    use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlan, InstalledPrecomputePlanHandle};
     use prost::Message;
     use reqwest::Client;
     use std::sync::atomic::AtomicU64;
@@ -2497,7 +2479,7 @@ mod tests {
             IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
             PLANNER_REVISION,
         };
-        let streaming_config = Arc::new(StreamingConfig::default());
+        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
         let envelope = PlanEnvelope {
             plan_id: 7,
             plan_version: 1,
@@ -2547,7 +2529,7 @@ mod tests {
                     },
                     rules: Vec::new(),
                 },
-                streaming_config: streaming_config.clone(),
+                installed_precompute_plan: installed_precompute_plan.clone(),
                 query_plan: Arc::new(asap_types::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
@@ -2560,7 +2542,7 @@ mod tests {
                 ),
             },
         );
-        let hot_reload = StreamingConfigHandle::from_active_physical_plan(active.clone());
+        let hot_reload = InstalledPrecomputePlanHandle::from_active_physical_plan(active.clone());
         let (sender, _worker) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -2649,7 +2631,9 @@ mod tests {
         );
     }
 
-    async fn setup_test_server_with_hot_reload(hot_reload: Option<StreamingConfigHandle>) -> u16 {
+    async fn setup_test_server_with_hot_reload(
+        hot_reload: Option<InstalledPrecomputePlanHandle>,
+    ) -> u16 {
         let adapter_config = AdapterConfig::prometheus_promql(
             "http://127.0.0.1:9999".to_string(), // Unused for this test
             false,                               // forward_unsupported_queries
@@ -2661,7 +2645,7 @@ mod tests {
             adapter_config,
         };
 
-        let streaming_config = Arc::new(StreamingConfig::default());
+        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
         let mut server = HttpServer::new(
@@ -2841,107 +2825,22 @@ mod tests {
         assert!(status.is_success() || status == reqwest::StatusCode::OK);
     }
 
-    // ── StreamingConfig hot-reload (PR E) ────────────────────────────────
+    // ── InstalledPrecomputePlan hot-reload (PR E) ────────────────────────────────
 
-    /// POST a YAML streaming-config and verify the active state via
-    /// GET reflects the swap. Covers the full round-trip through
-    /// `HttpServer::with_hot_reload_config`, the POST parse+swap, and
-    /// the GET snapshot emission.
+    /// A retired partial-configuration route cannot mutate the active plan.
     #[tokio::test]
-    async fn test_streaming_config_hot_reload_round_trip() {
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
-        let server_port = setup_test_server_with_hot_reload(Some(hot_reload.clone())).await;
-        let client = Client::new();
-
-        // Initial GET: empty config, 0 entries.
-        let initial = client
-            .get(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
+    async fn flat_streaming_config_is_rejected_without_mutating_active_state() {
+        let handle = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
+        let port = setup_test_server_with_hot_reload(Some(handle.clone())).await;
+        let before = handle.snapshot();
+        let response = Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/v1/streaming-config"))
+            .body("aggregations: [{aggregationType: Sum, metric: m}]")
             .send()
             .await
-            .expect("GET failed");
-        assert!(initial.status().is_success());
-        let initial_body: serde_json::Value = initial.json().await.unwrap();
-        assert_eq!(initial_body["aggregation_count"], 0);
-
-        // POST a new config with two aggregation_ids. The YAML shape
-        // matches what `StreamingConfig::from_yaml_data` parses — see
-        // `asap-common/dependencies/rs/asap_types/src/streaming_config.rs`.
-        let new_config_yaml = r#"
-aggregations:
-  - aggregationId: 101
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: cpu_usage
-    labels:
-      grouping: [host]
-      rollup: []
-      aggregated: []
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-  - aggregationId: 102
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: mem_usage
-    labels:
-      grouping: [host, region]
-      rollup: []
-      aggregated: []
-    parameters: {}
-    windowSize: 120
-    windowType: tumbling
-    spatialFilter: ''
-"#;
-        let post_resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
-            .header("content-type", "application/x-yaml")
-            .body(new_config_yaml.to_string())
-            .send()
-            .await
-            .expect("POST failed");
-        let post_status = post_resp.status();
-        let post_body: serde_json::Value = post_resp.json().await.unwrap();
-        assert!(
-            post_status.is_success(),
-            "POST returned {post_status}: {post_body}"
-        );
-        assert_eq!(post_body["status"], "success");
-        assert_eq!(post_body["new_aggregation_count"], 2);
-        // PR 5: the YAML's `aggregationId` fields are silently
-        // dropped — `agg_ids_added` carries fingerprint u64s.
-        let added = post_body["agg_ids_added"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap())
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(added.len(), 2, "exactly two distinct aggs were added");
-        assert!(added.iter().all(|id| *id != 0), "fingerprints are non-zero");
-
-        // GET again: should reflect the two new ids.
-        let after = client
-            .get(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
-            .send()
-            .await
-            .expect("GET after swap failed");
-        assert!(after.status().is_success());
-        let after_body: serde_json::Value = after.json().await.unwrap();
-        assert_eq!(after_body["aggregation_count"], 2);
-
-        // The underlying StreamingConfigHandle handle (cloned into
-        // the server at setup) also reflects the swap — proving that
-        // downstream consumers that re-snapshot would see the new
-        // state. PR 5: the map is keyed on fingerprints, so just
-        // assert the entry count.
-        let direct_snap = hot_reload.snapshot();
-        assert_eq!(direct_snap.materializations_by_policy_fingerprint.len(), 2);
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(Arc::ptr_eq(&before, &handle.snapshot()));
     }
 
     #[tokio::test]
@@ -2972,7 +2871,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_streaming_config_hot_reload_rejects_bad_yaml() {
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
@@ -2984,9 +2883,7 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "error");
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     /// Set up a test server wired with a hot-reload handle and a
@@ -2997,7 +2894,7 @@ aggregations:
     /// legacy `SchemaRegistry` is gone, so there is no longer a
     /// `schemas` parameter — every reconcile decision is sid-level.
     async fn setup_test_server_with_hot_reload_and_sketch_index(
-        hot_reload: StreamingConfigHandle,
+        hot_reload: InstalledPrecomputePlanHandle,
         summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> u16 {
         let adapter_config =
@@ -3007,7 +2904,7 @@ aggregations:
             handle_http_requests: true,
             adapter_config,
         };
-        let streaming_config = Arc::new(StreamingConfig::default());
+        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let server =
             HttpServer::new(config, query_engine, summary_store).with_hot_reload_config(hot_reload);
@@ -3032,7 +2929,7 @@ aggregations:
         use std::collections::BTreeSet;
         let group_by_keys: BTreeSet<String> = group_by.iter().map(|s| s.to_string()).collect();
         store.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,
@@ -3050,192 +2947,6 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn test_streaming_config_swap_drives_sid_reconcile() {
-        // Schema retirement final cut: the swap handler now drives a
-        // single sid-level reconcile (no `SchemaRegistry`). Sids that
-        // already exist in the catalog and whose content signature
-        // does not appear in the new config get force-retired; the
-        // response surfaces them under `sids_retired`. There is no
-        // `sids_added` — sids are minted lazily by the ingest path,
-        // not by the swap handler.
-        use crate::storage_engines::sketch_db::index::SketchStore;
-        use crate::storage_engines::sketch_db::AggStatus;
-
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
-        let summary_store = Arc::new(SketchStore::new());
-        // Pre-register two Active sids whose signatures match the
-        // first config below; only sid 1 will survive the second
-        // swap.
-        register_precompute_sid(&summary_store, 1, "cpu_usage", &["host"]);
-        register_precompute_sid(&summary_store, 2, "mem_usage", &["host"]);
-        let server_port = setup_test_server_with_hot_reload_and_sketch_index(
-            hot_reload.clone(),
-            summary_store.clone(),
-        )
-        .await;
-        let client = Client::new();
-
-        // POST a config whose signatures cover both pre-registered
-        // sids. Nothing should retire.
-        let yaml_two = r#"
-aggregations:
-  - aggregationId: 101
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: cpu_usage
-    labels:
-      grouping: [host]
-      rollup: []
-      aggregated: []
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-  - aggregationId: 202
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: mem_usage
-    labels:
-      grouping: [host]
-      rollup: []
-      aggregated: []
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-"#;
-        let resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
-            .header("content-type", "application/x-yaml")
-            .body(yaml_two.to_string())
-            .send()
-            .await
-            .expect("POST failed");
-        assert!(resp.status().is_success());
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "success");
-        let retired_ids = body["sids_retired"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            retired_ids.is_empty(),
-            "no sid should retire when every signature still appears in the new config; got {retired_ids:?}",
-        );
-        assert_eq!(
-            summary_store.instance(1).unwrap().status(),
-            AggStatus::Active
-        );
-        assert_eq!(
-            summary_store.instance(2).unwrap().status(),
-            AggStatus::Active
-        );
-
-        // Swap to a config that drops `mem_usage`. Sid 2's signature
-        // is now orphaned; the handler must force-retire it.
-        let yaml_one = r#"
-aggregations:
-  - aggregationId: 101
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: cpu_usage
-    labels:
-      grouping: [host]
-      rollup: []
-      aggregated: []
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-"#;
-        let resp2 = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
-            .header("content-type", "application/x-yaml")
-            .body(yaml_one.to_string())
-            .send()
-            .await
-            .expect("POST failed");
-        let body2: serde_json::Value = resp2.json().await.unwrap();
-        let retired = body2["sids_retired"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(retired, vec![2u64]);
-        assert_eq!(
-            summary_store.instance(1).unwrap().status(),
-            AggStatus::Active
-        );
-        assert_eq!(
-            summary_store.instance(2).unwrap().status(),
-            AggStatus::Retired
-        );
-    }
-
-    #[tokio::test]
-    async fn test_streaming_config_swap_response_shape_with_empty_catalog() {
-        // With no registered sids, the swap still works — it just
-        // produces an empty `sids_retired` array. The `agg_ids_added`
-        // / `agg_ids_removed` / `new_aggregation_count` fields are
-        // driven purely by the diff of the two configs and are
-        // independent of the sid catalog.
-        //
-        // PR 5: the YAML's `aggregationId: 42` is silently dropped at
-        // parse time — the backend identity is content-addressed via
-        // `PolicyFingerprint::from_config`. The `agg_ids_added` u64
-        // in the HTTP response is the fingerprint's `as_u64()` form,
-        // NOT the literal `42` the YAML once spelled out.
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
-        let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
-        let client = Client::new();
-
-        let yaml = r#"
-aggregations:
-  - aggregationType: Sum
-    aggregationSubType: ''
-    metric: m
-    labels:
-      grouping: []
-      rollup: []
-      aggregated: []
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-"#;
-        let resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
-            .header("content-type", "application/x-yaml")
-            .body(yaml.to_string())
-            .send()
-            .await
-            .expect("POST failed");
-        assert!(resp.status().is_success());
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "success");
-        assert_eq!(body["new_aggregation_count"], 1);
-        let added = body["agg_ids_added"].as_array().expect("array");
-        assert_eq!(added.len(), 1, "exactly one agg was added");
-        assert_ne!(
-            added[0].as_u64().unwrap(),
-            0,
-            "agg id is not the 0 sentinel"
-        );
-        assert_eq!(body["agg_ids_removed"], serde_json::json!([]));
-        // No pre-registered sids → nothing to retire.
-        assert_eq!(body["sids_retired"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
     async fn test_get_schemas_returns_active_and_retired_sids_with_status_filter() {
         // Schema retirement final cut: `/api/v1/db/schemas` now
         // surfaces sid-catalog entries. Pre-register two sids, then
@@ -3243,7 +2954,7 @@ aggregations:
         // handler force-retires it.
         use crate::storage_engines::sketch_db::index::SketchStore;
 
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
         let summary_store = Arc::new(SketchStore::new());
         register_precompute_sid(&summary_store, 1, "m1", &[]);
         register_precompute_sid(&summary_store, 2, "m2", &[]);
@@ -3254,29 +2965,12 @@ aggregations:
         .await;
         let client = Client::new();
 
-        // Retire sid 2 by pushing a config covering only `m1`.
-        let yaml_one = r#"
-aggregations:
-  - aggregationId: 1
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: m1
-    labels: { grouping: [], rollup: [], aggregated: [] }
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-"#;
-        let resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
-            .header("content-type", "application/x-yaml")
-            .body(yaml_one.to_string())
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
+        assert!(summary_store
+            .force_retire(
+                2,
+                crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION
+            )
+            .is_some());
 
         // GET /api/v1/db/schemas (no filter = all).
         let resp = client
@@ -3290,11 +2984,11 @@ aggregations:
         assert_eq!(body["count"], 2);
         let entries = body["schemas"].as_array().unwrap();
         // Sorted by sid — first is active, second is retired.
-        assert_eq!(entries[0]["sid"], 1);
+        assert_eq!(entries[0]["storage_handle"], 1);
         assert_eq!(entries[0]["status"], "active");
         assert_eq!(entries[0]["metric_name"], "m1");
         assert!(entries[0]["retired_at_ms"].is_null());
-        assert_eq!(entries[1]["sid"], 2);
+        assert_eq!(entries[1]["storage_handle"], 2);
         assert_eq!(entries[1]["status"], "retired");
         assert!(entries[1]["retired_at_ms"].is_u64());
 
@@ -3308,7 +3002,7 @@ aggregations:
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["count"], 1);
-        assert_eq!(body["schemas"][0]["sid"], 1);
+        assert_eq!(body["schemas"][0]["storage_handle"], 1);
 
         // Filter: retired only.
         let resp = client
@@ -3320,7 +3014,7 @@ aggregations:
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["count"], 1);
-        assert_eq!(body["schemas"][0]["sid"], 2);
+        assert_eq!(body["schemas"][0]["storage_handle"], 2);
 
         // Bogus filter → 400.
         let resp = client
@@ -3339,7 +3033,7 @@ aggregations:
         // attached (every `HttpServer` carries one). With no
         // registered sids the endpoint reports an empty array, not
         // a 503.
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
@@ -3365,7 +3059,7 @@ aggregations:
         use crate::storage_engines::sketch_db::index::SketchStore;
         use crate::storage_engines::sketch_db::AggStatus;
 
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
         let summary_store = Arc::new(SketchStore::new());
         register_precompute_sid(&summary_store, 11, "cpu", &["host"]);
         register_precompute_sid(&summary_store, 22, "mem", &["host"]);
@@ -3387,7 +3081,7 @@ aggregations:
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
-        assert_eq!(body["schema"]["sid"], 11);
+        assert_eq!(body["schema"]["storage_handle"], 11);
         assert_eq!(body["schema"]["status"], "retired");
         assert_eq!(
             summary_store.instance(11).unwrap().status(),
@@ -3405,7 +3099,7 @@ aggregations:
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
-        assert_eq!(body["schema"]["sid"], 22);
+        assert_eq!(body["schema"]["storage_handle"], 22);
         assert_eq!(body["schema"]["status"], "expired");
         assert_eq!(
             summary_store.instance(22).unwrap().status(),
@@ -3430,7 +3124,7 @@ aggregations:
     async fn test_get_timeline_missing_param_returns_400() {
         use crate::storage_engines::sketch_db::index::SketchStore;
 
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
         let summary_store = Arc::new(SketchStore::new());
         let server_port = setup_test_server_with_hot_reload_and_sketch_index(
             hot_reload.clone(),
@@ -3476,7 +3170,7 @@ aggregations:
         // reads from the sid catalog (always attached) instead of the
         // optional `SchemaRegistry`. Empty catalog → empty segments,
         // not a 503.
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
         let resp = client
@@ -3513,7 +3207,7 @@ aggregations:
         registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
         active_agg_ids: &[u64],
     ) -> (u16, std::collections::HashMap<u64, u64>) {
-        use asap_types::aggregation_config::AggregationConfig;
+        use asap_types::aggregation_config::PrecomputeMaterialization;
         use asap_types::enums::WindowKind;
         use asap_types::AggregationType;
         use asap_types::KeyByLabelNames;
@@ -3526,7 +3220,7 @@ aggregations:
             handle_http_requests: true,
             adapter_config,
         };
-        // Build a StreamingConfig with one Sum agg per `active_agg_ids`
+        // Build a InstalledPrecomputePlan with one Sum agg per `active_agg_ids`
         // so the backfill handler's agg-config lookup (post-schema-
         // retirement) can find them. The matching sid in the catalog
         // is registered via the canonical ingest path so its content
@@ -3535,7 +3229,7 @@ aggregations:
         let mut marker_to_fp = std::collections::HashMap::new();
         for marker in active_agg_ids {
             let metric = format!("metric_{marker}");
-            let cfg = AggregationConfig {
+            let cfg = PrecomputeMaterialization {
                 population_key_encoding: Default::default(),
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
@@ -3568,8 +3262,8 @@ aggregations:
             marker_to_fp.insert(*marker, fp);
             agg_map.insert(fp, cfg);
         }
-        let streaming_config = Arc::new(StreamingConfig::new(agg_map));
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_config.clone());
+        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::new(agg_map));
+        let hot_reload = InstalledPrecomputePlanHandle::from_arc(installed_precompute_plan.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let summary_store = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
         for marker in active_agg_ids {
@@ -3728,7 +3422,7 @@ aggregations:
     async fn test_backfill_endpoints_503_without_registry() {
         // Build a server with NO backfill registry attached — every
         // backfill endpoint should 503.
-        let hot_reload = StreamingConfigHandle::new(StreamingConfig::default());
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
@@ -3917,10 +3611,10 @@ aggregations:
     }
 
     /// Build an `HttpServer` whose router holds the supplied set of
-    /// `QueryEngine`s. The hot-reload `StreamingConfig` is pinned at
+    /// `QueryEngine`s. The hot-reload `InstalledPrecomputePlan` is pinned at
     /// `metric_storage_backend` so query dispatch follows the
     /// requested capability axis. Returns the bound port + the
-    /// `StreamingConfigHandle` handle so tests can swap the
+    /// `InstalledPrecomputePlanHandle` handle so tests can swap the
     /// `storage_backend` mid-flight if they need to.
     async fn setup_test_server_with_router(
         metric_storage_backend: StorageBackend,
@@ -3946,10 +3640,12 @@ aggregations:
         };
         // Pin `storage_backend` on the streaming config so the http
         // dispatcher reads it back through the hot-reload handle.
-        let streaming_cfg =
-            StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
+        let streaming_cfg = InstalledPrecomputePlan::with_storage_backend(
+            Default::default(),
+            metric_storage_backend,
+        );
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
+        let hot_reload = InstalledPrecomputePlanHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
@@ -3991,9 +3687,9 @@ aggregations:
         // — exactly what the production deploy looks like (the YAML
         // loader doesn't parse `storage_backend`). All routing
         // decisions must come from the per-metric routing table.
-        let streaming_cfg = StreamingConfig::default();
+        let streaming_cfg = InstalledPrecomputePlan::default();
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
+        let hot_reload = InstalledPrecomputePlanHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
@@ -4213,9 +3909,9 @@ aggregations:
 
     #[tokio::test]
     async fn http_query_with_no_storage_config_defaults_to_asap_tier() {
-        // `StreamingConfig::default()` has `storage_backend =
+        // `InstalledPrecomputePlan::default()` has `storage_backend =
         // SketchStore` (per the `#[serde(default)]` on the
-        // field — see `streaming_config.rs`). A server set up
+        // field — see `installed_precompute_plan.rs`). A server set up
         // without a hot-reload handle still infers ASAP-tier and
         // takes the ASAPQueryEngine direct path. Back-compat for
         // pre-Phase-5 deploys whose YAML doesn't include the new
@@ -4405,10 +4101,8 @@ aggregations:
     // mock the routing decision by pinning `streaming_cfg.storage_backend
     // = GorillaObjectStore` directly. That proves the dispatch BRANCH is
     // wired, but not the production code path — in real deploys the
-    // streaming-config YAML loader drops `storage_backend` (it always
-    // defaults to `SketchStore`), so the issue-46 v2 demo's queries
-    // never reached the EngineRouter. The tests below exercise the
-    // **production path** end-to-end: streaming config stays default,
+    // installed precompute view uses the default storage backend.
+    // The tests below exercise per-metric routing end-to-end:
     // a per-metric `BackendStorageRouting` table is loaded at startup
     // (mirroring `--backend-storage-routing` on `precompute_engine`),
     // and the handler must consult the table on every request.
@@ -4895,7 +4589,9 @@ aggregations:
         crate::query_engines::routing::HotReloadBackendStorageRouting,
     ) {
         use crate::query_engines::routing::HotReloadBackendStorageRouting;
-        use crate::storage_engines::types::{StreamingConfig, StreamingConfigHandle};
+        use crate::storage_engines::types::{
+            InstalledPrecomputePlan, InstalledPrecomputePlanHandle,
+        };
 
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
@@ -4904,9 +4600,9 @@ aggregations:
             handle_http_requests: true,
             adapter_config,
         };
-        let streaming_cfg = StreamingConfig::default();
+        let streaming_cfg = InstalledPrecomputePlan::default();
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
+        let hot_reload = InstalledPrecomputePlanHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let routing_handle = HotReloadBackendStorageRouting::empty();
         let server = HttpServer::new(
@@ -5226,10 +4922,12 @@ aggregations:
             handle_http_requests: true,
             adapter_config,
         };
-        let streaming_cfg =
-            StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
+        let streaming_cfg = InstalledPrecomputePlan::with_storage_backend(
+            Default::default(),
+            metric_storage_backend,
+        );
         let streaming_arc = Arc::new(streaming_cfg);
-        let hot_reload = StreamingConfigHandle::from_arc(streaming_arc.clone());
+        let hot_reload = InstalledPrecomputePlanHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
@@ -5275,7 +4973,7 @@ aggregations:
             handle_http_requests: true,
             adapter_config,
         };
-        let streaming_arc = Arc::new(StreamingConfig::default());
+        let streaming_arc = Arc::new(InstalledPrecomputePlan::default());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let cache = Arc::new(crate::query_engines::routing::FreshnessProbeCache::new());
         let server = HttpServer::new(
@@ -5595,129 +5293,18 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-// Streaming configuration endpoints: GET returns the active snapshot; POST
-// parses a replacement and atomically publishes it to new snapshot readers.
-// In-flight operations retain their existing snapshot.
-
-async fn handle_get_streaming_config(State(state): State<AppState>) -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-
-    let Some(handle) = state.hot_reload_config else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
-    let snap = handle.snapshot();
-    let body = serde_json::json!({
-        "status": "success",
-        "aggregation_count": snap.materializations_by_policy_fingerprint.len(),
-        "aggregation_ids": snap.materializations_by_policy_fingerprint.keys().copied().collect::<Vec<_>>(),
-        "streaming_config": &*snap});
-    (StatusCode::OK, axum::Json(body)).into_response()
-}
-
-async fn handle_post_streaming_config(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    use std::collections::HashSet;
-
-    let Some(handle) = state.hot_reload_config else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
-
-    let yaml_text = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(e) => {
-            let body = serde_json::json!({
-                "status": "error",
-                "error": format!("request body is not valid UTF-8: {e}")});
-            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
-        }
-    };
-    let yaml_value: serde_yaml::Value = match serde_yaml::from_str(yaml_text) {
-        Ok(v) => v,
-        Err(e) => {
-            let body = serde_json::json!({
-                "status": "error",
-                "error": format!("YAML parse error: {e}")});
-            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
-        }
-    };
-    let new_config =
-        match crate::storage_engines::types::StreamingConfig::from_yaml_data(&yaml_value) {
-            Ok(c) => c,
-            Err(e) => {
-                let body = serde_json::json!({
-                    "status": "error",
-                    "error": format!("StreamingConfig build error: {e}")});
-                return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
-            }
-        };
-
-    let new_ids: HashSet<u64> = new_config
-        .materializations_by_policy_fingerprint
-        .keys()
-        .copied()
-        .collect();
-    let old_arc = handle.swap(new_config);
-    let old_ids: HashSet<u64> = old_arc
-        .materializations_by_policy_fingerprint
-        .keys()
-        .copied()
-        .collect();
-    let added: Vec<u64> = new_ids.difference(&old_ids).copied().collect();
-    let removed: Vec<u64> = old_ids.difference(&new_ids).copied().collect();
-
-    if !removed.is_empty() {
-        warn!(
-            "streaming-config hot-reload removed agg_ids {:?} — any in-flight \
-             precompute worker groups for these ids will continue with their \
-             construction-time config until they close naturally (phase 1 \
-             limitation; see StreamingConfigHandle module doc)",
-            removed
-        );
-    }
-
-    // Schema retirement final cut: the sid catalog is the only
-    // lifecycle registry. The legacy per-`agg_id` `SchemaRegistry` is
-    // gone, so the swap handler now drives a single sid-level
-    // reconcile (`reconcile_from_streaming_config`) which force-retires
-    // any sid whose content signature no longer appears in the new
-    // config. There is no "added" set: sids are minted lazily at the
-    // first ingest write under the new config (see
-    // `SketchStore::ingest_precompute_for_agg_config`).
-    let snap = handle.snapshot();
-    let sid_summary = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
-        state.summary_store.as_ref(),
-        snap.as_ref(),
-        crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
-    );
-
-    let body = serde_json::json!({
-        "status": "success",
-        "agg_ids_added": added,
-        "agg_ids_removed": removed,
-        "new_aggregation_count": new_ids.len(),
-        "sids_retired": sid_summary.retired});
-    (StatusCode::OK, axum::Json(body)).into_response()
-}
-
 pub use asap_types::plan_publication::PhysicalPlanInstallRequest;
 
 /// Decode and cross-validate every backend view before it can become visible.
 /// Used by both startup artifact loading and the staged HTTP install path.
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(plan_id = request.transmission_plan.envelope.plan_id,
+        plan_version = request.transmission_plan.envelope.plan_version))]
 pub fn validate_and_build_runtime_plan(
     request: PhysicalPlanInstallRequest,
     default_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 ) -> Result<crate::storage_engines::types::RuntimePhysicalPlan, String> {
+    tracing::debug!(target: "asap_runtime_debug", "backend runtime plan validation started");
     use std::collections::BTreeSet;
     request
         .precompute_plan
@@ -5740,7 +5327,7 @@ pub fn validate_and_build_runtime_plan(
         &request.precompute_plan,
         &request.query_plan,
     )?;
-    let runtime_materializations = request
+    let _runtime_materializations = request
         .precompute_plan
         .runtime_materializations()
         .map_err(|error| format!("PrecomputePlan validation error: {error}"))?;
@@ -5755,9 +5342,12 @@ pub fn validate_and_build_runtime_plan(
     {
         return Err("physical subplans have different plan identity/version".into());
     }
-    let streaming_config =
-        crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
-    let typed_fps: BTreeSet<_> = streaming_config
+    let installed_precompute_plan =
+        crate::storage_engines::types::InstalledPrecomputePlan::from_precompute_plan(
+            request.precompute_plan.clone(),
+        )
+        .map_err(|error| format!("DAG execution installation failed: {error}"))?;
+    let typed_fps: BTreeSet<_> = installed_precompute_plan
         .materializations_by_policy_fingerprint
         .keys()
         .copied()
@@ -5783,7 +5373,7 @@ pub fn validate_and_build_runtime_plan(
         summary_catalog: Some(Arc::new(request.summary_catalog)),
         precompute_plan: request.precompute_plan,
         transmission_plan: request.transmission_plan,
-        streaming_config: Arc::new(streaming_config),
+        installed_precompute_plan: Arc::new(installed_precompute_plan),
         query_plan: Arc::new(request.query_plan),
         storage_routing,
     })
@@ -5797,8 +5387,25 @@ async fn handle_post_physical_plan(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    let call_id = NEXT_PLAN_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let requested_plan_id = request.transmission_plan.envelope.plan_id;
+    let requested_plan_version = request.transmission_plan.envelope.plan_version;
+    tracing::debug!(target: "asap_runtime_debug",
+        call_id,
+        plan_id = requested_plan_id,
+        plan_version = requested_plan_version,
+        "physical plan staging requested"
+    );
 
     let Some(active_handle) = state.active_physical_plan.as_ref() else {
+        tracing::warn!(
+            call_id,
+            plan_id = requested_plan_id,
+            plan_version = requested_plan_version,
+            error = "physical-plan hot-reload handles are not attached",
+            "physical plan staging failed"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -5808,6 +5415,13 @@ async fn handle_post_physical_plan(
             .into_response();
     };
     let Some(lifecycle) = state.physical_plan_lifecycle.as_ref() else {
+        tracing::warn!(
+            call_id,
+            plan_id = requested_plan_id,
+            plan_version = requested_plan_version,
+            error = "physical-plan lifecycle is not attached",
+            "physical plan staging failed"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -5823,6 +5437,9 @@ async fn handle_post_physical_plan(
             &request.adaptation_evidence,
             unix_time_ms(),
         ) {
+            tracing::warn!(call_id, plan_id = requested_plan_id,
+                plan_version = requested_plan_version,
+                %error, "physical plan successor rejected");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(serde_json::json!({
@@ -5837,6 +5454,9 @@ async fn handle_post_physical_plan(
     let active = match validate_and_build_runtime_plan(request, current.storage_routing.clone()) {
         Ok(active) => active,
         Err(error) => {
+            tracing::warn!(call_id, plan_id = requested_plan_id,
+                plan_version = requested_plan_version, %error,
+                "physical plan validation failed");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(serde_json::json!({"status": "error", "error": error})),
@@ -5852,6 +5472,13 @@ async fn handle_post_physical_plan(
             )
             || active.precompute_plan.ingest.endpoint_path != "/api/v1/write")
     {
+        tracing::warn!(
+            call_id,
+            plan_id = requested_plan_id,
+            plan_version = requested_plan_version,
+            error = "Remote Write listener requires a non-bootstrap prometheus_remote_write_v1 plan at /api/v1/write",
+            "physical plan staging failed"
+        );
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             axum::Json(serde_json::json!({
@@ -5878,12 +5505,23 @@ async fn handle_post_physical_plan(
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
+        tracing::warn!(call_id, plan_id, plan_version, %error, "physical plan staging failed");
         return (
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({"status": "error", "error": error.to_string()})),
         )
             .into_response();
     }
+    tracing::info!(
+        call_id,
+        plan_id,
+        plan_version,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        materialization_count,
+        metricsql_query_count,
+        clickhouse_plan_count,
+        "physical plan staged"
+    );
     (
         StatusCode::ACCEPTED,
         axum::Json(serde_json::json!({
@@ -5908,10 +5546,25 @@ async fn handle_activate_physical_plan(
     axum::Json(request): axum::Json<ActivatePhysicalPlanRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let call_id = NEXT_PLAN_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    tracing::debug!(target: "asap_runtime_debug",
+        call_id,
+        plan_id = request.plan_id,
+        plan_version = request.plan_version,
+        "physical plan activation requested"
+    );
     let (Some(lifecycle), Some(active_handle)) = (
         state.physical_plan_lifecycle.as_ref(),
         state.active_physical_plan.as_ref(),
     ) else {
+        tracing::warn!(
+            call_id,
+            plan_id = request.plan_id,
+            plan_version = request.plan_version,
+            error = "physical-plan lifecycle is not attached",
+            "physical plan activation failed"
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -5930,7 +5583,7 @@ async fn handle_activate_physical_plan(
         move |plan| match plan.summary_catalog.as_ref() {
             Some(catalog) => {
                 store
-                    .install_summary_catalog(Arc::clone(catalog))
+                    .install_precompute_plan(Arc::clone(catalog), &plan.precompute_plan)
                     .map_err(|error| format!("SummaryCatalog install error: {error}"))?;
                 if let Some(receiver) = &remote_write {
                     receiver.install_erp_observation_generation(
@@ -5944,16 +5597,27 @@ async fn handle_activate_physical_plan(
     ) {
         Ok(old) => old,
         Err(error) => {
+            tracing::warn!(call_id, plan_id = request.plan_id, plan_version = request.plan_version,
+                %error, "physical plan activation failed");
             return (
                 StatusCode::CONFLICT,
                 axum::Json(serde_json::json!({
                     "status": "error", "error": error.to_string()
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
     let activated = active_handle.active_snapshot();
+    tracing::info!(
+        call_id,
+        plan_id = request.plan_id,
+        plan_version = request.plan_version,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        previous_plan_id = old.plan_id(),
+        previous_plan_version = old.plan_version(),
+        "physical plan activated; summary catalog installed"
+    );
     let clickhouse_plan_count = activated
         .query_plan
         .entries
@@ -5974,7 +5638,7 @@ async fn handle_activate_physical_plan(
             }
         });
     }
-    let snap = activated.streaming_config.clone();
+    let snap = activated.installed_precompute_plan.clone();
     let retired = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
         state.summary_store.as_ref(),
         snap.as_ref(),
@@ -6088,6 +5752,10 @@ async fn handle_physical_plan_status(State(state): State<AppState>) -> axum::res
         )
             .into_response();
     };
+    let precompute_plan = state
+        .active_physical_plan
+        .as_ref()
+        .map(|active| active.active_snapshot().precompute_plan.clone());
     let materializations = state
         .active_physical_plan
         .as_ref()
@@ -6098,6 +5766,7 @@ async fn handle_physical_plan_status(State(state): State<AppState>) -> axum::res
         axum::Json(serde_json::json!({
             "status": "success",
             "plans": lifecycle.statuses(),
+            "precompute_plan": precompute_plan,
             "materializations": materializations
         })),
     )
@@ -6118,9 +5787,7 @@ fn unix_time_ms() -> u64 {
 ///
 /// Useful for operators to confirm a control plane push landed with the
 /// expected entries. Returns 503 when the backend wasn't built with a
-/// routing-table handle (legacy deploys that loaded the YAML directly
-/// can still hit `/api/v1/streaming-config` — this endpoint is for
-/// the Phase α JSON path).
+/// routing-table handle.
 async fn handle_get_storage_routing(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -6167,8 +5834,7 @@ async fn handle_get_storage_routing(
 /// * 503 — backend wasn't built with a routing-table handle.
 ///
 /// The swap is atomic: in-flight queries either see the entire old
-/// table or the entire new table; never a half-applied state. Mirrors
-/// the existing `POST /api/v1/streaming-config` swap contract.
+/// table or the entire new table; never a half-applied state.
 async fn handle_post_storage_routing(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -6277,11 +5943,23 @@ async fn handle_get_schemas(
         .iter()
         .filter(|m| allowed.contains(&m.status()))
         .map(|metadata| {
-            let descriptors = state.summary_store.descriptors_for_series_id(metadata.sid);
-            sid_instance_to_json(metadata, descriptors.as_ref())
+            let descriptors = state
+                .summary_store
+                .descriptors_for_series_id(metadata.storage_handle);
+            stored_output_instance_to_json(
+                metadata,
+                descriptors.as_ref(),
+                state
+                    .summary_store
+                    .stored_output_for_handle(metadata.storage_handle),
+            )
         })
         .collect();
-    entries.sort_by_key(|v| v.get("sid").and_then(|x| x.as_u64()).unwrap_or(0));
+    entries.sort_by_key(|v| {
+        v.get("storage_handle")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+    });
 
     let body = serde_json::json!({
         "status": "success",
@@ -6300,17 +5978,19 @@ fn status_str(s: crate::storage_engines::sketch_db::AggStatus) -> &'static str {
 }
 
 /// Encode sid metadata, including identity, lifecycle timestamps, and status.
-fn sid_instance_to_json(
+fn stored_output_instance_to_json(
     m: &crate::storage_engines::sketch_db::index::SummarySeriesMetadata,
     descriptors: Option<&(
         std::sync::Arc<crate::storage_engines::sketch_db::SummaryDescriptor>,
         std::sync::Arc<crate::storage_engines::sketch_db::DataDescriptor>,
     )>,
+    output: Option<asap_types::sds::StoredOutputReference>,
 ) -> serde_json::Value {
     let summary_descriptor_id = descriptors.map(|(summary, _)| summary.id.canonical());
     let data_descriptor_id = descriptors.map(|(_, data)| data.id.canonical());
     serde_json::json!({
-        "sid": m.sid,
+        "storage_handle": m.storage_handle,
+        "stored_output_reference": output,
         "metric_name": m.metric_name,
         "status": status_str(m.status()),
         "first_seen_unix_ms": m.first_seen_unix_ms,
@@ -6340,7 +6020,7 @@ async fn handle_post_schema_retire(
             let descriptors = state.summary_store.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
-                "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
+                "schema": stored_output_instance_to_json(&meta, descriptors.as_ref(), state.summary_store.stored_output_for_handle(meta.storage_handle))});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
@@ -6366,7 +6046,7 @@ async fn handle_post_schema_expire(
             let descriptors = state.summary_store.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
-                "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
+                "schema": stored_output_instance_to_json(&meta, descriptors.as_ref(), state.summary_store.stored_output_for_handle(meta.storage_handle))});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
@@ -6559,13 +6239,13 @@ async fn handle_post_backfill_job(
         return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
     }
 
-    // Resolve the aggregation from the current streaming-config snapshot, or
+    // Resolve the aggregation from the current installed precompute plan, or
     // return 404 `UnknownAgg`. Its earliest matching sid timestamp bounds the
     // backfill range; with no ingested sid, use the current time.
     let Some(handle) = state.hot_reload_config.as_ref() else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "hot-reload streaming-config handle not attached; backfill agg lookup requires HttpServer::with_hot_reload_config"});
+            "error": "hot-reload installed precompute handle not attached; backfill agg lookup requires HttpServer::with_hot_reload_config"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
     let snapshot = handle.snapshot();
@@ -6574,7 +6254,7 @@ async fn handle_post_backfill_job(
         None => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("unknown agg_id {} (not in streaming-config snapshot)", req.agg_id)});
+                "error": format!("unknown agg_id {} (not in installed precompute plan)", req.agg_id)});
             return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
         }
     };

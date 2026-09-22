@@ -21,11 +21,14 @@ use tracing::debug;
 use crate::drivers::ingest::population_attrs_fingerprint;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::{AggregateCore, KeyByLabelValues, StreamingConfigHandle};
-use asap_types::aggregation_config::AggregationConfig;
+use crate::storage_engines::types::{
+    AggregateCore, InstalledPrecomputePlanHandle, KeyByLabelValues,
+};
+use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 
 use super::raw_sample_reader::RawSample;
+#[cfg(test)]
 use super::window_builder::build_backfilled_accumulator;
 use super::worker::WindowProcessor;
 use super::BackfillRegistry;
@@ -39,7 +42,7 @@ use super::BackfillRegistry;
 /// Kept local to the backfill module (not shared with live) per
 /// the §5e separation ask; the implementations must stay identical
 /// by convention.
-fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
+fn extract_group_key(series_key: &str, config: &PrecomputeMaterialization) -> String {
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
     for label_name in &config.grouping_labels.names() {
@@ -71,7 +74,7 @@ fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
 /// live windows occupy the same storage row.
 fn resolve_backfill_bucket_sid(
     resolver: &SeriesIdResolver,
-    config: &AggregationConfig,
+    config: &PrecomputeMaterialization,
     series_key: &str,
     store: Option<&crate::storage_engines::sketch_db::index::SketchStore>,
     captured_generation: Option<&asap_types::sds::CatalogGeneration>,
@@ -86,22 +89,26 @@ fn resolve_backfill_bucket_sid(
         .map(|name| (name.as_str(), *labels.get(name.as_str()).unwrap_or(&"")))
         .collect();
     let attrs_fp = population_attrs_fingerprint(config.population_key_encoding, &grouping_pairs)?;
-    let agg_kind_canonical =
-        crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-    resolver.resolve_with_reactivation(&config.metric, &attrs_fp, &agg_kind_canonical, |sid| {
-        store.map_or(Ok(None), |store| {
-            store.validate_routed_catalog_generation(captured_generation)?;
-            let activation =
-                store.authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
-            if activation
-                .as_deref()
-                .is_some_and(|generation| Some(generation) != captured_generation)
-            {
-                return Err("stale backfill job cannot reactivate series".into());
-            }
-            Ok(activation)
-        })
-    })
+    if let Some(store) = store {
+        return store.resolve_output_storage_handle(
+            resolver,
+            config.policy_fingerprint().into(),
+            &attrs_fp,
+            captured_generation,
+        );
+    }
+    #[cfg(test)]
+    {
+        let store = crate::storage_engines::sketch_db::index::SketchStore::new();
+        store.resolve_output_storage_handle(
+            resolver,
+            config.policy_fingerprint().into(),
+            &attrs_fp,
+            captured_generation,
+        )
+    }
+    #[cfg(not(test))]
+    Err("backfill output requires an installed SummaryStore".into())
 }
 
 /// Fallback bucket id for the resolver-less code path (registry-only
@@ -123,10 +130,10 @@ fn fallback_bucket_id(group_key: &str) -> u64 {
 /// without round-tripping through the worker.
 pub struct BackfillWindowProcessor {
     /// Live config source. The processor snapshots the latest
-    /// `StreamingConfig` at each window to find the
-    /// `AggregationConfig` for `agg_id`. The snapshot is cheap
+    /// `InstalledPrecomputePlan` at each window to find the
+    /// `PrecomputeMaterialization` for `agg_id`. The snapshot is cheap
     /// (Arc refcount bump) so we don't optimise further.
-    config: StreamingConfigHandle,
+    config: InstalledPrecomputePlanHandle,
     /// Destination for rebuilt windows. Tests may omit it to record registry
     /// provenance without storing payloads.
     summary_store: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
@@ -148,7 +155,7 @@ pub struct BackfillWindowProcessor {
 
 impl BackfillWindowProcessor {
     pub fn new(
-        config: StreamingConfigHandle,
+        config: InstalledPrecomputePlanHandle,
         registry: Arc<BackfillRegistry>,
         job_id: u64,
     ) -> Self {
@@ -185,22 +192,6 @@ impl BackfillWindowProcessor {
         self.series_resolver = Some(series_resolver);
         self
     }
-
-    /// Look up the `AggregationConfig` for `agg_id` in the current
-    /// `StreamingConfig` snapshot. Returns an error string if the
-    /// agg has been removed from the config since the job was
-    /// created — rare but worth handling (e.g. operator retired
-    /// the agg mid-backfill; the `BackfillWorker` will
-    /// `mark_failed` the job with this message).
-    fn config_for_agg(
-        &self,
-        agg_id: u64,
-    ) -> Result<AggregationConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let snap = self.config.snapshot();
-        snap.get_aggregation_config(agg_id).cloned().ok_or_else(|| {
-            format!("agg_id {agg_id} not in current StreamingConfig — retired mid-backfill?").into()
-        })
-    }
 }
 
 /// One per-sid bucket assembled by [`BackfillWindowProcessor::process_window`].
@@ -219,7 +210,16 @@ impl WindowProcessor for BackfillWindowProcessor {
         window_range: (u64, u64),
         samples: Vec<RawSample>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let config = self.config_for_agg(agg_id)?;
+        let snapshot = self.config.snapshot();
+        let config = snapshot
+            .get_aggregation_config(agg_id)
+            .cloned()
+            .ok_or_else(|| format!("agg_id {agg_id} not in current InstalledPrecomputePlan"))?;
+        let program = snapshot.raw_programs.get(&agg_id).cloned();
+        #[cfg(not(test))]
+        if program.is_none() {
+            return Err("backfill requires a post-ASAP DAG installation".into());
+        }
 
         // B7.7 — sid-keyed bucketing. Per the schema-retirement #5
         // step 6 plan, the backfill processor's per-window grouping is
@@ -289,7 +289,18 @@ impl WindowProcessor for BackfillWindowProcessor {
 
         for (sid, bucket) in by_bucket {
             let SidBucket { group_key, samples } = bucket;
-            let accumulator = build_backfilled_accumulator(&config, &samples);
+            let accumulator = if let Some(program) = &program {
+                super::window_builder::build_dag_accumulator(program, &samples)?
+            } else {
+                #[cfg(test)]
+                {
+                    build_backfilled_accumulator(&config, &samples)
+                }
+                #[cfg(not(test))]
+                {
+                    return Err("missing backfill DAG producer".into());
+                }
+            };
             // Keyed accumulators (MultipleSubpopulation) carry their
             // subpopulation keys internally; the PrecomputedOutput's
             // `key` represents the *group* key (grouping_labels
@@ -307,7 +318,9 @@ impl WindowProcessor for BackfillWindowProcessor {
                 self.job_id,
                 PolicyFingerprint::from_config(&config),
             );
-            output.series_id = Some(sid);
+            output.storage_handle = Some(sid);
+            output.stored_output_reference =
+                snapshot.stored_output_reference(config.policy_fingerprint().into());
             output.catalog_generation = self.catalog_generation.clone();
             batch.push((sid, output, accumulator));
         }
@@ -324,13 +337,39 @@ impl WindowProcessor for BackfillWindowProcessor {
                     // to the same sid (the resolver is idempotent),
                     // but the round-trip is redundant now that we hold
                     // the value.
-                    for (sid, output, accumulator) in &batch {
-                        idx.ingest_precompute_with_series_id(
-                            *sid,
-                            &config,
-                            output,
-                            accumulator.as_ref(),
-                        )
+                    for (_handle, output, accumulator) in &batch {
+                        let reference = output
+                            .stored_output_reference
+                            .ok_or("backfill has no selected stored output")?;
+                        let (plan_id, plan_version) = self
+                            .catalog_generation
+                            .as_deref()
+                            .map(|generation| (generation.plan_id, generation.plan_version))
+                            .unwrap_or((0, 0));
+                        let address = asap_types::sds::StoredSummaryKey {
+                            plan_id,
+                            plan_version,
+                            output: reference,
+                            population: config
+                                .grouping_labels
+                                .iter()
+                                .cloned()
+                                .zip(output.key.clone().unwrap_or_default().labels)
+                                .collect(),
+                            window: asap_types::sds::HalfOpenTimeRange {
+                                start_ms: i64::try_from(output.start_timestamp)?,
+                                end_ms: i64::try_from(output.end_timestamp)?,
+                            },
+                        };
+                        idx.publish_unadmitted_summary_update(|writer| {
+                            writer.write_stored_summary(
+                                &address,
+                                _resolver,
+                                &config,
+                                output,
+                                accumulator.as_ref(),
+                            )
+                        })
                         .ok_or("backfill summary state publication rejected")?;
                     }
                 }
@@ -368,13 +407,13 @@ mod tests {
     };
     use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
     use crate::storage_engines::sketch_db::backfill::BackfillSource;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::sync::Arc;
 
-    fn sum_config(_agg_id: u64, metric: &str, grouping: Vec<&str>) -> AggregationConfig {
+    fn sum_config(_agg_id: u64, metric: &str, grouping: Vec<&str>) -> PrecomputeMaterialization {
         // `_agg_id` is unused after PR 5 — identity is content-addressed
         // via `PolicyFingerprint::from_config`.
         let grouping_labels = if grouping.is_empty() {
@@ -382,7 +421,7 @@ mod tests {
         } else {
             KeyByLabelNames::from_names(grouping.into_iter().map(String::from).collect())
         };
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             std::collections::HashMap::new(),
@@ -401,10 +440,10 @@ mod tests {
         )
     }
 
-    fn streaming_config_with(config: AggregationConfig) -> Arc<StreamingConfig> {
+    fn streaming_config_with(config: PrecomputeMaterialization) -> Arc<InstalledPrecomputePlan> {
         let mut map = std::collections::HashMap::new();
         map.insert(config.policy_fp_u64(), config);
-        Arc::new(StreamingConfig::new(map))
+        Arc::new(InstalledPrecomputePlan::new(map))
     }
 
     #[tokio::test]
@@ -412,7 +451,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -456,7 +495,7 @@ mod tests {
     async fn unknown_agg_id_fails_cleanly() {
         let cfg = sum_config(1, "m", vec![]);
         let streaming = streaming_config_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             999,
@@ -465,12 +504,14 @@ mod tests {
             1,
         );
         let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id);
-        // agg_id=999 isn't in the StreamingConfig.
+        // agg_id=999 isn't in the InstalledPrecomputePlan.
         let err = processor
             .process_window(999, (0, 10), vec![])
             .await
             .expect_err("unknown agg should fail");
-        assert!(err.to_string().contains("not in current StreamingConfig"));
+        assert!(err
+            .to_string()
+            .contains("not in current InstalledPrecomputePlan"));
         assert!(registry.windows_written_by(job_id).is_empty());
     }
 
@@ -479,7 +520,7 @@ mod tests {
         let cfg = sum_config(1, "m", vec![]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -500,7 +541,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             fp,
@@ -567,7 +608,7 @@ mod tests {
     /// when given the same ordered samples.
     #[test]
     fn backfill_builds_bit_identical_sum_accumulator_to_live() {
-        use crate::precompute_engine::accumulator_factory::create_accumulator_updater;
+        use crate::precompute_engine::accumulator_factory::create_fixture_accumulator;
 
         let cfg = sum_config(1, "m", vec![]);
 
@@ -592,7 +633,7 @@ mod tests {
 
         // Live path: factory + update_single per sample in order.
         let live_bytes = {
-            let mut updater = create_accumulator_updater(&cfg);
+            let mut updater = create_fixture_accumulator(&cfg);
             for s in &samples {
                 updater.update_single(s.value, s.timestamp_ms);
             }
@@ -612,7 +653,7 @@ mod tests {
              serialisations for SumAccumulator. \
              If this test fails, something diverged — check:\n\
              (1) Is `build_backfilled_accumulator` still calling \
-                 `create_accumulator_updater`?\n\
+                 `create_fixture_accumulator`?\n\
              (2) Did a recent change to `SumAccumulator` introduce \
                  non-deterministic state (e.g. a seed)?\n\
              (3) Does `serialize_to_bytes` include any timestamp \
@@ -792,7 +833,7 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
-        let hot = StreamingConfigHandle::from_arc(streaming.clone());
+        let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let summary_store = Arc::new(SketchStore::new());
         let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
@@ -858,10 +899,23 @@ mod tests {
         // `SeriesIdResolver::lookup` would return for the same
         // `(metric, grouping-values, agg_kind)` tuple — i.e. live
         // ingest and backfill share one sid namespace.
-        let sid_a =
-            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\"}", None, None).unwrap();
-        let sid_b =
-            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}", None, None).unwrap();
+        let generation = summary_store.active_catalog_generation().unwrap();
+        let sid_a = resolve_backfill_bucket_sid(
+            &resolver,
+            &cfg,
+            "latency{svc=\"a\"}",
+            Some(&summary_store),
+            Some(&generation),
+        )
+        .unwrap();
+        let sid_b = resolve_backfill_bucket_sid(
+            &resolver,
+            &cfg,
+            "latency{svc=\"b\"}",
+            Some(&summary_store),
+            Some(&generation),
+        )
+        .unwrap();
         assert_ne!(sid_a, sid_b, "distinct svc values mint distinct sids");
         assert_eq!(summary_store.classify(sid_a), SeriesLookup::Hit);
         assert_eq!(summary_store.classify(sid_b), SeriesLookup::Hit);
@@ -900,11 +954,10 @@ mod tests {
         );
         let attrs =
             population_attrs_fingerprint(encoding, &[("svc", "a"), ("zone", "z0")]).unwrap();
-        let expected_sid = resolver.resolve(
-            &cfg.metric,
-            &attrs,
-            &crate::storage_engines::sketch_db::data::materialization_kind_for_config(&cfg),
-        );
+        let store = crate::storage_engines::sketch_db::index::SketchStore::new();
+        let expected_sid = store
+            .resolve_output_storage_handle(&resolver, cfg.policy_fingerprint().into(), &attrs, None)
+            .unwrap();
         if encoding.is_legacy() {
             assert_eq!(backfill_result.unwrap(), expected_sid);
         } else {
@@ -930,7 +983,16 @@ mod tests {
             crate::precompute_engine::operators::sum_accumulator::SumAccumulator::with_sum(1.0);
         let live_sid = store
             .ingest_precompute_for_agg_config(
-                |metric, attrs, kind| resolver.resolve(metric, attrs, kind),
+                |_metric, attrs, _kind| {
+                    store
+                        .resolve_output_storage_handle(
+                            &resolver,
+                            cfg.policy_fingerprint().into(),
+                            attrs,
+                            None,
+                        )
+                        .ok()
+                },
                 &cfg,
                 &output,
                 &acc,

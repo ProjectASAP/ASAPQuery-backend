@@ -2,15 +2,15 @@
 //!
 //! Provides reusable construction helpers for ASAPQueryEngine + SketchStore
 //! populated with various accumulator types. Unlike TestConfigBuilder which
-//! hardcodes "SumAccumulator", these helpers build AggregationConfig with
+//! hardcodes "SumAccumulator", these helpers build PrecomputeMaterialization with
 //! the correct aggregation_type string.
 
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::query_engines::query_result::InstantVectorElement;
 use crate::storage_engines::types::{
-    AggregationConfig, AggregationType, KeyByLabelValues, PrecomputedOutput, QueryLanguage,
-    StreamingConfig, WindowKind,
+    AggregationType, InstalledPrecomputePlan, KeyByLabelValues, PrecomputeMaterialization,
+    PrecomputedOutput, QueryLanguage, WindowKind,
 };
 use crate::AggregateCore;
 use asap_types::KeyByLabelNames;
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 fn ingest_with_fresh_resolver(
     summary_store: &crate::storage_engines::sketch_db::index::SketchStore,
     resolver: &std::sync::Arc<SeriesIdResolver>,
-    agg_cfg: &AggregationConfig,
+    agg_cfg: &PrecomputeMaterialization,
     output: &PrecomputedOutput,
     accumulator: &dyn AggregateCore,
 ) -> Option<u64> {
@@ -89,7 +89,7 @@ pub fn create_engine_single_pop_with_aggregated(
         .collect();
 
     let mut materializations_by_policy_fingerprint = HashMap::new();
-    let agg_config = AggregationConfig {
+    let agg_config = PrecomputeMaterialization {
         population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
@@ -118,10 +118,12 @@ pub fn create_engine_single_pop_with_aggregated(
     let agg_id = agg_config.policy_fp_u64();
     materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
-    let streaming_config = Arc::new(StreamingConfig {
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
+        partitioning: Default::default(),
+        raw_programs: Default::default(),
+        precompute_plan: None,
         materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
-        monitors: Vec::new(),
     });
 
     let summary_store =
@@ -129,10 +131,10 @@ pub fn create_engine_single_pop_with_aggregated(
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
 
     // Insert data into SketchStore via the canonical helper (M2.3.6e).
-    let agg_cfg = streaming_config
+    let agg_cfg = installed_precompute_plan
         .get_aggregation_config(agg_id)
         .cloned()
-        .expect("agg config must be in streaming_config");
+        .expect("agg config must be in installed_precompute_plan");
     let timestamp = 1_000_000_u64;
     for (label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
@@ -175,7 +177,7 @@ pub fn create_engine_dual_input(
     let mut materializations_by_policy_fingerprint = HashMap::new();
 
     // Value aggregation
-    let value_agg_config = AggregationConfig {
+    let value_agg_config = PrecomputeMaterialization {
         population_key_encoding: Default::default(),
         aggregation_type: value_agg_type,
         aggregation_sub_type: String::new(),
@@ -205,7 +207,7 @@ pub fn create_engine_dual_input(
     materializations_by_policy_fingerprint.insert(value_id, value_agg_config);
 
     // Keys aggregation
-    let keys_agg_config = AggregationConfig {
+    let keys_agg_config = PrecomputeMaterialization {
         population_key_encoding: Default::default(),
         aggregation_type: key_agg_type,
         aggregation_sub_type: String::new(),
@@ -234,21 +236,23 @@ pub fn create_engine_dual_input(
     let keys_id = keys_agg_config.policy_fp_u64();
     materializations_by_policy_fingerprint.insert(keys_id, keys_agg_config);
 
-    let streaming_config = Arc::new(StreamingConfig {
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
+        partitioning: Default::default(),
+        raw_programs: Default::default(),
+        precompute_plan: None,
         materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
-        monitors: Vec::new(),
     });
 
     let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
 
-    let agg_cfg_1 = streaming_config
+    let agg_cfg_1 = installed_precompute_plan
         .get_aggregation_config(value_id)
         .cloned()
         .expect("value agg config");
-    let agg_cfg_2 = streaming_config
+    let agg_cfg_2 = installed_precompute_plan
         .get_aggregation_config(keys_id)
         .cloned()
         .expect("keys agg config");
@@ -300,7 +304,7 @@ pub fn create_engine_two_metrics(
 
     let mut materializations_by_policy_fingerprint = HashMap::new();
 
-    let agg_config_a = AggregationConfig {
+    let agg_config_a = PrecomputeMaterialization {
         population_key_encoding: Default::default(),
         aggregation_type: aggregation_type_a,
         aggregation_sub_type: String::new(),
@@ -329,7 +333,7 @@ pub fn create_engine_two_metrics(
     let id_a = agg_config_a.policy_fp_u64();
     materializations_by_policy_fingerprint.insert(id_a, agg_config_a);
 
-    let agg_config_b = AggregationConfig {
+    let agg_config_b = PrecomputeMaterialization {
         population_key_encoding: Default::default(),
         aggregation_type: aggregation_type_b,
         aggregation_sub_type: String::new(),
@@ -358,20 +362,22 @@ pub fn create_engine_two_metrics(
     let id_b = agg_config_b.policy_fp_u64();
     materializations_by_policy_fingerprint.insert(id_b, agg_config_b);
 
-    let streaming_config = Arc::new(StreamingConfig {
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
+        partitioning: Default::default(),
+        raw_programs: Default::default(),
+        precompute_plan: None,
         materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
-        monitors: Vec::new(),
     });
 
     let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-    let agg_cfg_1 = streaming_config
+    let agg_cfg_1 = installed_precompute_plan
         .get_aggregation_config(id_a)
         .cloned()
         .expect("agg a");
-    let agg_cfg_2 = streaming_config
+    let agg_cfg_2 = installed_precompute_plan
         .get_aggregation_config(id_b)
         .cloned()
         .expect("agg b");
@@ -434,7 +440,7 @@ pub fn create_engine_three_metrics(
         (aggregation_type_b, &labels_b, metric_b),
         (aggregation_type_c, &labels_c, metric_c),
     ] {
-        let cfg = AggregationConfig {
+        let cfg = PrecomputeMaterialization {
             population_key_encoding: Default::default(),
             aggregation_type: agg_type,
             aggregation_sub_type: String::new(),
@@ -465,10 +471,12 @@ pub fn create_engine_three_metrics(
         materializations_by_policy_fingerprint.insert(id, cfg);
     }
 
-    let streaming_config = Arc::new(StreamingConfig {
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
+        partitioning: Default::default(),
+        raw_programs: Default::default(),
+        precompute_plan: None,
         materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
-        monitors: Vec::new(),
     });
 
     let summary_store =
@@ -477,7 +485,7 @@ pub fn create_engine_three_metrics(
     let agg_cfgs: Vec<_> = ids
         .iter()
         .map(|id| {
-            streaming_config
+            installed_precompute_plan
                 .get_aggregation_config(*id)
                 .cloned()
                 .expect("agg present")
@@ -516,7 +524,7 @@ pub fn create_engine_multi_timestamp(
         grouping_labels.iter().map(|s| s.to_string()).collect();
 
     let mut materializations_by_policy_fingerprint = HashMap::new();
-    let agg_config = AggregationConfig {
+    let agg_config = PrecomputeMaterialization {
         population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
@@ -545,16 +553,18 @@ pub fn create_engine_multi_timestamp(
     let agg_id = agg_config.policy_fp_u64();
     materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
-    let streaming_config = Arc::new(StreamingConfig {
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
+        partitioning: Default::default(),
+        raw_programs: Default::default(),
+        precompute_plan: None,
         materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
-        monitors: Vec::new(),
     });
 
     let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-    let agg_cfg = streaming_config
+    let agg_cfg = installed_precompute_plan
         .get_aggregation_config(agg_id)
         .cloned()
         .expect("agg");
@@ -574,7 +584,7 @@ pub fn create_engine_multi_timestamp(
 /// Creates a single-pop engine with data at multiple timestamps and configurable window.
 ///
 /// Like `create_engine_multi_timestamp` but allows setting `window_size` and `window_type`
-/// on the AggregationConfig (needed for temporal queries like `sum_over_time(metric[5s])`).
+/// on the PrecomputeMaterialization (needed for temporal queries like `sum_over_time(metric[5s])`).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn create_engine_multi_timestamp_with_window(
@@ -590,7 +600,7 @@ pub fn create_engine_multi_timestamp_with_window(
         grouping_labels.iter().map(|s| s.to_string()).collect();
 
     let mut materializations_by_policy_fingerprint = HashMap::new();
-    let agg_config = AggregationConfig {
+    let agg_config = PrecomputeMaterialization {
         population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
@@ -619,16 +629,18 @@ pub fn create_engine_multi_timestamp_with_window(
     let agg_id = agg_config.policy_fp_u64();
     materializations_by_policy_fingerprint.insert(agg_id, agg_config);
 
-    let streaming_config = Arc::new(StreamingConfig {
+    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
+        partitioning: Default::default(),
+        raw_programs: Default::default(),
+        precompute_plan: None,
         materializations_by_policy_fingerprint,
         storage_backend: Default::default(),
-        monitors: Vec::new(),
     });
 
     let summary_store =
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-    let agg_cfg = streaming_config
+    let agg_cfg = installed_precompute_plan
         .get_aggregation_config(agg_id)
         .cloned()
         .expect("agg");

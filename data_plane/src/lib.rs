@@ -37,13 +37,13 @@ pub mod utils;
 
 // Re-export commonly used types to avoid glob import conflicts
 pub use storage_engines::types::{
-    AggregateCore, AggregationConfig, KeyByLabelValues, Measurement, MergeableAccumulator,
-    MultipleSubpopulationAggregate, PrecomputedOutput, SerializableToSink,
-    SingleSubpopulationAggregate,
+    AggregateCore, KeyByLabelValues, Measurement, MergeableAccumulator,
+    MultipleSubpopulationAggregate, PrecomputeMaterialization, PrecomputedOutput,
+    SerializableToSink, SingleSubpopulationAggregate,
 };
 
 pub use precompute_engine::operators::{
-    IncreaseAccumulator, MaxAccumulator, MinAccumulator, MultipleSumAccumulator, SumAccumulator,
+    IncreaseAccumulator, KeyedSumCountAccumulator, MaxAccumulator, MinAccumulator, SumAccumulator,
 };
 
 pub use storage_engines::StoreResult;
@@ -59,9 +59,9 @@ pub use precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
 pub use precompute_engine::output_sink::SketchStoreSink;
 pub use precompute_engine::PrecomputeEngine;
 
-pub use utils::read_streaming_config;
-
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[cfg(test)]
 pub mod tests;
+
+pub mod runtime_config;

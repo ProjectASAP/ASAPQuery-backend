@@ -10,20 +10,8 @@ use tokio::sync::mpsc;
 use xxhash_rust::xxh64::xxh64;
 
 /// A message sent from the router to a worker.
-///
-/// B7.6 (schema-retirement #5): the per-group bucket key on `GroupSamples`
-/// and `AccumulatorInput` is now a single `sid` (registry-allocated by
-/// `SeriesIdResolver`), not the `(agg_id, group_key)` tuple. The grouping
-/// label values are already folded into the sid via the
-/// `(metric, attrs_fingerprint, agg_kind)` identity contract — so one sid
-/// uniquely names one bucket, with no extra discriminator needed for
-/// hashing or pane lookup. `group_key` and `policy_fp` still travel
-/// alongside the sid: `group_key` is consumed at emit-time to render the
-/// output label vector; `policy_fp` is the handle the worker uses to fetch
-/// the source `AggregationConfig` from the hot-reload snapshot (window
-/// shape, late-data policy, etc.). Together they let the worker key state
-/// by sid without losing the data the legacy `(agg_id, group_key)` shape
-/// carried.
+/// Data partition ownership is derived from the installed DAG; storage locators
+/// carried by individual inputs do not determine their destination worker.
 pub enum WorkerMessage {
     /// Immutable producer generation captured before routing. The optional
     /// receipt proves atomic admission; absent receipts are never fabricated.
@@ -50,8 +38,8 @@ pub enum WorkerMessage {
         /// `(metric, attrs_fingerprint, agg_kind_canonical)` — see
         /// `SeriesIdResolver::resolve`. Worker keys `group_states` on this.
         sid: u64,
-        /// Source `AggregationConfig` fingerprint. Worker looks up its
-        /// `AggregationConfig` (window size, sketch kind/config, late
+        /// Source `PrecomputeMaterialization` fingerprint. Worker looks up its
+        /// `PrecomputeMaterialization` (window size, sketch kind/config, late
         /// data policy, etc.) via `snap.get_aggregation_config(policy_fp.as_u64())`.
         policy_fp: PolicyFingerprint,
         /// Grouping label values joined by semicolons (e.g. "constant").
@@ -78,7 +66,7 @@ pub enum WorkerMessage {
     AccumulatorInput {
         /// Registry-allocated bucket identity; see `GroupSamples::sid`.
         sid: u64,
-        /// Source `AggregationConfig` fingerprint; see
+        /// Source `PrecomputeMaterialization` fingerprint; see
         /// `GroupSamples::policy_fp`.
         policy_fp: PolicyFingerprint,
         /// Grouping label values joined by semicolons, matching the
@@ -96,6 +84,11 @@ pub enum WorkerMessage {
     Flush,
     /// Finite-input barrier: acknowledge only after queued input and trailing panes reach the sink.
     Drain(tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// Execute downstream DAG work after all raw windows have been sealed.
+    CompleteDag {
+        plan: Arc<crate::storage_engines::types::RuntimePhysicalPlan>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Graceful shutdown.
     Shutdown,
 }
@@ -148,6 +141,7 @@ impl fmt::Debug for WorkerMessage {
                 .finish(),
             Self::Flush => f.write_str("Flush"),
             Self::Drain(_) => f.write_str("Drain"),
+            Self::CompleteDag { .. } => f.write_str("CompleteDag"),
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
@@ -158,6 +152,7 @@ pub struct SeriesRouter {
     erp_observer: std::sync::OnceLock<std::sync::Arc<super::erp_observer::RuntimeErpObserver>>,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     num_workers: usize,
+    plan: Option<crate::storage_engines::types::InstalledPrecomputePlanHandle>,
 }
 
 impl SeriesRouter {
@@ -167,7 +162,23 @@ impl SeriesRouter {
             erp_observer: std::sync::OnceLock::new(),
             senders,
             num_workers,
+            plan: None,
         }
+    }
+
+    pub fn with_plan(
+        mut self,
+        plan: crate::storage_engines::types::InstalledPrecomputePlanHandle,
+    ) -> Self {
+        self.plan = Some(plan);
+        self
+    }
+
+    fn partition_rule(&self) -> super::partitioning::DagPartitioning {
+        self.plan
+            .as_ref()
+            .map(|plan| plan.snapshot().partitioning.clone())
+            .unwrap_or(super::partitioning::DagPartitioning::Population)
     }
 
     pub fn enable_erp_observation(
@@ -187,16 +198,15 @@ impl SeriesRouter {
 
     /// Route a pre-grouped batch of group messages to workers concurrently.
     ///
-    /// Each `GroupSamples` / `AccumulatorInput` message is routed by
-    /// `worker_for_sid(sid)` — same `sid` always lands on the same worker,
-    /// so per-bucket state stays single-owner. Messages within a single
-    /// worker are sent sequentially to preserve ordering.
+    /// Every producer uses the same DAG partition rule. Messages within one
+    /// worker are sent sequentially to preserve admission order.
     pub async fn route_group_batch(
         &self,
         messages: Vec<WorkerMessage>,
         _ingest_received_at: Instant,
         generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let partitioning = self.partition_rule();
         // Group messages by target worker index
         let mut per_worker: HashMap<usize, Vec<WorkerMessage>> = HashMap::new();
         for msg in messages {
@@ -204,8 +214,10 @@ impl SeriesRouter {
                 WorkerMessage::BoundInput { .. } => {
                     return Err("input must be admitted by the router".into())
                 }
-                WorkerMessage::GroupSamples { sid, .. } => self.worker_for_sid(*sid),
-                WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
+                WorkerMessage::GroupSamples { group_key, .. }
+                | WorkerMessage::AccumulatorInput { group_key, .. } => {
+                    partitioning.owner(&group_key.as_population_labels(), self.num_workers)?
+                }
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
                 _ => 0,
             };
@@ -249,16 +261,22 @@ impl SeriesRouter {
             String,
         >,
     ) -> Result<(), TryRouteError> {
+        let partitioning = self.partition_rule();
         let mut pending = Vec::with_capacity(messages.len());
         for message in messages {
             let worker_idx = match &message {
-                WorkerMessage::GroupSamples { sid, .. }
-                | WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
+                WorkerMessage::GroupSamples { group_key, .. }
+                | WorkerMessage::AccumulatorInput { group_key, .. } => partitioning
+                    .owner(&group_key.as_population_labels(), self.num_workers)
+                    .map_err(TryRouteError::Admission)?,
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
                 WorkerMessage::BoundInput { .. } => {
                     return Err(TryRouteError::Admission("input already admitted".into()))
                 }
-                WorkerMessage::Flush | WorkerMessage::Drain(_) | WorkerMessage::Shutdown => 0,
+                WorkerMessage::Flush
+                | WorkerMessage::Drain(_)
+                | WorkerMessage::Shutdown
+                | WorkerMessage::CompleteDag { .. } => 0,
             };
             let permit = self.senders[worker_idx]
                 .clone()
@@ -311,14 +329,36 @@ impl SeriesRouter {
         Ok(())
     }
 
-    /// Determine which worker handles a given sid bucket.
-    ///
-    /// Hashes the sid alone — the legacy `(agg_id, group_key)` tuple folded
-    /// into one u64 by `SeriesIdResolver`, so a single xxh64 over the sid
-    /// gives the same per-bucket sharding the tuple-hash produced.
-    fn worker_for_sid(&self, sid: u64) -> usize {
-        let hash = xxh64(&sid.to_le_bytes(), 0);
-        (hash as usize) % self.num_workers
+    pub async fn shutdown(&self) -> Result<(), String> {
+        for sender in &self.senders {
+            sender
+                .send(WorkerMessage::Shutdown)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub async fn complete_dag(
+        &self,
+        plan: Arc<crate::storage_engines::types::RuntimePhysicalPlan>,
+    ) -> Result<(), String> {
+        let mut replies = Vec::with_capacity(self.senders.len());
+        for sender in &self.senders {
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            sender
+                .send(WorkerMessage::CompleteDag {
+                    plan: Arc::clone(&plan),
+                    reply,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            replies.push(receiver);
+        }
+        for reply in replies {
+            reply.await.map_err(|error| error.to_string())??;
+        }
+        Ok(())
     }
 
     /// Determine which worker handles a given series key (for raw mode).
@@ -342,22 +382,41 @@ pub enum TryRouteError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_consistent_sid_routing() {
-        let (senders, _receivers): (Vec<_>, Vec<_>) =
-            (0..4).map(|_| mpsc::channel::<WorkerMessage>(10)).unzip();
-
+    // Shared DAG consumers must share partition ownership regardless of locator IDs.
+    #[tokio::test]
+    async fn shared_population_is_not_split_by_storage_locator() {
+        let (senders, mut receivers): (Vec<_>, Vec<_>) =
+            (0..4).map(|_| mpsc::channel::<WorkerMessage>(128)).unzip();
         let router = SeriesRouter::new(senders);
-
-        // Same sid should always go to the same worker.
-        let w1 = router.worker_for_sid(42);
-        let w2 = router.worker_for_sid(42);
-        assert_eq!(w1, w2);
-
-        // All resolved buckets land within the worker count.
-        assert!(router.worker_for_sid(7) < 4);
-        assert!(router.worker_for_sid(99) < 4);
-        assert!(router.worker_for_sid(0) < 4);
+        let messages = (0..32)
+            .map(|sid| WorkerMessage::GroupSamples {
+                sid,
+                policy_fp: PolicyFingerprint(sid),
+                group_key: Arc::new(GroupKey::new([("service", "api")])),
+                samples: vec![("counter".into(), 1, 1.0)],
+                ingest_received_at: Instant::now(),
+            })
+            .collect();
+        router
+            .route_group_batch(messages, Instant::now(), None)
+            .await
+            .unwrap();
+        let counts = receivers
+            .iter_mut()
+            .map(|rx| {
+                let mut count = 0;
+                while rx.try_recv().is_ok() {
+                    count += 1;
+                }
+                count
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts.iter().sum::<usize>(), 32);
+        assert_eq!(
+            counts.iter().filter(|n| **n != 0).count(),
+            1,
+            "one service's complete DAG must stay with one worker: {counts:?}"
+        );
     }
 
     #[test]

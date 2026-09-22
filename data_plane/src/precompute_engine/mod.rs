@@ -11,6 +11,7 @@ pub(crate) mod metrics;
 pub mod multisource_coordinator;
 pub mod operators;
 pub mod output_sink;
+pub mod raw_dag;
 pub mod series_buffer;
 pub mod series_router;
 pub mod subdag_scheduler;
@@ -19,3 +20,5 @@ pub mod worker;
 
 pub use engine::{PrecomputeEngine, PrecomputeWorkerDiagnostics};
 pub use ingest_handler::IngestState;
+
+pub mod partitioning;

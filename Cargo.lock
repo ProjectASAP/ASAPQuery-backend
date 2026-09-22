@@ -1178,6 +1178,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "lazy_static",
+ "libc",
  "memmap2",
  "moka",
  "prometheus",

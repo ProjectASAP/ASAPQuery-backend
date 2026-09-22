@@ -516,11 +516,15 @@ pub fn gos_policy_from_accuracy_budget(
     })
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(plan_id = envelope.plan_id, plan_version = envelope.plan_version,
+        producer_count = precompute.producers.len()))]
 pub fn build_transmission_plan(
     envelope: PlanEnvelope,
     precompute: &PrecomputePlan,
     runtime_policies: &BTreeMap<asap_types::PolicyFingerprint, RuntimeRulePolicy>,
 ) -> Result<TransmissionPlan, TransmissionPlanError> {
+    tracing::debug!(target: "asap_runtime_debug", "transmission plan construction started");
     if envelope != precompute.envelope {
         return Err(TransmissionPlanError::EnvelopeMismatch);
     }
@@ -1183,12 +1187,16 @@ impl PhysicalPlanCompiler {
         self.compile_for_frontend(request, environment, QueryFrontend::MetricsQl)
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(frontend = ?frontend, plan_version = environment.plan_version,
+            query_count = request.queries.len()))]
     pub fn compile_for_frontend(
         &self,
         mut request: PhysicalCompilationRequest,
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
+        tracing::debug!(target: "asap_runtime_debug", "physical plan compiler entered");
         if let Some(data) = &request.data_workload {
             data.validate()
                 .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -1484,10 +1492,7 @@ impl PhysicalPlanCompiler {
                     .with_window_implementation_costs(window_costs);
                 let metric = selected.metric.clone();
                 let aggregation_id = format!("{}:{ordinal}:{}", query.query_id, metric);
-                // Rate is a readout over the same reset-aware counter state
-                // as Increase. Keep that semantic distinction in QueryPlan,
-                // while the physical store binds both to Increase state.
-                let physical_family = physical_materialization_family(&selected.family);
+                let physical_family = selected.family.clone();
                 let physical_algorithm = match &physical_family {
                     SummaryFamilyType::ExactAggregate(kind, _) => {
                         format!("{kind:?}").to_ascii_lowercase()
@@ -1926,7 +1931,7 @@ impl PhysicalPlanCompiler {
                         .map_err(|error| crate::query_plan::QueryPlanError::Invalid(error.to_string()))?
                         .family;
                     let window_ms = materialization.window_size.saturating_mul(1_000);
-                    if materialization_family != physical_materialization_family(node_family)
+                    if materialization_family != *node_family
                         || window_ms == 0
                         || source_window.unwrap_or(query.query_lookback_seconds).saturating_mul(1_000)
                             % window_ms != 0
@@ -2394,6 +2399,8 @@ pub fn select_logical_roots_with_error_resource_profiles(
     select_logical_roots_with_trace(queries, roots, evidence, exact_costs, erp).map(|_| ())
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(query_count = queries.len(), root_count = roots.len()))]
 pub fn select_logical_roots_with_trace(
     queries: &mut [QueryCompilationInput],
     roots: Vec<Rc<QueryExpr>>,
@@ -2421,6 +2428,7 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
     erp: Option<&super::erp::ErpPlanningInput>,
     now_ms: u64,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
+    tracing::debug!(target: "asap_runtime_debug", "logical root selection started");
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(
@@ -3116,13 +3124,11 @@ pub(crate) fn estimated_state_bytes(
         A::HLL => 1u128 << parameter(&["precision", "p"], 14).min(24),
         A::DDSketch => 64 * 1024,
         A::Sum
+        | A::Count
         | A::Increase
+        | A::Rate
         | A::Min
         | A::Max
-        | A::MultipleSum
-        | A::MultipleIncrease
-        | A::MultipleMin
-        | A::MultipleMax
         | A::SingleSubpopulation
         | A::MultipleSubpopulation => 256,
     }
@@ -3140,7 +3146,7 @@ pub(crate) fn retained_partition_count(
     if materialization.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
         || matches!(
             materialization.aggregation_type,
-            A::Increase | A::MultipleIncrease | A::Min | A::Max | A::MultipleMin | A::MultipleMax
+            A::Increase | A::Rate | A::Min | A::Max
         )
         || !materialization.grouping_labels.names().is_empty()
     {
@@ -3387,7 +3393,7 @@ pub(crate) fn raw_materialization_input_contract(
     )
 }
 
-fn raw_time_series_input_contract(
+pub fn raw_time_series_input_contract(
     expr: &QueryExpr,
     exact: bool,
 ) -> Result<(String, Option<u64>, String), String> {
@@ -3583,7 +3589,7 @@ fn physical_aggregation(
     BackendAggregation {
         aggregation_id,
         metric_name: selected.metric.clone(),
-        family: physical_materialization_family(&selected.family),
+        family: selected.family.clone(),
         window_secs: selected.window_secs.unwrap_or(query.query_lookback_seconds),
         spatial_filter: selected.spatial_filter.clone(),
         grouping: selected
@@ -4855,8 +4861,7 @@ pub(crate) mod tests {
             .find(|materialization| {
                 matches!(
                     materialization.aggregation_type,
-                    asap_types::AggregationType::Increase
-                        | asap_types::AggregationType::MultipleIncrease
+                    asap_types::AggregationType::Rate
                 )
             })
             .expect("reset-aware exact counter");
@@ -5557,8 +5562,7 @@ pub(crate) mod tests {
             .iter()
             .all(|m| !matches!(
                 m.aggregation_type,
-                asap_types::AggregationType::Increase
-                    | asap_types::AggregationType::MultipleIncrease
+                asap_types::AggregationType::Increase | asap_types::AggregationType::Rate
             )));
         let entry = plan.query_plan.entries.values().next().unwrap();
         assert!(!entry.materialization_bindings().is_empty());
@@ -6116,7 +6120,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rate_and_increase_share_physical_counter_state() {
+    fn rate_and_increase_keep_planner_families_distinct() {
         let mut workload = request("rate", "rate(m[1m])");
         workload
             .queries
@@ -6125,10 +6129,14 @@ pub(crate) mod tests {
             .compile_promql(workload, environment(10_000))
             .unwrap();
         assert_eq!(bundle.query_plan.entries.len(), 2);
-        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         for collector in &bundle.collector_plans {
-            assert_eq!(collector.materializations.len(), 1);
-            assert_eq!(collector.materializations[0].algorithm, "increase");
+            let algorithms: std::collections::BTreeSet<_> = collector
+                .materializations
+                .iter()
+                .map(|materialization| materialization.algorithm.as_str())
+                .collect();
+            assert_eq!(algorithms, ["increase", "rate"].into());
         }
     }
 
@@ -6148,8 +6156,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn exact_dashboard_binds_sum_and_count_to_one_local_producer() {
-        // Both dashboard roots use one packed raw accumulator, with explicit readouts.
+    fn exact_dashboard_preserves_distinct_sum_and_count_producers() {
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -6165,7 +6172,7 @@ pub(crate) mod tests {
         entries.push(mean);
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
         let bundle = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
-        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         assert_eq!(bundle.query_plan.entries.len(), 2);
         for entry in bundle.query_plan.entries.values() {
             assert!(
@@ -6175,7 +6182,7 @@ pub(crate) mod tests {
                 )),
                 "{entry:?}"
             );
-            assert_eq!(entry.materialization_bindings().len(), 1);
+            assert!(!entry.materialization_bindings().is_empty());
         }
         assert!(bundle
             .query_plan
@@ -7482,15 +7489,22 @@ pub(crate) mod tests {
             &query_plan,
         )
         .unwrap();
-        // V1 has one stored output per definition; arbitrary output IDs are
-        // rejected before writer/reader agreement is considered.
+        // Output identity is independent of definition identity, but changing
+        // only the writer must still invalidate every unchanged reader binding.
         let mut rebound_writer = bundle.precompute_plan.clone();
         rebound_writer.schemas[0]
             .stored_output_reference
             .stored_output_id = asap_types::sds::StoredOutputId(123);
-        assert!(rebound_writer
+        rebound_writer
             .validate_against_catalog(&bundle.summary_catalog)
-            .is_err());
+            .unwrap();
+        assert!(
+            asap_types::plan_publication::validate_stored_output_references(
+                &rebound_writer,
+                &query_plan,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7952,8 +7966,8 @@ pub(crate) mod tests {
                 assert_eq!(
                     materialization.accumulator_spec().unwrap().family,
                     SummaryFamilyType::ExactAggregate(
-                        planner_types::post_asap::ExactKind::Increase,
-                        planner_types::post_asap::ExactParams::Increase,
+                        planner_types::post_asap::ExactKind::Rate,
+                        planner_types::post_asap::ExactParams::Rate,
                     )
                 );
             }

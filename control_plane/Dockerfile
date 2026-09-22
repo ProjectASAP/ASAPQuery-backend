@@ -15,8 +15,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY . ASAPQuery-backend
-
-RUN cd ASAPQuery-backend && cargo build --locked --release --bin control_plane
+RUN cd ASAPQuery-backend && cargo build --locked --release --bin control_plane --bin control_plane_quote_snapshot --example compile_workload_artifact
 
 # Runtime image: binary + CA certs.
 FROM debian:bookworm-slim
@@ -25,6 +24,10 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/ASAPQuery-backend/target/release/control_plane \
     /usr/local/bin/control_plane
+COPY --from=build /src/ASAPQuery-backend/target/release/control_plane_quote_snapshot \
+    /usr/local/bin/control_plane_quote_snapshot
+COPY --from=build /src/ASAPQuery-backend/target/release/examples/compile_workload_artifact \
+    /usr/local/bin/compile_workload_artifact
 
 ENV RUST_LOG=info
 # OpAMP ws 4320, controller gRPC 4321, controller HTTP 8080.
