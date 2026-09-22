@@ -24,6 +24,7 @@ then run the same checks as MVP CI. Updater unit tests run with:
 
 ```sh
 python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+node scripts/ci/test_planner_merge.js
 ```
 
 The sync script and scheduled workflow are shared with PR #765, at the same paths

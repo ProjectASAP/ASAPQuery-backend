@@ -28,8 +28,10 @@ jobs:
             if (prs.data.length !== 1) return;
             const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: prs.data[0].number});
             if (pr.head.repo.full_name !== `${owner}/${repo}` || pr.head.sha !== run.head_sha || pr.draft) return;
-            const testedPr = run.pull_requests.find(p => p.number === pr.number);
-            if (!testedPr || testedPr.base.sha !== pr.base.sha) {
+            const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `main...${run.head_sha}`
+            });
+            if (comparison.merge_base_commit.sha !== comparison.base_commit.sha) {
               core.info('Main changed since this CI run; wait for the next updater refresh.');
               return;
             }

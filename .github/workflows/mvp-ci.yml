@@ -51,7 +51,9 @@ jobs:
 
       - name: Test Planner dependency updater
         working-directory: ASAPQuery-backend
-        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+        run: |
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+          node scripts/ci/test_planner_merge.js
 
       - name: Check workspace formatting
         working-directory: ASAPQuery-backend
