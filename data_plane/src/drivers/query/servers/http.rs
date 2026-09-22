@@ -5825,6 +5825,11 @@ async fn handle_post_physical_plan(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    tracing::debug!(
+        plan_id = request.transmission_plan.envelope.plan_id,
+        plan_version = request.transmission_plan.envelope.plan_version,
+        "physical plan staging requested"
+    );
 
     let Some(active_handle) = state.active_physical_plan.as_ref() else {
         return (
@@ -5851,6 +5856,9 @@ async fn handle_post_physical_plan(
             &request.adaptation_evidence,
             unix_time_ms(),
         ) {
+            tracing::warn!(plan_id = request.transmission_plan.envelope.plan_id,
+                plan_version = request.transmission_plan.envelope.plan_version,
+                %error, "physical plan successor rejected");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(serde_json::json!({
@@ -5865,6 +5873,7 @@ async fn handle_post_physical_plan(
     let active = match validate_and_build_runtime_plan(request, current.storage_routing.clone()) {
         Ok(active) => active,
         Err(error) => {
+            tracing::warn!(%error, "physical plan validation failed");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(serde_json::json!({"status": "error", "error": error})),
@@ -5906,12 +5915,21 @@ async fn handle_post_physical_plan(
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
+        tracing::warn!(plan_id, plan_version, %error, "physical plan staging failed");
         return (
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({"status": "error", "error": error.to_string()})),
         )
             .into_response();
     }
+    tracing::info!(
+        plan_id,
+        plan_version,
+        materialization_count,
+        metricsql_query_count,
+        clickhouse_plan_count,
+        "physical plan staged"
+    );
     (
         StatusCode::ACCEPTED,
         axum::Json(serde_json::json!({
@@ -5936,6 +5954,11 @@ async fn handle_activate_physical_plan(
     axum::Json(request): axum::Json<ActivatePhysicalPlanRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    tracing::debug!(
+        plan_id = request.plan_id,
+        plan_version = request.plan_version,
+        "physical plan activation requested"
+    );
     let (Some(lifecycle), Some(active_handle)) = (
         state.physical_plan_lifecycle.as_ref(),
         state.active_physical_plan.as_ref(),
@@ -5972,16 +5995,25 @@ async fn handle_activate_physical_plan(
     ) {
         Ok(old) => old,
         Err(error) => {
+            tracing::warn!(plan_id = request.plan_id, plan_version = request.plan_version,
+                %error, "physical plan activation failed");
             return (
                 StatusCode::CONFLICT,
                 axum::Json(serde_json::json!({
                     "status": "error", "error": error.to_string()
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
     let activated = active_handle.active_snapshot();
+    tracing::info!(
+        plan_id = request.plan_id,
+        plan_version = request.plan_version,
+        previous_plan_id = old.plan_id(),
+        previous_plan_version = old.plan_version(),
+        "physical plan activated; summary catalog installed"
+    );
     let clickhouse_plan_count = activated
         .query_plan
         .entries

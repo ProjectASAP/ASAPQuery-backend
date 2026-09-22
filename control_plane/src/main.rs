@@ -50,7 +50,11 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     let api_addr = std::env::var("CONTROLLER_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let opamp_addr =
@@ -290,6 +294,12 @@ async fn compile_and_publish_physical_plan(
             }
             Err(response) => return physical_compile_failure(response),
         };
+    info!(
+        plan_id = bundle.envelope.plan_id,
+        plan_version = bundle.envelope.plan_version,
+        collector_count = bundle.collector_plans.len(),
+        "physical plan compiled"
+    );
 
     let Some(backend) = st.backend_client.as_ref() else {
         return (
@@ -303,6 +313,8 @@ async fn compile_and_publish_physical_plan(
         .ensure_collector_plan_targets(&bundle.collector_plans, apply_timeout)
         .await
     {
+        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+            %error, "collector plan preflight failed");
         return (
             StatusCode::BAD_GATEWAY,
             format!("collector physical-plan preflight failed: {error}"),
@@ -327,17 +339,26 @@ async fn compile_and_publish_physical_plan(
         )
         .await
     {
+        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+            %error, "backend plan staging failed");
         return (
             StatusCode::BAD_GATEWAY,
             format!("backend rejected physical plan: {error}"),
         )
             .into_response();
     }
+    info!(
+        plan_id = bundle.envelope.plan_id,
+        plan_version = bundle.envelope.plan_version,
+        "backend physical plan staged"
+    );
     if let Err(error) = st
         .opamp
         .publish_collector_plans(&bundle.collector_plans, apply_timeout)
         .await
     {
+        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+            %error, "collector plan publication failed");
         let cleanup = backend
             .discard_staged_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
             .await;
@@ -347,6 +368,11 @@ async fn compile_and_publish_physical_plan(
         )
             .into_response();
     }
+    info!(
+        plan_id = bundle.envelope.plan_id,
+        plan_version = bundle.envelope.plan_version,
+        "collector plans published"
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -366,6 +392,8 @@ async fn compile_and_publish_physical_plan(
         .activate_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
         .await
     {
+        tracing::warn!(plan_id = bundle.envelope.plan_id, plan_version = bundle.envelope.plan_version,
+            %error, "backend plan activation failed");
         return (
             StatusCode::BAD_GATEWAY,
             format!("backend physical-plan activation failed: {error}"),
@@ -374,6 +402,11 @@ async fn compile_and_publish_physical_plan(
     }
 
     *active_catalog = Some(Arc::new(bundle.summary_catalog));
+    info!(
+        plan_id = bundle.envelope.plan_id,
+        plan_version = bundle.envelope.plan_version,
+        "physical plan active"
+    );
 
     Json(CompileAndPublishPhysicalPlanResponse {
         cost_comparison: bundle.cost_comparison,

@@ -202,6 +202,9 @@ impl ASAPQueryEngine {
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
+        debug!(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %planned.query_id, evaluation_ms = now_ms,
+            "installed MetricsQL instant query selected");
         let leaves = self
             .prepare_query_inputs(&physical, planned, &[now_ms])
             .await?;
@@ -210,6 +213,9 @@ impl ASAPQueryEngine {
         stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
         stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
         annotate_logical_execution(&mut result, &stats);
+        debug!(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %planned.query_id, remote_evaluations = stats.remote_evaluations,
+            remote_rpcs = stats.remote_rpcs, "installed MetricsQL instant query completed");
         Ok(result)
     }
 
@@ -233,6 +239,9 @@ impl ASAPQueryEngine {
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
+        debug!(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+            query_id = %planned.query_id, start_ms, end_ms, step_ms,
+            "installed MetricsQL range query selected");
         self.execute_logical_range(&physical, planned, start_ms, end_ms, step_ms)
             .await
     }
@@ -750,6 +759,9 @@ impl ASAPQueryEngine {
     {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
+                debug!(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                    query_id = %entry.query_id, start_ms, end_ms, step_ms,
+                    "installed query DAG selected");
                 if entry.nodes.values().any(|node| {
                     matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
                 }) {
@@ -1001,6 +1013,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
+                debug!(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                    query_id = %entry.query_id, evaluation_ms = now_ms,
+                    "installed query DAG selected");
                 let leaves = self
                     .prepare_query_inputs(&physical, entry, &[now_ms])
                     .await
@@ -1018,6 +1033,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     leaves.values().map(|leaf| leaf.remote_evaluations).sum();
                 stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
                 annotate_logical_execution(&mut result, &stats);
+                debug!(plan_id = physical.plan_id(), plan_version = physical.plan_version(),
+                    query_id = %entry.query_id, remote_evaluations = stats.remote_evaluations,
+                    remote_rpcs = stats.remote_rpcs, "installed query DAG completed");
                 return Ok(result);
             }
         }

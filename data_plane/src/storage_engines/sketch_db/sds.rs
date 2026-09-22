@@ -126,6 +126,11 @@ impl SummaryDescriptorRegistry {
             snapshot_sha256: reference.snapshot_sha256,
         });
         *self.authoritative_catalog.write().unwrap() = Some((catalog, generation));
+        tracing::info!(
+            plan_id = reference.plan_id,
+            plan_version = reference.plan_version,
+            "storage descriptor catalog installed"
+        );
         Ok(())
     }
 
