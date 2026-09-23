@@ -104,10 +104,12 @@ pub fn validate_summary_kernel(
 }
 
 fn valid_matrix(width: u32, depth: u32) -> bool {
-    crate::accumulators::count_min_sketch_accumulator::validate_sketch_dims(
-        "Planner kernel",
-        depth as usize,
-        width as usize,
-    )
-    .is_ok()
+    // Construction uses the kernel's native row hashing. Packed-wire decoder
+    // limits describe a different representation and must not reject it here.
+    width > 0
+        && depth > 0
+        && (width as usize)
+            .checked_mul(depth as usize)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f64>()))
+            .is_some()
 }
