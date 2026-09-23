@@ -1,8 +1,8 @@
-use asap_physical_operators::accumulators::{KeyedSumCountAccumulator, SumAccumulator};
 #[cfg(test)]
 use crate::storage_engines::types::{
     KeyByLabelValues, MultipleSubpopulationAggregate, SingleSubpopulationAggregate,
 };
+use asap_physical_operators::accumulators::{KeyedSumCountAccumulator, SumAccumulator};
 use asap_types::Statistic;
 
 #[test]

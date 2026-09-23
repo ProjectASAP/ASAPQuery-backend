@@ -92,11 +92,11 @@ fn reconstruct_exact_agg(
     type_name: &str,
     bytes: &[u8],
 ) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
+    use crate::storage_engines::types::AggregateCore;
     use asap_physical_operators::accumulators::{
         IncreaseAccumulator, KeyedCounterState, KeyedSumCountAccumulator, MaxAccumulator,
         MinAccumulator, SumAccumulator,
     };
-    use crate::storage_engines::types::AggregateCore;
     match type_name {
         "PlannerExactAccumulatorV1" => asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
         "SumAccumulator" => SumAccumulator::deserialize_from_bytes(bytes)
@@ -6359,8 +6359,8 @@ mod tests {
     // Flush and reopen must preserve Planner family rather than reconstructing Rate as Increase.
     #[test]
     fn planner_exact_families_survive_disk_eviction_and_restart() {
-        use asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator;
         use crate::storage_engines::types::{AggregateCore, AggregationType};
+        use asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator;
         let kinds = [
             AggregationType::Sum,
             AggregationType::Count,

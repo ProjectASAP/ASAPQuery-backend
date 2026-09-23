@@ -1,16 +1,16 @@
-#[cfg(test)]
-use crate::tests::accumulator_fixture::create_fixture_accumulator;
-use asap_physical_operators::factory::AccumulatorUpdater;
 use crate::precompute_engine::config::LateDataPolicy;
 use crate::precompute_engine::group_key::GroupKey;
 use crate::precompute_engine::metrics::record_late_input;
-use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
     AggregateCore, InstalledPrecomputePlanHandle, KeyByLabelValues, PrecomputedOutput,
 };
+#[cfg(test)]
+use crate::tests::accumulator_fixture::create_fixture_accumulator;
+use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
+use asap_physical_operators::factory::AccumulatorUpdater;
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 use asap_types::SampleUpdateRule;
@@ -1943,11 +1943,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::precompute_engine::config::LateDataPolicy;
+    use crate::precompute_engine::output_sink::CapturingOutputSink;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_physical_operators::accumulators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
     use asap_physical_operators::accumulators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
     use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
-    use crate::precompute_engine::output_sink::CapturingOutputSink;
-    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_sketchlib::KllSketch;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -4352,9 +4352,9 @@ mod tests {
 #[cfg(test)]
 mod dag_execution_tests {
     use super::*;
-    use asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::InstalledPrecomputePlan;
+    use asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator;
     use asap_types::query_plan::ExactReadout;
 
     fn plan(query: &str) -> control_plane::physical::compiler::CompiledPhysicalPlan {

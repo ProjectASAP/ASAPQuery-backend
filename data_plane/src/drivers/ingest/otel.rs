@@ -24,7 +24,6 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use asap_physical_operators::accumulators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::IngestState;
 use crate::query_engines::routing::FreshnessProbeCache;
@@ -35,6 +34,7 @@ use asap_otel_proto::tonic::collector::metrics::v1::{
 };
 use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use asap_otel_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use asap_physical_operators::accumulators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use asap_sketchlib::MessagePackCodec;
 use axum::{body::Bytes, extract::State, routing::post, Json, Router};
@@ -2659,11 +2659,11 @@ fn empty_accumulator_for_delta_bootstrap(
     config: &crate::storage_engines::sketch_db::index::SketchConfig,
     encoding: i32,
 ) -> Option<Box<dyn AggregateCore>> {
+    use crate::storage_engines::sketch_db::index::SketchConfig;
     use asap_physical_operators::accumulators::{
         CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
         HllSketchAccumulator,
     };
-    use crate::storage_engines::sketch_db::index::SketchConfig;
 
     match (algorithm, config) {
         (SketchAlgorithm::Hll, SketchConfig::Hll { precision }) => {
@@ -3419,8 +3419,8 @@ mod policy_fp_lookup_tests {
 #[cfg(test)]
 mod dispatcher_tests {
     use super::*;
-    use asap_physical_operators::accumulators::{DDSketchAccumulator, HllSketchAccumulator};
     use crate::storage_engines::types::AggregateCore;
+    use asap_physical_operators::accumulators::{DDSketchAccumulator, HllSketchAccumulator};
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::HllVariant;
 
@@ -3772,8 +3772,8 @@ mod sid_resolution_tests {
     /// directly observable on the bucket counts.
     #[tokio::test]
     async fn delta_apply_rotates_per_series_base_at_window_boundary() {
-        use asap_physical_operators::accumulators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_physical_operators::accumulators::DDSketchAccumulator;
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
 
@@ -4104,8 +4104,8 @@ mod sid_resolution_tests {
     /// recover after a backend restart.
     #[tokio::test]
     async fn leading_cms_delta_bootstraps_onto_empty_base() {
-        use asap_physical_operators::accumulators::CountMinSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
+        use asap_physical_operators::accumulators::CountMinSketchAccumulator;
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -4190,8 +4190,8 @@ mod sid_resolution_tests {
     /// the register-max updates.
     #[tokio::test]
     async fn leading_hll_delta_bootstraps_onto_empty_base() {
-        use asap_physical_operators::accumulators::HllSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
+        use asap_physical_operators::accumulators::HllSketchAccumulator;
         use prost::Message;
 
         let (state, drain) = make_state().await;

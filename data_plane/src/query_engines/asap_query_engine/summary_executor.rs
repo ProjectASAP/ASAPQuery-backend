@@ -70,9 +70,6 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 
-use asap_physical_operators::accumulators::increase_accumulator::IncreaseAccumulator;
-use asap_physical_operators::accumulators::max_accumulator::MaxAccumulator;
-use asap_physical_operators::accumulators::min_accumulator::MinAccumulator;
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
@@ -81,6 +78,9 @@ use crate::storage_engines::sketch_db::query::delta_apply::{
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
 };
+use asap_physical_operators::accumulators::increase_accumulator::IncreaseAccumulator;
+use asap_physical_operators::accumulators::max_accumulator::MaxAccumulator;
+use asap_physical_operators::accumulators::min_accumulator::MinAccumulator;
 
 /// Per-query, per-call execution context — constructed fresh for each
 /// incoming query (never shared across concurrent queries, never
@@ -1958,9 +1958,9 @@ mod tests {
     /// One installed frequency summary merges panes before all four readouts.
     #[test]
     fn bound_univmon_merges_panes_for_four_readouts() {
-        use asap_physical_operators::accumulators::univmon_accumulator::UnivMonAccumulator;
         use crate::storage_engines::sketch_db::index::SketchEncoding;
         use crate::storage_engines::types::SerializableToSink;
+        use asap_physical_operators::accumulators::univmon_accumulator::UnivMonAccumulator;
         use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
         let index = SketchStore::new();
         let fp = asap_types::PolicyFingerprint(701);

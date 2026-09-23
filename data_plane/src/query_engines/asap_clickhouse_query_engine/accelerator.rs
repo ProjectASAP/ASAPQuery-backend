@@ -361,8 +361,8 @@ mod tests {
         }
     }
 
-    use asap_physical_operators::accumulators::SumAccumulator;
     use crate::storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata};
+    use asap_physical_operators::accumulators::SumAccumulator;
     use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
