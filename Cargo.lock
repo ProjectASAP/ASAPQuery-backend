@@ -966,6 +966,7 @@ dependencies = [
  "asap-aware-mapping",
  "asap-frontend-promql",
  "asap-frontend-sql",
+ "asap-physical-operators",
  "asap-types",
  "asap_types",
  "axum",

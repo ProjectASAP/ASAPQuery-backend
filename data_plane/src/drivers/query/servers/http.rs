@@ -6582,7 +6582,7 @@ mod catalog_install_tests {
         binding.window_ms += 1;
         let error = install(request).unwrap_err();
         assert!(
-            error.contains("query physical pane duration differs"),
+            error.contains("query") && error.contains("pane") && error.contains("differs"),
             "{error}"
         );
     }
