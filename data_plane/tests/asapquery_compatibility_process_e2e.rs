@@ -90,6 +90,111 @@ fn quote_snapshot_for_frontend_test(
     snapshot
 }
 
+/// Uncertified candidates must route through the installed exact endpoint unchanged.
+async fn assert_uncertified_exact_process(fixture: Value, queries: &[&str]) {
+    use control_plane::physical::compiler::BackendLocalPlanningInput;
+    use control_plane::query_plan::QueryPlanNode;
+    let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+    let priced = quote_snapshot_for_test(snapshot);
+    let plan = priced.clone().compile_promql().unwrap();
+    assert!(
+        plan.precompute_plan.materializations.is_empty(),
+        "{plan:#?}"
+    );
+    for entry in plan.query_plan.entries.values() {
+        assert!(
+            entry.nodes.values().any(|node| matches!(
+                node,
+                QueryPlanNode::ExactFallback { .. } | QueryPlanNode::ExternalExact { .. }
+            )),
+            "{entry:#?}"
+        );
+        assert!(
+            !entry
+                .nodes
+                .values()
+                .any(|node| matches!(node, QueryPlanNode::SummaryEstimate { .. })),
+            "{entry:#?}"
+        );
+    }
+    let received = Arc::new(Mutex::new(Vec::<HashMap<String, String>>::new()));
+    let requests = received.clone();
+    let exact_response = serde_json::json!({
+        "status": "success", "data": {"resultType": "vector", "result": [
+            {"metric": {"instance": "a"}, "value": [12345, "17"]}
+        ]}
+    });
+    let expected = exact_response.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_url = format!("http://{}", listener.local_addr().unwrap());
+    let fallback = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/-/healthy", get(|| async { "healthy" }))
+                .route(
+                    "/api/v1/query",
+                    get(move |Query(params): Query<HashMap<String, String>>| {
+                        let requests = requests.clone();
+                        let response = exact_response.clone();
+                        async move {
+                            requests.lock().await.push(params);
+                            Json(response)
+                        }
+                    }),
+                ),
+        )
+        .await
+        .unwrap();
+    });
+    let output = tempfile::tempdir().unwrap();
+    let path = output.path().join("planning.json");
+    std::fs::write(&path, serde_json::to_vec(&priced).unwrap()).unwrap();
+    let port = unused_port();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_data_plane"))
+            .args(["--profile", "asapquery", "--planning-snapshot"])
+            .arg(path)
+            .args([
+                "--prometheus-server",
+                &fallback_url,
+                "--forward-unsupported-queries",
+                "--http-port",
+                &port.to_string(),
+                "--output-dir",
+            ])
+            .arg(output.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::new();
+    let backend = format!("http://127.0.0.1:{port}");
+    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+    for query in queries {
+        let response = client
+            .get(format!("{backend}/api/v1/query"))
+            .query(&[("query", *query), ("time", "12345")])
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        assert_eq!(response.json::<Value>().await.unwrap(), expected);
+    }
+    let received = received.lock().await;
+    assert_eq!(received.len(), queries.len());
+    for (request, query) in received.iter().zip(queries) {
+        assert_eq!(request.get("query").unwrap(), query);
+        assert_eq!(request.get("time").unwrap(), "12345");
+    }
+    fallback.abort();
+}
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -548,11 +653,10 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         query.accuracy_target.clone(),
         algorithm.clone(),
     );
-    query.selected_plan_root = control_plane::planner_selection::select_summary_with_evidence(
+    query.selected_plan_root = control_plane::planner_selection::select_query_with_models(
         &expr,
         &model,
         &asap_aware_mapping::DefaultAccuracyModel,
-        &asap_aware_mapping::EqualSplitAllocator,
         &Evidence,
     )
     .unwrap();
