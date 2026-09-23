@@ -47,7 +47,7 @@ V1 uses one plan and three value adapters rather than three semantic programs.
 | Adapter | Nodes and values | Scheduling |
 | --- | --- | --- |
 | Stored-summary adapter | `ReadMaterialization`, state merge, exact/sketch readout, scalar arithmetic and reduction | Reachable nodes run in topological order. Each node runs once for the requested root. |
-| PromQL/MetricsQL residual adapter | Logical aggregation, binary, temporal, subquery, candidate reranking and prepared exact leaves | Demand evaluation memoized by `(node_id, evaluation_time)`. The time key is required because a subquery evaluates one dependency at several timestamps. |
+| PromQL/MetricsQL query-time adapter | Logical aggregation, binary, temporal, subquery, candidate reranking and prepared exact leaves | Demand evaluation memoized by `(node_id, evaluation_time)`. The time key is required because a subquery evaluates one dependency at several timestamps. |
 | ClickHouse relation adapter | External relations, filters, projections and joins around stored-summary sub-DAGs | Demand evaluation memoized by `node_id`. Each edge validates its declared relation schema. Stored-summary sub-DAGs delegate to the topological adapter. |
 
 All adapters start from a `QueryPlanEntry` node. The language adapters only
@@ -199,7 +199,12 @@ cannot enumerate TopK. Native matrix construction checks are distinct from
 packed-wire decoder limits. The SummaryAgg capability check does not validate
 all subsequent readout combinations or certify approximation guarantees.
 
-### Installed QueryPlan and residual coverage
+### Installed QueryPlan and query-time operation coverage
+
+These operations finish the query after its inputs have been obtained. For
+example, stored per-series rates can feed a sum by job and then TopK. The code
+calls these operations "residual" because they are the work remaining after
+precomputation; that term does not mean unsupported work or external fallback.
 
 | Installed node(s) | Local execution status |
 | --- | --- |
@@ -208,11 +213,11 @@ all subsequent readout combinations or certify approximation guarantees.
 | SummaryEstimate, ExactReadout, SummaryMerge | Implemented for supported typed states/readouts; not raw-source construction |
 | MembershipFilter | Value-preserving membership semijoin; ordinary Logical TopKSelection ranks its output |
 | Relational, RelationalJoin | Backend ClickHouse value adapter subset described above; not in shared library |
-| Logical | Residual operator subset listed below |
+| Logical | Query-time operation subset listed below |
 | ExternalExact | Declared external computation, possibly dependent on candidates; not local coverage |
 | ExactFallback | Deliberate failure handed to installed fallback policy; not an implementation |
 
-Residual operator inventory:
+Query-time operation inventory (`ResidualQueryOperator` in the code):
 
 - `CurrentSeries`: local read of an installed maintained population.
 - `ExactSubquery`, `CandidateExactSubquery`: prepared external exact results.
@@ -223,7 +228,7 @@ Residual operator inventory:
   Equal/NotEqual/Less/LessEqual/Greater/GreaterEqual; typed matching and domain
   restrictions apply, not arbitrary PromQL binary syntax.
 - `Temporal`: Rate, Increase, Avg, Max, Min, Sum, Count over supported inputs.
-- `Sort`, `HistogramQuantile`, `Subquery`: implemented residual paths; subqueries
+- `Sort`, `HistogramQuantile`, `Subquery`: implemented query-time paths; subqueries
   require bounded time grids and memoization by node and evaluation time.
 
 The shared synchronous/asynchronous DAG walker schedules and memoizes nodes. It
@@ -236,7 +241,7 @@ obtain a complete query engine by importing the shared crate alone.
 | Plan placement | Present evidence | Remaining requirement |
 | --- | --- | --- |
 | Raw only | Independent KLL consumer constructs and queries state directly | Backend local raw source plus query-time summary construction/lowering; currently not supported as a general installed query plan |
-| Partially precomputed | KLL consumer merges prebuilt prefix with query-built suffix; backend can combine supported stored and residual nodes | General stored-state + raw-suffix query DAG, typed update evaluation, compatible scope/merge checks and process acceptance |
+| Partially precomputed | KLL consumer merges prebuilt prefix with query-built suffix; backend can combine supported stored and query-time computation nodes | General stored-state + raw-suffix query DAG, typed update evaluation, compatible scope/merge checks and process acceptance |
 | Fully precomputed | Backend stored read/merge/readout paths and process tests | Valid only for supported family/schema/window/operator combinations; storage readiness remains a runtime requirement |
 
 To complete the requested contract, Planner must express valid query-time summary
@@ -309,7 +314,7 @@ PromQL subqueries are the exception to a plain node-only memo key. The same
 node has a different result at each evaluation timestamp, so their memo key is
 `(node_id, evaluation_time)`. Repeated access at the same timestamp reuses the
 value. Prepared external leaves use the same identity and are issued before
-local residual evaluation so network I/O does not hide inside a synchronous
+local query-time evaluation so network I/O does not hide inside a synchronous
 operator.
 
 Memoization is request local. It is discarded after the root result is adapted;
@@ -373,7 +378,7 @@ V1 evaluates ready nodes sequentially inside one request. Independent requests
 still run concurrently. Parallel execution of independent nodes is unnecessary
 for correctness and remains future work. External I/O uses the request client's
 timeout; cancellation drops the request-local evaluation and its prepared
-values. Logical subqueries enforce depth and evaluation budgets to bound memory
+values. Query-time subqueries enforce depth and evaluation budgets to bound memory
 and work.
 
 Large relation intermediates and a unified resource budget across all three
