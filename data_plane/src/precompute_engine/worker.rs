@@ -4446,9 +4446,11 @@ mod dag_execution_tests {
             &dag,
         )
         .unwrap();
-        assert!(StreamingConfig::from_precompute_plan(plan)
+        installed.document.schema_version =
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+        let error = StreamingConfig::from_precompute_plan(plan)
             .unwrap_err()
-            .to_string()
-            .contains("update"));
+            .to_string();
+        assert!(error.contains("update"), "{error}");
     }
 }

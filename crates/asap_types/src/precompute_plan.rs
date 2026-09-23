@@ -626,19 +626,19 @@ impl PrecomputePlan {
                             ExecutableOperatorPayload as Payload, ExecutionTiming, ValueOperation,
                         };
                         if node.output_state
-                            != planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS
+                            != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
                         {
                             return Err(invalid());
                         }
                         match &node.payload {
                             Payload::Value {
                                 operation: ValueOperation::FinalizeExactAccumulator,
-                                timing: ExecutionTiming::MaintenanceTime,
+                                timing: ExecutionTiming::IngestionTime,
                             } if children.len() == 1
                                 && frontiers.contains_key(&children[0].producer) => {}
                             Payload::Binary {
                                 operator,
-                                timing: ExecutionTiming::MaintenanceTime,
+                                timing: ExecutionTiming::IngestionTime,
                             } if children.len() == 2
                                 && children
                                     .iter()
@@ -1056,7 +1056,7 @@ mod source_window_cohort_tests {
                 reduction: Reduction::by(vec![]),
                 grouping: Default::default(),
             },
-            output_state: ExecutionDataState::MAINTENANCE_SUMMARY,
+            output_state: ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
@@ -1077,7 +1077,9 @@ mod source_window_cohort_tests {
         assert!(validate_maintenance_reduction(&config, &node).is_err());
         config.partitioning = None;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
-        node.payload = ExecutableOperatorPayload::SummaryMerge;
+        node.payload = ExecutableOperatorPayload::SummaryMerge {
+            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
+        };
         assert!(validate_maintenance_reduction(&config, &node).is_err());
     }
 

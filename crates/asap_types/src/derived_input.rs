@@ -215,7 +215,7 @@ mod tests {
         use planner_types::post_asap::{
             EdgeRole, ExecutionDataState, GroupingEdgeCompatibility, WindowEdgeCompatibility,
         };
-        let state = ExecutionDataState::MAINTENANCE_SUMMARY;
+        let state = ExecutionDataState::INGESTION_SUMMARY;
         OwnedPostAsapDag {
             schema_version: crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
             query_id: "query-a".into(),
@@ -224,7 +224,7 @@ mod tests {
                 .into_iter()
                 .map(|id| OwnedPostAsapNode {
                     id: PostAsapNodeId(id),
-                    payload: serde_json::json!({"kind":"summary_merge"}),
+                    payload: serde_json::json!({"kind":"summary_merge", "timing":"ingestion_time"}),
                     output_state: state,
                     output_schema: serde_json::json!({"fields":[],"time_index":null}),
                     guarantee: None,

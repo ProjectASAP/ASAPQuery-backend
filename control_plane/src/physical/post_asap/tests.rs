@@ -112,11 +112,11 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
         SummaryExpr::SummaryAgg { child, .. } => node_is_archive(child),
         SummaryExpr::ValueOperation { child, .. } => node_is_archive(child),
         SummaryExpr::SummaryEstimate { summary_input, .. } => node_is_archive(summary_input),
-        SummaryExpr::SummaryMerge { children } => children.iter().any(node_is_archive),
+        SummaryExpr::SummaryMerge { children, .. } => children.iter().any(node_is_archive),
         SummaryExpr::SummaryJoin { outer, inner, .. } => {
             node_is_archive(outer) || node_is_archive(inner)
         }
-        SummaryExpr::CandidateTopK {
+        SummaryExpr::MembershipFilter {
             candidates, values, ..
         } => node_is_archive(candidates) || node_is_archive(values),
         SummaryExpr::SummarySubtract { left, right }

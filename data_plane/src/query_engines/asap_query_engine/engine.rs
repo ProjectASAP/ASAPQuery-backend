@@ -286,7 +286,7 @@ impl ASAPQueryEngine {
         // Candidate-filtered exact cuts have a data dependency: read the
         // installed membership subtree once, then use that vector to build the
         // Prometheus selector. Keeping the result as a prepared leaf also means
-        // CandidateTopK reuses the same membership readout during composition.
+        // MembershipFilter reuses the same membership readout during composition.
         let dependencies = super::exact_subqueries::external_dependencies(entry, times)?;
         let mut prepared = super::logical_dag::PreparedLeaves::new();
         let unique_inputs = dependencies

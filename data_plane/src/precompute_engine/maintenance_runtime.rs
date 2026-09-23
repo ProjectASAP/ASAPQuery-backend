@@ -167,14 +167,16 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
         inputs: &[Arc<MaintenanceValue>],
     ) -> Result<MaintenanceValue, Self::Error> {
         match &node.payload {
-            ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
+            ExecutableOperatorPayload::SummaryMerge {
+                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
+            } => merge_inputs(inputs),
             ExecutableOperatorPayload::Binary {
                 operator,
-                timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
             } => {
                 if !self.inputs.frozen_inputs().is_some()
                     || node.output_state
-                        != planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS
+                        != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
                 {
                     return Err("maintenance binary requires immutable completed row inputs".into());
                 }
@@ -183,7 +185,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
 
             ExecutableOperatorPayload::Value {
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
             } => {
                 if !self.inputs.frozen_inputs().is_some() {
                     return Err(
@@ -2171,8 +2173,7 @@ mod tests {
             .nodes
             .iter()
             .filter(|node| {
-                node.output_state.timing
-                    == planner_types::post_asap::ExecutionTiming::MaintenanceTime
+                node.output_state.timing == planner_types::post_asap::ExecutionTiming::IngestionTime
             })
             .map(|node| node.id)
             .collect::<BTreeSet<_>>();
@@ -2249,8 +2250,10 @@ mod tests {
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
             id: PostAsapNodeId(id),
-            payload: ExecutableOperatorPayload::SummaryMerge,
-            output_state: planner_types::post_asap::ExecutionDataState::MAINTENANCE_SUMMARY,
+            payload: ExecutableOperatorPayload::SummaryMerge {
+                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
+            },
+            output_state: planner_types::post_asap::ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
@@ -2268,7 +2271,7 @@ mod tests {
                 fields: vec![],
                 time_index: None,
             },
-            data_state: planner_types::post_asap::ExecutionDataState::MAINTENANCE_SUMMARY,
+            data_state: planner_types::post_asap::ExecutionDataState::INGESTION_SUMMARY,
             grouping: GroupingEdgeCompatibility::Identical,
             window: WindowEdgeCompatibility::NotApplicable,
         }
@@ -2444,7 +2447,7 @@ mod tests {
         let mut read = node(2);
         read.payload = ExecutableOperatorPayload::Value {
             operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-            timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
         };
         read.output_schema.fields = vec![SummaryField {
             name: "value".into(),
@@ -2489,14 +2492,14 @@ mod tests {
             dtype: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
             nullable: false,
         }];
-        read.output_state = planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS;
+        read.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
         aggregate.output_schema.fields = vec![SummaryField {
             name: "state".into(),
             dtype: configs[1].accumulator_spec().unwrap().family,
             nullable: false,
         }];
         let mut query = node(4);
-        query.output_state = planner_types::post_asap::ExecutionDataState::READ_ROWS;
+        query.output_state = planner_types::post_asap::ExecutionDataState::QUERY_ROWS;
         let mut first_edge = edge(1, 2);
         first_edge.intermediate_schema = source_node.output_schema.clone();
         let mut second_edge = edge(2, 3);
@@ -2907,7 +2910,9 @@ mod tests {
         second_node.id = PostAsapNodeId(5);
         let mut merge = second_node.clone();
         merge.id = PostAsapNodeId(6);
-        merge.payload = ExecutableOperatorPayload::SummaryMerge;
+        merge.payload = ExecutableOperatorPayload::SummaryMerge {
+            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
+        };
         dag.nodes.extend([second_node, merge]);
         let original = dag
             .edges
@@ -3395,9 +3400,9 @@ mod tests {
         };
         operation.payload = ExecutableOperatorPayload::Binary {
             operator: operator.clone(),
-            timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
         };
-        operation.output_state = planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS;
+        operation.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
         assert!(frozen
             .execute(&operation, &[left.clone(), right.clone()])
             .is_ok());
@@ -3414,7 +3419,7 @@ mod tests {
             .is_err());
         operation.payload = ExecutableOperatorPayload::Binary {
             operator: operator.clone(),
-            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            timing: planner_types::post_asap::ExecutionTiming::QueryTime,
         };
         assert!(frozen
             .execute(&operation, &[left.clone(), right.clone()])
@@ -3870,7 +3875,7 @@ mod tests {
             .policy_fingerprint()
             .into();
         let mut query = node(2);
-        query.output_state = planner_types::post_asap::ExecutionDataState::READ_ROWS;
+        query.output_state = planner_types::post_asap::ExecutionDataState::QUERY_ROWS;
         let dag = ExecutableDag {
             nodes: vec![node(0), node(1), query],
             edges: vec![edge(0, 1), edge(1, 2)],
@@ -4010,7 +4015,7 @@ mod tests {
         // source 0 is shared by both branches; root therefore contains two
         // copies of its value while node 0 itself is evaluated once.
         let mut query = node(4);
-        query.output_state = planner_types::post_asap::ExecutionDataState::READ_ROWS;
+        query.output_state = planner_types::post_asap::ExecutionDataState::QUERY_ROWS;
         let dag = ExecutableDag {
             nodes: (0..4).map(node).chain([query]).collect(),
             edges: vec![edge(0, 1), edge(0, 2), edge(1, 3), edge(2, 3), edge(3, 4)],
@@ -4082,7 +4087,7 @@ mod tests {
         let mut unsupported = node(1);
         unsupported.payload = ExecutableOperatorPayload::SummarySubtract;
         let mut query = node(2);
-        query.output_state = planner_types::post_asap::ExecutionDataState::READ_ROWS;
+        query.output_state = planner_types::post_asap::ExecutionDataState::QUERY_ROWS;
         let dag = ExecutableDag {
             nodes: vec![node(0), unsupported, query],
             edges: vec![edge(0, 1), edge(1, 2)],
