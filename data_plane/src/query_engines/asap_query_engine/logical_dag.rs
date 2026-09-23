@@ -613,7 +613,10 @@ fn membership_filter(
     Ok((selected, warning))
 }
 
-fn native_scalar(value: f64, context: &physical::RunContext) -> Result<f64, EngineError> {
+pub(super) fn native_scalar(
+    value: f64,
+    context: &physical::RunContext,
+) -> Result<f64, EngineError> {
     use physical::{batch_execution::evaluate_source, operators::Operator, values::Value as Cell};
     let source = Operator::scalar(
         Cell::Float64(value),
@@ -1771,6 +1774,28 @@ mod shared_runtime_tests {
             assert!(stats.memo_hits >= 1);
         }
         assert_eq!(calls, vec![2000, 3000, 3000, 4000]);
+    }
+
+    // Query adapters use native computation and its parent execution budget.
+    #[test]
+    fn native_scalar_and_aggregation_share_parent_resource_control() {
+        let context = test_native_context();
+        assert_eq!(native_scalar(7., &context).unwrap(), 7.);
+        let output = aggregate(
+            Aggregation::Sum,
+            &Grouping {
+                labels: vec![],
+                without: false,
+            },
+            vec![(Labels::new(), 2.), (Labels::new(), 5.)],
+            &context,
+        )
+        .unwrap();
+        assert_eq!(output, vec![(Labels::new(), 7.)]);
+        assert!(context.peak_bytes() > 0);
+        context.cancel();
+        assert!(native_scalar(7., &context).is_err());
+        assert!(negate(Value::Scalar(1.), &context).is_err());
     }
 
     // Source failures keep their routing classification across the shared runtime.

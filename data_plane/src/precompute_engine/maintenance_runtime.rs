@@ -2435,6 +2435,30 @@ mod tests {
         .is_err());
     }
 
+    // Ingestion adapters must execute native operators in the parent's scope.
+    #[test]
+    fn native_merge_uses_the_parent_budget_and_cancellation() {
+        let input = Arc::new(MaintenanceValue::summary(Arc::new(
+            SumAccumulator::with_sum(3.),
+        )));
+        let context = test_context();
+        let output = merge_inputs(&[Arc::clone(&input)], &context).unwrap();
+        assert_eq!(
+            output
+                .state()
+                .unwrap()
+                .query_statistic(asap_types::Statistic::Sum, &None, &Default::default())
+                .unwrap(),
+            3.
+        );
+        assert!(context.peak_bytes() > 0);
+        context.cancel();
+        assert!(merge_inputs(&[input], &context)
+            .err()
+            .unwrap()
+            .contains("cancelled"));
+    }
+
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
             id: PostAsapNodeId(id),

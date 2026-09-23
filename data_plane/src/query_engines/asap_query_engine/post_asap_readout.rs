@@ -122,9 +122,12 @@ impl PhysicalQueryRuntime<'_> {
         _id: QueryNodeId,
         node: &QueryPlanNode,
         inputs: &[PhysicalQueryOutput],
+        context: &dag::RunContext,
     ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
         match node {
-            QueryPlanNode::Scalar { value } => Ok(PhysicalQueryOutput::Scalar(*value)),
+            QueryPlanNode::Scalar { value } => super::logical_dag::native_scalar(*value, context)
+                .map(PhysicalQueryOutput::Scalar)
+                .map_err(|error| PhysicalNodeError::Fallback(error.to_string())),
             QueryPlanNode::Binary { operator, .. } => {
                 let [lhs, rhs] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
@@ -598,7 +601,7 @@ impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
     fn start<'a>(
         &'a self,
         inputs: Vec<dag::Input<'a, PhysicalQueryOutput>>,
-        _: dag::RunContext,
+        context: dag::RunContext,
     ) -> Result<dag::OutputStream<'a, PhysicalQueryOutput>, dag::Error> {
         Ok(futures::stream::once(async move {
             let values =
@@ -613,7 +616,7 @@ impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
                 .map(|value| value.value().clone())
                 .collect::<Vec<_>>();
             self.runtime
-                .execute_node(self.id, self.node, &values)
+                .execute_node(self.id, self.node, &values, &context)
                 .map_err(|e| dag::Error::Operator(format!("query node {}: {e}", self.id.0)))
         })
         .boxed_local())
@@ -1582,7 +1585,7 @@ mod tests {
             control_plane::query_plan::ExactReadout::Increase,
         ] {
             assert!(matches!(native_runtime.execute_node(QueryNodeId(0),
-                &QueryPlanNode::ExactReadout { input:QueryNodeId(1),readout }, &[]),
+                &QueryPlanNode::ExactReadout { input:QueryNodeId(1),readout }, &[], &dag::RunContext::new(dag::Scope::Query { evaluation_time_ms: 0, revision: 0 }, dag::Limits::default()).unwrap()),
                 Err(PhysicalNodeError::Fallback(reason))
                     if reason.contains("native MetricsQL counter semantics require external exact execution")));
         }

@@ -154,6 +154,13 @@ a local raw Scan. The native binder covers a subset of Planner, and the installe
 backend binder remains separate while its value adapters are migrated. Neither
 binder may count external execution as native operator coverage.
 
+The shared-library foundation is #770. #763 integrates precompute execution;
+#765 integrates query execution. The [library design](physical-operators.md)
+defines the common boundary and compares DataFusion reuse with independent
+implementation. A storage adapter converts deployed values to native batches;
+it does not reimplement the operation. Native batch chains use the surrounding
+run's resource and cancellation context.
+
 ## Shared physical operator library
 
 The library's unit of composition is an executable physical operator. Each
@@ -263,20 +270,20 @@ means an implemented path for the stated subset, not universal support.
 | Read materialization | Load previously computed state | State decoding kernels; no storage adapter | Catalog/store binding for compatible populations and windows | General raw input access; unavailable or incompatible state cannot be read |
 | Maintain current-series state | Update the maintained values and timestamps for incoming time series. | None | Specialized remote-write ingestion path | General table-row updates and shared implementation |
 | Read current-series state | Read values from the maintained time-series state for query execution. | None | Current-series readout using the installed state identity and capacity | Arbitrary raw-table reading |
-| Scalar | Produce a scalar value | Typed native source, including nullable values | Installed scalar adapter on the shared runtime | Bind installed scalar nodes directly to the native batch source |
+| Scalar | Produce a scalar value | Typed native source, including nullable values | Both installed query evaluators use the native scalar source | General ingestion literal binding |
 | Binary | Combine or compare two inputs | Native matching-type Int64/Float64 arithmetic expressions, checked integer arithmetic, comparisons and boolean expressions; Float64 arithmetic kernels | Query arithmetic, CheckedDiv/FiniteDiv and comparisons; ingestion arithmetic on immutable completed, aligned rows | General coercion, arbitrary PromQL matching and unsupported value domains |
-| Unary negate | Negate a value | Native Int64/Float64 expression with null propagation and checked integer overflow | Typed query scalar/vector adapter | Connect installed value paths to the native expression binding |
-| Vector to scalar | Convert a vector to a scalar | Native Float64 batch operator; zero or multiple rows produce NaN | Typed query adapter | Connect installed value paths to the native batch operator |
-| Exact aggregate | Compute Count/Sum/Avg/Min/Max, including ReduceSum | Native grouped batches: checked Int64 Sum, Float64 Sum/Avg, Int64 Count, ordered Min/Max, nullable inputs; exact state kernels | Relation and query adapters | Connect installed adapters to native batches; no universal AggIntent, per-entity or unresolved grouping-without binding; blocking execution has no spill |
-| Finalize exact accumulator / ExactReadout | Obtain an exact result from typed state | Native validated readout for the six supported exact families; Int64 Count and Float64 numeric results | Typed query readout and ingestion finalization | Native batch integration; arbitrary state conversion and other exact families |
+| Unary negate | Negate a value | Native Int64/Float64 expression with null propagation and checked integer overflow | Query scalar/vector values use native Project with Negate | General ingestion expression binding |
+| Vector to scalar | Convert a vector to a scalar | Native Float64 batch operator; zero or multiple rows produce NaN | Query value adapter uses the native batch operator | General ingestion value binding |
+| Exact aggregate | Compute Count/Sum/Avg/Min/Max, including ReduceSum | Native grouped batches: checked Int64 Sum, Float64 Sum/Avg, Int64 Count, ordered Min/Max, nullable inputs; exact state kernels | Query grouped aggregation uses the native batch operator; relation adapter remains separate | Native relation binding; no universal AggIntent, per-entity or unresolved grouping-without binding; blocking execution has no spill |
+| Finalize exact accumulator / ExactReadout | Obtain an exact result from typed state | Native validated readout for the six supported exact families; Int64 Count and Float64 numeric results | Native ingestion finalization and typed stored-state query readout | Native query batch binding; arbitrary state conversion and other exact families |
 | Project | Select or calculate output columns | Native typed expressions and batch projection; Planner plain scalar and collection values are preserved | Query relation adapter | Complete expression vocabulary and installed native batch binding |
 | Filter | Keep rows satisfying a predicate | Native batch predicate evaluation; three-valued boolean logic, equality/less-than, null checks | Query relation adapter | Other predicates, coercions and installed native batch binding |
 | Relational join, including semi-join | Match rows by a predicate; semi-join retains matching left rows | Native batch semi-join with explicit matching columns; value order and left multiplicity preserved; other joins remain backend-local | Relation adapter supports inner/left/right/full/cross/semi/anti joins within its predicate/schema subset; vector candidate pruning currently uses a dedicated membership adapter; general semi-join replacement pending | General ingestion join adapter and unrestricted SQL/NULL semantics |
-| Sort | Order input rows or values | Native stable grouped sort with null placement; NaN follows numeric values | Query relation and logical adapters | Installed native batch binding; unsupported key types and spill-to-disk |
-| Limit | Keep a bounded slice of input | Native offset/limit per group across batches; global Limit stops consuming after its slice | Query relation offset/limit and specialized logical lowering | Planner grouped-Limit transport and installed native batch binding; Limit does not rank or match candidate keys |
+| Sort | Order input rows or values | Native stable grouped sort with null placement; NaN follows numeric values | Query value sorting uses native Sort; relation adapter remains separate | Native relation binding; unsupported key types and spill-to-disk |
+| Limit | Keep a bounded slice of input | Native offset/limit per group across batches; global Limit stops consuming after its slice | Query grouped ranking uses native Sort followed by grouped Limit; relation adapter remains separate | Planner grouped-Limit transport and native relation binding; Limit does not rank or match candidate keys |
 | Union | Combine input streams with the same schema | Native stream union; polls all inputs | Native Planner binding uses it for multi-input summary merge | General installed batch binding |
-| SummaryAgg | Construct summary state from input | Native incremental grouped builder for exact Sum/Count/Min/Max/Rate/Increase, KLL, DDSketch and HLL; non-null Float64 updates, timestamped counters | Ingestion specialization and restricted row-to-state adapter | Installed native builder; Int64 updates, keyed updates and other families in the native batch interface |
-| SummaryMerge | Combine compatible summary states | Native grouped state merge; multiple input streams compose through Union; family and parameters checked | Ingestion and query adapters | Installed native batch binding; cross-family conversion is not a merge |
+| SummaryAgg | Construct summary state from input | Native incremental grouped builder for exact Sum/Count/Min/Max/Rate/Increase, KLL, DDSketch and HLL; non-null Float64 updates, timestamped counters | Completed-window ingestion DAG uses the native builder; raw ingestion uses shared per-window updaters | Query builder binding; Int64 updates, keyed updates and other families in the native batch interface |
+| SummaryMerge | Combine compatible summary states | Native grouped state merge; multiple input streams compose through Union; family and parameters checked | Ingestion DAG uses native state merge; stored-query adapter remains separate | Native query batch binding; cross-family conversion is not a merge |
 | SummaryEstimate | Query a summary for an approximate result | Native KLL quantile, DDSketch quantile/count and HLL cardinality/count; parameters checked before execution | Typed stored-state readout | Other family/readout combinations in native batches; window/population compatibility and accuracy evidence remain required |
 | SummaryJoin | Combine summary inputs using summary join semantics | No registered kernel | No runtime dispatch | Concrete kernel and adapters |
 | SummarySubtract | Subtract summary state | No registered kernel | Unsupported in ingestion runtime | Concrete kernel and adapters |
@@ -287,8 +294,8 @@ means an implemented path for the stated subset, not universal support.
 | Extension | Execute an additional value operation | No general executor | Unsupported operations may route to explicit fallback | A concrete local implementation for each admitted extension |
 
 Grouped TopK is represented in the target plan as Sort followed by Limit within
-each group. The native library supports this composition. The installed dedicated TopK
-plan node must still be replaced, and Planner Limit needs an explicit grouping
+each group. The native library supports this composition. The query adapter already executes this composition. The installed TopK
+plan representation must still be replaced, and Planner Limit needs an explicit grouping
 contract. A global Limit is not equivalent. An
 optimized kernel may execute the composition without changing its meaning.
 Candidate completeness remains a condition on pruning, not on ranking.
@@ -326,7 +333,7 @@ runtime implementation. The graph contains these operations:
 
 The semi-join has no k, grouping or ranking behavior. The native DAG library
 implements semi-join, grouped Sort and grouped Limit as composable operators.
-Installed vector adapters still use specialized membership and ranking kernels;
+Installed vector adapters still use a dedicated membership binding and TopK plan representation;
 replacing their plan representation and bindings remains separate work. A missing authoritative value fails a
 certified membership plan; best-effort pruning remains explicitly approximate.
 The pruning certificate stays on the semi-join. Exact reranking does not prove

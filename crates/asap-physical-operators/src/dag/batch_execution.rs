@@ -44,11 +44,9 @@ fn evaluate_graph(
             Some(Some(Ok(batch))) => batches.push(batch.value().clone()),
             Some(Some(Err(error))) => return Err(error),
             Some(None) => return Ok(batches),
-            None => {
-                return Err(Error::Operator(
-                    "in-memory native batch chain unexpectedly awaited I/O".into(),
-                ))
-            }
+            // Native operators have no I/O sources here. Pending is the
+            // shared runtime's cooperative yield after a batch quantum.
+            None => continue,
         }
     }
 }
@@ -104,6 +102,26 @@ mod tests {
             let scalar = evaluate_source(source, context).unwrap();
             assert!(matches!(scalar[0].rows()[0][0], Value::Float64(9.)));
         }
+    }
+
+    // Native sources may cross the runtime's cooperative batch quantum.
+    #[test]
+    fn in_memory_source_drives_cooperative_yields() {
+        let schema = Arc::new(SummarySchema {
+            fields: vec![],
+            time_index: None,
+        });
+        let batch = Batch::try_new(schema.clone(), vec![vec![]]).unwrap();
+        let source = Operator::source(schema, vec![batch; 65]).unwrap();
+        let context = RunContext::new(
+            Scope::Query {
+                evaluation_time_ms: 0,
+                revision: 0,
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(evaluate_source(source, context).unwrap().len(), 65);
     }
 
     // A cancelled surrounding execution also prevents its native computation.
