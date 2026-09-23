@@ -573,9 +573,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
                     &self.dependencies,
                     &context,
                 )
-                .map(|value| {
+                .inspect(|_| {
                     tracing::debug!(target: "asap_runtime_debug", node_id = ?self.id, op = self.node.op_label(), elapsed_us = started.elapsed().as_micros() as u64, "installed query node completed");
-                    value
                 })
                 .map_err(|error| {
                     tracing::warn!(node_id = ?self.id, op = self.node.op_label(), elapsed_us = started.elapsed().as_micros() as u64, %error, "installed query node failed");
