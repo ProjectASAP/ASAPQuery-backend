@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::physical::{compiler::BackendLocalPlanningInput, erp::ErpShapeObserver};
+use control_plane::physical::erp::ErpShapeObserver;
 use data_plane::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
 use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
 
@@ -83,11 +83,10 @@ fn measured_artifact() -> Value {
 }
 
 #[tokio::test]
-async fn measured_readout_evidence_selects_and_executes_univmon() {
+async fn measured_univmon_without_confidence_uses_exact_process() {
     let artifact = measured_artifact();
     eprintln!("UNIVMON_MEASURED {artifact}");
     let raw = values(100_000);
-    let exact = truth(&raw);
     let mut observer = ErpShapeObserver::new(128).unwrap();
     for (i, value) in raw.iter().enumerate() {
         observer.observe(&value.to_string(), i / 100).unwrap();
@@ -126,61 +125,10 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             "minimum_confidence": 0.7, "minimum_confidence_margin": 0.05},
         "runtime": {"allowed_algorithms": ["Hll", "Kll", "UnivMon"], "max_memory_bytes": null}
     });
-    let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture.clone()).unwrap();
-    let plan = quote_snapshot_for_test(snapshot).compile_promql().unwrap();
-    eprintln!(
-        "UNIVMON_PLANNED {}",
-        serde_json::json!({"query_plan": plan.query_plan, "materializations": plan.precompute_plan.materializations, "lifecycle_estimates": plan.lifecycle_estimates, "executable_dags": plan.precompute_plan.executable_dags, "observation": observation})
-    );
-    assert!(
-        plan.precompute_plan
-            .materializations
-            .iter()
-            .any(|m| m.aggregation_type == asap_types::AggregationType::UnivMon),
-        "{plan:#?}"
-    );
-    // All three readouts can use one state when the selected parameters and
-    // population agree. Each still needs its own calibration evidence.
-    let mut shared_fixture = fixture.clone();
-    shared_fixture["implementation"]["erp"]["runtime"]["allowed_algorithms"] =
-        serde_json::json!(["UnivMon"]);
-    let records = shared_fixture["implementation"]["erp"]["artifact"]["records"]
-        .as_array_mut()
-        .unwrap();
-    records.remove(0);
-    let shared = quote_snapshot_for_test(
-        serde_json::from_value::<BackendLocalPlanningInput>(shared_fixture.clone()).unwrap(),
-    )
-    .compile_promql()
-    .unwrap();
-    assert_eq!(
-        shared.precompute_plan.materializations.len(),
-        1,
-        "distinct, L2 and entropy share one frequency population: {shared:#?}"
-    );
-    assert_eq!(
-        shared.precompute_plan.materializations[0].aggregation_type,
-        asap_types::AggregationType::UnivMon
-    );
-    for query in queries {
-        let entry = shared
-            .query_plan
-            .entries
-            .values()
-            .find(|e| e.canonical_query == query)
-            .unwrap();
-        assert!(
-            !entry.nodes.values().any(|n| matches!(
-                n,
-                control_plane::query_plan::QueryPlanNode::ExactFallback { .. }
-                    | control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
-            )),
-            "{entry:#?}"
-        );
-    }
-    // Removing only entropy evidence must leave the L2 path executable.
-    let mut missing_entropy = fixture.clone();
-    for row in missing_entropy["implementation"]["erp"]["artifact"]["records"]
+    // Measured maxima across ten populations are not a failure-probability proof.
+    assert_uncertified_exact_process(fixture.clone(), &queries).await;
+    // Removing one readout's measurements cannot authorize the other readouts.
+    for row in fixture["implementation"]["erp"]["artifact"]["records"]
         .as_array_mut()
         .unwrap()
     {
@@ -189,226 +137,5 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
             .unwrap()
             .remove("max_frequency_entropy_absolute_bits_error");
     }
-    let missing = quote_snapshot_for_test(
-        serde_json::from_value::<BackendLocalPlanningInput>(missing_entropy).unwrap(),
-    )
-    .compile_promql()
-    .unwrap();
-    use control_plane::query_plan::{QueryPlanNode, QueryReadout};
-    assert!(missing
-        .query_plan
-        .entries
-        .values()
-        .flat_map(|e| e.nodes.values())
-        .any(|node| matches!(
-            node,
-            QueryPlanNode::SummaryEstimate {
-                query: QueryReadout::FrequencyL2,
-                ..
-            }
-        )));
-    let entropy = missing
-        .query_plan
-        .entries
-        .values()
-        .find(|e| e.canonical_query.starts_with("entropy_over_time"))
-        .unwrap();
-    assert!(
-        entropy.nodes.values().any(|node| matches!(
-            node,
-            QueryPlanNode::ExactFallback { .. } | QueryPlanNode::ExternalExact { .. }
-        )),
-        "{entropy:#?}"
-    );
-    assert!(!entropy.nodes.values().any(|node| matches!(
-        node,
-        QueryPlanNode::SummaryEstimate {
-            query: QueryReadout::FrequencyEntropy,
-            ..
-        }
-    )));
-    let plan = shared;
-    let fixture = shared_fixture;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let fallback_url = format!("http://{}", listener.local_addr().unwrap());
-    let fallback = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route("/-/healthy", get(|| async { "healthy" })),
-        )
-        .await
-        .unwrap();
-    });
-    let runtime_samples = control_plane::runtime_samples::RuntimeSamplesStore::new(8);
-    let runtime_port = unused_port();
-    let runtime_endpoint = format!("http://127.0.0.1:{runtime_port}");
-    let runtime_service =
-        control_plane::runtime_samples::RuntimeSamplesService::new(runtime_samples.clone())
-            .into_server();
-    let runtime_task = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(runtime_service)
-            .serve(([127, 0, 0, 1], runtime_port).into())
-            .await
-            .unwrap();
-    });
-    let output = tempfile::tempdir().unwrap();
-    let path = output.path().join("planning.json");
-    let priced = quote_snapshot_for_test(serde_json::from_value(fixture.clone()).unwrap());
-    std::fs::write(&path, serde_json::to_vec(&priced).unwrap()).unwrap();
-    let port = unused_port();
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_data_plane"))
-            .args(["--erp-runtime-samples-endpoint", &runtime_endpoint])
-            .args(["--profile", "asapquery", "--planning-snapshot"])
-            .arg(&path)
-            .args([
-                "--prometheus-server",
-                &fallback_url,
-                "--forward-unsupported-queries",
-                "--http-port",
-                &port.to_string(),
-                "--output-dir",
-            ])
-            .arg(output.path())
-            .args([
-                "--precompute-allowed-lateness-ms",
-                "0",
-                "--precompute-flush-interval-ms",
-                "25",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let client = reqwest::Client::new();
-    let backend = format!("http://127.0.0.1:{port}");
-    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let base = now - now.rem_euclid(5000) - 20_000;
-    let mut samples: Vec<_> = raw
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (base + 1 + i as i64, *v))
-        .collect();
-    // Bracket the calibrated population; these boundary samples are outside it.
-    samples.insert(0, (base, 0.0));
-    assert_eq!(
-        remote_write(
-            &client,
-            &backend,
-            &WriteRequest {
-                timeseries: vec![series("erp_frequency", &samples)]
-            }
-        )
-        .await,
-        204
-    );
-    assert_eq!(
-        remote_write(
-            &client,
-            &backend,
-            &WriteRequest {
-                timeseries: vec![series("erp_frequency", &[(base + 15001, 0.0)])]
-            }
-        )
-        .await,
-        204
-    );
-    drain_precompute(&client, &backend).await;
-    let keys = runtime_samples.keys();
-    assert!(
-        !keys.is_empty(),
-        "real worker inputs must reach RuntimeSamples after finite drain"
-    );
-    for key in keys {
-        let record = runtime_samples.latest(&key).unwrap();
-        let observed: asap_types::erp_observation::ErpPopulationObservations<
-            asap_types::erp_observation::EmpiricalFrequencyObservation,
-        > = serde_json::from_value(record.payload["erp_population_observations"].clone()).unwrap();
-        assert!(observed.invalid_reason.is_none(), "{observed:?}");
-        assert!(!observed.populations.is_empty());
-        assert_eq!(observed.window_end_ms - observed.window_start_ms, 5000);
-        for population in &observed.populations {
-            assert_eq!(population.shape.event_count(), Some(raw.len() as u64));
-            assert_eq!(population.shape.sorted_counts.len(), 128);
-        }
-        assert!(plan
-            .summary_catalog
-            .materializations
-            .contains_key(&observed.summary_definition_id));
-        assert_eq!(
-            observed.catalog_generation,
-            plan.summary_catalog.reference().unwrap()
-        );
-        if key.sketch == "univmon" {
-            let mut live_snapshot: BackendLocalPlanningInput =
-                serde_json::from_value(fixture.clone()).unwrap();
-            let policy = live_snapshot.physical_inputs.erp.as_mut().unwrap();
-            policy.observed_shape_source =
-                Some(control_plane::physical::erp::ErpObservedShapeSource {
-                    source: key.source.clone(),
-                    sketch: key.sketch.clone(),
-                    implementation: key.impl_name.clone(),
-                    population_scope: Some(
-                        control_plane::physical::erp::ErpPopulationObservationScope {
-                            catalog_generation: observed.catalog_generation.clone(),
-                            summary_definition_id: observed.summary_definition_id,
-                            input_semantics: observed.input_semantics,
-                            freshness: asap_types::erp_observation::ErpObservationFreshness {
-                                max_age_ms: 60_000,
-                                max_future_skew_ms: 1000,
-                            },
-                        },
-                    ),
-                });
-            policy.hydrate_observed_shape(&runtime_samples).unwrap();
-            policy.resolve_population_data_descriptor(Some(&plan.summary_catalog));
-            assert!(policy
-                .observed_populations
-                .as_ref()
-                .unwrap()
-                .invalid_reason
-                .is_none());
-            let replanned = quote_snapshot_for_test(live_snapshot)
-                .compile_promql()
-                .unwrap();
-            assert!(
-                replanned
-                    .precompute_plan
-                    .materializations
-                    .iter()
-                    .any(|m| m.aggregation_type == asap_types::AggregationType::UnivMon),
-                "actual producer evidence should reach normal Planner selection"
-            );
-        }
-    }
-    runtime_task.abort();
-
-    for (i, query) in queries.iter().enumerate() {
-        let result = wait_for_warm_instant(
-            &client,
-            &backend,
-            query,
-            (base + 5000) as f64 / 1000.0,
-            &output.path().join("query_engine.log"),
-        )
-        .await;
-        let estimate = first_value(&result, "value").unwrap();
-        let error = (estimate - exact[i]).abs() / if i == 2 { 1.0 } else { exact[i] };
-        assert!(
-            error <= 0.2,
-            "{query}: {result}, truth={}, error={error}",
-            exact[i]
-        );
-        eprintln!(
-            "UNIVMON_WARM {}",
-            serde_json::json!({"query": query, "result": result, "truth": exact[i], "measured_error": error, "units": if i == 2 { "absolute_bits" } else { "relative" }})
-        );
-    }
-    fallback.abort();
+    assert_uncertified_exact_process(fixture, &queries).await;
 }
