@@ -313,16 +313,13 @@ fn is_warm(response: &Value) -> bool {
     })
 }
 
-// Measured ERP parameters must reach the real accumulator and answer held-out
+// Confidence-sized KLL parameters must reach the real accumulator and answer
 // raw samples through the installed QueryPlan, without native fallback.
+// Uncertified ERP maxima have separate exact-routing process coverage.
 #[tokio::test]
-async fn erp_measured_kll_state_to_query_oracle() {
+async fn certified_kll_state_to_query_oracle() {
     use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
-    let artifact: Value = serde_json::from_str(include_str!(
-        "../../control_plane/tests/fixtures/erp-kll-measured.json"
-    ))
-    .unwrap();
     let mut fixture: Value = serde_json::from_str(include_str!(
         "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
     ))
@@ -331,14 +328,6 @@ async fn erp_measured_kll_state_to_query_oracle() {
     entry["query"] = QUERY.into();
     entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.06}});
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
-    fixture["implementation"]["erp"] = serde_json::json!({
-        "distribution": artifact["records"][0]["distribution"],
-        "artifact": artifact, "implementation": "lib", "error_metric": "max_rank_err",
-        "min_trials": 10, "expected_updates": 1000.0, "expected_queries": 10.0,
-        "expected_merges": 0.0, "retention_seconds": 60.0, "cpu_weight": 1.0,
-        "byte_second_weight": 1e-9, "mode": "hybrid",
-        "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
-    });
     let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
     let window_model = snapshot.physical_inputs.window_cost_model.clone();
     let (mut request, mut environment) = snapshot.into_physical_compilation_request().unwrap();
@@ -366,7 +355,23 @@ async fn erp_measured_kll_state_to_query_oracle() {
         .compile_promql(request, environment)
         .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
-    assert_eq!(plan.precompute_plan.materializations[0].parameters["k"], 32);
+    let k = plan.precompute_plan.materializations[0].parameters["k"]
+        .as_u64()
+        .unwrap() as u32;
+    let guarantee = asap_aware_mapping::DefaultAccuracyModel::sketch_guarantee(
+        &planner_types::post_asap::SketchAlgorithm::Kll,
+        &planner_types::post_asap::SketchParams::Kll { k },
+        &planner_types::post_asap::SketchQuery::Quantile { q: 0.9 },
+    )
+    .unwrap();
+    assert!(asap_aware_mapping::AccuracyModel::satisfies(
+        &asap_aware_mapping::DefaultAccuracyModel,
+        &guarantee,
+        &planner_types::types::AccuracyTarget::EpsilonDelta {
+            epsilon: 0.06,
+            delta: 0.01
+        }
+    ));
     let collector = serde_json::to_value(&plan.collector_plans[0]).unwrap();
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
@@ -415,8 +420,7 @@ async fn erp_measured_kll_state_to_query_oracle() {
         .unwrap()
         .as_millis() as i64;
     let base = now - now.rem_euclid(5000) - 20000;
-    // A different deterministic stream from training seed 42; the oracle
-    // evaluates rank error, not the unrelated relative error of the value.
+    // The oracle evaluates rank error, not relative error of the value.
     let raw: Vec<f64> = (0..1000)
         .map(|i| ((i * 7919 + 17) % 1009) as f64 / 1009.0)
         .collect();
@@ -456,7 +460,7 @@ async fn erp_measured_kll_state_to_query_oracle() {
         }
     })
     .await
-    .expect("ERP plan must answer without exact fallback");
+    .expect("certified KLL plan must answer without exact fallback");
     let estimate = first_value(&response, "value").expect("numeric estimate");
     let rank = raw.iter().filter(|v| **v <= estimate).count() as f64 / raw.len() as f64;
     assert!(
@@ -478,7 +482,11 @@ fn erp_collector_kll_export(plan: &Value, end_ms: u64, raw: &[f64], sequence: u6
     let decoded: asap_types::producer_plan::CollectorPlan =
         serde_json::from_value(plan.clone()).unwrap();
     assert_eq!(decoded.materializations.len(), 1);
-    let k = 32;
+    let k = decoded.materializations[0].parameters["k"]
+        .as_u64()
+        .unwrap()
+        .try_into()
+        .unwrap();
     let mut sketch = asap_sketchlib::sketches::kll::KLL::<f64>::init_kll_with_seed(k, 123);
     for value in raw {
         sketch.update(value);
