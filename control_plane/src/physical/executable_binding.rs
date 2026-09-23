@@ -16,15 +16,16 @@ fn operator_execution(
     use planner_types::post_asap::{ExecutableOperatorPayload as Payload, ExecutionTiming};
 
     let declared = match &node.payload {
-        Payload::Binary { timing, .. } | Payload::Value { timing, .. } => *timing,
-        Payload::CandidateTopK { .. } | Payload::SummaryEstimate { .. } => {
-            ExecutionTiming::ReadTime
+        Payload::Binary { timing, .. }
+        | Payload::Value { timing, .. }
+        | Payload::SummaryMerge { timing } => *timing,
+        Payload::MembershipFilter { .. } | Payload::SummaryEstimate { .. } => {
+            ExecutionTiming::QueryTime
         }
         Payload::SummaryAgg { .. }
         | Payload::SummaryJoin { .. }
         | Payload::SummarySubtract
-        | Payload::SummaryDelete { .. }
-        | Payload::SummaryMerge => ExecutionTiming::MaintenanceTime,
+        | Payload::SummaryDelete { .. } => ExecutionTiming::IngestionTime,
         // These operators can be placed on either side of the stored-state
         // boundary. Planner's validated output state is authoritative.
         Payload::Fallback { .. } | Payload::RelationalJoin { .. } => node.output_state.timing,
@@ -38,8 +39,8 @@ fn operator_execution(
         ));
     }
     Ok(match declared {
-        ExecutionTiming::MaintenanceTime => OperatorExecution::Maintenance,
-        ExecutionTiming::ReadTime => OperatorExecution::Query,
+        ExecutionTiming::IngestionTime => OperatorExecution::Maintenance,
+        ExecutionTiming::QueryTime => OperatorExecution::Query,
     })
 }
 
