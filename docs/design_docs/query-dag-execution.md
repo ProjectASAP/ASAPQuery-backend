@@ -54,6 +54,35 @@ All adapters start from a `QueryPlanEntry` node. The language adapters only
 represent different runtime value types. They cannot select a replacement
 definition or reconstruct an operator from the request text.
 
+## Shared physical operator library
+
+`crates/asap-physical-operators` owns the concrete accumulator kernels, typed
+state/update traits, Planner-family factory, scalar arithmetic, and installed
+QueryPlan DAG traversal. Both maintenance and query execution import this crate
+directly; the old data-plane operator/factory modules are removed. A deployment
+such as asap-fusion can depend on the library without importing `data_plane` or
+`control_plane`, and without taking a dependency on this backend's Arrow version.
+
+The compiler calls the library's allocation-free `validate_summary_kernel`
+when binding a `SummaryAgg`. Runtime construction uses the same validation.
+Unsupported family/layout combinations and invalid parameters are rejected
+before the accumulator runs. This is a summary-kernel capability check, not a
+claim that every Planner payload has a complete local implementation.
+
+Kernels do not own execution placement. Their state can be constructed during
+maintenance or during a query, and the same merge/readout implementation handles
+raw-only, partially precomputed and fully precomputed inputs. The independent
+library integration test exercises these three boundaries with KLL. This test
+checks operator reuse; it does not claim that the backend's currently forbidden
+raw Scan has become an installed query source.
+
+Storage reads, population/window selection, expression-to-update evaluation,
+transport, language result adaptation and scheduling policy remain deployment
+responsibilities. In particular, Planner's current maintenance-only summary
+placement still limits which query-time summary DAGs can be exported. Completing
+that contract requires Planner placement support and backend raw-source binding;
+classifying an enum variant is not proof of local executability.
+
 ## Planner physical-operator coverage
 
 The backend pins one ASAPPlanner `main` commit and treats its exported

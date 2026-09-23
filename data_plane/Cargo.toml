@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 # Internal crates (workspace)
 asap_types.workspace = true
+asap-physical-operators.workspace = true
 asap_sketch_codec = { path = "../crates/asap_sketch_codec" }
 # Phase 9: the control plane is now an in-process library inside the
 # backend binary. Wiring up the in-process OpAMP server + capability-map
@@ -103,4 +104,4 @@ default = []
 # Enable lock profiling instrumentation
 lock_profiling = []
 # Enable extra debugging output
-extra_debugging = []
+extra_debugging = ["asap-physical-operators/extra_debugging"]

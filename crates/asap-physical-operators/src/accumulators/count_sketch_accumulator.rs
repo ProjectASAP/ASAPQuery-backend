@@ -5,7 +5,7 @@
 //! estimator so query and ingest use the same hash specification. Top-k
 //! requires the separate heap-bearing accumulator.
 
-use crate::storage_engines::types::{
+use crate::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
@@ -96,7 +96,7 @@ impl CountSketchAccumulator {
         // ingest caller skips the data point) instead of building a
         // degenerate or huge matrix. Shares the CMS validator since the
         // CountSketch matrix uses the same packed-hash column layout.
-        crate::precompute_engine::operators::count_min_sketch_accumulator::validate_sketch_dims(
+        crate::accumulators::count_min_sketch_accumulator::validate_sketch_dims(
             "CountSketchState",
             rows,
             cols,
@@ -161,7 +161,7 @@ impl CountSketchAccumulator {
         &mut self,
         buffer: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use asap_otel_proto::sketchlib::v1::CountSketchDelta as PbDelta;
+        use asap_sketchlib::proto::sketchlib::CountSketchDelta as PbDelta;
         use prost::Message;
 
         let pb = PbDelta::decode(buffer).map_err(|e| format!("decode CountSketchDelta: {e}"))?;
@@ -183,17 +183,8 @@ impl CountSketchAccumulator {
             .zip(pb.d_counts.iter())
             .map(|((r, c), dc)| (*r, *c, *dc))
             .collect();
-        // Proto-schema-divergence-tracker: the Go-side
-        // `CountSketchDelta` proto carries an `hh_keys` field
-        // (heavy-hitter candidate keys forwarded by the upstream
-        // Space-Saving tracker). The Rust wire-format struct now
-        // models it (`asap_sketchlib::CountSketchDelta::hh_keys`),
-        // but the vendored Rust proto bindings in
-        // `asap_otel_proto::sketchlib::v1` haven't been regenerated
-        // against the latest `.proto` yet, so no `hh_keys` arrive on
-        // the wire from Go producers. Sending an empty `hh_keys`
-        // disables the TopK rebuild path; it'll start firing once the
-        // proto-schema sync PR lands.
+        // This is the heap-less matrix kernel; ranked membership is handled
+        // by the explicit heap-bearing operator, not inferred from delta keys.
         let delta = CountSketchDelta {
             rows: pb.rows,
             cols: pb.cols,
@@ -563,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_core_merge_wrong_type_rejects() {
-        use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
+        use crate::accumulators::count_min_sketch_accumulator::CountMinSketchAccumulator;
         let cs = CountSketchAccumulator::new(2, 3);
         let cms = CountMinSketchAccumulator::new(2, 3);
         let result = cs.merge_with(&cms);
@@ -592,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_apply_proto_delta_bytes_round_trip() {
-        use asap_otel_proto::sketchlib::v1::CountSketchDelta as PbDelta;
+        use asap_sketchlib::proto::sketchlib::CountSketchDelta as PbDelta;
         use prost::Message;
 
         let mut acc = CountSketchAccumulator {
@@ -609,6 +600,7 @@ mod tests {
             cell_cols: vec![0, 2],
             d_counts: vec![10, -6],
             l2: vec![],
+            ..Default::default()
         }
         .encode_to_vec();
 

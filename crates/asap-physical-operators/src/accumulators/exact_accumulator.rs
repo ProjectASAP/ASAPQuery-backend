@@ -1,6 +1,6 @@
 //! Exact summary state identified by Planner family, independent of keyed layout.
 use super::increase_accumulator::IncreaseAccumulator;
-use crate::storage_engines::types::{
+use crate::{
     AggregateCore, AggregationType, AuxStats, KeyByLabelValues, Measurement, SerializableToSink,
 };
 use asap_types::Statistic;
@@ -132,16 +132,15 @@ fn merge_scalar(left: &ScalarState, right: &ScalarState) -> Result<ScalarState, 
         (ScalarState::Max(a), ScalarState::Max(b)) => {
             ScalarState::Max(a.iter().chain(b).copied().reduce(f64::max))
         }
-        (ScalarState::Counter(a), ScalarState::Counter(b)) => {
-            ScalarState::Counter(match (a, b) {
-                (Some(a), Some(b)) => Some(
-                    <IncreaseAccumulator as crate::storage_engines::types::MergeableAccumulator<
-                        _,
-                    >>::merge_accumulators(vec![a.clone(), b.clone()])?,
-                ),
-                (a, b) => a.clone().or_else(|| b.clone()),
-            })
-        }
+        (ScalarState::Counter(a), ScalarState::Counter(b)) => ScalarState::Counter(match (a, b) {
+            (Some(a), Some(b)) => Some(
+                <IncreaseAccumulator as crate::MergeableAccumulator<_>>::merge_accumulators(vec![
+                    a.clone(),
+                    b.clone(),
+                ])?,
+            ),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        }),
         _ => return Err("exact scalar state families differ".into()),
     })
 }
