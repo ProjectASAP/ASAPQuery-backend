@@ -155,7 +155,9 @@ impl RelationDagExecutor<'_> {
                 left_schema,
                 right_schema,
                 output_schema,
+                pruning,
             }) => {
+                if pruning.is_some() { return Err("candidate pruning is not bound for this relation source".into()); }
                 if output_schema != expected_schema {
                     return Err("join output schema differs from its parent edge".into());
                 }

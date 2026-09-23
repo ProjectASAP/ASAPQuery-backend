@@ -154,7 +154,6 @@ fn query_node_label(node: &QueryPlanNode) -> String {
         QueryPlanNode::SummaryEstimate { query, .. } => format!("SummaryEstimate\n{query:?}"),
         QueryPlanNode::ExactReadout { readout, .. } => format!("ExactReadout\n{readout:?}"),
         QueryPlanNode::SummaryMerge { .. } => "SummaryMerge".into(),
-        QueryPlanNode::MembershipFilter { .. } => "MembershipFilter".into(),
         QueryPlanNode::ExternalExact { .. } => "ExternalExact".into(),
         QueryPlanNode::ExactFallback { reason } => format!("ExactFallback\n{reason}"),
     }
@@ -169,7 +168,7 @@ fn residual_label(operator: &ResidualQueryOperator) -> &'static str {
         ResidualQueryOperator::UnaryNegate => "UnaryNegate",
         ResidualQueryOperator::VectorToScalar => "VectorToScalar",
         ResidualQueryOperator::Aggregate { .. } => "Aggregate",
-        ResidualQueryOperator::TopKSelection { .. } => "TopKSelection",
+        ResidualQueryOperator::Limit { .. } => "Limit",
         ResidualQueryOperator::Binary { .. } => "Binary",
         ResidualQueryOperator::Temporal { .. } => "Temporal",
         ResidualQueryOperator::Sort { .. } => "Sort",

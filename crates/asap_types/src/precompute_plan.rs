@@ -623,7 +623,7 @@ impl PrecomputePlan {
                             .filter(|edge| edge.consumer == id)
                             .collect();
                         use planner_types::post_asap::{
-                            ExecutableOperatorPayload as Payload, ExecutionTiming, ValueOperation,
+                            ExecutableOperatorPayload as Payload, ValueOperation,
                         };
                         if node.output_state
                             != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
@@ -633,32 +633,29 @@ impl PrecomputePlan {
                         match &node.payload {
                             Payload::Value {
                                 operation: ValueOperation::FinalizeExactAccumulator,
-                                timing: ExecutionTiming::IngestionTime,
                             } if children.len() == 1
                                 && frontiers.contains_key(&children[0].producer) => {}
-                            Payload::Binary {
-                                operator,
-                                timing: ExecutionTiming::IngestionTime,
-                            } if children.len() == 2
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Left
-                                    })
-                                    .count()
-                                    == 1
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Right
-                                    })
-                                    .count()
-                                    == 1
-                                && operator.vector_match.is_none()
-                                && matches!(
-                                    operator.kind,
-                                    planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
-                                ) =>
+                            Payload::Binary { operator }
+                                if children.len() == 2
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Left
+                                        })
+                                        .count()
+                                        == 1
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Right
+                                        })
+                                        .count()
+                                        == 1
+                                    && operator.vector_match.is_none()
+                                    && matches!(
+                                        operator.kind,
+                                        planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+                                    ) =>
                             {
                                 pending.extend(children.iter().map(|edge| edge.producer));
                             }
@@ -1077,9 +1074,7 @@ mod source_window_cohort_tests {
         assert!(validate_maintenance_reduction(&config, &node).is_err());
         config.partitioning = None;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
-        node.payload = ExecutableOperatorPayload::SummaryMerge {
-            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
-        };
+        node.payload = ExecutableOperatorPayload::SummaryMerge;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
     }
 
