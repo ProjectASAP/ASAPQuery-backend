@@ -71,7 +71,7 @@ pub struct QueryCompilationInput {
     /// materialization sources are derived from each post-ASAP SummaryAgg;
     /// it also remains part of the cost manifest workload identity.
     pub legacy_query_source: Source,
-    pub query_lookback_seconds: u64,
+    pub query_lookback_ms: u64,
     /// Label names are deployment metadata because Planner's canonical IR
     /// currently carries positional column IDs at this boundary.
     pub group_by_labels: Vec<String>,
@@ -838,14 +838,9 @@ impl BackendLocalPlanningInput {
                     )))
                 }
             };
-            if self.physical_inputs.scrape_interval_ms == 0
-                || !self
-                    .physical_inputs
-                    .scrape_interval_ms
-                    .is_multiple_of(1_000)
-            {
+            if self.physical_inputs.scrape_interval_ms == 0 {
                 return Err(CompileError::Snapshot(
-                    "scrape_interval_ms must be a positive whole number of seconds".into(),
+                    "scrape_interval_ms must be positive".into(),
                 ));
             }
             let accuracy = entry.requirements.accuracy.target();
@@ -891,7 +886,7 @@ impl BackendLocalPlanningInput {
                 legacy_query_source: Source::TimeSeries {
                     metric: source_hint,
                 },
-                query_lookback_seconds: lookback_ms / 1_000,
+                query_lookback_ms: lookback_ms,
                 group_by_labels: metadata.group_by_labels,
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
@@ -1440,8 +1435,10 @@ impl PhysicalPlanCompiler {
             let cohort_nodes = windows::cohort_nodes(&selected);
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let mut branch_query = query.clone();
-                branch_query.query_lookback_seconds =
-                    selected.window_secs.unwrap_or(query.query_lookback_seconds);
+                branch_query.query_lookback_ms = selected
+                    .window_secs
+                    .map(|seconds| seconds.saturating_mul(1_000))
+                    .unwrap_or(query.query_lookback_ms);
                 branch_query.group_by_labels = selected
                     .group_by
                     .clone()
@@ -1449,7 +1446,8 @@ impl PhysicalPlanCompiler {
                 branch_query
                     .window_realization_candidates
                     .retain(|candidate| {
-                        candidate.window_secs == branch_query.query_lookback_seconds
+                        candidate.window_secs.saturating_mul(1_000)
+                            == branch_query.query_lookback_ms
                             && if cohort_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
                                 windows::is_full_cohort(candidate)
                             } else {
@@ -1536,7 +1534,7 @@ impl PhysicalPlanCompiler {
                                 let cadence = u64::from(
                                     query.summary_lifecycle_inputs.evaluation_interval_ms,
                                 );
-                                let window = query.query_lookback_seconds.saturating_mul(1_000);
+                                let window = query.query_lookback_ms;
                                 a % cadence == b % cadence && a % window == b % window
                             }
                             _ => index == query_index,
@@ -1927,7 +1925,7 @@ impl PhysicalPlanCompiler {
                     let window_ms = materialization.window_size.saturating_mul(1_000);
                     if materialization_family != *node_family
                         || window_ms == 0
-                        || source_window.unwrap_or(query.query_lookback_seconds).saturating_mul(1_000)
+                        || source_window.map(|seconds| seconds.saturating_mul(1_000)).unwrap_or(query.query_lookback_ms)
                             % window_ms != 0
                     {
                         return Err(crate::query_plan::QueryPlanError::Invalid(format!(
@@ -1950,7 +1948,7 @@ impl PhysicalPlanCompiler {
                     })
             };
             let instant = InstantExecution {
-                lookback_ms: query.query_lookback_seconds.saturating_mul(1_000),
+                lookback_ms: query.query_lookback_ms,
                 full_history: false,
                 cumulative_readout: true,
             };
@@ -2832,10 +2830,9 @@ pub(super) fn derived_window_cost(
 /// example, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
 fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<u64, CompileError> {
     fn duration_ms(duration: std::time::Duration) -> Result<u64, CompileError> {
-        if duration.subsec_nanos() != 0 {
+        if !duration.subsec_nanos().is_multiple_of(1_000_000) {
             return Err(CompileError::Snapshot(
-                "PromQL ranges must be a whole number of seconds in the backend-local profile"
-                    .into(),
+                "PromQL ranges must have millisecond precision".into(),
             ));
         }
         u64::try_from(duration.as_millis())
@@ -2864,17 +2861,10 @@ fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<
                 duration_ms(*range)?,
                 visit(child, scrape_interval_ms, true)?,
             ),
-            QueryExpr::TimeShift { shift, child } => {
-                if !shift.offset_ms.unsigned_abs().is_multiple_of(1_000) {
-                    return Err(CompileError::Snapshot(
-                        "PromQL offsets must be a whole number of seconds in the backend-local profile".into(),
-                    ));
-                }
-                add(
-                    shift.offset_ms.max(0) as u64,
-                    visit(child, scrape_interval_ms, in_range)?,
-                )
-            }
+            QueryExpr::TimeShift { shift, child } => add(
+                shift.offset_ms.max(0) as u64,
+                visit(child, scrape_interval_ms, in_range)?,
+            ),
             QueryExpr::PromqlScalarBridge(child)
             | QueryExpr::PromqlVectorFromScalar(child)
             | QueryExpr::PromqlScalarFromVector(child)
@@ -3020,7 +3010,7 @@ pub(super) fn validate_window_implementations(
             && evidence.cpu_cost >= 0.0
             && evidence.weighted_cost.is_finite()
             && evidence.weighted_cost >= 0.0
-            && candidate.window_secs == query.query_lookback_seconds
+            && candidate.window_secs.saturating_mul(1_000) == query.query_lookback_ms
             && candidate
                 .layout
                 .validate(candidate.window_secs, candidate.slide_secs)
@@ -3232,8 +3222,8 @@ fn select_lifecycle(
                             raw_materialization_input_contract(node)
                                 .ok()
                                 .and_then(|(_, window, _)| window)
-                                .unwrap_or(query.query_lookback_seconds)
-                                .saturating_mul(1_000),
+                                .map(|seconds| seconds.saturating_mul(1_000))
+                                .unwrap_or(query.query_lookback_ms),
                         )),
                         as_of: None,
                     },
@@ -3583,7 +3573,9 @@ fn physical_aggregation(
         aggregation_id,
         metric_name: selected.metric.clone(),
         family: selected.family.clone(),
-        window_secs: selected.window_secs.unwrap_or(query.query_lookback_seconds),
+        window_secs: selected
+            .window_secs
+            .unwrap_or(query.query_lookback_ms.div_ceil(1_000)),
         spatial_filter: selected.spatial_filter.clone(),
         grouping: selected
             .group_by
@@ -5024,7 +5016,7 @@ pub(crate) mod tests {
                 query_string: promql.into(),
                 selected_plan_root: post_asap,
                 legacy_query_source: Source::TimeSeries { metric: "m".into() },
-                query_lookback_seconds: 60,
+                query_lookback_ms: 60_000,
                 group_by_labels: vec![],
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
@@ -6662,7 +6654,8 @@ pub(crate) mod tests {
             .unwrap()
             .0
             .queries[0]
-            .query_lookback_seconds
+            .query_lookback_ms
+            / 1_000
     }
 
     fn set_data_ingestion_interval(
@@ -6687,7 +6680,7 @@ pub(crate) mod tests {
         set_data_ingestion_interval(&mut snapshot, Some(1_000));
 
         let (request, _) = snapshot.into_physical_compilation_request().unwrap();
-        assert_eq!(request.queries[0].query_lookback_seconds, 1);
+        assert_eq!(request.queries[0].query_lookback_ms, 1_000);
     }
 
     // Snapshot lowering must use the environment clock for cadence freshness.
@@ -6727,7 +6720,7 @@ pub(crate) mod tests {
             request.data_workload.unwrap().data_ingestion_interval.value,
             Some(DurationMs(5_000))
         );
-        assert_eq!(request.queries[0].query_lookback_seconds, 5);
+        assert_eq!(request.queries[0].query_lookback_ms, 5_000);
     }
 
     // An explicitly invalid interval must not be replaced by the migration value.
@@ -6762,29 +6755,48 @@ pub(crate) mod tests {
         assert_eq!(derived_query_window_secs("sum_over_time(a[1s])"), 1);
     }
 
-    // The seconds-based backend must fail explicitly instead of shrinking history.
+    /// Fractional ranges, subqueries and offsets preserve their exact history.
     #[test]
-    fn derived_history_rejects_fractional_seconds() {
-        for query in [
-            "sum_over_time(a[1500ms])",
-            "sum_over_time(a[500ms])",
-            "sum_over_time(a[1500ms] offset 500ms)",
-            "sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))",
-            "avg_over_time((sum(a))[1500ms:])",
-            "sum(a offset 500ms)",
+    fn derived_history_preserves_milliseconds() {
+        for (query, expected) in [
+            ("sum_over_time(a[1500ms])", 1500),
+            ("sum_over_time(a[500ms])", 500),
+            ("sum_over_time(a[1500ms] offset 500ms)", 2000),
+            ("sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))", 1000),
+            ("avg_over_time((sum(a))[1500ms:])", 6500),
+            ("sum(a offset 500ms)", 5500),
         ] {
             let mut snapshot = planning_snapshot();
             snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
                 Query(query.into());
-            let error = snapshot
-                .into_physical_compilation_request()
-                .expect_err(query)
-                .to_string();
-            assert!(
-                error.contains("whole number of seconds"),
-                "{query}: {error}"
-            );
+            let (request, _) = snapshot.into_physical_compilation_request().expect(query);
+            assert_eq!(request.queries[0].query_lookback_ms, expected, "{query}");
         }
+    }
+
+    /// A real 100 ms source stays at 100 ms through lowering and query publication.
+    #[test]
+    fn hundred_millisecond_source_compiles_without_rounding() {
+        let mut snapshot = planning_snapshot();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum(data)".into());
+        snapshot.physical_inputs.scrape_interval_ms = 100;
+        set_data_ingestion_interval(&mut snapshot, Some(100));
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        assert_eq!(request.queries[0].query_lookback_ms, 100);
+        let plan = PhysicalPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        assert_eq!(
+            plan.query_plan
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .instant
+                .lookback_ms,
+            100
+        );
     }
 
     #[test]
@@ -6945,7 +6957,7 @@ pub(crate) mod tests {
             (60_000, 90_000),
         ] {
             let mut query = request.queries[0].clone();
-            query.query_lookback_seconds = lookback_ms / 1_000;
+            query.query_lookback_ms = lookback_ms;
             let expr = crate::query_parser::parse_query_expr_canonical(
                 &format!("quantile_over_time(0.5, data[{}s])", lookback_ms / 1_000),
                 AccuracyTarget::Exact,
@@ -8276,9 +8288,9 @@ pub(crate) mod tests {
         let mut second = request("q40", "sum(sum_over_time(m[40s]))")
             .queries
             .remove(0);
-        workload.queries[0].query_lookback_seconds = 20;
+        workload.queries[0].query_lookback_ms = 20_000;
         workload.queries[0].window_realization_candidates[0].window_secs = 20;
-        second.query_lookback_seconds = 40;
+        second.query_lookback_ms = 40_000;
         second.summary_lifecycle_inputs.evaluation_interval_ms = 20_000;
         second.window_realization_candidates[0].window_secs = 40;
         workload.queries.push(second);

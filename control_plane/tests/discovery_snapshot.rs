@@ -55,7 +55,7 @@ fn discovered_snapshot_plans_with_observed_cadence_and_promql_history() {
         .into_physical_compilation_request()
         .unwrap();
     assert_eq!(request.scrape_interval_ms, Some(60_000));
-    assert_eq!(request.queries[0].query_lookback_seconds, 3660);
+    assert_eq!(request.queries[0].query_lookback_ms, 3_660_000);
     let roundtrip: BackendLocalPlanningInput =
         serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
     assert_eq!(snapshot, roundtrip);
