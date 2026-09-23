@@ -1,7 +1,7 @@
 //! SQL boundary around the shared, compiler-bound physical DAG executor.
 use super::{
     clickhouse_result_adapter::{from_series_rows, ClickHouseQueryResult},
-    relational_adapter::{ClickHouseRelation, ClickHouseRelationalAdapter},
+    relational_adapter::ClickHouseRelation,
 };
 use crate::{
     query_engines::asap_query_engine::{
@@ -11,7 +11,6 @@ use crate::{
 };
 use asap_types::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use asap_types::summary_catalog::SummaryCatalog;
-use planner_types::post_asap::ValueOperation;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type PreparedExternalLeaves = BTreeMap<QueryNodeId, ClickHouseRelation>;
@@ -27,29 +26,6 @@ pub enum ClickHouseDagFallback {
     ResultEncoding(String),
 }
 
-fn apply_relational_operation(
-    operation: serde_json::Value,
-    output_schema: &planner_types::post_asap::SummarySchema,
-    relation: ClickHouseRelation,
-) -> Result<ClickHouseRelation, String> {
-    let adapter = ClickHouseRelationalAdapter;
-    if let Some(filter) = operation.get("Filter") {
-        let predicate = filter
-            .get("pred")
-            .cloned()
-            .ok_or_else(|| "published Filter lacks pred".to_owned())
-            .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))?;
-        return adapter
-            .apply_filter(&predicate, relation)
-            .map_err(|error| error.to_string());
-    }
-    let operation: ValueOperation =
-        serde_json::from_value(operation).map_err(|error| error.to_string())?;
-    adapter
-        .apply_operation(&operation, output_schema, relation)
-        .map_err(|error| error.to_string())
-}
-
 struct RelationDagExecutor<'a> {
     index: &'a SketchStore,
     entry: &'a QueryPlanEntry,
@@ -59,7 +35,6 @@ struct RelationDagExecutor<'a> {
     is_cumulative: bool,
     memo: BTreeMap<QueryNodeId, ClickHouseRelation>,
     schemas: BTreeMap<QueryNodeId, planner_types::post_asap::SummarySchema>,
-    active: BTreeSet<QueryNodeId>,
     #[cfg(test)]
     evaluations: BTreeMap<QueryNodeId, usize>,
 }
@@ -81,21 +56,8 @@ impl RelationDagExecutor<'_> {
         if let Some(relation) = self.memo.get(&root) {
             return Ok(relation.clone());
         }
-        if !self.active.insert(root) {
-            return Err(format!(
-                "query `{}` contains a cycle at relation node {}",
-                self.entry.query_id, root.0
-            ));
-        }
         self.schemas.insert(root, expected_schema.clone());
-        let result = self.execute_uncached(root, expected_schema);
-        self.active.remove(&root);
-        let relation = result.map_err(|error| {
-            format!(
-                "query `{}` relation node {} failed: {error}",
-                self.entry.query_id, root.0
-            )
-        })?;
+        let relation = self.execute_graph(root, expected_schema)?;
         self.record_evaluation(root);
         self.memo.insert(root, relation.clone());
         Ok(relation)
@@ -109,7 +71,190 @@ impl RelationDagExecutor<'_> {
     #[cfg(not(test))]
     fn record_evaluation(&mut self, _id: QueryNodeId) {}
 
-    fn execute_uncached(
+    fn execute_graph(
+        &mut self,
+        root: QueryNodeId,
+        expected: &planner_types::post_asap::SummarySchema,
+    ) -> Result<ClickHouseRelation, String> {
+        use super::relational_adapter::native;
+        use asap_physical_operators::dag::{self, operators::Operator};
+        use futures::{FutureExt, StreamExt};
+        use planner_types::post_asap::{
+            ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState,
+            PostAsapNodeId, SummarySchema,
+        };
+        use std::sync::Arc;
+        let mut pending = vec![(root, expected.clone())];
+        let mut schemas = BTreeMap::<QueryNodeId, SummarySchema>::new();
+        let mut operations = BTreeMap::new();
+        let mut sources = Vec::new();
+        // Bind the entire computation before reading any storage source.
+        while let Some((id, expected)) = pending.pop() {
+            if let Some(previous) = schemas.get(&id) {
+                if previous != &expected {
+                    return Err("inconsistent relation schemas".into());
+                }
+                continue;
+            }
+            schemas.insert(id, expected.clone());
+            let (payload, inputs) = match self.entry.nodes.get(&id) {
+                Some(QueryPlanNode::Relational {
+                    input,
+                    operation,
+                    input_schema,
+                    output_schema,
+                }) => {
+                    if output_schema != &expected {
+                        return Err("relational output schema mismatch".into());
+                    }
+                    let operation =
+                        serde_json::from_value(operation.clone()).map_err(|e| e.to_string())?;
+                    (
+                        Payload::Value { operation },
+                        vec![(*input, input_schema.clone())],
+                    )
+                }
+                Some(QueryPlanNode::RelationalJoin {
+                    inputs,
+                    join_kind,
+                    pred,
+                    left_schema,
+                    right_schema,
+                    output_schema,
+                    pruning,
+                }) => {
+                    if output_schema != &expected {
+                        return Err("join output schema mismatch".into());
+                    }
+                    if pruning.is_some() {
+                        return Err(
+                            "candidate pruning is not bound for this relation source".into()
+                        );
+                    }
+                    (
+                        Payload::RelationalJoin {
+                            join_kind: join_kind.clone(),
+                            pred: serde_json::from_value(pred.clone())
+                                .map_err(|e| e.to_string())?,
+                            pruning: None,
+                        },
+                        vec![
+                            (inputs[0], left_schema.clone()),
+                            (inputs[1], right_schema.clone()),
+                        ],
+                    )
+                }
+                Some(_) => {
+                    sources.push(id);
+                    continue;
+                }
+                None => return Err("missing relation node".into()),
+            };
+            let node = ExecutableDagNode {
+                id: PostAsapNodeId(
+                    u32::try_from(id.0).map_err(|_| "relation node ID exceeds Planner range")?,
+                ),
+                payload,
+                output_state: ExecutionDataState::QUERY_ROWS,
+                output_schema: expected,
+                guarantee: None,
+            };
+            let op = dag::planner::bind_node(
+                &node,
+                &inputs
+                    .iter()
+                    .map(|(_, schema)| Arc::new(schema.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| e.to_string())?;
+            operations.insert(
+                id,
+                (inputs.iter().map(|(id, _)| id.0).collect::<Vec<_>>(), op),
+            );
+            pending.extend(inputs);
+        }
+        let mut graph = dag::PhysicalDag::default();
+        for (id, (inputs, op)) in operations {
+            graph.add(id.0, inputs, op).map_err(|e| e.to_string())?;
+        }
+        // Empty placeholders validate DAG shape before deployment source access.
+        let mut validation = dag::PhysicalDag::default();
+        for (id, schema) in &schemas {
+            let inputs = if sources.contains(id) {
+                vec![]
+            } else {
+                self.entry.nodes[id]
+                    .inputs()
+                    .iter()
+                    .map(|id| id.0)
+                    .collect()
+            };
+            validation
+                .add(
+                    id.0,
+                    inputs.clone(),
+                    SchemaCheck {
+                        inputs: inputs
+                            .iter()
+                            .map(|id| Arc::new(schemas[&QueryNodeId(*id)].clone()))
+                            .collect(),
+                        output: Arc::new(schema.clone()),
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        validation.validate(&[root.0]).map_err(|e| e.to_string())?;
+        let mut coverage = None;
+        let mut first = true;
+        for id in sources {
+            let relation = self.execute_source(id, &schemas[&id])?;
+            coverage = if first {
+                first = false;
+                relation.coverage
+            } else {
+                match (coverage, relation.coverage) {
+                    (Some((a, b)), Some((c, d))) if a.max(c) <= b.min(d) => {
+                        Some((a.max(c), b.min(d)))
+                    }
+                    _ => None,
+                }
+            };
+            let batch = native::batch(&relation, &schemas[&id]).map_err(|e| e.to_string())?;
+            graph
+                .add(
+                    id.0,
+                    vec![],
+                    Operator::source(batch.schema().clone(), vec![batch])
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        let context = dag::RunContext::new(
+            dag::Scope::Query {
+                evaluation_time_ms: i64::try_from(self.t1_ms)
+                    .map_err(|_| "evaluation time overflow")?,
+                revision: self.index.summary_update_revision().mutation_sequence(),
+            },
+            dag::Limits::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut output = graph
+            .execute(&[root.0], context)
+            .map_err(|e| e.to_string())?
+            .remove(0);
+        let mut batches = Vec::new();
+        loop {
+            match output.next().now_or_never() {
+                Some(Some(Ok(batch))) => batches.push(batch),
+                Some(Some(Err(error))) => return Err(error.to_string()),
+                Some(None) => break,
+                None => continue,
+            }
+        }
+        native::relation(&batches, expected, coverage).map_err(|e| e.to_string())
+    }
+
+    fn execute_source(
         &mut self,
         root: QueryNodeId,
         expected_schema: &planner_types::post_asap::SummarySchema,
@@ -135,39 +280,6 @@ impl RelationDagExecutor<'_> {
                     .get(&root)
                     .cloned()
                     .ok_or_else(|| "published external exact leaf was not prepared".into())
-            }
-            Some(QueryPlanNode::Relational {
-                input,
-                operation,
-                input_schema,
-                output_schema,
-            }) => {
-                if output_schema != expected_schema {
-                    return Err("relational node output schema differs from its parent edge".into());
-                }
-                let input = self.execute(*input, input_schema)?;
-                apply_relational_operation(operation.clone(), output_schema, input)
-            }
-            Some(QueryPlanNode::RelationalJoin {
-                inputs,
-                join_kind,
-                pred,
-                left_schema,
-                right_schema,
-                output_schema,
-                pruning,
-            }) => {
-                if pruning.is_some() { return Err("candidate pruning is not bound for this relation source".into()); }
-                if output_schema != expected_schema {
-                    return Err("join output schema differs from its parent edge".into());
-                }
-                let left = self.execute(inputs[0], left_schema)?;
-                let right = self.execute(inputs[1], right_schema)?;
-                let pred =
-                    serde_json::from_value(pred.clone()).map_err(|error| error.to_string())?;
-                ClickHouseRelationalAdapter
-                    .apply_join(join_kind, &pred, output_schema, left, right)
-                    .map_err(|error| error.to_string())
             }
             Some(_) => {
                 let outcome = execute_query_plan_from_readout(
@@ -289,7 +401,11 @@ fn execute_sql_dag_with_external_unfenced(
         ids.iter().any(|id| {
             matches!(
                 entry.nodes.get(id),
-                Some(QueryPlanNode::RelationalJoin { .. } | QueryPlanNode::ExternalExact { .. })
+                Some(
+                    QueryPlanNode::Relational { .. }
+                        | QueryPlanNode::RelationalJoin { .. }
+                        | QueryPlanNode::ExternalExact { .. }
+                )
             )
         })
     });
@@ -329,7 +445,6 @@ fn execute_sql_dag_with_external_unfenced(
             is_cumulative,
             memo: BTreeMap::new(),
             schemas: BTreeMap::new(),
-            active: BTreeSet::new(),
             #[cfg(test)]
             evaluations: BTreeMap::new(),
         })
@@ -345,7 +460,7 @@ fn execute_sql_dag_with_external_unfenced(
             Err(error) => {
                 return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
                     error,
-                ))
+                ));
             }
         };
         let bindings = entry.materialization_bindings();
@@ -371,26 +486,7 @@ fn execute_sql_dag_with_external_unfenced(
             )),
         };
     }
-    let mut base_root = entry.root;
-    let mut relational = Vec::new();
-    loop {
-        match entry.nodes.get(&base_root) {
-            Some(QueryPlanNode::Relational {
-                input,
-                operation,
-                input_schema,
-                output_schema,
-            }) => {
-                relational.push((
-                    operation.clone(),
-                    input_schema.clone(),
-                    output_schema.clone(),
-                ));
-                base_root = *input;
-            }
-            _ => break,
-        }
-    }
+    let base_root = entry.root;
     if let Err(detail) = validate_reachable(entry, base_root) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(detail));
     }
@@ -427,67 +523,7 @@ fn execute_sql_dag_with_external_unfenced(
             observed: outcome.coverage,
         });
     }
-    if relational.is_empty() {
-        return match from_series_rows(outcome.series) {
-            Ok(result) => ClickHouseDagOutcome::Accelerated(result),
-            Err(error) => ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(
-                error.to_string(),
-            )),
-        };
-    }
-    let input_schema = &relational.last().expect("non-empty").1;
-    let mut relation = match ClickHouseRelation::from_series_rows(
-        input_schema,
-        outcome.series,
-        outcome.coverage,
-    ) {
-        Ok(relation) => relation,
-        Err(error) => {
-            return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(
-                error.to_string(),
-            ))
-        }
-    };
-    let adapter = ClickHouseRelationalAdapter;
-    for (wire_operation, _, output_schema) in relational.into_iter().rev() {
-        if let Some(filter) = wire_operation.get("Filter") {
-            let predicate = filter
-                .get("pred")
-                .cloned()
-                .ok_or_else(|| "published Filter lacks pred".to_owned())
-                .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()));
-            relation = match predicate.and_then(|predicate| {
-                adapter
-                    .apply_filter(&predicate, relation)
-                    .map_err(|error| error.to_string())
-            }) {
-                Ok(relation) => relation,
-                Err(error) => {
-                    return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                        format!("invalid published Filter: {error}"),
-                    ))
-                }
-            };
-            continue;
-        }
-        let operation: ValueOperation = match serde_json::from_value(wire_operation) {
-            Ok(operation) => operation,
-            Err(error) => {
-                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                    format!("invalid published relational operation: {error}"),
-                ))
-            }
-        };
-        relation = match adapter.apply_operation(&operation, &output_schema, relation) {
-            Ok(relation) => relation,
-            Err(error) => {
-                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                    error.to_string(),
-                ))
-            }
-        };
-    }
-    match relation.into_result() {
+    match from_series_rows(outcome.series) {
         Ok(result) => ClickHouseDagOutcome::Accelerated(result),
         Err(error) => {
             ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(error.to_string()))
@@ -509,6 +545,45 @@ fn validate_reachable(entry: &QueryPlanEntry, root: QueryNodeId) -> Result<(), S
         pending.extend(node.inputs());
     }
     Ok(())
+}
+
+// Validate schemas and graph shape before touching deployment sources.
+struct SchemaCheck {
+    inputs: Vec<asap_physical_operators::dag::values::Schema>,
+    output: asap_physical_operators::dag::values::Schema,
+}
+impl
+    asap_physical_operators::dag::PhysicalOperator<
+        asap_physical_operators::dag::values::Batch,
+        asap_physical_operators::dag::values::Schema,
+    > for SchemaCheck
+{
+    fn name(&self) -> &str {
+        "SchemaCheck"
+    }
+    fn input_schemas(&self) -> Vec<asap_physical_operators::dag::values::Schema> {
+        self.inputs.clone()
+    }
+    fn output_schema(&self) -> asap_physical_operators::dag::values::Schema {
+        self.output.clone()
+    }
+    fn output_bytes(&self, batch: &asap_physical_operators::dag::values::Batch) -> usize {
+        batch.bytes()
+    }
+    fn start<'a>(
+        &'a self,
+        _: Vec<
+            asap_physical_operators::dag::Input<'a, asap_physical_operators::dag::values::Batch>,
+        >,
+        _: asap_physical_operators::dag::RunContext,
+    ) -> Result<
+        asap_physical_operators::dag::OutputStream<'a, asap_physical_operators::dag::values::Batch>,
+        asap_physical_operators::dag::Error,
+    > {
+        Err(asap_physical_operators::dag::Error::Invalid(
+            "validation-only source".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -586,7 +661,6 @@ mod tests {
             is_cumulative: false,
             memo: BTreeMap::new(),
             schemas: BTreeMap::new(),
-            active: BTreeSet::new(),
             evaluations: BTreeMap::new(),
         };
 
@@ -599,6 +673,63 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("query `shared-external` node 0"));
         assert!(error.contains("inconsistent relation schemas"));
+    }
+
+    // A SQL diamond binds one source to both join inputs in the shared DAG.
+    #[test]
+    fn relation_dag_executes_a_shared_source_join() {
+        use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
+        let schema = relation_schema("x");
+        let mut entry = external_entry(&schema);
+        let mut output = schema.clone();
+        output.fields.push(schema.fields[0].clone());
+        entry.nodes.insert(
+            QueryNodeId(1),
+            QueryPlanNode::RelationalJoin {
+                inputs: [QueryNodeId(0), QueryNodeId(0)],
+                join_kind: JoinKind::Cross,
+                pred: serde_json::to_value(Predicate::<usize>(
+                    QueryExpr::Literal(ScalarValue::Boolean(true)).into(),
+                ))
+                .unwrap(),
+                left_schema: schema.clone(),
+                right_schema: schema.clone(),
+                output_schema: output.clone(),
+                pruning: None,
+            },
+        );
+        entry.root = QueryNodeId(1);
+        let relation = ClickHouseRelation::from_json_compact(
+            &schema,
+            br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1],[2]]}"#,
+        )
+        .unwrap();
+        let prepared = BTreeMap::from([(QueryNodeId(0), relation)]);
+        let index = SketchStore::new();
+        let mut executor = RelationDagExecutor {
+            index: &index,
+            entry: &entry,
+            prepared: &prepared,
+            t0_ms: 0,
+            t1_ms: 1,
+            is_cumulative: false,
+            memo: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            evaluations: BTreeMap::new(),
+        };
+        let result = executor
+            .execute(entry.root, &output)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            result
+                .batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            4
+        );
     }
 
     #[test]

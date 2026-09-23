@@ -11,7 +11,7 @@ Planner IR at the same immutable revision. It does not own a second copy of the
 runtime or mathematical kernels. A new IR operation and its implementation can
 be changed and tested together in Planner.
 
-Both engines use the independent ASAP DAG runtime. Deployment code binds input
+The query and precompute integration PRs both use the independent ASAP DAG runtime. Deployment code binds input
 sources, storage, ingestion windows, publication and protocol outputs. Execution
 phase belongs to the physical node's data state, not the operator payload.
 Computation has the same semantics at ingestion time and query time.
@@ -32,3 +32,16 @@ validation, storage compatibility and query responses.
 The migration does not supply a local raw Scan. That deployment capability
 remains deferred. Library tests supplied with raw batches are not evidence that
 the backend can execute arbitrary raw-only installed plans.
+
+## Stack integration
+
+Planner PR #462 owns the library and depends on Planner #461, including its
+composed candidate-pruning API. Backend #770 consumes the pinned library;
+#763 integrates ingestion DAG execution and #765 integrates query DAG execution.
+The remaining backend stack builds on those integrations. #759 carries the
+full-workload acceptance suite; its performance results must be reported
+separately from library and process correctness tests.
+
+The library also owns stored-summary decoding, delta reconstruction and
+family-specific readout kernels. Deployment adapters select compatible panes
+and translate inputs and outputs; they do not copy those computations.
