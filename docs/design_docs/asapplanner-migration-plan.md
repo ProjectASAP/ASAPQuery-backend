@@ -65,10 +65,10 @@ provenance:
   selected_dag: Input -> BuildKLL -> SummaryEstimate -> Result
 ```
 
-During rollout, the backend normalizes a supported legacy artifact into this
-internal form. Old and new forms must produce the same update count and query
-result. After compatibility gates pass, the complete-DAG execution path can be
-removed while its versioned reader remains for the supported window.
+The runtime accepts only the current split artifact. Reject obsolete schemas
+before activation; do not retain a parallel reader or complete-DAG executor.
+Migrate producers and fixtures together, and verify the new path against
+independent exact results before deployment.
 
 ## Stage 1: inventory and fixtures
 
@@ -78,7 +78,7 @@ Collector.
 
 Capture fixtures for:
 
-- full, delta and legacy bare-state decoding;
+- full and delta decoding under the current envelope;
 - summary reconstruction, maintenance updates and query readout;
 - completion, restart and recovery;
 - staging, activation, readiness and fallback.
@@ -100,8 +100,8 @@ rest must not infer incremental support from recurring query demand.
 
 Prefer existing sketch-library APIs. Move reusable DDSketch/KLL reconstruction
 out of Collector wrappers and remove reconstruct-serialize-decode round trips.
-Keep legacy readers and family-specific backend paths until replacements have
-parity evidence.
+Remove obsolete readers and duplicate family-specific execution paths when
+introducing their replacements; require parity evidence before merging.
 
 Remove `asap-precompute-rs` and Collector-specific Cargo patches. Inspect
 manifests, lockfiles, dependency graphs, scripts and required tests for direct or
@@ -126,8 +126,7 @@ unchanged schema version.
 Do not introduce a standalone catalog `Materialization` object. Keep definitions
 in `SummaryStore.summary_definitions`, format/partition/writer configuration in
 executable bindings, and actual coverage with payloads in
-`SummaryStore.stored_summaries`. Normalize legacy
-stored-output identities into version-scoped `stored_output_id` values;
+`SummaryStore.stored_summaries`. Require version-scoped `stored_output_id` values;
 validate all consumers against the same writer configuration. The existing
 `BackendNodeBinding::Materialization` remains a placement marker for stored output.
 
@@ -142,13 +141,13 @@ separate: until coverage is ready, QueryPlan follows its configured fallback or
 explicit unavailability. Failed staging preserves the previous plan version.
 
 Render PrecomputePlan and QueryPlan separately, joined by state references.
-Legacy projected views label maintenance-owned and query-owned nodes.
+Each view labels maintenance-owned and query-owned nodes.
 
 ## Stage 5: migrate and retire
 
-Release pinned neutral-library versions and rollback artifacts. Migrate
-backend-local publications first and retain versioned adapters for the supported
-compatibility window.
+Release pinned neutral-library versions and matching rollback artifacts.
+Migrate publications and their producers together; do not retain versioned
+adapters for obsolete plan formats.
 
 Remove complete-DAG precompute execution and Collector adapter code only after
 fixtures and end-to-end tests pass. State reuse across plan versions requires an
@@ -164,7 +163,8 @@ Completion requires:
 - derived state observes completion and schema requirements;
 - invalid bindings fail before activation;
 - restart and plan version switching preserve consistency and fallback;
-- legacy and split artifacts produce equivalent results and update counts;
+- obsolete artifacts are rejected, and the split path matches exact reference
+  results and expected update counts;
 - backend builds and required tests do not fetch, build or run ASAPCollector.
 
 Record tested revisions, supported state families, fixture results and dependency

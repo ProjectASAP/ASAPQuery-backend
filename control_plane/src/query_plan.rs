@@ -9,8 +9,6 @@ pub use asap_types::query_plan::*;
 use asap_types::PolicyFingerprint;
 use planner_types::post_asap::{SummaryExpr, SummaryFamilyType, SummaryNode};
 use planner_types::pre_asap::Reduction;
-#[deprecated(note = "Use query_plan::residual")]
-pub use residual as logical;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -1187,7 +1185,7 @@ mod tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let root = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let root = crate::planner_selection::plan_test_query(&canonical).unwrap();
         let SummaryExpr::BinaryOp { operator, .. } = &root.expr else {
             panic!("expected the Planner's average rewrite");
         };

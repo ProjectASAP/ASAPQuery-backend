@@ -1,6 +1,6 @@
 //! Backend-owned physical compilation over ASAPPlanner's selected post-ASAP IR.
 //!
-//! Planner owns semantic alternatives and guarantees. This module owns the
+//! Planner owns semantic candidates and guarantees. This module owns the
 //! deployment decision: evidence freshness, target capabilities, windows, the
 //! Collector execution projection, SummaryCatalog, and executable plans.
 
@@ -8,13 +8,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use asap_aware_mapping::cost_model::Cost;
+#[cfg(test)]
+use asap_aware_mapping::DefaultAccuracyModel;
 use asap_aware_mapping::{
     plan_summary_maintenance_lifecycles, AccuracyEvidenceProvider, CostRate, Horizon,
     PropagationStats, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCapabilities,
     SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
 };
-#[cfg(test)]
-use asap_aware_mapping::{DefaultAccuracyModel, EqualSplitAllocator};
 use planner_types::post_asap::{
     CompositionOperator, EvaluationSchedule, ExecutableDagCompilation, OutputRepresentation,
     PostAsapNodeId, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
@@ -114,7 +114,7 @@ pub struct WindowRealizationCostQuote {
 #[serde(deny_unknown_fields)]
 pub struct WindowRealizationCandidate {
     /// Backend-owned identity; never copied into Planner IR.
-    #[serde(rename = "implementation_id", alias = "realization_id")]
+    #[serde(rename = "implementation_id")]
     pub realization_id: String,
     pub framework: SummaryWindowFramework,
     pub window_secs: u64,
@@ -200,7 +200,7 @@ pub struct TopKMembershipEvidence {
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDeploymentContext {
     pub target: PhysicalDeploymentTarget,
-    #[serde(rename = "collector_ids", alias = "target_collector_ids")]
+    #[serde(rename = "collector_ids")]
     pub target_collector_ids: Vec<String>,
     pub capability_snapshot_id: String,
     pub observed_at_unix_ms: u64,
@@ -226,7 +226,7 @@ pub enum PhysicalDeploymentTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPlanningInput {
-    #[serde(rename = "snapshot_version", alias = "schema_version")]
+    #[serde(rename = "snapshot_version")]
     pub schema_version: u32,
     /// May be absent during candidate discovery, never during deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,7 +234,7 @@ pub struct BackendLocalPlanningInput {
     #[serde(deserialize_with = "deserialize_snapshot_query_workload")]
     pub query_workload: QueryWorkload,
     pub data_workload: DataWorkload,
-    #[serde(rename = "implementation", alias = "physical_inputs")]
+    #[serde(rename = "implementation")]
     pub physical_inputs: BackendLocalPhysicalInputs,
     pub environment: PhysicalDeploymentContext,
 }
@@ -252,22 +252,15 @@ pub struct BackendLocalPhysicalInputs {
     /// default is distinct from Prometheus instant-selector lookback delta.
     pub scrape_interval_ms: u64,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
-    #[serde(
-        rename = "query_staleness_margin_ms",
-        alias = "query_retention_margin_ms"
-    )]
+    #[serde(rename = "query_staleness_margin_ms")]
     pub query_retention_margin_ms: u64,
     /// Admission budget for all retained panes and estimated partitions.
     /// Missing legacy snapshots inherit the backend default.
     #[serde(
         default = "default_retained_summary_memory_budget_bytes",
-        alias = "maxRetainedSummaryBytes",
         skip_serializing_if = "is_default_retained_summary_memory_budget_bytes"
     )]
-    #[serde(
-        rename = "max_retained_summary_bytes",
-        alias = "retained_summary_memory_budget_bytes"
-    )]
+    #[serde(rename = "max_retained_summary_bytes")]
     pub retained_summary_memory_budget_bytes: u64,
     /// Certificates keyed by exact registered PromQL; converted to root IDs
     /// before workload selection so one query cannot borrow another's evidence.
@@ -481,7 +474,7 @@ pub struct CompiledPhysicalPlan {
 pub struct MaterializationLifecycleEstimate {
     pub materialization: asap_types::sds::SummaryDefinitionId,
     pub consumer_query_ids: Vec<String>,
-    #[serde(rename = "window_implementation_id", alias = "window_realization_id")]
+    #[serde(rename = "window_implementation_id")]
     pub window_realization_id: String,
     pub horizon_seconds: f64,
     pub expected_reads: f64,
@@ -494,7 +487,7 @@ pub enum CompileError {
     #[error("invalid backend-local workload snapshot: {0}")]
     Snapshot(String),
     #[error("no feasible completely costed alternative: {0}")]
-    Alternatives(serde_json::Value),
+    Candidates(serde_json::Value),
     #[error("planner revision mismatch: request={request}, compiler={compiler}")]
     PlannerRevision {
         request: String,
@@ -1090,6 +1083,7 @@ impl PhysicalPlanCompiler {
                 validate_evidence(&query.query_id, e, &environment)?;
             }
             let node = query.selected_plan_root.clone();
+            reject_uncertified_readouts(&query.query_id, &node)?;
             let selected = collect_selected_materializations(
                 &node,
                 request.allow_mixed_summary_and_exact_execution,
@@ -2397,11 +2391,10 @@ pub fn select_post_asap(
             delete: false,
         },
     );
-    crate::planner_selection::select_summary_with_evidence(
+    crate::planner_selection::select_query_with_models(
         expr,
         &model,
         &DefaultAccuracyModel,
-        &EqualSplitAllocator,
         &QueryEvidence(evidence),
     )
 }
@@ -2807,20 +2800,25 @@ pub(super) fn retained_state_count(
 /// cells use two words here, covering the counter plus observed serialization
 /// overhead. Heap and exact-state estimates include container slack.
 fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization) -> u128 {
+    estimated_state_bytes(
+        &materialization.aggregation_type,
+        &materialization.parameters,
+    )
+}
+
+pub(super) fn estimated_state_bytes(
+    aggregation: &asap_types::AggregationType,
+    parameters: &HashMap<String, Value>,
+) -> u128 {
     use asap_types::AggregationType as A;
 
     let parameter = |names: &[&str], fallback: u64| {
         names
             .iter()
-            .find_map(|name| {
-                materialization
-                    .parameters
-                    .get(*name)
-                    .and_then(Value::as_u64)
-            })
+            .find_map(|name| parameters.get(*name).and_then(Value::as_u64))
             .unwrap_or(fallback) as u128
     };
-    match materialization.aggregation_type {
+    match aggregation {
         A::CountMinSketch | A::CountSketch => {
             parameter(&["width", "w", "col_num", "col"], 1)
                 * parameter(&["depth", "d", "row_num", "row"], 1)
@@ -3273,6 +3271,31 @@ fn validate_executable_subdag(node: &Rc<SummaryNode>) -> Result<(), String> {
     Ok(())
 }
 
+fn reject_uncertified_readouts(query_id: &str, root: &Rc<SummaryNode>) -> Result<(), CompileError> {
+    let dag = planner_types::post_asap::compile_executable_dag(root).map_err(|error| {
+        CompileError::Query {
+            query_id: query_id.into(),
+            reason: format!("invalid executable subDAG: {error}"),
+        }
+    })?;
+    for node in &dag.nodes {
+        if matches!(
+            node.payload,
+            planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
+        ) && node
+            .guarantee
+            .as_ref()
+            .is_none_or(planner_types::post_asap::ResultGuarantee::has_unknown)
+        {
+            return Err(CompileError::Query {
+                query_id: query_id.into(),
+                reason: "selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn physical_aggregation(
     query: &QueryCompilationInput,
     selected: &SelectedMaterialization,
@@ -3692,7 +3715,7 @@ fn collect_selected_materializations(
     Ok(selected)
 }
 
-fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
+pub(super) fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
         P::UnivMon {
@@ -3743,30 +3766,6 @@ fn stable_workload_plan_id(
     hasher.finish()
 }
 
-// Compatibility imports; new callers use the domain names above.
-#[deprecated(note = "Use BackendLocalPhysicalInputs")]
-pub use BackendLocalPhysicalInputs as BackendLocalImplementation;
-#[deprecated(note = "Use BackendLocalPlanningInput")]
-pub use BackendLocalPlanningInput as BackendLocalPlanningSnapshot;
-#[deprecated(note = "Use CompiledPhysicalPlan")]
-pub use CompiledPhysicalPlan as PhysicalPlan;
-#[deprecated(note = "Use LifecycleUnitCosts")]
-pub use LifecycleUnitCosts as LifecycleCostEvidence;
-#[deprecated(note = "Use PhysicalCompilationRequest")]
-pub use PhysicalCompilationRequest as PlanningRequest;
-#[deprecated(note = "Use PhysicalDeploymentContext")]
-pub use PhysicalDeploymentContext as DeploymentEnvironment;
-#[deprecated(note = "Use PhysicalPlanCompiler")]
-pub use PhysicalPlanCompiler as PhysicalCompiler;
-#[deprecated(note = "Use QueryCompilationInput")]
-pub use QueryCompilationInput as PlanningQuery;
-#[deprecated(note = "Use SummaryLifecyclePlanningInputs")]
-pub use SummaryLifecyclePlanningInputs as LifecyclePlanningInput;
-#[deprecated(note = "Use WindowRealizationCandidate")]
-pub use WindowRealizationCandidate as WindowImplementationCandidate;
-#[deprecated(note = "Use WindowRealizationCostQuote")]
-pub use WindowRealizationCostQuote as ImplementationCostEvidence;
-
 /// Parser/executor frontend for the time-series physical compiler. SQL has its
 /// own compilation input and must not silently enter this path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3794,38 +3793,6 @@ impl QueryFrontend {
         PhysicalPlanCompiler.compile_for_frontend(request, environment, self)
     }
 }
-impl BackendLocalPlanningInput {
-    #[deprecated(note = "Use compile_promql")]
-    pub fn compile(self) -> Result<CompiledPhysicalPlan, CompileError> {
-        self.compile_promql()
-    }
-    #[deprecated(note = "Use into_physical_compilation_request")]
-    pub fn planning_request(
-        self,
-    ) -> Result<(PhysicalCompilationRequest, PhysicalDeploymentContext), CompileError> {
-        self.into_physical_compilation_request()
-    }
-}
-impl PhysicalPlanCompiler {
-    #[deprecated(note = "Use compile_promql")]
-    pub fn compile(
-        &self,
-        request: PhysicalCompilationRequest,
-        environment: PhysicalDeploymentContext,
-    ) -> Result<CompiledPhysicalPlan, CompileError> {
-        self.compile_promql(request, environment)
-    }
-}
-
-#[deprecated(note = "Use build_transmission_plan")]
-pub use build_transmission_plan as compile_transmission_plan;
-#[deprecated(note = "Use select_logical_roots_for_queries")]
-pub use select_logical_roots_for_queries as select_workload_roots;
-#[deprecated(note = "Use select_logical_roots_with_error_resource_profiles")]
-pub use select_logical_roots_with_error_resource_profiles as select_workload_roots_with_erp;
-#[deprecated(note = "Use select_logical_roots_with_trace")]
-pub use select_logical_roots_with_trace as select_workload_roots_with_trace;
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3859,15 +3826,16 @@ pub(crate) mod tests {
                 .collect(),
         );
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        let plans: Vec<_> = super::super::workload_cost::with_exact_alternative(request)
-            .unwrap()
-            .into_iter()
-            .filter_map(|r| {
-                PhysicalPlanCompiler
-                    .compile_promql(r, environment.clone())
-                    .ok()
-            })
-            .collect();
+        let plans: Vec<_> =
+            super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
+                .unwrap()
+                .into_iter()
+                .filter_map(|r| {
+                    PhysicalPlanCompiler
+                        .compile_promql(r, environment.clone())
+                        .ok()
+                })
+                .collect();
         let plan = plans.iter().find(|plan| plan.query_plan.entries.values().all(|entry|
             entry.nodes.values().any(|node| matches!(node, crate::query_plan::QueryPlanNode::Logical {
                 operator: crate::query_plan::residual::ResidualQueryOperator::CurrentSeries { .. }, ..
@@ -4157,7 +4125,9 @@ pub(crate) mod tests {
                 entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
             }
             let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-            let candidates = super::super::workload_cost::with_exact_alternative(request).unwrap();
+            let candidates =
+                super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
+                    .unwrap();
             let mut reasons = vec![];
             assert!(
                 candidates.into_iter().any(|candidate| {
@@ -4544,7 +4514,7 @@ pub(crate) mod tests {
     #[test]
     fn hybrid_weighted_topk_installs_only_candidates_and_delegates_filtered_exact_values() {
         use crate::query_plan::{
-            logical::ResidualQueryOperator, ExternalExactInput, ExternalExactOutput, QueryPlanNode,
+            residual::ResidualQueryOperator, ExternalExactInput, ExternalExactOutput, QueryPlanNode,
         };
         let query = "topk(2, sum by (job) (rate(m[1m])))";
         let evidence = TopKMembershipEvidence {
@@ -4700,7 +4670,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_backend_snapshot_gets_explicit_retained_memory_default_and_alias() {
+    fn snapshot_uses_retained_memory_default_and_canonical_override() {
         let source = include_str!("../../../docs/examples/asapquery-planning-snapshot.json");
         let snapshot: BackendLocalPlanningInput = serde_json::from_str(source).unwrap();
         assert_eq!(
@@ -4711,7 +4681,7 @@ pub(crate) mod tests {
         );
 
         let mut value: Value = serde_json::from_str(source).unwrap();
-        value["implementation"]["maxRetainedSummaryBytes"] = json!(123_456);
+        value["implementation"]["max_retained_summary_bytes"] = json!(123_456);
         let snapshot: BackendLocalPlanningInput = serde_json::from_value(value).unwrap();
         assert_eq!(
             snapshot
@@ -4944,9 +4914,43 @@ pub(crate) mod tests {
             .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. })));
     }
 
-    /// Distinct range queries retain a per-series HLL selected by Planner.
+    /// An externally supplied unknown guarantee must not bypass global selection.
     #[test]
-    fn distinct_range_compiles_to_partitioned_hll() {
+    fn supplied_uncertified_readout_is_rejected() {
+        use asap_aware_mapping::{
+            Replacement, ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
+        };
+        let mut workload = request("unknown", "distinct_over_time(m[1m])");
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                "distinct_over_time(m[1m])",
+                AccuracyTarget::Epsilon(0.05),
+            )
+            .unwrap(),
+        );
+        let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(0.05));
+        workload.queries[0].selected_plan_root = SketchAlgorithmStrategy::new(&model)
+            .replacements(&TargetSubDAG::new(&root))
+            .into_iter()
+            .find_map(|candidate| {
+                if !candidate.has_missing_accuracy_evidence() {
+                    return None;
+                }
+                match candidate.replacement {
+                    Replacement::Summary(node) => Some(node),
+                    _ => None,
+                }
+            })
+            .expect("unknown HLL candidate stays inspectable");
+        let result = PhysicalPlanCompiler.compile_metricsql(workload, environment(10_000));
+        assert!(
+            matches!(result, Err(CompileError::Query { reason, .. }) if reason.contains("no certified accuracy guarantee"))
+        );
+    }
+
+    /// HLL without a confidence proof remains exact under canonical selection.
+    #[test]
+    fn uncertified_distinct_range_remains_exact() {
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.target_collector_ids.clear();
@@ -4969,40 +4973,31 @@ pub(crate) mod tests {
         let plan = PhysicalPlanCompiler
             .compile_metricsql(workload, deployment)
             .unwrap();
-        assert_eq!(plan.precompute_plan.materializations.len(), 1);
-        let materialization = &plan.precompute_plan.materializations[0];
-        assert_eq!(
-            materialization.aggregation_type,
-            asap_types::AggregationType::HLL
-        );
-        assert_eq!(
-            materialization.partitioning,
-            Some(asap_types::sds::PopulationPartitioning::PerEntity)
-        );
-        plan.precompute_plan.validate().unwrap();
-        assert!(plan
-            .query_plan
-            .entries
-            .values()
-            .any(|entry| entry.nodes.values().any(|node| matches!(
-                node,
-                crate::query_plan::QueryPlanNode::SummaryEstimate {
-                    query: crate::query_plan::QueryReadout::Cardinality,
-                    ..
-                }
-            ))));
+        assert!(plan.precompute_plan.materializations.is_empty());
+        assert!(matches!(
+            plan.query_plan
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .nodes
+                .values()
+                .next()
+                .unwrap(),
+            crate::query_plan::QueryPlanNode::ExactFallback { .. }
+        ));
     }
 
-    /// An unimplemented cardinality family fails admission rather than panicking in an emitter.
+    /// Mixed execution does not authorize an uncertified cardinality sketch.
     #[test]
-    fn unsupported_cardinality_family_fails_admission() {
+    fn uncertified_cardinality_is_not_materialized() {
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.target_collector_ids.clear();
         let mut workload = request("confidence", "distinct_over_time(m[1m])");
         workload.allow_mixed_summary_and_exact_execution = true;
         let result = PhysicalPlanCompiler.compile_metricsql(workload, deployment);
-        assert!(matches!(result, Err(CompileError::QueryPlan(_))));
+        assert!(result.unwrap().precompute_plan.materializations.is_empty());
     }
 
     #[test]
@@ -5172,7 +5167,7 @@ pub(crate) mod tests {
 
     // Frozen sketch-bench output exercises the same wire schema on every CI run.
     #[test]
-    fn measured_erp_kll_parameters_survive_workload_selection() {
+    fn measured_erp_without_failure_probability_uses_exact_fallback() {
         use super::super::erp::{
             ErpAccuracyMode, ErpParameterDecision, ErpPlanningInput, ErpRuntimeCapabilities,
         };
@@ -5236,92 +5231,14 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        fn contains_measured_kll(node: &SummaryNode) -> bool {
-            match &node.expr {
-                SummaryExpr::SummaryAgg { family, child, .. } => {
-                    matches!(family, SummaryFamilyType::Sketch(kind, _)
-                        if matches!(kind.params(), SketchParams::Kll { k: 32 }))
-                        || contains_measured_kll(child)
-                }
-                SummaryExpr::SummaryEstimate { summary_input, .. }
-                | SummaryExpr::ValueOperation {
-                    child: summary_input,
-                    ..
-                } => contains_measured_kll(summary_input),
-                _ => false,
-            }
-        }
-        assert!(
-            contains_measured_kll(&workload.queries[0].selected_plan_root),
-            "ERP hit was lost before physical compilation: {:#?}",
-            workload.queries[0].selected_plan_root
-        );
-        let guarantee = workload.queries[0]
-            .selected_plan_root
-            .guarantee
-            .as_ref()
-            .unwrap();
-        assert_eq!(guarantee.failure_probability.evaluate(), None);
-        assert!(!guarantee.is_exact());
+        assert!(matches!(
+            workload.queries[0].selected_plan_root.expr,
+            SummaryExpr::KeepPreAsap(_)
+        ));
         let plan = PhysicalPlanCompiler
             .compile_promql(workload, environment(10000))
             .unwrap();
-        assert_eq!(plan.precompute_plan.materializations[0].parameters["k"], 32);
-        let empirical_identity = plan.precompute_plan.materializations[0].policy_fingerprint();
-        let mut drift = erp.clone();
-        drift.distribution = serde_json::json!({"shifted": true});
-        let mut unsupported = drift.clone();
-        unsupported.runtime.allowed_algorithms = vec![SketchAlgorithm::Hll];
-        let mut wrong_implementation = erp.clone();
-        wrong_implementation.artifact.records[0].implementation = "oxide".into();
-        wrong_implementation.implementation = Some("oxide".into());
-        for (policy, accuracy, exact) in [
-            (drift, AccuracyTarget::Epsilon(0.06), false),
-            (wrong_implementation, AccuracyTarget::Epsilon(0.06), false),
-            (
-                erp.clone(),
-                AccuracyTarget::EpsilonDelta {
-                    epsilon: 0.06,
-                    delta: 0.01,
-                },
-                false,
-            ),
-            (unsupported, AccuracyTarget::Epsilon(0.06), true),
-        ] {
-            let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
-            workload.queries[0].accuracy_target = accuracy.clone();
-            let root = Rc::new(
-                crate::query_parser::parse_query_expr_canonical(
-                    &workload.queries[0].query_string,
-                    accuracy,
-                )
-                .unwrap(),
-            );
-            select_logical_roots_with_error_resource_profiles(
-                &mut workload.queries,
-                vec![root],
-                &workload.topk_membership_evidence_by_query_id,
-                &workload.exact_composition_costs,
-                Some(&policy),
-            )
-            .unwrap();
-            if exact {
-                assert!(matches!(
-                    workload.queries[0].selected_plan_root.expr,
-                    SummaryExpr::KeepPreAsap(_)
-                ));
-            } else {
-                assert!(!contains_measured_kll(
-                    &workload.queries[0].selected_plan_root
-                ));
-                let plan = PhysicalPlanCompiler
-                    .compile_promql(workload, environment(10000))
-                    .unwrap();
-                let state = &plan.precompute_plan.materializations[0];
-                assert!(state.parameters["k"].as_u64().unwrap() > 32);
-                assert_ne!(state.policy_fingerprint(), empirical_identity);
-            }
-        }
+        assert!(plan.precompute_plan.materializations.is_empty());
     }
 
     fn measured_exact_composition_rows(
@@ -5804,6 +5721,26 @@ pub(crate) mod tests {
             Query("sum by (service) (sum_over_time(m[1m]) / count_over_time(m[1m]))".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
         let (mut request, _) = snapshot.into_physical_compilation_request().unwrap();
+        // Exercise the invalid externally supplied graph, independent of the
+        // global selector (which now already chooses an exact fallback).
+        use asap_aware_mapping::ReplacementStrategy;
+        let candidates = asap_aware_mapping::SketchAlgorithmStrategy::new(
+            &ControlPlaneCostModel::new(AccuracyTarget::Exact),
+        )
+        .replacements(&asap_aware_mapping::TargetSubDAG::new(
+            &request.canonical_roots[0],
+        ));
+        request.queries[0].selected_plan_root = candidates
+            .into_iter()
+            .find_map(|candidate| match candidate.replacement {
+                asap_aware_mapping::Replacement::Summary(node)
+                    if !matches!(node.expr, SummaryExpr::KeepPreAsap(_)) =>
+                {
+                    Some(node)
+                }
+                _ => None,
+            })
+            .expect("invalid summary fixture");
         assert!(!matches!(
             request.queries[0].selected_plan_root.expr,
             SummaryExpr::KeepPreAsap(_)
@@ -5820,8 +5757,13 @@ pub(crate) mod tests {
 
     #[test]
     fn selected_maintenance_dependency_still_requires_a_valid_executable_dag() {
-        let mut request = request("invalid-dependency", "sum(sum_over_time(m[1m]))");
-        let selected = request.queries[0].selected_plan_root.clone();
+        let mut request = request("invalid-dependency", "sum_over_time(m[1m])");
+        let selected_root = request.queries[0].selected_plan_root.clone();
+        let selected = match &selected_root.expr {
+            SummaryExpr::SummaryEstimate { summary_input, .. } => summary_input.clone(),
+            SummaryExpr::SummaryAgg { .. } => selected_root.clone(),
+            _ => panic!("expected maintained aggregate fixture"),
+        };
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
@@ -6835,7 +6777,7 @@ pub(crate) mod tests {
     // with each operand keeping its own range.
     #[test]
     fn composable_binary_summarizes_each_prometheus_filtered_operand() {
-        use crate::query_plan::{logical::ResidualQueryOperator, QueryPlanNode};
+        use crate::query_plan::{residual::ResidualQueryOperator, QueryPlanNode};
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -7931,7 +7873,13 @@ pub(crate) mod tests {
 
     #[test]
     fn topk_fails_closed_without_membership_evidence() {
-        assert!(request_with_evidence("q-topk", "topk(5, m)", None).is_err());
+        let request = request_with_evidence("q-topk", "topk(5, m)", None).unwrap();
+        assert!(request.queries[0]
+            .selected_plan_root
+            .guarantee
+            .as_ref()
+            .unwrap()
+            .is_exact());
     }
 
     #[test]
