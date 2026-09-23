@@ -166,14 +166,12 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
         node: &ExecutableDagNode,
         inputs: &[Arc<MaintenanceValue>],
     ) -> Result<MaintenanceValue, Self::Error> {
+        if node.output_state.timing != planner_types::post_asap::ExecutionTiming::IngestionTime {
+            return Err("ingestion executor received a query-time node".into());
+        }
         match &node.payload {
-            ExecutableOperatorPayload::SummaryMerge {
-                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
-            } => merge_inputs(inputs),
-            ExecutableOperatorPayload::Binary {
-                operator,
-                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
-            } => {
+            ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
+            ExecutableOperatorPayload::Binary { operator } => {
                 if !self.inputs.frozen_inputs().is_some()
                     || node.output_state
                         != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
@@ -185,7 +183,6 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
 
             ExecutableOperatorPayload::Value {
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
             } => {
                 if !self.inputs.frozen_inputs().is_some() {
                     return Err(
@@ -2251,9 +2248,7 @@ mod tests {
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
             id: PostAsapNodeId(id),
-            payload: ExecutableOperatorPayload::SummaryMerge {
-                timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
-            },
+            payload: ExecutableOperatorPayload::SummaryMerge,
             output_state: planner_types::post_asap::ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: vec![],
@@ -2448,7 +2443,6 @@ mod tests {
         let mut read = node(2);
         read.payload = ExecutableOperatorPayload::Value {
             operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
         };
         read.output_schema.fields = vec![SummaryField {
             name: "value".into(),
@@ -2911,9 +2905,7 @@ mod tests {
         second_node.id = PostAsapNodeId(5);
         let mut merge = second_node.clone();
         merge.id = PostAsapNodeId(6);
-        merge.payload = ExecutableOperatorPayload::SummaryMerge {
-            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
-        };
+        merge.payload = ExecutableOperatorPayload::SummaryMerge;
         dag.nodes.extend([second_node, merge]);
         let original = dag
             .edges
@@ -3401,7 +3393,6 @@ mod tests {
         };
         operation.payload = ExecutableOperatorPayload::Binary {
             operator: operator.clone(),
-            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
         };
         operation.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
         assert!(frozen
@@ -3420,11 +3411,12 @@ mod tests {
             .is_err());
         operation.payload = ExecutableOperatorPayload::Binary {
             operator: operator.clone(),
-            timing: planner_types::post_asap::ExecutionTiming::QueryTime,
         };
+        operation.output_state = planner_types::post_asap::ExecutionDataState::QUERY_ROWS;
         assert!(frozen
             .execute(&operation, &[left.clone(), right.clone()])
             .is_err());
+        operation.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
 
         for invalid in [
             rows(vec![]),

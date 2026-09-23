@@ -170,12 +170,20 @@ impl Lower {
                             )?
                         }
                     };
-                    return self.operation(
-                        ResidualQueryOperator::TopKSelection {
-                            k: u64::try_from(k).unwrap_or(0),
-                            grouping,
+                    let sorted = self.operation(
+                        ResidualQueryOperator::Sort {
+                            descending: true,
+                            grouping: grouping.clone(),
                         },
                         vec![input],
+                    )?;
+                    return self.operation(
+                        ResidualQueryOperator::Limit {
+                            n: u64::try_from(k).unwrap_or(0),
+                            offset: 0,
+                            grouping,
+                        },
+                        vec![sorted],
                     );
                 }
                 if a.param.is_some() {
@@ -202,8 +210,20 @@ impl Lower {
                 let operator = match c.func.name {
                     "scalar" => ResidualQueryOperator::VectorToScalar,
                     "histogram_quantile" => ResidualQueryOperator::HistogramQuantile,
-                    "sort" => ResidualQueryOperator::Sort { descending: false },
-                    "sort_desc" => ResidualQueryOperator::Sort { descending: true },
+                    "sort" => ResidualQueryOperator::Sort {
+                        descending: false,
+                        grouping: Grouping {
+                            labels: vec![],
+                            without: false,
+                        },
+                    },
+                    "sort_desc" => ResidualQueryOperator::Sort {
+                        descending: true,
+                        grouping: Grouping {
+                            labels: vec![],
+                            without: false,
+                        },
+                    },
                     name => ResidualQueryOperator::Temporal {
                         operation: match name {
                             "rate" => TemporalOperation::Rate,
@@ -508,11 +528,6 @@ pub(super) fn selected_native_expression(
                 rhs: right,
                 ..
             }
-            | SummaryExpr::MembershipFilter {
-                candidates: left,
-                values: right,
-                ..
-            }
             | SummaryExpr::RelationalJoin { left, right, .. }
             | SummaryExpr::SummaryJoin {
                 outer: left,
@@ -748,7 +763,7 @@ mod planner_workload_tests {
                 matches!(
                     entry.nodes[&entry.root],
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::TopKSelection { .. },
+                        operator: ResidualQueryOperator::Limit { .. },
                         ..
                     }
                 ),
@@ -776,7 +791,7 @@ mod planner_workload_tests {
             assert!(matches!(
                 entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::TopKSelection { .. },
+                    operator: ResidualQueryOperator::Limit { .. },
                     ..
                 }
             ));
@@ -1122,12 +1137,7 @@ pub fn eligible_materialization_keys(
                 visit(original, left, keys)?;
                 visit(original, right, keys)?;
             }
-            SummaryExpr::MembershipFilter {
-                candidates, values, ..
-            } => {
-                visit(original, candidates, keys)?;
-                visit(original, values, keys)?;
-            }
+
             SummaryExpr::ValueOperation { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryAgg { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryEstimate { summary_input, .. }
@@ -1241,7 +1251,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         ) || matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::TopKSelection { .. },
+                operator: ResidualQueryOperator::Limit { .. },
                 ..
             }
         );
@@ -1522,7 +1532,7 @@ mod tests {
             assert!(matches!(
                 entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::TopKSelection { k: actual, .. },
+                    operator: ResidualQueryOperator::Limit { n: actual, .. },
                     ..
                 } if actual == k
             ));
@@ -1541,7 +1551,7 @@ mod tests {
         assert!(matches!(
             entry.nodes[&entry.root],
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::TopKSelection { k: 3, .. },
+                operator: ResidualQueryOperator::Limit { n: 3, .. },
                 ..
             }
         ));
@@ -1570,7 +1580,7 @@ mod tests {
             assert!(matches!(
                 &entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::TopKSelection { grouping, .. },
+                    operator: ResidualQueryOperator::Limit { grouping, .. },
                     ..
                 } if grouping.labels == labels && grouping.without == without
             ));

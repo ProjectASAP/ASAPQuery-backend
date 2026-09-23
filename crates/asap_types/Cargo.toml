@@ -21,3 +21,5 @@ planner-types.workspace = true
 
 # Accuracy metadata projects the authoritative Planner guarantees.
 asap-aware-mapping.workspace = true
+
+asap-physical-operators.workspace = true
