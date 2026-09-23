@@ -471,8 +471,9 @@ fn evaluate_aligned_binary(
             let right = right_rows
                 .get(&timestamp)
                 .ok_or("maintenance binary requires matching timestamp sets")?;
-            let value =
-                asap_physical_operators::arithmetic::evaluate_float64_arithmetic(arithmetic, left, *right);
+            let value = asap_physical_operators::arithmetic::evaluate_float64_arithmetic(
+                arithmetic, left, *right,
+            );
             if !value.is_finite() {
                 return Err("maintenance binary produced a non-finite update".into());
             }

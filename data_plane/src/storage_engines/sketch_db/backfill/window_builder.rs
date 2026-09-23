@@ -5,13 +5,13 @@
 //! so both paths use the same sketch semantics.
 
 #[cfg(test)]
-use asap_physical_operators::factory::AccumulatorUpdater;
-#[cfg(test)]
-use crate::tests::accumulator_fixture::create_fixture_accumulator;
-#[cfg(test)]
 use crate::precompute_engine::worker::apply_sample;
 use crate::storage_engines::sketch_db::backfill::raw_sample_reader::RawSample;
 use crate::storage_engines::types::AggregateCore;
+#[cfg(test)]
+use crate::tests::accumulator_fixture::create_fixture_accumulator;
+#[cfg(test)]
+use asap_physical_operators::factory::AccumulatorUpdater;
 #[cfg(test)]
 use asap_types::aggregation_config::PrecomputeMaterialization;
 

@@ -1146,7 +1146,9 @@ mod tests {
                             BTreeMap::new(),
                             bounds,
                             Box::new(
-                                asap_physical_operators::accumulators::SumAccumulator::with_sum(sum),
+                                asap_physical_operators::accumulators::SumAccumulator::with_sum(
+                                    sum,
+                                ),
                             ),
                         );
                     }
