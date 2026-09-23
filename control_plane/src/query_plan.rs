@@ -179,7 +179,7 @@ where
                         *input = remap[input];
                     }
                 }
-                QueryPlanNode::CandidateTopK { inputs, .. }
+                QueryPlanNode::MembershipFilter { inputs, .. }
                 | QueryPlanNode::Binary { inputs, .. }
                 | QueryPlanNode::RelationalJoin { inputs, .. } => {
                     for input in inputs {
@@ -308,7 +308,7 @@ where
                             ..
                         },
                     ),
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             } if measures.len() == 1 => {
                 use planner_types::pre_asap::AggIntent;
                 let operation = match &measures[0] {
@@ -368,12 +368,12 @@ where
             SummaryExpr::ValueOperation {
                 child: sort,
                 operation: planner_types::post_asap::ValueOperation::Limit { n, offset: 0 },
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             } => {
                 let SummaryExpr::ValueOperation {
                     child,
                     operation: planner_types::post_asap::ValueOperation::Sort { keys, partition_by },
-                    timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                    timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 } = &sort.expr
                 else {
                     return Err(QueryPlanError::Invalid(
@@ -434,7 +434,7 @@ where
             SummaryExpr::ValueOperation {
                 child,
                 operation: planner_types::post_asap::ValueOperation::Sort { keys, .. },
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             } if keys.len() == 1 => QueryPlanNode::Logical {
                 operator: residual::ResidualQueryOperator::Sort {
                     descending: !keys[0].ascending,
@@ -444,43 +444,14 @@ where
             SummaryExpr::ValueOperation { .. } => QueryPlanNode::ExactFallback {
                 reason: "unsupported post-ASAP value operation".into(),
             },
-            SummaryExpr::CandidateTopK {
+            SummaryExpr::MembershipFilter {
                 candidates,
                 values,
-                k,
-                grouping,
                 completeness,
             } => {
-                let labels = grouping
-                    .keys()
-                    .iter()
-                    .map(|&column| {
-                        values
-                            .schema
-                            .fields
-                            .get(column)
-                            .map(|field| field.name.clone())
-                            .ok_or_else(|| {
-                                QueryPlanError::Invalid(
-                                    "unresolved CandidateTopK grouping column".into(),
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
                 let candidate_input = self.lower(candidates)?;
                 let value_input = if let Some(original) = &self.logical_source {
-                    let parsed = promql_parser::parser::parse(original)
-                        .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
-                    let promql_parser::parser::Expr::Aggregate(aggregate) = parsed else {
-                        return Err(QueryPlanError::Invalid(
-                            "CandidateTopK requires a top-level PromQL aggregate".into(),
-                        ));
-                    };
-                    if aggregate.op.to_string() != "topk" {
-                        return Err(QueryPlanError::Invalid(
-                            "CandidateTopK requires a topk source expression".into(),
-                        ));
-                    }
+                    let exact_expression = residual::selected_native_expression(original, values)?;
                     fn item_label(node: &SummaryNode) -> Option<String> {
                         match &node.expr {
                             SummaryExpr::SummaryEstimate { summary_input, .. } => {
@@ -500,7 +471,7 @@ where
                     }
                     let item_label = item_label(candidates).ok_or_else(|| {
                         QueryPlanError::Invalid(
-                            "CandidateTopK membership has no named item label".into(),
+                            "MembershipFilter membership has no named item label".into(),
                         )
                     })?;
                     let value_id = QueryNodeId(self.next_id);
@@ -510,7 +481,7 @@ where
                         QueryPlanNode::ExternalExact {
                             request: ExternalExactRequest {
                                 language: QueryLanguage::PromQl,
-                                expression: aggregate.expr.to_string(),
+                                expression: exact_expression.to_string(),
                                 output: ExternalExactOutput::InstantVector,
                                 parameters: BTreeMap::new(),
                                 start_parameter: None,
@@ -526,15 +497,8 @@ where
                 } else {
                     self.lower(values)?
                 };
-                QueryPlanNode::CandidateTopK {
+                QueryPlanNode::MembershipFilter {
                     inputs: [candidate_input, value_input],
-                    k: u64::try_from(*k).map_err(|_| {
-                        QueryPlanError::Invalid("CandidateTopK k exceeds u64".into())
-                    })?,
-                    grouping: residual::Grouping {
-                        labels,
-                        without: grouping.is_without(),
-                    },
                     completeness: completeness.clone(),
                 }
             }
@@ -542,7 +506,7 @@ where
                 lhs,
                 rhs,
                 operator,
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             } if self.logical_source.is_some()
                 || operator.checked_relative_division
                 || operator.checked_finite_division =>
@@ -624,7 +588,7 @@ where
                 lhs,
                 rhs,
                 operator,
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             } if exact_value_executable(node) => {
                 let planner_types::pre_asap::BinaryOpKind::Arithmetic(operator) = &operator.kind
                 else {
@@ -782,7 +746,7 @@ where
                 input: self.lower(summary_input)?,
                 query: query.clone().into(),
             },
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 if children.is_empty() {
                     QueryPlanNode::ExactFallback {
                         reason: "empty summary_merge".into(),
@@ -881,7 +845,7 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
             lhs,
             rhs,
             operator,
-            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            timing: planner_types::post_asap::ExecutionTiming::QueryTime,
         } => {
             matches!(
                 operator.kind,
@@ -1393,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_topk_rejects_invalid_completeness_contract() {
+    fn membership_filter_rejects_invalid_completeness_contract() {
         let leaf = QueryPlanNode::ExactFallback {
             reason: "prepared".into(),
         };
@@ -1408,13 +1372,8 @@ mod tests {
                 (QueryNodeId(1), leaf),
                 (
                     QueryNodeId(2),
-                    QueryPlanNode::CandidateTopK {
+                    QueryPlanNode::MembershipFilter {
                         inputs: [QueryNodeId(0), QueryNodeId(1)],
-                        k: 2,
-                        grouping: residual::Grouping {
-                            labels: vec![],
-                            without: false,
-                        },
                         completeness: CandidateCompleteness::Certified {
                             guarantee: planner_types::post_asap::ResultGuarantee {
                                 metric: planner_types::post_asap::ErrorMetric::Frequency,

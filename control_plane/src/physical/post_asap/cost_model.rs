@@ -521,8 +521,8 @@ impl CostModel for ControlPlaneCostModel {
 
     fn value_operation_capabilities(&self) -> ValueOperationCapabilities {
         ValueOperationCapabilities {
-            read_time: true,
-            maintenance_time: false,
+            query_time: true,
+            ingestion_time: false,
         }
     }
 
