@@ -809,7 +809,7 @@ mod planner_workload_tests {
         let Replacement::Summary(selected) = &candidate.replacement else {
             panic!("expected exact summary fixture")
         };
-        let operator = selected_aggregate_operator(query, &selected).unwrap();
+        let operator = selected_aggregate_operator(query, selected).unwrap();
         assert!(matches!(
             operator,
             ResidualQueryOperator::Aggregate {
