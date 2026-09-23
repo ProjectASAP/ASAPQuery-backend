@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+futures = "0.3"
 asap_types.workspace = true
 planner-types.workspace = true
 asap_sketch_codec = { path = "../asap_sketch_codec" }
@@ -12,7 +13,6 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-async-trait = "0.1"
 base64 = "0.21"
 bincode = "1.3"
 rmp-serde = "1.3"
@@ -24,5 +24,4 @@ default = []
 extra_debugging = []
 
 [dev-dependencies]
-tokio.workspace = true
 hex = "0.4"

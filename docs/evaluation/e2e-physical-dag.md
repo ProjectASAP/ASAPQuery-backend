@@ -157,7 +157,7 @@ jq '.precompute_plan | {materializations, executable_dags}' \
   target/physical-dag-inspection/selected.json
 ```
 
-Look for explicit maintenance-time operations and frontier bindings. Raw
+Look for explicit ingestion-time operations and frontier bindings. Raw
 materializations receive samples; a derived materialization consumes its
 bound immutable input program and must not receive raw backfill/collector jobs.
 The runtime supports only its validated operator, schema, grouping and window

@@ -12,7 +12,6 @@ name = "control_plane"
 path = "src/main.rs"
 
 [dependencies]
-asap-physical-operators.workspace = true
 tokio       = { version = "1",    features = ["full"] }
 axum        = { version = "0.7",  features = ["ws"] }
 futures-util = "0.3"
@@ -33,6 +32,7 @@ parking_lot    = "0.12"
 prometheus     = { version = "0.13", default-features = false, features = ["process"] }
 tonic          = { version = "0.12", features = ["gzip"] }
 asap_types.workspace = true
+asap-physical-operators.workspace = true
 
 # Planner's IR, replacement search, and frontends share the workspace pin.
 planner-types.workspace = true
