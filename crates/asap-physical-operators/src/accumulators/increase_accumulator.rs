@@ -1,4 +1,4 @@
-use crate::storage_engines::types::{
+use crate::{
     AggregateCore, AggregationType, Measurement, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate,
 };
@@ -391,7 +391,7 @@ impl AggregateCore for IncreaseAccumulator {
         _key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::SingleSubpopulationAggregate;
+        use crate::SingleSubpopulationAggregate;
         self.query(
             statistic,
             (!query_kwargs.is_empty()).then_some(query_kwargs),

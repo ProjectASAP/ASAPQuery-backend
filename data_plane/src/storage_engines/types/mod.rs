@@ -9,20 +9,14 @@
 pub mod enums;
 pub mod hot_reload_config;
 pub mod installed_precompute_plan;
-pub mod key_by_label_values;
-pub mod measurement;
 pub mod precomputed_output;
 pub mod storage_backend;
-pub mod traits;
 
 pub use enums::*;
 pub use hot_reload_config::*;
 pub use installed_precompute_plan::*;
-pub use key_by_label_values::*;
-pub use measurement::*;
 pub use precomputed_output::*;
 pub use storage_backend::*;
-pub use traits::*;
 
 // Cross-module re-export of asap_types data types so callers can
 // write `crate::storage_engines::types::PrecomputeMaterialization` instead of
@@ -35,3 +29,5 @@ pub use crate::query_engines::routing::{
     classify_query_shape, BackendStorageRouting, HotReloadBackendStorageRouting,
     QueryOperatorShape, RoutingTarget,
 };
+
+pub use asap_physical_operators::{traits::*, KeyByLabelValues, Measurement};

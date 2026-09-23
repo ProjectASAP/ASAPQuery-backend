@@ -12,7 +12,7 @@
 //! for `SketchAlgorithm::CountSketchWithHeap` sids -- the same conflation bug
 //! already fixed on the read side, now closed on the write side too.
 
-use crate::storage_engines::types::{
+use crate::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
@@ -285,7 +285,7 @@ impl AggregateCore for CountSketchWithHeapAccumulator {
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::MultipleSubpopulationAggregate;
+        use crate::MultipleSubpopulationAggregate;
         let key_val = key
             .as_ref()
             .ok_or("Key required for CountSketchWithHeapAccumulator")?;
@@ -561,7 +561,7 @@ mod tests {
     /// min-over-rows divergence at the sketch-math level).
     #[test]
     fn test_rejects_merge_with_cms_family_accumulator() {
-        use crate::precompute_engine::operators::count_min_sketch_with_heap_accumulator::CountMinSketchWithHeapAccumulator;
+        use crate::accumulators::count_min_sketch_with_heap_accumulator::CountMinSketchWithHeapAccumulator;
 
         let cs = CountSketchWithHeapAccumulator::new(4, 64, 10);
         let cms = CountMinSketchWithHeapAccumulator::new(4, 64, 10);

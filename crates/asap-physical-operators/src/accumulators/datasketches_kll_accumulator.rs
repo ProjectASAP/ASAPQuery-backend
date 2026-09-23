@@ -1,4 +1,4 @@
-use crate::storage_engines::types::{
+use crate::{
     AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate,
 };
@@ -139,7 +139,7 @@ impl DatasketchesKLLAccumulator {
 
     /// Merge multiple accumulators efficiently without cloning all of them.
     pub fn merge_multiple(
-        accumulators: &[Box<dyn crate::storage_engines::types::AggregateCore>],
+        accumulators: &[Box<dyn crate::AggregateCore>],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if accumulators.is_empty() {
             return Err("No accumulators to merge".into());
@@ -299,7 +299,7 @@ impl AggregateCore for DatasketchesKLLAccumulator {
         _key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::SingleSubpopulationAggregate;
+        use crate::SingleSubpopulationAggregate;
         self.query(statistic, Some(query_kwargs))
     }
 }
@@ -359,10 +359,10 @@ impl MergeableAccumulator<DatasketchesKLLAccumulator> for DatasketchesKLLAccumul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     fn encode_state(state: asap_sketchlib::proto::sketchlib::KllState) -> Vec<u8> {
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
-        use prost::Message;
         SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
             ..Default::default()
@@ -537,7 +537,7 @@ mod tests {
         let boxed_accs: Vec<Box<dyn AggregateCore>> = vec![Box::new(kll1), Box::new(kll2)];
         assert!(DatasketchesKLLAccumulator::merge_multiple(&boxed_accs).is_err());
 
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::accumulators::sum_accumulator::SumAccumulator;
         let kll = DatasketchesKLLAccumulator::new(200);
         let sum = SumAccumulator::new();
         let mixed_accs: Vec<Box<dyn AggregateCore>> = vec![Box::new(kll), Box::new(sum)];
@@ -552,7 +552,6 @@ mod tests {
         // match the ground truth (sorted items) within KLL's own
         // rank-error bound for k=200.
         use asap_sketchlib::proto::sketchlib::KllState;
-        use prost::Message;
 
         let items: Vec<f64> = (0..64).map(|i| i as f64).collect();
         let state = KllState {
@@ -593,7 +592,6 @@ mod tests {
     #[test]
     fn compacted_wire_state_preserves_count_and_quantiles() {
         use asap_sketchlib::{proto::sketchlib::KllState, sketches::KLL};
-        use prost::Message;
         let mut source = KLL::<f64>::init_kll_with_seed(32, 123);
         for i in 0..1000 {
             source.update(&(((i * 7919 + 17) % 1009) as f64 / 1009.0));
@@ -624,7 +622,6 @@ mod tests {
         // wrapped in a `SketchEnvelope{kll: ...}` via sketchlib-go's
         // `SerializePortableFO` + `proto.Marshal`.
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
-        use prost::Message;
 
         let items: Vec<f64> = (0..64).map(|i| i as f64).collect();
         let state = KllState {
@@ -652,7 +649,6 @@ mod tests {
     #[test]
     fn test_from_sketchlib_proto_bytes_envelope_wrong_sketch_type() {
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, CountMinState, SketchEnvelope};
-        use prost::Message;
 
         let env = SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::CountMin(
@@ -669,7 +665,6 @@ mod tests {
     #[test]
     fn test_from_sketchlib_proto_bytes_rejects_small_k() {
         use asap_sketchlib::proto::sketchlib::KllState;
-        use prost::Message;
         let state = KllState {
             k: 4, // < minimum of 8
             m: 2,
@@ -690,7 +685,6 @@ mod tests {
     #[test]
     fn test_from_sketchlib_proto_bytes_rejects_inconsistent_levels() {
         use asap_sketchlib::proto::sketchlib::KllState;
-        use prost::Message;
         // num_levels=1 but levels array has 3 entries instead of 2
         let state = KllState {
             k: 200,
