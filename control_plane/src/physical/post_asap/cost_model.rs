@@ -16,11 +16,12 @@ use asap_aware_mapping::empirical_cost::EmpiricalEvidenceProvider;
 use asap_aware_mapping::{
     CompleteSummaryCandidateEstimate, CostModel, CostProvenance, EvaluationRate,
     ExactCompositionCostInputs, ExactCompositionCostRequest, Horizon, OperationPlacement,
-    Realization, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
-    ValueOperationCapabilities,
+    Realization, Replacement, ReplacementSubDAG, SummaryMaintenanceCapabilities,
+    SummaryMaintenanceLifecycleCostInputs, TargetSubDAG, ValueOperationCapabilities,
 };
 use planner_types::post_asap::{
-    SketchAlgorithm, SketchParams, SketchQuery, SummaryWindowFramework,
+    ExecutableOperatorPayload, GroupingStrategy, SketchAlgorithm, SketchParams, SketchQuery,
+    SummaryFamilyType, SummaryWindowFramework,
 };
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
@@ -30,6 +31,55 @@ use crate::planner_selection::FREQUENCY_EXT_KIND;
 use crate::types::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
 use serde::{Deserialize, Serialize};
+
+/// A local state-footprint estimate, never a complete deployment quote.
+#[derive(Debug, Serialize)]
+pub struct CandidateCostEstimate {
+    pub value: f64,
+    pub unit: &'static str,
+    pub model: &'static str,
+    pub source: &'static str,
+    pub erp_record_ids: Vec<String>,
+}
+
+fn analytical_state_bytes(family: &SummaryFamilyType) -> Option<f64> {
+    use asap_types::AggregationType as A;
+    use planner_types::post_asap::ExactKind;
+    let (aggregation, params) = match family {
+        SummaryFamilyType::ExactAggregate(kind, _) => (
+            match kind {
+                ExactKind::Sum | ExactKind::Count => A::Sum,
+                ExactKind::Min => A::Min,
+                ExactKind::Max => A::Max,
+                ExactKind::Increase | ExactKind::Rate | ExactKind::IRate => A::Increase,
+            },
+            std::collections::HashMap::new(),
+        ),
+        SummaryFamilyType::Sketch(kind, GroupingStrategy::PerSubpopulationInstance) => {
+            let aggregation = match kind.algorithm() {
+                SketchAlgorithm::DDSketch => A::DDSketch,
+                SketchAlgorithm::Kll => A::DatasketchesKLL,
+                SketchAlgorithm::Hll => A::HLL,
+                SketchAlgorithm::Cms => A::CountMinSketch,
+                SketchAlgorithm::CountSketch => A::CountSketch,
+                SketchAlgorithm::CmsWithHeap => A::CountMinSketchWithHeap,
+                SketchAlgorithm::CountSketchWithHeap => A::CountSketchWithHeap,
+                SketchAlgorithm::UnivMon => A::UnivMon,
+                SketchAlgorithm::Kmv | SketchAlgorithm::Theta => return None,
+            };
+            let params = super::super::compiler::sketch_params_json(kind.params())
+                .as_object()?
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            (aggregation, params)
+        }
+        // A shared grid needs its own population/layout model; an independent
+        // state's measurement is not a measurement of that grid.
+        _ => return None,
+    };
+    Some(super::super::compiler::estimated_state_bytes(&aggregation, &params) as f64)
+}
 
 /// One measured execution profile for an exact operator composed with a
 /// maintained summary. Values use CPU nanoseconds so every term in Planner's
@@ -120,6 +170,39 @@ pub struct ControlPlaneCostModel {
 }
 
 impl ControlPlaneCostModel {
+    pub fn candidate_cost_estimate(
+        &self,
+        candidate: &ReplacementSubDAG,
+    ) -> Option<CandidateCostEstimate> {
+        let Replacement::Summary(root) = &candidate.replacement else {
+            // Exact compositions have a separate measured rate model. Raw
+            // rewrites have no retained-state estimate in this model.
+            return None;
+        };
+        let dag = planner_types::post_asap::compile_executable_dag(root).ok()?;
+        let mut value = 0.0;
+        let mut states = 0;
+        for node in &dag.nodes {
+            let family = match &node.payload {
+                ExecutableOperatorPayload::SummaryAgg { family, .. }
+                | ExecutableOperatorPayload::SummaryJoin { family, .. } => family,
+                _ => continue,
+            };
+            states += 1;
+            value += analytical_state_bytes(family)?;
+        }
+        if states == 0 || !value.is_finite() {
+            return None;
+        }
+        Some(CandidateCostEstimate {
+            value,
+            unit: "bytes_per_state_partition",
+            model: "backend_state_footprint_v1",
+            source: "analytical",
+            erp_record_ids: vec![],
+        })
+    }
+
     pub fn new(workload_accuracy: AccuracyTarget) -> Self {
         Self {
             workload_accuracy,
@@ -427,6 +510,15 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
 }
 
 impl CostModel for ControlPlaneCostModel {
+    fn candidate_cost(
+        &self,
+        candidate: &ReplacementSubDAG,
+        _target: &TargetSubDAG<'_>,
+    ) -> Option<Cost> {
+        self.candidate_cost_estimate(candidate)
+            .map(|estimate| Cost(estimate.value))
+    }
+
     fn value_operation_capabilities(&self) -> ValueOperationCapabilities {
         ValueOperationCapabilities {
             read_time: true,
@@ -777,6 +869,14 @@ impl ForcedFamilyCostModel {
 }
 
 impl CostModel for ForcedFamilyCostModel {
+    fn candidate_cost(
+        &self,
+        candidate: &ReplacementSubDAG,
+        target: &TargetSubDAG<'_>,
+    ) -> Option<Cost> {
+        self.inner.candidate_cost(candidate, target)
+    }
+
     fn rank_candidates(
         &self,
         intent: &AggIntent,
