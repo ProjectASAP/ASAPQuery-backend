@@ -5,7 +5,7 @@
 //! (via `SketchEnvelope::decode`) only when merge or query operations need
 //! the inner sketch type.
 
-use crate::storage_engines::types::{AggregateCore, KeyByLabelValues, SerializableToSink};
+use crate::{AggregateCore, KeyByLabelValues, SerializableToSink};
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use prost::Message;
 use serde_json::Value;
@@ -135,7 +135,7 @@ impl AggregateCore for SketchEnvelopeAccumulator {
     }
 }
 
-impl crate::storage_engines::types::MultipleSubpopulationAggregate for SketchEnvelopeAccumulator {
+impl crate::MultipleSubpopulationAggregate for SketchEnvelopeAccumulator {
     fn query(
         &self,
         _statistic: Statistic,
@@ -148,9 +148,7 @@ impl crate::storage_engines::types::MultipleSubpopulationAggregate for SketchEnv
         )
     }
 
-    fn clone_boxed(
-        &self,
-    ) -> Box<dyn crate::storage_engines::types::MultipleSubpopulationAggregate> {
+    fn clone_boxed(&self) -> Box<dyn crate::MultipleSubpopulationAggregate> {
         Box::new(self.clone())
     }
 }

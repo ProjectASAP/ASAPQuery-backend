@@ -11,10 +11,8 @@
 //! registers + variant + HIP accumulators losslessly, so the merge +
 //! store round-trip works end-to-end without that richer query surface.
 
-use crate::precompute_engine::operators::dd_sketch_accumulator::normalize_sample_p;
-use crate::storage_engines::types::{
-    AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink,
-};
+use crate::accumulators::dd_sketch_accumulator::normalize_sample_p;
+use crate::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
 use asap_sketchlib::{HllSketch, HllVariant, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -232,7 +230,7 @@ impl HllSketchAccumulator {
     /// Called against an accumulator that already carries the base
     /// sketch state; the caller is the per-series snapshot cache in
     /// the ingest path. Bytes are the
-    /// `asap_otel_proto::sketchlib::v1::HllDelta` message.
+    /// `asap_sketchlib::proto::sketchlib::HllDelta` message.
     pub fn apply_proto_delta_bytes(
         &mut self,
         buffer: &[u8],
@@ -569,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_core_merge_wrong_type_rejects() {
-        use crate::precompute_engine::operators::count_sketch_accumulator::CountSketchAccumulator;
+        use crate::accumulators::count_sketch_accumulator::CountSketchAccumulator;
         let hll = HllSketchAccumulator::new(HllVariant::Regular, 2);
         let cs = CountSketchAccumulator::new(2, 3);
         assert!(hll.merge_with(&cs).is_err());
@@ -601,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_apply_proto_delta_bytes_round_trip() {
-        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
+        use asap_sketchlib::proto::sketchlib::HllDelta as PbDelta;
         use prost::Message;
 
         let mut acc = HllSketchAccumulator::new(HllVariant::Regular, 2);

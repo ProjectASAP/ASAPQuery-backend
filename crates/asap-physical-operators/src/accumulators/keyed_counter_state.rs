@@ -1,5 +1,5 @@
-use crate::precompute_engine::operators::IncreaseAccumulator;
-use crate::storage_engines::types::{
+use crate::accumulators::IncreaseAccumulator;
+use crate::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink, SingleSubpopulationAggregate,
 };
@@ -209,7 +209,7 @@ impl AggregateCore for KeyedCounterState {
         key: &Option<KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::MultipleSubpopulationAggregate;
+        use crate::MultipleSubpopulationAggregate;
         let key_val = key.as_ref().ok_or("Key required for KeyedCounterState")?;
         self.query(statistic, key_val, Some(query_kwargs))
     }
@@ -263,7 +263,7 @@ impl MergeableAccumulator<KeyedCounterState> for KeyedCounterState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::Measurement;
+    use crate::Measurement;
 
     fn create_test_increase_accumulator(start_val: f64, end_val: f64) -> IncreaseAccumulator {
         IncreaseAccumulator::new(

@@ -807,7 +807,7 @@ fn has_unsafe_raw_entity_leaf(
         SummaryExpr::SummaryEstimate { summary_input, .. } => {
             has_unsafe_raw_entity_leaf(summary_input, selected, false)
         }
-        SummaryExpr::SummaryMerge { children } => children
+        SummaryExpr::SummaryMerge { children, .. } => children
             .iter()
             .any(|child| has_unsafe_raw_entity_leaf(child, selected, false)),
         _ => false,
@@ -2056,7 +2056,7 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
-            SummaryExpr::CandidateTopK {
+            SummaryExpr::MembershipFilter {
                 candidates, values, ..
             } => {
                 walk(candidates, metrics);
@@ -2064,7 +2064,7 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
             }
             SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     walk(child, metrics);
                 }
@@ -2321,7 +2321,7 @@ fn requires_exact_erp_fallback(
                 child: summary_input,
                 ..
             } => walk(summary_input, out),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 children.iter().for_each(|child| walk(child, out))
             }
             SummaryExpr::SummaryJoin { outer, inner, .. } => {
@@ -2338,7 +2338,7 @@ fn requires_exact_erp_fallback(
                 walk(left, out);
                 walk(right, out);
             }
-            SummaryExpr::CandidateTopK {
+            SummaryExpr::MembershipFilter {
                 candidates, values, ..
             } => {
                 walk(candidates, out);
@@ -3206,7 +3206,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
                 lhs,
                 rhs,
                 operator,
-                timing: ExecutionTiming::MaintenanceTime,
+                timing: ExecutionTiming::IngestionTime,
             } if operator.vector_match.is_none()
                 && matches!(
                     operator.kind,
@@ -3219,7 +3219,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
             SummaryExpr::ValueOperation {
                 child: source,
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                timing: ExecutionTiming::MaintenanceTime,
+                timing: ExecutionTiming::IngestionTime,
             } if matches!(&source.expr,
                     SummaryExpr::SummaryAgg { family: SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), child, .. }
                     if matches!(child.expr, SummaryExpr::KeepPreAsap(_))) =>
@@ -3535,7 +3535,7 @@ fn collect_selected_materializations(
             }
         }
         match &node.expr {
-            SummaryExpr::CandidateTopK {
+            SummaryExpr::MembershipFilter {
                 candidates, values, ..
             } => {
                 walk(candidates, readout, composable, grouping.clone(), selected)?;
@@ -3589,7 +3589,7 @@ fn collect_selected_materializations(
                 grouping.clone(),
                 selected,
             )?,
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     walk(child, readout, composable, grouping.clone(), selected)?;
                 }
@@ -4441,10 +4441,17 @@ pub(crate) mod tests {
             .compile_promql(request, environment(10_000))
             .unwrap();
         let entry = plan.query_plan.entries.values().next().unwrap();
-        let crate::query_plan::QueryPlanNode::CandidateTopK { inputs, .. } =
-            &entry.nodes[&entry.root]
+        let crate::query_plan::QueryPlanNode::Logical {
+            operator: asap_types::query_plan::residual::ResidualQueryOperator::TopKSelection { .. },
+            inputs,
+        } = &entry.nodes[&entry.root]
         else {
-            panic!("Planner weighted TopK must lower to CandidateTopK: {entry:#?}");
+            panic!("expected ordinary TopK root")
+        };
+        let crate::query_plan::QueryPlanNode::MembershipFilter { inputs, .. } =
+            &entry.nodes[&inputs[0]]
+        else {
+            panic!("Planner weighted TopK must lower to MembershipFilter: {entry:#?}");
         };
         assert!(matches!(
             entry.nodes[&inputs[0]],
@@ -4540,7 +4547,14 @@ pub(crate) mod tests {
             asap_types::AggregationType::CountMinSketchWithHeap
         );
         let entry = plan.query_plan.lookup(query).unwrap();
-        let QueryPlanNode::CandidateTopK { inputs, .. } = &entry.nodes[&entry.root] else {
+        let QueryPlanNode::Logical {
+            operator: ResidualQueryOperator::TopKSelection { .. },
+            inputs,
+        } = &entry.nodes[&entry.root]
+        else {
+            panic!("expected ordinary TopK root")
+        };
+        let QueryPlanNode::MembershipFilter { inputs, .. } = &entry.nodes[&inputs[0]] else {
             panic!("expected candidate TopK: {entry:#?}");
         };
         assert!(matches!(
@@ -4581,7 +4595,7 @@ pub(crate) mod tests {
             .nodes
             .iter()
             .all(|node| node.output_state.timing
-                == planner_types::post_asap::ExecutionTiming::MaintenanceTime));
+                == planner_types::post_asap::ExecutionTiming::IngestionTime));
         assert_eq!(installed.binding.query_plan_sink, entry.root);
         let mut mismatched = plan.to_publication_artifact().unwrap();
         let projected = mismatched
@@ -5766,7 +5780,7 @@ pub(crate) mod tests {
         };
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 lhs: selected.clone(),
                 rhs: selected.clone(),
                 operator: planner_types::post_asap::BinaryOperator {
@@ -5967,7 +5981,7 @@ pub(crate) mod tests {
         let right = right.queries[0].selected_plan_root.clone();
         let right = Rc::new(SummaryNode {
             expr: SummaryExpr::ValueOperation {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
                 child: right.clone(),
             },
@@ -5976,7 +5990,7 @@ pub(crate) mod tests {
         });
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 lhs: left.clone(),
                 rhs: right,
                 operator: planner_types::post_asap::BinaryOperator {
@@ -7605,6 +7619,7 @@ pub(crate) mod tests {
         };
         let merge = Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryMerge {
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 children: vec![left.clone(), right.clone()],
             },
             schema: left.schema.clone(),

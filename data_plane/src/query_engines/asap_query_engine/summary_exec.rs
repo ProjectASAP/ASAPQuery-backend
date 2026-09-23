@@ -184,7 +184,7 @@ pub fn execute<E: SummaryExecutor>(
             Ok(ExecOutcome::Value(out))
         }
 
-        SummaryExpr::SummaryMerge { children } => {
+        SummaryExpr::SummaryMerge { children, .. } => {
             if children.is_empty() {
                 return Err(ExecError::EmptyMerge);
             }
@@ -223,11 +223,11 @@ pub fn execute<E: SummaryExecutor>(
 
         SummaryExpr::SummaryJoin { .. } => Err(ExecError::NotYetSupported("SummaryJoin")),
         SummaryExpr::RelationalJoin { .. } => Err(ExecError::NotYetSupported("RelationalJoin")),
-        // CandidateTopK is lowered to the deployed QueryPlan DAG, where both
+        // MembershipFilter is lowered to the deployed QueryPlan DAG, where both
         // row inputs retain labels for intersection and exact reranking. This
         // legacy generic adapter exposes opaque GroupKey values and cannot
         // implement that contract without losing label identity.
-        SummaryExpr::CandidateTopK { .. } => Err(ExecError::NotYetSupported("CandidateTopK")),
+        SummaryExpr::MembershipFilter { .. } => Err(ExecError::NotYetSupported("MembershipFilter")),
         SummaryExpr::BinaryOp { .. } => Err(ExecError::NotYetSupported("BinaryOp")),
         SummaryExpr::ValueOperation { .. } => Err(ExecError::NotYetSupported("ValueOperation")),
         SummaryExpr::SummarySubtract { .. } => Err(ExecError::NotYetSupported("SummarySubtract")),
@@ -350,7 +350,10 @@ mod tests {
 
     fn merge_node(children: Vec<Rc<SummaryNode>>) -> Rc<SummaryNode> {
         Rc::new(SummaryNode {
-            expr: SummaryExpr::SummaryMerge { children },
+            expr: SummaryExpr::SummaryMerge {
+                children,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
+            },
             schema: lift(vec!["value"]),
             guarantee: None,
         })
@@ -522,7 +525,7 @@ mod tests {
         let child = logical_node();
         let tree = SummaryNode {
             expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 lhs: child.clone(),
                 rhs: child.clone(),
                 operator: planner_types::post_asap::BinaryOperator {

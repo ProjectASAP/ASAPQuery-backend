@@ -180,7 +180,7 @@ where
         let node = nodes
             .get(&id)
             .ok_or_else(|| ScheduleError::Invalid(format!("missing node {id}")))?;
-        if node.output_state == ExecutionDataState::READ_ROWS {
+        if node.output_state == ExecutionDataState::QUERY_ROWS {
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
             )));
@@ -268,8 +268,7 @@ mod tests {
             .nodes
             .iter()
             .filter(|node| {
-                node.output_state.timing
-                    == planner_types::post_asap::ExecutionTiming::MaintenanceTime
+                node.output_state.timing == planner_types::post_asap::ExecutionTiming::IngestionTime
             })
             .map(|node| node.id)
             .collect::<std::collections::BTreeSet<_>>();
@@ -285,7 +284,7 @@ mod tests {
         ExecutableDagNode {
             id: PostAsapNodeId(id),
             payload: ExecutableOperatorPayload::SummarySubtract,
-            output_state: ExecutionDataState::MAINTENANCE_SUMMARY,
+            output_state: ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: Vec::new(),
                 time_index: None,
@@ -303,7 +302,7 @@ mod tests {
                 fields: Vec::new(),
                 time_index: None,
             },
-            data_state: ExecutionDataState::MAINTENANCE_SUMMARY,
+            data_state: ExecutionDataState::INGESTION_SUMMARY,
             grouping: GroupingEdgeCompatibility::Identical,
             window: WindowEdgeCompatibility::NotApplicable,
         }
@@ -408,7 +407,7 @@ mod tests {
         }
         let mut binary = node(3);
         binary.payload = ExecutableOperatorPayload::Binary {
-            timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
             operator: BinaryOperator {
                 checked_relative_division: false,
                 checked_finite_division: false,
@@ -423,7 +422,7 @@ mod tests {
         let mut dag = ExecutableDag {
             nodes: vec![node(0), node(1), node(2), binary, {
                 let mut query = node(4);
-                query.output_state = ExecutionDataState::READ_ROWS;
+                query.output_state = ExecutionDataState::QUERY_ROWS;
                 query
             }],
             edges: vec![right, left],
@@ -459,7 +458,7 @@ mod tests {
                 .map(node)
                 .chain([{
                     let mut query = node(4);
-                    query.output_state = ExecutionDataState::READ_ROWS;
+                    query.output_state = ExecutionDataState::QUERY_ROWS;
                     query
                 }])
                 .collect(),
@@ -504,9 +503,9 @@ mod tests {
             }
         }
         let mut raw = node(0);
-        raw.output_state = ExecutionDataState::READ_ROWS;
+        raw.output_state = ExecutionDataState::QUERY_ROWS;
         let mut query = node(4);
-        query.output_state = ExecutionDataState::READ_ROWS;
+        query.output_state = ExecutionDataState::QUERY_ROWS;
         let dag = ExecutableDag {
             nodes: vec![raw, node(1), node(2), node(3), query],
             edges: vec![edge(0, 1), edge(1, 2), edge(1, 3), edge(2, 3), edge(3, 4)],
@@ -532,7 +531,7 @@ mod tests {
     #[test]
     fn rejects_query_node_in_precompute_path_and_mismatched_lineage_key() {
         let mut query_child = node(0);
-        query_child.output_state = ExecutionDataState::READ_ROWS;
+        query_child.output_state = ExecutionDataState::QUERY_ROWS;
         let dag = ExecutableDag {
             nodes: vec![query_child, node(1)],
             edges: vec![edge(0, 1)],

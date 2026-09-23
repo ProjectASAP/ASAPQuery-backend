@@ -19,7 +19,7 @@ pub fn install_selected_dag(
             precompute_sinks.push(node.id);
             BackendNodeBinding::Materialization { summary_definition }
         } else if node.output_state.timing
-            == planner_types::post_asap::ExecutionTiming::MaintenanceTime
+            == planner_types::post_asap::ExecutionTiming::IngestionTime
         {
             BackendNodeBinding::MaintenanceInput
         } else {

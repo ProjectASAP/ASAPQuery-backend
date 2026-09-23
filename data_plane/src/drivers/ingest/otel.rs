@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::precompute_engine::operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
+use asap_physical_operators::accumulators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::IngestState;
 use crate::query_engines::routing::FreshnessProbeCache;
@@ -2095,7 +2095,7 @@ fn dp_carries_heap(dp: &ModifiedOtlpSketchDp) -> bool {
                 .unwrap_or(false)
         }
         ENCODING_MSGPACK_DELTA => {
-            use crate::precompute_engine::operators::CountMinSketchWithHeapAccumulator;
+            use asap_physical_operators::accumulators::CountMinSketchWithHeapAccumulator;
             CountMinSketchWithHeapAccumulator::from_msgpack_heap_delta_bytes(&dp.sketch)
                 .map(|acc| !acc.inner.topk_heap_items().is_empty())
                 .unwrap_or(false)
@@ -2523,7 +2523,7 @@ fn decode_modified_otlp_sketch_bytes(
     encoding: i32,
     bytes: &[u8],
 ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>> {
-    use crate::precompute_engine::operators::{
+    use asap_physical_operators::accumulators::{
         CountMinSketchAccumulator, CountSketchAccumulator, DDSketchAccumulator,
         DatasketchesKLLAccumulator, HllSketchAccumulator,
     };
@@ -2594,7 +2594,7 @@ fn decode_modified_otlp_sketch_bytes(
                 use asap_sketchlib::CountSketchWithHeap;
                 if let Ok(heap) = CountSketchWithHeap::from_msgpack(bytes) {
                     if !heap.topk_heap_items().is_empty() {
-                        use crate::precompute_engine::operators::CountSketchWithHeapAccumulator;
+                        use asap_physical_operators::accumulators::CountSketchWithHeapAccumulator;
                         return Ok(Box::new(
                             CountSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(bytes)?,
                         ));
@@ -2659,7 +2659,7 @@ fn empty_accumulator_for_delta_bootstrap(
     config: &crate::storage_engines::sketch_db::index::SketchConfig,
     encoding: i32,
 ) -> Option<Box<dyn AggregateCore>> {
-    use crate::precompute_engine::operators::{
+    use asap_physical_operators::accumulators::{
         CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
         HllSketchAccumulator,
     };
@@ -2733,7 +2733,7 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
     existing: &mut Box<dyn AggregateCore>,
     bytes: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::precompute_engine::operators::{
+    use asap_physical_operators::accumulators::{
         CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
         DDSketchAccumulator, HllSketchAccumulator,
     };
@@ -2979,7 +2979,7 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                         // ExactAgg(Sum) path as a plain delta Sum — the backend sums
                         // the per-window/per-shard partials for the same sid.
                         for dp in &sa.data_points {
-                            let value = match crate::precompute_engine::operators::sum_accumulator::SumAccumulator::from_sum_bytes(&dp.sketch) {
+                            let value = match asap_physical_operators::accumulators::sum_accumulator::SumAccumulator::from_sum_bytes(&dp.sketch) {
                                 Ok(acc) => acc.sum,
                                 Err(e) => {
                                     debug!("asap_edge: SumAgg data point decode failed (skipping): {e}");
@@ -3419,7 +3419,7 @@ mod policy_fp_lookup_tests {
 #[cfg(test)]
 mod dispatcher_tests {
     use super::*;
-    use crate::precompute_engine::operators::{DDSketchAccumulator, HllSketchAccumulator};
+    use asap_physical_operators::accumulators::{DDSketchAccumulator, HllSketchAccumulator};
     use crate::storage_engines::types::AggregateCore;
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::HllVariant;
@@ -3772,7 +3772,7 @@ mod sid_resolution_tests {
     /// directly observable on the bucket counts.
     #[tokio::test]
     async fn delta_apply_rotates_per_series_base_at_window_boundary() {
-        use crate::precompute_engine::operators::DDSketchAccumulator;
+        use asap_physical_operators::accumulators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
@@ -4104,7 +4104,7 @@ mod sid_resolution_tests {
     /// recover after a backend restart.
     #[tokio::test]
     async fn leading_cms_delta_bootstraps_onto_empty_base() {
-        use crate::precompute_engine::operators::CountMinSketchAccumulator;
+        use asap_physical_operators::accumulators::CountMinSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
         use prost::Message;
 
@@ -4190,7 +4190,7 @@ mod sid_resolution_tests {
     /// the register-max updates.
     #[tokio::test]
     async fn leading_hll_delta_bootstraps_onto_empty_base() {
-        use crate::precompute_engine::operators::HllSketchAccumulator;
+        use asap_physical_operators::accumulators::HllSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
         use prost::Message;
 

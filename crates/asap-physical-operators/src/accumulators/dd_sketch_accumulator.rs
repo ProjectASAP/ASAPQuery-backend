@@ -14,9 +14,7 @@
 //! served by controller-provisioned exact aggregations — `query_statistic`
 //! returns the unavailable-statistic error for them.
 
-use crate::storage_engines::types::{
-    AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink,
-};
+use crate::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
 use asap_sketchlib::{DdSketch, DdSketchDelta, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -119,12 +117,12 @@ impl DDSketchAccumulator {
     /// Called against an accumulator that already carries the base
     /// sketch state; the caller is the per-series snapshot cache in
     /// the ingest path. Bytes are the
-    /// `asap_otel_proto::sketchlib::v1::DdSketchDelta` message.
+    /// `asap_sketchlib::proto::sketchlib::DdSketchDelta` message.
     pub fn apply_proto_delta_bytes(
         &mut self,
         buffer: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use asap_otel_proto::sketchlib::v1::DdSketchDelta as PbDelta;
+        use asap_sketchlib::proto::sketchlib::DdSketchDelta as PbDelta;
         use prost::Message;
 
         let pb = PbDelta::decode(buffer).map_err(|e| format!("decode DDSketchDelta: {e}"))?;
@@ -400,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_core_merge_wrong_type_rejects() {
-        use crate::precompute_engine::operators::count_sketch_accumulator::CountSketchAccumulator;
+        use crate::accumulators::count_sketch_accumulator::CountSketchAccumulator;
         let dd = DDSketchAccumulator::new(0.01);
         let cs = CountSketchAccumulator::new(2, 3);
         assert!(dd.merge_with(&cs).is_err());
@@ -426,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_apply_proto_delta_bytes_round_trip() {
-        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_sketchlib::proto::sketchlib::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use prost::Message;
 
         let mut acc = DDSketchAccumulator::new(0.01);
@@ -457,7 +455,7 @@ mod tests {
     /// A valid protobuf with an inadmissible span must not acknowledge a dropped update.
     #[test]
     fn test_apply_proto_delta_rejects_span_without_mutating_state() {
-        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_sketchlib::proto::sketchlib::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use prost::Message;
         let mut acc = DDSketchAccumulator::new(0.01);
         acc.inner = DdSketch::from_raw(0.01, vec![1, 2, 3], 0);

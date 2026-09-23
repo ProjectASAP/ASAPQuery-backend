@@ -193,7 +193,7 @@ pub fn warn_if_retention_inverted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precompute_engine::operators::SumAccumulator;
+    use asap_physical_operators::accumulators::SumAccumulator;
     use crate::storage_engines::types::{AggregationType, InstalledPrecomputePlan};
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;

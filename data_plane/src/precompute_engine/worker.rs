@@ -1,10 +1,10 @@
 #[cfg(test)]
-use crate::precompute_engine::accumulator_factory::create_fixture_accumulator;
-use crate::precompute_engine::accumulator_factory::AccumulatorUpdater;
+use crate::tests::accumulator_fixture::create_fixture_accumulator;
+use asap_physical_operators::factory::AccumulatorUpdater;
 use crate::precompute_engine::config::LateDataPolicy;
 use crate::precompute_engine::group_key::GroupKey;
 use crate::precompute_engine::metrics::record_late_input;
-use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
@@ -1943,9 +1943,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::precompute_engine::config::LateDataPolicy;
-    use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
-    use crate::precompute_engine::operators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
-    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use asap_physical_operators::accumulators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
+    use asap_physical_operators::accumulators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
+    use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_sketchlib::KllSketch;
@@ -3241,7 +3241,7 @@ mod tests {
     // OTLP ingest dispatch builds via `decode_modified_otlp_sketch_bytes`.
     // -----------------------------------------------------------------------
 
-    use crate::precompute_engine::operators::DDSketchAccumulator;
+    use asap_physical_operators::accumulators::DDSketchAccumulator;
     use asap_sketchlib::DdSketch;
 
     /// Build a fresh DDSketch holding `vals` so each test has a real,
@@ -4006,7 +4006,7 @@ mod tests {
     // A pooled Sum is correct only for an explicit cross-entity reduction.
     #[test]
     fn pooled_sum_does_not_preserve_per_entity_output_rows() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::accumulators::SumAccumulator;
         let config = make_agg_config(
             1,
             "gauge",
@@ -4060,7 +4060,7 @@ mod tests {
     // The physical compiler rejects raw counter producers until series state is preserved.
     #[test]
     fn pooled_counter_samples_lose_independent_same_timestamp_reset() {
-        use crate::precompute_engine::operators::IncreaseAccumulator;
+        use asap_physical_operators::accumulators::IncreaseAccumulator;
         let config = make_agg_config(
             1,
             "requests_total",
@@ -4352,7 +4352,7 @@ mod tests {
 #[cfg(test)]
 mod dag_execution_tests {
     use super::*;
-    use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
+    use asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_types::query_plan::ExactReadout;
@@ -4624,9 +4624,9 @@ mod dag_execution_tests {
         .unwrap();
         installed.document.schema_version =
             asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
-        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
+        let error = InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
-            .to_string()
-            .contains("update"));
+            .to_string();
+        assert!(error.contains("update"), "{error}");
     }
 }
