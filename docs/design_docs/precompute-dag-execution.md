@@ -230,14 +230,15 @@ Within one evaluation, the worker follows this workflow:
 
 ### Shared physical operator execution
 
-The shared library is introduced by #770, before this integration. Installed
-precompute DAGs execute through its `PhysicalDag` runtime. The backend supplies
+The shared library lives in ASAPPlanner alongside post-ASAP IR. Backend #770
+pins that library and IR to the same revision; this PR integrates ingestion.
+Installed precompute DAGs execute through its `PhysicalDag` runtime. The backend supplies
 storage frontiers, declared edge order, window completeness and durable commit
 keys. It does not own a second dependency walker.
 
 For completed-window DAGs, SummaryAgg uses the native summary builder,
 SummaryMerge uses the native state merge, finalization uses native typed readout,
-and Binary lowers aligned rows to native arithmetic Project. Batch conversion
+and Binary lowers aligned rows to native Project using the Planner binary contract, including checked division. Batch conversion
 preserves the installed population and timestamp bindings. Native calls receive
 the surrounding execution context, so they share its memory budget and
 cancellation. Query execution uses the same library's operations.
