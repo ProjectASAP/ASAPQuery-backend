@@ -328,6 +328,17 @@ async fn certified_kll_state_to_query_oracle() {
     entry["query"] = QUERY.into();
     entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.06}});
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+    // This collector fixture exports KLL state only. An empty ERP artifact
+    // keeps runtime capability filtering while requiring theoretical sizing.
+    fixture["implementation"]["erp"] = serde_json::json!({
+        "distribution": {"workload": {"external": {"dataset": "kll-process-fixture"}}},
+        "artifact": {"schema_version": 1, "producer_version": "test", "records": []},
+        "implementation": "lib", "error_metric": "max_rank_err",
+        "min_trials": 10, "expected_updates": 1000.0, "expected_queries": 10.0,
+        "expected_merges": 0.0, "retention_seconds": 60.0, "cpu_weight": 1.0,
+        "byte_second_weight": 1e-9, "mode": "hybrid",
+        "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
+    });
     let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
     let window_model = snapshot.physical_inputs.window_cost_model.clone();
     let (mut request, mut environment) = snapshot.into_physical_compilation_request().unwrap();
