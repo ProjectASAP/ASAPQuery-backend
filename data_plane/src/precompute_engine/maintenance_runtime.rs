@@ -403,7 +403,7 @@ fn native_rows(
         .collect())
 }
 fn native_arithmetic(
-    op: &planner_types::pre_asap::ArithmeticOpKind,
+    op: &planner_types::post_asap::BinaryOperator,
     inputs: Vec<(i64, f64, f64)>,
     context: &RunContext,
 ) -> Result<Vec<(i64, f64)>, String> {
@@ -423,8 +423,8 @@ fn native_arithmetic(
             ("time".into(), Expression::Column(0)),
             (
                 "value".into(),
-                Expression::Arithmetic {
-                    op: op.clone(),
+                Expression::Binary {
+                    operator: op.clone(),
                     left: Box::new(Expression::Column(1)),
                     right: Box::new(Expression::Column(2)),
                 },
@@ -552,7 +552,7 @@ fn evaluate_aligned_binary(
     context: &RunContext,
 ) -> Result<MaintenanceValue, String> {
     use planner_types::pre_asap::BinaryOpKind;
-    let BinaryOpKind::Arithmetic(arithmetic) = &operator.kind else {
+    let BinaryOpKind::Arithmetic(_) = &operator.kind else {
         return Err("maintenance binary currently requires arithmetic".into());
     };
     if operator.vector_match.is_some() {
@@ -612,7 +612,7 @@ fn evaluate_aligned_binary(
                 .ok_or("maintenance binary requires matching timestamp sets")?;
             joined.push((timestamp, left, *right));
         }
-        let joined = native_arithmetic(arithmetic, joined, context)?;
+        let joined = native_arithmetic(operator, joined, context)?;
         values.insert(group.clone(), joined);
     }
     Ok(MaintenanceValue::Rows {
