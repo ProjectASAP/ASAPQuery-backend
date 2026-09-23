@@ -180,7 +180,7 @@ where
         let node = nodes
             .get(&id)
             .ok_or_else(|| ScheduleError::Invalid(format!("missing node {id}")))?;
-        if node.output_state == ExecutionDataState::QUERY_ROWS {
+        if node.output_state.timing == planner_types::post_asap::ExecutionTiming::QueryTime {
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
             )));
@@ -562,6 +562,13 @@ mod tests {
         };
         assert!(matches!(
             execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(1), &registry, &sink),
+            Err(ScheduleError::Invalid(message)) if message.contains("query-owned node")
+        ));
+        let mut summary_dag = dag.clone();
+        summary_dag.nodes[0].output_state.primitive =
+            planner_types::post_asap::DataPrimitive::SummaryState;
+        assert!(matches!(
+            execute_precompute_sink(&summary_dag, &invalid_path_binding, PostAsapNodeId(1), key(1), &registry, &sink),
             Err(ScheduleError::Invalid(message)) if message.contains("query-owned node")
         ));
         assert!(matches!(
