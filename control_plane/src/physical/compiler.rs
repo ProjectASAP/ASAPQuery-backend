@@ -2064,12 +2064,7 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
-            SummaryExpr::MembershipFilter {
-                candidates, values, ..
-            } => {
-                walk(candidates, metrics);
-                walk(values, metrics);
-            }
+
             SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
             SummaryExpr::SummaryMerge { children, .. } => {
@@ -2349,12 +2344,7 @@ fn requires_exact_erp_fallback(
                 walk(left, out);
                 walk(right, out);
             }
-            SummaryExpr::MembershipFilter {
-                candidates, values, ..
-            } => {
-                walk(candidates, out);
-                walk(values, out);
-            }
+
             SummaryExpr::KeepPreAsap(_) => {}
         }
     }
@@ -3546,13 +3536,15 @@ fn collect_selected_materializations(
             }
         }
         match &node.expr {
-            SummaryExpr::MembershipFilter {
-                candidates, values, ..
+            SummaryExpr::RelationalJoin {
+                left: values,
+                right: candidates,
+                kind: planner_types::pre_asap::JoinKind::Semi,
+                pruning: Some(_),
+                ..
             } => {
                 walk(candidates, readout, composable, grouping.clone(), selected)?;
-                // In a hybrid TopK, the sketch is only a candidate-membership
-                // sidecar. Prometheus owns the authoritative value subtree;
-                // provisioning local exact state here duplicates that work.
+                // Explicit external authoritative values do not need duplicate local state.
                 if !composable {
                     walk(values, readout, composable, grouping.clone(), selected)?;
                 }
@@ -4453,25 +4445,32 @@ pub(crate) mod tests {
             .unwrap();
         let entry = plan.query_plan.entries.values().next().unwrap();
         let crate::query_plan::QueryPlanNode::Logical {
-            operator: asap_types::query_plan::residual::ResidualQueryOperator::TopKSelection { .. },
+            operator: asap_types::query_plan::residual::ResidualQueryOperator::Limit { .. },
             inputs,
         } = &entry.nodes[&entry.root]
         else {
             panic!("expected ordinary TopK root")
         };
-        let crate::query_plan::QueryPlanNode::MembershipFilter { inputs, .. } =
+        let crate::query_plan::QueryPlanNode::Logical {
+            operator: asap_types::query_plan::residual::ResidualQueryOperator::Sort { .. },
+            inputs,
+        } = &entry.nodes[&inputs[0]]
+        else {
+            panic!("expected grouped Sort below Limit")
+        };
+        let crate::query_plan::QueryPlanNode::RelationalJoin { inputs, .. } =
             &entry.nodes[&inputs[0]]
         else {
-            panic!("Planner weighted TopK must lower to MembershipFilter: {entry:#?}");
+            panic!("Planner weighted TopK must lower to semi-join: {entry:#?}");
         };
         assert!(matches!(
-            entry.nodes[&inputs[0]],
+            entry.nodes[&inputs[1]],
             crate::query_plan::QueryPlanNode::SummaryEstimate {
                 query: crate::query_plan::QueryReadout::TopK { .. },
                 ..
             }
         ));
-        let candidate_read = match &entry.nodes[&inputs[0]] {
+        let candidate_read = match &entry.nodes[&inputs[1]] {
             crate::query_plan::QueryPlanNode::SummaryEstimate { input, .. } => *input,
             _ => unreachable!(),
         };
@@ -4559,17 +4558,24 @@ pub(crate) mod tests {
         );
         let entry = plan.query_plan.lookup(query).unwrap();
         let QueryPlanNode::Logical {
-            operator: ResidualQueryOperator::TopKSelection { .. },
+            operator: ResidualQueryOperator::Limit { .. },
             inputs,
         } = &entry.nodes[&entry.root]
         else {
             panic!("expected ordinary TopK root")
         };
-        let QueryPlanNode::MembershipFilter { inputs, .. } = &entry.nodes[&inputs[0]] else {
+        let QueryPlanNode::Logical {
+            operator: ResidualQueryOperator::Sort { .. },
+            inputs,
+        } = &entry.nodes[&inputs[0]]
+        else {
+            panic!("expected grouped Sort below Limit")
+        };
+        let QueryPlanNode::RelationalJoin { inputs, .. } = &entry.nodes[&inputs[0]] else {
             panic!("expected candidate TopK: {entry:#?}");
         };
         assert!(matches!(
-            &entry.nodes[&inputs[1]],
+            &entry.nodes[&inputs[0]],
             QueryPlanNode::ExternalExact {
                 request,
                 inputs: exact_inputs,
@@ -4579,7 +4585,7 @@ pub(crate) mod tests {
                 && request.input_contracts == vec![ExternalExactInput::CandidateMembership {
                     item_label: "job".into(),
                 }]
-                && exact_inputs == &vec![inputs[0]]
+                && exact_inputs == &vec![inputs[1]]
         ));
         assert!(entry.nodes.values().all(|node| !matches!(
             node,
