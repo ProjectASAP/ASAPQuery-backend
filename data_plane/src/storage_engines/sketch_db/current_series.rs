@@ -2,7 +2,7 @@
 use crate::drivers::ingest::prometheus_remote_write::CanonicalSample;
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
-    logical::{LabelMatch, ResidualQueryOperator},
+    residual::{LabelMatch, ResidualQueryOperator},
     QueryPlan, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet};

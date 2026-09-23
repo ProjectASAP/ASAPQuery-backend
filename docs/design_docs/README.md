@@ -8,6 +8,11 @@ Backend-specific implementation design notes are organized by component under
 [`../developer_docs`](../developer_docs/README.md). They explain current Rust
 internals and are subordinate to the shared system contracts.
 
+Implemented backend contracts:
+
+- [Planner selection contract](planner-selection-contract.md) defines candidate selection,
+  accuracy admission and the current API boundary.
+
 Proposals for shared-contract review:
 
 - [ASAPPlanner integration architecture](asapplanner-integration.md) proposes
