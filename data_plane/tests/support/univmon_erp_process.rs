@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::physical::{compiler::BackendLocalPlanningInput, erp::ErpShapeObserver};
+use control_plane::physical::erp::ErpShapeObserver;
 use data_plane::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
 use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
 
@@ -83,11 +83,13 @@ fn measured_artifact() -> Value {
 }
 
 #[tokio::test]
-async fn measured_univmon_errors_without_failure_probability_use_exact_fallback() {
+async fn measured_univmon_without_confidence_uses_exact_process() {
+    let artifact = measured_artifact();
+    eprintln!("UNIVMON_MEASURED {artifact}");
     let raw = values(100_000);
     let mut observer = ErpShapeObserver::new(128).unwrap();
-    for (index, value) in raw.iter().enumerate() {
-        observer.observe(&value.to_string(), index / 100).unwrap();
+    for (i, value) in raw.iter().enumerate() {
+        observer.observe(&value.to_string(), i / 100).unwrap();
     }
     let observation = observer.snapshot().unwrap();
     let queries = [
@@ -105,6 +107,7 @@ async fn measured_univmon_errors_without_failure_probability_use_exact_fallback(
         .map(|query| {
             let mut entry = template.clone();
             entry["query"] = (*query).into();
+            // ERP evidence is calibrated for one complete five-second population.
             entry["demand"]["fixed_interval_at"]["interval"] = serde_json::json!(5000);
             entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.2}});
             entry
@@ -113,7 +116,7 @@ async fn measured_univmon_errors_without_failure_probability_use_exact_fallback(
         .into();
     fixture["implementation"]["erp"] = serde_json::json!({
         "distribution": {"workload": {"external": {"dataset": "held-out-frequency-population"}}},
-        "artifact": measured_artifact(), "implementation": null, "error_metric": "readout_specific",
+        "artifact": artifact, "implementation": null, "error_metric": "readout_specific",
         "min_trials": 10, "expected_updates": raw.len(), "expected_queries": 10.0,
         "expected_merges": 1.0, "retention_seconds": 60.0, "cpu_weight": 0.0,
         "byte_second_weight": 1e-9, "mode": "hybrid", "observed_shape": observation.observation,
@@ -122,21 +125,17 @@ async fn measured_univmon_errors_without_failure_probability_use_exact_fallback(
             "minimum_confidence": 0.7, "minimum_confidence_margin": 0.05},
         "runtime": {"allowed_algorithms": ["Hll", "Kll", "UnivMon"], "max_memory_bytes": null}
     });
-    let plan = quote_snapshot_for_test(
-        serde_json::from_value::<BackendLocalPlanningInput>(fixture).unwrap(),
-    )
-    .compile_promql()
-    .unwrap();
-    assert!(plan.precompute_plan.materializations.is_empty());
-    assert_eq!(plan.query_plan.entries.len(), queries.len());
-    assert!(plan
-        .query_plan
-        .entries
-        .values()
-        .all(|entry| entry.nodes.values().any(|node| {
-            matches!(
-                node,
-                control_plane::query_plan::QueryPlanNode::ExactFallback { .. }
-            )
-        })));
+    // Measured maxima across ten populations are not a failure-probability proof.
+    assert_uncertified_exact_process(fixture.clone(), &queries).await;
+    // Removing one readout's measurements cannot authorize the other readouts.
+    for row in fixture["implementation"]["erp"]["artifact"]["records"]
+        .as_array_mut()
+        .unwrap()
+    {
+        row["error_metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_frequency_entropy_absolute_bits_error");
+    }
+    assert_uncertified_exact_process(fixture, &queries).await;
 }

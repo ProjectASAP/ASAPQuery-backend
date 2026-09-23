@@ -668,7 +668,7 @@ fn compile_physical_plan_request(
             legacy_query_source: planner_types::pre_asap::Source::TimeSeries {
                 metric: query.metric,
             },
-            query_lookback_seconds: query.window_secs,
+            query_lookback_ms: query.window_secs.saturating_mul(1_000),
             group_by_labels: query.group_by,
             accuracy_target: query.accuracy,
             summary_lifecycle_inputs: query.lifecycle,
@@ -1044,7 +1044,7 @@ mod api_tests {
             "target": "backend_local_remote_write",
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
-                "metric": metric, "window_secs": query.query_lookback_seconds, "accuracy": query.accuracy_target,
+                "metric": metric, "window_secs": query.query_lookback_ms / 1_000, "accuracy": query.accuracy_target,
                 "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_realization_candidates[0].cost }
             }],
             "collector_ids": [], "capability_snapshot_id": "test",

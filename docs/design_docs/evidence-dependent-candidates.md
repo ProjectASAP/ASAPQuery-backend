@@ -281,3 +281,14 @@ samples or a favorable shape-match score.
 Related: [integration architecture](asapplanner-integration.md),
 [shape-aware ERP](shape-aware-erp-v1.md),
 [Planner evidence contract](https://github.com/ProjectASAP/ASAPPlanner/blob/2ec3fc80caa922c8e1f33aa05f60b7d787e73257/docs/design_docs/architecture/evidence-dependent-candidates.md).
+
+## Time precision at admission
+
+Source cadence, query lookback, ranges and offsets retain integral millisecond
+precision through workload lowering and query publication. A 100 ms source is
+not rejected or rewritten to one second before costing. Existing pane layout
+contracts still express storage sizes in seconds; rounding a storage sizing
+bound must not change the query's read interval. A temporal producer that cannot
+implement a fractional range remains unsupported for that binding, while exact
+execution preserves the original range. Level-3 acceptance uses the actual
+replay cadence and still requires a local executable plan.
