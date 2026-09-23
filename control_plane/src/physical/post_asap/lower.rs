@@ -1,22 +1,4 @@
-//! L3 → L4/L5 lowering — `QueryExpr` walk that selects candidates from
-//! `SketchAlgorithmStrategy::replacements` via `planner_selection::select_summary`, with
-//! `crate::physical::post_asap::cost_model::ControlPlaneCostModel` plugged in
-//! for family selection + parameter sizing.
-//!
-//! Per `control_plane/docs/design.md` §6: "the optimizer's job is to
-//! selectively replace logical aggregates / joins with their sketch-bound
-//! variants when a binding rule fires; everything else stays inside
-//! `Logical(…)`."
-//!
-//! `AggIntent::Extension` (the `Frequency` point-query) needs no such
-//! pre-pass anymore: `ControlPlaneCostModel::realize_extension`/
-//! `readout_extension` (ASAPController#150) now realize it as a real
-//! `CountSketch`, so the catch-all arm below selects it like any other intent.
-//! `AggIntent::TopK { accuracy: Exact }` is the one remaining case left to
-//! fall through to the strategy's `KeepPreAsap` fallback
-//! unchanged — a genuine, still-open `asap-plan` coverage gap (filed
-//! upstream — see ASAPController#151), not something this deployment
-//! should route around locally.
+//! Query binding delegates selection to Planner's costed workload search.
 
 #![allow(dead_code)]
 
@@ -131,12 +113,12 @@ fn bind_recursive(
         ) =>
         {
             Ok(PostAsapPlan::Summary(
-                crate::planner_selection::select_summary(expr, cost_model)?,
+                crate::planner_selection::select_query(expr, cost_model)?,
             ))
         }
 
         _ => Ok(PostAsapPlan::Summary(
-            crate::planner_selection::select_summary(expr, cost_model)?,
+            crate::planner_selection::select_query(expr, cost_model)?,
         )),
     }
 }

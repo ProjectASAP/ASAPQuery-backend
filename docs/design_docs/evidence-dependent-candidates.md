@@ -1,6 +1,7 @@
 # Evidence-dependent candidate selection and deployment
 
-Status: design implemented by backend PR #761 against ASAPPlanner #455
+Status: evidence and workload costing implemented by backend PR #761 on the
+[Planner selection contract](planner-selection-contract.md), against ASAPPlanner #455
 (`2ec3fc80`). This document defines the backend decision boundary for Planner
 issue #454 and backend issue #752. It does not claim that every retained
 candidate has a deployable implementation.
@@ -22,8 +23,8 @@ could prove valid or deploys one whose guarantee has never been established.
 The backend still invokes Planner's workload search and global selection. It
 does not introduce a second semantic optimizer. Physical binding preserves the
 selected DAG's operators, grouping, windows and dependencies; a semantic change
-requires a new selection. The legacy first-candidate helper remains a witness
-API and cannot authorize deployment.
+requires a new selection. Single-query and workload selection use the same
+costed Planner search; the first-candidate helper has been removed.
 
 ## Decision flow
 

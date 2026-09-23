@@ -523,11 +523,10 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         query.accuracy_target.clone(),
         algorithm.clone(),
     );
-    query.selected_plan_root = control_plane::planner_selection::select_summary_with_evidence(
+    query.selected_plan_root = control_plane::planner_selection::select_query_with_models(
         &expr,
         &model,
         &asap_aware_mapping::DefaultAccuracyModel,
-        &asap_aware_mapping::EqualSplitAllocator,
         &Evidence,
     )
     .unwrap();
