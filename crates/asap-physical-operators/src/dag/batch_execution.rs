@@ -1,6 +1,6 @@
 //! Execute a bounded in-memory batch through native operators. This is also the
 //! bridge for deployments whose boundary values are not yet streaming batches.
-use super::{operators::Operator, values::Batch, Error, PhysicalDag, RunContext};
+use super::{operators::Operator, values::Batch, Error, PhysicalDag, RunContext, SharedValue};
 use futures::{FutureExt, StreamExt};
 
 /// Every input is already in memory; the chain contains native operators only.
@@ -10,7 +10,7 @@ pub fn evaluate_batch(
     input: Batch,
     operators: Vec<Operator>,
     context: RunContext,
-) -> Result<Vec<Batch>, Error> {
+) -> Result<Vec<SharedValue<Batch>>, Error> {
     let mut graph = PhysicalDag::default();
     graph.add(
         0,
@@ -26,7 +26,10 @@ pub fn evaluate_batch(
 }
 
 /// Evaluate a native in-memory source, including scalar sources, in the caller's scope.
-pub fn evaluate_source(source: Operator, context: RunContext) -> Result<Vec<Batch>, Error> {
+pub fn evaluate_source(
+    source: Operator,
+    context: RunContext,
+) -> Result<Vec<SharedValue<Batch>>, Error> {
     let mut graph = PhysicalDag::default();
     graph.add(0, vec![], source)?;
     evaluate_graph(graph, 0, context)
@@ -36,12 +39,12 @@ fn evaluate_graph(
     graph: PhysicalDag<'_, Batch, super::values::Schema>,
     root: super::NodeId,
     context: RunContext,
-) -> Result<Vec<Batch>, Error> {
+) -> Result<Vec<SharedValue<Batch>>, Error> {
     let mut output = graph.execute(&[root], context)?.remove(0);
     let mut batches = Vec::new();
     loop {
         match output.next().now_or_never() {
-            Some(Some(Ok(batch))) => batches.push(batch.value().clone()),
+            Some(Some(Ok(batch))) => batches.push(batch),
             Some(Some(Err(error))) => return Err(error),
             Some(None) => return Ok(batches),
             // Native operators have no I/O sources here. Pending is the
@@ -122,6 +125,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evaluate_source(source, context).unwrap().len(), 65);
+    }
+
+    // An adapter-held output must retain its parent's reservation after execution.
+    #[test]
+    fn returned_batches_keep_their_resource_reservation() {
+        let schema = Arc::new(SummarySchema {
+            fields: vec![],
+            time_index: None,
+        });
+        let batch = Batch::try_new(schema.clone(), vec![vec![]]).unwrap();
+        let bytes = batch.bytes();
+        let source = Operator::source(schema, vec![batch]).unwrap();
+        let context = RunContext::new(
+            Scope::Query {
+                evaluation_time_ms: 0,
+                revision: 0,
+            },
+            Limits {
+                max_bytes: bytes,
+                max_buffered_batches: 1,
+            },
+        )
+        .unwrap();
+        let held = evaluate_source(source.clone(), context.clone()).unwrap();
+        assert_eq!(context.retained_bytes(), bytes);
+        assert!(evaluate_source(source.clone(), context.clone()).is_err());
+        drop(held);
+        assert_eq!(context.retained_bytes(), 0);
+        assert!(evaluate_source(source, context).is_ok());
     }
 
     // A cancelled surrounding execution also prevents its native computation.
