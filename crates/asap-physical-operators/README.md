@@ -60,8 +60,8 @@ exact Sum/Count/Min/Max/Rate/Increase, KLL, DDSketch and HLL. Binding checks fam
 parameters and readout compatibility; source batches also validate state payloads.
 Existing accumulator algorithms are reused as kernels behind these operators.
 
-Both backend ingestion DAG execution and installed query DAG execution use this
-runtime. Some installed value/storage adapters still provide backend-specific
+Backend ingestion integration is delivered in #763 and query integration in
+#765, after this foundation. Installed value/storage adapters provide deployment-specific
 computation; they have not all been replaced by native batch bindings. Local raw
 Scan remains deferred. See the [design and coverage table](../../docs/design_docs/query-dag-execution.md)
 for the distinction between native operator support and backend integration.
