@@ -1,4 +1,4 @@
-use crate::precompute_engine::operators::{KeyedSumCountAccumulator, SumAccumulator};
+use asap_physical_operators::accumulators::{KeyedSumCountAccumulator, SumAccumulator};
 #[cfg(test)]
 use crate::storage_engines::types::{
     KeyByLabelValues, MultipleSubpopulationAggregate, SingleSubpopulationAggregate,

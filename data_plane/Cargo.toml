@@ -104,4 +104,4 @@ default = []
 # Enable lock profiling instrumentation
 lock_profiling = []
 # Enable extra debugging output
-extra_debugging = []
+extra_debugging = ["asap-physical-operators/extra_debugging"]

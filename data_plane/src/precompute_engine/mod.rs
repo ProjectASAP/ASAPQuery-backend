@@ -1,4 +1,3 @@
-pub mod accumulator_factory;
 pub mod config;
 pub mod coordination_checkpoint;
 mod engine;
@@ -9,7 +8,6 @@ pub mod ingest_handler;
 pub mod maintenance_runtime;
 pub(crate) mod metrics;
 pub mod multisource_coordinator;
-pub mod operators;
 pub mod output_sink;
 pub mod raw_dag;
 pub mod series_buffer;

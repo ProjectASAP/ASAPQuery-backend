@@ -572,7 +572,7 @@ mod tests {
     /// when given the same ordered samples.
     #[test]
     fn backfill_builds_bit_identical_sum_accumulator_to_live() {
-        use crate::precompute_engine::accumulator_factory::create_fixture_accumulator;
+        use crate::tests::accumulator_fixture::create_fixture_accumulator;
 
         let cfg = sum_config(1, "m", vec![]);
 
@@ -932,7 +932,7 @@ mod tests {
             cfg.policy_fingerprint(),
         );
         let acc =
-            crate::precompute_engine::operators::sum_accumulator::SumAccumulator::with_sum(1.0);
+            asap_physical_operators::accumulators::sum_accumulator::SumAccumulator::with_sum(1.0);
         let live_sid = store
             .ingest_precompute_for_agg_config(
                 |metric, attrs, kind| resolver.resolve(metric, attrs, kind),

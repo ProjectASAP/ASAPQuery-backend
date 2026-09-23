@@ -1394,7 +1394,7 @@ mod sketch_query_tests {
 #[cfg(test)]
 mod aux_pushdown_tests {
     use super::*;
-    use crate::precompute_engine::operators::{
+    use asap_physical_operators::accumulators::{
         max_accumulator::MaxAccumulator, min_accumulator::MinAccumulator,
         sum_accumulator::SumAccumulator,
     };
@@ -1613,7 +1613,7 @@ mod asap_tier_classify_tests {
     /// results instead of a CapabilityMiss.
     #[tokio::test]
     async fn execute_sum_by_zone_dispatches_to_exact_agg_reducer() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
 
@@ -2263,7 +2263,7 @@ mod asap_tier_classify_tests {
     /// `OuterFn::Plain` instant sums.
     #[tokio::test]
     async fn execute_instant_sum_accumulates_all_windows_not_last() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
 

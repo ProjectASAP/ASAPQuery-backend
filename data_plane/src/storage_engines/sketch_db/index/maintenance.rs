@@ -729,7 +729,7 @@ impl SketchStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precompute_engine::operators::SumAccumulator;
+    use asap_physical_operators::accumulators::SumAccumulator;
     use crate::storage_engines::types::PrecomputedOutput;
     use asap_types::traits::SerializableToSink;
 
@@ -1237,7 +1237,7 @@ mod tests {
             )])
         );
         let assert_complete_output = |store: &SketchStore| {
-            use crate::precompute_engine::operators::DDSketchAccumulator;
+            use asap_physical_operators::accumulators::DDSketchAccumulator;
             use crate::storage_engines::sketch_db::data::SketchEncoding;
             let rows = store.query_range(target_sid, 0, 60_000);
             assert_eq!(rows.len(), 1);

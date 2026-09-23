@@ -70,9 +70,9 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 
-use crate::precompute_engine::operators::increase_accumulator::IncreaseAccumulator;
-use crate::precompute_engine::operators::max_accumulator::MaxAccumulator;
-use crate::precompute_engine::operators::min_accumulator::MinAccumulator;
+use asap_physical_operators::accumulators::increase_accumulator::IncreaseAccumulator;
+use asap_physical_operators::accumulators::max_accumulator::MaxAccumulator;
+use asap_physical_operators::accumulators::min_accumulator::MinAccumulator;
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
@@ -251,7 +251,7 @@ impl GroupState {
 
         let planner_state = entries.iter().flat_map(|w| w.values()).any(|a| {
             a.as_any()
-                .is::<crate::precompute_engine::operators::exact_accumulator::ExactAccumulator>()
+                .is::<asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator>()
         });
         // Temporal exact summaries are the hot path for long-window
         // dashboards. Merge their concrete, fixed-size states in one batch
@@ -1441,7 +1441,7 @@ mod tests {
 
     #[test]
     fn keyed_count_state_follows_planner_family_and_query_readout() {
-        use crate::precompute_engine::operators::KeyedSumCountAccumulator;
+        use asap_physical_operators::accumulators::KeyedSumCountAccumulator;
         use asap_types::query_plan::ExactReadout;
 
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
@@ -1958,7 +1958,7 @@ mod tests {
     /// One installed frequency summary merges panes before all four readouts.
     #[test]
     fn bound_univmon_merges_panes_for_four_readouts() {
-        use crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
+        use asap_physical_operators::accumulators::univmon_accumulator::UnivMonAccumulator;
         use crate::storage_engines::sketch_db::index::SketchEncoding;
         use crate::storage_engines::types::SerializableToSink;
         use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
@@ -3190,13 +3190,13 @@ mod tests {
             sid,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(10.0)),
+            Box::new(asap_physical_operators::accumulators::SumAccumulator::with_sum(10.0)),
         );
         idx.append_precompute(
             sid,
             BTreeMap::new(),
             (T0 + 1000, T0 + 2000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(15.0)),
+            Box::new(asap_physical_operators::accumulators::SumAccumulator::with_sum(15.0)),
         );
 
         let child = scan_node("bytes_total", None);
@@ -3296,13 +3296,13 @@ mod tests {
             1,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(30.0)),
+            Box::new(asap_physical_operators::accumulators::SumAccumulator::with_sum(30.0)),
         );
         idx.append_precompute(
             2,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(12.0)),
+            Box::new(asap_physical_operators::accumulators::SumAccumulator::with_sum(12.0)),
         );
 
         let child = scan_node("bytes_total", None);
@@ -3342,7 +3342,7 @@ mod tests {
             sid,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::MaxAccumulator::new()),
+            Box::new(asap_physical_operators::accumulators::MaxAccumulator::new()),
         );
 
         let child = scan_node("latency_max_ms", None);

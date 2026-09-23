@@ -888,7 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_minute_error_ratio_combines_prometheus_cut_with_summary_store() {
-        use crate::precompute_engine::operators::IncreaseAccumulator;
+        use asap_physical_operators::accumulators::IncreaseAccumulator;
         use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
         use crate::storage_engines::sketch_db::{
             data::AggKind,

@@ -258,7 +258,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                         "keyed maintenance updates require explicit row identity routing".into(),
                     );
                 }
-                let mut updater = super::accumulator_factory::create_planner_accumulator(
+                let mut updater = asap_physical_operators::factory::create_planner_accumulator(
                     family, input, grouping,
                 )?;
                 if updater.is_keyed() {
@@ -472,7 +472,7 @@ fn evaluate_aligned_binary(
                 .get(&timestamp)
                 .ok_or("maintenance binary requires matching timestamp sets")?;
             let value =
-                crate::utils::arithmetic::evaluate_float64_arithmetic(arithmetic, left, *right);
+                asap_physical_operators::arithmetic::evaluate_float64_arithmetic(arithmetic, left, *right);
             if !value.is_finite() {
                 return Err("maintenance binary produced a non-finite update".into());
             }
@@ -2155,7 +2155,7 @@ pub(crate) fn affected_materializations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precompute_engine::operators::SumAccumulator;
+    use asap_physical_operators::accumulators::SumAccumulator;
     use planner_types::post_asap::{
         EdgeRole, ExecutableDag, ExecutableDagEdge, GroupingEdgeCompatibility, SummarySchema,
         WindowEdgeCompatibility,
@@ -2189,7 +2189,7 @@ mod tests {
     fn cohort_lineage_is_order_independent_and_binds_every_input() {
         use crate::storage_engines::sketch_db::index::FrozenExactWindows;
         let make = |sid, id, value| {
-            let mut state = crate::precompute_engine::operators::SumAccumulator::new();
+            let mut state = asap_physical_operators::accumulators::SumAccumulator::new();
             state.update(value);
             FrozenExactWindows {
                 sid,
