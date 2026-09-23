@@ -386,6 +386,7 @@ where
                     child.schema.fields.get(column).map(|field| &field.dtype),
                     Some(SummaryFamilyType::Plain(
                         planner_types::pre_asap::DataType::Float64
+                            | planner_types::pre_asap::DataType::Int64
                     )) | Some(SummaryFamilyType::ExactAggregate(..))
                 ) {
                     return Err(QueryPlanError::Invalid(
