@@ -81,9 +81,8 @@ contracts() {
     say "contracts: shared policy and routing types"
     rust_test asap_types
 
-    CURRENT_STAGE="contracts/asap-physical-operators"
-    say "contracts: shared physical kernels and deployment-independent execution"
-    rust_test asap-physical-operators
+    # The physical library's independent tests run in the ASAPPlanner workspace.
+    # Backend type/control-plane/data-plane tests cover its deployment bindings.
 
     CURRENT_STAGE="contracts/asap_otel_proto"
     say "contracts: modified OTLP and monitor protobuf compatibility"
