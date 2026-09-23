@@ -485,6 +485,36 @@ pub(super) fn estimate(
                     output_rows = cardinality;
                     cardinality * CPU_PER_ITEM
                 }
+                Node::RelationalJoin {
+                    inputs,
+                    join_kind,
+                    pred,
+                    left_schema,
+                    right_schema,
+                    ..
+                } if matches!(
+                    join_kind,
+                    planner_types::pre_asap::JoinKind::Semi
+                        | planner_types::pre_asap::JoinKind::Anti
+                ) =>
+                {
+                    output_rows = rows[&inputs[0]];
+                    let indexed = *join_kind == planner_types::pre_asap::JoinKind::Semi
+                        && serde_json::from_value(pred.clone()).is_ok_and(|predicate| {
+                            asap_physical_operators::dag::planner::equijoin_keys(
+                                &predicate,
+                                left_schema,
+                                right_schema,
+                            )
+                            .is_ok()
+                        });
+                    detail = json!({"input_rows": input_rows, "output_rows_upper_bound": output_rows, "indexed_equality_semijoin": indexed});
+                    if indexed {
+                        input_rows.max(1.0) * input_rows.max(2.0).log2() * CPU_PER_ITEM
+                    } else {
+                        rows[&inputs[0]] * rows[&inputs[1]] * CPU_PER_ITEM
+                    }
+                }
                 Node::RelationalJoin { .. } => {
                     output_rows = input_rows.powi(2);
                     output_rows * CPU_PER_ITEM
@@ -506,7 +536,6 @@ pub(super) fn estimate(
                 Node::ExactReadout { .. }
                 | Node::Binary { .. }
                 | Node::Relational { .. }
-                | Node::MembershipFilter { .. }
                 | Node::Logical { .. } => {
                     input_rows.max(1.0) * input_rows.max(2.0).log2() * CPU_PER_ITEM
                 }
