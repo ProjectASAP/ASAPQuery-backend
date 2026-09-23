@@ -1,17 +1,18 @@
-use crate::precompute_engine::operators::{
+use crate::accumulators::{
     CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
     CountSketchWithHeapAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
     HydraKllSketchAccumulator, IncreaseAccumulator, KeyedCounterState, KeyedMaxState,
     KeyedMinState, KeyedSumCountAccumulator, MaxAccumulator, MinAccumulator, SumAccumulator,
 };
-use crate::storage_engines::types::{
-    AggregateCore, AggregationType, KeyByLabelValues, Measurement,
-};
+#[cfg(test)]
+use crate::AggregationType;
+use crate::{AggregateCore, KeyByLabelValues, Measurement};
+#[cfg(test)]
 use asap_types::aggregation_config::PrecomputeMaterialization;
 // Production dispatch consumes Planner SummaryAgg payloads directly. The
 // config adapter below is compiled only for isolated historical kernel tests.
-use super::operators::hll_sketch_accumulator::HllSketchAccumulator;
-use super::operators::univmon_accumulator::UnivMonAccumulator;
+use crate::accumulators::hll_sketch_accumulator::HllSketchAccumulator;
+use crate::accumulators::univmon_accumulator::UnivMonAccumulator;
 #[cfg(test)]
 use asap_types::accumulator_spec::cms_params;
 use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
@@ -43,7 +44,7 @@ macro_rules! impl_clone_accumulator_methods {
     };
 }
 
-/// Trait for feeding samples into accumulators in the precompute engine.
+/// Shared update interface for query-time and maintenance-time accumulation.
 ///
 /// This provides a uniform interface over all accumulator types so that the
 /// worker loop doesn't need to know which concrete type it's dealing with.
@@ -1493,7 +1494,7 @@ mod tests {
         let acc = updater.snapshot_accumulator();
         let kll = acc
             .as_any()
-            .downcast_ref::<crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator>()
+            .downcast_ref::<crate::accumulators::datasketches_kll_accumulator::DatasketchesKLLAccumulator>()
             .expect("should be KLL");
         assert_eq!(kll.inner.k, 50, "k should be 50 from capital-K param");
     }
@@ -1824,13 +1825,14 @@ pub fn create_planner_accumulator(
     input: &planner_types::post_asap::SummaryUpdate,
     grouping: &planner_types::post_asap::GroupingStrategy,
 ) -> Result<Box<dyn AccumulatorUpdater>, String> {
+    crate::capability::validate_summary_kernel(family, input, grouping)?;
     use planner_types::post_asap::GroupingStrategy;
     if grouping != &GroupingStrategy::PerSubpopulationInstance {
         return Err("shared summary grouping requires a supported Planner Hydra kernel".into());
     }
     if matches!(family, SummaryFamilyType::ExactAggregate(..)) {
         return Ok(Box::new(PlannerExactUpdater {
-            acc: super::operators::exact_accumulator::ExactAccumulator::new(
+            acc: crate::accumulators::exact_accumulator::ExactAccumulator::new(
                 family.clone(),
                 input.item.is_some(),
             )?,
@@ -1928,7 +1930,7 @@ pub fn create_planner_accumulator(
 }
 
 struct PlannerExactUpdater {
-    acc: super::operators::exact_accumulator::ExactAccumulator,
+    acc: crate::accumulators::exact_accumulator::ExactAccumulator,
 }
 impl AccumulatorUpdater for PlannerExactUpdater {
     fn update_single(&mut self, value: f64, timestamp: i64) {
@@ -1939,7 +1941,7 @@ impl AccumulatorUpdater for PlannerExactUpdater {
     }
     impl_clone_accumulator_methods!(acc);
     fn reset(&mut self) {
-        self.acc = super::operators::exact_accumulator::ExactAccumulator::new(
+        self.acc = crate::accumulators::exact_accumulator::ExactAccumulator::new(
             self.acc.family().clone(),
             self.acc.is_keyed(),
         )

@@ -394,6 +394,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "asap-physical-operators"
+version = "0.1.0"
+dependencies = [
+ "asap-types",
+ "asap_sketch_codec",
+ "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?branch=main)",
+ "asap_types",
+ "async-trait",
+ "base64 0.21.7",
+ "bincode",
+ "hex",
+ "prost",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
 source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cd7e9e0f710816d49190dabd6c789359067a208f#cd7e9e0f710816d49190dabd6c789359067a208f"
@@ -945,6 +967,7 @@ dependencies = [
  "asap-aware-mapping",
  "asap-frontend-promql",
  "asap-frontend-sql",
+ "asap-physical-operators",
  "asap-types",
  "asap_types",
  "axum",
@@ -1155,6 +1178,7 @@ dependencies = [
  "arrow",
  "asap-aware-mapping",
  "asap-frontend-promql",
+ "asap-physical-operators",
  "asap-types",
  "asap_otel_proto",
  "asap_sketch_codec",

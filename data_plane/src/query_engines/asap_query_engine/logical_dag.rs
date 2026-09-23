@@ -838,7 +838,7 @@ mod topk_tests {
     // An overflowing sum cannot implement average, but zero/subnormal averages remain valid.
     #[test]
     fn finite_division_guards_temporal_average_without_rejecting_zero() {
-        let mut sum = crate::precompute_engine::operators::sum_accumulator::SumAccumulator::new();
+        let mut sum = asap_physical_operators::accumulators::sum_accumulator::SumAccumulator::new();
         sum.update(1e308);
         sum.update(1e308);
         assert!(binary(

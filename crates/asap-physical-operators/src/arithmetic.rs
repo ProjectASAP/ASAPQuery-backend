@@ -1,7 +1,7 @@
-//! Float64 arithmetic shared by data-plane execution engines.
+//! Float64 arithmetic shared by ASAP execution engines.
 //! Preserve IEEE non-finite results; callers own their output policies.
 
-pub(crate) fn evaluate_float64_arithmetic(
+pub fn evaluate_float64_arithmetic(
     operator: &planner_types::pre_asap::ArithmeticOpKind,
     left: f64,
     right: f64,

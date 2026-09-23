@@ -1,5 +1,6 @@
 //! Catalog-backed ClickHouse acceleration boundary.
 
+use asap_physical_operators::accumulators::SumAccumulator;
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -361,10 +362,7 @@ mod tests {
         }
     }
 
-    use crate::{
-        precompute_engine::operators::SumAccumulator,
-        storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata},
-    };
+    use crate::storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata};
     use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,

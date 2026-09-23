@@ -1,8 +1,6 @@
 //! One frequency state shared by count, distinct, L2 and entropy readouts.
 
-use crate::storage_engines::types::{
-    AggregateCore, AuxStats, KeyByLabelValues, SerializableToSink,
-};
+use crate::{AggregateCore, AuxStats, KeyByLabelValues, SerializableToSink};
 use asap_sketchlib::{DataInput, UnivMon};
 use asap_types::{AggregationType, Statistic};
 use serde_json::Value;

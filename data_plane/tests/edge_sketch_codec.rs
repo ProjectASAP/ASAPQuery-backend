@@ -35,7 +35,7 @@ fn ddsketch_bare_state_is_rejected_and_envelope_supports_query_readout() {
     let bare = prost::Message::encode_to_vec(&state);
     assert!(asap_sketch_codec::reconstruct_ddsketch(&bare).is_err());
     let (decoded, _) = asap_sketch_codec::reconstruct_ddsketch(&envelope).unwrap();
-    let accumulator = data_plane::precompute_engine::operators::DDSketchAccumulator {
+    let accumulator = asap_physical_operators::accumulators::DDSketchAccumulator {
         inner: decoded,
         sample_p: 1.0,
     };
@@ -62,7 +62,7 @@ fn kll_envelope_keeps_level_layout_for_backend_readout() {
     assert_eq!(state.k, 200);
     assert_eq!(state.items.len(), 50);
     let snapshot_bytes = bytes;
-    let accumulator = data_plane::precompute_engine::operators::DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&snapshot_bytes).unwrap();
+    let accumulator = asap_physical_operators::accumulators::DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&snapshot_bytes).unwrap();
     assert!(accumulator.get_quantile(0.5).is_finite());
 }
 

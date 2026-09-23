@@ -366,8 +366,8 @@ mod tests {
     #[tokio::test]
     async fn delta_path_reconstitutes_cumulative_state() {
         use crate::drivers::ingest::otel::apply_modified_otlp_delta_bytes;
-        use crate::precompute_engine::operators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_physical_operators::accumulators::DDSketchAccumulator;
         use asap_sketchlib::DdSketch;
         use planner_types::post_asap::SketchAlgorithm;
         use prost::Message;
@@ -472,7 +472,7 @@ mod tests {
     /// survive; a stale entry from far in the past must be swept.
     #[tokio::test]
     async fn stale_snapshot_entry_is_evicted_by_sweep() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::accumulators::SumAccumulator;
 
         let (state, drain) = setup_state(7, "evict_metric").await;
 
