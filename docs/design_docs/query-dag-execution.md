@@ -24,16 +24,30 @@ miss and follows the installed routing policy.
 
 ```mermaid
 flowchart LR
-  Request[Canonical query request] --> Lookup[Lookup QueryPlanEntry]
-  Lookup --> Root[Start at entry.root]
-  Root --> Walk[Find reachable sub-DAG]
-  Walk --> Inputs[Evaluate dependencies]
-  Inputs --> Node[Execute node adapter]
-  Node --> Memo[Memoize node output]
-  Memo --> Result[Adapt root output]
-  Store[SummaryStore] -->|StoredOutputReference| Inputs
-  Exact[External exact engine] -->|declared exact leaf| Inputs
+  Request[Query request] --> Lookup[Find installed query physical plan]
+  Lookup --> Root[Identify query result operation]
+  Root --> Walk[Find required physical operations]
+  Walk --> Inputs[Obtain operation inputs]
+  Inputs --> Execute[Execute physical operation]
+  Execute --> Memo[Cache result within this request]
+  Memo --> Result[Return query result]
+  Store[Stored materializations] --> Read[Read materialization]
+  Read --> Inputs
+  External[Declared external computation] --> Inputs
 ```
+
+The installed query physical plan is represented by `QueryPlanEntry`; its `root`
+identifies the operation producing the query result. Required input operations
+execute before their consumers. The execution adapter invokes the implementation
+of each physical operation, and request-local caching avoids repeated evaluation
+of shared dependencies. Operations evaluated at multiple query times are cached
+separately for each evaluation time.
+
+“Read materialization” is the operation listed in the coverage table. It obtains
+stored state from `SummaryStore` through a `StoredOutputReference`. Declared
+external computation supplies an explicitly bound input; it is not a local
+physical operation implementation.
+
 
 Installation rejects missing inputs, cycles, unreachable nodes, invalid output
 bindings, unsupported provenance versions, and a reader whose window contract
