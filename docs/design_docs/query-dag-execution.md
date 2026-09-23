@@ -1,10 +1,10 @@
 # QueryPlan DAG execution
 
-Audience: backend designers and developers.
+Audience: system designers and deployment implementers.
 
 This document describes how the backend executes an installed `QueryPlan`.
 The [plan split](asapplanner-integration.md) defines why query-time work is
-separate from maintenance, and the
+separate from ingestion-time work, and the
 [SDS contract](summary-catalog-sds-architecture.md) defines the stored records
 read by the plan.
 
@@ -54,53 +54,161 @@ bindings, unsupported provenance versions, and a reader whose window contract
 or `StoredOutputReference` differs from its PrecomputePlan writer. Runtime
 errors retain the query ID and node ID.
 
-## Execution layers
+## Shared DAG execution
 
-V1 uses one plan and three value adapters rather than three semantic programs.
+**Decision: ASAP will independently implement the shared DAG runtime and
+physical operators. Both the precompute engine and the query engine will use
+this library. DataFusion is a design reference, not the execution framework.**
 
-| Adapter | Nodes and values | Scheduling |
-| --- | --- | --- |
-| Stored-summary adapter | `ReadMaterialization`, state merge, exact/sketch readout, scalar arithmetic and reduction | Reachable nodes run in topological order. Each node runs once for the requested root. |
-| PromQL/MetricsQL query-time adapter | Logical aggregation, binary, temporal, subquery, candidate reranking and prepared exact leaves | Demand evaluation memoized by `(node_id, evaluation_time)`. The time key is required because a subquery evaluates one dependency at several timestamps. |
-| ClickHouse relation adapter | External relations, filters, projections and joins around stored-summary sub-DAGs | Demand evaluation memoized by `node_id`. Each edge validates its declared relation schema. Stored-summary sub-DAGs delegate to the topological adapter. |
+The shared library executes a physical operator DAG for both the precompute
+engine and the query engine. It is designed around that execution contract,
+not around the current backend's function or module boundaries. The existing
+accumulator library and backend-driven query traversal do not yet provide this
+architecture.
 
-All adapters start from a `QueryPlanEntry` node. The language adapters only
-represent different runtime value types. They cannot select a replacement
-definition or reconstruct an operator from the request text.
+```mermaid
+flowchart TB
+  Planner[Post-ASAP physical plan] --> Bind[Bind and validate physical operators]
+  Bind --> DAG[Executable physical operator DAG]
+  Precompute[Precompute engine] -->|Ingestion inputs and windows| Run[Shared DAG execution library]
+  Query[Query engine] -->|Query inputs and evaluation time| Run
+  DAG --> Run
+  Run --> States[States and materialized results]
+  Run --> Results[Query results]
+```
+
+The compiler binds each operation to a concrete implementation and checks its
+input and output types before accepting the plan. Both engines execute the
+result through the same library. Neither engine supplies a second interpretation
+of Filter, Project, Aggregate, SummaryMerge, Sort, or Limit.
+
+An operation defines its computation, typed inputs and outputs, and requirements
+such as input ordering and grouping. An execution instance owns the changing
+state for one run. Keeping the plan separate from running state allows the same
+plan to serve concurrent queries and ingestion windows without sharing mutable
+accumulators accidentally.
+
+Operations consume and produce batches incrementally where their semantics
+allow it. Filter and Project can emit results as batches arrive. Sorting a
+complete group must wait until that group's input is complete. Grouped Limit
+counts across batches, not separately within each batch. For ingestion, the
+engine supplies window completion; for a query, the engine supplies the
+requested input range. These requirements do not make an operator exclusive to
+one execution phase.
+
+### Engine responsibilities
+
+| Component | Responsibility |
+| --- | --- |
+| Shared DAG execution library | Physical operator implementations, typed expressions, state construction/merge/readout, dependency execution, shared intermediate results, cancellation, and execution resource accounting |
+| Precompute engine | Connect ingestion sources, assign data to the intended windows, supply completion signals, and persist or restore operator state and materialized results |
+| Query engine | Bind request parameters and evaluation times, connect stored or declared external inputs, invoke the shared DAG, and format results |
+| Deployment integration | Supply source/sink implementations, storage, scheduling resources, and durability policy |
+
+The library does not depend on either engine. Another deployment such as
+asap-fusion can bind its own sources and sinks to the same physical operators.
+Every computation operator may run at ingestion time or query time; the plan
+chooses when, and the engine supplies the appropriate inputs and execution scope.
+
+### Shared dependencies
+
+A DAG can have several consumers of the same operation. The execution library
+must represent that shared identity explicitly. Reusing a plan object alone does
+not establish that its computation runs once.
+
+Within a query, **request-local caching of intermediate results** prevents
+repeated evaluation of a shared dependency. Time-dependent results are separated
+by evaluation time. During ingestion, sharing is scoped to the same execution
+and input window. Results from distinct requests or windows are never mixed.
+
+For streaming output, the runtime delivers the same produced batches to each
+consumer. Buffering is bounded and participates in the execution memory budget;
+a slow consumer cannot cause unlimited retention. Cancelling one consumer does
+not stop a producer still needed by another. Cancelling the whole execution
+releases its streams, intermediate results, and tasks.
 
 ## Shared physical operator library
 
-`crates/asap-physical-operators` owns the concrete accumulator kernels, typed
-state/update traits, Planner-family factory, scalar arithmetic, row membership filtering, grouped TopK, and installed
-QueryPlan DAG traversal. Both maintenance and query execution import this crate
-directly; the old data-plane operator/factory modules are removed. A deployment
-such as asap-fusion can depend on the library without importing `data_plane` or
-`control_plane`, and without taking a dependency on this backend's Arrow version.
+The library's unit of composition is an executable physical operator. Each
+operator exposes its input dependencies, output schema, execution requirements,
+and a way to start execution. Filter, Project, Aggregate, Join, Sort, Limit,
+and summary operations participate in this same contract.
 
-The compiler calls the library's allocation-free `validate_summary_kernel`
-when binding a `SummaryAgg`. Runtime construction uses the same validation.
-Unsupported family/layout combinations and invalid parameters are rejected
-before the accumulator runs. This is a summary-kernel capability check, not a
-claim that every Planner payload has a complete local implementation.
+Typed scalar expressions are separate from operations over batches. A literal,
+negation, or comparison can be evaluated inside Project or Filter without
+inventing a separate DAG node for every expression. Where Planner represents a
+standalone scalar-producing operation, it uses the same expression semantics.
+All accepted value types and nullability rules follow Planner's contract.
 
-Kernels do not own execution placement. Their state can be constructed during
-maintenance or during a query, and the same merge/readout implementation handles
-raw-only, partially precomputed and fully precomputed inputs. The independent
-library integration test exercises these three boundaries with KLL. This test
-checks operator reuse; it does not claim that the backend's currently forbidden
-raw Scan has become an installed query source.
+Existing mathematical algorithms may supply internal kernels, but their current
+backend wrappers do not define the new operator API. Moving helper functions
+into a crate is not sufficient: both engines must instantiate and execute the
+shared operators through the shared DAG runtime. Removed backend-specific
+execution paths must not survive as compatibility branches.
 
-Storage reads, population/window selection, expression-to-update evaluation,
-transport, language result adaptation and scheduling policy remain deployment
-responsibilities. In particular, Planner's current restrictions on summary construction
-still limit which query-time summary DAGs can be exported. Completing
-that contract requires Planner placement support and backend raw-source binding;
-classifying an enum variant is not proof of local executability.
+## DataFusion reuse vs. independent implementation
+
+The alternatives are to build on DataFusion's execution framework and general
+operators, adding ASAP-specific operators, or to implement ASAP's own DAG runtime
+and physical operators. This design selects independent implementation.
+
+| Concern | Reuse DataFusion | Independent ASAP implementation |
+| --- | --- | --- |
+| General computations | Reuse existing expressions, projection, filtering, joins, sorting, and aggregation where their semantics match Planner | Implement and test the supported operations and expression semantics against Planner's contract |
+| Execution model | Adopt its physical-plan interfaces and batch streams; integrate ASAP-specific execution requirements | Define node identity, typed edges, execution instances, and multi-consumer behavior as the library's core contract |
+| Shared dependencies | Shared references to a plan object do not by themselves guarantee shared execution; additional coordination is needed | One producer execution per node, input partition, and evaluation scope, with explicit result delivery to all consumers |
+| Summary state | Supply custom accumulators/operators and integrate the required state lifecycle | Treat summary construction, updates, merge, readout, snapshots, and restoration as native operator capabilities |
+| Ingestion and query execution | Adapt both engines to DataFusion while adding ASAP's window and persistence behavior | Use the same runtime and operators in both engines; engines supply their inputs, execution scope, and persistence integration |
+| Resource management | Reuse framework facilities where applicable, while accounting for ASAP-specific state and sharing | Implement bounded buffering, memory accounting, backpressure, cancellation, and cleanup |
+| Dependencies and maintenance | Accept DataFusion/Arrow interface and version constraints | Own the execution API and its maintenance; accept greater implementation and verification work |
+
+DataFusion's
+[ExecutionPlan interface](https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html)
+represents input dependencies through shared plan references and starts execution
+by returning a batch stream. This permits shared references in the plan
+representation; it does not establish a general execute-once guarantee for a
+producer with multiple consumers. ASAP's decision is therefore not based on a
+claim that DataFusion cannot represent a shared node. It is based on making
+shared execution and the summary-state lifecycle explicit parts of ASAP's own
+runtime contract.
+
+ASAP needs both a finite query execution and ingestion execution over successive
+windows. The same summary producer may feed several computations or sinks.
+The runtime must coordinate those consumers without duplicating updates,
+mixing evaluation times, or cancelling work still needed elsewhere. Persisted
+state also requires explicit snapshot and restoration semantics. DataFusion's
+[Accumulator interface](https://docs.rs/datafusion/latest/datafusion/logical_expr/trait.Accumulator.html)
+provides update, merge, and result operations, but its intermediate-state export
+can consume state; that interface alone is not an ingestion checkpoint protocol.
+
+Independent implementation gives ASAP direct control over these behaviors and
+keeps the shared library usable by other deployments. The cost is substantial:
+ASAP must implement and test the general operators, type and null semantics,
+stream lifecycle, and resource controls rather than assume a framework supplies
+them. The coverage table must continue to report incomplete implementations.
+
+DataFusion remains a reference for separating immutable operator definitions
+from execution state, batch-stream processing, typed
+[physical expressions](https://docs.rs/datafusion/latest/datafusion/physical_expr/trait.PhysicalExpr.html),
+and operator input/output requirements. Existing sketch algorithms and suitable
+low-level libraries may be reused internally. This does not authorize retaining
+the current backend executor as a second execution path. Choosing a batch memory
+format is separate from choosing the DAG runtime; independence does not require
+reimplementing every buffer or mathematical primitive.
+
+Acceptance of the new runtime must include a shared producer with two consumers,
+consumers progressing at different rates, cancellation of one consumer, failure
+propagation, and isolation between query times and ingestion windows. Stateful
+operators must also survive snapshot and restoration without applying a committed
+input twice. The execute-once guarantee within one execution does not by itself
+prove correct recovery after a restart. These tests complement operator result
+checks and must run through both engines' integration with the shared library.
 
 ## Physical operator coverage and acceptance contract
 
 Coverage describes this PR and the immutable Planner revision in `Cargo.toml`.
-**This PR does not yet meet the universal local-execution contract.**
+**The current code does not yet implement the shared DAG architecture or meet
+the universal local-execution contract.**
 An exhaustive phase match proves ownership only. A reusable kernel proves an
 algorithm implementation exists; neither proves that a concrete installed plan
 can obtain its inputs and execute every node locally.
@@ -139,7 +247,6 @@ means an implemented path for the stated subset, not universal support.
 | Relational join, including semi-join | Match rows by a predicate; semi-join retains matching left rows | Row membership kernel; general semi-join replacement pending; other joins remain backend-local | Relation adapter supports inner/left/right/full/cross/semi/anti joins within its predicate/schema subset; vector candidate pruning currently uses a dedicated membership adapter; general semi-join replacement pending | General ingestion join adapter and unrestricted SQL/NULL semantics |
 | Sort | Order input rows or values | No general sorting adapter | Query relation and logical sorting | Relation partitioned sorting, NaN and unsupported key types; general ingestion adapter |
 | Limit | Keep a bounded slice of input | No separate adapter | Query relation offset/limit and specialized logical lowering | General ingestion adapter; does not rank or match candidate keys |
-| Grouped TopK | Rank values and select the best k per group | Grouped TopK kernel | Query TopK selection after authoritative values are obtained | General ingestion adapter; ranking does not prove candidate completeness |
 | SummaryAgg | Construct summary state from input | Supported-family construction/update kernels | Raw-ingestion specialization and restricted row-to-state ingestion aggregation | Installed query-time builder; arbitrary item expressions/output populations; typed update evaluation required |
 | SummaryMerge | Combine compatible summary states | Compatible-state merge kernels | Ingestion and query state merge | Universal cross-family merge is not supported |
 | SummaryEstimate | Query a summary for an approximate result | Family-specific sketch query kernels | Typed stored-state readout | Unsupported family/readout combinations; window/population compatibility and accuracy evidence remain required |
@@ -148,8 +255,14 @@ means an implemented path for the stated subset, not universal support.
 | SummaryDelete | Remove contributions from summary state | No registered kernel | No runtime dispatch | Concrete kernel and adapters |
 | Temporal computation | Compute Rate/Increase/Avg/Max/Min/Sum/Count over time | Relevant exact accumulator kernels, not a complete temporal adapter | Query paths over supported inputs | General input/state combinations and ingestion adapter |
 | Histogram quantile | Calculate a quantile from histogram buckets | No separate histogram adapter | Query path | General ingestion adapter |
-| Subquery | Evaluate an expression over a time grid | DAG memoization support, not the subquery executor | Query path with bounded grids and memoization by node/evaluation time | Unbounded grids and general ingestion adapter |
+| Subquery | Evaluate an expression over a time grid | Request-local caching of intermediate results; full shared DAG runtime pending | Query path with bounded grids and request-local caching by operation and evaluation time | Unbounded grids and general ingestion adapter |
 | Extension | Execute an additional value operation | No general executor | Unsupported operations may route to explicit fallback | A concrete local implementation for each admitted extension |
+
+Grouped TopK is represented in the target plan as Sort followed by Limit within
+each group. The current dedicated TopK plan node must be replaced, and Limit
+needs an explicit grouping contract. A global Limit is not equivalent. An
+optimized kernel may execute the composition without changing its meaning.
+Candidate completeness remains a condition on pruning, not on ranking.
 
 The current-series operations maintain and read a set of time series and their
 current values; they do not provide a general raw-table scan or full historical
@@ -159,15 +272,12 @@ read. Their code names are `MaintainPopulation` for updates and `ReadPopulation`
 External computation (`ExternalExact`, `ExactSubquery`,
 `CandidateExactSubquery`) and fallback are routing choices, not local physical
 operation implementations. They do not fill any missing coverage in this table.
-The shared DAG walker schedules and memoizes nodes but still needs backend
+The shared DAG walker schedules operations and caches intermediate results within each request but still needs backend
 adapters; importing the library alone does not provide a complete query engine.
 
 **Deferred raw-data support:** this PR does not implement local raw Scan or
 claim complete local execution when only raw data is stored. External fallback
 and the independent raw-input kernel tests do not satisfy that capability.
-
-The phase API uses `IngestionTime` and `QueryTime`, serialized as
-`ingestion_time` and `query_time`, without aliases for former names.
 
 ### Candidate pruning is a composed subgraph
 
@@ -181,7 +291,7 @@ documentation update. The graph contains these operations:
    into an explicitly bound external request.
 3. Apply a general semi-join with explicit matching keys that preserves value-row order and
    multiplicity. Membership scores never replace authoritative values.
-4. Apply the ordinary grouped TopK operator.
+4. Sort authoritative values and apply Limit independently within each group.
 
 The semi-join has no k, grouping or ranking behavior. The shared library currently provides `rows::membership_filter` and
 `rows::grouped_topk`; the pending change replaces the former with a general
@@ -193,10 +303,8 @@ for an exact request.
 
 External expression binding verifies the selected exact subtree against its
 native expression; it does not substitute the original top-level TopK child.
-Planner exports and costs filtering and ranking separately. Executable DAG wire
-version 3 requires updated consumers; no fused-operator compatibility path is
-retained. Backend owned-DAG schema version 3 and ingestion-DAG schema version 4
-reject incompatible installed documents.
+Planner represents and costs filtering and ranking separately. Incompatible
+installed plans are rejected; removed operators have no compatibility path.
 
 ### Summary-family and readout coverage
 
@@ -262,16 +370,6 @@ coverage or universal executability is claimed until these tests exist and pass.
 
 ### Evidence and verification limits
 
-Source map (paths relative to repository root):
-
-- `control_plane/src/physical/executable_binding.rs`: phase ownership and SummaryAgg admission; ownership is not whole-graph capability validation.
-- `control_plane/src/query_plan.rs`, `control_plane/src/physical/maintained_population.rs`: lowering and specialized population handling.
-- `crates/asap-physical-operators/src/capability.rs`, `factory.rs`, `query_dag.rs`: shared admission, construction and adapter-driven scheduling.
-- `data_plane/src/precompute_engine/raw_dag.rs`, `maintenance_runtime.rs`: raw specialization, implemented maintenance dispatch and unsupported branches.
-- `data_plane/src/query_engines/asap_query_engine/{post_asap_readout,logical_dag,summary_executor,exact_subqueries}.rs`: query adapters and raw/external boundaries.
-- `data_plane/src/query_engines/asap_clickhouse_query_engine/relational_adapter.rs` and its `aggregate.rs`: relation subset and rejection conditions.
-- `crates/asap_types/src/query_plan.rs` and `query_plan/residual.rs`: complete installed node/operator inventory.
-
 Shared-library tests cover kernels, a KLL three-boundary consumer, invalid KLL
 parameters and native CountSketch dimensions. Backend tests cover supported DAG,
 maintenance, readout and relation paths. Passing these suites is not a proof that
@@ -308,17 +406,17 @@ a partial accelerated answer.
 ## Dependency ordering and reuse
 
 Each evaluation derives only the sub-DAG reachable from the requested root.
-Dependencies complete before their consumer. Output memoization makes a diamond
+Dependencies complete before their consumer. Request-local caching of intermediate results makes a diamond
 graph execute its shared node once within that evaluation.
 
-PromQL subqueries are the exception to a plain node-only memo key. The same
-node has a different result at each evaluation timestamp, so their memo key is
+PromQL subqueries are the exception to a cache key containing only the operation identity. The same
+node has a different result at each evaluation timestamp, so their cache key is
 `(node_id, evaluation_time)`. Repeated access at the same timestamp reuses the
 value. Prepared external leaves use the same identity and are issued before
 local query-time evaluation so network I/O does not hide inside a synchronous
 operator.
 
-Memoization is request local. It is discarded after the root result is adapted;
+The cache is request local. It is discarded after the root result is adapted;
 the SummaryStore is the cross-request reuse boundary. A summary revision fence
 prevents a response from combining payloads changed during one evaluation.
 
@@ -364,26 +462,25 @@ readout sub-DAG. No query rebuilds the KLL and no serving-time catalog search
 chooses a different summary.
 
 Within one entry, two parents may also share a read or relational node. The
-request-local memo returns its existing value to the second parent. Across the
+request-local cache returns its existing value to the second parent. Across the
 p50 and p99 requests, payload reuse comes from SummaryStore rather than a
 cross-request executor cache.
 
 ## Concurrency, cancellation and limits
 
-Requests execute concurrently and own separate memo maps and intermediate
+Requests execute concurrently and own separate result caches and intermediate
 values. The active physical plan and committed stored summaries are shared
 through immutable snapshots or synchronized store indexes. No mutable execution
 context is shared between requests.
 
-V1 evaluates ready nodes sequentially inside one request. Independent requests
+The current backend evaluates ready nodes sequentially inside one request. Independent requests
 still run concurrently. Parallel execution of independent nodes is unnecessary
 for correctness and remains future work. External I/O uses the request client's
 timeout; cancellation drops the request-local evaluation and its prepared
 values. Query-time subqueries enforce depth and evaluation budgets to bound memory
 and work.
 
-Large relation intermediates and a unified resource budget across all three
-adapters remain follow-up work. The current implementation also does not cache
+Large relation intermediates and a unified execution resource budget remain follow-up work. The current implementation also does not cache
 root results across requests, add a distributed query scheduler, or reuse stored
 payloads across plan versions without the activation-time compatibility check.
 
@@ -394,8 +491,8 @@ payloads across plan versions without the activation-time compatibility check.
    entry; it does not compile a new execution graph.
 3. The engine validates the entry against the active catalog generation.
 4. Declared external leaves are prepared when allowed.
-5. The appropriate value adapter evaluates the reachable sub-DAG with
-   request-local memoization.
+5. The target shared runtime executes the reachable physical operator DAG with
+   request-local caching of intermediate results.
 6. `ReadMaterialization` nodes resolve their bound ready stored summaries.
 7. Node failures carry query/node context and follow the installed fallback
    policy.

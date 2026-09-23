@@ -205,7 +205,7 @@ for a query that cannot be executed end to end.
 
 Graph traversal is separate from node definitions and store semantics.
 Activation validates roots, edges, bindings, reachability, and cycles.
-Execution uses the validated topological order and memoizes every node result,
+Execution uses the validated topological order and caches every operation result within the request,
 so a shared node in a diamond DAG performs one store/operator execution. A
 typed node failure follows the entry's explicit fallback route.
 

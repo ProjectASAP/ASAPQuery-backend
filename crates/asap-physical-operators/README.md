@@ -1,6 +1,6 @@
 # ASAP physical operators
 
-Shared Rust kernels for maintenance-time and query-time execution. Used by
+Shared Rust kernels for ingestion time and query time execution. Used by
 ASAPQuery-backend; other deployments can depend on the `asap-physical-operators`
 package in this Git repository. No backend server, storage implementation,
 background worker, Arrow or DataFusion version is required.
@@ -52,3 +52,11 @@ groups, retaining input order for ties and placing NaN after numeric values.
 Neither kernel knows about sketches, storage, execution phase or external
 queries. The deployment enforces the pruning certificate; filtering and ranking
 remain separate operations in the installed graph.
+
+## Shared DAG execution design
+
+The target is an independently implemented ASAP DAG runtime and physical
+operator library used by both the precompute engine and the query engine.
+DataFusion is a design reference, not the execution framework. The current kernels and backend-driven traversal are not yet
+that implementation. See the [design document](../../docs/design_docs/query-dag-execution.md)
+for operator responsibilities, engine integration, and shared-dependency semantics.
