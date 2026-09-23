@@ -97,53 +97,78 @@ output schemas/states, grouping, time scope and placement. Raw-only, partial
 precomputation and full precomputation must obey the same contract. An explicitly
 external plan may remain useful, but is not evidence of local coverage.
 
-### All Planner executable payloads
+### Physical operation coverage
 
-“Backend” below describes implemented paths and their restrictions, not a promise
-that every instance of the payload is accepted. Shared kernels do not include
-backend storage, relational adapters or arbitrary expression evaluation.
+A physical operation defines **what computation happens**. The plan chooses
+**ingestion time or query time**. This applies to every computation operation;
+ingestion time includes background processing of arriving data. Current adapter
+gaps are implementation work, not permanent restrictions on execution time.
 
-| Payload | Execution phase | Backend implementation / limitation | Shared library |
-| --- | --- | --- | --- |
-| `Fallback` | Ingestion time or query time | Selected ingestion source boundary, prepared external exact subtree, or explicit whole-query fallback. No general local raw-query executor. | No source/SQL/PromQL executor |
-| `Binary` | Ingestion time or query time | Maintenance arithmetic requires immutable completed, aligned row inputs; query scalar/vector arithmetic uses the relevant value adapter. Not arbitrary row/vector coercion. | Float64 Add/Sub/Mul/Div/Mod/Pow/Atan2; alignment and vector semantics remain backend-local |
-| `MembershipFilter` | Ingestion time or query time | Query vector semijoin is implemented, with pruning completeness checked separately from ranking. No ingestion adapter yet. | Generic row membership filter; ordinary grouped TopK is a separate kernel |
-| `Value` | Ingestion time or query time | Operation-specific subset; see next table. | Exact accumulator kernels only; no general Value dispatcher |
-| `RelationalJoin` | Ingestion time or query time | Query ClickHouse relation adapter implements inner/left/right/full/cross/semi/anti joins within supported predicate/schema/value semantics. No generic maintenance join implementation. This is not a claim of all ClickHouse settings/NULL semantics. | Not extracted |
-| `SummaryAgg` | Ingestion time or query time | Raw-ingestion specialization and restricted maintenance row-to-state aggregation. Factory validates family/layout/parameters. Maintenance DAG path needs a typed update evaluator, immutable inputs and installed materialization; it does not support arbitrary item expressions or output populations. No installed query-time builder. | Construction/update kernels for families below; placement-neutral |
-| `SummaryJoin` | Ingestion time or query time | Ownership classified; no dispatch implementation in maintenance runtime. | No registered SummaryJoin kernel |
-| `SummarySubtract` | Ingestion time or query time | Ownership classified; unsupported by maintenance runtime. | No registered SummarySubtract kernel |
-| `SummaryDelete` | Ingestion time or query time | Ownership classified; no dispatch implementation in maintenance runtime. | No registered SummaryDelete kernel |
-| `SummaryEstimate` | Ingestion time or query time | Typed sketch readout over compatible stored states, with family, window and population restrictions. | Underlying sketch query kernels; store/readout adapter remains backend-local |
-| `SummaryMerge` | Ingestion time or query time | Planner and backend support both phases. Query merges can consume stored ingestion results and query-produced states; ingestion merges cannot depend on future query results. | Compatible-state merge kernels; no universal cross-family merge |
+The table lists each operation once, regardless of whether the code represents
+it inside `ValueOperation`, `Logical`, or another wrapper. “Backend integration”
+means an implemented path for the stated subset, not universal support.
 
-A physical operator defines **what computation happens**. The plan decides
-**when it happens: ingestion time or query time**. This rule applies to every
-physical computation operator. Ingestion time includes background processing
-of arriving data; it need not run inline with each sample. The phase column
-states the design contract. The implementation column records current gaps;
-it must not turn those gaps into permanent restrictions on an operator.
+| Physical operation | Purpose | Shared library implementation | Backend integration | Missing coverage |
+| --- | --- | --- | --- | --- |
+| Raw Scan | Read raw input rows | None | Rejected in installed local query plans | Local raw source; deferred from this PR |
+| Read materialization | Load previously computed state | State decoding kernels; no storage adapter | Catalog/store binding for compatible populations and windows | General raw input access; unavailable or incompatible state cannot be read |
+| Maintain population | Update the current-series population | None | Specialized remote-write ingestion path | General table-row updates and shared implementation |
+| Read population / CurrentSeries | Read current values from a maintained population | None | Installed population identity/capacity and current-series readout | Arbitrary raw-table reading |
+| Scalar | Produce a scalar value | No separate scalar-source executor | Typed scalar path | General expression evaluation |
+| Binary | Combine or compare two inputs | Float64 Add/Sub/Mul/Div/Mod/Pow/Atan2 kernels | Query arithmetic, CheckedDiv/FiniteDiv and comparisons; ingestion arithmetic on immutable completed, aligned rows | General coercion, arbitrary PromQL matching and unsupported value domains |
+| Unary negate | Negate a value | No separate adapter | Typed query scalar/vector path | General ingestion adapter |
+| Vector to scalar | Convert a vector to a scalar | No separate adapter | Typed query path | General ingestion adapter |
+| Exact aggregate | Compute Count/Sum/Avg/Min/Max, including ReduceSum | Exact accumulator kernels | Relation and query aggregate adapters | No universal aggregate implementation; relation numeric measures require non-null Int64/Float64 and finite valid values; relation per-entity reduction and grouping-without unsupported |
+| Finalize exact accumulator / ExactReadout | Obtain an exact result from typed state | Exact-family readout kernels | Typed query readout and ingestion finalization of immutable completed windows | Arbitrary state conversion and unsupported exact families |
+| Project | Select or calculate output columns | No general expression executor | Query relation adapter | Unsupported expressions/types and general ingestion adapter |
+| Filter | Keep rows satisfying a predicate | No general predicate executor | Query relation adapter | Unsupported predicates/types and general ingestion adapter |
+| Relational join, including semi-join | Match rows by a predicate; semi-join retains matching left rows | Row membership kernel; general semi-join replacement pending; other joins remain backend-local | Relation adapter supports inner/left/right/full/cross/semi/anti joins within its predicate/schema subset; vector candidate pruning currently uses a dedicated membership adapter; general semi-join replacement pending | General ingestion join adapter and unrestricted SQL/NULL semantics |
+| Sort | Order input rows or values | No general sorting adapter | Query relation and logical sorting | Relation partitioned sorting, NaN and unsupported key types; general ingestion adapter |
+| Limit | Keep a bounded slice of input | No separate adapter | Query relation offset/limit and specialized logical lowering | General ingestion adapter; does not rank or match candidate keys |
+| Grouped TopK | Rank values and select the best k per group | Grouped TopK kernel | Query TopK selection after authoritative values are obtained | General ingestion adapter; ranking does not prove candidate completeness |
+| SummaryAgg | Construct summary state from input | Supported-family construction/update kernels | Raw-ingestion specialization and restricted row-to-state ingestion aggregation | Installed query-time builder; arbitrary item expressions/output populations; typed update evaluation required |
+| SummaryMerge | Combine compatible summary states | Compatible-state merge kernels | Ingestion and query state merge | Universal cross-family merge is not supported |
+| SummaryEstimate | Query a summary for an approximate result | Family-specific sketch query kernels | Typed stored-state readout | Unsupported family/readout combinations; window/population compatibility and accuracy evidence remain required |
+| SummaryJoin | Combine summary inputs using summary join semantics | No registered kernel | No runtime dispatch | Concrete kernel and adapters |
+| SummarySubtract | Subtract summary state | No registered kernel | Unsupported in ingestion runtime | Concrete kernel and adapters |
+| SummaryDelete | Remove contributions from summary state | No registered kernel | No runtime dispatch | Concrete kernel and adapters |
+| Temporal computation | Compute Rate/Increase/Avg/Max/Min/Sum/Count over time | Relevant exact accumulator kernels, not a complete temporal adapter | Query paths over supported inputs | General input/state combinations and ingestion adapter |
+| Histogram quantile | Calculate a quantile from histogram buckets | No separate histogram adapter | Query path | General ingestion adapter |
+| Subquery | Evaluate an expression over a time grid | DAG memoization support, not the subquery executor | Query path with bounded grids and memoization by node/evaluation time | Unbounded grids and general ingestion adapter |
+| Extension | Execute an additional value operation | No general executor | Unsupported operations may route to explicit fallback | A concrete local implementation for each admitted extension |
+
+External computation (`ExternalExact`, `ExactSubquery`,
+`CandidateExactSubquery`) and fallback are routing choices, not local physical
+operation implementations. They do not fill any missing coverage in this table.
+The shared DAG walker schedules and memoizes nodes but still needs backend
+adapters; importing the library alone does not provide a complete query engine.
+
+**Deferred raw-data support:** this PR does not implement local raw Scan or
+claim complete local execution when only raw data is stored. External fallback
+and the independent raw-input kernel tests do not satisfy that capability.
 
 The phase API uses `IngestionTime` and `QueryTime`, serialized as
-`ingestion_time` and `query_time`. There are no aliases for the former names.
+`ingestion_time` and `query_time`, without aliases for former names.
 
 ### Candidate pruning is a composed subgraph
 
 The fused candidate-ranking operator is removed from Planner and QueryPlan.
-The graph contains independently executable operations:
+The target graph uses a general semi-join in place of the current dedicated
+`MembershipFilter` adapter. That code change is pending separately from this
+documentation update. The graph contains these operations:
 
 1. Read membership keys from a summary.
 2. Obtain authoritative values, optionally pushing the membership restriction
    into an explicitly bound external request.
-3. Apply `MembershipFilter`, a semijoin that preserves value-row order and
+3. Apply a general semi-join with explicit matching keys that preserves value-row order and
    multiplicity. Membership scores never replace authoritative values.
 4. Apply the ordinary grouped TopK operator.
 
-`MembershipFilter` has no k, grouping or ranking behavior. The shared library
-provides separate `rows::membership_filter` and `rows::grouped_topk` kernels,
-which other deployments can compose. A missing authoritative value fails a
+The semi-join has no k, grouping or ranking behavior. The shared library currently provides `rows::membership_filter` and
+`rows::grouped_topk`; the pending change replaces the former with a general
+`rows::semi_join` kernel that other deployments can compose with ranking. A missing authoritative value fails a
 certified membership plan; best-effort pruning remains explicitly approximate.
-The pruning certificate stays on the filter. Exact reranking does not prove
+The pruning certificate stays on the semi-join. Exact reranking does not prove
 that omitted keys could not have won. Planner still rejects uncertified pruning
 for an exact request.
 
@@ -153,20 +178,6 @@ Planner exports and costs filtering and ranking separately. Executable DAG wire
 version 3 requires updated consumers; no fused-operator compatibility path is
 retained. Backend owned-DAG schema version 3 and ingestion-DAG schema version 4
 reject incompatible installed documents.
-
-### Every ValueOperation
-
-| Operation | Implemented path | Limits / missing coverage |
-| --- | --- | --- |
-| `MaintainPopulation` | Specialized remote-write current-series maintenance | Not a general table-row update executor; not shared-library functionality |
-| `ReadPopulation` | Compiled current-series readout with installed identity/capacity | Specialized maintained population, not arbitrary raw Scan |
-| `Exact(Aggregate)` | Relation adapter and supported logical aggregate lowering | Relation measures Count/Sum/Avg/Min/Max; numeric Sum/Avg/Min/Max require non-null Int64/Float64 and finite valid values. Per-entity reduction and grouping-without unsupported there. No universal AggIntent implementation |
-| `FinalizeExactAccumulator` | Typed exact readout; maintenance finalization of immutable completed windows | Supported exact families below; not an arbitrary state conversion |
-| `Project` | Query relation adapter | Supported expression/value subset; no general maintenance implementation |
-| `Filter` | Query relation predicate adapter | Supported expression/value subset; no general maintenance implementation |
-| `Sort` | Query relation adapter; supported logical sorting | Relation partitioned sorting, NaN or unsupported sort-key types rejected |
-| `Limit` | Query relation adapter with offset; specialized logical lowering | Not a generic maintenance operator |
-| `Extension` | No general executor | Unsupported value operations can lower to explicit ExactFallback; this is not local support |
 
 ### Summary-family and readout coverage
 
@@ -199,43 +210,6 @@ cannot enumerate TopK. Native matrix construction checks are distinct from
 packed-wire decoder limits. The SummaryAgg capability check does not validate
 all subsequent readout combinations or certify approximation guarantees.
 
-### Installed QueryPlan and query-time operation coverage
-
-These operations finish the query after its inputs have been obtained. For
-example, stored per-series rates can feed a sum by job and then TopK. The code
-calls these operations "residual" because they are the work remaining after
-precomputation; that term does not mean unsupported work or external fallback.
-
-| Installed node(s) | Local execution status |
-| --- | --- |
-| Scalar, Binary, ReduceSum | Implemented scalar/grouped value paths |
-| ReadMaterialization | Bound catalog/store read; requires available compatible population/windows |
-| SummaryEstimate, ExactReadout, SummaryMerge | Implemented for supported typed states/readouts; not raw-source construction |
-| MembershipFilter | Value-preserving membership semijoin; ordinary Logical TopKSelection ranks its output |
-| Relational, RelationalJoin | Backend ClickHouse value adapter subset described above; not in shared library |
-| Logical | Query-time operation subset listed below |
-| ExternalExact | Declared external computation, possibly dependent on candidates; not local coverage |
-| ExactFallback | Deliberate failure handed to installed fallback policy; not an implementation |
-
-Query-time operation inventory (`ResidualQueryOperator` in the code):
-
-- `CurrentSeries`: local read of an installed maintained population.
-- `ExactSubquery`, `CandidateExactSubquery`: prepared external exact results.
-- `Scan`: explicitly rejected in deployed plans (`local raw Scan is forbidden`).
-- `UnaryNegate`, `VectorToScalar`: implemented typed scalar/vector operations.
-- `Aggregate`: Sum, Max, Min, Avg, Count; `TopKSelection`: grouped value ranking.
-- `Binary`: Add/Sub/Mul/Div/CheckedDiv/FiniteDiv/Mod/Pow and
-  Equal/NotEqual/Less/LessEqual/Greater/GreaterEqual; typed matching and domain
-  restrictions apply, not arbitrary PromQL binary syntax.
-- `Temporal`: Rate, Increase, Avg, Max, Min, Sum, Count over supported inputs.
-- `Sort`, `HistogramQuantile`, `Subquery`: implemented query-time paths; subqueries
-  require bounded time grids and memoization by node and evaluation time.
-
-The shared synchronous/asynchronous DAG walker schedules and memoizes nodes. It
-requires a runtime adapter; it is not an implementation of the entire inventory.
-Relational and PromQL adapters remain in data_plane, so asap-fusion cannot yet
-obtain a complete query engine by importing the shared crate alone.
-
 ### Precomputation boundary: present status and required acceptance
 
 | Plan placement | Present evidence | Remaining requirement |
@@ -244,7 +218,8 @@ obtain a complete query engine by importing the shared crate alone.
 | Partially precomputed | KLL consumer merges prebuilt prefix with query-built suffix; backend can combine supported stored and query-time computation nodes | General stored-state + raw-suffix query DAG, typed update evaluation, compatible scope/merge checks and process acceptance |
 | Fully precomputed | Backend stored read/merge/readout paths and process tests | Valid only for supported family/schema/window/operator combinations; storage readiness remains a runtime requirement |
 
-To complete the requested contract, Planner must express valid query-time summary
+The remaining work below describes the target contract, not a requirement to
+implement local raw Scan in this PR. Planner must express valid query-time summary
 placement; the backend must bind local raw inputs and query-time builders; and
 installation must check every reachable operator against concrete adapter
 capabilities, including expressions, family/readout combinations and edge states.
