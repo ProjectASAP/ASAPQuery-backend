@@ -1,4 +1,4 @@
-use crate::storage_engines::types::KeyByLabelValues;
+use crate::KeyByLabelValues;
 use std::collections::HashMap;
 
 use asap_types::AggregationType;

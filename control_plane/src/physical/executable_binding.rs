@@ -56,6 +56,16 @@ pub fn install_selected_dag(
     let mut nodes = std::collections::BTreeMap::new();
     let mut precompute_sinks = Vec::new();
     for node in &dag.nodes {
+        if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+            family,
+            input,
+            grouping,
+            ..
+        } = &node.payload
+        {
+            asap_physical_operators::capability::validate_summary_kernel(family, input, grouping)
+                .map_err(|reason| format!("post-ASAP node {:?}: {reason}", node.id))?;
+        }
         let execution = operator_execution(node)?;
         let binding = if let Some(summary_definition) = materialization(node.id) {
             precompute_sinks.push(node.id);

@@ -1,4 +1,4 @@
-use crate::storage_engines::types::{
+use crate::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
@@ -211,7 +211,7 @@ impl AggregateCore for KeyedMaxState {
         key: &Option<KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::MultipleSubpopulationAggregate;
+        use crate::MultipleSubpopulationAggregate;
         let key_val = key.as_ref().ok_or("Key required for KeyedMaxState")?;
         self.query(statistic, key_val, Some(query_kwargs))
     }

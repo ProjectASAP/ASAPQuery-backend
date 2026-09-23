@@ -327,9 +327,9 @@ impl OutputSink for NoopOutputSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precompute_engine::operators::{DDSketchAccumulator, SumAccumulator};
     use crate::storage_engines::sketch_db::index::{AggKind, SeriesLookup};
     use crate::storage_engines::types::{InstalledPrecomputePlan, KeyByLabelValues};
+    use asap_physical_operators::accumulators::{DDSketchAccumulator, SumAccumulator};
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;

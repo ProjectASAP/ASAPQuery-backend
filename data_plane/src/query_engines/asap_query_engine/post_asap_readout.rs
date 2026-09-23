@@ -2,11 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::utils::arithmetic::evaluate_float64_arithmetic as arithmetic;
+use asap_physical_operators::arithmetic::evaluate_float64_arithmetic as arithmetic;
 
 use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
 
-use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
+use asap_physical_operators::query_dag::{self, QueryNodeRuntime};
 /// A planned warm query cannot be served; callers may route to an exact backend.
 #[derive(Debug)]
 pub enum LoweringSkip {
@@ -554,7 +554,7 @@ fn execute_physical_query_payload(
                 allowed_materializations: None,
             },
         };
-        let output = physical_dag::execute_from(entry, root, &runtime)
+        let output = query_dag::execute_from(entry, root, &runtime)
             .map_err(|error| LoweringSkip::ExecuteFailed(format!("{error:?}")))?;
         match output {
             PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(
@@ -1050,7 +1050,7 @@ mod tests {
             1,
             BTreeMap::new(),
             (1_000, 2_000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
+            Box::new(asap_physical_operators::accumulators::SumAccumulator::with_sum(42.0)),
         );
         let config =
             test_plan::materialization("bytes_total", "Sum", serde_json::json!({}), &[], 1000);
@@ -1146,7 +1146,9 @@ mod tests {
                             BTreeMap::new(),
                             bounds,
                             Box::new(
-                                crate::precompute_engine::operators::SumAccumulator::with_sum(sum),
+                                asap_physical_operators::accumulators::SumAccumulator::with_sum(
+                                    sum,
+                                ),
                             ),
                         );
                     }
@@ -1214,7 +1216,7 @@ mod tests {
                 BTreeMap::new(),
                 (pane * 60_000, (pane + 1) * 60_000),
                 Box::new(
-                    crate::precompute_engine::operators::SumAccumulator::with_sum(
+                    asap_physical_operators::accumulators::SumAccumulator::with_sum(
                         (pane + 1) as f64,
                     ),
                 ),
@@ -1289,7 +1291,7 @@ mod tests {
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
                 Box::new(
-                    crate::precompute_engine::operators::SumAccumulator::with_sum(
+                    asap_physical_operators::accumulators::SumAccumulator::with_sum(
                         (pane + 1) as f64,
                     ),
                 ),
@@ -1356,7 +1358,7 @@ mod tests {
                 7,
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
-                Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(1.0)),
+                Box::new(asap_physical_operators::accumulators::SumAccumulator::with_sum(1.0)),
             );
         }
         assert!(
@@ -1386,7 +1388,7 @@ mod tests {
             policy_fp: policy,
         });
         use crate::storage_engines::types::Measurement;
-        let mut accumulator = crate::precompute_engine::operators::IncreaseAccumulator::new(
+        let mut accumulator = asap_physical_operators::accumulators::IncreaseAccumulator::new(
             Measurement::new(10.0),
             10_000,
             Measurement::new(10.0),
