@@ -14,10 +14,10 @@ version = "0.1.0"
 [workspace.dependencies]
 # Keep Planner frontends, selection, and IR on the same immutable revision.
 # Alias upstream asap-types because this workspace also defines asap_types.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14fceed73f0ea35b5d5b275e4920f35a34233a9c" }
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14fceed73f0ea35b5d5b275e4920f35a34233a9c" }
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14fceed73f0ea35b5d5b275e4920f35a34233a9c" }
-asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14fceed73f0ea35b5d5b275e4920f35a34233a9c" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "46328f0e50c1450bc2385a4fab32c9c5631f4e0e" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "46328f0e50c1450bc2385a4fab32c9c5631f4e0e" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "46328f0e50c1450bc2385a4fab32c9c5631f4e0e" }
+asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "46328f0e50c1450bc2385a4fab32c9c5631f4e0e" }
 
 # Shared external deps (used by 2+ crates)
 serde = { version = "1.0", features = ["derive"] }
@@ -37,8 +37,8 @@ arc-swap = "1.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Internal crates
-asap-physical-operators = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14fceed73f0ea35b5d5b275e4920f35a34233a9c" }
-asap_sketch_codec = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14fceed73f0ea35b5d5b275e4920f35a34233a9c" }
+asap-physical-operators = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "46328f0e50c1450bc2385a4fab32c9c5631f4e0e" }
+asap_sketch_codec = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "46328f0e50c1450bc2385a4fab32c9c5631f4e0e" }
 asap_types = { path = "crates/asap_types" }
 asap_otel_proto = { path = "crates/asap_otel_proto" }
 indexmap = { version = "2.0", features = ["serde"] }
