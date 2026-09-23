@@ -1,4 +1,5 @@
 //! Executes the installed typed logical DAG. No serving-time PromQL parsing.
+mod native_values;
 use crate::query_engines::{
     query_result::{InstantVectorElement, QueryResult},
     EngineError,
@@ -205,13 +206,34 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 }
                 self.logical(operator, &inputs, at)?
             }
-            QueryPlanNode::MembershipFilter {
+            QueryPlanNode::RelationalJoin {
                 inputs,
-                completeness,
+                join_kind: planner_types::pre_asap::JoinKind::Semi,
+                pred,
+                pruning,
+                left_schema,
+                right_schema,
+                ..
             } => {
-                let candidates = vector(self.eval(inputs[0], at)?)?;
-                let values = vector(self.eval(inputs[1], at)?)?;
-                let (selected, warning) = membership_filter(candidates, values, &completeness)?;
+                let values = vector(self.eval(inputs[0], at)?)?;
+                let candidates = vector(self.eval(inputs[1], at)?)?;
+                let predicate = serde_json::from_value(pred)
+                    .map_err(|_| miss("invalid semi-join predicate"))?;
+                let keys = asap_physical_operators::dag::planner::equijoin_keys(
+                    &predicate,
+                    &left_schema,
+                    &right_schema,
+                )
+                .map_err(|error| miss(error.to_string()))?
+                .into_iter()
+                .map(|(left, right)| {
+                    (
+                        left_schema.fields[left].name.clone(),
+                        right_schema.fields[right].name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+                let (selected, warning) = semi_join(candidates, values, &keys, pruning.as_ref())?;
                 if let Some(warning) = warning {
                     self.warnings.push(warning);
                 }
@@ -277,9 +299,15 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Vector(aggregate(operation, &grouping, values)))
             }
-            ResidualQueryOperator::TopKSelection { k, grouping } => {
+            ResidualQueryOperator::Limit {
+                n,
+                offset,
+                grouping,
+            } => {
                 let values = vector(self.eval(input(0)?, at)?)?;
-                Ok(Value::Vector(topk_selection(k, &grouping, values)))
+                Ok(Value::Vector(native_values::limit(
+                    values, &grouping, n, offset,
+                )?))
             }
             ResidualQueryOperator::Binary {
                 operation,
@@ -350,22 +378,14 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         .collect(),
                 ))
             }
-            ResidualQueryOperator::Sort { descending } => {
-                let mut values = vector(self.eval(input(0)?, at)?)?;
-                values.sort_by(|a, b| {
-                    if a.1.is_nan() && b.1.is_nan() {
-                        std::cmp::Ordering::Equal
-                    } else if a.1.is_nan() {
-                        std::cmp::Ordering::Greater
-                    } else if b.1.is_nan() {
-                        std::cmp::Ordering::Less
-                    } else if descending {
-                        b.1.total_cmp(&a.1)
-                    } else {
-                        a.1.total_cmp(&b.1)
-                    }
-                });
-                Ok(Value::Vector(values))
+            ResidualQueryOperator::Sort {
+                descending,
+                grouping,
+            } => {
+                let values = vector(self.eval(input(0)?, at)?)?;
+                Ok(Value::Vector(native_values::sort(
+                    values, &grouping, descending,
+                )?))
             }
             ResidualQueryOperator::HistogramQuantile => {
                 let Value::Scalar(quantile) = self.eval(input(0)?, at)? else {
@@ -420,27 +440,39 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
     }
 }
 
-fn membership_filter(
+fn semi_join(
     candidates: Vector,
     values: Vector,
-    completeness: &CandidateCompleteness,
+    keys: &[(String, String)],
+    completeness: Option<&CandidateCompleteness>,
 ) -> Result<(Vector, Option<String>), EngineError> {
-    let identity = |labels: &Labels| {
-        let mut labels = labels.clone();
-        labels.remove("__name__");
-        labels
+    let left_key = |labels: &Labels| {
+        keys.iter()
+            .map(|(left, _)| labels.get(left).cloned().unwrap_or_default())
+            .collect::<Vec<_>>()
     };
-    let (selected, missing) = asap_physical_operators::rows::membership_filter(
-        candidates.iter().map(|(labels, _)| identity(labels)),
-        values,
-        |(labels, _)| identity(labels),
-    );
-    if !missing.is_empty() && matches!(completeness, CandidateCompleteness::Certified { .. }) {
-        return Err(miss("certified membership key has no authoritative value"));
+    let right_key = |labels: &Labels| {
+        keys.iter()
+            .map(|(_, right)| labels.get(right).cloned().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    let available = values
+        .iter()
+        .map(|(labels, _)| left_key(labels))
+        .collect::<std::collections::BTreeSet<_>>();
+    let missing = candidates
+        .iter()
+        .map(|(labels, _)| right_key(labels))
+        .filter(|key| !available.contains(key))
+        .collect::<Vec<_>>();
+    let selected = native_values::semi_join(values, &candidates, &left_key, &right_key)?;
+    if !missing.is_empty() && matches!(completeness, Some(CandidateCompleteness::Certified { .. }))
+    {
+        return Err(miss("certified pruning key has no authoritative value"));
     }
     let warning = match completeness {
-        CandidateCompleteness::Certified { .. } => None,
-        CandidateCompleteness::BestEffort { guarantee } => Some(match guarantee {
+        None | Some(CandidateCompleteness::Certified { .. }) => None,
+        Some(CandidateCompleteness::BestEffort { guarantee }) => Some(match guarantee {
             Some(guarantee) => format!(
                 "ASAP membership pruning is approximate: {:?}",
                 guarantee.metric
@@ -506,13 +538,15 @@ fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
 /// Select by the child sample value while retaining every selected series'
 /// labels. NaN ranks below every numeric value, matching Prometheus' TOPK heap.
 /// Stable sorting also leaves equal-valued series in the child's order.
+#[cfg(test)]
 fn topk_selection(k: u64, grouping: &Grouping, values: Vector) -> Vector {
-    asap_physical_operators::rows::grouped_topk(
-        values,
-        usize::try_from(k).unwrap_or(usize::MAX),
-        |(labels, _)| grouping_key(labels, grouping),
-        |(_, value)| *value,
+    native_values::limit(
+        native_values::sort(values, grouping, true).unwrap(),
+        grouping,
+        k,
+        0,
     )
+    .unwrap()
 }
 
 fn binary(
@@ -1070,8 +1104,22 @@ mod topk_tests {
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::TopKSelection {
-                            k: 2,
+                        operator: ResidualQueryOperator::Limit {
+                            offset: 0,
+                            n: 2,
+                            grouping: Grouping {
+                                labels: vec![],
+                                without: false,
+                            },
+                        },
+                        inputs: vec![QueryNodeId(98)],
+                    },
+                ),
+                (
+                    QueryNodeId(98),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Sort {
+                            descending: true,
                             grouping: Grouping {
                                 labels: vec![],
                                 without: false,
@@ -1154,12 +1202,13 @@ mod topk_tests {
             (labels(&[("pod", "b")]), 8.0),
             (labels(&[("pod", "c")]), 9.0),
         ];
-        let (selected, warning) = membership_filter(
+        let (selected, warning) = semi_join(
             candidates,
             exact,
-            &CandidateCompleteness::Certified {
+            &[("pod".into(), "pod".into())],
+            Some(&CandidateCompleteness::Certified {
                 guarantee: topk_membership_guarantee(),
-            },
+            }),
         )
         .unwrap();
         let selected = topk_selection(
@@ -1205,20 +1254,59 @@ mod topk_tests {
                         reason: "prepared exact counter readout".into(),
                     },
                 ),
-                (
-                    filter,
-                    QueryPlanNode::MembershipFilter {
-                        inputs: [candidate_id, value_id],
-                        completeness: CandidateCompleteness::Certified {
+                (filter, {
+                    let schema = planner_types::post_asap::SummarySchema {
+                        fields: vec![planner_types::post_asap::SummaryField {
+                            name: "pod".into(),
+                            dtype: planner_types::post_asap::SummaryFamilyType::Plain(
+                                planner_types::pre_asap::DataType::Utf8,
+                            ),
+                            nullable: false,
+                        }],
+                        time_index: None,
+                    };
+                    QueryPlanNode::RelationalJoin {
+                        inputs: [value_id, candidate_id],
+                        join_kind: planner_types::pre_asap::JoinKind::Semi,
+                        pred: serde_json::to_value(planner_types::pre_asap::Predicate(
+                            std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
+                                left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
+                                    0,
+                                )),
+                                op: planner_types::pre_asap::CompareOpKind::Eq,
+                                right: std::rc::Rc::new(
+                                    planner_types::pre_asap::QueryExpr::Column(1),
+                                ),
+                            }),
+                        ))
+                        .unwrap(),
+                        pruning: Some(CandidateCompleteness::Certified {
                             guarantee: topk_membership_guarantee(),
-                        },
-                    },
-                ),
+                        }),
+                        left_schema: schema.clone(),
+                        right_schema: schema.clone(),
+                        output_schema: schema,
+                    }
+                }),
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::TopKSelection {
-                            k: 1,
+                        operator: ResidualQueryOperator::Limit {
+                            offset: 0,
+                            n: 1,
+                            grouping: Grouping {
+                                labels: vec![],
+                                without: false,
+                            },
+                        },
+                        inputs: vec![QueryNodeId(98)],
+                    },
+                ),
+                (
+                    QueryNodeId(98),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Sort {
+                            descending: true,
                             grouping: Grouping {
                                 labels: vec![],
                                 without: false,
@@ -1281,23 +1369,25 @@ mod topk_tests {
     fn uncertified_candidate_sidecar_warns_or_falls_back_explicitly() {
         let candidates = vec![(labels(&[("pod", "a")]), 1.0)];
         let exact = vec![(labels(&[("pod", "a")]), 2.0)];
-        let (_, warning) = membership_filter(
+        let (_, warning) = semi_join(
             candidates.clone(),
             exact.clone(),
-            &CandidateCompleteness::BestEffort { guarantee: None },
+            &[("pod".into(), "pod".into())],
+            Some(&CandidateCompleteness::BestEffort { guarantee: None }),
         )
         .unwrap();
         assert!(warning.unwrap().contains("approximate"));
-        // Exact queries never lower an uncertified MembershipFilter. The Planner
+        // Exact queries never lower an uncertified pruning semi-join. The Planner
         // emits its ordinary exact fallback instead; this runtime node is only
         // valid for certified or explicitly approximate plans.
         let certified = CandidateCompleteness::Certified {
             guarantee: topk_membership_guarantee(),
         };
-        assert!(membership_filter(
+        assert!(semi_join(
             vec![(labels(&[("pod", "missing")]), 1.0)],
             exact,
-            &certified,
+            &[("pod".into(), "pod".into())],
+            Some(&certified),
         )
         .is_err());
     }

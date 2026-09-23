@@ -82,12 +82,6 @@ fn inspect(
             inspect(lhs, model, seen, states, raw);
             inspect(rhs, model, seen, states, raw);
         }
-        SummaryExpr::MembershipFilter {
-            candidates, values, ..
-        } => {
-            inspect(candidates, model, seen, states, raw);
-            inspect(values, model, seen, states, raw);
-        }
     }
 }
 
