@@ -1,7 +1,7 @@
 # Evidence-dependent candidate selection and deployment
 
-Status: evidence and workload costing implemented by backend PR #761 on the
-[Planner selection contract](planner-selection-contract.md), against ASAPPlanner #455
+Status: evidence and workload costing implemented by backend PR #761, building
+on the API adaptation in #768, against ASAPPlanner #455
 (`2ec3fc80`). This document defines the backend decision boundary for Planner
 issue #454 and backend issue #752. It does not claim that every retained
 candidate has a deployable implementation.
