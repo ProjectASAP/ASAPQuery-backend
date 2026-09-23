@@ -137,7 +137,10 @@ fn snapshot_retains_real_data_and_query_demand() {
     let data = Dataset::load(Path::new("../datasets/issue-754.yaml")).unwrap();
     let suite = Suite::load(Path::new("../suites/issue-754.yaml")).unwrap();
     let snapshot = planning::snapshot(&suite, &data, 10000, true).unwrap();
+    let plan = snapshot.clone().compile_promql().unwrap();
+    planning::validate_cost(&plan).unwrap();
     let value = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(value["implementation"]["scrape_interval_ms"], 100);
     assert!(value.get("workload_cost_evidence").is_none());
     assert!(value["query_workload"].get("data_workload").is_none());
     assert_eq!(

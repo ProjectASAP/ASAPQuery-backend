@@ -52,7 +52,7 @@ pub fn snapshot(
         value["data_workload"][name] =
             json!({"value":n,"source":"declared","observed_at_ms":null,"valid_for_ms":null});
     }
-    value["implementation"]["scrape_interval_ms"] = json!(cadence.div_ceil(1000) * 1000);
+    value["implementation"]["scrape_interval_ms"] = json!(cadence);
     Ok(serde_json::from_value(value)?)
 }
 
