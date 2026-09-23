@@ -74,6 +74,31 @@ The backend validates the supplied record's scope and consistency. It does not
 derive a source-domain proof from samples or establish the truth of a producer's
 claimed contract. Producing valid external proofs remains an upstream duty.
 
+### Bounded classic HLL confidence
+
+Scoped evidence may carry `hll: {"model":
+"asap-classic64-uniform-hash-linear-counting-v1", "max_distinct_per_readout": 128}`.
+This declares an enforced source-domain upper bound for **each complete readout
+population**, including the union of all merged panes, and the independent
+uniform bucket-hash assumption. Series count, a sampled distinct count, and
+ERP observed maxima do not establish this contract. The bound is supplied by
+the source-contract owner; the backend validates its query/data/snapshot/time
+scope, not the truth of the external source assertion.
+
+The model supports declared upper bounds from 1 through 4096 and precisions
+4 through 18. It only certifies parameters that keep every permitted population
+in classic HLL's linear-counting branch. A finite collision-arrival bound gives
+failure probability for the requested relative error. Sizing searches for the
+smallest supported precision meeting the same epsilon/delta contract. Explain
+retains the model, population limit, hash assumption and numerical guarantee.
+
+The implementation is bound to the backend-local Regular HLL estimator;
+collector estimators, HIP, MLE and unbounded populations are not certified by it.
+Missing contracts retain generic HLL's unknown probability; infeasible targets
+retain exact execution. ERP resources can still price the selected parameters,
+but ERP error maxima cannot override this confidence model. Each readout's
+probability is not a simultaneous guarantee for an entire dashboard.
+
 ## Accuracy, runtime and cost remain separate
 
 A known accuracy guarantee does not establish executor support. The physical

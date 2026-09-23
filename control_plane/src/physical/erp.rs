@@ -204,10 +204,44 @@ impl ReadoutEvidence {
     }
 }
 
-/// ERP v1 measures error magnitudes, not tail probabilities. Only an explicit
-/// epsilon-only request may use these observations as its accuracy contract.
+/// Trusted source contract for every HLL readout population of one scoped query.
+/// The upper bound covers the union of all merged panes, not each pane separately.
+/// This is not derived from observed series count or a sampled distinct count.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HllConfidenceContract {
+    /// Identifies classic 64-bit HLL with its linear-counting correction, under
+    /// independent uniform bucket hashing. Other estimators are not certified.
+    pub model: String,
+    pub max_distinct_per_readout: u32,
+}
+
+impl HllConfidenceContract {
+    pub(crate) fn valid(&self) -> bool {
+        self.model == "asap-classic64-uniform-hash-linear-counting-v1"
+            && (1..=4096).contains(&self.max_distinct_per_readout)
+    }
+
+    pub(crate) fn confidence(
+        &self,
+        epsilon: f64,
+    ) -> Option<asap_aware_mapping::hll_confidence::ClassicHllConfidence> {
+        self.valid()
+            .then(|| {
+                asap_aware_mapping::hll_confidence::ClassicHllConfidence::new(
+                    self.max_distinct_per_readout,
+                    epsilon,
+                )
+            })
+            .flatten()
+    }
+}
+
+/// ERP error magnitudes and estimator-specific confidence are separate inputs.
+/// ERP v1 observed maxima do not establish a failure-probability guarantee.
 pub(crate) struct ErpAccuracyModel<'a> {
     pub policy: Option<&'a ErpPlanningInput>,
+    pub hll: Option<&'a HllConfidenceContract>,
     pub max_error: f64,
 }
 
@@ -224,6 +258,20 @@ impl asap_aware_mapping::AccuracyModel for ErpAccuracyModel<'_> {
         query: &planner_types::post_asap::SketchQuery,
     ) -> Option<planner_types::post_asap::ResultGuarantee> {
         use planner_types::post_asap::*;
+        if let (
+            Some(contract),
+            SummaryFamilyType::Sketch(kind, GroupingStrategy::PerSubpopulationInstance),
+            SketchQuery::Cardinality,
+        ) = (self.hll, family, query)
+        {
+            if let (SketchAlgorithm::Hll, SketchParams::Hll { precision }) =
+                (kind.algorithm(), kind.params())
+            {
+                // Resource ERP can still rank this state. Error maxima must not
+                // replace the independent, estimator-specific confidence bound.
+                return contract.confidence(self.max_error)?.guarantee(*precision);
+            }
+        }
         let theoretical = asap_aware_mapping::DefaultAccuracyModel.local_guarantee(family, query);
         let (Some(policy), SummaryFamilyType::Sketch(kind, _)) = (self.policy, family) else {
             return theoretical;
@@ -1168,6 +1216,7 @@ mod tests {
             GroupingStrategy::PerSubpopulationInstance,
         );
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2,
         };
@@ -1181,6 +1230,7 @@ mod tests {
         ));
         policy.artifact.records[1].error_metrics.clear();
         assert!(ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2
         }
@@ -1202,6 +1252,7 @@ mod tests {
             GroupingStrategy::PerSubpopulationInstance,
         );
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.05,
         };
@@ -1248,6 +1299,7 @@ mod tests {
             GroupingStrategy::PerSubpopulationInstance,
         );
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2,
         };
@@ -1279,6 +1331,7 @@ mod tests {
             .error_metrics
             .remove("max_frequency_entropy_absolute_bits_error");
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2,
         };
