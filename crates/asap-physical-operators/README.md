@@ -63,8 +63,8 @@ Existing accumulator algorithms are reused as kernels behind these operators.
 Backend ingestion integration is delivered in #763 and query integration in
 #765, after this foundation. Installed value/storage adapters provide deployment-specific
 computation; they have not all been replaced by native batch bindings. Local raw
-Scan remains deferred. See the [design and coverage table](../../docs/design_docs/query-dag-execution.md)
-for the distinction between native operator support and backend integration.
+Scan remains deferred. See the [shared operator design](../../docs/design_docs/physical-operators.md).
+The dependent #765 query DAG design tracks installed engine coverage separately.
 
 The default limits are eight buffered batches per producer and 64 MiB of estimated
 retained execution data. Callers can set both through `Limits`. Accounting includes
