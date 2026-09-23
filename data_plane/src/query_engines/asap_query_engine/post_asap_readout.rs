@@ -138,7 +138,7 @@ impl PhysicalQueryRuntime<'_> {
                 let [PhysicalQueryOutput::Value(values, coverage)] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
-                reduce_sum_values(grouping, values, *coverage)
+                reduce_sum_values_in_context(grouping, values, *coverage, context)
             }
             QueryPlanNode::ReadMaterialization { binding } => {
                 let mut groups = self
@@ -481,17 +481,42 @@ fn intersect_coverage(left: Option<(u64, u64)>, right: Option<(u64, u64)>) -> Op
     (result.0 <= result.1).then_some(result)
 }
 
+#[cfg(test)]
 fn reduce_sum_values(
     grouping: &asap_types::query_plan::PhysicalGrouping,
     values: &[(BTreeMap<String, String>, SummaryValue)],
     coverage: Option<(u64, u64)>,
 ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
+    let context = dag::RunContext::new(
+        dag::Scope::Query {
+            evaluation_time_ms: 0,
+            revision: 0,
+        },
+        dag::Limits::default(),
+    )
+    .unwrap();
+    reduce_sum_values_in_context(grouping, values, coverage, &context)
+}
+fn reduce_sum_values_in_context(
+    grouping: &asap_types::query_plan::PhysicalGrouping,
+    values: &[(BTreeMap<String, String>, SummaryValue)],
+    coverage: Option<(u64, u64)>,
+    context: &dag::RunContext,
+) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
+    use dag::{
+        operators::{Operator, Reduction},
+        values::{Batch, Value},
+    };
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::DataType,
+    };
     let asap_types::query_plan::PhysicalGrouping::Reduce(keys) = grouping else {
         return Ok(PhysicalQueryOutput::Value(values.to_vec(), coverage));
     };
     let mut groups = BTreeMap::new();
     for (labels, value) in values {
-        let SummaryValue::Points(points, coverage) = value else {
+        let SummaryValue::Points(points, row_coverage) = value else {
             return Err(PhysicalNodeError::ExpectedState);
         };
         let labels = labels
@@ -500,27 +525,52 @@ fn reduce_sum_values(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<BTreeMap<_, _>>();
         for (timestamp, value) in points {
-            groups
+            let group = groups
                 .entry((labels.clone(), *timestamp))
-                .and_modify(|(sum, cover): &mut (f64, Option<(u64, u64)>)| {
-                    *sum += value;
-                    *cover = intersect_coverage(*cover, *coverage);
-                })
-                .or_insert((*value, *coverage));
+                .or_insert_with(|| (Vec::new(), *row_coverage));
+            group.0.push(*value);
+            group.1 = intersect_coverage(group.1, *row_coverage);
         }
     }
-    Ok(PhysicalQueryOutput::Value(
-        groups
+    let groups = groups.into_iter().collect::<Vec<_>>();
+    let schema = std::sync::Arc::new(SummarySchema {
+        fields: vec![("group", DataType::Int64), ("value", DataType::Float64)]
             .into_iter()
-            .map(|((labels, timestamp), (sum, coverage))| {
-                (
-                    labels,
-                    SummaryValue::Points(vec![(timestamp, sum)], coverage),
-                )
+            .map(|(name, dtype)| SummaryField {
+                name: name.into(),
+                dtype: SummaryFamilyType::Plain(dtype),
+                nullable: false,
             })
             .collect(),
-        coverage,
-    ))
+        time_index: None,
+    });
+    let rows = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (_, (values, _)))| {
+            values
+                .iter()
+                .map(move |value| vec![Value::Int64(index as i64), Value::Float64(*value)])
+        })
+        .collect();
+    let error = |error: dag::Error| PhysicalNodeError::Fallback(error.to_string());
+    let batch = Batch::try_new(schema.clone(), rows).map_err(error)?;
+    let operator = Operator::aggregate(schema, vec![0], vec![("value".into(), Reduction::Sum(1))])
+        .map_err(error)?;
+    let output = dag::batch_execution::evaluate_batch(batch, vec![operator], context.clone())
+        .map_err(error)?;
+    let mut result = Vec::new();
+    for row in output.iter().flat_map(|batch| batch.rows()) {
+        let [Value::Int64(index), Value::Float64(sum)] = row.as_slice() else {
+            return Err(PhysicalNodeError::ExpectedState);
+        };
+        let ((labels, time), (_, row_coverage)) = &groups[*index as usize];
+        result.push((
+            labels.clone(),
+            SummaryValue::Points(vec![(*time, *sum)], *row_coverage),
+        ));
+    }
+    Ok(PhysicalQueryOutput::Value(result, coverage))
 }
 
 fn execute_physical_query_plan(
