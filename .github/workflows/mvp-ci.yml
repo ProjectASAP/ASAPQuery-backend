@@ -49,6 +49,12 @@ jobs:
           # post-step can package `target`; registry/git inputs are sufficient.
           cache-targets: false
 
+      - name: Test Planner dependency updater
+        working-directory: ASAPQuery-backend
+        run: |
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+          node scripts/ci/test_planner_merge.js
+
       - name: Check workspace formatting
         working-directory: ASAPQuery-backend
         # `--all` also follows this workspace's sibling path dependencies.
@@ -59,20 +65,20 @@ jobs:
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
       - name: Lint workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
         # Preserve the existing warning policy while expanding runtime coverage.
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build process-test control plane
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo build -p control_plane --bin control_plane
+        run: cargo build -p control_plane --bin control_plane --locked
 
       - name: Test workspace
         env:
@@ -84,4 +90,4 @@ jobs:
         # Match scripts/e2e.sh to avoid competing flushers exhausting those waits.
         run: |
           export ASAP_E2E_CONTROL_PLANE_BIN="$PWD/target/debug/control_plane"
-          cargo test --workspace -- --test-threads=1
+          cargo test --workspace --locked -- --test-threads=1

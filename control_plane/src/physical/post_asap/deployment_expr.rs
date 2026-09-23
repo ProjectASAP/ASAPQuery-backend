@@ -172,7 +172,14 @@ mod tests {
             having: None,
             child: Rc::new(windowed_scan()),
         };
-        let node = crate::planner_selection::select_summary_default(&q).expect("implements");
+        let node = crate::planner_selection::select_query(
+            &q,
+            &crate::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
+                crate::types::AccuracyTarget::Epsilon(0.01),
+                planner_types::post_asap::SketchAlgorithm::Kll,
+            ),
+        )
+        .expect("implements");
         let e = PhysicalExpr::committed(node);
         match e {
             PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
