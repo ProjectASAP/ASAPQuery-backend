@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::physical::{compiler::BackendLocalPlanningInput, erp::ErpShapeObserver};
+use control_plane::physical::erp::ErpShapeObserver;
 
 fn measured_profiles(raw: &[f64]) -> Value {
     let mut records = Vec::new();
@@ -39,7 +39,7 @@ fn measured_profiles(raw: &[f64]) -> Value {
 }
 
 #[tokio::test]
-async fn measured_kll_error_without_failure_probability_uses_exact_fallback() {
+async fn measured_error_without_confidence_uses_exact_process() {
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
     let training: Vec<f64> = (1..=16)
         .flat_map(|value| std::iter::repeat_n(value as f64, 512 / value))
@@ -53,39 +53,44 @@ async fn measured_kll_error_without_failure_probability_uses_exact_fallback() {
         observer.observe(&value.to_string(), index / 100).unwrap();
     }
     let observation = observer.snapshot().unwrap();
-    let mut fixture: Value = serde_json::from_str(include_str!(
-        "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
-    ))
-    .unwrap();
-    let mut entry = fixture["query_workload"]["repeating_queries"][3].clone();
-    entry["query"] = QUERY.into();
-    entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.2}});
-    fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
-    fixture["implementation"]["erp"] = serde_json::json!({
-        "distribution": {"workload": {"external": {"dataset": "held-out-process-stream"}}},
-        "artifact": measured_profiles(&training), "implementation": "lib", "error_metric": "max_rank_err",
-        "min_trials": 10, "expected_updates": raw.len(), "expected_queries": 10.0,
-        "expected_merges": 0.0, "retention_seconds": 60.0, "cpu_weight": 0.0,
-        "byte_second_weight": 1e-9, "mode": "hybrid", "observed_shape": observation.observation,
-        "shape_match": {"minimum_benchmark_events": 1000, "max_log2_cardinality_distance": 0.0,
-            "max_parameter_distance": 0.1, "max_goodness_of_fit": 0.1,
-            "minimum_confidence": 0.8, "minimum_confidence_margin": 0.05},
-        "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
-    });
-    let plan = quote_snapshot_for_test(
-        serde_json::from_value::<BackendLocalPlanningInput>(fixture).unwrap(),
-    )
-    .compile_promql()
-    .unwrap();
-    assert!(plan.precompute_plan.materializations.is_empty());
-    assert!(plan
-        .query_plan
-        .entries
-        .values()
-        .all(|entry| entry.nodes.values().any(|node| {
-            matches!(
-                node,
-                control_plane::query_plan::QueryPlanNode::ExactFallback { .. }
-            )
-        })));
+    let artifact = measured_profiles(&training);
+    for only_large in [false, true] {
+        let mut evidence = artifact.clone();
+        if only_large {
+            evidence["records"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|row| row["parameters"]["k"] == 128);
+        }
+        let mut fixture: Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let mut entry = fixture["query_workload"]["repeating_queries"][3].clone();
+        entry["query"] = QUERY.into();
+        entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.2}});
+        fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+        fixture["implementation"]["erp"] = serde_json::json!({
+            "distribution": {"workload": {"external": {"dataset": "held-out-process-stream"}}},
+            "artifact": evidence, "implementation": "lib", "error_metric": "max_rank_err",
+            "min_trials": 10, "expected_updates": raw.len(), "expected_queries": 10.0,
+            "expected_merges": 0.0, "retention_seconds": 60.0, "cpu_weight": 0.0,
+            "byte_second_weight": 1e-9, "mode": "hybrid", "observed_shape": observation.observation,
+            "shape_match": {"minimum_benchmark_events": 1000, "max_log2_cardinality_distance": 0.0,
+                "max_parameter_distance": 0.1, "max_goodness_of_fit": 0.1,
+                "minimum_confidence": 0.8, "minimum_confidence_margin": 0.05},
+            "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
+        });
+        let policy: control_plane::physical::erp::ErpPlanningInput =
+            serde_json::from_value(fixture["implementation"]["erp"].clone()).unwrap();
+        assert!(matches!(
+            policy.select(
+                planner_types::post_asap::SketchAlgorithm::Kll,
+                0.2,
+                planner_types::post_asap::SketchParams::Kll { k: 128 }
+            ),
+            control_plane::physical::erp::ErpParameterDecision::Empirical { .. }
+        ));
+        assert_uncertified_exact_process(fixture, &[QUERY]).await;
+    }
 }
