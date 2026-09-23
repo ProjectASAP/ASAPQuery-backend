@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::physical::{compiler::BackendLocalPlanningInput, erp::ErpShapeObserver};
+use control_plane::physical::erp::ErpShapeObserver;
 
 fn measured_profiles(raw: &[f64]) -> Value {
     let mut records = Vec::new();
@@ -39,17 +39,7 @@ fn measured_profiles(raw: &[f64]) -> Value {
 }
 
 #[tokio::test]
-async fn observed_shape_selects_installed_parameters_and_executes_remote_write() {
-    let fallback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let fallback_url = format!("http://{}", fallback_listener.local_addr().unwrap());
-    let fallback_task = tokio::spawn(async move {
-        axum::serve(
-            fallback_listener,
-            Router::new().route("/-/healthy", get(|| async { "healthy" })),
-        )
-        .await
-        .unwrap();
-    });
+async fn measured_error_without_confidence_uses_exact_process() {
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
     let training: Vec<f64> = (1..=16)
         .flat_map(|value| std::iter::repeat_n(value as f64, 512 / value))
@@ -64,7 +54,6 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
     }
     let observation = observer.snapshot().unwrap();
     let artifact = measured_profiles(&training);
-    let mut chosen = Vec::new();
     for only_large in [false, true] {
         let mut evidence = artifact.clone();
         if only_large {
@@ -102,163 +91,6 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
             ),
             control_plane::physical::erp::ErpParameterDecision::Empirical { .. }
         ));
-        let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture.clone()).unwrap();
-        let plan = quote_snapshot_for_test(snapshot).compile_promql().unwrap();
-        assert_eq!(
-            plan.precompute_plan.materializations.len(),
-            1,
-            "plan={plan:#?}; observation={observation:#?}; evidence={artifact}"
-        );
-        let expected_k = if only_large { 128 } else { 32 };
-        assert_eq!(
-            plan.precompute_plan.materializations[0].parameters["k"],
-            expected_k
-        );
-        chosen.push(plan.precompute_plan.materializations[0].policy_fingerprint());
-        eprintln!(
-            "ERP_PLANNED {}",
-            serde_json::json!({
-                "query": QUERY, "available_profiles": policy.artifact.records,
-            "parameter_decision": format!("{:?}", policy.select(planner_types::post_asap::SketchAlgorithm::Kll, 0.2, planner_types::post_asap::SketchParams::Kll { k: 128 })),
-            "lifecycle_estimates": plan.lifecycle_estimates,
-                "observation": policy.observed_shape,
-                "selected_parameters": plan.precompute_plan.materializations[0].parameters,
-                "materialization": chosen.last(),
-                "partitioning": plan.precompute_plan.materializations[0].partitioning,
-                "query_plan": plan.query_plan,
-            })
-        );
-        let output = tempfile::tempdir().unwrap();
-        let path = output.path().join("planning.json");
-        let priced = quote_snapshot_for_test(serde_json::from_value(fixture.clone()).unwrap());
-        std::fs::write(&path, serde_json::to_vec(&priced).unwrap()).unwrap();
-        let port = unused_port();
-        let mut child = ChildGuard(
-            Command::new(env!("CARGO_BIN_EXE_data_plane"))
-                .args([
-                    "--forward-unsupported-queries",
-                    "--prometheus-server",
-                    &fallback_url,
-                    "--profile",
-                    "asapquery",
-                    "--planning-snapshot",
-                ])
-                .arg(&path)
-                .args(["--http-port", &port.to_string(), "--output-dir"])
-                .arg(output.path())
-                .args([
-                    "--precompute-allowed-lateness-ms",
-                    "0",
-                    "--precompute-flush-interval-ms",
-                    "25",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        );
-        let client = reqwest::Client::new();
-        let backend = format!("http://127.0.0.1:{port}");
-        wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
-        let config: Value = client
-            .get(format!("{backend}/api/v1/physical-plan/status"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let config_text = serde_json::to_string(&config).unwrap();
-        assert!(
-            config_text.contains(&chosen.last().unwrap().0.to_string()),
-            "installed ERP identity missing: {config}"
-        );
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let base = now - now.rem_euclid(5000) - 20000;
-        let samples: Vec<_> = raw
-            .iter()
-            .enumerate()
-            .map(|(i, value)| (base + 1 + i as i64, *value))
-            .collect();
-        assert_eq!(
-            remote_write(
-                &client,
-                &backend,
-                &WriteRequest {
-                    timeseries: vec![
-                        series_with_labels("erp_latency", &[("instance", "a")], &samples),
-                        series_with_labels(
-                            "erp_latency",
-                            &[("instance", "b")],
-                            &samples
-                                .iter()
-                                .map(|(t, v)| (*t, *v + 1000.0))
-                                .collect::<Vec<_>>()
-                        ),
-                    ]
-                }
-            )
-            .await,
-            204
-        );
-        assert_eq!(
-            remote_write(
-                &client,
-                &backend,
-                &WriteRequest {
-                    timeseries: vec![
-                        series_with_labels(
-                            "erp_latency",
-                            &[("instance", "a")],
-                            &[(base + 15001, 1.0)]
-                        ),
-                        series_with_labels(
-                            "erp_latency",
-                            &[("instance", "b")],
-                            &[(base + 15001, 1001.0)]
-                        ),
-                    ]
-                }
-            )
-            .await,
-            204
-        );
-        drain_precompute(&client, &backend).await;
-        let result = wait_for_warm_instant(
-            &client,
-            &backend,
-            QUERY,
-            (base + 5000) as f64 / 1000.0,
-            &output.path().join("query_engine.log"),
-        )
-        .await;
-        let rows = result["data"]["result"].as_array().unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "per-series KLL states must not pool: {result}"
-        );
-        eprintln!(
-            "ERP_WARM {}",
-            serde_json::json!({"materialization": chosen.last(), "result": result})
-        );
-        for (instance, offset) in [("a", 0.0), ("b", 1000.0)] {
-            let row = rows
-                .iter()
-                .find(|row| row["metric"]["instance"] == instance)
-                .expect("source labels retained");
-            let estimate = row["value"][1].as_str().unwrap().parse::<f64>().unwrap() - offset;
-            let lower = raw.iter().filter(|v| **v < estimate).count() as f64 / raw.len() as f64;
-            let upper = raw.iter().filter(|v| **v <= estimate).count() as f64 / raw.len() as f64;
-            assert!((lower - 0.9).max(0.9 - upper).max(0.0) <= 0.2, "{result}");
-        }
+        assert_uncertified_exact_process(fixture, &[QUERY]).await;
     }
-    fallback_task.abort();
-    assert_ne!(
-        chosen[0], chosen[1],
-        "changed evidence must change installed state identity"
-    );
 }
