@@ -42,7 +42,7 @@ pub use storage_engines::types::{
     SerializableToSink, SingleSubpopulationAggregate,
 };
 
-pub use precompute_engine::operators::{
+pub use asap_physical_operators::accumulators::{
     IncreaseAccumulator, KeyedSumCountAccumulator, MaxAccumulator, MinAccumulator, SumAccumulator,
 };
 

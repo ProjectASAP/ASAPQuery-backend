@@ -1394,11 +1394,11 @@ mod sketch_query_tests {
 #[cfg(test)]
 mod aux_pushdown_tests {
     use super::*;
-    use crate::precompute_engine::operators::{
+    use crate::storage_engines::types::AggregationType;
+    use asap_physical_operators::accumulators::{
         max_accumulator::MaxAccumulator, min_accumulator::MinAccumulator,
         sum_accumulator::SumAccumulator,
     };
-    use crate::storage_engines::types::AggregationType;
     use asap_types::Statistic;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1613,9 +1613,9 @@ mod asap_tier_classify_tests {
     /// results instead of a CapabilityMiss.
     #[tokio::test]
     async fn execute_sum_by_zone_dispatches_to_exact_agg_reducer() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
+        use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         // Mirror the acceptance-test setup: four ExactAgg(Sum) sids, one
@@ -2267,9 +2267,9 @@ mod asap_tier_classify_tests {
     /// `OuterFn::Plain` instant sums.
     #[tokio::test]
     async fn execute_instant_sum_accumulates_all_windows_not_last() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
+        use asap_physical_operators::accumulators::sum_accumulator::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = 600_000_u64;

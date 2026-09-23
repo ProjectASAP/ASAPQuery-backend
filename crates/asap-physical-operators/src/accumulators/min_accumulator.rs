@@ -1,4 +1,4 @@
-use crate::storage_engines::types::{
+use crate::{
     AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate,
 };
@@ -152,7 +152,7 @@ impl AggregateCore for MinAccumulator {
         _key: &Option<crate::KeyByLabelValues>,
         _query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::SingleSubpopulationAggregate;
+        use crate::SingleSubpopulationAggregate;
         self.query(statistic, None)
     }
 }

@@ -1,5 +1,5 @@
-use crate::precompute_engine::operators::dd_sketch_accumulator::normalize_sample_p;
-use crate::storage_engines::types::{
+use crate::accumulators::dd_sketch_accumulator::normalize_sample_p;
+use crate::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
@@ -213,7 +213,7 @@ impl CountMinSketchAccumulator {
         &mut self,
         buffer: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
+        use asap_sketchlib::proto::sketchlib::CountMinDelta as PbDelta;
         use prost::Message;
 
         let pb = PbDelta::decode(buffer).map_err(|e| format!("decode CountMinDelta: {e}"))?;
@@ -300,7 +300,7 @@ impl CountMinSketchAccumulator {
 
     /// Merge multiple accumulators efficiently without cloning all of them.
     pub fn merge_multiple(
-        accumulators: &[Box<dyn crate::storage_engines::types::AggregateCore>],
+        accumulators: &[Box<dyn crate::AggregateCore>],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if accumulators.is_empty() {
             return Err("No accumulators to merge".into());
@@ -379,8 +379,7 @@ pub(crate) const MAX_SKETCH_CELLS: usize = 8 * 1024 * 1024;
 ///    slices overflow / alias the 64-bit word and the matrix-cell
 ///    layout is no longer the one the producer hashed into — the sketch
 ///    is internally degenerate. This mirrors sketchlib's own
-///    `MatrixFastHash::assert_compatible` budget (`rows * (mask_bits +
-///    1) <= 64`); we check the column-index bits alone so realistic
+///    `MatrixFastHash::assert_compatible` budget (`rows * (mask_bits + 1) <= 64`); we check the column-index bits alone so realistic
 ///    configs (5x2048, 5x4096, 5x2000) — for which the sign bits share
 ///    the top of the word without affecting the cell layout — still
 ///    pass.
@@ -515,7 +514,7 @@ impl AggregateCore for CountMinSketchAccumulator {
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::MultipleSubpopulationAggregate;
+        use crate::MultipleSubpopulationAggregate;
         use asap_types::Statistic;
 
         // Key-provided path: route to MultipleSubpopulationAggregate::query
@@ -811,7 +810,7 @@ mod tests {
         let boxed_accs: Vec<Box<dyn AggregateCore>> = vec![Box::new(cms1), Box::new(cms2)];
         assert!(CountMinSketchAccumulator::merge_multiple(&boxed_accs).is_err());
 
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::accumulators::sum_accumulator::SumAccumulator;
         let cms = CountMinSketchAccumulator::new(2, 3);
         let sum = SumAccumulator::new();
         let mixed_accs: Vec<Box<dyn AggregateCore>> = vec![Box::new(cms), Box::new(sum)];
@@ -971,7 +970,7 @@ mod tests {
 
     #[test]
     fn test_apply_proto_delta_bytes_round_trip() {
-        use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
+        use asap_sketchlib::proto::sketchlib::CountMinDelta as PbDelta;
         use prost::Message;
 
         let mut acc = CountMinSketchAccumulator {
@@ -990,6 +989,7 @@ mod tests {
             d_counts: vec![10, 100],
             l1: vec![],
             l2: vec![],
+            ..Default::default()
         }
         .encode_to_vec();
 
