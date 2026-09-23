@@ -54,9 +54,9 @@ fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchAlgorithm> {
         // `ExactAgg` case.
         SummaryExpr::SummaryAgg { .. } => None,
         SummaryExpr::SummaryEstimate { summary_input, .. } => extract_from_node(summary_input),
-        SummaryExpr::SummaryMerge { children } => children.iter().find_map(extract_from_node),
+        SummaryExpr::SummaryMerge { children, .. } => children.iter().find_map(extract_from_node),
         SummaryExpr::ValueOperation { child, .. } => extract_from_node(child),
-        SummaryExpr::CandidateTopK {
+        SummaryExpr::MembershipFilter {
             candidates, values, ..
         } => extract_from_node(candidates).or_else(|| extract_from_node(values)),
         // Not surfaced by any `Bind*` path yet (gated on rules that
