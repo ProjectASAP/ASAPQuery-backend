@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=46328f0e50c1450bc2385a4fab32c9c5631f4e0e#46328f0e50c1450bc2385a4fab32c9c5631f4e0e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=93a0fa2b60219c624fe74a0218ff4a76cd97ea78#93a0fa2b60219c624fe74a0218ff4a76cd97ea78"
 dependencies = [
  "asap-types",
  "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib)",
@@ -376,7 +376,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=46328f0e50c1450bc2385a4fab32c9c5631f4e0e#46328f0e50c1450bc2385a4fab32c9c5631f4e0e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=93a0fa2b60219c624fe74a0218ff4a76cd97ea78#93a0fa2b60219c624fe74a0218ff4a76cd97ea78"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0 (git+https://github.com/ProjectASAP/promql-parser?rev=9fede7eecca923c9882fe256484d00d37f8706cb)",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=46328f0e50c1450bc2385a4fab32c9c5631f4e0e#46328f0e50c1450bc2385a4fab32c9c5631f4e0e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=93a0fa2b60219c624fe74a0218ff4a76cd97ea78#93a0fa2b60219c624fe74a0218ff4a76cd97ea78"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -396,7 +396,7 @@ dependencies = [
 [[package]]
 name = "asap-physical-operators"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=46328f0e50c1450bc2385a4fab32c9c5631f4e0e#46328f0e50c1450bc2385a4fab32c9c5631f4e0e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=93a0fa2b60219c624fe74a0218ff4a76cd97ea78#93a0fa2b60219c624fe74a0218ff4a76cd97ea78"
 dependencies = [
  "asap-types",
  "asap_sketch_codec",
@@ -416,12 +416,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=46328f0e50c1450bc2385a4fab32c9c5631f4e0e#46328f0e50c1450bc2385a4fab32c9c5631f4e0e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=93a0fa2b60219c624fe74a0218ff4a76cd97ea78#93a0fa2b60219c624fe74a0218ff4a76cd97ea78"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=46328f0e50c1450bc2385a4fab32c9c5631f4e0e#46328f0e50c1450bc2385a4fab32c9c5631f4e0e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=93a0fa2b60219c624fe74a0218ff4a76cd97ea78#93a0fa2b60219c624fe74a0218ff4a76cd97ea78"
 dependencies = [
  "serde",
  "serde_json",
@@ -442,7 +442,7 @@ dependencies = [
 [[package]]
 name = "asap_sketch_codec"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=46328f0e50c1450bc2385a4fab32c9c5631f4e0e#46328f0e50c1450bc2385a4fab32c9c5631f4e0e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=93a0fa2b60219c624fe74a0218ff4a76cd97ea78#93a0fa2b60219c624fe74a0218ff4a76cd97ea78"
 dependencies = [
  "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?rev=026cd18c7b8c23ae6c46d4d683151ba562b8cd3a)",
  "prost",
