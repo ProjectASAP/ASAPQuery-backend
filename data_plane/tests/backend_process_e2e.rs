@@ -523,13 +523,13 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
     let publication: serde_json::Value =
         serde_json::from_str(&publication_body).expect("decode publication response");
     assert_eq!(
-        publication["cost_comparison"]["alternatives"]
+        publication["cost_comparison"]["candidates"]
             .as_array()
             .unwrap()
             .len(),
         2
     );
-    assert!(publication["cost_comparison"]["alternatives"][1]["unavailable_reason"].is_string());
+    assert!(publication["cost_comparison"]["candidates"][1]["unavailable_reason"].is_string());
     let (collector_plan, collector_socket) = collector.await.expect("collector task completed");
     assert_eq!(
         publication["plan_id"],

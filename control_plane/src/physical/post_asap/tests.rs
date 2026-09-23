@@ -138,7 +138,7 @@ fn bind_kll_quantile_basic() {
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model =
         ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchAlgorithm::Kll);
-    let node = crate::planner_selection::select_summary(&expr, &cost_model)
+    let node = crate::planner_selection::select_query(&expr, &cost_model)
         .expect("KLL should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
         SummaryExpr::SummaryEstimate {
@@ -167,7 +167,7 @@ fn bind_ddsketch_quantile_basic() {
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model =
         ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchAlgorithm::DDSketch);
-    let node = crate::planner_selection::select_summary(&expr, &cost_model)
+    let node = crate::planner_selection::select_query(&expr, &cost_model)
         .expect("DDSketch should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
         SummaryExpr::SummaryEstimate {
@@ -276,52 +276,33 @@ fn topk_binding_family(bound: &PhysicalExpr) -> (SketchAlgorithm, u32, u32) {
     }
 }
 
-/// (a) A **loose-recall** top-k (any non-exact accuracy target) binds the
-/// cheap **CMS-with-heap** family — the Fig-12 cost-gap fix. The old rule
-/// hard-bound the ~66×-more-expensive CountSketch here.
+/// A loose TopK target still needs membership evidence to select a sketch.
 #[test]
-fn bind_cms_topk_loose_recall_picks_cms_heap() {
+fn uncertified_topk_keeps_exact_execution() {
     let acc = AccuracyTarget::EpsilonDelta {
         epsilon: 0.01,
         delta: 0.001,
     };
     let expr = agg_topk(10, acc.clone());
-    assert!(bind_query_expr(&expr, acc).is_err());
+    assert!(query_is_exact(&committed_node(
+        bind_query_expr(&expr, acc).unwrap()
+    )));
 }
 
-/// (b) A **tight / exact-recall** top-k binds the unbiased
-/// **CountSketch-with-heap** — the family that supports exact rank /
-/// signed estimates.
-///
-/// NOTE — behavior change forced by the new realization pass, not just a rename:
-/// the old fixture used `AggIntent::TopK{accuracy: Exact}` (the intent's
-/// OWN accuracy) to signal "tight/exact-recall". Under
-/// `asap_aware_mapping::replacement::realizations_for_intent`, the per-intent
-/// summary-vs-exact boundary decision checks the intent's own `accuracy`
-/// field FIRST: `TopK{accuracy: Exact}` now declines to bind at all
-/// (`SummaryExpr::KeepPreAsap`) rather than reaching the cost model's
-/// family-selection logic at all — see `topk_exact_accuracy_declines_to_bind`
-/// above (a REAL, accepted behavior change — ASAPController#151 — per
-/// this migration's design notes, not a bug to route around). "Tight
-/// recall" (→ CountSketchWithHeap) is still live logic in
-/// `ControlPlaneCostModel::topk_family_order` — it fires off the
-/// WORKLOAD-level accuracy (not the intent's own) being `Exact`, which
-/// still lets the intent itself bind.
+/// An exact workload target cannot accept uncertified TopK membership.
 #[test]
-fn bind_cms_topk_tight_recall_picks_countsketch() {
+fn exact_topk_keeps_exact_execution() {
     // Intent requests a normal (non-exact) rank so binding still
     // happens; the workload-level policy demands exact recall.
     let expr = agg_topk(10, AccuracyTarget::Epsilon(0.01));
-    assert!(bind_query_expr(&expr, AccuracyTarget::Exact).is_err());
+    assert!(query_is_exact(&committed_node(
+        bind_query_expr(&expr, AccuracyTarget::Exact).unwrap()
+    )));
 }
 
-/// (c) The chosen family is the **cost-minimal one that meets the recall
-/// SLA**, per the `physical::deployment_cost::wire` table — the same "min cost s.t.
-/// SLA" the oracle uses. Loose → both families clear the bar → cheapest
-/// (CMS, ~4 KB) wins; the CountSketch alternative (~250 KB) is ~66×
-/// costlier.
+/// A cheaper sketch never substitutes for missing membership evidence.
 #[test]
-fn bind_cms_topk_picks_cost_min_meeting_sla() {
+fn cheap_topk_does_not_bypass_membership_evidence() {
     use crate::physical::deployment_cost::wire::WireCostTable;
     let table = WireCostTable::default();
     let cms = table.for_algorithm(&SketchAlgorithm::Cms).per_flush();
@@ -341,11 +322,13 @@ fn bind_cms_topk_picks_cost_min_meeting_sla() {
 
     // Loose recall → the planner must land on the cost-min family (CMS).
     let acc = AccuracyTarget::Epsilon(0.01);
-    assert!(bind_query_expr(&agg_topk(10, acc.clone()), acc).is_err());
+    assert!(query_is_exact(&committed_node(
+        bind_query_expr(&agg_topk(10, acc.clone()), acc).unwrap()
+    )));
 }
 
 #[test]
-fn bind_hll_cardinality_basic() {
+fn uncertified_hll_keeps_exact_execution() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
         measures: vec![AggIntent::Cardinality {
@@ -357,35 +340,7 @@ fn bind_hll_cardinality_basic() {
         child: Rc::new(windowed_scan()),
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("no error");
-    match bound {
-        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryEstimate {
-                query,
-                summary_input,
-            } => {
-                assert!(matches!(query, SketchQuery::Cardinality));
-                match &summary_input.expr {
-                    SummaryExpr::SummaryAgg { family, .. } => match family {
-                        SummaryFamilyType::Sketch(kind, _)
-                            if kind.algorithm() == &SketchAlgorithm::Hll =>
-                        {
-                            let SketchParams::Hll { precision } = kind.params() else {
-                                panic!("HLL algorithm has mismatched params")
-                            };
-                            assert!(
-                                *precision >= 12,
-                                "ε=0.01 should land on at least precision 12 (~1.6%) per the rung table"
-                            );
-                        }
-                        other => panic!("expected Hll family, got {other:?}"),
-                    },
-                    other => panic!("expected SummaryAgg, got {other:?}"),
-                }
-            }
-            other => panic!("expected SummaryEstimate, got {other:?}"),
-        },
-        other => panic!("expected Committed(Summary(_)), got {other:?}"),
-    }
+    assert!(query_is_exact(&committed_node(bound)));
 }
 
 #[test]
@@ -909,4 +864,17 @@ fn topk_exact_accuracy_declines_to_bind() {
         }
         other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
+}
+
+fn committed_node(bound: PhysicalExpr) -> Rc<SummaryNode> {
+    let PhysicalExpr::Committed(PostAsapPlan::Summary(node)) = bound else {
+        panic!("expected committed query")
+    };
+    node
+}
+
+fn query_is_exact(node: &SummaryNode) -> bool {
+    node.guarantee
+        .as_ref()
+        .is_some_and(|guarantee| guarantee.is_exact())
 }

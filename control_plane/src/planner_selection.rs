@@ -9,8 +9,8 @@ use std::rc::Rc;
 use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
 use crate::types::AccuracyTarget;
 use asap_aware_mapping::{
-    AccuracyBudgetAllocator, AccuracyEvidenceProvider, AccuracyModel, CostModel, Replacement,
-    ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
+    AccuracyEvidenceProvider, AccuracyModel, CostModel, Replacement, ReplacementStrategy,
+    SketchAlgorithmStrategy, TargetSubDAG,
 };
 use planner_types::post_asap::{
     SummaryExpr, SummaryFamilyType, SummaryField, SummaryNode, SummarySchema,
@@ -232,31 +232,26 @@ pub fn keep_pre_asap(expr: &QueryExpr) -> Result<Rc<SummaryNode>, SelectionError
     }))
 }
 
-/// Legacy single-site witness helper used by residual matching and examples.
-/// Deployment selection uses `select_workload_with_accuracy_model_and_trace`
-/// followed by physical compilation; this helper does not establish runtime
-/// support or authorize publication.
-pub fn select_summary(
+/// Select a complete query through the same costed Planner search as workloads.
+/// Per-operator requirements remain in the canonical expression.
+pub fn select_query(
     expr: &QueryExpr,
     cost_model: &dyn CostModel,
 ) -> Result<Rc<SummaryNode>, SelectionError> {
-    let root = Rc::new(expr.clone());
-    let strategy = SketchAlgorithmStrategy::new(cost_model);
-    let candidate = strategy
-        .replacements(&TargetSubDAG::new(&root))
-        .into_iter()
-        .next()
-        .ok_or(SelectionError::NoLegalCandidate)?;
-    match candidate.replacement {
-        Replacement::Summary(node) => Ok(node),
-        Replacement::Rewrite(_) | Replacement::ExactComposition(_) => {
-            Err(SelectionError::UnexpectedRewrite)
-        }
-    }
+    select_query_with_models(
+        expr,
+        cost_model,
+        &asap_aware_mapping::DefaultAccuracyModel,
+        &asap_aware_mapping::NoAccuracyEvidence,
+    )
 }
 
-pub fn select_summary_default(expr: &QueryExpr) -> Result<Rc<SummaryNode>, SelectionError> {
-    select_summary(expr, &asap_aware_mapping::DefaultCostModel)
+#[cfg(test)]
+pub(crate) fn plan_test_query(expr: &QueryExpr) -> Result<Rc<SummaryNode>, SelectionError> {
+    select_query(
+        expr,
+        &ControlPlaneCostModel::new(AccuracyTarget::Epsilon(0.01)),
+    )
 }
 
 #[cfg(test)]
@@ -498,33 +493,25 @@ fn select_workload_impl(
     Ok(roots)
 }
 
-/// Select from Planner's legal candidates with deployment-supplied accuracy
-/// models and typed evidence (for example a TopK membership certificate).
-pub fn select_summary_with_evidence(
+/// Evidence and accuracy hooks feed canonical global selection; enumeration
+/// order never authorizes a query plan.
+pub fn select_query_with_models(
     expr: &QueryExpr,
     cost_model: &dyn CostModel,
     accuracy_model: &dyn AccuracyModel,
-    allocator: &dyn AccuracyBudgetAllocator,
     evidence: &dyn AccuracyEvidenceProvider,
 ) -> Result<Rc<SummaryNode>, SelectionError> {
-    let root = Rc::new(expr.clone());
-    let strategy = SketchAlgorithmStrategy::new_with_planning_inputs_and_evidence(
-        cost_model,
+    let strategies = replacement_strategies(cost_model, evidence, accuracy_model);
+    let space = asap_aware_mapping::search_workload_with_targets(
+        vec![(0, Rc::new(expr.clone()), None)],
+        &strategies,
         accuracy_model,
-        allocator,
-        evidence,
     );
-    let candidate = strategy
-        .replacements(&TargetSubDAG::new(&root))
-        .into_iter()
-        .next()
-        .ok_or(SelectionError::NoLegalCandidate)?;
-    match candidate.replacement {
-        Replacement::Summary(node) => Ok(node),
-        Replacement::Rewrite(_) | Replacement::ExactComposition(_) => {
-            Err(SelectionError::UnexpectedRewrite)
-        }
-    }
+    space
+        .global_selection(cost_model)
+        .assemble_selected_dag(&space.roots[0].1)
+        .map_err(|error| SelectionError::Workload(error.to_string()))?
+        .ok_or(SelectionError::NoLegalCandidate)
 }
 
 #[cfg(test)]
