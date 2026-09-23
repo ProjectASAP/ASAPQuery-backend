@@ -43,3 +43,12 @@ Deployment adapters supply storage, source rows, time/population scope, expressi
 evaluation, I/O and output representation. Planner's current maintenance-only
 summary placement and the backend's missing local raw Scan remain separate
 integration limitations; exporting these kernels does not silently bypass them.
+
+## Composable row operators
+
+`rows::membership_filter` performs a value-preserving semijoin and reports
+missing membership keys. `rows::grouped_topk` independently ranks rows within
+groups, retaining input order for ties and placing NaN after numeric values.
+Neither kernel knows about sketches, storage, execution phase or external
+queries. The deployment enforces the pruning certificate; filtering and ranking
+remain separate operations in the installed graph.

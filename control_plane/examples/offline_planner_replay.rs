@@ -59,7 +59,7 @@ fn inspect(
             inspect(summary_input, model, seen, states, raw)
         }
         SummaryExpr::ValueOperation { child, .. } => inspect(child, model, seen, states, raw),
-        SummaryExpr::SummaryMerge { children } => {
+        SummaryExpr::SummaryMerge { children, .. } => {
             for child in children {
                 inspect(child, model, seen, states, raw);
             }
@@ -82,7 +82,7 @@ fn inspect(
             inspect(lhs, model, seen, states, raw);
             inspect(rhs, model, seen, states, raw);
         }
-        SummaryExpr::CandidateTopK {
+        SummaryExpr::MembershipFilter {
             candidates, values, ..
         } => {
             inspect(candidates, model, seen, states, raw);
