@@ -212,11 +212,18 @@ all subsequent readout combinations or certify approximation guarantees.
 
 ### Precomputation boundary: present status and required acceptance
 
-| Plan placement | Present evidence | Remaining requirement |
+| Precomputation mode | Definition | Current support / remaining gaps |
 | --- | --- | --- |
-| Raw only | Independent KLL consumer constructs and queries state directly | Backend local raw source plus query-time summary construction/lowering; currently not supported as a general installed query plan |
-| Partially precomputed | KLL consumer merges prebuilt prefix with query-built suffix; backend can combine supported stored and query-time computation nodes | General stored-state + raw-suffix query DAG, typed update evaluation, compatible scope/merge checks and process acceptance |
-| Fully precomputed | Backend stored read/merge/readout paths and process tests | Valid only for supported family/schema/window/operator combinations; storage readiness remains a runtime requirement |
+| No precomputation | The query starts from raw data and performs all required computation at query time. | General local raw input and query-time summary construction are not supported in installed plans; deferred from this PR. |
+| Partial precomputation | The query reuses previously computed results or states and performs the remaining computation at query time. Inputs may combine stored states, stored values, and raw data. | Supported stored-state and query-time operations can be combined. General plans requiring local raw input or query-time summary construction remain incomplete. |
+| Full precomputation | All data-dependent computation needed for the query result has been performed before the query arrives. Query execution retrieves the prepared result and formats the response. | Supported only where the prepared result matches the requested query and time scope and is available. Reading stored summaries followed by merging, estimation, aggregation or ranking is partial precomputation. |
+
+These definitions are independent of any particular algorithm. The KLL consumer
+tests are examples of constructing, merging, and querying state across different
+precomputation boundaries. They demonstrate reusable kernel behavior, not
+complete backend support for all three modes. In particular, a test that queries
+a prebuilt KLL state still performs estimation at query time; it does not
+demonstrate full precomputation of the query result.
 
 The remaining work below describes the target contract, not a requirement to
 implement local raw Scan in this PR. Planner must express valid query-time summary
