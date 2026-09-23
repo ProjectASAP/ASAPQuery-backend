@@ -63,3 +63,34 @@ fn invalid_kll_parameters_are_rejected_at_binding() {
     );
     assert!(result.is_err());
 }
+
+// Native CountSketch supports the confidence-sized depth used by the backend;
+// a packed-wire column-bit budget must not be imposed on this constructor.
+#[test]
+fn native_count_sketch_dimensions_are_not_packed_wire_dimensions() {
+    use asap_physical_operators::planner::post_asap::SummaryInputExpr;
+    use asap_physical_operators::KeyByLabelValues;
+    let family = SummaryFamilyType::Sketch(
+        SketchKind::new(
+            SketchAlgorithm::CountSketchWithHeap,
+            SketchParams::CountSketchWithHeap {
+                width: 1200,
+                depth: 55,
+                heap_size: 3,
+            },
+        ),
+        Default::default(),
+    );
+    let mut update = SummaryUpdate::column(ColumnRef::SampleValue);
+    update.item = Some(SummaryInputExpr::Column(ColumnRef::Named("host".into())));
+    let mut operator = create_planner_accumulator(&family, &update, &Default::default()).unwrap();
+    let key = KeyByLabelValues::new_with_labels(vec!["a".into()]);
+    operator.update_keyed(&key, 7.0, 1000);
+    let state = operator.into_accumulator();
+    assert_eq!(
+        state
+            .query_statistic(Statistic::Sum, &Some(key), &Default::default())
+            .unwrap(),
+        7.0
+    );
+}
