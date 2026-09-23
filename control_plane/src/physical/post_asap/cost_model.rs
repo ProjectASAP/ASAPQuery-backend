@@ -168,6 +168,7 @@ pub struct ControlPlaneCostModel {
     exact_composition_costs: Vec<ExactCompositionCostEvidence>,
     erp: Option<ErpPlanningInput>,
     erp_costs: Option<ErpPlanningInput>,
+    hll_confidence: Option<super::super::erp::HllConfidenceContract>,
 }
 
 impl ControlPlaneCostModel {
@@ -238,6 +239,7 @@ impl ControlPlaneCostModel {
             exact_composition_costs: Vec::new(),
             erp: None,
             erp_costs: None,
+            hll_confidence: None,
         }
     }
 
@@ -246,6 +248,14 @@ impl ControlPlaneCostModel {
         costs: Vec<ExactCompositionCostEvidence>,
     ) -> Self {
         self.exact_composition_costs = costs;
+        self
+    }
+
+    pub fn with_hll_confidence(
+        mut self,
+        contract: super::super::erp::HllConfidenceContract,
+    ) -> Self {
+        self.hll_confidence = Some(contract);
         self
     }
 
@@ -746,6 +756,19 @@ impl CostModel for ControlPlaneCostModel {
         eps: f64,
         delta: f64,
     ) -> SketchParams {
+        if kind == SketchAlgorithm::Hll && matches!(intent, AggIntent::Cardinality { .. }) {
+            if let Some(contract) = &self.hll_confidence {
+                if let Some((eps, delta)) = self.combined_eps_delta(&intent_accuracy(intent)) {
+                    // If no supported precision meets the target, keep the tightest
+                    // candidate for explain; its guarantee still fails selection.
+                    let precision = contract
+                        .confidence(eps)
+                        .and_then(|model| model.precision(delta))
+                        .unwrap_or(18);
+                    return SketchParams::Hll { precision };
+                }
+            }
+        }
         let (max_error, theoretical) = match intent {
             AggIntent::TopK { k, .. } => {
                 let (eps, delta) = self.topk_eps_delta(&intent_accuracy(intent));
