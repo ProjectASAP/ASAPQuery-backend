@@ -1,8 +1,11 @@
+use asap_physical_operators::dag as execution;
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
+use futures::StreamExt;
 use planner_types::post_asap::PostAsapNodeId;
 use planner_types::post_asap::{
     EdgeRole, ExecutableDag, ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState,
 };
+use std::{cell::RefCell, rc::Rc};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -28,7 +31,15 @@ pub trait PrecomputeOperatorRegistry<V> {
     fn materialized_input(&self, _node: &ExecutableDagNode) -> Result<Option<V>, Self::Error> {
         Ok(None)
     }
-    fn execute(&self, node: &ExecutableDagNode, inputs: &[Arc<V>]) -> Result<V, Self::Error>;
+    fn output_bytes(&self, _value: &V) -> usize {
+        std::mem::size_of::<V>().max(1)
+    }
+    fn execute(
+        &self,
+        node: &ExecutableDagNode,
+        inputs: &[Arc<V>],
+        context: execution::RunContext,
+    ) -> Result<V, Self::Error>;
 }
 
 /// Atomic persistence boundary. Implementations must return the already
@@ -49,6 +60,26 @@ pub enum ScheduleError<OperatorError, SinkError> {
     Invalid(String),
     Operator(OperatorError),
     Sink(SinkError),
+}
+
+/// Execute one precompute sink and its transitive dependencies in topological
+/// order. Intermediates use `Arc`, so a shared upstream node is computed once
+/// without copying summary payloads. Only the sink is committed; upstream
+/// materialization sinks are committed by their own lineage-keyed invocation.
+pub fn execute_precompute_sink<V, R, S>(
+    dag: &ExecutableDag,
+    binding: &BackendExecutableBinding,
+    sink_node: PostAsapNodeId,
+    key: MaterializationCommitKey,
+    registry: &R,
+    sink: &S,
+) -> Result<Arc<V>, ScheduleError<R::Error, S::Error>>
+where
+    R: PrecomputeOperatorRegistry<V>,
+    S: IdempotentCommitSink<V>,
+{
+    let mut outputs = execute_precompute_sinks(dag, binding, &[(sink_node, key)], registry, sink)?;
+    Ok(outputs.remove(0))
 }
 
 fn node_syntax(payload: &ExecutableOperatorPayload) -> String {
@@ -79,26 +110,6 @@ fn node_syntax(payload: &ExecutableOperatorPayload) -> String {
     details.chars().take(256).collect()
 }
 
-/// Execute one precompute sink and its transitive dependencies in topological
-/// order. Intermediates use `Arc`, so a shared upstream node is computed once
-/// without copying summary payloads. Only the sink is committed; upstream
-/// materialization sinks are committed by their own lineage-keyed invocation.
-pub fn execute_precompute_sink<V, R, S>(
-    dag: &ExecutableDag,
-    binding: &BackendExecutableBinding,
-    sink_node: PostAsapNodeId,
-    key: MaterializationCommitKey,
-    registry: &R,
-    sink: &S,
-) -> Result<Arc<V>, ScheduleError<R::Error, S::Error>>
-where
-    R: PrecomputeOperatorRegistry<V>,
-    S: IdempotentCommitSink<V>,
-{
-    let mut outputs = execute_precompute_sinks(dag, binding, &[(sink_node, key)], registry, sink)?;
-    Ok(outputs.remove(0))
-}
-
 /// Evaluate all selected stored outputs with one dependency cache. Keys must
 /// describe the same input revision and window; only their output identity may
 /// differ. Validation finishes before executing or committing any output.
@@ -113,10 +124,6 @@ where
     R: PrecomputeOperatorRegistry<V>,
     S: IdempotentCommitSink<V>,
 {
-    let _span = tracing::debug_span!(target: "asap_runtime_debug", "precompute_dag",
-        output_count = outputs.len(), node_count = dag.nodes.len(), edge_count = dag.edges.len())
-    .entered();
-    tracing::debug!(target: "asap_runtime_debug", "precompute DAG execution started");
     let mut unique = BTreeSet::new();
     for (node, key) in outputs {
         if !unique.insert(node.0)
@@ -190,99 +197,179 @@ where
         };
         inputs.insert(consumer, ordered);
     }
-    let mut active = BTreeSet::new();
-    let mut values = BTreeMap::<u32, Arc<V>>::new();
-    fn visit<V, R, OE, SE>(
-        id: u32,
-        nodes: &BTreeMap<u32, &ExecutableDagNode>,
-        inputs: &BTreeMap<u32, Vec<u32>>,
-        active: &mut BTreeSet<u32>,
-        values: &mut BTreeMap<u32, Arc<V>>,
-        registry: &R,
-    ) -> Result<(), ScheduleError<OE, SE>>
-    where
-        R: PrecomputeOperatorRegistry<V, Error = OE>,
-    {
-        if values.contains_key(&id) {
-            return Ok(());
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let error = Rc::new(RefCell::new(None));
+    let mut sources = BTreeMap::new();
+    for (node, key) in outputs {
+        if let Some(value) = sink.get(key).map_err(ScheduleError::Sink)? {
+            sources.insert(node.0, value);
         }
-        if !active.insert(id) {
-            return Err(ScheduleError::Invalid("precompute subDAG cycle".into()));
+    }
+    let committed = sources.keys().copied().collect::<BTreeSet<_>>();
+    let mut graph = execution::PhysicalDag::default();
+    let mut pending = outputs.iter().map(|(id, _)| id.0).collect::<Vec<_>>();
+    let mut added = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !added.insert(id) {
+            continue;
         }
-        let node = nodes
+        let node = *nodes
             .get(&id)
             .ok_or_else(|| ScheduleError::Invalid(format!("missing node {id}")))?;
-        let op = match &node.payload {
-            ExecutableOperatorPayload::Fallback { .. } => "Fallback",
-            ExecutableOperatorPayload::Binary { .. } => "Binary",
-            ExecutableOperatorPayload::MembershipFilter { .. } => "MembershipFilter",
-            ExecutableOperatorPayload::Value { .. } => "Value",
-            ExecutableOperatorPayload::RelationalJoin { .. } => "RelationalJoin",
-            ExecutableOperatorPayload::SummaryAgg { .. } => "SummaryAgg",
-            ExecutableOperatorPayload::SummaryJoin { .. } => "SummaryJoin",
-            ExecutableOperatorPayload::SummarySubtract => "SummarySubtract",
-            ExecutableOperatorPayload::SummaryDelete { .. } => "SummaryDelete",
-            ExecutableOperatorPayload::SummaryEstimate { .. } => "SummaryEstimate",
-            ExecutableOperatorPayload::SummaryMerge { .. } => "SummaryMerge",
-        };
         if node.output_state.timing == planner_types::post_asap::ExecutionTiming::QueryTime {
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
             )));
         }
-        if let Some(value) = registry
-            .materialized_input(node)
-            .map_err(ScheduleError::Operator)?
-        {
-            tracing::debug!(target: "asap_runtime_debug", node_id = id, ?op,
-                "precompute node used materialized input");
-            values.insert(id, Arc::new(value));
-            active.remove(&id);
-            return Ok(());
-        }
-        let child_ids = inputs.get(&id).cloned().unwrap_or_default();
-        for child in &child_ids {
-            visit(*child, nodes, inputs, active, values, registry)?;
-        }
-        let child_values = child_ids
+        let source = if let Some(value) = sources.remove(&id) {
+            Some(value)
+        } else {
+            registry
+                .materialized_input(node)
+                .map_err(ScheduleError::Operator)?
+                .map(Arc::new)
+        };
+        let children = if source.is_some() {
+            vec![]
+        } else {
+            inputs.get(&id).cloned().unwrap_or_default()
+        };
+        let schemas = children
             .iter()
-            .map(|child| Arc::clone(&values[child]))
-            .collect::<Vec<_>>();
-        let started = std::time::Instant::now();
-        tracing::debug!(target: "asap_runtime_debug", node_id = id, ?op,
-            syntax = %node_syntax(&node.payload), inputs = ?child_ids,
-            "precompute node started");
-        let value = registry.execute(node, &child_values).map_err(|error| {
-            tracing::warn!(
-                node_id = id,
-                ?op,
-                elapsed_us = started.elapsed().as_micros() as u64,
-                "precompute node failed"
-            );
-            ScheduleError::Operator(error)
-        })?;
-        tracing::debug!(target: "asap_runtime_debug", node_id = id, ?op,
-            elapsed_us = started.elapsed().as_micros() as u64, "precompute node completed");
-        values.insert(id, Arc::new(value));
-        active.remove(&id);
-        Ok(())
+            .map(|child| {
+                nodes
+                    .get(child)
+                    .map(|n| n.output_schema.clone())
+                    .ok_or_else(|| ScheduleError::Invalid(format!("missing node {child}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        pending.extend(children.iter().copied());
+        graph
+            .add(
+                u64::from(id),
+                children.into_iter().map(u64::from).collect(),
+                IngestionOperator {
+                    node,
+                    registry,
+                    source,
+                    schemas,
+                    error: error.clone(),
+                },
+            )
+            .map_err(|e| ScheduleError::Invalid(e.to_string()))?;
     }
-    let mut results = Vec::with_capacity(outputs.len());
-    for (node, key) in outputs {
-        if let Some(committed) = sink.get(key).map_err(ScheduleError::Sink)? {
-            tracing::debug!(target: "asap_runtime_debug", sink_node_id = node.0, "precompute DAG reused committed sink");
-            values.insert(node.0, Arc::clone(&committed));
-            results.push(committed);
-            continue;
-        }
-        visit(node.0, &nodes, &inputs, &mut active, &mut values, registry)?;
-        let value = sink
-            .commit_if_absent(key.clone(), Arc::clone(&values[&node.0]))
-            .map_err(ScheduleError::Sink)?;
-        tracing::debug!(target: "asap_runtime_debug", sink_node_id = node.0, "precompute DAG sink commit completed");
-        results.push(value);
+    let key = &outputs[0].1;
+    let context = execution::RunContext::new(
+        execution::Scope::Ingestion {
+            window_start_ms: key.window_start_ms,
+            window_end_ms: key.window_end_ms,
+            revision: key.plan_version,
+        },
+        execution::Limits::default(),
+    )
+    .map_err(|e| ScheduleError::Invalid(e.to_string()))?;
+    let roots = outputs
+        .iter()
+        .map(|(id, _)| u64::from(id.0))
+        .collect::<Vec<_>>();
+    let streams = graph
+        .execute(&roots, context)
+        .map_err(|e| ScheduleError::Invalid(e.to_string()))?;
+    futures::executor::block_on(futures::future::try_join_all(
+        streams
+            .into_iter()
+            .zip(outputs)
+            .map(|(mut stream, (node, key))| {
+                let error = &error;
+                let committed = &committed;
+                async move {
+                    let result = stream.next().await.ok_or_else(|| {
+                        ScheduleError::Invalid("ingestion root produced no value".into())
+                    })?;
+                    let value = match result {
+                        Ok(value) => Arc::clone(value.value()),
+                        Err(failure) => {
+                            return Err(match error.borrow_mut().take() {
+                                Some(error) => ScheduleError::Operator(error),
+                                None => ScheduleError::Invalid(failure.to_string()),
+                            })
+                        }
+                    };
+                    if committed.contains(&node.0) {
+                        tracing::debug!(target: "asap_runtime_debug", sink_node_id = node.0, "precompute DAG reused committed sink");
+                        Ok(value)
+                    } else {
+                        let value = sink.commit_if_absent(key.clone(), value).map_err(ScheduleError::Sink)?;
+                        tracing::debug!(target: "asap_runtime_debug", sink_node_id = node.0, "precompute DAG sink commit completed");
+                        Ok(value)
+                    }
+                }
+            }),
+    ))
+}
+
+struct IngestionOperator<'a, V, R: PrecomputeOperatorRegistry<V>> {
+    node: &'a ExecutableDagNode,
+    registry: &'a R,
+    source: Option<Arc<V>>,
+    schemas: Vec<planner_types::post_asap::SummarySchema>,
+    error: Rc<RefCell<Option<R::Error>>>,
+}
+impl<V, R: PrecomputeOperatorRegistry<V>>
+    execution::PhysicalOperator<Arc<V>, planner_types::post_asap::SummarySchema>
+    for IngestionOperator<'_, V, R>
+{
+    fn name(&self) -> &str {
+        "InstalledIngestionOperator"
     }
-    Ok(results)
+    fn input_schemas(&self) -> Vec<planner_types::post_asap::SummarySchema> {
+        self.schemas.clone()
+    }
+    fn output_schema(&self) -> planner_types::post_asap::SummarySchema {
+        self.node.output_schema.clone()
+    }
+    fn output_bytes(&self, value: &Arc<V>) -> usize {
+        self.registry.output_bytes(value)
+    }
+    fn start<'a>(
+        &'a self,
+        inputs: Vec<execution::Input<'a, Arc<V>>>,
+        context: execution::RunContext,
+    ) -> Result<execution::OutputStream<'a, Arc<V>>, execution::Error> {
+        Ok(futures::stream::once(async move {
+            if let Some(source) = &self.source {
+                tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, "precompute node used materialized input");
+                return Ok(Arc::clone(source));
+            }
+            let inputs =
+                futures::future::try_join_all(inputs.into_iter().map(|mut input| async move {
+                    input.next().await.ok_or_else(|| {
+                        execution::Error::Operator("ingestion input produced no value".into())
+                    })?
+                }))
+                .await?;
+            let values = inputs
+                .iter()
+                .map(|value| Arc::clone(value.value()))
+                .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, syntax = %node_syntax(&self.node.payload), "precompute node started");
+            self.registry
+                .execute(self.node, &values, context)
+                .map(|value| {
+                    tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, elapsed_us = started.elapsed().as_micros() as u64, "precompute node completed");
+                    Arc::new(value)
+                })
+                .map_err(|e| {
+                    tracing::warn!(node_id = self.node.id.0, elapsed_us = started.elapsed().as_micros() as u64, "precompute node failed");
+                    *self.error.borrow_mut() = Some(e);
+                    execution::Error::Operator(format!("ingestion node {} failed", self.node.id.0))
+                })
+        })
+        .boxed_local())
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +466,7 @@ mod tests {
             &self,
             node: &ExecutableDagNode,
             inputs: &[Arc<u32>],
+            _context: execution::RunContext,
         ) -> Result<u32, Self::Error> {
             *self.0.lock().unwrap().entry(node.id.0).or_default() += 1;
             Ok(node.id.0 + inputs.iter().map(|v| **v).sum::<u32>())
@@ -457,6 +545,7 @@ mod tests {
                 &self,
                 node: &ExecutableDagNode,
                 inputs: &[Arc<u32>],
+                _context: execution::RunContext,
             ) -> Result<u32, String> {
                 match node.id.0 {
                     0 => Ok(10),
@@ -554,13 +643,14 @@ mod tests {
                 &self,
                 node: &ExecutableDagNode,
                 inputs: &[Arc<u32>],
+                context: execution::RunContext,
             ) -> Result<u32, String> {
                 assert_ne!(
                     node.id,
                     PostAsapNodeId(0),
                     "absorbed source subtree must not execute"
                 );
-                self.0.execute(node, inputs)
+                self.0.execute(node, inputs, context)
             }
         }
         let mut raw = node(0);

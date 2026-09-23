@@ -228,6 +228,25 @@ same family of summary.
 
 Within one evaluation, the worker follows this workflow:
 
+### Shared physical operator execution
+
+The shared library is introduced by #770, before this integration. Installed
+precompute DAGs execute through its `PhysicalDag` runtime. The backend supplies
+storage frontiers, declared edge order, window completeness and durable commit
+keys. It does not own a second dependency walker.
+
+For completed-window DAGs, SummaryAgg uses the native summary builder,
+SummaryMerge uses the native state merge, finalization uses native typed readout,
+and Binary lowers aligned rows to native arithmetic Project. Batch conversion
+preserves the installed population and timestamp bindings. Native calls receive
+the surrounding execution context, so they share its memory budget and
+cancellation. Query execution uses the same library's operations.
+
+Raw ingestion retains per-window accumulator state through shared-library
+updaters; worker routing and window completion remain backend responsibilities.
+Storage publication occurs only after successful DAG execution. It is separate
+from the library's request-local caching of intermediate results.
+
 ```text
 execute(partition, evaluation_window, bound_inputs):
     check input identities and required completeness
