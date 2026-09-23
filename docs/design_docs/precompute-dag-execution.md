@@ -398,6 +398,11 @@ or isolates incompatible old worker state before new work uses a different
 partition assignment. Changing worker count requires coordinated reassignment;
 changing a hash modulus while state is active is insufficient.
 
+A newly activated version is cold until its own stored outputs are available.
+Queries must not substitute the previous version's payload to hide that gap.
+Continuous warm service across activation requires an explicit readiness or
+state-migration protocol; atomic plan publication alone does not provide it.
+
 Recovery validates persisted record identities, definitions, formats and
 coverage before exposing them to readers. A matching definition alone does not
 authorize reuse across plan versions. Runtime caches and routing indexes are
