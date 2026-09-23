@@ -645,11 +645,12 @@ fn compile_physical_plan_request(
     )
     .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
     let planner_selection_trace = compilation_request.planner_selection_trace.clone();
-    let (manifests, alternatives) = physical::workload_cost::compile_candidates_for_pricing(
-        candidates.clone(),
-        environment.clone(),
-        frontend,
-    );
+    let (manifests, candidate_evaluations) =
+        physical::workload_cost::compile_candidates_for_pricing(
+            candidates.clone(),
+            environment.clone(),
+            frontend,
+        );
     let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
     // Quote preparation enumerates feasible bindings; it does not select the
     // default warm candidate, which may be unavailable while exact is valid.
@@ -657,7 +658,7 @@ fn compile_physical_plan_request(
         if manifests.is_empty() {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                serde_json::json!({"status": "all_infeasible", "alternatives": alternatives,
+                serde_json::json!({"status": "all_infeasible", "candidates": candidate_evaluations,
                     "logical_selection": compilation_request.planner_selection_trace}),
             ));
         }
@@ -666,7 +667,7 @@ fn compile_physical_plan_request(
             request.target_collector_ids,
             apply_timeout,
             request.runtime_adaptation_evidence,
-            (manifests, alternatives, planner_selection_trace),
+            (manifests, candidate_evaluations, planner_selection_trace),
         ));
     }
     let compiled = match request.workload_cost_evidence {
@@ -688,7 +689,7 @@ fn compile_physical_plan_request(
     };
     let bundle = match compiled {
         Ok(bundle) => bundle,
-        Err(physical::compiler::CompileError::Alternatives(report)) => {
+        Err(physical::compiler::CompileError::Candidates(report)) => {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, report))
         }
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
@@ -698,7 +699,7 @@ fn compile_physical_plan_request(
         request.target_collector_ids,
         apply_timeout,
         request.runtime_adaptation_evidence,
-        (manifests, alternatives, planner_selection_trace),
+        (manifests, candidate_evaluations, planner_selection_trace),
     ))
 }
 
@@ -735,9 +736,9 @@ fn workload_cost_manifests(
     }
     let explain = request.explain;
     match compile_physical_plan_request(request, true, frontend) {
-        Ok((_, _, _, _, (manifests, alternatives, planner_selection_trace))) => {
+        Ok((_, _, _, _, (manifests, candidates, planner_selection_trace))) => {
             if explain {
-                Json(serde_json::json!({"manifests": manifests, "alternatives": alternatives, "logical_selection": planner_selection_trace}))
+                Json(serde_json::json!({"manifests": manifests, "candidates": candidates, "logical_selection": planner_selection_trace}))
                     .into_response()
             } else {
                 Json(manifests).into_response()
@@ -866,12 +867,12 @@ mod api_tests {
             let manifests = body_json(response).await;
             if explain {
                 assert_eq!(manifests["manifests"].as_array().unwrap().len(), 1);
-                let alternatives = manifests["alternatives"].as_array().unwrap();
-                assert_eq!(alternatives.len(), 2);
-                assert_eq!(alternatives[0]["status"], "bind_failed");
-                assert!(alternatives[0]["unavailable_reason"].is_string());
-                assert_eq!(alternatives[1]["status"], "bound");
-                assert!(alternatives[1]["physical_alternative_id"].is_string());
+                let candidates = manifests["candidates"].as_array().unwrap();
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0]["status"], "bind_failed");
+                assert!(candidates[0]["unavailable_reason"].is_string());
+                assert_eq!(candidates[1]["status"], "bound");
+                assert!(candidates[1]["physical_candidate_id"].is_string());
                 assert!(!manifests["logical_selection"]
                     .as_array()
                     .unwrap()
@@ -889,8 +890,8 @@ mod api_tests {
         assert_eq!(response.headers()["content-type"], "application/json");
         let report = body_json(response).await;
         assert_eq!(report["status"], "all_infeasible");
-        assert_eq!(report["alternatives"].as_array().unwrap().len(), 2);
-        assert!(report["alternatives"]
+        assert_eq!(report["candidates"].as_array().unwrap().len(), 2);
+        assert!(report["candidates"]
             .as_array()
             .unwrap()
             .iter()
