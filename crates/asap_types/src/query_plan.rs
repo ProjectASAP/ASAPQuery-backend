@@ -366,6 +366,7 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            validate_native_relation(*id, node)?;
             if let QueryPlanNode::Logical { operator, inputs } = node {
                 operator.validate(inputs.len())?;
             }
@@ -950,5 +951,101 @@ mod contract_tests {
         };
         assert_eq!(exact.op_label(), "logical/exact_subquery");
         assert!(exact.log_syntax().is_empty());
+    }
+}
+
+/// Bind portable relation semantics before an installed plan can access its sources.
+fn validate_native_relation(id: QueryNodeId, node: &QueryPlanNode) -> Result<(), QueryPlanError> {
+    use planner_types::post_asap::{
+        ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState, PostAsapNodeId,
+    };
+    use std::sync::Arc;
+    let invalid = |error: String| QueryPlanError::Invalid(format!("query node {}: {error}", id.0));
+    let (payload, inputs, output) = match node {
+        QueryPlanNode::Relational {
+            operation,
+            input_schema,
+            output_schema,
+            ..
+        } => (
+            Payload::Value {
+                operation: serde_json::from_value(operation.clone())
+                    .map_err(|e| invalid(e.to_string()))?,
+            },
+            vec![Arc::new(input_schema.clone())],
+            output_schema,
+        ),
+        QueryPlanNode::RelationalJoin {
+            join_kind,
+            pred,
+            left_schema,
+            right_schema,
+            output_schema,
+            pruning,
+            ..
+        } => (
+            Payload::RelationalJoin {
+                join_kind: join_kind.clone(),
+                pred: serde_json::from_value(pred.clone()).map_err(|e| invalid(e.to_string()))?,
+                pruning: serde_json::from_value(
+                    serde_json::to_value(pruning).map_err(|e| invalid(e.to_string()))?,
+                )
+                .map_err(|e| invalid(e.to_string()))?,
+            },
+            vec![
+                Arc::new(left_schema.clone()),
+                Arc::new(right_schema.clone()),
+            ],
+            output_schema,
+        ),
+        _ => return Ok(()),
+    };
+    let node = ExecutableDagNode {
+        id: PostAsapNodeId(0),
+        payload,
+        output_state: ExecutionDataState::QUERY_ROWS,
+        output_schema: output.clone(),
+        guarantee: None,
+    };
+    asap_physical_operators::dag::planner::bind_node(&node, &inputs)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_binding_tests {
+    use super::*;
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
+        pre_asap::{DataType, Predicate, QueryExpr},
+    };
+
+    // Unsupported expressions fail installation without evaluating any source.
+    #[test]
+    fn rejects_unimplemented_relation_predicate_before_execution() {
+        let schema = SummarySchema {
+            fields: vec![SummaryField {
+                name: "value".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Float64),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let node = QueryPlanNode::Relational {
+            input: QueryNodeId(0),
+            operation: serde_json::to_value(ValueOperation::Filter {
+                pred: Predicate(
+                    QueryExpr::FunctionCall {
+                        name: "unimplemented_predicate".into(),
+                        args: vec![],
+                    }
+                    .into(),
+                ),
+            })
+            .unwrap(),
+            input_schema: schema.clone(),
+            output_schema: schema,
+        };
+        assert!(validate_native_relation(QueryNodeId(1), &node).is_err());
     }
 }
