@@ -4,44 +4,17 @@ pub use asap_types::executable_plan::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OperatorExecution {
-    Maintenance,
+    Ingestion,
     Query,
 }
 
-/// Keep the backend's ownership decision exhaustive over Planner's physical IR.
-/// Adding a payload variant upstream must therefore choose an executor here.
-fn operator_execution(
-    node: &planner_types::post_asap::ExecutableDagNode,
-) -> Result<OperatorExecution, String> {
-    use planner_types::post_asap::{ExecutableOperatorPayload as Payload, ExecutionTiming};
-
-    let declared = match &node.payload {
-        Payload::Binary { timing, .. }
-        | Payload::Value { timing, .. }
-        | Payload::SummaryMerge { timing } => *timing,
-        Payload::MembershipFilter { .. } | Payload::SummaryEstimate { .. } => {
-            ExecutionTiming::QueryTime
-        }
-        Payload::SummaryAgg { .. }
-        | Payload::SummaryJoin { .. }
-        | Payload::SummarySubtract
-        | Payload::SummaryDelete { .. } => ExecutionTiming::IngestionTime,
-        // These operators can be placed on either side of the stored-state
-        // boundary. Planner's validated output state is authoritative.
-        Payload::Fallback { .. } | Payload::RelationalJoin { .. } => node.output_state.timing,
-    };
-    if declared != node.output_state.timing {
-        return Err(format!(
-            "post-ASAP node {:?} has operator timing {} but output state {}",
-            node.id,
-            declared.as_str(),
-            node.output_state
-        ));
+/// Every physical operator uses its node's placement; payload kind does not
+/// restrict execution phase. Runtime capability is checked separately.
+fn operator_execution(node: &planner_types::post_asap::ExecutableDagNode) -> OperatorExecution {
+    match node.output_state.timing {
+        planner_types::post_asap::ExecutionTiming::IngestionTime => OperatorExecution::Ingestion,
+        planner_types::post_asap::ExecutionTiming::QueryTime => OperatorExecution::Query,
     }
-    Ok(match declared {
-        ExecutionTiming::IngestionTime => OperatorExecution::Maintenance,
-        ExecutionTiming::QueryTime => OperatorExecution::Query,
-    })
 }
 
 /// Assign backend phases to a selected semantic DAG without changing its nodes.
@@ -67,11 +40,11 @@ pub fn install_selected_dag(
             asap_physical_operators::capability::validate_summary_kernel(family, input, grouping)
                 .map_err(|reason| format!("post-ASAP node {:?}: {reason}", node.id))?;
         }
-        let execution = operator_execution(node)?;
+        let execution = operator_execution(node);
         let binding = if let Some(summary_definition) = materialization(node.id) {
             precompute_sinks.push(node.id);
             BackendNodeBinding::Materialization { summary_definition }
-        } else if execution == OperatorExecution::Maintenance {
+        } else if execution == OperatorExecution::Ingestion {
             BackendNodeBinding::MaintenanceInput
         } else {
             query_node(node.id).map_or(BackendNodeBinding::QueryInput, |query_node| {

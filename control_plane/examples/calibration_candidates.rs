@@ -37,15 +37,7 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 vec![lhs, rhs],
                 json!({"operator_debug":format!("{operator:?}"),"timing_debug":format!("{timing:?}")}),
             ),
-            SummaryExpr::MembershipFilter {
-                candidates,
-                values,
-                completeness,
-            } => (
-                "MembershipFilter",
-                vec![candidates, values],
-                json!({"completeness_debug":format!("{completeness:?}")}),
-            ),
+
             SummaryExpr::ValueOperation {
                 child,
                 operation,
@@ -82,6 +74,7 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 right,
                 kind,
                 pred,
+                ..
             } => (
                 "RelationalJoin",
                 vec![left, right],

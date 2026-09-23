@@ -7,7 +7,7 @@ edition.workspace = true
 # Internal crates (workspace)
 asap_types.workspace = true
 asap-physical-operators.workspace = true
-asap_sketch_codec = { path = "../crates/asap_sketch_codec" }
+asap_sketch_codec.workspace = true
 # Phase 9: the control plane is now an in-process library inside the
 # backend binary. Wiring up the in-process OpAMP server + capability-map
 # exposure is a follow-up after Phase 4 (centralized series_id
@@ -65,7 +65,7 @@ prometheus = "0.13"
 lazy_static = "1.4"
 reqwest.workspace = true
 tracing-appender = "0.2"
-asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
+asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "026cd18c7b8c23ae6c46d4d683151ba562b8cd3a" }
 # Generic MessagePack codec for decoding the heap-bearing CountSketch
 # DELTA-HEAP wire frame (`MSGPACK_DELTA`) directly in the backend, WITHOUT
 # adding a delta API to the public `asap_sketchlib`: the frame is decoded
