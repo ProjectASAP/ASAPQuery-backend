@@ -8,9 +8,6 @@
 pub mod current_series;
 pub mod residual;
 
-#[deprecated(note = "Use query_plan::residual")]
-pub use residual as logical;
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use planner_types::post_asap::SketchQuery;

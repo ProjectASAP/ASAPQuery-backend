@@ -66,7 +66,7 @@ pub fn artifact_from_materializations(
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), configs, &["fixture".into()]).unwrap();
     precompute.summary_catalog = Some(catalog.reference().unwrap());
-    let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
+    let mut transmission = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute,
         &BTreeMap::new(),

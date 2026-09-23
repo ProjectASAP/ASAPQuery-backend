@@ -1,6 +1,6 @@
 //! Maintained current-value populations, shared independently of q and k.
 use super::{
-    logical::{Grouping, LabelMatcher},
+    residual::{Grouping, LabelMatcher},
     QueryPlanError,
 };
 use serde::{Deserialize, Serialize};
