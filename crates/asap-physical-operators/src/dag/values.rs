@@ -263,10 +263,19 @@ fn validate_state(family: &SummaryFamilyType, state: &dyn AggregateCore) -> Resu
     use planner_types::post_asap::SketchParams;
     validate_family(family)?;
     let valid = match family {
-        SummaryFamilyType::ExactAggregate(..) => state
-            .as_any()
-            .downcast_ref::<ExactAccumulator>()
-            .is_some_and(|s| s.family() == family && !s.is_keyed()),
+        SummaryFamilyType::ExactAggregate(..) => {
+            state
+                .as_any()
+                .downcast_ref::<ExactAccumulator>()
+                .is_some_and(|s| s.family() == family && !s.is_keyed())
+                || (matches!(
+                    family,
+                    SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Sum,
+                        planner_types::post_asap::ExactParams::Sum
+                    )
+                ) && state.as_any().is::<crate::accumulators::SumAccumulator>())
+        }
         SummaryFamilyType::Sketch(kind, _) => match kind.params() {
             SketchParams::Kll { k } => state
                 .as_any()

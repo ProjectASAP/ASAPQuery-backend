@@ -513,3 +513,5 @@ pub mod values;
 mod tests;
 
 pub mod planner;
+
+pub mod batch_execution;

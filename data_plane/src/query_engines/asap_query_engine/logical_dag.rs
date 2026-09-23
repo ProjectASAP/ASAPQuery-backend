@@ -233,6 +233,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         node: &QueryPlanNode,
         inputs: &[Value],
         dependencies: &[(QueryNodeId, i64)],
+        context: &physical::RunContext,
     ) -> Result<Value, EngineError> {
         if let Some(leaf) = self.leaves.get(&(id, at)) {
             if leaf.remote {
@@ -246,7 +247,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             return Ok(value);
         }
         let value = match node.clone() {
-            QueryPlanNode::Scalar { value } => Value::Scalar(value),
+            QueryPlanNode::Scalar { value } => Value::Scalar(native_scalar(value, context)?),
             QueryPlanNode::Logical {
                 operator: ResidualQueryOperator::CurrentSeries { .. },
                 ..
@@ -268,7 +269,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
                     ));
                 }
-                self.logical(operator, inputs, dependencies, at)?
+                self.logical(operator, inputs, dependencies, at, context)?
             }
             QueryPlanNode::MembershipFilter { completeness, .. } => {
                 let [candidates, values] = inputs else {
@@ -298,6 +299,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         inputs: &[Value],
         dependencies: &[(QueryNodeId, i64)],
         at: i64,
+        context: &physical::RunContext,
     ) -> Result<Value, EngineError> {
         let input = |index: usize| {
             inputs
@@ -316,34 +318,22 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             ResidualQueryOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
-            ResidualQueryOperator::UnaryNegate => match input(0)? {
-                Value::Scalar(value) => Ok(Value::Scalar(-value)),
-                Value::Vector(values) => Ok(Value::Vector(
-                    values
-                        .into_iter()
-                        .map(|(labels, value)| (labels, -value))
-                        .collect(),
-                )),
-                _ => Err(miss("cannot negate range vector")),
-            },
-            ResidualQueryOperator::VectorToScalar => {
-                let values = vector(input(0)?)?;
-                Ok(Value::Scalar(if values.len() == 1 {
-                    values[0].1
-                } else {
-                    f64::NAN
-                }))
-            }
+            ResidualQueryOperator::UnaryNegate => negate(input(0)?, context),
+            ResidualQueryOperator::VectorToScalar => vector_to_scalar(vector(input(0)?)?, context),
             ResidualQueryOperator::Aggregate {
                 operation,
                 grouping,
             } => {
                 let values = vector(input(0)?)?;
-                Ok(Value::Vector(aggregate(operation, &grouping, values)))
+                Ok(Value::Vector(aggregate(
+                    operation, &grouping, values, context,
+                )?))
             }
             ResidualQueryOperator::TopKSelection { k, grouping } => {
                 let values = vector(input(0)?)?;
-                Ok(Value::Vector(topk_selection(k, &grouping, values)))
+                Ok(Value::Vector(topk_selection(
+                    k, &grouping, values, context,
+                )?))
             }
             ResidualQueryOperator::Binary {
                 operation,
@@ -414,23 +404,11 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                         .collect(),
                 ))
             }
-            ResidualQueryOperator::Sort { descending } => {
-                let mut values = vector(input(0)?)?;
-                values.sort_by(|a, b| {
-                    if a.1.is_nan() && b.1.is_nan() {
-                        std::cmp::Ordering::Equal
-                    } else if a.1.is_nan() {
-                        std::cmp::Ordering::Greater
-                    } else if b.1.is_nan() {
-                        std::cmp::Ordering::Less
-                    } else if descending {
-                        b.1.total_cmp(&a.1)
-                    } else {
-                        a.1.total_cmp(&b.1)
-                    }
-                });
-                Ok(Value::Vector(values))
-            }
+            ResidualQueryOperator::Sort { descending } => Ok(Value::Vector(sort_values(
+                vector(input(0)?)?,
+                descending,
+                context,
+            )?)),
             ResidualQueryOperator::HistogramQuantile => {
                 let Value::Scalar(quantile) = input(0)? else {
                     return Err(miss("quantile requires scalar"));
@@ -571,7 +549,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
     fn start<'a>(
         &'a self,
         inputs: Vec<physical::Input<'a, Value>>,
-        _: physical::RunContext,
+        context: physical::RunContext,
     ) -> Result<physical::OutputStream<'a, Value>, physical::Error> {
         Ok(futures::stream::once(async move {
             let values =
@@ -584,7 +562,14 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
             let values = values.iter().map(|v| v.value().clone()).collect::<Vec<_>>();
             self.runtime
                 .borrow_mut()
-                .execute_node(self.id, self.time, self.node, &values, &self.dependencies)
+                .execute_node(
+                    self.id,
+                    self.time,
+                    self.node,
+                    &values,
+                    &self.dependencies,
+                    &context,
+                )
                 .map_err(|error| {
                     *self.error.borrow_mut() = Some(error);
                     physical::Error::Operator(format!(
@@ -628,42 +613,221 @@ fn membership_filter(
     Ok((selected, warning))
 }
 
-fn aggregate(operation: Aggregation, grouping: &Grouping, values: Vector) -> Vector {
-    let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
-    for (labels, value) in values {
-        let key = labels
-            .into_iter()
-            .filter(|(key, _)| {
-                if grouping.without {
-                    key != "__name__" && !grouping.labels.contains(key)
-                } else {
-                    grouping.labels.contains(key)
-                }
-            })
-            .collect();
-        groups.entry(key).or_default().push(value);
+fn native_scalar(value: f64, context: &physical::RunContext) -> Result<f64, EngineError> {
+    use physical::{batch_execution::evaluate_source, operators::Operator, values::Value as Cell};
+    let source = Operator::scalar(
+        Cell::Float64(value),
+        planner_types::pre_asap::DataType::Float64,
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    let batches = evaluate_source(source, context.clone()).map_err(|e| miss(e.to_string()))?;
+    match batches
+        .first()
+        .and_then(|b| b.rows().first())
+        .and_then(|r| r.first())
+    {
+        Some(Cell::Float64(value)) => Ok(*value),
+        _ => Err(miss("native scalar source returned invalid output")),
     }
-    groups
+}
+
+fn native_labels(labels: &Labels) -> physical::values::Value {
+    physical::values::Value::Map(
+        labels
+            .iter()
+            .map(|(k, v)| {
+                (
+                    physical::values::Value::Utf8(k.as_str().into()),
+                    physical::values::Value::Utf8(v.as_str().into()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    )
+}
+fn native_vector_batch(
+    values: Vector,
+    grouping: &Grouping,
+) -> Result<physical::values::Batch, EngineError> {
+    use physical::values::{Batch, Value as Cell};
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::DataType,
+    };
+    let label_type = DataType::Map {
+        key: Box::new(DataType::Utf8),
+        value: Box::new(DataType::Utf8),
+        value_nullable: false,
+    };
+    let schema = std::sync::Arc::new(SummarySchema {
+        fields: vec![
+            ("labels", label_type.clone()),
+            ("group", label_type),
+            ("value", DataType::Float64),
+        ]
         .into_iter()
-        .map(|(labels, values)| {
-            let value = match operation {
-                Aggregation::Sum => values.iter().sum(),
-                Aggregation::Avg => values.iter().sum::<f64>() / values.len() as f64,
-                Aggregation::Count => values.len() as f64,
-                Aggregation::Max => {
-                    values
-                        .into_iter()
-                        .fold(f64::NAN, |a, b| if a.is_nan() || b > a { b } else { a })
-                }
-                Aggregation::Min => {
-                    values
-                        .into_iter()
-                        .fold(f64::NAN, |a, b| if a.is_nan() || b < a { b } else { a })
+        .map(|(name, dtype)| SummaryField {
+            name: name.into(),
+            dtype: SummaryFamilyType::Plain(dtype),
+            nullable: false,
+        })
+        .collect(),
+        time_index: None,
+    });
+    let rows = values
+        .into_iter()
+        .map(|(labels, value)| {
+            vec![
+                native_labels(&labels),
+                native_labels(&grouping_key(&labels, grouping)),
+                Cell::Float64(value),
+            ]
+        })
+        .collect();
+    Batch::try_new(schema, rows).map_err(|e| miss(e.to_string()))
+}
+fn native_batch_rows(
+    batch: physical::values::Batch,
+    ops: Vec<physical::operators::Operator>,
+    context: &physical::RunContext,
+) -> Result<Vec<Vec<physical::values::Value>>, EngineError> {
+    physical::batch_execution::evaluate_batch(batch, ops, context.clone())
+        .map(|batches| {
+            batches
+                .into_iter()
+                .flat_map(|batch| batch.rows().to_vec())
+                .collect()
+        })
+        .map_err(|e| miss(e.to_string()))
+}
+fn native_vector_output(
+    rows: Vec<Vec<physical::values::Value>>,
+    label_column: usize,
+    value_column: usize,
+) -> Result<Vector, EngineError> {
+    use physical::values::Value as Cell;
+    rows.into_iter()
+        .map(|row| {
+            let Some(Cell::Map(entries)) = row.get(label_column) else {
+                return Err(miss("native operator returned invalid labels"));
+            };
+            let labels = entries
+                .iter()
+                .map(|(k, v)| match (k, v) {
+                    (Cell::Utf8(k), Cell::Utf8(v)) => Ok((k.to_string(), v.to_string())),
+                    _ => Err(miss("native label map is not Utf8")),
+                })
+                .collect::<Result<Labels, _>>()?;
+            let value = match row.get(value_column) {
+                Some(Cell::Float64(value)) => *value,
+                Some(Cell::Int64(value)) if value.unsigned_abs() <= (1u64 << 53) => *value as f64,
+                _ => {
+                    return Err(miss(
+                        "native result is not representable in the query Float64 protocol",
+                    ))
                 }
             };
-            (labels, value)
+            Ok((labels, value))
         })
         .collect()
+}
+fn aggregate(
+    operation: Aggregation,
+    grouping: &Grouping,
+    values: Vector,
+    context: &physical::RunContext,
+) -> Result<Vector, EngineError> {
+    use physical::operators::{Operator, Reduction};
+    let batch = native_vector_batch(values, grouping)?;
+    let reduction = match operation {
+        Aggregation::Sum => Reduction::Sum(2),
+        Aggregation::Avg => Reduction::Avg(2),
+        Aggregation::Count => Reduction::Count,
+        Aggregation::Max => Reduction::Max(2),
+        Aggregation::Min => Reduction::Min(2),
+    };
+    let operator = Operator::aggregate(
+        batch.schema().clone(),
+        vec![1],
+        vec![("value".into(), reduction)],
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
+}
+fn sort_values(
+    values: Vector,
+    descending: bool,
+    context: &physical::RunContext,
+) -> Result<Vector, EngineError> {
+    use physical::operators::{Operator, SortKey};
+    let batch = native_vector_batch(
+        values,
+        &Grouping {
+            labels: vec![],
+            without: false,
+        },
+    )?;
+    let operator = Operator::sort(
+        batch.schema().clone(),
+        vec![SortKey {
+            column: 2,
+            descending,
+            nulls_first: false,
+        }],
+        vec![],
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 2)
+}
+fn negate(value: Value, context: &physical::RunContext) -> Result<Value, EngineError> {
+    use physical::operators::{Expression, Operator};
+    let scalar = matches!(value, Value::Scalar(_));
+    let values = match value {
+        Value::Scalar(v) => vec![(Labels::new(), v)],
+        Value::Vector(v) => v,
+        _ => return Err(miss("cannot negate range vector")),
+    };
+    let batch = native_vector_batch(
+        values,
+        &Grouping {
+            labels: vec![],
+            without: false,
+        },
+    )?;
+    let operator = Operator::project(
+        batch.schema().clone(),
+        vec![
+            ("labels".into(), Expression::Column(0)),
+            (
+                "value".into(),
+                Expression::Negate(Box::new(Expression::Column(2))),
+            ),
+        ],
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    let result = native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)?;
+    Ok(if scalar {
+        Value::Scalar(result[0].1)
+    } else {
+        Value::Vector(result)
+    })
+}
+fn vector_to_scalar(values: Vector, context: &physical::RunContext) -> Result<Value, EngineError> {
+    use physical::{operators::Operator, values::Value as Cell};
+    let batch = native_vector_batch(
+        values,
+        &Grouping {
+            labels: vec![],
+            without: false,
+        },
+    )?;
+    let operator =
+        Operator::vector_to_scalar(batch.schema().clone(), 2).map_err(|e| miss(e.to_string()))?;
+    let rows = native_batch_rows(batch, vec![operator], context)?;
+    match rows.first().and_then(|row| row.first()) {
+        Some(Cell::Float64(value)) => Ok(Value::Scalar(*value)),
+        _ => Err(miss("native scalar conversion returned invalid output")),
+    }
 }
 
 fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
@@ -683,13 +847,31 @@ fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
 /// Select by the child sample value while retaining every selected series'
 /// labels. NaN ranks below every numeric value, matching Prometheus' TOPK heap.
 /// Stable sorting also leaves equal-valued series in the child's order.
-fn topk_selection(k: u64, grouping: &Grouping, values: Vector) -> Vector {
-    asap_physical_operators::rows::grouped_topk(
-        values,
-        usize::try_from(k).unwrap_or(usize::MAX),
-        |(labels, _)| grouping_key(labels, grouping),
-        |(_, value)| *value,
+fn topk_selection(
+    k: u64,
+    grouping: &Grouping,
+    values: Vector,
+    context: &physical::RunContext,
+) -> Result<Vector, EngineError> {
+    use physical::operators::{Operator, SortKey};
+    let batch = native_vector_batch(values, grouping)?;
+    let sort = Operator::sort(
+        batch.schema().clone(),
+        vec![SortKey {
+            column: 2,
+            descending: true,
+            nulls_first: false,
+        }],
+        vec![1],
     )
+    .map_err(|e| miss(e.to_string()))?;
+    let limit = Operator::limit(sort.schema(), k, 0, vec![1]).map_err(|e| miss(e.to_string()))?;
+    let mut output =
+        native_vector_output(native_batch_rows(batch, vec![sort, limit], context)?, 0, 2)?;
+    // The HTTP adapter preserves canonical label-group presentation; native Sort
+    // already determined score order within each group.
+    output.sort_by_key(|(labels, _)| grouping_key(labels, grouping));
+    Ok(output)
 }
 
 fn binary(
@@ -922,6 +1104,18 @@ fn bucket_quantile(q: f64, mut b: Vec<(f64, f64)>) -> f64 {
 }
 
 #[cfg(test)]
+fn test_native_context() -> physical::RunContext {
+    physical::RunContext::new(
+        physical::Scope::Query {
+            evaluation_time_ms: 0,
+            revision: 0,
+        },
+        physical::Limits::default(),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 mod topk_tests {
     use super::*;
     use asap_types::query_plan::{FallbackPolicy, InstantExecution};
@@ -1029,7 +1223,9 @@ mod topk_tests {
                 without: false,
             },
             values,
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].0["pod"], "b");
         assert_eq!(selected[0].1, 9.0);
@@ -1053,7 +1249,9 @@ mod topk_tests {
                 (labels(&[("series", "low")]), -1.0),
                 (labels(&[("series", "high")]), 3.0),
             ],
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         let selected = topk_selection(
             2,
             &Grouping {
@@ -1061,7 +1259,9 @@ mod topk_tests {
                 without: false,
             },
             selected,
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -1346,7 +1546,9 @@ mod topk_tests {
                 without: false,
             },
             selected,
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         assert_eq!(
             selected
                 .iter()

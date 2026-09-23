@@ -34,7 +34,12 @@ pub trait PrecomputeOperatorRegistry<V> {
     fn output_bytes(&self, _value: &V) -> usize {
         std::mem::size_of::<V>().max(1)
     }
-    fn execute(&self, node: &ExecutableDagNode, inputs: &[Arc<V>]) -> Result<V, Self::Error>;
+    fn execute(
+        &self,
+        node: &ExecutableDagNode,
+        inputs: &[Arc<V>],
+        context: execution::RunContext,
+    ) -> Result<V, Self::Error>;
 }
 
 /// Atomic persistence boundary. Implementations must return the already
@@ -301,7 +306,7 @@ impl<V, R: PrecomputeOperatorRegistry<V>>
     fn start<'a>(
         &'a self,
         inputs: Vec<execution::Input<'a, Arc<V>>>,
-        _: execution::RunContext,
+        context: execution::RunContext,
     ) -> Result<execution::OutputStream<'a, Arc<V>>, execution::Error> {
         Ok(futures::stream::once(async move {
             if let Some(source) = &self.source {
@@ -319,7 +324,7 @@ impl<V, R: PrecomputeOperatorRegistry<V>>
                 .map(|value| Arc::clone(value.value()))
                 .collect::<Vec<_>>();
             self.registry
-                .execute(self.node, &values)
+                .execute(self.node, &values, context)
                 .map(Arc::new)
                 .map_err(|e| {
                     *self.error.borrow_mut() = Some(e);
@@ -424,6 +429,7 @@ mod tests {
             &self,
             node: &ExecutableDagNode,
             inputs: &[Arc<u32>],
+            _context: execution::RunContext,
         ) -> Result<u32, Self::Error> {
             *self.0.lock().unwrap().entry(node.id.0).or_default() += 1;
             Ok(node.id.0 + inputs.iter().map(|v| **v).sum::<u32>())
@@ -502,6 +508,7 @@ mod tests {
                 &self,
                 node: &ExecutableDagNode,
                 inputs: &[Arc<u32>],
+                _context: execution::RunContext,
             ) -> Result<u32, String> {
                 match node.id.0 {
                     0 => Ok(10),
@@ -599,13 +606,14 @@ mod tests {
                 &self,
                 node: &ExecutableDagNode,
                 inputs: &[Arc<u32>],
+                context: execution::RunContext,
             ) -> Result<u32, String> {
                 assert_ne!(
                     node.id,
                     PostAsapNodeId(0),
                     "absorbed source subtree must not execute"
                 );
-                self.0.execute(node, inputs)
+                self.0.execute(node, inputs, context)
             }
         }
         let mut raw = node(0);
