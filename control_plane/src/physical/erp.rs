@@ -1454,7 +1454,7 @@ mod tests {
         ))
         .unwrap();
         let mut query = fixture["query_workload"]["repeating_queries"][3].clone();
-        query["query"] = "distinct_over_time(asap_demo_latency_ms[5s])".into();
+        query["query"] = "quantile_over_time(0.9,asap_demo_latency_ms[5s])".into();
         query["requirements"]["accuracy"] = serde_json::json!({"explicit":{"Epsilon":0.05}});
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([query]);
         let snapshot: crate::physical::compiler::BackendLocalPlanningInput =
@@ -1465,15 +1465,27 @@ mod tests {
         )
         .compile_promql()
         .unwrap();
+        // Catalog resolution is independent of Planner selection. Build an
+        // HLL catalog fixture from a compiled source identity; production
+        // selection cannot deploy HLL without a known confidence guarantee.
+        let mut materialization = plan.precompute_plan.materializations[0].clone();
+        materialization.aggregation_type = asap_types::AggregationType::HLL;
+        materialization.parameters =
+            serde_json::from_value(serde_json::json!({"precision": 14})).unwrap();
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+            plan.summary_catalog.plan_id,
+            plan.summary_catalog.plan_version,
+            &[materialization],
+        )
+        .unwrap();
         let (mut policy, mut observed) = online_population_fixture();
-        observed.catalog_generation = plan.summary_catalog.reference().unwrap();
-        observed.summary_definition_id = *plan.summary_catalog.definitions.keys().next().unwrap();
+        observed.catalog_generation = catalog.reference().unwrap();
+        observed.summary_definition_id = *catalog.definitions.keys().next().unwrap();
         observed.input_semantics =
             asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue;
         policy.observed_populations = Some(observed.clone());
-        policy.resolve_population_data_descriptor(Some(&plan.summary_catalog));
-        let expected =
-            &plan.summary_catalog.definitions[&observed.summary_definition_id].data_descriptor_id;
+        policy.resolve_population_data_descriptor(Some(&catalog));
+        let expected = &catalog.definitions[&observed.summary_definition_id].data_descriptor_id;
         assert_eq!(
             &policy.resolved_data_descriptor.as_ref().unwrap().id,
             expected

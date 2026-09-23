@@ -521,10 +521,15 @@ pub(crate) fn selected_residual_nodes(
             ) else {
                 continue;
             };
-            let Ok(witness) = crate::planner_selection::select_summary_default(&canonical) else {
-                continue;
+            // Match provenance against all exact candidates. Do not make a
+            // second selection or assume the first enumerated candidate won.
+            use asap_aware_mapping::{
+                Replacement, ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
             };
-            if witness.as_ref() == selected {
+            let root = std::rc::Rc::new(canonical);
+            let candidates = SketchAlgorithmStrategy::new(&asap_aware_mapping::DefaultCostModel)
+                .replacements(&TargetSubDAG::new(&root));
+            if candidates.iter().any(|candidate| matches!(&candidate.replacement, Replacement::Summary(node) if node.as_ref() == selected)) {
                 let mut lower = Lower {
                     nodes: BTreeMap::new(),
                     seen: BTreeMap::new(),
@@ -579,7 +584,7 @@ mod hybrid_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
         let entry = crate::query_plan::compile_bound_composable_mapped(
             "hybrid".into(),
             query.into(),
@@ -662,7 +667,7 @@ mod hybrid_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
         assert!(
             selected_residual_nodes("sum_over_time(m{job=\"worker\"}[5m])", &selected).is_err()
         );
@@ -792,7 +797,18 @@ mod planner_workload_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        use asap_aware_mapping::{
+            Replacement, ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
+        };
+        let root = std::rc::Rc::new(canonical);
+        let candidates = SketchAlgorithmStrategy::new(&asap_aware_mapping::DefaultCostModel)
+            .replacements(&TargetSubDAG::new(&root));
+        let [candidate] = candidates.as_slice() else {
+            panic!("expected one exact aggregate candidate")
+        };
+        let Replacement::Summary(selected) = &candidate.replacement else {
+            panic!("expected exact summary fixture")
+        };
         let operator = selected_aggregate_operator(query, &selected).unwrap();
         assert!(matches!(
             operator,
@@ -811,13 +827,13 @@ mod planner_workload_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
         let maximum = crate::query_parser::parse_query_expr_canonical(
             "max(m)",
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let maximum = crate::planner_selection::select_summary_default(&maximum).unwrap();
+        let maximum = crate::planner_selection::plan_test_query(&maximum).unwrap();
         let result = selected_residual_nodes("min(m) + max(m)", &selected);
         if selected == maximum {
             assert!(result.is_err());
@@ -919,7 +935,7 @@ mod range_max_materialization_tests {
                 planner_types::types::AccuracyTarget::Exact,
             )
             .unwrap();
-            let selected = crate::planner_selection::select_summary_default(&original).unwrap();
+            let selected = crate::planner_selection::plan_test_query(&original).unwrap();
             let key = selected_range_max_materialization(query, &selected)
                 .unwrap()
                 .unwrap();
@@ -939,7 +955,7 @@ mod range_max_materialization_tests {
                 planner_types::types::AccuracyTarget::Exact,
             )
             .unwrap();
-            let selected = crate::planner_selection::select_summary_default(&original).unwrap();
+            let selected = crate::planner_selection::plan_test_query(&original).unwrap();
             assert!(
                 selected_range_max_materialization(query, &selected)
                     .unwrap()
@@ -950,7 +966,7 @@ mod range_max_materialization_tests {
     }
 }
 
-/// Stable contract identity used by priced physical alternatives, independent of node IDs.
+/// Stable contract identity used by priced physical candidates, independent of node IDs.
 fn materialization_candidate_key(
     candidate: MaterializationCandidateIdentity,
 ) -> Result<String, QueryPlanError> {
@@ -1332,7 +1348,7 @@ mod remote_boundary_regressions {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&parsed).unwrap();
+        let selected = crate::planner_selection::plan_test_query(&parsed).unwrap();
         assert_eq!(
             eligible_materialization_keys(query, &selected)
                 .unwrap()
@@ -1341,9 +1357,6 @@ mod remote_boundary_regressions {
         );
     }
 }
-
-#[deprecated(note = "Use eligible_materialization_keys")]
-pub use eligible_materialization_keys as materialization_candidate_keys;
 
 #[cfg(test)]
 mod tests {
