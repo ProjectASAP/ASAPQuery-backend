@@ -391,15 +391,7 @@ impl QueryPlanEntry {
                     ));
                 }
             }
-            if let QueryPlanNode::CandidateTopK {
-                k, completeness, ..
-            } = node
-            {
-                if *k == 0 {
-                    return Err(QueryPlanError::Invalid(
-                        "CandidateTopK requires k > 0".into(),
-                    ));
-                }
+            if let QueryPlanNode::MembershipFilter { completeness, .. } = node {
                 if matches!(
                     completeness,
                     CandidateCompleteness::Certified { guarantee }
@@ -409,7 +401,7 @@ impl QueryPlanEntry {
                             || guarantee.failure_probability.evaluate().is_none()
                 ) {
                     return Err(QueryPlanError::Invalid(
-                        "invalid CandidateTopK completeness certificate".into(),
+                        "invalid MembershipFilter completeness certificate".into(),
                     ));
                 }
             }
@@ -613,13 +605,11 @@ pub enum QueryPlanNode {
     SummaryMerge {
         inputs: Vec<QueryNodeId>,
     },
-    /// Use an approximate heap only as a membership sidecar, then rerank the
-    /// matching exact counter readouts. `inputs[0]` is candidate membership;
-    /// `inputs[1]` is the authoritative exact value vector.
-    CandidateTopK {
+    /// Semijoin value rows against membership identities, preserving their values
+    /// and order. Inputs are membership and authoritative values respectively.
+    /// Ranking, grouping and limiting are separate downstream operators.
+    MembershipFilter {
         inputs: [QueryNodeId; 2],
-        k: u64,
-        grouping: residual::Grouping,
         completeness: CandidateCompleteness,
     },
     /// An exact subtree evaluated outside ASAP. Its results enter the query DAG
@@ -677,7 +667,7 @@ impl QueryPlanNode {
                 ExactReadout::Max => "exact_readout/max",
             },
             Self::SummaryMerge { .. } => "summary_merge",
-            Self::CandidateTopK { .. } => "candidate_top_k",
+            Self::MembershipFilter { .. } => "membership_filter",
             Self::ExternalExact { .. } => "external_exact",
             Self::ExactFallback { .. } => "exact_fallback",
         }
@@ -753,10 +743,7 @@ impl QueryPlanNode {
             },
             Self::ExactReadout { readout, .. } => format!("readout={readout:?}"),
             Self::SummaryMerge { .. } => String::new(),
-            Self::CandidateTopK { k, grouping, .. } => format!(
-                "k={k} grouping={}",
-                log_grouping(&grouping.labels, grouping.without)
-            ),
+            Self::MembershipFilter { .. } => String::new(),
             Self::ExternalExact { .. } | Self::ExactFallback { .. } => String::new(),
         }
     }
@@ -774,7 +761,7 @@ impl QueryPlanNode {
             Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
-            Self::CandidateTopK { inputs, .. } => inputs,
+            Self::MembershipFilter { inputs, .. } => inputs,
         }
     }
 }

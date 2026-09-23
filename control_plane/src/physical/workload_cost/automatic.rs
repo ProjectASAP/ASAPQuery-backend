@@ -506,7 +506,7 @@ pub(super) fn estimate(
                 Node::ExactReadout { .. }
                 | Node::Binary { .. }
                 | Node::Relational { .. }
-                | Node::CandidateTopK { .. }
+                | Node::MembershipFilter { .. }
                 | Node::Logical { .. } => {
                     input_rows.max(1.0) * input_rows.max(2.0).log2() * CPU_PER_ITEM
                 }
