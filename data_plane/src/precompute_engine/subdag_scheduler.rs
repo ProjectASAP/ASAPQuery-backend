@@ -85,12 +85,11 @@ where
 fn node_syntax(payload: &ExecutableOperatorPayload) -> String {
     let details = match payload {
         ExecutableOperatorPayload::Fallback { .. } => String::new(),
-        ExecutableOperatorPayload::Binary { timing, operator } => {
-            format!("operator={operator:?} timing={timing:?}")
+        ExecutableOperatorPayload::Binary { operator } => {
+            format!("operator={operator:?}")
         }
-        ExecutableOperatorPayload::MembershipFilter { .. } => String::new(),
-        ExecutableOperatorPayload::Value { operation, timing } => {
-            format!("operation={operation:?} timing={timing:?}")
+        ExecutableOperatorPayload::Value { operation } => {
+            format!("operation={operation:?}")
         }
         ExecutableOperatorPayload::RelationalJoin { join_kind, .. } => {
             format!("join_kind={join_kind:?}")
