@@ -7,7 +7,7 @@ older description of a merge-only adapter is obsolete.
 
 ## Plans and runtime capability
 
-Planner emits the actual maintenance-time operations. The control plane binds
+Planner emits the actual ingestion-time operations. The control plane binds
 source and derived `SummaryDefinitionId`s into the existing owned executable
 DAG, then validates the complete PrecomputePlan against SummaryCatalog. Raw
 inputs update raw materializations. Derived configurations must not receive raw
