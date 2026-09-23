@@ -17,7 +17,7 @@ pub fn empty() -> asap_types::plan_publication::PhysicalPlanInstallRequest {
     let mut precompute_plan = PrecomputePlan::build(envelope.clone(), vec![], &[]).unwrap();
     precompute_plan.summary_catalog = Some(catalog.reference().unwrap());
     let mut transmission_plan =
-        compile_transmission_plan(envelope, &precompute_plan, &Default::default()).unwrap();
+        build_transmission_plan(envelope, &precompute_plan, &Default::default()).unwrap();
     transmission_plan.summary_catalog = precompute_plan.summary_catalog.clone();
     asap_types::plan_publication::PhysicalPlanInstallRequest {
         summary_catalog: catalog,
