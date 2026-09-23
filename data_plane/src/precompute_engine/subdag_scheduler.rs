@@ -104,7 +104,7 @@ fn node_syntax(payload: &ExecutableOperatorPayload) -> String {
         ExecutableOperatorPayload::SummarySubtract => String::new(),
         ExecutableOperatorPayload::SummaryDelete { .. } => String::new(),
         ExecutableOperatorPayload::SummaryEstimate { query } => format!("readout={query:?}"),
-        ExecutableOperatorPayload::SummaryMerge { .. } => String::new(),
+        ExecutableOperatorPayload::SummaryMerge => String::new(),
     };
     details.chars().take(256).collect()
 }
