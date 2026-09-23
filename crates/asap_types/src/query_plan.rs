@@ -651,7 +651,7 @@ impl QueryPlanNode {
                     residual::Aggregation::Avg => "logical/aggregate/avg",
                     residual::Aggregation::Count => "logical/aggregate/count",
                 },
-                R::TopKSelection { .. } => "logical/top_k_selection",
+                R::Limit { .. } => "logical/limit",
                 R::Binary { .. } => "logical/binary",
                 R::Temporal { .. } => "logical/temporal",
                 R::Sort { .. } => "logical/sort",
@@ -672,7 +672,6 @@ impl QueryPlanNode {
                 ExactReadout::Max => "exact_readout/max",
             },
             Self::SummaryMerge { .. } => "summary_merge",
-            Self::MembershipFilter { .. } => "membership_filter",
             Self::ExternalExact { .. } => "external_exact",
             Self::ExactFallback { .. } => "exact_fallback",
         }
@@ -710,8 +709,12 @@ impl QueryPlanNode {
                     "operation={operation:?} grouping={}",
                     log_grouping(&grouping.labels, grouping.without)
                 ),
-                R::TopKSelection { k, grouping } => format!(
-                    "k={k} grouping={}",
+                R::Limit {
+                    n,
+                    offset,
+                    grouping,
+                } => format!(
+                    "n={n} offset={offset} grouping={}",
                     log_grouping(&grouping.labels, grouping.without)
                 ),
                 R::Binary {
@@ -719,7 +722,13 @@ impl QueryPlanNode {
                     return_bool,
                 } => format!("operation={operation:?} return_bool={return_bool}"),
                 R::Temporal { operation } => format!("operation={operation:?}"),
-                R::Sort { descending } => format!("descending={descending}"),
+                R::Sort {
+                    descending,
+                    grouping,
+                } => format!(
+                    "descending={descending} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
                 R::Subquery {
                     range_ms,
                     step_ms,
@@ -748,7 +757,6 @@ impl QueryPlanNode {
             },
             Self::ExactReadout { readout, .. } => format!("readout={readout:?}"),
             Self::SummaryMerge { .. } => String::new(),
-            Self::MembershipFilter { .. } => String::new(),
             Self::ExternalExact { .. } | Self::ExactFallback { .. } => String::new(),
         }
     }
