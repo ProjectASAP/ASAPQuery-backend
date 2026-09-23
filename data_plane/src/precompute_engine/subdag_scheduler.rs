@@ -354,7 +354,7 @@ impl<V, R: PrecomputeOperatorRegistry<V>>
                 .map(|value| Arc::clone(value.value()))
                 .collect::<Vec<_>>();
             let started = std::time::Instant::now();
-            tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, syntax = %node_syntax(&self.node.payload), "precompute node started");
+            tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, phase = ?self.node.output_state.timing, syntax = %node_syntax(&self.node.payload), "precompute node started");
             self.registry
                 .execute(self.node, &values, context)
                 .map(|value| {
