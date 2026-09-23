@@ -126,8 +126,8 @@ means an implemented path for the stated subset, not universal support.
 | --- | --- | --- | --- | --- |
 | Raw Scan | Read raw input rows | None | Rejected in installed local query plans | Local raw source; deferred from this PR |
 | Read materialization | Load previously computed state | State decoding kernels; no storage adapter | Catalog/store binding for compatible populations and windows | General raw input access; unavailable or incompatible state cannot be read |
-| Maintain population | Update the current-series population | None | Specialized remote-write ingestion path | General table-row updates and shared implementation |
-| Read population / CurrentSeries | Read current values from a maintained population | None | Installed population identity/capacity and current-series readout | Arbitrary raw-table reading |
+| Maintain current-series state | Update the maintained values and timestamps for incoming time series. | None | Specialized remote-write ingestion path | General table-row updates and shared implementation |
+| Read current-series state | Read values from the maintained time-series state for query execution. | None | Current-series readout using the installed state identity and capacity | Arbitrary raw-table reading |
 | Scalar | Produce a scalar value | No separate scalar-source executor | Typed scalar path | General expression evaluation |
 | Binary | Combine or compare two inputs | Float64 Add/Sub/Mul/Div/Mod/Pow/Atan2 kernels | Query arithmetic, CheckedDiv/FiniteDiv and comparisons; ingestion arithmetic on immutable completed, aligned rows | General coercion, arbitrary PromQL matching and unsupported value domains |
 | Unary negate | Negate a value | No separate adapter | Typed query scalar/vector path | General ingestion adapter |
@@ -150,6 +150,11 @@ means an implemented path for the stated subset, not universal support.
 | Histogram quantile | Calculate a quantile from histogram buckets | No separate histogram adapter | Query path | General ingestion adapter |
 | Subquery | Evaluate an expression over a time grid | DAG memoization support, not the subquery executor | Query path with bounded grids and memoization by node/evaluation time | Unbounded grids and general ingestion adapter |
 | Extension | Execute an additional value operation | No general executor | Unsupported operations may route to explicit fallback | A concrete local implementation for each admitted extension |
+
+The current-series operations maintain and read a set of time series and their
+current values; they do not provide a general raw-table scan or full historical
+read. Their code names are `MaintainPopulation` for updates and `ReadPopulation`
+/ `CurrentSeries` for reads.
 
 External computation (`ExternalExact`, `ExactSubquery`,
 `CandidateExactSubquery`) and fallback are routing choices, not local physical
