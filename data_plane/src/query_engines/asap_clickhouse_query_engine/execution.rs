@@ -204,10 +204,43 @@ impl RelationDagExecutor<'_> {
                 .map_err(|e| e.to_string())?;
         }
         validation.validate(&[root.0]).map_err(|e| e.to_string())?;
+        let context = dag::RunContext::new(
+            dag::Scope::Query {
+                evaluation_time_ms: i64::try_from(self.t1_ms)
+                    .map_err(|_| "evaluation time overflow")?,
+                revision: self.index.summary_update_revision().mutation_sequence(),
+            },
+            dag::Limits::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut storage_roots = BTreeSet::new();
+        for source in &sources {
+            if !matches!(
+                self.entry.nodes[source],
+                QueryPlanNode::ExternalExact { .. }
+            ) {
+                storage_roots.insert(*source);
+                for id in self
+                    .entry
+                    .topological_order_from(*source)
+                    .map_err(|e| e.to_string())?
+                {
+                    if matches!(
+                        self.entry.nodes[&id],
+                        QueryPlanNode::ReadMaterialization { .. }
+                    ) {
+                        storage_roots.insert(id);
+                    }
+                }
+            }
+        }
+        let stored = crate::query_engines::asap_query_engine::post_asap_readout::execute_query_plan_readouts(
+            self.index,self.entry,&storage_roots.into_iter().collect::<Vec<_>>(),self.t0_ms,self.t1_ms,self.is_cumulative,context.clone(),
+        ).map_err(|e|format!("incomplete leaf coverage: {e:?}"))?;
         let mut coverage = None;
         let mut first = true;
         for id in sources {
-            let relation = self.execute_source(id, &schemas[&id])?;
+            let relation = self.execute_source(id, &schemas[&id], &stored)?;
             coverage = if first {
                 first = false;
                 relation.coverage
@@ -229,15 +262,6 @@ impl RelationDagExecutor<'_> {
                 )
                 .map_err(|e| e.to_string())?;
         }
-        let context = dag::RunContext::new(
-            dag::Scope::Query {
-                evaluation_time_ms: i64::try_from(self.t1_ms)
-                    .map_err(|_| "evaluation time overflow")?,
-                revision: self.index.summary_update_revision().mutation_sequence(),
-            },
-            dag::Limits::default(),
-        )
-        .map_err(|e| e.to_string())?;
         let mut output = graph
             .execute(&[root.0], context)
             .map_err(|e| e.to_string())?
@@ -258,6 +282,10 @@ impl RelationDagExecutor<'_> {
         &mut self,
         root: QueryNodeId,
         expected_schema: &planner_types::post_asap::SummarySchema,
+        stored: &BTreeMap<
+            QueryNodeId,
+            crate::query_engines::asap_query_engine::post_asap_readout::PostAsapReadoutOutcome,
+        >,
     ) -> Result<ClickHouseRelation, String> {
         match self.entry.nodes.get(&root) {
             Some(QueryPlanNode::ExternalExact { request, .. }) => {
@@ -282,15 +310,7 @@ impl RelationDagExecutor<'_> {
                     .ok_or_else(|| "published external exact leaf was not prepared".into())
             }
             Some(_) => {
-                let outcome = execute_query_plan_from_readout(
-                    self.index,
-                    self.entry,
-                    root,
-                    self.t0_ms,
-                    self.t1_ms,
-                    self.is_cumulative,
-                )
-                .map_err(|error| format!("incomplete leaf coverage: {error:?}"))?;
+                let outcome = stored.get(&root).ok_or("missing bound storage frontier")?;
                 let reachable = self
                     .entry
                     .topological_order_from(root)
@@ -305,15 +325,9 @@ impl RelationDagExecutor<'_> {
                             _ => None,
                         })
                 {
-                    let leaf_outcome = execute_query_plan_from_readout(
-                        self.index,
-                        self.entry,
-                        leaf_id,
-                        self.t0_ms,
-                        self.t1_ms,
-                        self.is_cumulative,
-                    )
-                    .map_err(|error| format!("incomplete leaf coverage: {error:?}"))?;
+                    let leaf_outcome = stored
+                        .get(&leaf_id)
+                        .ok_or("missing materialization coverage")?;
                     if !binding.covers_range(self.t0_ms, self.t1_ms)
                         || !complete_pane_coverage(
                             leaf_outcome.coverage,
@@ -331,7 +345,7 @@ impl RelationDagExecutor<'_> {
                 }
                 ClickHouseRelation::from_series_rows(
                     expected_schema,
-                    outcome.series,
+                    outcome.series.clone(),
                     outcome.coverage,
                 )
                 .map_err(|error| error.to_string())

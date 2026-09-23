@@ -92,7 +92,7 @@ fn expected_plan(name: &str) -> ExpectedPlan {
             family: Some(ExpectedFamily::Exact(ExactKind::Rate)),
             partitioning: "per_entity",
             readout: "rate",
-            root_operation: Some("top_k_selection"),
+            root_operation: Some("limit"),
         },
         "quantile-ratio" => ExpectedPlan {
             family: None,
@@ -209,7 +209,8 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
         if operation == "aggregate" {
             assert_eq!(node["operator"]["operation"], "sum");
         } else {
-            assert_eq!(node["operator"]["k"], 3, "{name}: wrong TopK limit");
+            assert_eq!(node["operator"]["n"], 3, "{name}: wrong grouped limit");
+            assert_eq!(node["operator"]["offset"], 0);
         }
         assert_eq!(
             node["operator"]["grouping"],
@@ -219,10 +220,24 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
         let inputs = node["inputs"].as_array().unwrap();
         assert_eq!(inputs.len(), 1, "{name}: root must have one input");
         node = &nodes[&inputs[0].to_string()];
+        if operation == "limit" {
+            assert_eq!(node["op"], "logical");
+            assert_eq!(node["operator"]["kind"], "sort");
+            assert_eq!(node["operator"]["descending"], true);
+            assert_eq!(
+                node["operator"]["grouping"],
+                json!({"labels":["label_0"],"without":false})
+            );
+            let inputs = node["inputs"].as_array().unwrap();
+            assert_eq!(inputs.len(), 1);
+            node = &nodes[&inputs[0].to_string()];
+        }
     }
     assert_eq!(
         nodes.len(),
-        if expected.root_operation.is_some() {
+        if expected.root_operation == Some("limit") {
+            4
+        } else if expected.root_operation.is_some() {
             3
         } else {
             2

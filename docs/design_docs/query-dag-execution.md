@@ -45,7 +45,8 @@ flowchart LR
 The installed plan carries deployment bindings and source references. Planner
 operations retain Planner types, parameters, expressions and grouping semantics.
 SQL relation nodes bind through the shared Planner binder and execute in one
-shared DAG. PromQL bindings convert labeled vectors and windows to native
+shared DAG. Their storage frontiers execute together as multiple roots, sharing
+upstream work and the enclosing cancellation and memory budget. PromQL bindings convert labeled vectors and windows to native
 batches; common arithmetic, aggregation, sorting, limiting and temporal
 computation execute in the library. Metric-name presentation and protocol
 matching remain deployment bindings.
