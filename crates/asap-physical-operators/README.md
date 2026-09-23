@@ -1,62 +1,80 @@
 # ASAP physical operators
 
-Shared Rust kernels for ingestion time and query time execution. Used by
-ASAPQuery-backend; other deployments can depend on the `asap-physical-operators`
-package in this Git repository. No backend server, storage implementation,
-background worker, Arrow or DataFusion version is required.
+An independent Rust physical operator DAG runtime shared by ingestion time and
+query time execution. The library requires neither backend engine, a server,
+a storage implementation, Arrow nor DataFusion. DataFusion informed the design;
+it is not the execution framework.
 
-The public `planner` export names the exact Planner types used by the library.
-`capability::validate_summary_kernel` checks family, parameters, update layout
-and grouping without allocating state. `factory::create_planner_accumulator`
-constructs that same kernel. A compiler should validate before accepting the
-operator; a caller then supplies evaluated updates, merges compatible states,
-and invokes the state's typed readout. Neither operation requires persistence.
+`dag::PhysicalDag` binds typed operator inputs to node IDs. Each execution starts
+one producer per reachable node, shares output batches among its consumers, and
+bounds buffering. Dropping one consumer does not cancel other consumers. A
+`RunContext` carries query or ingestion scope, cancellation and byte accounting.
+Executions use the caller's worker and worker-local streams, with no internal
+thread pool. Poll multiple root streams concurrently when they share inputs.
+
+`dag::operators::Operator` implements native batch sources, scalar values,
+projection, filtering, grouped exact aggregation, semi-join, grouped Sort and
+Limit, vector-to-scalar conversion, Union, and summary construction/merge/readout.
+Sort followed by Limit implements grouped ranking; no dedicated TopK physical
+operator is needed. Summary construction updates state batch by batch. End of
+input means the supplied query range or ingestion window is complete.
 
 ```rust
-use asap_physical_operators::{factory::create_planner_accumulator, Statistic};
-use asap_physical_operators::planner::{
-    post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryUpdate},
-    pre_asap::ColumnRef,
+use asap_physical_operators::dag::{
+    operators::{Expression, Operator},
+    values::Value,
+    Limits, PhysicalDag, RunContext, Scope,
 };
+use asap_physical_operators::planner::pre_asap::DataType;
+use futures::{executor::block_on, StreamExt};
 
-let family = SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum);
-let mut operator = create_planner_accumulator(
-    &family,
-    &SummaryUpdate::column(ColumnRef::SampleValue),
-    &Default::default(),
-).unwrap();
-operator.validate_single_input(3.0).unwrap();
-operator.update_single(3.0, 1000);
-let state = operator.into_accumulator();
-assert_eq!(state.query_statistic(Statistic::Sum, &None, &Default::default()).unwrap(), 3.0);
+let source = Operator::scalar(Value::Int64(7), DataType::Int64)?;
+let negate = Operator::project(source.schema(), vec![
+    ("value".into(), Expression::Negate(Box::new(Expression::Column(0)))),
+])?;
+let mut plan = PhysicalDag::default();
+plan.add(0, vec![], source)?;
+plan.add(1, vec![0], negate)?;
+let run = RunContext::new(
+    Scope::Query { evaluation_time_ms: 1000, revision: 1 },
+    Limits::default(),
+)?;
+let mut output = plan.execute(&[1], run)?.remove(0);
+let batch = block_on(output.next()).unwrap()?;
+assert!(matches!(batch.rows()[0][0], Value::Int64(-7)));
+# Ok::<(), asap_physical_operators::dag::Error>(())
 ```
 
-The crate contains exact and sketch accumulators, common state traits, the
-Planner-family factory, Float64 arithmetic and synchronous/asynchronous
-QueryPlan DAG traversal. Unsupported kernel families are errors. It does not
-infer new plans, choose a fallback engine, promise arbitrary SQL/PromQL support,
-or change the execution phase encoded by Planner. Kernel availability does not
-certify an accuracy guarantee; Planner and the deployment must still validate
-the requested accuracy and evidence scope.
+`dag::planner::bind` accepts a post-ASAP DAG and explicit source bindings for
+installed ingestion/storage frontiers. It rejects unsupported operations and
+schema mismatches before starting a source. Implement `PhysicalOperator` for a
+deployment source, including asynchronous I/O; computation operators remain in
+the library. The public `planner` export identifies the exact Planner types used
+by the crate. The native binder currently supports a subset of those types and
+operations; it does not interpret an unknown node as external fallback.
 
-Deployment adapters supply storage, source rows, time/population scope, expression
-evaluation, I/O and output representation. Planner's current maintenance-only
-summary placement and the backend's missing local raw Scan remain separate
-integration limitations; exporting these kernels does not silently bypass them.
+Plain values preserve Planner scalar/collection types and nullability. Numeric
+arithmetic uses matching Int64 or Float64 inputs; integer overflow is an error.
+Boolean predicates use three-valued logic. Native summary states currently cover
+exact Sum/Count/Min/Max/Rate/Increase, KLL, DDSketch and HLL. Binding checks family,
+parameters and readout compatibility; source batches also validate state payloads.
+Existing accumulator algorithms are reused as kernels behind these operators.
 
-## Composable row operators
+Both backend ingestion DAG execution and installed query DAG execution use this
+runtime. Some installed value/storage adapters still provide backend-specific
+computation; they have not all been replaced by native batch bindings. Local raw
+Scan remains deferred. See the [design and coverage table](../../docs/design_docs/query-dag-execution.md)
+for the distinction between native operator support and backend integration.
 
-`rows::membership_filter` performs a value-preserving semijoin and reports
-missing membership keys. `rows::grouped_topk` independently ranks rows within
-groups, retaining input order for ties and placing NaN after numeric values.
-Neither kernel knows about sketches, storage, execution phase or external
-queries. The deployment enforces the pruning certificate; filtering and ranking
-remain separate operations in the installed graph.
+The default limits are eight buffered batches per producer and 64 MiB of estimated
+retained execution data. Callers can set both through `Limits`. Accounting includes
+consumer-held outputs and reserved operator state, but is not a hard RSS cap or an
+allocator hook. Source-owned data and temporary allocation peaks are excluded.
+Blocking operators have no spill support. Plan depth is limited to 128. No execution
+state is shared between runs, and no implicit fallback or legacy traversal API is
+provided.
 
-## Shared DAG execution design
-
-The target is an independently implemented ASAP DAG runtime and physical
-operator library used by both the precompute engine and the query engine.
-DataFusion is a design reference, not the execution framework. The current kernels and backend-driven traversal are not yet
-that implementation. See the [design document](../../docs/design_docs/query-dag-execution.md)
-for operator responsibilities, engine integration, and shared-dependency semantics.
+Run `cargo test -p asap-physical-operators --locked` for the independent library
+acceptance tests, including shared producers, backpressure, cancellation, grouping,
+state restoration and raw/partial/fully precomputed DAG examples. These examples
+supply in-memory batches; they do not establish backend local raw-Scan support.

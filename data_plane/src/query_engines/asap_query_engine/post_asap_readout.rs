@@ -6,7 +6,8 @@ use asap_physical_operators::arithmetic::evaluate_float64_arithmetic as arithmet
 
 use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
 
-use asap_physical_operators::query_dag::{self, QueryNodeRuntime};
+use asap_physical_operators::dag::{self, PhysicalOperator};
+use futures::StreamExt;
 /// A planned warm query cannot be served; callers may route to an exact backend.
 #[derive(Debug)]
 pub enum LoweringSkip {
@@ -115,16 +116,13 @@ struct PhysicalQueryRuntime<'a> {
     context: QueryExecutionContext<'a>,
 }
 
-impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
-    type Output = PhysicalQueryOutput;
-    type Error = PhysicalNodeError;
-
+impl PhysicalQueryRuntime<'_> {
     fn execute_node(
         &self,
         _id: QueryNodeId,
         node: &QueryPlanNode,
-        inputs: &[Self::Output],
-    ) -> Result<Self::Output, Self::Error> {
+        inputs: &[PhysicalQueryOutput],
+    ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
         match node {
             QueryPlanNode::Scalar { value } => Ok(PhysicalQueryOutput::Scalar(*value)),
             QueryPlanNode::Binary { operator, .. } => {
@@ -533,6 +531,129 @@ fn execute_physical_query_plan(
     execute_physical_query_payload(index, entry, entry.root, t0_ms, t1_ms, is_cumulative)
 }
 
+// Store adapters retain backend coverage/population metadata; dependency execution
+// and shared-node lifetime are owned by the independent physical DAG runtime.
+struct BoundQueryOperator<'a, 'store> {
+    id: QueryNodeId,
+    node: &'a QueryPlanNode,
+    runtime: &'a PhysicalQueryRuntime<'store>,
+}
+impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
+    fn name(&self) -> &str {
+        "InstalledQueryOperator"
+    }
+    fn input_schemas(&self) -> Vec<()> {
+        vec![(); self.node.inputs().len()]
+    }
+    fn output_schema(&self) {}
+    fn output_bytes(&self, value: &PhysicalQueryOutput) -> usize {
+        match value {
+            PhysicalQueryOutput::Scalar(_) => 8,
+            PhysicalQueryOutput::State {
+                groups,
+                item_labels,
+            } => {
+                groups
+                    .iter()
+                    .map(|(labels, state)| {
+                        labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                            + match state {
+                                GroupState::Sketch { entries, .. } => entries
+                                    .iter()
+                                    .flat_map(|entry| entry.samples.values())
+                                    .flatten()
+                                    .map(|sample| {
+                                        sample.bytes.len() + std::mem::size_of_val(sample)
+                                    })
+                                    .sum::<usize>(),
+                                GroupState::ExactAgg { entries, .. } => entries
+                                    .iter()
+                                    .flat_map(|entry| entry.values())
+                                    .map(|state| state.approx_memory_bytes() + 8)
+                                    .sum::<usize>(),
+                            }
+                    })
+                    .sum::<usize>()
+                    + item_labels.iter().map(String::len).sum::<usize>()
+            }
+            PhysicalQueryOutput::Value(values, _) => values
+                .iter()
+                .map(|(labels, value)| {
+                    labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                        + match value {
+                            SummaryValue::Points(points, _) => {
+                                points.len() * std::mem::size_of::<(i64, f64)>()
+                            }
+                            SummaryValue::TopK(points, _) => points
+                                .iter()
+                                .map(|(_, items)| {
+                                    8 + items.iter().map(|(key, _)| key.len() + 8).sum::<usize>()
+                                })
+                                .sum::<usize>(),
+                        }
+                })
+                .sum(),
+        }
+    }
+    fn start<'a>(
+        &'a self,
+        inputs: Vec<dag::Input<'a, PhysicalQueryOutput>>,
+        _: dag::RunContext,
+    ) -> Result<dag::OutputStream<'a, PhysicalQueryOutput>, dag::Error> {
+        Ok(futures::stream::once(async move {
+            let values =
+                futures::future::try_join_all(inputs.into_iter().map(|mut input| async move {
+                    input.next().await.ok_or_else(|| {
+                        dag::Error::Operator("query input produced no value".into())
+                    })?
+                }))
+                .await?;
+            let values = values
+                .iter()
+                .map(|value| value.value().clone())
+                .collect::<Vec<_>>();
+            self.runtime
+                .execute_node(self.id, self.node, &values)
+                .map_err(|e| dag::Error::Operator(format!("query node {}: {e}", self.id.0)))
+        })
+        .boxed_local())
+    }
+}
+fn execute_bound_query(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    root: QueryNodeId,
+    runtime: &PhysicalQueryRuntime<'_>,
+    revision: u64,
+) -> Result<PhysicalQueryOutput, dag::Error> {
+    let order = entry
+        .topological_order_from(root)
+        .map_err(|e| dag::Error::Invalid(e.to_string()))?;
+    let mut graph = dag::PhysicalDag::default();
+    for id in order {
+        let node = &entry.nodes[&id];
+        graph.add(
+            id.0,
+            node.inputs().iter().map(|id| id.0).collect(),
+            BoundQueryOperator { id, node, runtime },
+        )?;
+    }
+    let context = dag::RunContext::new(
+        dag::Scope::Query {
+            evaluation_time_ms: i64::try_from(runtime.context.t1_ms)
+                .map_err(|_| dag::Error::Invalid("query time exceeds i64".into()))?,
+            revision,
+        },
+        dag::Limits::default(),
+    )?;
+    let mut root = graph.execute(&[root.0], context)?.remove(0);
+    futures::executor::block_on(async {
+        root.next()
+            .await
+            .ok_or_else(|| dag::Error::Operator("query root produced no value".into()))?
+            .map(|output| output.value().clone())
+    })
+}
+
 fn execute_physical_query_payload(
     index: &SketchStore,
     entry: &asap_types::query_plan::QueryPlanEntry,
@@ -554,8 +675,10 @@ fn execute_physical_query_payload(
                 allowed_materializations: None,
             },
         };
-        let output = query_dag::execute_from(entry, root, &runtime)
-            .map_err(|error| LoweringSkip::ExecuteFailed(format!("{error:?}")))?;
+        let output = execute_bound_query(entry, root, &runtime, revision.mutation_sequence())
+            .map_err(|error| {
+                LoweringSkip::ExecuteFailed(format!("query {}: {error}", entry.query_id))
+            })?;
         match output {
             PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(
                 "scalar-only query is not a warm vector result".into(),

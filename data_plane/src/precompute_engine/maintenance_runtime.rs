@@ -163,6 +163,34 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
         }
     }
 
+    fn output_bytes(&self, value: &MaintenanceValue) -> usize {
+        fn labels(group: &Population) -> usize {
+            group.iter().map(|(k, v)| k.len() + v.len()).sum()
+        }
+        match value {
+            MaintenanceValue::Summary { state, .. } => state.approx_memory_bytes(),
+            MaintenanceValue::SummaryWindows { states, .. } => states
+                .iter()
+                .map(|(group, windows)| {
+                    labels(group)
+                        + windows
+                            .iter()
+                            .map(|(_, state)| 8 + state.approx_memory_bytes())
+                            .sum::<usize>()
+                })
+                .sum(),
+            MaintenanceValue::Rows { values, name, .. } => {
+                name.len()
+                    + values
+                        .iter()
+                        .map(|(group, rows)| {
+                            labels(group) + rows.len() * std::mem::size_of::<(i64, f64)>()
+                        })
+                        .sum::<usize>()
+            }
+        }
+    }
+
     fn execute(
         &self,
         node: &ExecutableDagNode,

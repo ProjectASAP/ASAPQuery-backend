@@ -4,10 +4,13 @@ use crate::query_engines::{
     EngineError,
 };
 use crate::storage_engines::types::KeyByLabelValues;
+use asap_physical_operators::dag as physical;
 use asap_types::query_plan::residual::{
     Aggregation, BinaryOperation, Grouping, ResidualQueryOperator, TemporalOperation,
 };
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
+use futures::{FutureExt, StreamExt};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 type Labels = BTreeMap<String, String>;
@@ -104,17 +107,91 @@ fn execute_values<F>(
 where
     F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
 {
-    let mut evaluator = Evaluator {
+    let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
+    let runtime = RefCell::new(ValueRuntime {
         entry,
         leaves,
         callback,
         stats: ExecutionStats::default(),
-        memo: BTreeMap::new(),
-        active: BTreeSet::new(),
-        warnings: Vec::new(),
+        warnings: vec![],
+    });
+    let error = RefCell::new(None);
+    let mut graph = physical::PhysicalDag::default();
+    let mut identities = BTreeMap::from([((entry.root, at_signed), 0u64)]);
+    let mut pending = vec![(entry.root, at_signed)];
+    let mut depths = BTreeMap::from([((entry.root, at_signed), 1usize)]);
+    while let Some((id, time)) = pending.pop() {
+        let node = entry
+            .nodes
+            .get(&id)
+            .ok_or_else(|| miss("missing installed node"))?;
+        let dependencies = if leaves.contains_key(&(id, time)) {
+            vec![]
+        } else {
+            expanded_inputs(node, time)?
+        };
+        let mut input_ids = Vec::new();
+        for dependency in &dependencies {
+            if let Some(id) = identities.get(dependency) {
+                runtime.borrow_mut().stats.memo_hits += 1;
+                input_ids.push(*id);
+            } else {
+                if identities.len() >= 200_000 {
+                    return Err(miss("installed DAG evaluation budget exceeded"));
+                }
+                let depth = depths[&(id, time)] + 1;
+                if depth > 128 {
+                    return Err(miss("installed DAG exceeds execution depth of 128"));
+                }
+                depths.insert(*dependency, depth);
+                let id = identities.len() as u64;
+                identities.insert(*dependency, id);
+                pending.push(*dependency);
+                input_ids.push(id);
+            }
+        }
+        graph
+            .add(
+                identities[&(id, time)],
+                input_ids,
+                BoundValueOperator {
+                    id,
+                    time,
+                    node,
+                    dependencies,
+                    runtime: &runtime,
+                    error: &error,
+                },
+            )
+            .map_err(|error| miss(error.to_string()))?;
+    }
+    let context = physical::RunContext::new(
+        physical::Scope::Query {
+            evaluation_time_ms: at_signed,
+            revision: 0,
+        },
+        physical::Limits::default(),
+    )
+    .map_err(|error| miss(error.to_string()))?;
+    let mut output = graph
+        .execute(&[0], context)
+        .map_err(|error| miss(error.to_string()))?
+        .remove(0);
+    // These adapters have synchronous callbacks and prepared I/O leaves. A
+    // single poll avoids nesting a blocking futures executor inside a readout.
+    let evaluated = match output.next().now_or_never().flatten() {
+        Some(Ok(value)) => value.value().clone(),
+        Some(Err(failure)) => {
+            return Err(error
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| miss(failure.to_string())))
+        }
+        None => return Err(miss("synchronous query adapter did not produce a result")),
     };
-    let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
-    let evaluated = evaluator.eval(entry.root, at_signed)?;
+    drop(output);
+    drop(graph);
+    let mut evaluator = runtime.into_inner();
     if matches!(evaluated, Value::Scalar(_)) {
         // QueryResult currently models vectors/matrices only. Preserve a scalar
         // root's HTTP type by routing it to native, while scalar intermediates
@@ -141,21 +218,22 @@ where
     Ok((output, evaluator.stats))
 }
 
-struct Evaluator<'a, F> {
+struct ValueRuntime<'a, F> {
     entry: &'a QueryPlanEntry,
     leaves: &'a PreparedLeaves,
     stats: ExecutionStats,
     callback: F,
-    memo: BTreeMap<(QueryNodeId, i64), Value>,
-    active: BTreeSet<(QueryNodeId, i64)>,
     warnings: Vec<String>,
 }
-impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'_, F> {
-    fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
-        if let Some(value) = self.memo.get(&(id, at)) {
-            self.stats.memo_hits += 1;
-            return Ok(value.clone());
-        }
+impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntime<'_, F> {
+    fn execute_node(
+        &mut self,
+        id: QueryNodeId,
+        at: i64,
+        node: &QueryPlanNode,
+        inputs: &[Value],
+        dependencies: &[(QueryNodeId, i64)],
+    ) -> Result<Value, EngineError> {
         if let Some(leaf) = self.leaves.get(&(id, at)) {
             if leaf.remote {
                 self.stats.remote_branch_evaluations += 1;
@@ -165,22 +243,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 self.stats.summary_readout_evaluations += 1;
             }
             let value = leaf.value.clone();
-            self.memo.insert((id, at), value.clone());
             return Ok(value);
         }
-        if self.active.len() >= 256 || !self.active.insert((id, at)) {
-            return Err(miss("cyclic or excessively deep installed DAG"));
-        }
-        if self.memo.len() >= 200_000 {
-            return Err(miss("installed DAG evaluation budget exceeded"));
-        }
-        let node = self
-            .entry
-            .nodes
-            .get(&id)
-            .ok_or_else(|| miss("missing installed node"))?
-            .clone();
-        let value = match node {
+        let value = match node.clone() {
             QueryPlanNode::Scalar { value } => Value::Scalar(value),
             QueryPlanNode::Logical {
                 operator: ResidualQueryOperator::CurrentSeries { .. },
@@ -192,7 +257,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                     u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
                 )?)?
             }
-            QueryPlanNode::Logical { operator, inputs } => {
+            QueryPlanNode::Logical { operator, .. } => {
                 if matches!(
                     operator,
                     ResidualQueryOperator::Scan { .. }
@@ -203,14 +268,14 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
                     ));
                 }
-                self.logical(operator, &inputs, at)?
+                self.logical(operator, inputs, dependencies, at)?
             }
-            QueryPlanNode::MembershipFilter {
-                inputs,
-                completeness,
-            } => {
-                let candidates = vector(self.eval(inputs[0], at)?)?;
-                let values = vector(self.eval(inputs[1], at)?)?;
+            QueryPlanNode::MembershipFilter { completeness, .. } => {
+                let [candidates, values] = inputs else {
+                    return Err(miss("membership operator requires two inputs"));
+                };
+                let candidates = vector(candidates.clone())?;
+                let values = vector(values.clone())?;
                 let (selected, warning) = membership_filter(candidates, values, &completeness)?;
                 if let Some(warning) = warning {
                     self.warnings.push(warning);
@@ -225,20 +290,19 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 )?)?
             }
         };
-        self.active.remove(&(id, at));
-        self.memo.insert((id, at), value.clone());
         Ok(value)
     }
     fn logical(
         &mut self,
         operator: ResidualQueryOperator,
-        inputs: &[QueryNodeId],
+        inputs: &[Value],
+        dependencies: &[(QueryNodeId, i64)],
         at: i64,
     ) -> Result<Value, EngineError> {
         let input = |index: usize| {
             inputs
                 .get(index)
-                .copied()
+                .cloned()
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
@@ -252,7 +316,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             ResidualQueryOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
-            ResidualQueryOperator::UnaryNegate => match self.eval(input(0)?, at)? {
+            ResidualQueryOperator::UnaryNegate => match input(0)? {
                 Value::Scalar(value) => Ok(Value::Scalar(-value)),
                 Value::Vector(values) => Ok(Value::Vector(
                     values
@@ -263,7 +327,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 _ => Err(miss("cannot negate range vector")),
             },
             ResidualQueryOperator::VectorToScalar => {
-                let values = vector(self.eval(input(0)?, at)?)?;
+                let values = vector(input(0)?)?;
                 Ok(Value::Scalar(if values.len() == 1 {
                     values[0].1
                 } else {
@@ -274,23 +338,23 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 operation,
                 grouping,
             } => {
-                let values = vector(self.eval(input(0)?, at)?)?;
+                let values = vector(input(0)?)?;
                 Ok(Value::Vector(aggregate(operation, &grouping, values)))
             }
             ResidualQueryOperator::TopKSelection { k, grouping } => {
-                let values = vector(self.eval(input(0)?, at)?)?;
+                let values = vector(input(0)?)?;
                 Ok(Value::Vector(topk_selection(k, &grouping, values)))
             }
             ResidualQueryOperator::Binary {
                 operation,
                 return_bool,
             } => {
-                let left = self.eval(input(0)?, at)?;
-                let right = self.eval(input(1)?, at)?;
+                let left = input(0)?;
+                let right = input(1)?;
                 binary(operation, return_bool, left, right)
             }
             ResidualQueryOperator::Temporal { operation } => {
-                let Value::Matrix(values, start, end) = self.eval(input(0)?, at)? else {
+                let Value::Matrix(values, start, end) = input(0)? else {
                     return Err(miss("temporal operator requires range vector"));
                 };
                 Ok(Value::Vector(
@@ -351,7 +415,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 ))
             }
             ResidualQueryOperator::Sort { descending } => {
-                let mut values = vector(self.eval(input(0)?, at)?)?;
+                let mut values = vector(input(0)?)?;
                 values.sort_by(|a, b| {
                     if a.1.is_nan() && b.1.is_nan() {
                         std::cmp::Ordering::Equal
@@ -368,11 +432,11 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 Ok(Value::Vector(values))
             }
             ResidualQueryOperator::HistogramQuantile => {
-                let Value::Scalar(quantile) = self.eval(input(0)?, at)? else {
+                let Value::Scalar(quantile) = input(0)? else {
                     return Err(miss("quantile requires scalar"));
                 };
                 let mut groups: BTreeMap<Labels, Vec<(f64, f64)>> = BTreeMap::new();
-                for (mut labels, value) in vector(self.eval(input(1)?, at)?)? {
+                for (mut labels, value) in vector(input(1)?)? {
                     if let Some(le) = labels.remove("le").and_then(|s| s.parse::<f64>().ok()) {
                         groups.entry(no_name(labels)).or_default().push((le, value));
                     }
@@ -389,34 +453,147 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 step_ms,
                 offset_ms,
             } => {
-                let end = at
-                    .checked_sub(offset_ms)
-                    .ok_or_else(|| miss("offset overflow"))?;
-                let range = i64::try_from(range_ms).map_err(|_| miss("range overflow"))?;
-                let step = i64::try_from(step_ms).map_err(|_| miss("step overflow"))?;
-                if step <= 0 || range / step > 100_000 {
-                    return Err(miss("invalid or excessive subquery steps"));
-                }
-                let start = end
-                    .checked_sub(range)
-                    .ok_or_else(|| miss("range overflow"))?;
-                let mut t = start
-                    .div_euclid(step)
-                    .checked_add(1)
-                    .and_then(|n| n.checked_mul(step))
-                    .ok_or_else(|| miss("subquery grid overflow"))?;
+                let (start, end, _) = subquery_grid(at, range_ms, step_ms, offset_ms)?;
                 let mut values: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
-                while t <= end {
-                    for (labels, value) in vector(self.eval(input(0)?, t)?)? {
-                        values.entry(labels).or_default().push((t, value));
+                if inputs.len() != dependencies.len() {
+                    return Err(miss("subquery grid input mismatch"));
+                }
+                for (value, (_, time)) in inputs.iter().zip(dependencies) {
+                    for (labels, value) in vector(value.clone())? {
+                        values.entry(labels).or_default().push((*time, value));
                     }
-                    t = t
-                        .checked_add(step)
-                        .ok_or_else(|| miss("subquery time overflow"))?;
                 }
                 Ok(Value::Matrix(values.into_iter().collect(), start, end))
             }
         }
+    }
+}
+
+fn subquery_grid(
+    at: i64,
+    range_ms: u64,
+    step_ms: u64,
+    offset_ms: i64,
+) -> Result<(i64, i64, Vec<i64>), EngineError> {
+    let end = at
+        .checked_sub(offset_ms)
+        .ok_or_else(|| miss("offset overflow"))?;
+    let range = i64::try_from(range_ms).map_err(|_| miss("range overflow"))?;
+    let step = i64::try_from(step_ms).map_err(|_| miss("step overflow"))?;
+    if step <= 0 || range / step > 100_000 {
+        return Err(miss("invalid or excessive subquery steps"));
+    }
+    let start = end
+        .checked_sub(range)
+        .ok_or_else(|| miss("range overflow"))?;
+    let mut time = start
+        .div_euclid(step)
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(step))
+        .ok_or_else(|| miss("subquery grid overflow"))?;
+    let mut times = Vec::new();
+    while time <= end {
+        times.push(time);
+        time = time
+            .checked_add(step)
+            .ok_or_else(|| miss("subquery time overflow"))?;
+    }
+    Ok((start, end, times))
+}
+fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i64)>, EngineError> {
+    match node {
+        QueryPlanNode::Logical {
+            operator:
+                ResidualQueryOperator::Scan { .. }
+                | ResidualQueryOperator::ExactSubquery { .. }
+                | ResidualQueryOperator::CandidateExactSubquery { .. },
+            ..
+        } => Err(miss(
+            "installed leaf was not prepared; local raw execution is forbidden",
+        )),
+        QueryPlanNode::Logical {
+            operator:
+                ResidualQueryOperator::Subquery {
+                    range_ms,
+                    step_ms,
+                    offset_ms,
+                },
+            inputs,
+        } => {
+            let [input] = inputs.as_slice() else {
+                return Err(miss("subquery requires one input"));
+            };
+            let (_, _, times) = subquery_grid(at, *range_ms, *step_ms, *offset_ms)?;
+            Ok(times.into_iter().map(|time| (*input, time)).collect())
+        }
+        QueryPlanNode::Logical {
+            operator: ResidualQueryOperator::CurrentSeries { .. },
+            ..
+        } => Ok(vec![]),
+        QueryPlanNode::Logical { inputs, .. } => Ok(inputs.iter().map(|&id| (id, at)).collect()),
+        QueryPlanNode::MembershipFilter { inputs, .. } => {
+            Ok(inputs.iter().map(|&id| (id, at)).collect())
+        }
+        _ => Ok(vec![]),
+    }
+}
+struct BoundValueOperator<'a, 'entry, F> {
+    id: QueryNodeId,
+    time: i64,
+    node: &'entry QueryPlanNode,
+    dependencies: Vec<(QueryNodeId, i64)>,
+    runtime: &'a RefCell<ValueRuntime<'entry, F>>,
+    error: &'a RefCell<Option<EngineError>>,
+}
+impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
+    physical::PhysicalOperator<Value, ()> for BoundValueOperator<'_, '_, F>
+{
+    fn name(&self) -> &str {
+        "InstalledValueOperator"
+    }
+    fn input_schemas(&self) -> Vec<()> {
+        vec![(); self.dependencies.len()]
+    }
+    fn output_schema(&self) {}
+    fn output_bytes(&self, value: &Value) -> usize {
+        fn labels(value: &Labels) -> usize {
+            value.iter().map(|(k, v)| k.len() + v.len()).sum()
+        }
+        match value {
+            Value::Scalar(_) => 8,
+            Value::Vector(values) => values.iter().map(|(key, _)| labels(key) + 8).sum(),
+            Value::Matrix(values, ..) => values
+                .iter()
+                .map(|(key, points)| labels(key) + points.len() * 16)
+                .sum(),
+        }
+    }
+    fn start<'a>(
+        &'a self,
+        inputs: Vec<physical::Input<'a, Value>>,
+        _: physical::RunContext,
+    ) -> Result<physical::OutputStream<'a, Value>, physical::Error> {
+        Ok(futures::stream::once(async move {
+            let values =
+                futures::future::try_join_all(inputs.into_iter().map(|mut input| async move {
+                    input.next().await.ok_or_else(|| {
+                        physical::Error::Operator("query input produced no value".into())
+                    })?
+                }))
+                .await?;
+            let values = values.iter().map(|v| v.value().clone()).collect::<Vec<_>>();
+            self.runtime
+                .borrow_mut()
+                .execute_node(self.id, self.time, self.node, &values, &self.dependencies)
+                .map_err(|error| {
+                    *self.error.borrow_mut() = Some(error);
+                    physical::Error::Operator(format!(
+                        "query node {} at {} failed",
+                        self.id.0, self.time
+                    ))
+                })
+        })
+        .boxed_local())
     }
 }
 
@@ -1300,5 +1477,107 @@ mod topk_tests {
             &certified,
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod shared_runtime_tests {
+    use super::*;
+    use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryLanguage};
+
+    fn entry() -> QueryPlanEntry {
+        QueryPlanEntry {
+            language: QueryLanguage::PromQl,
+            query_id: "shared-grid".into(),
+            canonical_query: "shared-grid".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(3),
+            // The callback owns the absorbed summary dependencies. Only its
+            // declared readout boundary participates in this value graph.
+            nodes: BTreeMap::from([
+                (
+                    QueryNodeId(0),
+                    QueryPlanNode::ExactReadout {
+                        input: QueryNodeId(99),
+                        readout: asap_types::query_plan::ExactReadout::Sum,
+                    },
+                ),
+                (
+                    QueryNodeId(1),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Subquery {
+                            range_ms: 2000,
+                            step_ms: 1000,
+                            offset_ms: 0,
+                        },
+                        inputs: vec![QueryNodeId(0)],
+                    },
+                ),
+                (
+                    QueryNodeId(2),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Temporal {
+                            operation: TemporalOperation::Sum,
+                        },
+                        inputs: vec![QueryNodeId(1)],
+                    },
+                ),
+                (
+                    QueryNodeId(3),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Binary {
+                            operation: BinaryOperation::Add,
+                            return_bool: false,
+                        },
+                        inputs: vec![QueryNodeId(2), QueryNodeId(2)],
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 2000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        }
+    }
+
+    // A shared time-grid node runs once per query; distinct times and runs stay isolated.
+    #[test]
+    fn shared_subquery_scopes_do_not_duplicate_or_leak_values() {
+        let entry = entry();
+        let mut calls = Vec::new();
+        for (at, expected) in [(3000, 10.), (4000, 14.)] {
+            let (result, stats) = execute_installed(&entry, &BTreeMap::new(), at, |id, time| {
+                assert_eq!(id, QueryNodeId(0));
+                calls.push(time);
+                Ok(QueryResult::vector(
+                    vec![InstantVectorElement::new(
+                        KeyByLabelValues::new_with_labels(vec!["a".into()]),
+                        time as f64 / 1000.,
+                    )
+                    .with_label_keys_override(vec!["pod".into()])],
+                    time,
+                ))
+            })
+            .unwrap();
+            let QueryResult::Vector(result) = result else {
+                panic!("vector required");
+            };
+            assert_eq!(result.values[0].value, expected);
+            assert_eq!(stats.summary_readout_evaluations, 2);
+            assert!(stats.memo_hits >= 1);
+        }
+        assert_eq!(calls, vec![2000, 3000, 3000, 4000]);
+    }
+
+    // Source failures keep their routing classification across the shared runtime.
+    #[test]
+    fn source_error_classification_survives_execution() {
+        let error = execute_installed(&entry(), &BTreeMap::new(), 3000, |_, _| {
+            Err(EngineError::capability_miss("source", "failed"))
+        })
+        .unwrap_err();
+        assert!(matches!(error,EngineError::CapabilityMiss{engine_id,..} if engine_id=="source"));
     }
 }

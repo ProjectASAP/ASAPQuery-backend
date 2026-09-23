@@ -56,15 +56,16 @@ errors retain the query ID and node ID.
 
 ## Shared DAG execution
 
-**Decision: ASAP will independently implement the shared DAG runtime and
-physical operators. Both the precompute engine and the query engine will use
-this library. DataFusion is a design reference, not the execution framework.**
+**Decision: ASAP owns an independently implemented shared DAG runtime and
+physical operators. Both engines use the same runtime. DataFusion is a design
+reference, not the execution framework.**
 
 The shared library executes a physical operator DAG for both the precompute
 engine and the query engine. It is designed around that execution contract,
-not around the current backend's function or module boundaries. The existing
-accumulator library and backend-driven query traversal do not yet provide this
-architecture.
+not around the backend's function or module boundaries. The independent runtime
+and native batch operators are implemented. Both installed query execution and
+ingestion execution use this runtime; their existing storage and value adapters
+are still being replaced by native batch operator bindings.
 
 ```mermaid
 flowchart TB
@@ -77,10 +78,11 @@ flowchart TB
   Run --> Results[Query results]
 ```
 
-The compiler binds each operation to a concrete implementation and checks its
-input and output types before accepting the plan. Both engines execute the
-result through the same library. Neither engine supplies a second interpretation
-of Filter, Project, Aggregate, SummaryMerge, Sort, or Limit.
+The intended boundary is that the compiler binds each operation to a concrete
+implementation and checks its input and output types before accepting the plan.
+Both engines execute the result through the same library. Computation semantics
+belong in that library; replacing the remaining backend adapters with native
+operator bindings is still required to complete this boundary.
 
 An operation defines its computation, typed inputs and outputs, and requirements
 such as input ordering and grouping. An execution instance owns the changing
@@ -124,8 +126,33 @@ and input window. Results from distinct requests or windows are never mixed.
 For streaming output, the runtime delivers the same produced batches to each
 consumer. Buffering is bounded and participates in the execution memory budget;
 a slow consumer cannot cause unlimited retention. Cancelling one consumer does
-not stop a producer still needed by another. Cancelling the whole execution
-releases its streams, intermediate results, and tasks.
+not stop a producer still needed by another. Cancelling the whole execution wakes consumers; the next poll or dropping the
+execution releases producer streams and queued results. Already delivered values
+remain owned and accounted for until their consumers release them.
+
+### Implemented execution boundaries
+
+An execution runs on the caller's worker; the library does not create a thread
+pool. Its streams may await deployment I/O, and every consumer of a shared
+producer must be polled concurrently. It currently uses worker-local execution
+state, so a running execution cannot migrate between threads. Separate runs have
+separate producers, buffers and accumulators.
+
+Each producer has a configurable batch-buffer limit. Outputs and native blocking
+state use a configurable estimated byte budget, including values retained by a
+consumer after queue eviction. This is execution accounting, not a hard process
+RSS limit: source-owned input, temporary allocation peaks and allocator overhead
+are outside the guarantee. Sort, exact aggregation and semi-join currently
+materialize their inputs and fail when the budget is exceeded; they do not spill.
+Summary construction updates its accumulators incrementally. Plan depth is
+limited to 128 to bound recursive stream polling.
+
+A native post-ASAP binding rejects unknown operations, unsupported expressions,
+invalid parameters and incompatible schemas before starting sources. Deployments
+explicitly bind storage or ingestion frontiers; those bindings do not authorize
+a local raw Scan. The native binder covers a subset of Planner, and the installed
+backend binder remains separate while its value adapters are migrated. Neither
+binder may count external execution as native operator coverage.
 
 ## Shared physical operator library
 
@@ -207,8 +234,8 @@ checks and must run through both engines' integration with the shared library.
 ## Physical operator coverage and acceptance contract
 
 Coverage describes this PR and the immutable Planner revision in `Cargo.toml`.
-**The current code does not yet implement the shared DAG architecture or meet
-the universal local-execution contract.**
+**The shared DAG runtime and the native operator subset below are implemented.
+The backend does not yet meet the universal local-execution contract.**
 An exhaustive phase match proves ownership only. A reusable kernel proves an
 algorithm implementation exists; neither proves that a concrete installed plan
 can obtain its inputs and execute every node locally.
@@ -236,31 +263,33 @@ means an implemented path for the stated subset, not universal support.
 | Read materialization | Load previously computed state | State decoding kernels; no storage adapter | Catalog/store binding for compatible populations and windows | General raw input access; unavailable or incompatible state cannot be read |
 | Maintain current-series state | Update the maintained values and timestamps for incoming time series. | None | Specialized remote-write ingestion path | General table-row updates and shared implementation |
 | Read current-series state | Read values from the maintained time-series state for query execution. | None | Current-series readout using the installed state identity and capacity | Arbitrary raw-table reading |
-| Scalar | Produce a scalar value | No separate scalar-source executor | Typed scalar path | General expression evaluation |
-| Binary | Combine or compare two inputs | Float64 Add/Sub/Mul/Div/Mod/Pow/Atan2 kernels | Query arithmetic, CheckedDiv/FiniteDiv and comparisons; ingestion arithmetic on immutable completed, aligned rows | General coercion, arbitrary PromQL matching and unsupported value domains |
-| Unary negate | Negate a value | No separate adapter | Typed query scalar/vector path | General ingestion adapter |
-| Vector to scalar | Convert a vector to a scalar | No separate adapter | Typed query path | General ingestion adapter |
-| Exact aggregate | Compute Count/Sum/Avg/Min/Max, including ReduceSum | Exact accumulator kernels | Relation and query aggregate adapters | No universal aggregate implementation; relation numeric measures require non-null Int64/Float64 and finite valid values; relation per-entity reduction and grouping-without unsupported |
-| Finalize exact accumulator / ExactReadout | Obtain an exact result from typed state | Exact-family readout kernels | Typed query readout and ingestion finalization of immutable completed windows | Arbitrary state conversion and unsupported exact families |
-| Project | Select or calculate output columns | No general expression executor | Query relation adapter | Unsupported expressions/types and general ingestion adapter |
-| Filter | Keep rows satisfying a predicate | No general predicate executor | Query relation adapter | Unsupported predicates/types and general ingestion adapter |
-| Relational join, including semi-join | Match rows by a predicate; semi-join retains matching left rows | Row membership kernel; general semi-join replacement pending; other joins remain backend-local | Relation adapter supports inner/left/right/full/cross/semi/anti joins within its predicate/schema subset; vector candidate pruning currently uses a dedicated membership adapter; general semi-join replacement pending | General ingestion join adapter and unrestricted SQL/NULL semantics |
-| Sort | Order input rows or values | No general sorting adapter | Query relation and logical sorting | Relation partitioned sorting, NaN and unsupported key types; general ingestion adapter |
-| Limit | Keep a bounded slice of input | No separate adapter | Query relation offset/limit and specialized logical lowering | General ingestion adapter; does not rank or match candidate keys |
-| SummaryAgg | Construct summary state from input | Supported-family construction/update kernels | Raw-ingestion specialization and restricted row-to-state ingestion aggregation | Installed query-time builder; arbitrary item expressions/output populations; typed update evaluation required |
-| SummaryMerge | Combine compatible summary states | Compatible-state merge kernels | Ingestion and query state merge | Universal cross-family merge is not supported |
-| SummaryEstimate | Query a summary for an approximate result | Family-specific sketch query kernels | Typed stored-state readout | Unsupported family/readout combinations; window/population compatibility and accuracy evidence remain required |
+| Scalar | Produce a scalar value | Typed native source, including nullable values | Installed scalar adapter on the shared runtime | Bind installed scalar nodes directly to the native batch source |
+| Binary | Combine or compare two inputs | Native matching-type Int64/Float64 arithmetic expressions, checked integer arithmetic, comparisons and boolean expressions; Float64 arithmetic kernels | Query arithmetic, CheckedDiv/FiniteDiv and comparisons; ingestion arithmetic on immutable completed, aligned rows | General coercion, arbitrary PromQL matching and unsupported value domains |
+| Unary negate | Negate a value | Native Int64/Float64 expression with null propagation and checked integer overflow | Typed query scalar/vector adapter | Connect installed value paths to the native expression binding |
+| Vector to scalar | Convert a vector to a scalar | Native Float64 batch operator; zero or multiple rows produce NaN | Typed query adapter | Connect installed value paths to the native batch operator |
+| Exact aggregate | Compute Count/Sum/Avg/Min/Max, including ReduceSum | Native grouped batches: checked Int64 Sum, Float64 Sum/Avg, Int64 Count, ordered Min/Max, nullable inputs; exact state kernels | Relation and query adapters | Connect installed adapters to native batches; no universal AggIntent, per-entity or unresolved grouping-without binding; blocking execution has no spill |
+| Finalize exact accumulator / ExactReadout | Obtain an exact result from typed state | Native validated readout for the six supported exact families; Int64 Count and Float64 numeric results | Typed query readout and ingestion finalization | Native batch integration; arbitrary state conversion and other exact families |
+| Project | Select or calculate output columns | Native typed expressions and batch projection; Planner plain scalar and collection values are preserved | Query relation adapter | Complete expression vocabulary and installed native batch binding |
+| Filter | Keep rows satisfying a predicate | Native batch predicate evaluation; three-valued boolean logic, equality/less-than, null checks | Query relation adapter | Other predicates, coercions and installed native batch binding |
+| Relational join, including semi-join | Match rows by a predicate; semi-join retains matching left rows | Native batch semi-join with explicit matching columns; value order and left multiplicity preserved; other joins remain backend-local | Relation adapter supports inner/left/right/full/cross/semi/anti joins within its predicate/schema subset; vector candidate pruning currently uses a dedicated membership adapter; general semi-join replacement pending | General ingestion join adapter and unrestricted SQL/NULL semantics |
+| Sort | Order input rows or values | Native stable grouped sort with null placement; NaN follows numeric values | Query relation and logical adapters | Installed native batch binding; unsupported key types and spill-to-disk |
+| Limit | Keep a bounded slice of input | Native offset/limit per group across batches; global Limit stops consuming after its slice | Query relation offset/limit and specialized logical lowering | Planner grouped-Limit transport and installed native batch binding; Limit does not rank or match candidate keys |
+| Union | Combine input streams with the same schema | Native stream union; polls all inputs | Native Planner binding uses it for multi-input summary merge | General installed batch binding |
+| SummaryAgg | Construct summary state from input | Native incremental grouped builder for exact Sum/Count/Min/Max/Rate/Increase, KLL, DDSketch and HLL; non-null Float64 updates, timestamped counters | Ingestion specialization and restricted row-to-state adapter | Installed native builder; Int64 updates, keyed updates and other families in the native batch interface |
+| SummaryMerge | Combine compatible summary states | Native grouped state merge; multiple input streams compose through Union; family and parameters checked | Ingestion and query adapters | Installed native batch binding; cross-family conversion is not a merge |
+| SummaryEstimate | Query a summary for an approximate result | Native KLL quantile, DDSketch quantile/count and HLL cardinality/count; parameters checked before execution | Typed stored-state readout | Other family/readout combinations in native batches; window/population compatibility and accuracy evidence remain required |
 | SummaryJoin | Combine summary inputs using summary join semantics | No registered kernel | No runtime dispatch | Concrete kernel and adapters |
 | SummarySubtract | Subtract summary state | No registered kernel | Unsupported in ingestion runtime | Concrete kernel and adapters |
 | SummaryDelete | Remove contributions from summary state | No registered kernel | No runtime dispatch | Concrete kernel and adapters |
 | Temporal computation | Compute Rate/Increase/Avg/Max/Min/Sum/Count over time | Relevant exact accumulator kernels, not a complete temporal adapter | Query paths over supported inputs | General input/state combinations and ingestion adapter |
 | Histogram quantile | Calculate a quantile from histogram buckets | No separate histogram adapter | Query path | General ingestion adapter |
-| Subquery | Evaluate an expression over a time grid | Request-local caching of intermediate results; full shared DAG runtime pending | Query path with bounded grids and request-local caching by operation and evaluation time | Unbounded grids and general ingestion adapter |
+| Subquery | Evaluate an expression over a time grid | Shared DAG execution and request-local caching of intermediate results | Backend expands each operation and evaluation time into a node in the shared runtime; bounded grids and explicit source frontiers | Shared time-grid construction and general ingestion adapter |
 | Extension | Execute an additional value operation | No general executor | Unsupported operations may route to explicit fallback | A concrete local implementation for each admitted extension |
 
 Grouped TopK is represented in the target plan as Sort followed by Limit within
-each group. The current dedicated TopK plan node must be replaced, and Limit
-needs an explicit grouping contract. A global Limit is not equivalent. An
+each group. The native library supports this composition. The installed dedicated TopK
+plan node must still be replaced, and Planner Limit needs an explicit grouping
+contract. A global Limit is not equivalent. An
 optimized kernel may execute the composition without changing its meaning.
 Candidate completeness remains a condition on pruning, not on ranking.
 
@@ -272,19 +301,21 @@ read. Their code names are `MaintainPopulation` for updates and `ReadPopulation`
 External computation (`ExternalExact`, `ExactSubquery`,
 `CandidateExactSubquery`) and fallback are routing choices, not local physical
 operation implementations. They do not fill any missing coverage in this table.
-The shared DAG walker schedules operations and caches intermediate results within each request but still needs backend
-adapters; importing the library alone does not provide a complete query engine.
+The shared runtime owns dependency execution, bounded batch delivery and
+request-local caching of intermediate results. Installed-plan adapters still
+provide some computation semantics; the table identifies these migration gaps.
+Importing the library does not provide backend sources or a complete query engine.
 
 **Deferred raw-data support:** this PR does not implement local raw Scan or
 claim complete local execution when only raw data is stored. External fallback
-and the independent raw-input kernel tests do not satisfy that capability.
+and independent DAG tests with supplied batches do not satisfy that capability.
 
 ### Candidate pruning is a composed subgraph
 
 The fused candidate-ranking operator is removed from Planner and QueryPlan.
 The target graph uses a general semi-join in place of the current dedicated
 `MembershipFilter` adapter. That code change is pending separately from this
-documentation update. The graph contains these operations:
+runtime implementation. The graph contains these operations:
 
 1. Read membership keys from a summary.
 2. Obtain authoritative values, optionally pushing the membership restriction
@@ -293,9 +324,10 @@ documentation update. The graph contains these operations:
    multiplicity. Membership scores never replace authoritative values.
 4. Sort authoritative values and apply Limit independently within each group.
 
-The semi-join has no k, grouping or ranking behavior. The shared library currently provides `rows::membership_filter` and
-`rows::grouped_topk`; the pending change replaces the former with a general
-`rows::semi_join` kernel that other deployments can compose with ranking. A missing authoritative value fails a
+The semi-join has no k, grouping or ranking behavior. The native DAG library
+implements semi-join, grouped Sort and grouped Limit as composable operators.
+Installed vector adapters still use specialized membership and ranking kernels;
+replacing their plan representation and bindings remains separate work. A missing authoritative value fails a
 certified membership plan; best-effort pruning remains explicitly approximate.
 The pruning certificate stays on the semi-join. Exact reranking does not prove
 that omitted keys could not have won. Planner still rejects uncertified pruning
@@ -307,6 +339,10 @@ Planner represents and costs filtering and ranking separately. Incompatible
 installed plans are rejected; removed operators have no compatibility path.
 
 ### Summary-family and readout coverage
+
+The native batch interface currently admits exact Sum/Count/Min/Max/Rate/Increase,
+KLL, DDSketch and HLL states. The broader low-level factory inventory below does
+not imply native DAG bindings for every listed family.
 
 The Planner-family factory accepts only `PerSubpopulationInstance` grouping and
 matching family/parameter variants. The presence of a low-level accumulator does
@@ -341,13 +377,13 @@ all subsequent readout combinations or certify approximation guarantees.
 
 | Precomputation mode | Definition | Current support / remaining gaps |
 | --- | --- | --- |
-| No precomputation | The query starts from raw data and performs all required computation at query time. | General local raw input and query-time summary construction are not supported in installed plans; deferred from this PR. |
+| No precomputation | The query starts from raw data and performs all required computation at query time. | Native DAGs can construct and query summaries from supplied batches. Installed plans still need native builder bindings; the local raw source is deferred from this PR. |
 | Partial precomputation | The query reuses previously computed results or states and performs the remaining computation at query time. Inputs may combine stored states, stored values, and raw data. | Supported stored-state and query-time operations can be combined. General plans requiring local raw input or query-time summary construction remain incomplete. |
 | Full precomputation | All data-dependent computation needed for the query result has been performed before the query arrives. Query execution retrieves the prepared result and formats the response. | Supported only where the prepared result matches the requested query and time scope and is available. Reading stored summaries followed by merging, estimation, aggregation or ranking is partial precomputation. |
 
 These definitions are independent of any particular algorithm. The KLL consumer
 tests are examples of constructing, merging, and querying state across different
-precomputation boundaries. They demonstrate reusable kernel behavior, not
+precomputation boundaries. They execute native operator DAGs as well as reusable kernels, not
 complete backend support for all three modes. In particular, a test that queries
 a prebuilt KLL state still performs estimation at query time; it does not
 demonstrate full precomputation of the query result.
@@ -370,8 +406,11 @@ coverage or universal executability is claimed until these tests exist and pass.
 
 ### Evidence and verification limits
 
-Shared-library tests cover kernels, a KLL three-boundary consumer, invalid KLL
-parameters and native CountSketch dimensions. Backend tests cover supported DAG,
+Shared-library tests cover native DAGs, shared producers, backpressure, cancellation,
+resource accounting, isolated runs, typed expressions, grouped Sort/Limit, semi-join,
+summary construction/merge/readout at both phases, source schema validation and
+unsupported binding rejection. KLL examples cover all three state-input boundaries.
+Kernel tests additionally cover invalid KLL parameters and native CountSketch dimensions. Backend tests cover supported DAG,
 maintenance, readout and relation paths. Passing these suites is not a proof that
 every Planner payload or parameter combination is locally executable. Inherited
 level-1 grouped-Sum/quantile-ratio failures and #759's strict local-execution gate
