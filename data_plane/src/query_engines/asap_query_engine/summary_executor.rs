@@ -59,6 +59,7 @@
 //! on top of a sketch or exact-agg readout ("outer-agg-fold") — out of
 //! scope by explicit design choice, not an oversight.
 
+use asap_physical_operators::accumulators::{MaxAccumulator, MinAccumulator};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -75,12 +76,7 @@ use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_summary_state, per_window_summary_states, DeltaSketchKind, SummaryState,
 };
-use crate::storage_engines::types::{
-    AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
-};
-use asap_physical_operators::accumulators::increase_accumulator::IncreaseAccumulator;
-use asap_physical_operators::accumulators::max_accumulator::MaxAccumulator;
-use asap_physical_operators::accumulators::min_accumulator::MinAccumulator;
+use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues};
 
 /// Per-query, per-call execution context — constructed fresh for each
 /// incoming query (never shared across concurrent queries, never
@@ -212,18 +208,13 @@ impl GroupState {
             SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => asap_types::Statistic::Rate,
             _ => return None,
         };
-        let mut merged: Option<Box<dyn AggregateCore>> = None;
-        for windows in entries {
-            for acc in windows.values() {
-                merged = Some(match merged.take() {
-                    None => acc.clone_boxed_core(),
-                    Some(current) => current.merge_with(acc.as_ref()).ok()?,
-                });
-            }
-        }
-        merged?
-            .query_statistic(stat, key, &std::collections::HashMap::new())
-            .ok()
+        asap_physical_operators::stored_state::readout::exact_readout(
+            entries.iter().flat_map(|windows| windows.values().cloned()),
+            stat,
+            key,
+            &std::collections::HashMap::new(),
+        )
+        .ok()
     }
 
     /// Finalize the Planner-declared exact family with its matching readout.
@@ -249,76 +240,17 @@ impl GroupState {
             asap_types::query_plan::ExactReadout::Max => asap_types::Statistic::Max,
         };
 
-        let planner_state = entries.iter().flat_map(|w| w.values()).any(|a| {
-            a.as_any()
-                .is::<asap_physical_operators::accumulators::exact_accumulator::ExactAccumulator>()
-        });
-        // Temporal exact summaries are the hot path for long-window
-        // dashboards. Merge their concrete, fixed-size states in one batch
-        // instead of allocating a boxed trait object for every pane.
-        if !planner_state
-            && matches!(
-                readout,
-                asap_types::query_plan::ExactReadout::Increase
-                    | asap_types::query_plan::ExactReadout::Rate
-            )
-        {
-            let accumulators = entries
-                .iter()
-                .flat_map(|windows| windows.values())
-                .map(|acc| acc.as_any().downcast_ref::<IncreaseAccumulator>().cloned())
-                .collect::<Option<Vec<_>>>()?;
-            let merged = <IncreaseAccumulator as MergeableAccumulator<
-                IncreaseAccumulator,
-            >>::merge_accumulators(accumulators)
-            .ok()?;
-            let query_kwargs = std::collections::HashMap::from([
-                ("range_start_ms".to_string(), range_start_ms.to_string()),
-                ("range_end_ms".to_string(), range_end_ms.to_string()),
-            ]);
-            return merged.query_statistic(stat, key, &query_kwargs).ok();
-        }
-        if !planner_state && readout == asap_types::query_plan::ExactReadout::Min {
-            return entries
-                .iter()
-                .flat_map(|windows| windows.values())
-                .map(|acc| {
-                    acc.as_any()
-                        .downcast_ref::<MinAccumulator>()
-                        .map(|a| a.value)
-                })
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .reduce(f64::min);
-        }
-        if !planner_state && readout == asap_types::query_plan::ExactReadout::Max {
-            return entries
-                .iter()
-                .flat_map(|windows| windows.values())
-                .map(|acc| {
-                    acc.as_any()
-                        .downcast_ref::<MaxAccumulator>()
-                        .map(|a| a.value)
-                })
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .reduce(f64::max);
-        }
-        let mut merged: Option<Box<dyn AggregateCore>> = None;
-        for windows in entries {
-            for acc in windows.values() {
-                merged = Some(match merged.take() {
-                    None => acc.clone_boxed_core(),
-                    Some(m) => m.merge_with(acc.as_ref()).ok()?,
-                });
-            }
-        }
         let query_kwargs = std::collections::HashMap::from([
             ("range_start_ms".to_string(), range_start_ms.to_string()),
             ("range_end_ms".to_string(), range_end_ms.to_string()),
         ]);
-        let merged = merged?;
-        merged.query_statistic(stat, key, &query_kwargs).ok()
+        asap_physical_operators::stored_state::readout::exact_readout(
+            entries.iter().flat_map(|windows| windows.values().cloned()),
+            stat,
+            key,
+            &query_kwargs,
+        )
+        .ok()
     }
 
     /// Coverage analog of `exact_value` — folds `(min_window_end_ms,
@@ -1074,97 +1006,22 @@ fn readout_per_window(
 /// Read one scalar out of a merged `SummaryState` for the requested
 /// `SketchQuery` -- shared by both the cumulative and per-window readout
 /// paths.
-fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, SummaryExecutorError> {
-    if let SummaryState::UnivMon(state) = rs {
-        use crate::storage_engines::types::AggregateCore;
-        let statistic = match query {
-            SketchQuery::Cardinality => asap_types::Statistic::Cardinality,
-            SketchQuery::FrequencyL2 => asap_types::Statistic::FrequencyL2,
-            SketchQuery::FrequencyEntropy => asap_types::Statistic::FrequencyEntropy,
-            SketchQuery::PointCount {
-                key: ColumnRef::SampleValue,
-                value: None,
-            } => asap_types::Statistic::Count,
-            _ => {
-                return Err(SummaryExecutorError::Unsupported(
-                    "unsupported UnivMon readout",
-                ))
-            }
-        };
-        return state
-            .query_statistic(statistic, &None, &Default::default())
-            .map_err(|_| SummaryExecutorError::Unsupported("UnivMon readout failed"));
-    }
-    match query {
-        SketchQuery::FrequencyL2 | SketchQuery::FrequencyEntropy => Err(
-            SummaryExecutorError::Unsupported("frequency moment readout requires UnivMon"),
-        ),
-        SketchQuery::Quantile { q } => match rs {
-            // Typed PromQL/continuous-percentile readout uses interpolation;
-            // portable DDS `quantile` deliberately retains lower-rank parity.
-            SummaryState::Dd(sketch) => {
-                sketch
-                    .quantile_interpolated(*q)
-                    .ok_or(SummaryExecutorError::Unsupported(
-                        "DDS interpolated quantile is unavailable",
-                    ))
-            }
-            _ => Ok(rs.quantile(*q)),
+fn sketch_query_value(
+    state: &SummaryState,
+    query: &SketchQuery,
+) -> Result<f64, SummaryExecutorError> {
+    asap_physical_operators::stored_state::readout::sketch_query_value(state, query).map_err(
+        |asap_physical_operators::stored_state::readout::Error::Unsupported(reason)| {
+            SummaryExecutorError::Unsupported(reason)
         },
-        SketchQuery::Cardinality => Ok(rs.cardinality()),
-        // `key: ColumnRef::SampleValue, value: None` means "no specific
-        // item" -- the bare bucket total. `key: Named(_), value: Some(v)`
-        // is a per-item point lookup (e.g. `count(cms_metric{item="x"})`)
-        // -- `value` is where the filter's actual value lives (see
-        // `planner_types::post_asap::SketchQuery::PointCount`'s doc for why `readout`
-        // can't resolve it itself). Any other combination (e.g. a `Named`
-        // key with no value, or `SampleValue` with a value) is a shape
-        // this executor doesn't expect to see and reports rather than
-        // silently misreading.
-        SketchQuery::PointCount {
-            key: ColumnRef::SampleValue,
-            value: None,
-        } => Ok(rs.total()),
-        SketchQuery::PointCount {
-            key: ColumnRef::Named(_) | ColumnRef::Qualified { .. },
-            value: Some(v),
-        } => rs.estimate(v).ok_or(SummaryExecutorError::Unsupported(
-            "PointCount by key requires a Frequency-family sketch (Cms/CountSketch/..WithHeap)",
-        )),
-        SketchQuery::PointCount { .. } => Err(SummaryExecutorError::Unsupported(
-            "unrecognized PointCount shape (key/value combination not expected)",
-        )),
-        // Both readout callers branch on `TopK` before ever calling this
-        // function (see `readout_cumulative`/`readout_per_window`), so
-        // this arm is unreachable in practice; kept for match
-        // exhaustiveness (`SketchQuery` has no `#[non_exhaustive]`) and to
-        // fail loudly rather than panic if that invariant is ever broken.
-        SketchQuery::TopK { .. } => Err(SummaryExecutorError::Unsupported(
-            "TopK must be read out via topk_ranked, not sketch_query_value",
-        )),
-    }
+    )
 }
-
-/// Rank a merged `SummaryState`'s top-k heap items descending by value and
-/// cap at the requested `k`. The sort is load-bearing, not defensive
-/// polish: `SummaryState::topk_items` reads back a bounded min-heap's
-/// backing array as-is (`HHHeap::heap()`, asap_sketchlib) -- it does NOT
-/// actually guarantee order despite its own doc wording. Errors for a
-/// heap-less family (`Dd`/`Hll`/`Kll`/`Cms`/`CountSketch` -- no item
-/// universe to rank), not for an empty heap (a heap-bearing family that
-/// simply never received any updates yields `Ok(vec![])`, not an error).
-fn topk_ranked(rs: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, SummaryExecutorError> {
-    let mut items = rs.topk_items().ok_or(SummaryExecutorError::Unsupported(
-        "TopK requires a heap-bearing family (CmsWithHeap/CountSketchWithHeap) -- \
-         this state's family carries no item universe to rank",
-    ))?;
-    items.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0)) // deterministic tie-break for equal counts
-    });
-    items.truncate(k);
-    Ok(items)
+fn topk_ranked(state: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, SummaryExecutorError> {
+    asap_physical_operators::stored_state::readout::topk_ranked(state, k).map_err(
+        |asap_physical_operators::stored_state::readout::Error::Unsupported(reason)| {
+            SummaryExecutorError::Unsupported(reason)
+        },
+    )
 }
 
 /// Exact canonical `SketchKind` match against a sid's own
