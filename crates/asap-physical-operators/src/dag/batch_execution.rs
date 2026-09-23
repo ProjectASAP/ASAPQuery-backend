@@ -22,6 +22,21 @@ pub fn evaluate_batch(
         graph.add(root + 1, vec![root], operator)?;
         root += 1;
     }
+    evaluate_graph(graph, root, context)
+}
+
+/// Evaluate a native in-memory source, including scalar sources, in the caller's scope.
+pub fn evaluate_source(source: Operator, context: RunContext) -> Result<Vec<Batch>, Error> {
+    let mut graph = PhysicalDag::default();
+    graph.add(0, vec![], source)?;
+    evaluate_graph(graph, 0, context)
+}
+
+fn evaluate_graph(
+    graph: PhysicalDag<'_, Batch, super::values::Schema>,
+    root: super::NodeId,
+    context: RunContext,
+) -> Result<Vec<Batch>, Error> {
     let mut output = graph.execute(&[root], context)?.remove(0);
     let mut batches = Vec::new();
     loop {
@@ -80,10 +95,14 @@ mod tests {
             )
             .unwrap();
             let context = RunContext::new(scope, Limits::default()).unwrap();
-            let result =
-                futures::executor::block_on(async { evaluate_batch(batch, vec![negate], context) })
-                    .unwrap();
+            let result = futures::executor::block_on(async {
+                evaluate_batch(batch, vec![negate], context.clone())
+            })
+            .unwrap();
             assert!(matches!(result[0].rows()[0][0], Value::Float64(-7.)));
+            let source = Operator::scalar(Value::Float64(9.), DataType::Float64).unwrap();
+            let scalar = evaluate_source(source, context).unwrap();
+            assert!(matches!(scalar[0].rows()[0][0], Value::Float64(9.)));
         }
     }
 
