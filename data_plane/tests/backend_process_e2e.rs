@@ -726,8 +726,9 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .await
                 .unwrap();
             assert_eq!(first_scalar(&still_warm), Some(value));
-            // Retry the staged successor while queries are in flight. Each
-            // request must retain a complete active snapshot through cutover.
+            // Retry while queries are in flight. Old-generation reads may finish,
+            // but the successor must stay cold until its own output is published.
+            // Reusing the old payload would violate StoredOutputReference identity.
             request["activation_unix_ms"] = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -750,11 +751,12 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                         .json()
                         .await
                         .unwrap();
-                    assert_eq!(
-                        first_scalar(&response),
-                        Some(value),
-                        "torn serving snapshot: {response}"
-                    );
+                    if let Some(actual) = first_scalar(&response) {
+                        assert_eq!(actual, value, "incorrect old-generation result: {response}");
+                    } else {
+                        assert_eq!(response["status"], "error", "{response}");
+                        assert_eq!(response["error"], "No result for query", "{response}");
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             });
@@ -777,6 +779,27 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
             assert_eq!(activated["plan_version"], 2);
             let (successor, _collector_socket) = collector.await.unwrap();
             readers.await.unwrap();
+            let cold_successor: serde_json::Value = client
+                .get(format!("{data_base}/api/v1/query"))
+                .query(&[
+                    ("query", query.to_string()),
+                    ("time", (window_end_ms as f64 / 1000.0).to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(cold_successor["status"], "error", "{cold_successor}");
+            assert_eq!(
+                cold_successor["error"], "No result for query",
+                "{cold_successor}"
+            );
+            assert!(
+                first_scalar(&cold_successor).is_none(),
+                "successor reused old state"
+            );
             let old_frame = client
                 .post(format!("http://{otlp_http}/v1/metrics"))
                 .header("content-type", "application/x-protobuf")
