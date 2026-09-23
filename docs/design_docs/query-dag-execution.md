@@ -104,19 +104,28 @@ external plan may remain useful, but is not evidence of local coverage.
 that every instance of the payload is accepted. Shared kernels do not include
 backend storage, relational adapters or arbitrary expression evaluation.
 
-| Payload | Current placement | Backend implementation / limitation | Shared library |
+| Payload | Current Planner execution phase（当前 Planner 执行阶段） | Backend implementation / limitation | Shared library |
 | --- | --- | --- | --- |
-| `Fallback` | From validated edge state | Selected ingestion source boundary, prepared external exact subtree, or explicit whole-query fallback. No general local raw-query executor. | No source/SQL/PromQL executor |
-| `Binary` | Maintenance or read, from timing | Maintenance arithmetic requires immutable completed, aligned row inputs; query scalar/vector arithmetic uses the relevant value adapter. Not arbitrary row/vector coercion. | Float64 Add/Sub/Mul/Div/Mod/Pow/Atan2; alignment and vector semantics remain backend-local |
-| `CandidateTopK` | Read | Membership sidecar plus authoritative exact values and grouped reranking. Exact values may require an external leaf; candidate membership alone is not a complete exact answer. | No candidate/vector adapter |
-| `Value` | From timing | Operation-specific subset; see next table. | Exact accumulator kernels only; no general Value dispatcher |
-| `RelationalJoin` | From row edge state | Query ClickHouse relation adapter implements inner/left/right/full/cross/semi/anti joins within supported predicate/schema/value semantics. No generic maintenance join implementation. This is not a claim of all ClickHouse settings/NULL semantics. | Not extracted |
-| `SummaryAgg` | Maintenance | Raw-ingestion specialization and restricted maintenance row-to-state aggregation. Factory validates family/layout/parameters. Maintenance DAG path needs a typed update evaluator, immutable inputs and installed materialization; it does not support arbitrary item expressions or output populations. No installed query-time builder. | Construction/update kernels for families below; placement-neutral |
-| `SummaryJoin` | Maintenance | Ownership classified; no dispatch implementation in maintenance runtime. | No registered SummaryJoin kernel |
-| `SummarySubtract` | Maintenance | Ownership classified; unsupported by maintenance runtime. | No registered SummarySubtract kernel |
-| `SummaryDelete` | Maintenance | Ownership classified; no dispatch implementation in maintenance runtime. | No registered SummaryDelete kernel |
-| `SummaryEstimate` | Read | Typed sketch readout over compatible stored states, with family, window and population restrictions. | Underlying sketch query kernels; store/readout adapter remains backend-local |
-| `SummaryMerge` | Maintenance in Planner | Maintenance state merge is implemented. Separately, installed QueryPlan SummaryMerge merges compatible stored states at query time. That read adapter does not make Planner summary construction query-placeable. | Accumulator merge implementations; no universal cross-family merge |
+| `Fallback` | Depends on the neighbor nodes in the DAG (validated edge states) | Selected ingestion source boundary, prepared external exact subtree, or explicit whole-query fallback. No general local raw-query executor. | No source/SQL/PromQL executor |
+| `Binary` | Ingestion time or read/query time (explicit `timing`, validated against DAG edges) | Maintenance arithmetic requires immutable completed, aligned row inputs; query scalar/vector arithmetic uses the relevant value adapter. Not arbitrary row/vector coercion. | Float64 Add/Sub/Mul/Div/Mod/Pow/Atan2; alignment and vector semantics remain backend-local |
+| `CandidateTopK` | Read/query time | Membership sidecar plus authoritative exact values and grouped reranking. Exact values may require an external leaf; candidate membership alone is not a complete exact answer. | No candidate/vector adapter |
+| `Value` | Ingestion time or read/query time (explicit `timing`, validated against DAG edges) | Operation-specific subset; see next table. | Exact accumulator kernels only; no general Value dispatcher |
+| `RelationalJoin` | Depends on the neighbor nodes in the DAG (validated row edge states) | Query ClickHouse relation adapter implements inner/left/right/full/cross/semi/anti joins within supported predicate/schema/value semantics. No generic maintenance join implementation. This is not a claim of all ClickHouse settings/NULL semantics. | Not extracted |
+| `SummaryAgg` | Ingestion time | Raw-ingestion specialization and restricted maintenance row-to-state aggregation. Factory validates family/layout/parameters. Maintenance DAG path needs a typed update evaluator, immutable inputs and installed materialization; it does not support arbitrary item expressions or output populations. No installed query-time builder. | Construction/update kernels for families below; placement-neutral |
+| `SummaryJoin` | Ingestion time | Ownership classified; no dispatch implementation in maintenance runtime. | No registered SummaryJoin kernel |
+| `SummarySubtract` | Ingestion time | Ownership classified; unsupported by maintenance runtime. | No registered SummarySubtract kernel |
+| `SummaryDelete` | Ingestion time | Ownership classified; no dispatch implementation in maintenance runtime. | No registered SummaryDelete kernel |
+| `SummaryEstimate` | Read/query time | Typed sketch readout over compatible stored states, with family, window and population restrictions. | Underlying sketch query kernels; store/readout adapter remains backend-local |
+| `SummaryMerge` | Ingestion time in Planner | Maintenance state merge is implemented. Separately, installed QueryPlan SummaryMerge merges compatible stored states at query time. That read adapter does not make Planner summary construction query-placeable. | Accumulator merge implementations; no universal cross-family merge |
+
+In this column, **ingestion time** includes ingestion-triggered background
+maintenance; it does not require execution inline with each incoming sample.
+The current API still names this phase `MaintenanceTime`. **Read/query time**
+means execution while serving a query. “Depends on the neighbor nodes in the
+DAG” refers to validated input/output edge states, not an unconstrained runtime
+choice. `Binary` and `Value` carry explicit `timing`, so their phase is not
+inferred solely from neighboring nodes. These labels describe the current
+Planner contract, not whether a backend implementation exists.
 
 ### Every ValueOperation
 
