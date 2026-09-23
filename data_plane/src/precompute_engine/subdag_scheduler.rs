@@ -557,7 +557,6 @@ mod tests {
         }
         let mut binary = node(3);
         binary.payload = ExecutableOperatorPayload::Binary {
-            timing: planner_types::post_asap::ExecutionTiming::IngestionTime,
             operator: BinaryOperator {
                 checked_relative_division: false,
                 checked_finite_division: false,

@@ -85,9 +85,9 @@ fn leaves(
                 }
                 _ => pending.extend(inputs.iter().map(|input| (*input, at))),
             },
-            // MembershipFilter is a typed composition node rather than a Logical
+            // A join is a typed composition node rather than a Logical
             // wrapper, but its value input can still be a Prometheus leaf.
-            QueryPlanNode::MembershipFilter { inputs, .. } => {
+            QueryPlanNode::RelationalJoin { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
             QueryPlanNode::ExternalExact { request, inputs } => {
@@ -657,21 +657,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_exact_is_discovered_and_prepared_behind_membership_filter_root() {
+    async fn candidate_exact_is_discovered_and_prepared_behind_semi_join_root() {
         use asap_types::query_plan::CandidateCompleteness;
         let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");
-        entry.nodes.insert(
-            QueryNodeId(2),
-            QueryPlanNode::MembershipFilter {
-                inputs: [QueryNodeId(1), QueryNodeId(0)],
-                completeness: CandidateCompleteness::BestEffort { guarantee: None },
-            },
-        );
+        entry.nodes.insert(QueryNodeId(2), {
+            let schema = planner_types::post_asap::SummarySchema {
+                fields: vec![planner_types::post_asap::SummaryField {
+                    name: "job".into(),
+                    dtype: planner_types::post_asap::SummaryFamilyType::Plain(
+                        planner_types::pre_asap::DataType::Utf8,
+                    ),
+                    nullable: false,
+                }],
+                time_index: None,
+            };
+            QueryPlanNode::RelationalJoin {
+                inputs: [QueryNodeId(0), QueryNodeId(1)],
+                join_kind: planner_types::pre_asap::JoinKind::Semi,
+                pred: serde_json::to_value(planner_types::pre_asap::Predicate(std::rc::Rc::new(
+                    planner_types::pre_asap::QueryExpr::Compare {
+                        left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(0)),
+                        op: planner_types::pre_asap::CompareOpKind::Eq,
+                        right: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(1)),
+                    },
+                )))
+                .unwrap(),
+                pruning: Some(CandidateCompleteness::BestEffort { guarantee: None }),
+                left_schema: schema.clone(),
+                right_schema: schema.clone(),
+                output_schema: schema,
+            }
+        });
         entry.nodes.insert(
             QueryNodeId(3),
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::TopKSelection {
-                    k: 2,
+                operator: ResidualQueryOperator::Limit {
+                    offset: 0,
+                    n: 2,
                     grouping: asap_types::query_plan::residual::Grouping {
                         labels: vec![],
                         without: false,

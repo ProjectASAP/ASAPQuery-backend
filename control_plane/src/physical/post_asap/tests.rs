@@ -116,9 +116,7 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
         SummaryExpr::SummaryJoin { outer, inner, .. } => {
             node_is_archive(outer) || node_is_archive(inner)
         }
-        SummaryExpr::MembershipFilter {
-            candidates, values, ..
-        } => node_is_archive(candidates) || node_is_archive(values),
+
         SummaryExpr::SummarySubtract { left, right }
         | SummaryExpr::RelationalJoin { left, right, .. }
         | SummaryExpr::BinaryOp {

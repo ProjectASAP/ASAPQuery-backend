@@ -223,11 +223,10 @@ pub fn execute<E: SummaryExecutor>(
 
         SummaryExpr::SummaryJoin { .. } => Err(ExecError::NotYetSupported("SummaryJoin")),
         SummaryExpr::RelationalJoin { .. } => Err(ExecError::NotYetSupported("RelationalJoin")),
-        // MembershipFilter is lowered to the deployed QueryPlan DAG, where both
+        // semi-join is lowered to the deployed QueryPlan DAG, where both
         // row inputs retain labels for intersection and exact reranking. This
         // legacy generic adapter exposes opaque GroupKey values and cannot
         // implement that contract without losing label identity.
-        SummaryExpr::MembershipFilter { .. } => Err(ExecError::NotYetSupported("MembershipFilter")),
         SummaryExpr::BinaryOp { .. } => Err(ExecError::NotYetSupported("BinaryOp")),
         SummaryExpr::ValueOperation { .. } => Err(ExecError::NotYetSupported("ValueOperation")),
         SummaryExpr::SummarySubtract { .. } => Err(ExecError::NotYetSupported("SummarySubtract")),

@@ -224,7 +224,7 @@ mod tests {
                 .into_iter()
                 .map(|id| OwnedPostAsapNode {
                     id: PostAsapNodeId(id),
-                    payload: serde_json::json!({"kind":"summary_merge", "timing":"ingestion_time"}),
+                    payload: serde_json::json!({"kind":"summary_merge"}),
                     output_state: state,
                     output_schema: serde_json::json!({"fields":[],"time_index":null}),
                     guarantee: None,
