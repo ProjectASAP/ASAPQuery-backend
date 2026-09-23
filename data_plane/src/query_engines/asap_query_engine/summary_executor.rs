@@ -1389,7 +1389,7 @@ fn find_metric(node: &SummaryNode) -> Option<String> {
         SummaryExpr::KeepPreAsap(qe) => find_metric_in_query_expr(qe),
         SummaryExpr::SummaryAgg { child, .. } => find_metric(child),
         SummaryExpr::SummaryEstimate { summary_input, .. } => find_metric(summary_input),
-        SummaryExpr::SummaryMerge { children } => children.first().and_then(|c| find_metric(c)),
+        SummaryExpr::SummaryMerge { children, .. } => children.first().and_then(|c| find_metric(c)),
         _ => None,
     }
 }
