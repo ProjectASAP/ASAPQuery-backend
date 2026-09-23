@@ -1,9 +1,6 @@
 use crate::{
-    storage_engines::types::{
-        AggregateCore, AggregationType, MergeableAccumulator, MultipleSubpopulationAggregate,
-        SerializableToSink,
-    },
-    KeyByLabelValues,
+    AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
+    MultipleSubpopulationAggregate, SerializableToSink,
 };
 use asap_sketchlib::{HydraKllSketch, MessagePackCodec};
 use base64::{engine::general_purpose, Engine as _};
@@ -127,7 +124,7 @@ impl AggregateCore for HydraKllSketchAccumulator {
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::storage_engines::types::MultipleSubpopulationAggregate;
+        use crate::MultipleSubpopulationAggregate;
         let key_val = key
             .as_ref()
             .ok_or("Key required for HydraKllSketchAccumulator")?;

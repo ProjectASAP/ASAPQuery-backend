@@ -1,7 +1,7 @@
 //! Graph traversal for an installed physical QueryPlan.
 //!
 //! This module owns dependency ordering and memoization only. Physical node
-//! definitions live in `control_plane`; store and operator semantics are
+//! definitions live in `asap_types`; store and operator semantics are
 //! supplied by a runtime adapter.
 
 use std::collections::BTreeMap;
@@ -99,7 +99,6 @@ pub fn execute_from<R: QueryNodeRuntime>(
     })
 }
 
-#[cfg(test)]
 pub async fn execute_async<R: AsyncQueryNodeRuntime + Sync>(
     entry: &QueryPlanEntry,
     runtime: &R,
