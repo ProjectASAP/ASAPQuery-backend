@@ -395,13 +395,13 @@ fn bench_query_precomputes_by_agg(c: &mut Criterion) {
 /// config the reconciler retires nothing — the steady-state ingest
 /// case, where the per-batch reconcile is pure scan overhead.
 fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types::StreamingConfig {
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType as AT;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
 
-    let cfg = AggregationConfig::new(
+    let cfg = PrecomputeMaterialization::new(
         AT::Sum,
         String::new(),
         HashMap::new(),

@@ -1,6 +1,6 @@
-use crate::precompute_engine::accumulator_factory::{
-    create_accumulator_updater, AccumulatorUpdater,
-};
+#[cfg(test)]
+use crate::precompute_engine::accumulator_factory::create_fixture_accumulator;
+use crate::precompute_engine::accumulator_factory::AccumulatorUpdater;
 use crate::precompute_engine::config::LateDataPolicy;
 use crate::precompute_engine::group_key::GroupKey;
 use crate::precompute_engine::metrics::record_late_input;
@@ -11,7 +11,7 @@ use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
     AggregateCore, KeyByLabelValues, PrecomputedOutput, StreamingConfigHandle,
 };
-use asap_types::aggregation_config::AggregationConfig;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 use asap_types::SampleUpdateRule;
 use std::collections::{BTreeMap, HashMap};
@@ -37,10 +37,11 @@ use tracing::{debug, debug_span, info, warn};
 /// producing one output per (sid, window) — exactly like Arroyo's
 /// `GROUP BY window, key`.
 struct GroupState {
+    program: Option<Arc<super::raw_dag::RawDagProgram>>,
     series_id: u64,
     catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     input_revisions: BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
-    config: Arc<AggregationConfig>,
+    config: Arc<PrecomputeMaterialization>,
     /// Source policy fingerprint that minted this sid. Held so
     /// `evict_orphaned_groups` can check liveness against the streaming
     /// config snapshot (a sid stays alive only while its source policy is
@@ -411,7 +412,7 @@ impl Worker {
     ///
     /// B7.6 — buckets are now keyed by `sid` (a single u64) rather than
     /// `(agg_id, group_key)`. `policy_fp` is the source config's
-    /// fingerprint, used to fetch the `AggregationConfig` from the
+    /// fingerprint, used to fetch the `PrecomputeMaterialization` from the
     /// hot-reload snapshot the first time we see this sid; `group_key` is
     /// remembered on the `GroupState` for emit-time label rendering.
     ///
@@ -425,12 +426,16 @@ impl Worker {
         sid: u64,
         policy_fp: PolicyFingerprint,
         group_key: &Arc<GroupKey>,
-    ) -> Option<&mut GroupState> {
+    ) -> Result<Option<&mut GroupState>, String> {
         if !self.group_states.contains_key(&sid) {
             let snap = self.hot_reload.snapshot();
-            let cfg = snap.get_aggregation_config(policy_fp.as_u64())?;
+            let Some(cfg) = snap.get_aggregation_config(policy_fp.as_u64()) else {
+                return Ok(None);
+            };
+            let program = snap.raw_programs.get(&policy_fp.as_u64()).cloned();
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
+                program,
                 series_id: sid,
                 catalog_generation: self.current_catalog_generation.clone(),
                 input_revisions: BTreeMap::new(),
@@ -454,7 +459,7 @@ impl Worker {
             self.group_count
                 .store(self.group_states.len(), Ordering::Relaxed);
         }
-        self.group_states.get_mut(&sid)
+        Ok(self.group_states.get_mut(&sid))
     }
 
     /// Process a batch of samples for a specific sid bucket.
@@ -462,7 +467,7 @@ impl Worker {
     ///
     /// This is the core of the Arroyo-equivalent GROUP BY logic.
     /// B7.6 — buckets are keyed by `sid`; `policy_fp` is the source
-    /// `AggregationConfig` fingerprint used to resolve the bucket's
+    /// `PrecomputeMaterialization` fingerprint used to resolve the bucket's
     /// config on first sight; `group_key` is held on the resulting
     /// `GroupState` for emit-time label rendering.
     pub fn process_group_samples(
@@ -479,7 +484,7 @@ impl Worker {
         let now_ms = (self.now_ms_fn)();
 
         if self
-            .get_or_create_group_state(sid, policy_fp, group_key)
+            .get_or_create_group_state(sid, policy_fp, group_key)?
             .is_none()
         {
             warn!(
@@ -489,6 +494,10 @@ impl Worker {
             return Ok(());
         }
         let state = self.group_states.get_mut(&sid).unwrap();
+        #[cfg(not(test))]
+        if state.program.is_none() {
+            return Err("raw precompute requires an installed post-ASAP DAG producer".into());
+        }
 
         // Keep original timestamps inside accumulators (notably rate/increase),
         // shifting only pane membership and closure watermark for PromQL (a,b].
@@ -537,12 +546,19 @@ impl Worker {
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let value =
-                if let SampleUpdateRule::CounterDelta { .. } = state.config.sample_update_rule() {
-                    reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
-                } else {
-                    Some(*val)
-                };
+            let value = if state.program.as_deref().map_or_else(
+                || {
+                    matches!(
+                        state.config.sample_update_rule(),
+                        SampleUpdateRule::CounterDelta { .. }
+                    )
+                },
+                |p| p.uses_counter_delta(),
+            ) {
+                reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
+            } else {
+                Some(*val)
+            };
             for bucket_start in state.bucket_starts_for(pane_timestamp(*ts)) {
                 if let Some(revision) = &input_revision {
                     state
@@ -589,9 +605,14 @@ impl Worker {
                             // Never feed the raw counter value into a membership
                             // heap; the authoritative ExactCounter branch remains
                             // responsible for the visible result.
-                            if matches!(
-                                state.config.sample_update_rule(),
-                                SampleUpdateRule::CounterDelta { .. }
+                            if state.program.as_deref().map_or_else(
+                                || {
+                                    matches!(
+                                        state.config.sample_update_rule(),
+                                        SampleUpdateRule::CounterDelta { .. }
+                                    )
+                                },
+                                |p| p.uses_counter_delta(),
                             ) {
                                 if let Some(input) = state.input_revisions.get_mut(&bucket_start) {
                                     Arc::make_mut(input).first_revision = 0;
@@ -600,8 +621,16 @@ impl Worker {
                                 continue;
                             }
                             record_late_input("append_correction", "raw_sample");
-                            let mut updater = create_accumulator_updater(&state.config);
-                            apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
+                            let mut updater =
+                                installed_updater(state.program.as_deref(), &state.config)?;
+                            apply_installed_sample(
+                                state.program.as_deref(),
+                                &mut *updater,
+                                series_key,
+                                *val,
+                                *ts,
+                                &state.config,
+                            )?;
                             if let (Some(observer), Some(revision)) =
                                 (&self.erp_observer, &input_revision)
                             {
@@ -646,12 +675,21 @@ impl Worker {
                 // only closes an idle pane, not a long-running bulk ingest whose
                 // records share one event timestamp.
                 state.touch_pane(bucket_start, now_ms);
-                let updater = state
-                    .active_panes
-                    .entry(bucket_start)
-                    .or_insert_with(|| create_accumulator_updater(&state.config));
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    state.active_panes.entry(bucket_start)
+                {
+                    entry.insert(installed_updater(state.program.as_deref(), &state.config)?);
+                }
+                let updater = state.active_panes.get_mut(&bucket_start).unwrap();
                 if let Some(value) = value {
-                    apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+                    apply_installed_sample(
+                        state.program.as_deref(),
+                        &mut **updater,
+                        series_key,
+                        value,
+                        *ts,
+                        &state.config,
+                    )?;
                     if let (Some(observer), Some(revision)) = (&self.erp_observer, &input_revision)
                     {
                         observer.observe(
@@ -767,7 +805,7 @@ impl Worker {
         let now_ms = (self.now_ms_fn)();
 
         if self
-            .get_or_create_group_state(sid, policy_fp, group_key)
+            .get_or_create_group_state(sid, policy_fp, group_key)?
             .is_none()
         {
             warn!(
@@ -1349,7 +1387,10 @@ pub fn extract_metric_name(series_key: &str) -> &str {
 /// aggregation config's `grouping_labels`.
 ///
 /// The series key format is: `metric_name{label1="val1",label2="val2",...}`
-pub fn extract_key_from_series(series_key: &str, config: &AggregationConfig) -> KeyByLabelValues {
+pub fn extract_key_from_series(
+    series_key: &str,
+    config: &PrecomputeMaterialization,
+) -> KeyByLabelValues {
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
 
@@ -1492,19 +1533,61 @@ pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+fn installed_updater(
+    program: Option<&super::raw_dag::RawDagProgram>,
+    config: &PrecomputeMaterialization,
+) -> Result<Box<dyn AccumulatorUpdater>, String> {
+    if let Some(program) = program {
+        return program.updater();
+    }
+    #[cfg(test)]
+    {
+        Ok(create_fixture_accumulator(config))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        Err("missing installed Planner producer".into())
+    }
+}
+
+fn apply_installed_sample(
+    program: Option<&super::raw_dag::RawDagProgram>,
+    updater: &mut dyn AccumulatorUpdater,
+    series: &str,
+    value: f64,
+    timestamp: i64,
+    config: &PrecomputeMaterialization,
+) -> Result<(), String> {
+    if let Some(program) = program {
+        return program.apply(updater, series, value, timestamp);
+    }
+    #[cfg(test)]
+    {
+        apply_sample(updater, series, value, timestamp, config);
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        Err("missing installed Planner producer".into())
+    }
+}
+
 /// Route a single sample to `updater`, dispatching keyed vs. non-keyed based on config.
 ///
 /// For keyed accumulators (MultipleSum, CMS, HydraKLL), the key is extracted
 /// from the series' **aggregated_labels** — these are the labels that become
 /// the key dimension *inside* the sketch (e.g., which bucket in a CMS, which
-/// entry in a MultipleSumAccumulator's HashMap). This matches the Arroyo SQL
+/// entry in a KeyedSumCountAccumulator's HashMap). This matches the Arroyo SQL
 /// pattern: `udf(concat_ws(';', aggregated_labels), value)`.
+#[cfg(test)]
 pub(crate) fn apply_sample(
     updater: &mut dyn AccumulatorUpdater,
     series_key: &str,
     val: f64,
     ts: i64,
-    config: &AggregationConfig,
+    config: &PrecomputeMaterialization,
 ) {
     if updater.is_keyed() {
         // Planner's PromQL Top-K item is the series identity. When no
@@ -1529,7 +1612,7 @@ pub(crate) fn apply_sample(
 /// Convert a cumulative counter sample into a non-negative, reset-aware
 /// increment. Only the immediately preceding sample per series is retained;
 /// pane rotation therefore cannot lose the boundary increment.
-fn reset_aware_counter_delta(
+pub(crate) fn reset_aware_counter_delta(
     previous: &mut HashMap<String, (i64, f64)>,
     series_key: &str,
     value: f64,
@@ -1560,7 +1643,7 @@ fn reset_aware_counter_delta(
 /// (MultipleSum, CMS, HydraKLL), matching Arroyo's `agg_columns`.
 fn extract_aggregated_key_from_series(
     series_key: &str,
-    config: &AggregationConfig,
+    config: &PrecomputeMaterialization,
 ) -> KeyByLabelValues {
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
@@ -1792,7 +1875,7 @@ mod tests {
 
     use crate::precompute_engine::config::LateDataPolicy;
     use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
-    use crate::precompute_engine::operators::multiple_sum_accumulator::MultipleSumAccumulator;
+    use crate::precompute_engine::operators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::StreamingConfig;
@@ -1808,7 +1891,7 @@ mod tests {
         window_secs: u64,
         slide_secs: u64,
         grouping: Vec<&str>,
-    ) -> AggregationConfig {
+    ) -> PrecomputeMaterialization {
         make_agg_config_full(
             id,
             metric,
@@ -1831,7 +1914,7 @@ mod tests {
         slide_secs: u64,
         grouping: Vec<&str>,
         aggregated: Vec<&str>,
-    ) -> AggregationConfig {
+    ) -> PrecomputeMaterialization {
         // `_id` is unused after PR 5 — identity is content-addressed
         // via `PolicyFingerprint::from_config`. Callers below build the
         // streaming-config map by reading `config.policy_fp_u64()`
@@ -1841,7 +1924,7 @@ mod tests {
         } else {
             WindowKind::Sliding
         };
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             agg_type,
             agg_sub_type.to_string(),
             HashMap::new(),
@@ -1861,7 +1944,7 @@ mod tests {
     }
 
     fn make_worker(
-        agg_configs: HashMap<u64, AggregationConfig>,
+        agg_configs: HashMap<u64, PrecomputeMaterialization>,
         sink: Arc<CapturingOutputSink>,
         pass_raw: bool,
         raw_agg_id: u64,
@@ -1871,7 +1954,7 @@ mod tests {
     }
 
     fn make_worker_with_lateness(
-        agg_configs: HashMap<u64, AggregationConfig>,
+        agg_configs: HashMap<u64, PrecomputeMaterialization>,
         sink: Arc<CapturingOutputSink>,
         pass_raw: bool,
         raw_agg_id: u64,
@@ -1900,12 +1983,12 @@ mod tests {
     }
 
     /// Build a fresh `StreamingConfigHandle` from a map of agg_id
-    /// → AggregationConfig. Worker::new takes this handle instead of
-    /// the old `HashMap<u64, Arc<AggregationConfig>>`. Tests use this
+    /// → PrecomputeMaterialization. Worker::new takes this handle instead of
+    /// the old `HashMap<u64, Arc<PrecomputeMaterialization>>`. Tests use this
     /// helper instead of constructing the handle inline at every
     /// callsite.
     fn make_hot_reload(
-        configs: HashMap<u64, AggregationConfig>,
+        configs: HashMap<u64, PrecomputeMaterialization>,
     ) -> crate::storage_engines::types::StreamingConfigHandle {
         crate::storage_engines::types::StreamingConfigHandle::new(
             crate::storage_engines::types::StreamingConfig::new(configs),
@@ -1991,7 +2074,7 @@ mod tests {
             assert_eq!(output.start_timestamp as i64, *ts);
             assert_eq!(output.end_timestamp as i64, *ts);
             // Raw mode emits PolicyFingerprint::UNSET (no source
-            // AggregationConfig in the raw-mode fast path). The sink
+            // PrecomputeMaterialization in the raw-mode fast path). The sink
             // drops UNSET outputs with a warn — verified separately
             // via integration tests.
             assert!(output.policy_fp.is_unset());
@@ -2452,7 +2535,7 @@ mod tests {
     #[test]
     fn test_keyed_accumulator_aggregated_labels() {
         // Like planner output for `sum by (host) (cpu)`:
-        // grouping=[] (empty), aggregated=[host] (key inside MultipleSumAccumulator)
+        // grouping=[] (empty), aggregated=[host] (key inside KeyedSumCountAccumulator)
         let config = make_agg_config_full(
             3,
             "cpu",
@@ -2504,10 +2587,10 @@ mod tests {
         let (_output, acc) = &captured[0];
         let ms_acc = acc
             .as_any()
-            .downcast_ref::<MultipleSumAccumulator>()
-            .expect("should be MultipleSumAccumulator");
+            .downcast_ref::<KeyedSumCountAccumulator>()
+            .expect("should be KeyedSumCountAccumulator");
 
-        // The MultipleSumAccumulator should have two internal keys: "A" and "B"
+        // The KeyedSumCountAccumulator should have two internal keys: "A" and "B"
         assert_eq!(ms_acc.sums.len(), 2, "two host keys inside one accumulator");
 
         let mut found_a = false;
@@ -2680,100 +2763,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_worker_from_streaming_config_yaml() {
-        let yaml = r#"
-aggregations:
-- aggregationType: SingleSubpopulation
-  aggregationSubType: Sum
-  labels:
-    grouping: []
-    rollup: []
-    aggregated: []
-  metric: requests_total
-  parameters: {}
-  tumblingWindowSize: 10
-  windowSize: 10
-  windowType: tumbling
-  slideInterval: 0
-  spatialFilter: ''
-"#;
-
-        let data: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid YAML");
-        let streaming_config =
-            StreamingConfig::from_yaml_data(&data).expect("valid streaming config");
-
-        // PR 5: the streaming-config key is the policy fingerprint.
-        let agg_id = *streaming_config
-            .materializations()
-            .keys()
-            .next()
-            .expect("one agg");
-        assert!(streaming_config.contains(agg_id));
-
-        let agg_configs = streaming_config.materializations().clone();
-        let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
-
-        let pf = PolicyFingerprint(agg_id);
-        let sid = 1_u64;
-        worker
-            .process_group_samples(
-                sid,
-                pf,
-                &test_group_key(""),
-                group_samples("requests_total", vec![(1_000, 3.0)]),
-            )
-            .unwrap();
-        worker
-            .process_group_samples(
-                sid,
-                pf,
-                &test_group_key(""),
-                group_samples("requests_total", vec![(5_000, 4.0)]),
-            )
-            .unwrap();
-        worker
-            .process_group_samples(
-                sid,
-                pf,
-                &test_group_key(""),
-                group_samples("requests_total", vec![(9_000, 5.0)]),
-            )
-            .unwrap();
-        assert_eq!(sink.len(), 0);
-
-        worker
-            .process_group_samples(
-                sid,
-                pf,
-                &test_group_key(""),
-                group_samples("requests_total", vec![(10_000, 0.0)]),
-            )
-            .unwrap();
-
-        let captured = sink.drain();
-        assert_eq!(captured.len(), 1);
-
-        let (output, acc) = &captured[0];
-        let _ = agg_id;
-        assert!(!output.policy_fp.is_unset());
-        assert_eq!(output.start_timestamp, 0);
-        assert_eq!(output.end_timestamp, 10_000);
-
-        let sum_acc = acc
-            .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("should be SumAccumulator");
-        assert!(
-            (sum_acc.sum - 12.0).abs() < 1e-10,
-            "sum should be 3+4+5=12, got {}",
-            sum_acc.sum
-        );
+    fn test_worker_rejects_flat_streaming_config_yaml() {
+        let data =
+            serde_yaml::from_str("aggregations: [{aggregationType: Sum, metric: m}]").unwrap();
+        assert!(StreamingConfig::from_yaml_data(&data).is_err());
     }
 
     #[test]
     fn test_extract_key_from_series() {
-        let config = AggregationConfig::new(
+        let config = PrecomputeMaterialization::new(
             AggregationType::SingleSubpopulation,
             "Sum".to_string(),
             HashMap::new(),
@@ -3413,7 +3411,7 @@ aggregations:
 
     /// Build a worker with explicit wall-clock closure grace values.
     fn make_worker_with_wall_clock_policy(
-        agg_configs: HashMap<u64, AggregationConfig>,
+        agg_configs: HashMap<u64, PrecomputeMaterialization>,
         sink: Arc<CapturingOutputSink>,
         late_data_policy: LateDataPolicy,
         idle_grace_period_ms: i64,
@@ -4276,5 +4274,181 @@ aggregations:
             0,
             "force-close must be idempotent once panes are drained"
         );
+    }
+}
+
+#[cfg(test)]
+mod dag_execution_tests {
+    use super::*;
+    use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
+    use crate::precompute_engine::output_sink::CapturingOutputSink;
+    use crate::storage_engines::types::StreamingConfig;
+    use asap_types::query_plan::ExactReadout;
+
+    fn plan(query: &str) -> control_plane::physical::compiler::CompiledPhysicalPlan {
+        let mut json: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let mut item = json["query_workload"]["repeating_queries"][0].clone();
+        item["query"] = query.into();
+        json["query_workload"]["repeating_queries"] = serde_json::json!([item]);
+        let snapshot = serde_json::from_value(json).unwrap();
+        crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile_promql()
+            .unwrap()
+    }
+
+    // A selected producer must govern updates, persisted family, and query readout.
+    #[test]
+    fn installed_dag_ingestion_persistence_and_readout() {
+        for (query, readout, answer) in [
+            (
+                "sum_over_time(asap_demo_gauge[5s])",
+                ExactReadout::Sum,
+                54.0,
+            ),
+            (
+                "count_over_time(asap_demo_gauge[5s])",
+                ExactReadout::Count,
+                5.0,
+            ),
+            ("min_over_time(asap_demo_gauge[5s])", ExactReadout::Min, 3.0),
+            (
+                "max_over_time(asap_demo_gauge[5s])",
+                ExactReadout::Max,
+                20.0,
+            ),
+            ("rate(asap_demo_counter_total[5s])", ExactReadout::Rate, 5.5),
+            (
+                "increase(asap_demo_counter_total[5s])",
+                ExactReadout::Increase,
+                27.5,
+            ),
+        ] {
+            let plan = plan(query);
+            let config = plan
+                .precompute_plan
+                .materializations
+                .first()
+                .expect("ASAP producer required")
+                .clone();
+            let fp = config.policy_fingerprint();
+            let streaming = StreamingConfig::from_precompute_plan(plan.precompute_plan).unwrap();
+            let doc = serde_json::to_value(&streaming).unwrap();
+            assert!(doc.get("aggregation_configs").is_none());
+            let streaming: StreamingConfig = serde_json::from_value(doc).unwrap();
+            let sink = Arc::new(CapturingOutputSink::new());
+            let (_tx, rx) = mpsc::channel(8);
+            let mut worker = Worker::new(
+                0,
+                rx,
+                sink.clone(),
+                StreamingConfigHandle::new(streaming),
+                WorkerRuntimeConfig {
+                    max_buffer_per_series: 100,
+                    allowed_lateness_ms: 10_000,
+                    pass_raw_samples: false,
+                    raw_mode_aggregation_id: 0,
+                    late_data_policy: LateDataPolicy::Drop,
+                    wall_clock_idle_grace_period_ms: 0,
+                    wall_clock_max_open_grace_period_ms: 0,
+                },
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicI64::new(0)),
+            );
+            worker
+                .process_group_samples(
+                    1,
+                    fp,
+                    &Arc::new(GroupKey::new([])),
+                    [
+                        (1000, 10.0),
+                        (2000, 20.0),
+                        (3000, 3.0),
+                        (4000, 9.0),
+                        (5000, 12.0),
+                    ]
+                    .into_iter()
+                    .map(|(t, v)| (config.metric.clone(), t, v))
+                    .collect(),
+                )
+                .unwrap();
+            worker.force_close_all().unwrap();
+            let mut states = BTreeMap::new();
+            for (output, state) in sink.drain() {
+                let select = if matches!(
+                    config.window_layout,
+                    asap_types::WindowMaterializationLayout::FullWindow
+                ) {
+                    output.start_timestamp == 0 && output.end_timestamp == 5000
+                } else {
+                    output.end_timestamp <= 5000
+                };
+                if select {
+                    assert_eq!(
+                        state.get_accumulator_type().planner_exact_family(),
+                        Some(readout.planner_family())
+                    );
+                    let restored =
+                        ExactAccumulator::deserialize_from_bytes(&state.serialize_to_bytes())
+                            .unwrap();
+                    states.insert(
+                        output.end_timestamp as i64,
+                        Arc::new(restored) as Arc<dyn AggregateCore>,
+                    );
+                }
+            }
+            assert!(!states.is_empty(), "{query}: no stored states");
+            let group =
+                crate::query_engines::asap_query_engine::summary_executor::GroupState::ExactAgg {
+                    entries: vec![std::rc::Rc::new(states)],
+                    agg_type: config.aggregation_type,
+                };
+            assert_eq!(
+                group.exact_value_for(readout, &None, 0, 5000),
+                Some(answer),
+                "{query}"
+            );
+        }
+    }
+
+    // A flat config and a DAG whose producer no longer matches its binding cannot install.
+    #[test]
+    fn execution_requires_matching_dag_producer() {
+        assert!(serde_json::from_value::<StreamingConfig>(
+            serde_json::json!({"aggregation_configs":{}})
+        )
+        .is_err());
+        let mut plan = plan("rate(asap_demo_counter_total[5s])").precompute_plan;
+        plan.executable_dags.clear();
+        assert!(StreamingConfig::from_precompute_plan(plan)
+            .unwrap_err()
+            .to_string()
+            .contains("DAG producer"));
+    }
+    // Changing a raw update must not silently reuse the original summary identity.
+    #[test]
+    fn altered_dag_update_cannot_reuse_a_stored_definition() {
+        let mut plan = plan("sum_over_time(asap_demo_gauge[5s])").precompute_plan;
+        let installed = plan.executable_dags.values_mut().next().unwrap();
+        let mut dag = installed.document.decode().unwrap();
+        for node in &mut dag.nodes {
+            if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                input, ..
+            } = &mut node.payload
+            {
+                input.weight = planner_types::post_asap::SummaryInputExpr::Constant(99.0);
+            }
+        }
+        installed.document = asap_types::executable_plan::OwnedPostAsapDag::from_executable(
+            installed.document.query_id.clone(),
+            &dag,
+        )
+        .unwrap();
+        assert!(StreamingConfig::from_precompute_plan(plan)
+            .unwrap_err()
+            .to_string()
+            .contains("update"));
     }
 }

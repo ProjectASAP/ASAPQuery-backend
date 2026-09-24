@@ -18,7 +18,7 @@ pub struct WindowManager {
 impl WindowManager {
     /// Create a new WindowManager.
     ///
-    /// `window_size_secs` and `slide_interval_secs` come from `AggregationConfig`
+    /// `window_size_secs` and `slide_interval_secs` come from `PrecomputeMaterialization`
     /// (which stores them in seconds). They are converted to milliseconds internally.
     pub fn new(window_size_secs: u64, slide_interval_secs: u64) -> Self {
         Self::with_origin(window_size_secs, slide_interval_secs, None)

@@ -34,10 +34,7 @@ pub(super) fn share_additive_panes(
         if !seen.insert(old)
             || m.derived_input.is_some()
             || derived_sources.contains(&old)
-            || !matches!(
-                m.aggregation_type,
-                AggregationType::Sum | AggregationType::MultipleSum
-            )
+            || !matches!(m.aggregation_type, AggregationType::Sum)
         {
             continue;
         }

@@ -1,4 +1,4 @@
-use crate::precompute_engine::operators::{MultipleSumAccumulator, SumAccumulator};
+use crate::precompute_engine::operators::{KeyedSumCountAccumulator, SumAccumulator};
 #[cfg(test)]
 use crate::storage_engines::types::{
     KeyByLabelValues, MultipleSubpopulationAggregate, SingleSubpopulationAggregate,
@@ -18,7 +18,7 @@ fn test_single_subpopulation_interface() {
 #[test]
 fn test_multiple_subpopulation_interface() {
     // Multiple accumulator - matches Python behavior exactly
-    let mut multi_acc = MultipleSumAccumulator::new();
+    let mut multi_acc = KeyedSumCountAccumulator::new();
 
     let mut key = KeyByLabelValues::new();
     key.insert("web".to_string());
@@ -43,7 +43,7 @@ fn test_interface_prevents_misuse() {
     let single_acc: Box<dyn SingleSubpopulationAggregate> =
         Box::new(SumAccumulator::with_sum(42.0));
     let multi_acc: Box<dyn MultipleSubpopulationAggregate> =
-        Box::new(MultipleSumAccumulator::new());
+        Box::new(KeyedSumCountAccumulator::new());
 
     // ✅ These work - correct usage
     let _result1 = single_acc.query(Statistic::Sum, None);
@@ -68,7 +68,7 @@ fn test_python_alignment() {
 
     // Python: multiple_accumulator.query(Statistic.SUM, key)
     // Rust:   multiple_accumulator.query(Statistic::Sum, &key)
-    let mut multi_acc = MultipleSumAccumulator::new();
+    let mut multi_acc = KeyedSumCountAccumulator::new();
     let key = KeyByLabelValues::new();
     multi_acc.add_sum(key.clone(), 100.0);
     let multi_trait: Box<dyn MultipleSubpopulationAggregate> = Box::new(multi_acc);

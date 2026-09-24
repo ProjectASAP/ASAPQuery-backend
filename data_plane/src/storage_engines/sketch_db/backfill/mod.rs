@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use asap_types::aggregation_config::AggregationConfig;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -507,12 +507,12 @@ impl BackfillRegistry {
     /// control-plane-facing HTTP endpoint can return specific 404 /
     /// 409 / 400 statuses. `CreateError::UnknownAgg` is no longer
     /// returned from this method — the caller proves the agg
-    /// exists by holding the `AggregationConfig` — but the variant
+    /// exists by holding the `PrecomputeMaterialization` — but the variant
     /// is kept on the enum for HTTP error-mapping compatibility
     /// (the handler still produces it when its own lookup misses).
     pub fn create_checked(
         &self,
-        config: &AggregationConfig,
+        config: &PrecomputeMaterialization,
         created_at_ms: u64,
         time_range: (u64, u64),
         source: BackfillSource,
@@ -883,7 +883,9 @@ pub use service::{
     default_reader_factory, noop_reader_factory, BackfillService, BackfillServiceConfig,
     BackfillServiceHandle, ReaderFactory,
 };
+#[cfg(test)]
 pub use window_builder::build_backfilled_accumulator;
+pub use window_builder::build_dag_accumulator;
 pub use worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};
 
 #[cfg(test)]

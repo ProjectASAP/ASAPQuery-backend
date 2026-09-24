@@ -22,10 +22,11 @@ use crate::drivers::ingest::population_attrs_fingerprint;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
 use crate::storage_engines::types::{AggregateCore, KeyByLabelValues, StreamingConfigHandle};
-use asap_types::aggregation_config::AggregationConfig;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 
 use super::raw_sample_reader::RawSample;
+#[cfg(test)]
 use super::window_builder::build_backfilled_accumulator;
 use super::worker::WindowProcessor;
 use super::BackfillRegistry;
@@ -39,7 +40,7 @@ use super::BackfillRegistry;
 /// Kept local to the backfill module (not shared with live) per
 /// the §5e separation ask; the implementations must stay identical
 /// by convention.
-fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
+fn extract_group_key(series_key: &str, config: &PrecomputeMaterialization) -> String {
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
     for label_name in &config.grouping_labels.names() {
@@ -71,7 +72,7 @@ fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
 /// live windows occupy the same storage row.
 fn resolve_backfill_bucket_sid(
     resolver: &SeriesIdResolver,
-    config: &AggregationConfig,
+    config: &PrecomputeMaterialization,
     series_key: &str,
     store: Option<&crate::storage_engines::sketch_db::index::SketchStore>,
     captured_generation: Option<&asap_types::sds::CatalogGeneration>,
@@ -124,7 +125,7 @@ fn fallback_bucket_id(group_key: &str) -> u64 {
 pub struct BackfillWindowProcessor {
     /// Live config source. The processor snapshots the latest
     /// `StreamingConfig` at each window to find the
-    /// `AggregationConfig` for `agg_id`. The snapshot is cheap
+    /// `PrecomputeMaterialization` for `agg_id`. The snapshot is cheap
     /// (Arc refcount bump) so we don't optimise further.
     config: StreamingConfigHandle,
     /// Destination for rebuilt windows. Tests may omit it to record registry
@@ -185,22 +186,6 @@ impl BackfillWindowProcessor {
         self.series_resolver = Some(series_resolver);
         self
     }
-
-    /// Look up the `AggregationConfig` for `agg_id` in the current
-    /// `StreamingConfig` snapshot. Returns an error string if the
-    /// agg has been removed from the config since the job was
-    /// created — rare but worth handling (e.g. operator retired
-    /// the agg mid-backfill; the `BackfillWorker` will
-    /// `mark_failed` the job with this message).
-    fn config_for_agg(
-        &self,
-        agg_id: u64,
-    ) -> Result<AggregationConfig, Box<dyn std::error::Error + Send + Sync>> {
-        let snap = self.config.snapshot();
-        snap.get_aggregation_config(agg_id).cloned().ok_or_else(|| {
-            format!("agg_id {agg_id} not in current StreamingConfig — retired mid-backfill?").into()
-        })
-    }
 }
 
 /// One per-sid bucket assembled by [`BackfillWindowProcessor::process_window`].
@@ -219,7 +204,16 @@ impl WindowProcessor for BackfillWindowProcessor {
         window_range: (u64, u64),
         samples: Vec<RawSample>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let config = self.config_for_agg(agg_id)?;
+        let snapshot = self.config.snapshot();
+        let config = snapshot
+            .get_aggregation_config(agg_id)
+            .cloned()
+            .ok_or_else(|| format!("agg_id {agg_id} not in current StreamingConfig"))?;
+        let program = snapshot.raw_programs.get(&agg_id).cloned();
+        #[cfg(not(test))]
+        if program.is_none() {
+            return Err("backfill requires a post-ASAP DAG installation".into());
+        }
 
         // B7.7 — sid-keyed bucketing. Per the schema-retirement #5
         // step 6 plan, the backfill processor's per-window grouping is
@@ -289,7 +283,18 @@ impl WindowProcessor for BackfillWindowProcessor {
 
         for (sid, bucket) in by_bucket {
             let SidBucket { group_key, samples } = bucket;
-            let accumulator = build_backfilled_accumulator(&config, &samples);
+            let accumulator = if let Some(program) = &program {
+                super::window_builder::build_dag_accumulator(program, &samples)?
+            } else {
+                #[cfg(test)]
+                {
+                    build_backfilled_accumulator(&config, &samples)
+                }
+                #[cfg(not(test))]
+                {
+                    return Err("missing backfill DAG producer".into());
+                }
+            };
             // Keyed accumulators (MultipleSubpopulation) carry their
             // subpopulation keys internally; the PrecomputedOutput's
             // `key` represents the *group* key (grouping_labels
@@ -374,7 +379,7 @@ mod tests {
     use asap_types::KeyByLabelNames;
     use std::sync::Arc;
 
-    fn sum_config(_agg_id: u64, metric: &str, grouping: Vec<&str>) -> AggregationConfig {
+    fn sum_config(_agg_id: u64, metric: &str, grouping: Vec<&str>) -> PrecomputeMaterialization {
         // `_agg_id` is unused after PR 5 — identity is content-addressed
         // via `PolicyFingerprint::from_config`.
         let grouping_labels = if grouping.is_empty() {
@@ -382,7 +387,7 @@ mod tests {
         } else {
             KeyByLabelNames::from_names(grouping.into_iter().map(String::from).collect())
         };
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             std::collections::HashMap::new(),
@@ -401,7 +406,7 @@ mod tests {
         )
     }
 
-    fn streaming_config_with(config: AggregationConfig) -> Arc<StreamingConfig> {
+    fn streaming_config_with(config: PrecomputeMaterialization) -> Arc<StreamingConfig> {
         let mut map = std::collections::HashMap::new();
         map.insert(config.policy_fp_u64(), config);
         Arc::new(StreamingConfig::new(map))
@@ -567,7 +572,7 @@ mod tests {
     /// when given the same ordered samples.
     #[test]
     fn backfill_builds_bit_identical_sum_accumulator_to_live() {
-        use crate::precompute_engine::accumulator_factory::create_accumulator_updater;
+        use crate::precompute_engine::accumulator_factory::create_fixture_accumulator;
 
         let cfg = sum_config(1, "m", vec![]);
 
@@ -592,7 +597,7 @@ mod tests {
 
         // Live path: factory + update_single per sample in order.
         let live_bytes = {
-            let mut updater = create_accumulator_updater(&cfg);
+            let mut updater = create_fixture_accumulator(&cfg);
             for s in &samples {
                 updater.update_single(s.value, s.timestamp_ms);
             }
@@ -612,7 +617,7 @@ mod tests {
              serialisations for SumAccumulator. \
              If this test fails, something diverged — check:\n\
              (1) Is `build_backfilled_accumulator` still calling \
-                 `create_accumulator_updater`?\n\
+                 `create_fixture_accumulator`?\n\
              (2) Did a recent change to `SumAccumulator` introduce \
                  non-deterministic state (e.g. a seed)?\n\
              (3) Does `serialize_to_bytes` include any timestamp \

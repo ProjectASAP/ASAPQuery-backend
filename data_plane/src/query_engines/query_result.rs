@@ -102,7 +102,7 @@ impl QueryResult {
 
     /// Attach an accuracy envelope. Chainable so engine paths
     /// can build the bare result first and decorate once the
-    /// `agg_id → AggregationConfig → AccuracyProfile` lookup
+    /// `agg_id → PrecomputeMaterialization → AccuracyProfile` lookup
     /// has resolved.
     pub fn with_accuracy(mut self, envelope: AccuracyEnvelope) -> Self {
         match &mut self {

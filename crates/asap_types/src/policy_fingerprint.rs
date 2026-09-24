@@ -1,6 +1,6 @@
 //! Legacy routing wrapper for a deployed stored output.
 //!
-//! An explicit `AggregationConfig::stored_output_id` takes precedence.
+//! An explicit `PrecomputeMaterialization::stored_output_id` takes precedence.
 //! Otherwise the compiler allocates a deterministic default from the existing
 //! policy fields (including pane layout and cadence). This identifier is not
 //! semantic identity: `SummaryDefinitionId` hashes the versioned semantic
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use xxhash_rust::xxh64::xxh64;
 
-use crate::aggregation_config::AggregationConfig;
+use crate::aggregation_config::PrecomputeMaterialization;
 
 /// Routing handle for one deployed stored output. See the module contract.
 #[derive(
@@ -33,14 +33,14 @@ impl PolicyFingerprint {
 }
 
 impl PolicyFingerprint {
-    /// Compute the fingerprint of an [`AggregationConfig`].
+    /// Compute the fingerprint of an [`PrecomputeMaterialization`].
     ///
     /// Hash inputs are concatenated with `\0` byte separators and
     /// canonicalized so that map/iteration order can't affect the
     /// outcome. Parameter values are rendered via `serde_json::to_string`
     /// for nested-shape determinism (matches the existing
     /// `parameters_canonical` form used in `AggKind::ExactAgg`).
-    pub fn from_config(cfg: &AggregationConfig) -> Self {
+    pub fn from_config(cfg: &PrecomputeMaterialization) -> Self {
         if let Some(output) = cfg.stored_output_id {
             return output.fingerprint();
         }
@@ -226,8 +226,8 @@ mod tests {
         group_by: Vec<&str>,
         window_size: u64,
         spatial_filter: &str,
-    ) -> AggregationConfig {
-        AggregationConfig::new(
+    ) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             agg_type,
             String::new(),
             params,
@@ -259,7 +259,7 @@ mod tests {
         );
         let wire = serde_json::to_value(&legacy).unwrap();
         assert!(wire.get("population_key_encoding").is_none());
-        let decoded: AggregationConfig = serde_json::from_value(wire).unwrap();
+        let decoded: PrecomputeMaterialization = serde_json::from_value(wire).unwrap();
         assert!(decoded.population_key_encoding.is_legacy());
         assert_eq!(legacy.policy_fingerprint(), decoded.policy_fingerprint());
         let mut canonical = legacy.clone();
@@ -267,7 +267,7 @@ mod tests {
         assert_ne!(legacy.policy_fingerprint(), canonical.policy_fingerprint());
         let wire = serde_json::to_value(&canonical).unwrap();
         assert_eq!(wire["population_key_encoding"], "canonical_labels_v1");
-        let decoded: AggregationConfig = serde_json::from_value(wire).unwrap();
+        let decoded: PrecomputeMaterialization = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded.policy_fingerprint(), canonical.policy_fingerprint());
         use crate::traits::SerializableToSink;
         let mut sink = canonical.serialize_to_json();
@@ -276,7 +276,7 @@ mod tests {
         sink["aggregatedLabels"] =
             serde_json::to_value(&canonical.aggregated_labels.labels).unwrap();
         sink["rollupLabels"] = serde_json::to_value(&canonical.rollup_labels.labels).unwrap();
-        let decoded = AggregationConfig::deserialize_from_json(&sink).unwrap();
+        let decoded = PrecomputeMaterialization::deserialize_from_json(&sink).unwrap();
         assert_eq!(
             decoded.population_key_encoding,
             canonical.population_key_encoding
@@ -423,7 +423,7 @@ mod tests {
         );
     }
 
-    /// Pre-PR-5 the `aggregation_id` field on `AggregationConfig` was
+    /// Pre-PR-5 the `aggregation_id` field on `PrecomputeMaterialization` was
     /// excluded from the fingerprint hash. PR 5 deletes the field
     /// entirely — identity *is* the fingerprint — so this is now
     /// vacuously true. Kept as a doc-comment anchor; no runtime test
@@ -486,7 +486,7 @@ mod tests {
     fn spatial_filter_canonicalization_drives_fingerprint() {
         // Two filters that differ only in matcher ordering produce the
         // SAME normalized form, hence the SAME fingerprint. The
-        // canonicalization step in `AggregationConfig::new` (via
+        // canonicalization step in `PrecomputeMaterialization::new` (via
         // `normalize_spatial_filter`) sorts matchers by key.
         let a = cfg(
             "http_lat",

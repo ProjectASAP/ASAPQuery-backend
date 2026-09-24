@@ -197,7 +197,11 @@ impl SingleSubpopulationAggregate for SumAccumulator {
         }
 
         match statistic {
-            Statistic::Sum | Statistic::Count => Ok(self.sum),
+            Statistic::Sum => Ok(self.sum),
+            Statistic::Count => self
+                .observation_count
+                .map(|count| count as f64)
+                .ok_or_else(|| "sample count is unavailable for this Sum payload".into()),
             _ => Err(format!("Unsupported statistic in SumAccumulator: {statistic:?}").into()),
         }
     }
@@ -308,16 +312,24 @@ mod tests {
             crate::SingleSubpopulationAggregate::query(&acc, Statistic::Sum, None).unwrap(),
             42.0
         );
-        assert_eq!(
-            crate::SingleSubpopulationAggregate::query(&acc, Statistic::Count, None).unwrap(),
-            42.0
-        );
+        assert!(crate::SingleSubpopulationAggregate::query(&acc, Statistic::Count, None).is_err());
 
         assert!(crate::SingleSubpopulationAggregate::query(&acc, Statistic::Min, None).is_err());
         // SumAccumulator is a single subpopulation accumulator, doesn't need key-based queries
         assert_eq!(
             crate::SingleSubpopulationAggregate::query(&acc, Statistic::Sum, None).unwrap(),
             42.0
+        );
+    }
+
+    #[test]
+    fn count_readout_uses_observation_count_not_sum() {
+        let mut acc = SumAccumulator::new();
+        acc.update(10.0);
+        acc.update(20.0);
+        assert_eq!(
+            crate::SingleSubpopulationAggregate::query(&acc, Statistic::Count, None).unwrap(),
+            2.0
         );
     }
 

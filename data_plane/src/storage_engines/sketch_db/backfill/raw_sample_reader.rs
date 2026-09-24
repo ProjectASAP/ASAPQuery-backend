@@ -43,7 +43,7 @@ pub struct RawSample {
 /// honour. Exactly one metric name plus zero or more equality
 /// matchers on grouping labels — no regex, no negation, no
 /// lexicographic ranges. The control plane picks the subset of
-/// `AggregationConfig.grouping_labels` that should gate the read.
+/// `PrecomputeMaterialization.grouping_labels` that should gate the read.
 ///
 /// Rationale: every supported exact-DB backend (Prometheus,
 /// ClickHouse, S3+Gorilla) can evaluate this filter efficiently,

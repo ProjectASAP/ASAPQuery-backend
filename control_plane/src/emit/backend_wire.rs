@@ -5,7 +5,7 @@
 //! * the storage-routing table, which maps each metric's materialized summary
 //!   families to the query shapes the ASAP tier serves natively versus the
 //!   ones that belong to the archive;
-//! * the aggregation and readout JSON the backend's `AggregationConfig`
+//! * the aggregation and readout JSON the backend's `PrecomputeMaterialization`
 //!   parser consumes.
 //!
 //! `backend_plan::from_stage_config` reuses [`build_backend_aggregation_json`]

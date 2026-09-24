@@ -717,11 +717,9 @@ fn route_messages(
                     && matches!(
                         config.aggregation_type,
                         asap_types::AggregationType::Increase
-                            | asap_types::AggregationType::MultipleIncrease
+                            | asap_types::AggregationType::Rate
                             | asap_types::AggregationType::Min
                             | asap_types::AggregationType::Max
-                            | asap_types::AggregationType::MultipleMin
-                            | asap_types::AggregationType::MultipleMax
                     ));
             let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
                 Vec::new()
@@ -1041,8 +1039,8 @@ mod tests {
 
     fn configured_receiver() -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
-        use asap_types::{AggregationType, KeyByLabelNames, AggregationConfig};
-        let aggregation = AggregationConfig {
+        use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
+        let aggregation = PrecomputeMaterialization {
             stored_output_id: None,
             semantic_fragment: None,
             population_key_encoding: Default::default(),
@@ -1168,10 +1166,10 @@ mod tests {
     #[test]
     fn global_topk_cms_routes_once_while_counters_remain_per_series() {
         use asap_types::enums::WindowKind;
-        use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
+        use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
 
         let config = |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| {
-            AggregationConfig {
+            PrecomputeMaterialization {
                 stored_output_id: None,
                 semantic_fragment: None,
                 population_key_encoding: Default::default(),

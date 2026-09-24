@@ -1,7 +1,7 @@
 //! Backend-facing emission for a compiled physical plan.
 //!
 //! * [`backend_wire`] builds the storage-routing table and the aggregation /
-//!   readout JSON the backend's `AggregationConfig` parser consumes.
+//!   readout JSON the backend's `PrecomputeMaterialization` parser consumes.
 //! * [`monitor`] carries the CDM monitor declarations.
 
 pub mod backend_wire;
