@@ -1373,9 +1373,9 @@ mod tests {
             sid: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
-            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Increase)),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),
             agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::AggregationType::Increase,
+                agg_type: asap_types::AggregationType::Rate,
                 parameters_canonical: String::new(),
                 spatial_filter_canonical: String::new(),
             },

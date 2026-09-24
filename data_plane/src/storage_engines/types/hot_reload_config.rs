@@ -680,7 +680,7 @@ impl ActivePhysicalPlanHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::AggregationConfig;
+    use crate::storage_engines::types::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -755,8 +755,8 @@ mod tests {
         }
     }
 
-    fn dummy_agg(id: u64) -> AggregationConfig {
-        AggregationConfig::new(
+    fn dummy_agg(id: u64) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             HashMap::new(),

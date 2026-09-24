@@ -35,7 +35,7 @@ pub struct BackendAggregation {
     /// Internal-only id (see struct doc). Not on the wire.
     pub aggregation_id: String,
     /// Source metric the aggregation runs over. Required by the backend's
-    /// `AggregationConfig` parser.
+    /// `PrecomputeMaterialization` parser.
     pub metric_name: String,
     /// Planner-owned committed summary identity. Sketch entries carry a
     /// validated `SketchKind` (category + algorithm + params); exact entries
