@@ -677,7 +677,7 @@ mod hybrid_tests {
 #[cfg(test)]
 mod planner_workload_tests {
     use super::*;
-    use crate::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use crate::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
 
     fn compile_one(query: &str) -> crate::physical::compiler::CompiledPhysicalPlan {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -692,7 +692,7 @@ mod planner_workload_tests {
         let (request, environment) = snapshot
             .into_physical_compilation_request()
             .unwrap_or_else(|error| panic!("{query}: {error}"));
-        PhysicalPlanCompiler
+        DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap_or_else(|error| panic!("{query}: {error}"))
     }
@@ -778,7 +778,7 @@ mod planner_workload_tests {
         let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         assert!(request.allow_mixed_summary_and_exact_execution);
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         assert_eq!(plan.query_plan.entries.len(), 24);

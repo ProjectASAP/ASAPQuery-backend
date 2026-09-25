@@ -1,4 +1,4 @@
-# Planner output to backend physical plans
+# Planner physical computation to backend deployment plans
 
 Status: proposed backend architecture. Audience: developers changing the
 Planner-to-backend compilation and execution boundary.
@@ -7,8 +7,7 @@ Terminology: [Planner/backend glossary](planner-backend-glossary.md).
 
 ## Purpose and scope
 
-This design splits one selected post-ASAP DAG from ASAPPlanner into two executable
-backend plans:
+This design instantiates ASAPPlanner physical computation in two backend deployment plans:
 
 - **PrecomputePlan** produces and maintains stored summary state.
 - **QueryPlan** reads stored state and computes query results.
@@ -42,12 +41,27 @@ This is a representation defect tracked by
 [issue #740](https://github.com/ProjectASAP/ASAPQuery-backend/issues/740).
 The target design requires separate executable projections.
 
-The compiler instead binds stored summaries once and cuts the DAG at each
-materialization boundary:
+The canonical boundary is defined by [Physical Planning, Summary Maintenance,
+and Deployment](https://github.com/ProjectASAP/ASAPPlanner/blob/feat/shared-physical-operators/docs/design_docs/physical-planning-and-deployment.md).
+ASAPPlanner selects a logical candidate and maintenance lifecycle, then
+`physical_planner` compiles deployment-independent Physical DAGs. These contain
+concrete operators, typed input boundaries and output roots. The lifecycle
+accompanies the computation; it is not a second operator IR.
+
+The backend `DeploymentPlanCompiler` binds those boundaries to sources and
+compatible stored summaries, assigns plan identities, and establishes readiness,
+scheduling, retention and publication. It does not lower operators or cut a
+physical graph itself. A boundary change goes back through Planner compilation.
+The deployment engines invoke `asap-physical-operators` with resolved inputs and
+a run context.
+
+The ownership and backend outputs are:
 
 ```mermaid
 flowchart LR
-  D[Selected post-ASAP DAG] --> C[Physical compiler]
+  L[Logical post-ASAP DAG + selected lifecycle] --> PP[ASAPPlanner physical_planner]
+  PP --> D[Physical DAGs + typed boundaries]
+  D --> C[Backend DeploymentPlanCompiler]
   C --> P[PrecomputePlan]
   C --> Q[QueryPlan]
   C -->|definitions snapshot for installation| Def
@@ -80,7 +94,7 @@ are associated with its summary producers through plan-scoped node identities.
 Planner's `SummaryMaintenanceLifecyclePlan` contains a materialized DAG `root`
 and a `deployments` collection, with one entry per unique reachable `SummaryAgg`.
 Each deployment identifies its `post_asap_node_id` and carries an optional
-`SummaryMaintenanceLifecycleGuarantee`, considered alternatives and a selected
+`SummaryMaintenanceLifecycleGuarantee`, considered candidates and a selected
 window framework. The plan also carries workload demand and costing context.
 Thus the lifecycle plan already refers to the computation DAG; it is not a
 separate query representation, nor is one whole lifecycle plan required per
@@ -136,12 +150,10 @@ build leaves that endpoint unready; the configured fallback/unavailability
 policy applies. Reusing an older snapshot requires an explicit query freshness
 policy and must not silently change query time semantics.
 
-Planner supplies legal maintenance alternatives. The backend supplies executable
-implementations and evidence; the control plane commits a feasible selection.
-Concrete engine and implementation IDs remain in backend bindings, not Planner
-IR. The backend binds each producer to its implementation, placement, state
-schema and active plan version, following the
-[planner-runtime contract](https://github.com/ProjectASAP/ASAPPlanner/blob/f46cbf6c5738db2f4460d419baa8af5572f5276a/docs/design_docs/architecture/planner-runtime-contract.md).
+Planner constructs and evaluates maintenance candidates using deployment
+capabilities and scoped cost evidence. Planner owns the selected computation,
+lifecycle and concrete physical implementation. The backend binds each physical
+input/output to concrete sources, storage, placement and an active plan version.
 The compiler validates the selected deployment guarantee and schedule/retention
 without silently changing the mode, coverage or sharing. A changed selection is
 installed through a new plan version. It need not change the semantic summary
@@ -167,7 +179,7 @@ the corresponding producer is supported.
 
 **Physical cost evidence** is a scoped estimate or measurement for one
 implementation/configuration and maintenance mode. It is supplied by the backend
-provider and used when comparing feasible alternatives over the same planning
+provider and used when comparing feasible candidates over the same planning
 horizon. It is separate from both capability and the selected deployment
 guarantee and schedule/retention.
 
@@ -187,11 +199,12 @@ sample count or CPU cost.
 ### Selection and validation
 
 ```text
-Selected computation and lifecycle alternatives
+Selected computation and lifecycle candidates
     + backend capabilities: supported combinations
     + scoped cost evidence: resource costs of those combinations
         -> selected deployment guarantee and schedule/retention per producer
-        -> physical compiler validation
+        -> ASAPPlanner physical compilation
+        -> backend deployment binding and validation
         -> PrecomputePlan + QueryPlan + catalog bindings
 ```
 
@@ -366,7 +379,8 @@ that output a `stored_output_id` and emits matching writer/reader bindings; see
 | Layer | Owns |
 | --- | --- |
 | ASAPPlanner | Semantic candidates, legality, accuracy reasoning and selection among advertised capabilities |
-| Physical compiler | Concrete implementation, subgraph split, catalog bindings and plan version |
+| ASAPPlanner `physical_planner` | Concrete operator implementation, valid boundary DAGs and physical validation |
+| Backend `DeploymentPlanCompiler` | Source/state bindings, catalog identities, placement, scheduling and plan version |
 | Precompute runtime | Installed maintenance nodes and state publication |
 | Query runtime | Bound state reads, query operators, exact residuals and fallback |
 | Definitions snapshot | Compiler-supplied rows validated and registered in `SummaryStore.summary_definitions` at installation |
@@ -377,7 +391,7 @@ that output a `stored_output_id` and emits matching writer/reader bindings; see
 
 The compiler consumes:
 
-- selected Planner DAG roots and query associations;
+- compiled Physical DAGs, their typed boundaries, selected roots and query associations;
 - query accuracy and response requirements;
 - each selected deployment guarantee and its schedule/retention for the
   supported backend mode;
@@ -402,14 +416,14 @@ summary semantics, grouping, time ranges or schemas independently.
 
 ### Executable subgraphs and materialization boundaries
 
-For every selected stored summary, the compiler:
+For every selected stored summary, the deployment compiler binds the physical boundaries supplied by Planner:
 
 1. Creates or reuses a compatible summary definition and assigns the persisted
    DAG output a `stored_output_id` within the plan version. No standalone catalog
    materialization is created.
 2. Places source reads, maintenance operators, derived-state reads and the state
    sink in PrecomputePlan.
-3. Replaces the stored-summary edge in QueryPlan with an explicit state read
+3. Binds the already-compiled typed query input boundary to an explicit state read
    referencing the same stored output and definition, with matching format and partition
    rules. Writer identity belongs to the PrecomputePlan binding.
 4. Places `SummaryEstimate`, merges, exact residuals and result composition in

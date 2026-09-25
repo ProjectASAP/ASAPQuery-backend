@@ -46,7 +46,7 @@ fn quote_snapshot_for_frontend_test(
     metricsql: bool,
 ) -> control_plane::physical::compiler::BackendLocalPlanningInput {
     use control_plane::physical::{
-        compiler::{PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION},
+        compiler::{DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION},
         workload_cost::{self, WorkloadCostEvidence, WorkloadQuote},
     };
     let (request, environment) = snapshot
@@ -59,9 +59,9 @@ fn quote_snapshot_for_frontend_test(
         .into_iter()
         .filter_map(|candidate| {
             let plan = if metricsql {
-                PhysicalPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                DeploymentPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
             } else {
-                PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone())
+                DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone())
             }
             .ok()?;
             let unit_cost = if preferred { 1.0 } else { 1e12 };
@@ -318,7 +318,7 @@ fn is_warm(response: &Value) -> bool {
 // Uncertified ERP maxima have separate exact-routing process coverage.
 #[tokio::test]
 async fn certified_kll_state_to_query_oracle() {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
     let mut fixture: Value = serde_json::from_str(include_str!(
         "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
@@ -362,7 +362,7 @@ async fn certified_kll_state_to_query_oracle() {
         request.query_retention_margin_ms,
     )
     .unwrap();
-    let plan = PhysicalPlanCompiler
+    let plan = DeploymentPlanCompiler
         .compile_promql(request, environment)
         .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
@@ -604,7 +604,7 @@ async fn registered_temporal_topk_count_sketch_heap() {
 }
 
 async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlgorithm) {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
     use planner_types::post_asap::{CompositionOperator, SketchQuery, SummaryFamilyType};
     const QUERY: &str = "topk(3, count_over_time(top_endpoint_qps[5s]))";
     struct Evidence;
@@ -662,7 +662,7 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         &Evidence,
     )
     .unwrap();
-    let plan = PhysicalPlanCompiler
+    let plan = DeploymentPlanCompiler
         .compile_promql(request, environment)
         .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
@@ -924,7 +924,7 @@ async fn run_shared_dashboard(multi_pane: bool) {
         .into_iter()
         .enumerate()
         .map(|(index, candidate)| {
-            let plan = control_plane::physical::compiler::PhysicalPlanCompiler
+            let plan = control_plane::physical::compiler::DeploymentPlanCompiler
                 .compile_promql(candidate.clone(), environment.clone())
                 .unwrap();
             let manifest =

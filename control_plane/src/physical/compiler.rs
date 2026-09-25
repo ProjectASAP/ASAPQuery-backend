@@ -527,7 +527,7 @@ impl AccuracyEvidenceProvider for QueryEvidence<'_> {
 }
 
 #[derive(Debug, Default)]
-pub struct PhysicalPlanCompiler;
+pub struct DeploymentPlanCompiler;
 
 impl BackendLocalPlanningInput {
     /// Invoke the pinned Planner from canonical startup workloads and compile
@@ -940,7 +940,7 @@ fn preserve_metricsql_counter_only_roots(
     Ok(())
 }
 
-impl PhysicalPlanCompiler {
+impl DeploymentPlanCompiler {
     pub fn compile_promql(
         &self,
         request: PhysicalCompilationRequest,
@@ -2370,7 +2370,7 @@ fn requires_exact_erp_fallback(
 #[cfg(test)]
 /// Planner-adapter selection step used before physical compilation. Keeping
 /// this separate makes the ownership boundary explicit: callers supply the
-/// selected post-ASAP DAG to [`PhysicalPlanCompiler::compile`].
+/// selected post-ASAP DAG to [`DeploymentPlanCompiler::compile`].
 pub fn select_post_asap(
     expr: &QueryExpr,
     accuracy: AccuracyTarget,
@@ -3790,7 +3790,7 @@ impl QueryFrontend {
         request: PhysicalCompilationRequest,
         environment: PhysicalDeploymentContext,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
-        PhysicalPlanCompiler.compile_for_frontend(request, environment, self)
+        DeploymentPlanCompiler.compile_for_frontend(request, environment, self)
     }
 }
 #[cfg(test)]
@@ -3831,7 +3831,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .into_iter()
                 .filter_map(|r| {
-                    PhysicalPlanCompiler
+                    DeploymentPlanCompiler
                         .compile_promql(r, environment.clone())
                         .ok()
                 })
@@ -3947,7 +3947,7 @@ pub(crate) mod tests {
         environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         environment.target_collector_ids.clear();
         let request = request("average", "avg_over_time(a[1m])");
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         assert!(
@@ -3977,7 +3977,7 @@ pub(crate) mod tests {
         env.target_collector_ids.clear();
         let mut input = request("minimum", "min_over_time(data[1m])");
         input.allow_mixed_summary_and_exact_execution = true;
-        let plan = PhysicalPlanCompiler.compile_promql(input, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(input, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         assert_eq!(
             plan.precompute_plan.materializations[0].aggregation_type,
@@ -4081,9 +4081,9 @@ pub(crate) mod tests {
             .enumerate()
             .filter_map(|(index, candidate)| {
                 let plan = if frontend == QueryFrontend::MetricsQl {
-                    PhysicalPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                    DeploymentPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
                 } else {
-                    PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone())
+                    DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone())
                 }
                 .ok()?;
                 let manifest = manifest(&plan, &candidate.queries).unwrap();
@@ -4131,7 +4131,7 @@ pub(crate) mod tests {
             let mut reasons = vec![];
             assert!(
                 candidates.into_iter().any(|candidate| {
-                    match PhysicalPlanCompiler.compile_promql(candidate, environment.clone()) {
+                    match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
                         Ok(plan) => {
                             !plan.precompute_plan.materializations.is_empty()
                                 && plan
@@ -4162,7 +4162,7 @@ pub(crate) mod tests {
             snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
                 Query(text.into());
             let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(request, environment)
                 .unwrap();
             assert!(plan.precompute_plan.materializations.is_empty(), "{text}");
@@ -4221,7 +4221,7 @@ pub(crate) mod tests {
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         env.target_collector_ids.clear();
-        let mut plan = PhysicalPlanCompiler
+        let mut plan = DeploymentPlanCompiler
             .compile_promql(request("scope", "sum_over_time(m[1m])"), env)
             .unwrap();
         let installed = plan
@@ -4273,7 +4273,7 @@ pub(crate) mod tests {
             let mut environment = environment(10_000);
             environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             environment.target_collector_ids.clear();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(request("per-entity", query), environment)
                 .unwrap();
             assert!(
@@ -4292,7 +4292,7 @@ pub(crate) mod tests {
             let mut environment = environment(10_000);
             environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             environment.target_collector_ids.clear();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(request("reduced", query), environment)
                 .unwrap();
             assert!(
@@ -4308,7 +4308,7 @@ pub(crate) mod tests {
         let mut environment = environment(10_000);
         environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         environment.target_collector_ids.clear();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
@@ -4332,7 +4332,7 @@ pub(crate) mod tests {
 
     #[test]
     fn raw_counter_artifact_is_valid_for_backend_precompute() {
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request("counter", "rate(m[1m])"), environment(10_000))
             .unwrap();
         plan.precompute_plan.validate().unwrap();
@@ -4359,7 +4359,7 @@ pub(crate) mod tests {
         let mut environment = environment(10_000);
         environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         environment.target_collector_ids.clear();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(workload, environment)
             .unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
@@ -4415,7 +4415,7 @@ pub(crate) mod tests {
                 source: "unit-fixture".into(),
             };
             let request = request_with_evidence("topk", query, Some(evidence)).unwrap();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(request, environment(10000))
                 .unwrap();
             assert_eq!(plan.precompute_plan.materializations.len(), 1, "{query}");
@@ -4437,7 +4437,7 @@ pub(crate) mod tests {
             source: "unit-fixture".into(),
         };
         let request = request_with_evidence("topk-rate", query, Some(evidence)).unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .unwrap();
         let entry = plan.query_plan.entries.values().next().unwrap();
@@ -4530,7 +4530,7 @@ pub(crate) mod tests {
         environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         environment.target_collector_ids.clear();
 
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
 
@@ -4613,7 +4613,7 @@ pub(crate) mod tests {
             observed_at_unix_ms: 9_500,
             source: "unit-fixture".into(),
         };
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(
                 request_with_evidence(
                     "topk-rate",
@@ -4663,7 +4663,7 @@ pub(crate) mod tests {
 
         let mut request = request("bounded", "sum(sum_over_time(m[1m]))");
         request.retained_summary_memory_budget_bytes = Some(1);
-        let error = PhysicalPlanCompiler
+        let error = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .unwrap_err();
         assert!(error.to_string().contains("retained summary footprint"));
@@ -4821,7 +4821,7 @@ pub(crate) mod tests {
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.target_collector_ids.clear();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(workload, deployment)
             .unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
@@ -4867,7 +4867,7 @@ pub(crate) mod tests {
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.target_collector_ids.clear();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(workload, deployment)
             .unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 3);
@@ -4942,7 +4942,7 @@ pub(crate) mod tests {
                 }
             })
             .expect("unknown HLL candidate stays inspectable");
-        let result = PhysicalPlanCompiler.compile_metricsql(workload, environment(10_000));
+        let result = DeploymentPlanCompiler.compile_metricsql(workload, environment(10_000));
         assert!(
             matches!(result, Err(CompileError::Query { reason, .. }) if reason.contains("no certified accuracy guarantee"))
         );
@@ -4970,7 +4970,7 @@ pub(crate) mod tests {
             None,
         )
         .unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_metricsql(workload, deployment)
             .unwrap();
         assert!(plan.precompute_plan.materializations.is_empty());
@@ -4996,7 +4996,7 @@ pub(crate) mod tests {
         deployment.target_collector_ids.clear();
         let mut workload = request("confidence", "distinct_over_time(m[1m])");
         workload.allow_mixed_summary_and_exact_execution = true;
-        let result = PhysicalPlanCompiler.compile_metricsql(workload, deployment);
+        let result = DeploymentPlanCompiler.compile_metricsql(workload, deployment);
         assert!(result.unwrap().precompute_plan.materializations.is_empty());
     }
 
@@ -5027,7 +5027,7 @@ pub(crate) mod tests {
         second.query_string = "max_over_time(b[1m])".into();
         workload.queries.push(second);
 
-        let error = PhysicalPlanCompiler
+        let error = DeploymentPlanCompiler
             .compile_promql(workload, environment(10_000))
             .unwrap_err();
         assert!(matches!(
@@ -5048,7 +5048,7 @@ pub(crate) mod tests {
             let mut deployment = environment(10_000);
             deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             deployment.target_collector_ids.clear();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_metricsql(workload, deployment)
                 .unwrap();
             assert!(plan.precompute_plan.materializations.is_empty());
@@ -5065,7 +5065,7 @@ pub(crate) mod tests {
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.target_collector_ids.clear();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_metricsql(workload, deployment)
             .unwrap();
         assert!(!plan.precompute_plan.materializations.is_empty());
@@ -5102,7 +5102,7 @@ pub(crate) mod tests {
         workload.queries[0].query_string = query.into();
         workload.queries[0].selected_plan_root =
             crate::planner_selection::keep_pre_asap(&canonical).unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_metricsql(workload, environment(10_000))
             .unwrap();
         let identity = canonical_promql(query).unwrap();
@@ -5235,7 +5235,7 @@ pub(crate) mod tests {
             workload.queries[0].selected_plan_root.expr,
             SummaryExpr::KeepPreAsap(_)
         ));
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(workload, environment(10000))
             .unwrap();
         assert!(plan.precompute_plan.materializations.is_empty());
@@ -5333,7 +5333,7 @@ pub(crate) mod tests {
         let mut backend = environment(10_000);
         backend.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         backend.target_collector_ids.clear();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(with_evidence, backend)
             .unwrap();
         assert!(
@@ -5364,7 +5364,7 @@ pub(crate) mod tests {
         let mut backend = environment(10_000);
         backend.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         backend.target_collector_ids.clear();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(unavailable, backend)
             .unwrap();
         // Planner 54f can realize this particular shape directly as an exact
@@ -5479,7 +5479,7 @@ pub(crate) mod tests {
             &workload.exact_composition_costs,
         )
         .unwrap();
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(workload, environment(10000))
             .unwrap();
         assert_eq!(bundle.query_plan.entries.len(), 2);
@@ -5511,7 +5511,7 @@ pub(crate) mod tests {
     // Adding another readout adds recurring reads, not another update stream.
     #[test]
     fn joint_lifecycle_charges_shared_updates_once() {
-        let baseline = PhysicalPlanCompiler
+        let baseline = DeploymentPlanCompiler
             .compile_promql(
                 request("q90", "quantile_over_time(0.9, m[1m])"),
                 environment(10000),
@@ -5523,7 +5523,7 @@ pub(crate) mod tests {
             .remove(0);
         second.summary_lifecycle_inputs.evaluation_interval_ms = 20000;
         workload.queries.push(second);
-        let shared = PhysicalPlanCompiler
+        let shared = DeploymentPlanCompiler
             .compile_promql(workload, environment(10000))
             .unwrap();
         assert_eq!(shared.lifecycle_estimates.len(), 1);
@@ -5552,7 +5552,7 @@ pub(crate) mod tests {
         second.summary_lifecycle_inputs.ingestion_rate_per_second = 200.0;
         workload.queries.push(second);
         assert!(matches!(
-            PhysicalPlanCompiler.compile_promql(workload, environment(10000)),
+            DeploymentPlanCompiler.compile_promql(workload, environment(10000)),
             Err(CompileError::Lifecycle { .. })
         ));
     }
@@ -5578,7 +5578,7 @@ pub(crate) mod tests {
             if target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
                 env.target_collector_ids.clear();
             }
-            let bundle = PhysicalPlanCompiler
+            let bundle = DeploymentPlanCompiler
                 .compile_promql(workload, env)
                 .expect("shared compile");
             assert_eq!(bundle.query_plan.entries.len(), 2);
@@ -5602,14 +5602,14 @@ pub(crate) mod tests {
     #[test]
     fn adding_shared_consumer_changes_plan_identity() {
         let workload = request("q90", "quantile_over_time(0.90, m[1m])");
-        let one = PhysicalPlanCompiler
+        let one = DeploymentPlanCompiler
             .compile_promql(workload, environment(10_000))
             .unwrap();
         let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
         workload
             .queries
             .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
-        let two = PhysicalPlanCompiler
+        let two = DeploymentPlanCompiler
             .compile_promql(workload, environment(10_000))
             .unwrap();
         assert_ne!(one.envelope.plan_id, two.envelope.plan_id);
@@ -5622,7 +5622,7 @@ pub(crate) mod tests {
         let mut other = request("qn", "quantile_over_time(0.90, n[1m])");
         other.queries[0].legacy_query_source = Source::TimeSeries { metric: "n".into() };
         workload.queries.extend(other.queries);
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(workload, environment(10_000))
             .unwrap();
         assert_eq!(bundle.summary_catalog.definitions.len(), 2);
@@ -5638,7 +5638,7 @@ pub(crate) mod tests {
         workload
             .queries
             .extend(request("increase", "increase(m[1m])").queries);
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(workload, environment(10_000))
             .unwrap();
         assert_eq!(bundle.query_plan.entries.len(), 2);
@@ -5660,7 +5660,7 @@ pub(crate) mod tests {
         other.queries[0].window_realization_candidates[0].realization_id =
             "another-implementation".into();
         workload.queries.extend(other.queries);
-        let error = PhysicalPlanCompiler
+        let error = DeploymentPlanCompiler
             .compile_promql(workload, environment(10_000))
             .expect_err("conflicting shared state must fail before publication");
         assert!(error
@@ -5684,7 +5684,7 @@ pub(crate) mod tests {
         );
         entries.push(mean);
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let bundle = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let bundle = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         assert_eq!(bundle.query_plan.entries.len(), 2);
         for entry in bundle.query_plan.entries.values() {
@@ -5786,7 +5786,7 @@ pub(crate) mod tests {
         environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         environment.target_collector_ids.clear();
 
-        let error = PhysicalPlanCompiler
+        let error = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap_err();
 
@@ -5813,7 +5813,7 @@ pub(crate) mod tests {
             entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
             let (mut request, environment) = snapshot.into_physical_compilation_request().unwrap();
             request.allow_mixed_summary_and_exact_execution = false;
-            let bundle = PhysicalPlanCompiler
+            let bundle = DeploymentPlanCompiler
                 .compile_promql(request, environment)
                 .unwrap();
             assert!(bundle.precompute_plan.materializations.is_empty());
@@ -5839,13 +5839,13 @@ pub(crate) mod tests {
         let candidates =
             super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
                 .unwrap();
-        match PhysicalPlanCompiler.compile_promql(candidates[0].clone(), environment.clone()) {
+        match DeploymentPlanCompiler.compile_promql(candidates[0].clone(), environment.clone()) {
             Ok(plan) => assert!(plan.precompute_plan.materializations.is_empty()),
             Err(error) => assert!(error
                 .to_string()
                 .contains("semantically identical original subtree witness")),
         }
-        let native = PhysicalPlanCompiler
+        let native = DeploymentPlanCompiler
             .compile_promql(candidates.last().unwrap().clone(), environment)
             .unwrap();
         assert!(native.precompute_plan.materializations.is_empty());
@@ -5862,7 +5862,7 @@ pub(crate) mod tests {
         entry.query = Query("sum_over_time(m[1m])".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         assert_eq!(
             plan.precompute_plan.materializations[0].partitioning,
@@ -5889,7 +5889,7 @@ pub(crate) mod tests {
         // The derivation now covers both range selectors, so this no longer
         // needs a hand-supplied 5m candidate to keep `b` from falling back.
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         let bindings = plan
             .query_plan
             .entries
@@ -5933,7 +5933,7 @@ pub(crate) mod tests {
             value["data_workload"]["ingestion_rate"]["value"] = json!(rate);
             let snapshot: BackendLocalPlanningInput = serde_json::from_value(value).unwrap();
             let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-            let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
             assert!(plan
                 .precompute_plan
                 .materializations
@@ -6010,7 +6010,7 @@ pub(crate) mod tests {
                     asap_types::WindowMaterializationLayout::Pane { .. }
                 )
             });
-        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert!(plan
             .precompute_plan
             .materializations
@@ -6064,7 +6064,7 @@ pub(crate) mod tests {
                     evaluation_phase: planner_types::workload::TimestampMs(0),
                 };
                 let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-                let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+                let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
                 assert_eq!(plan.precompute_plan.materializations.len(), expected_states);
                 let entry = plan.query_plan.entries.values().next().unwrap();
                 let bindings = entry.materialization_bindings();
@@ -6102,7 +6102,7 @@ pub(crate) mod tests {
             };
             entries.push(second);
             let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-            let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
             assert_eq!(
                 plan.precompute_plan.materializations.len(),
                 if phase == 0 { 1 } else { 2 }
@@ -6156,7 +6156,7 @@ pub(crate) mod tests {
             .window_realization_candidates
             .iter()
             .any(|c| !c.derived));
-        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 2);
     }
 
@@ -6518,7 +6518,7 @@ pub(crate) mod tests {
                                 asap_types::WindowMaterializationLayout::FullWindow
                             ) == full
                         });
-                    let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+                    let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
                     let config = &plan.precompute_plan.materializations[0];
                     assert_eq!(config.slide_interval, u64::from(evaluation));
                     assert_eq!(config.window_size, 60);
@@ -6574,7 +6574,7 @@ pub(crate) mod tests {
                     )
                 });
             }
-            let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
             assert_eq!(
                 plan.precompute_plan.materializations.len(),
                 if read_cost == 0.0 { 1 } else { 2 }
@@ -6627,7 +6627,7 @@ pub(crate) mod tests {
                     )
                 });
             }
-            let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
             assert_eq!(plan.precompute_plan.materializations.len(), 2);
             assert!(plan
                 .lifecycle_estimates
@@ -6648,7 +6648,7 @@ pub(crate) mod tests {
         };
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
         assert!(request.queries[0].window_realization_candidates.is_empty());
-        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert!(plan.precompute_plan.materializations.is_empty());
     }
 
@@ -6725,7 +6725,7 @@ pub(crate) mod tests {
     fn retained_state_count_follows_the_derived_pane_width() {
         let snapshot = planning_snapshot();
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         assert_eq!(
@@ -6750,7 +6750,7 @@ pub(crate) mod tests {
             };
         }
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         let materialization = &plan.precompute_plan.materializations[0];
@@ -6787,7 +6787,7 @@ pub(crate) mod tests {
             Query("sum(sum_over_time(a[1m])) / sum(sum_over_time(b{job!=\"x\"}[5m]))".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         let query = plan.query_plan.entries.values().next().unwrap();
         let bindings = query.materialization_bindings();
         // Both operands now hold a summary. The filtered denominator is no
@@ -6872,7 +6872,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .pop()
                     .unwrap();
-            let bundle = PhysicalPlanCompiler
+            let bundle = DeploymentPlanCompiler
                 .compile_promql(request, environment)
                 .unwrap();
             assert!(bundle.precompute_plan.materializations.is_empty());
@@ -7005,7 +7005,7 @@ pub(crate) mod tests {
 
     #[test]
     fn precompute_catalog_validates_without_backend_projection() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("catalog", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7062,7 +7062,7 @@ pub(crate) mod tests {
 
     #[test]
     fn publication_is_catalog_authoritative_and_round_trips() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("publication", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7087,7 +7087,7 @@ pub(crate) mod tests {
 
     #[test]
     fn compiles_one_decision_into_matching_collector_and_backend_views() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q-quantile", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7226,7 +7226,7 @@ pub(crate) mod tests {
 
     #[test]
     fn backend_local_hll_and_envelope_ingest_are_supported() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7256,7 +7256,7 @@ pub(crate) mod tests {
 
     #[test]
     fn backend_local_precompute_contract_has_no_collector_producers() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q-quantile", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7444,7 +7444,7 @@ pub(crate) mod tests {
             deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             deployment.target_collector_ids.clear();
             let compiled =
-                PhysicalPlanCompiler.compile_promql(request(query_id, promql), deployment);
+                DeploymentPlanCompiler.compile_promql(request(query_id, promql), deployment);
             let plan = compiled.unwrap_or_else(|error| panic!("{promql} must compile: {error}"));
             assert_eq!(plan.summary_catalog.definitions.len(), 1, "{promql}");
             assert_eq!(plan.query_plan.entries.len(), 1, "{promql}");
@@ -7485,7 +7485,7 @@ pub(crate) mod tests {
             .clone()
             .into_physical_compilation_request()
             .unwrap();
-        let isolated = PhysicalPlanCompiler.compile_promql(local, env).unwrap();
+        let isolated = DeploymentPlanCompiler.compile_promql(local, env).unwrap();
         assert!(!isolated.precompute_plan.materializations.is_empty());
         assert!(isolated
             .precompute_plan
@@ -7498,7 +7498,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(native, environment)
             .expect("native fixture compiles");
         assert!(plan.precompute_plan.materializations.is_empty());
@@ -7525,7 +7525,7 @@ pub(crate) mod tests {
             .clone()
             .into_physical_compilation_request()
             .unwrap();
-        let isolated = PhysicalPlanCompiler.compile_promql(local, env).unwrap();
+        let isolated = DeploymentPlanCompiler.compile_promql(local, env).unwrap();
         assert!(!isolated.precompute_plan.materializations.is_empty());
         assert!(isolated
             .precompute_plan
@@ -7538,7 +7538,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(native, environment)
             .expect("native demo compiles");
 
@@ -7568,7 +7568,7 @@ pub(crate) mod tests {
                     .remove(0),
             );
         }
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(compilation_request, environment(10_000))
             .unwrap();
 
@@ -7612,7 +7612,7 @@ pub(crate) mod tests {
             guarantee: left_root.guarantee.clone(),
         });
 
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(compilation_request, environment(10_000))
             .expect("compile merged post-ASAP DAG");
         assert_eq!(bundle.summary_catalog.definitions.len(), 2);
@@ -7661,7 +7661,7 @@ pub(crate) mod tests {
 
     #[test]
     fn precompute_schema_must_match_materialization_semantics() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q-quantile", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7693,7 +7693,7 @@ pub(crate) mod tests {
             let mut env = environment(10_000);
             env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             env.target_collector_ids.clear();
-            let bundle = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            let bundle = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
             let materialization = bundle.precompute_plan.materializations.first().unwrap();
             assert_eq!(materialization.window_size, 60);
             assert_eq!(
@@ -7747,7 +7747,7 @@ pub(crate) mod tests {
             let mut env = environment(10_000);
             env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             env.target_collector_ids.clear();
-            let bundle = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+            let bundle = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
             assert_eq!(
                 bundle.lifecycle_estimates[0].window_realization_id,
                 expected_id
@@ -7798,7 +7798,7 @@ pub(crate) mod tests {
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         env.target_collector_ids.clear();
-        let bundle = PhysicalPlanCompiler.compile_promql(workload, env).unwrap();
+        let bundle = DeploymentPlanCompiler.compile_promql(workload, env).unwrap();
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
     }
 
@@ -7810,14 +7810,14 @@ pub(crate) mod tests {
             asap_types::WindowMaterializationLayout::Pane { pane_secs: 7 };
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
-        assert!(PhysicalPlanCompiler.compile_promql(request, env).is_err());
+        assert!(DeploymentPlanCompiler.compile_promql(request, env).is_err());
     }
 
     #[test]
     fn missing_window_implementation_evidence_fails_closed() {
         let mut request = request("q-window", "quantile_over_time(0.99, m[1m])");
         request.queries[0].window_realization_candidates.clear();
-        let error = PhysicalPlanCompiler
+        let error = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .expect_err("Planner must not receive a zero-cost invented window");
         assert!(matches!(error, CompileError::Lifecycle { .. }));
@@ -7825,7 +7825,7 @@ pub(crate) mod tests {
 
     #[test]
     fn precompute_plan_rejects_schema_or_producer_drift() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q-quantile", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7849,7 +7849,7 @@ pub(crate) mod tests {
 
     #[test]
     fn precompute_plan_rejects_empty_or_duplicate_schema_ids() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q-quantile", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -7896,7 +7896,7 @@ pub(crate) mod tests {
             }),
         )
         .expect("selection accepts evidence before freshness validation");
-        let error = PhysicalPlanCompiler
+        let error = DeploymentPlanCompiler
             .compile_promql(request, environment(100_000))
             .expect_err("stale certificate must fail");
         assert!(matches!(error, CompileError::InvalidEvidence { .. }));
@@ -7917,7 +7917,7 @@ pub(crate) mod tests {
         )
         .expect("selection occurs before deployment-time freshness validation");
         assert!(matches!(
-            PhysicalPlanCompiler.compile_promql(topk, environment(10_000)),
+            DeploymentPlanCompiler.compile_promql(topk, environment(10_000)),
             Err(CompileError::InvalidEvidence { .. })
         ));
 
@@ -7926,7 +7926,7 @@ pub(crate) mod tests {
             .cost
             .observed_at_unix_ms = 10_001;
         assert!(matches!(
-            PhysicalPlanCompiler.compile_promql(window, environment(10_000)),
+            DeploymentPlanCompiler.compile_promql(window, environment(10_000)),
             Err(CompileError::Lifecycle { .. })
         ));
     }
@@ -7945,7 +7945,7 @@ pub(crate) mod tests {
             }),
         )
         .expect("selection accepts valid evidence");
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .expect("certified TopK compiles");
         assert_eq!(bundle.summary_catalog.definitions.len(), 1);
@@ -7962,7 +7962,7 @@ pub(crate) mod tests {
         let mut request = request("q", "quantile_over_time(0.9, m[1m])");
         request.planner_revision = "different".into();
         assert!(matches!(
-            PhysicalPlanCompiler.compile_promql(request, environment(10_000)),
+            DeploymentPlanCompiler.compile_promql(request, environment(10_000)),
             Err(CompileError::PlannerRevision { .. })
         ));
     }
@@ -7977,7 +7977,7 @@ pub(crate) mod tests {
             .summary_lifecycle_inputs
             .evidence_valid_for_ms = 10;
         assert!(matches!(
-            PhysicalPlanCompiler.compile_promql(request, environment(10_000)),
+            DeploymentPlanCompiler.compile_promql(request, environment(10_000)),
             Err(CompileError::Lifecycle { .. })
         ));
     }
@@ -8003,7 +8003,7 @@ pub(crate) mod tests {
 
     #[test]
     fn runtime_policy_encoding_is_checked() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
@@ -8035,7 +8035,7 @@ pub(crate) mod tests {
             absolute_threshold: 0.0,
             gos: None,
         });
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .expect("delta-capable physical plan");
         let rule = &bundle.transmission_plan.rules[0];
@@ -8070,7 +8070,7 @@ pub(crate) mod tests {
 
     #[test]
     fn runtime_adaptation_requires_fresh_exact_evidence_and_successor_version() {
-        let bundle = PhysicalPlanCompiler
+        let bundle = DeploymentPlanCompiler
             .compile_promql(
                 request("q", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),

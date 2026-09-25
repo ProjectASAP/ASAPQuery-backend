@@ -10,7 +10,7 @@
 //!
 //! The control plane drives the plan: a PromQL query and an accuracy target
 //! go through `BackendLocalPlanningInput::planning_request` →
-//! `PhysicalPlanCompiler::compile`, and the resulting materializations are
+//! `DeploymentPlanCompiler::compile`, and the resulting materializations are
 //! projected into a physical-plan artifact with QueryPlan/SummaryCatalog
 //! bindings, then staged and activated before ingest.
 //!
@@ -172,7 +172,7 @@ use prost::Message;
 /// rather than pinning a family. Family selection itself is covered by the
 /// control-plane compiler tests.
 fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMaterialization> {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
 
     let mut fixture: JsonValue = serde_json::from_str(include_str!(
         "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
@@ -202,7 +202,7 @@ fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMate
     let (request, environment) = snapshot
         .into_physical_compilation_request()
         .expect("snapshot yields a planning request");
-    let plan = PhysicalPlanCompiler
+    let plan = DeploymentPlanCompiler
         .compile_promql(request, environment)
         .expect("physical compilation succeeds");
     plan.precompute_plan.materializations
@@ -2006,7 +2006,7 @@ async fn live_serve_hll_global_count_merges_across_sids() {
 
 #[test]
 fn probe_queryplan() {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
     for q in [
         "sum by (service) (quantile_over_time(0.99, http_latency_ms[1s]))",
         "quantile_over_time(0.99, http_latency_ms[1s])",
@@ -2021,7 +2021,7 @@ fn probe_queryplan() {
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
         let snap: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
         let (req, env) = snap.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler.compile_promql(req, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(req, env).unwrap();
         eprintln!("PROBE {q}");
         for (id, e) in plan.query_plan.entries.iter() {
             eprintln!(

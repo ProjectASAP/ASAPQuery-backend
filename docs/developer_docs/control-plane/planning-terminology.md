@@ -23,7 +23,7 @@ flowchart TB
         LOGICAL["ASAPPlanner + selection adapter<br/>Legal semantic DAG selection"]
         REQUEST["PhysicalCompilationRequest<br/>QueryCompilationInput + enabled materialization keys"]
         WINDOWS["Generate window candidates<br/>Cadence + evaluation phase + WindowCostModel"]
-        COMPILE["PhysicalPlanCompiler<br/>Compile concrete candidate plans"]
+        COMPILE["DeploymentPlanCompiler<br/>Compile concrete candidate plans"]
         MANIFEST["WorkloadCostManifest<br/>Component implementations and pricing basis"]
         QUOTE["WorkloadQuote<br/>Provider feasibility and component prices"]
         EVALUATE["CandidatePlanEvaluation<br/>Select the lowest-cost feasible enumerated candidate"]

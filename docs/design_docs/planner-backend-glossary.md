@@ -11,8 +11,10 @@ in the serialized API.
 | Term | Meaning |
 | --- | --- |
 | Selected post-ASAP DAG | Planner-selected computation graph, including summary producers, shared dependencies and query readouts. |
+| Physical DAG | Planner-owned concrete operators, typed input boundaries, dependencies and roots; no storage identities or placement. |
+| Deployment plan | System instantiation of physical computation with concrete source/state bindings and operational policy. |
 | Summary producer | An operation or subgraph that builds summary state. Multiple queries may share its stored output. |
-| `SummaryMaintenanceLifecyclePlan` | Planner result associating a post-ASAP root with deployment decisions for its unique reachable summary producers, plus workload and costing context. |
+| `SummaryMaintenanceLifecyclePlan` | Planner result associating a post-ASAP root with selected maintenance requirements for its unique reachable summary producers, plus workload and costing context. |
 | Selected deployment guarantee and schedule/retention | The selected `SummaryMaintenanceLifecycleGuarantee` for one producer, together with its concrete scheduling and retention binding. This is part of a deployment in `SummaryMaintenanceLifecyclePlan`, not a separate model. |
 | Maintenance | Work that constructs, refreshes or derives stored summary state, including batch rebuilds and incremental updates. |
 | `PrecomputePlan` | Backend executable plan for maintenance and state writes. |
