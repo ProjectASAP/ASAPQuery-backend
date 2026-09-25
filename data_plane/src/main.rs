@@ -52,7 +52,7 @@ struct Args {
 
     /// Versioned canonical QueryWorkload + DataWorkload and backend-local
     /// implementation evidence. The ASAPQuery profile invokes the pinned
-    /// Planner and PhysicalPlanCompiler at startup when this is supplied.
+    /// Planner and DeploymentPlanCompiler at startup when this is supplied.
     #[arg(long)]
     planning_snapshot: Option<std::path::PathBuf>,
 

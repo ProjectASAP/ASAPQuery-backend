@@ -1,6 +1,6 @@
 //! Synthetic complete quotes for deployment fixtures; never used in production.
 use control_plane::physical::compiler::{
-    BackendLocalPlanningInput, PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
+    BackendLocalPlanningInput, DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
 };
 
 pub(crate) fn quoted_snapshot(
@@ -20,9 +20,9 @@ pub(crate) fn quoted_snapshot(
         .enumerate()
         .filter_map(|(index, candidate)| {
             let plan = if metricsql {
-                PhysicalPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                DeploymentPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
             } else {
-                PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone())
+                DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone())
             }
             .ok()?;
             let manifest = manifest(&plan, &candidate.queries).unwrap();

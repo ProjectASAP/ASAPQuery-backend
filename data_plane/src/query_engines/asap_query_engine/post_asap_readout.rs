@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn compiled_window_schedules_execute_exact_ranges() {
         use crate::precompute_engine::window_manager::WindowManager;
-        use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+        use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
         for evaluation_secs in [20, 45, 60, 120, 90] {
             for phase_ms in [0, 5_000] {
                 for full in [false, true] {
@@ -1105,7 +1105,7 @@ mod tests {
                                 asap_types::WindowMaterializationLayout::FullWindow
                             ) == full
                         });
-                    let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+                    let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
                     let config = &plan.precompute_plan.materializations[0];
                     let manager = WindowManager::with_layout(
                         config.window_size,
@@ -1176,7 +1176,7 @@ mod tests {
     // Compile the two readouts, store one pane series, and execute the actual ratio.
     #[test]
     fn compiled_shared_sum_panes_preserve_each_lookback() {
-        use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+        use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
         let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -1187,7 +1187,7 @@ mod tests {
         entry["demand"]["fixed_interval_at"]["interval"] = serde_json::json!(60_000);
         let snapshot: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler.compile_promql(request, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         let config = &plan.precompute_plan.materializations[0];
         let policy = config.policy_fingerprint();
