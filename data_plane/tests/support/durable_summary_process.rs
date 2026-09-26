@@ -134,7 +134,10 @@ async fn persisted_summary_restarts_without_live_reregistration() {
         .as_object()
         .unwrap()
         .values()
-        .all(|binding| !binding["summary_definition_id"].is_null()
+        .all(|binding| !binding["stored_output_id"].is_null()
+            && binding["summary_definition_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("sds-v1:"))
             && !binding["catalog_generation_sha256"].is_null()));
     drop(first);
     let port = unused_port();

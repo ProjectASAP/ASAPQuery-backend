@@ -208,7 +208,7 @@ impl SketchStoreSink {
                 return false;
             };
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                summary_definition_id: output.policy_fp.into(),
+                stored_output_id: output.policy_fp.into(),
                 time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
                 group_values,
             };
@@ -389,6 +389,8 @@ mod tests {
         // via `PolicyFingerprint::from_config`. Callers obtain the id
         // via `config.policy_fp_u64()`.
         PrecomputeMaterialization {
+            stored_output_id: None,
+            semantic_fragment: None,
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),

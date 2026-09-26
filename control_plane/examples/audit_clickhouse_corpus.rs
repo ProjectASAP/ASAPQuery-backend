@@ -69,7 +69,7 @@ fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
     )
     .unwrap();
     let reference = sds.reference().unwrap();
-    precompute_plan.summary_catalog = Some(reference.clone());
+    precompute_plan.bind_catalog(&sds).unwrap();
     transmission_plan.summary_catalog = Some(reference);
     ClickHouseSqlWorkload {
         summary_catalog: sds,

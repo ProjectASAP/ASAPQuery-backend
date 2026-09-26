@@ -637,7 +637,7 @@ impl Worker {
                                 observer.observe(
                                     &revision.generation,
                                     asap_types::sds::SummaryInstanceCoordinates {
-                                        summary_definition_id: policy_fp.into(),
+                                        stored_output_id: policy_fp.into(),
                                         time_range: asap_types::sds::HalfOpenTimeRange {
                                             start_ms: bucket_start,
                                             end_ms: bucket_end,
@@ -695,7 +695,7 @@ impl Worker {
                         observer.observe(
                             &revision.generation,
                             asap_types::sds::SummaryInstanceCoordinates {
-                                summary_definition_id: policy_fp.into(),
+                                stored_output_id: policy_fp.into(),
                                 time_range: asap_types::sds::HalfOpenTimeRange {
                                     start_ms: bucket_start,
                                     end_ms: bucket_end,

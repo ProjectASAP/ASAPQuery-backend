@@ -73,7 +73,7 @@ async fn main() {
     let reference = catalog.reference().unwrap();
     let mut precompute_plan =
         PrecomputePlan::build_backend_local(envelope.clone(), vec![]).unwrap();
-    precompute_plan.summary_catalog = Some(reference.clone());
+    precompute_plan.bind_catalog(&catalog).unwrap();
     let mut transmission_plan = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute_plan,

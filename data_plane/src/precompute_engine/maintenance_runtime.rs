@@ -70,7 +70,7 @@ type PendingOutput = (
 
 enum MaintenanceInputs<'a> {
     Live {
-        definition: asap_types::sds::SummaryDefinitionId,
+        definition: asap_types::sds::StoredOutputId,
         state: SummaryState,
     },
     Frozen(&'a [crate::storage_engines::sketch_db::index::FrozenExactWindows]),
@@ -91,7 +91,7 @@ impl MaintenanceInputs<'_> {
 
 fn frozen_population_value(
     inputs: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],
-    definition: asap_types::sds::SummaryDefinitionId,
+    definition: asap_types::sds::StoredOutputId,
     family: Option<planner_types::post_asap::SummaryFamilyType>,
     complete: bool,
 ) -> Result<Option<MaintenanceValue>, String> {
@@ -133,7 +133,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
         node: &ExecutableDagNode,
     ) -> Result<Option<MaintenanceValue>, String> {
         let definition = match self.binding.node(node.id) {
-            Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
+            Some(BackendNodeBinding::Materialization { stored_output }) => *stored_output,
             _ => return Ok(None),
         };
         let family = node.output_schema.fields.iter().find_map(|field| {
@@ -210,9 +210,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                     );
                 }
                 let target = match self.binding.node(node.id) {
-                    Some(BackendNodeBinding::Materialization { summary_definition }) => {
-                        summary_definition
-                    }
+                    Some(BackendNodeBinding::Materialization { stored_output }) => stored_output,
                     _ => {
                         return Err(
                             "maintenance SummaryAgg lacks installed materialization binding".into(),
@@ -712,7 +710,7 @@ fn prepare_frozen_maintenance_sink(
 > {
     installed.validate()?;
     let target = match installed.binding.node(sink) {
-        Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
+        Some(BackendNodeBinding::Materialization { stored_output }) => *stored_output,
         _ => return Err("immutable sink lacks a materialization binding".into()),
     };
     let config = configs
@@ -751,10 +749,10 @@ fn prepare_frozen_maintenance_sink(
         .nodes
         .iter()
         .filter_map(|(node, binding)| match binding {
-            BackendNodeBinding::Materialization { summary_definition }
-                if expected_input.inputs.contains(summary_definition) =>
+            BackendNodeBinding::Materialization { stored_output }
+                if expected_input.inputs.contains(stored_output) =>
             {
-                Some((*node, *summary_definition))
+                Some((*node, *stored_output))
             }
             _ => None,
         })
@@ -775,7 +773,7 @@ fn prepare_frozen_maintenance_sink(
     let key = MaterializationCommitKey {
         plan_id: generation.plan_id,
         plan_version: generation.plan_version,
-        summary_definition: target,
+        stored_output: target,
         window_start_ms: i64::try_from(output_window.0)
             .map_err(|_| "output window exceeds timestamp range")?,
         window_end_ms: i64::try_from(output_window.1)
@@ -866,7 +864,7 @@ pub fn execute_completed_maintenance(
     group: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
     let target = match installed.binding.node(sink) {
-        Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
+        Some(BackendNodeBinding::Materialization { stored_output }) => *stored_output,
         _ => return Err("maintenance sink lacks an installed output identity".into()),
     };
     let derived = configs
@@ -902,14 +900,14 @@ pub(crate) fn execute_completed_maintenance_cohort(
     installed: &asap_types::executable_plan::InstalledPostAsapDag,
     configs: &[asap_types::PrecomputeMaterialization],
     sink: PostAsapNodeId,
-    source_sids: &BTreeMap<asap_types::sds::SummaryDefinitionId, u64>,
+    source_sids: &BTreeMap<asap_types::sds::StoredOutputId, u64>,
     target_sid: u64,
     window: (u64, u64),
     group: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
     use asap_types::executable_plan::BackendNodeBinding;
     let target = match installed.binding.node(sink) {
-        Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
+        Some(BackendNodeBinding::Materialization { stored_output }) => *stored_output,
         _ => return Err("maintenance sink lacks an installed output identity".into()),
     };
     let target_config = configs
@@ -1085,7 +1083,7 @@ fn execute_finite_source_cohort(
         .as_ref()
         .ok_or("finite maintenance requires a catalog generation")?;
     let Some(BackendNodeBinding::Materialization {
-        summary_definition: target,
+        stored_output: target,
     }) = installed.binding.node(sink)
     else {
         return Err("finite maintenance sink has no installed definition".into());
@@ -1245,7 +1243,7 @@ fn execute_finite_complete_populations(
     generation: &Arc<asap_types::sds::CatalogGeneration>,
 ) -> Result<(), String> {
     let target = match installed.binding.node(sink) {
-        Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
+        Some(BackendNodeBinding::Materialization { stored_output }) => *stored_output,
         _ => return Err("complete maintenance target is not bound".into()),
     };
     let config = plan
@@ -1432,7 +1430,7 @@ pub(crate) fn execute_finite_maintenance(
     for installed in plan.executable_dags.values() {
         for sink in &installed.binding.precompute_sinks {
             let Some(BackendNodeBinding::Materialization {
-                summary_definition: target,
+                stored_output: target,
             }) = installed.binding.node(*sink)
             else {
                 continue;
@@ -1580,7 +1578,7 @@ struct CommittedState {
 struct CommitRegistryState {
     generation: Option<(u64, u64)>,
     entries: BTreeMap<MaterializationCommitKey, CommittedState>,
-    frontiers: BTreeMap<asap_types::sds::SummaryDefinitionId, (i64, u64)>,
+    frontiers: BTreeMap<asap_types::sds::StoredOutputId, (i64, u64)>,
     pending_batch: Option<[u8; 32]>,
     batch_has_published: bool,
     admitted_keys: BTreeSet<MaterializationCommitKey>,
@@ -1597,7 +1595,7 @@ impl CommitRegistryState {
         if !self.admitted_keys.contains(key)
             && self
                 .frontiers
-                .get(&key.summary_definition)
+                .get(&key.stored_output)
                 .is_some_and(|(latest, horizon)| {
                     key.window_end_ms
                         <= latest.saturating_sub(i64::try_from(*horizon).unwrap_or(i64::MAX))
@@ -1687,7 +1685,7 @@ impl CommitRegistry {
             }
             let frontier = state
                 .frontiers
-                .entry(key.summary_definition)
+                .entry(key.stored_output)
                 .or_insert((key.window_end_ms, *horizon));
             frontier.0 = frontier.0.max(key.window_end_ms);
             frontier.1 = frontier.1.max(*horizon);
@@ -1695,7 +1693,7 @@ impl CommitRegistry {
         let frontiers = state.frontiers.clone();
         state.entries.retain(|key, _| {
             frontiers
-                .get(&key.summary_definition)
+                .get(&key.stored_output)
                 .is_none_or(|(latest, horizon)| {
                     key.window_end_ms
                         > latest.saturating_sub(i64::try_from(*horizon).unwrap_or(i64::MAX))
@@ -1806,13 +1804,13 @@ impl MaintenanceDagSink {
         output: PrecomputedOutput,
         state: Box<dyn AggregateCore>,
     ) -> Result<Vec<PendingOutput>, String> {
-        let source_definition: asap_types::sds::SummaryDefinitionId = output.policy_fp.into();
+        let source_definition: asap_types::sds::StoredOutputId = output.policy_fp.into();
         let source: SummaryState = Arc::from(state);
         let mut derived = Vec::new();
         let mut matched = false;
         let mut lineage = Sha256::new();
         lineage.update(b"asap-maintenance-lineage-v1");
-        let definition_bytes = source_definition.0 .0.to_be_bytes();
+        let definition_bytes = source_definition.0.to_be_bytes();
         lineage.update(definition_bytes);
         if let Some(input) = &output.input_revision {
             if input.generation.plan_id != plan.plan_id()
@@ -1841,7 +1839,7 @@ impl MaintenanceDagSink {
                 .binding
                 .nodes
                 .iter()
-                .filter_map(|(id, binding)| matches!(binding, BackendNodeBinding::Materialization { summary_definition } if *summary_definition == source_definition).then_some(*id))
+                .filter_map(|(id, binding)| matches!(binding, BackendNodeBinding::Materialization { stored_output } if *stored_output == source_definition).then_some(*id))
                 .collect::<BTreeSet<_>>();
             if source_nodes.is_empty() {
                 continue;
@@ -1858,9 +1856,9 @@ impl MaintenanceDagSink {
                 // Derived summaries consume complete immutable windows at the
                 // completion barrier, never additive worker fragments.
                 if matches!(installed.binding.node(*sink_node),
-                    Some(BackendNodeBinding::Materialization { summary_definition })
+                    Some(BackendNodeBinding::Materialization { stored_output })
                         if plan.precompute_plan.materializations.iter().any(|config|
-                            config.policy_fingerprint() == summary_definition.fingerprint()
+                            config.policy_fingerprint() == stored_output.fingerprint()
                                 && config.derived_input.is_some()))
                 {
                     continue;
@@ -1874,8 +1872,8 @@ impl MaintenanceDagSink {
                     !has_input
                         && matches!(
                             installed.binding.node(*node),
-                            Some(BackendNodeBinding::Materialization { summary_definition })
-                                if *summary_definition != source_definition
+                            Some(BackendNodeBinding::Materialization { stored_output })
+                                if *stored_output != source_definition
                         )
                 });
                 if foreign_source {
@@ -1900,15 +1898,13 @@ impl MaintenanceDagSink {
                 }
                 matched = true;
                 let target = match installed.binding.node(*sink_node) {
-                    Some(BackendNodeBinding::Materialization { summary_definition }) => {
-                        *summary_definition
-                    }
+                    Some(BackendNodeBinding::Materialization { stored_output }) => *stored_output,
                     _ => return Err("precompute sink lacks materialization binding".into()),
                 };
                 let key = MaterializationCommitKey {
                     plan_id: plan.plan_id(),
                     plan_version: plan.plan_version(),
-                    summary_definition: target,
+                    stored_output: target,
                     window_start_ms: output.start_timestamp as i64,
                     window_end_ms: output.end_timestamp as i64,
                     input_lineage: lineage.clone(),
@@ -2116,21 +2112,21 @@ impl OutputSink for MaintenanceDagSink {
 /// semantic dependencies rather than assuming source and output identities match.
 pub(crate) fn affected_materializations(
     plan: &asap_types::precompute_plan::PrecomputePlan,
-    source: asap_types::sds::SummaryDefinitionId,
-) -> BTreeSet<asap_types::sds::SummaryDefinitionId> {
+    source: asap_types::sds::StoredOutputId,
+) -> BTreeSet<asap_types::sds::StoredOutputId> {
     use asap_types::executable_plan::BackendNodeBinding;
     let mut affected = BTreeSet::from([source]);
     for installed in plan.executable_dags.values() {
         let mut reachable = installed.binding.nodes.iter().filter_map(|(node, binding)| {
-            matches!(binding, BackendNodeBinding::Materialization { summary_definition } if *summary_definition == source).then_some(*node)
+            matches!(binding, BackendNodeBinding::Materialization { stored_output } if *stored_output == source).then_some(*node)
         }).collect::<BTreeSet<_>>();
         let mut frontier = reachable.iter().copied().collect::<Vec<_>>();
         while let Some(producer) = frontier.pop() {
             for edge in &installed.document.edges {
                 let immutable = matches!(installed.binding.node(edge.consumer),
-                    Some(BackendNodeBinding::Materialization { summary_definition })
+                    Some(BackendNodeBinding::Materialization { stored_output })
                         if plan.materializations.iter().any(|config|
-                            config.policy_fingerprint() == summary_definition.fingerprint()
+                            config.policy_fingerprint() == stored_output.fingerprint()
                                 && config.derived_input.is_some()));
                 if edge.producer == producer && !immutable && reachable.insert(edge.consumer) {
                     frontier.push(edge.consumer);
@@ -2139,10 +2135,10 @@ pub(crate) fn affected_materializations(
         }
         for sink in &installed.binding.precompute_sinks {
             if reachable.contains(sink) {
-                if let Some(BackendNodeBinding::Materialization { summary_definition }) =
+                if let Some(BackendNodeBinding::Materialization { stored_output }) =
                     installed.binding.nodes.get(sink)
                 {
-                    affected.insert(*summary_definition);
+                    affected.insert(*stored_output);
                 }
             }
         }
@@ -2159,7 +2155,7 @@ mod tests {
         WindowEdgeCompatibility,
     };
 
-    fn definition(value: u64) -> asap_types::sds::SummaryDefinitionId {
+    fn definition(value: u64) -> asap_types::sds::StoredOutputId {
         asap_types::PolicyFingerprint(value).into()
     }
 
@@ -2299,10 +2295,10 @@ mod tests {
         let binding = BackendExecutableBinding {
             nodes: [(1, definition(1)), (2, definition(2)), (3, definition(3))]
                 .into_iter()
-                .map(|(id, summary_definition)| {
+                .map(|(id, stored_output)| {
                     (
                         PostAsapNodeId(id),
-                        BackendNodeBinding::Materialization { summary_definition },
+                        BackendNodeBinding::Materialization { stored_output },
                     )
                 })
                 .collect(),
@@ -2405,14 +2401,14 @@ mod tests {
                 (
                     PostAsapNodeId(1),
                     BackendNodeBinding::Materialization {
-                        summary_definition: source_definition,
+                        stored_output: source_definition,
                     },
                 ),
                 (PostAsapNodeId(2), BackendNodeBinding::MaintenanceInput),
                 (
                     PostAsapNodeId(3),
                     BackendNodeBinding::Materialization {
-                        summary_definition: target,
+                        stored_output: target,
                     },
                 ),
             ]),
@@ -2511,7 +2507,7 @@ mod tests {
         scheduled_binding.nodes.insert(
             PostAsapNodeId(1),
             BackendNodeBinding::Materialization {
-                summary_definition: source_definition,
+                stored_output: source_definition,
             },
         );
         scheduled_binding
@@ -2533,7 +2529,7 @@ mod tests {
         let key = MaterializationCommitKey {
             plan_id: 1,
             plan_version: 1,
-            summary_definition: target,
+            stored_output: target,
             window_start_ms: 0,
             window_end_ms: 1000,
             input_lineage: vec![1],
@@ -2577,7 +2573,7 @@ mod tests {
         durable_binding.nodes.insert(
             PostAsapNodeId(3),
             BackendNodeBinding::Materialization {
-                summary_definition: durable_configs[1].policy_fingerprint().into(),
+                stored_output: durable_configs[1].policy_fingerprint().into(),
             },
         );
         let installed = InstalledPostAsapDag {
@@ -2610,7 +2606,7 @@ mod tests {
         let generation = store.active_catalog_generation().unwrap();
         for ((start, end), value) in [((0, 1000), 2.0), ((1000, 2000), 7.0)] {
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                summary_definition_id: source_definition,
+                stored_output_id: source_definition,
                 time_range: asap_types::sds::HalfOpenTimeRange {
                     start_ms: start,
                     end_ms: end,
@@ -2952,14 +2948,14 @@ mod tests {
         );
         document.schema_version = asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
         let mut binding = binding.clone();
-        for (node, summary_definition) in [
+        for (node, stored_output) in [
             (1, first_id),
             (5, second_id),
             (3, target.policy_fingerprint().into()),
         ] {
             binding.nodes.insert(
                 PostAsapNodeId(node),
-                BackendNodeBinding::Materialization { summary_definition },
+                BackendNodeBinding::Materialization { stored_output },
             );
         }
         binding
@@ -3033,7 +3029,7 @@ mod tests {
                     BTreeMap::new()
                 };
                 let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                    summary_definition_id: config.policy_fingerprint().into(),
+                    stored_output_id: config.policy_fingerprint().into(),
                     time_range: asap_types::sds::HalfOpenTimeRange {
                         start_ms: start,
                         end_ms: start + 2000,
@@ -3618,7 +3614,7 @@ mod tests {
             nodes: BTreeMap::from([(
                 PostAsapNodeId(1),
                 BackendNodeBinding::Materialization {
-                    summary_definition: config.policy_fingerprint().into(),
+                    stored_output: config.policy_fingerprint().into(),
                 },
             )]),
             query_sink: PostAsapNodeId(1),
@@ -3683,7 +3679,7 @@ mod tests {
             nodes: BTreeMap::from([(
                 PostAsapNodeId(1),
                 BackendNodeBinding::Materialization {
-                    summary_definition: config.policy_fingerprint().into(),
+                    stored_output: config.policy_fingerprint().into(),
                 },
             )]),
             query_sink: PostAsapNodeId(1),
@@ -3729,7 +3725,7 @@ mod tests {
         let key = |end| MaterializationCommitKey {
             plan_id: 7,
             plan_version: 1,
-            summary_definition: definition(2),
+            stored_output: definition(2),
             window_start_ms: end - 10,
             window_end_ms: end,
             input_lineage: vec![0; 32],
@@ -3764,7 +3760,7 @@ mod tests {
         let key = |end| MaterializationCommitKey {
             plan_id: 7,
             plan_version: 1,
-            summary_definition: definition(2),
+            stored_output: definition(2),
             window_start_ms: end - 10,
             window_end_ms: end,
             input_lineage: vec![0; 32],
@@ -3803,7 +3799,7 @@ mod tests {
             let key = MaterializationCommitKey {
                 plan_id: 7,
                 plan_version: 1,
-                summary_definition: definition(target),
+                stored_output: definition(target),
                 window_start_ms: 0,
                 window_end_ms: 10,
                 input_lineage: vec![0; 32],
@@ -3879,13 +3875,13 @@ mod tests {
                 (
                     PostAsapNodeId(0),
                     BackendNodeBinding::Materialization {
-                        summary_definition: definition(1),
+                        stored_output: definition(1),
                     },
                 ),
                 (
                     PostAsapNodeId(1),
                     BackendNodeBinding::Materialization {
-                        summary_definition: target_definition,
+                        stored_output: target_definition,
                     },
                 ),
                 (
@@ -4020,7 +4016,7 @@ mod tests {
                     (
                         PostAsapNodeId(id),
                         BackendNodeBinding::Materialization {
-                            summary_definition: definition(if id == 0 { 1 } else { id as u64 + 1 }),
+                            stored_output: definition(if id == 0 { 1 } else { id as u64 + 1 }),
                         },
                     )
                 })
@@ -4049,7 +4045,7 @@ mod tests {
         let key = MaterializationCommitKey {
             plan_id: 7,
             plan_version: 2,
-            summary_definition: definition(4),
+            stored_output: definition(4),
             window_start_ms: 0,
             window_end_ms: 10,
             input_lineage: b"batch:1".to_vec(),
@@ -4091,13 +4087,13 @@ mod tests {
                 (
                     PostAsapNodeId(0),
                     BackendNodeBinding::Materialization {
-                        summary_definition: definition(1),
+                        stored_output: definition(1),
                     },
                 ),
                 (
                     PostAsapNodeId(1),
                     BackendNodeBinding::Materialization {
-                        summary_definition: definition(2),
+                        stored_output: definition(2),
                     },
                 ),
                 (
@@ -4124,7 +4120,7 @@ mod tests {
         let key = MaterializationCommitKey {
             plan_id: 7,
             plan_version: 2,
-            summary_definition: definition(2),
+            stored_output: definition(2),
             window_start_ms: 0,
             window_end_ms: 10,
             input_lineage: b"batch:1".to_vec(),
