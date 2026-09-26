@@ -21,7 +21,7 @@ struct Population {
 struct Observations {
     generation: Option<CatalogGeneration>,
     populations: BTreeMap<SummaryInstanceId, Population>,
-    extent: BTreeMap<SummaryDefinitionId, (i64, i64)>,
+    extent: BTreeMap<StoredOutputId, (i64, i64)>,
     total_keys: usize,
     metadata_bytes: usize,
     invalid: Option<String>,
@@ -97,7 +97,7 @@ impl RuntimeErpObserver {
         }
         let extent = state
             .extent
-            .entry(coordinates.summary_definition_id)
+            .entry(coordinates.stored_output_id)
             .or_insert((timestamp_ms, timestamp_ms));
         extent.0 = extent.0.min(timestamp_ms);
         extent.1 = extent.1.max(timestamp_ms);
@@ -133,7 +133,7 @@ impl RuntimeErpObserver {
         let population = state.populations.entry(id).or_insert_with(|| Population {
             source: format!(
                 "summary-definition:{}",
-                coordinates.summary_definition_id.as_u64()
+                coordinates.stored_output_id.as_u64()
             ),
             coordinates,
             semantics,
@@ -178,7 +178,7 @@ impl RuntimeErpObserver {
                 return Ok(());
             }
             let mut groups: BTreeMap<
-                (SummaryDefinitionId, i64, i64),
+                (StoredOutputId, i64, i64),
                 (
                     String,
                     String,
@@ -188,14 +188,14 @@ impl RuntimeErpObserver {
             > = BTreeMap::new();
             for (id, population) in &state.populations {
                 let c = &population.coordinates;
-                let Some((first, last)) = state.extent.get(&c.summary_definition_id) else {
+                let Some((first, last)) = state.extent.get(&c.stored_output_id) else {
                     continue;
                 };
                 if c.time_range.start_ms < *first || c.time_range.end_ms > *last {
                     continue;
                 }
                 let key = (
-                    c.summary_definition_id,
+                    c.stored_output_id,
                     c.time_range.start_ms,
                     c.time_range.end_ms,
                 );
@@ -207,7 +207,7 @@ impl RuntimeErpObserver {
                         ErpPopulationObservations {
                             schema_version: 1,
                             catalog_generation: generation.clone(),
-                            summary_definition_id: c.summary_definition_id,
+                            stored_output_id: c.stored_output_id,
                             observed_at_unix_ms: now_ms,
                             window_start_ms: c.time_range.start_ms,
                             window_end_ms: c.time_range.end_ms,
@@ -294,7 +294,7 @@ mod tests {
     }
     fn coordinate(group: usize) -> SummaryInstanceCoordinates {
         SummaryInstanceCoordinates {
-            summary_definition_id: asap_types::PolicyFingerprint(1).into(),
+            stored_output_id: asap_types::PolicyFingerprint(1).into(),
             time_range: HalfOpenTimeRange {
                 start_ms: 0,
                 end_ms: 60_000,
