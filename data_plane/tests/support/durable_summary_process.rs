@@ -32,39 +32,7 @@ async fn persisted_summary_restarts_without_live_reregistration() {
     let artifact = directory.path().join("plan.json");
     let disk = directory.path().join("disk");
     std::fs::create_dir_all(&disk).unwrap();
-    let mut document = serde_json::to_value(&install).unwrap();
-    let output_ids: std::collections::BTreeMap<u64, u64> = install
-        .precompute_plan
-        .schemas
-        .iter()
-        .enumerate()
-        .map(|(index, schema)| {
-            (
-                schema.stored_output_reference.stored_output_id.0,
-                101 + index as u64,
-            )
-        })
-        .collect();
-    fn assign_output_ids(value: &mut Value, ids: &std::collections::BTreeMap<u64, u64>) {
-        match value {
-            Value::Object(fields) => {
-                if let Some(id) = fields.get_mut("stored_output_id") {
-                    *id = serde_json::json!(ids[&id.as_u64().unwrap()]);
-                }
-                for nested in fields.values_mut() {
-                    assign_output_ids(nested, ids);
-                }
-            }
-            Value::Array(values) => {
-                for nested in values {
-                    assign_output_ids(nested, ids);
-                }
-            }
-            _ => {}
-        }
-    }
-    assign_output_ids(&mut document, &output_ids);
-    std::fs::write(&artifact, serde_json::to_vec(&document).unwrap()).unwrap();
+    std::fs::write(&artifact, serde_json::to_vec(&install).unwrap()).unwrap();
     let spawn = |port: u16| {
         ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_data_plane"))
@@ -162,7 +130,10 @@ async fn persisted_summary_restarts_without_live_reregistration() {
         .as_object()
         .unwrap()
         .values()
-        .all(|binding| !binding["summary_definition_id"].is_null()
+        .all(|binding| !binding["stored_output_id"].is_null()
+            && binding["summary_definition_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("sds-v1:"))
             && !binding["catalog_generation_sha256"].is_null()));
     drop(first);
     let port = unused_port();

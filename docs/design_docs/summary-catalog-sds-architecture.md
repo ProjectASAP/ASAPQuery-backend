@@ -230,20 +230,35 @@ It is a plan binding, not another stored object or Materialization catalog.
 
 ## 6. Reading a bound SDS
 
-For an already planned query:
+An installed `QueryPlan` selects a deployed output and its expected semantics:
+
+```yaml
+reference:
+  stored_output_id: latency-kll
+  definition_id: D1
+```
+
+The query supplies a concrete group and requested time range. Within the installed
+plan's namespace, `SummaryStore` locates state by:
 
 ```text
-QueryPlan
-   │
-   ▼
-StoredOutputReference
-   │
-   ▼
-eligible StoredSummary records
-   │
-   ▼
-Physical DAG execution
+(plan_version, stored_output_id, group_key)
+    → records ordered/indexed by window
 ```
+
+For `(42, latency-kll, service=api)`, a query for `(12:00, 12:05]` performs a
+range lookup over the available panes. `definition_id` does not select another
+producer when this output is absent.
+
+```text
+plan version + stored output + group + window → locate concrete state
+expected definition + revision + format + coverage → validate that state
+```
+
+This requires efficient prefix and window-range lookup; the design does not
+prescribe a physical index such as a hash table or B-tree. The installed plan
+also supplies any enclosing deployment namespace; equal plan-version numbers
+in different deployments do not authorize cross-deployment reads.
 
 The runtime checks two things.
 
