@@ -1087,7 +1087,7 @@ impl SketchStore {
         if inventory.validate_publication(generation, coordinate, first_revision, revision)? {
             tracing::debug!(target: "asap_runtime_debug", plan_id = generation.plan_id,
                 plan_version = generation.plan_version,
-                summary_definition = coordinate.summary_definition_id.as_u64(),
+                stored_output = coordinate.stored_output_id.as_u64(),
                 window_start_ms = coordinate.time_range.start_ms,
                 window_end_ms = coordinate.time_range.end_ms, revision,
                 "SDS summary publication replay acknowledged");
@@ -1099,7 +1099,7 @@ impl SketchStore {
         inventory.acknowledge(generation, coordinate, revision)?;
         tracing::debug!(target: "asap_runtime_debug", plan_id = generation.plan_id,
             plan_version = generation.plan_version, sid = series_id,
-            summary_definition = coordinate.summary_definition_id.as_u64(),
+            stored_output = coordinate.stored_output_id.as_u64(),
             window_start_ms = coordinate.time_range.start_ms,
             window_end_ms = coordinate.time_range.end_ms, revision,
             "SDS summary publication acknowledged");
