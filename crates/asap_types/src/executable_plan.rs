@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::sds::SummaryDefinitionId;
+use crate::sds::StoredOutputId;
 use planner_types::post_asap::{
     EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutionDataState,
     ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId, WindowEdgeCompatibility,
@@ -259,7 +259,7 @@ pub enum BackendNodeBinding {
     QueryInput,
     MaintenanceInput,
     Materialization {
-        summary_definition: SummaryDefinitionId,
+        stored_output: StoredOutputId,
     },
 }
 

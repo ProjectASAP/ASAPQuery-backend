@@ -715,7 +715,7 @@ impl Worker {
                                 observer.observe(
                                     &revision.generation,
                                     asap_types::sds::SummaryInstanceCoordinates {
-                                        summary_definition_id: policy_fp.into(),
+                                        stored_output_id: policy_fp.into(),
                                         time_range: asap_types::sds::HalfOpenTimeRange {
                                             start_ms: bucket_start,
                                             end_ms: bucket_end,
@@ -737,7 +737,7 @@ impl Worker {
                                 &state.input_revisions,
                                 state.series_id,
                                 state.catalog_generation.as_ref(),
-                                state.stored_output_reference,
+                                state.stored_output_reference.clone(),
                             );
                             emit_batch.push((output, updater.take_accumulator()));
                             debug!(
@@ -774,7 +774,7 @@ impl Worker {
                         observer.observe(
                             &revision.generation,
                             asap_types::sds::SummaryInstanceCoordinates {
-                                summary_definition_id: policy_fp.into(),
+                                stored_output_id: policy_fp.into(),
                                 time_range: asap_types::sds::HalfOpenTimeRange {
                                     start_ms: bucket_start,
                                     end_ms: bucket_end,
@@ -814,7 +814,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
-                    state.stored_output_reference,
+                    state.stored_output_reference.clone(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -953,7 +953,7 @@ impl Worker {
                             &state.input_revisions,
                             state.series_id,
                             state.catalog_generation.as_ref(),
-                            state.stored_output_reference,
+                            state.stored_output_reference.clone(),
                         );
                         emit_batch.push((output, incoming.clone_boxed_core()));
                     }
@@ -1002,7 +1002,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
-                    state.stored_output_reference,
+                    state.stored_output_reference.clone(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -1021,7 +1021,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
-                    state.stored_output_reference,
+                    state.stored_output_reference.clone(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -1213,7 +1213,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
-                        state.stored_output_reference,
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1231,7 +1231,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
-                        state.stored_output_reference,
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1321,7 +1321,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
-                        state.stored_output_reference,
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1339,7 +1339,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
-                        state.stored_output_reference,
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }

@@ -15,7 +15,7 @@ use std::{
 pub struct MaterializationCommitKey {
     pub plan_id: u64,
     pub plan_version: u64,
-    pub summary_definition: asap_types::sds::SummaryDefinitionId,
+    pub stored_output: asap_types::sds::StoredOutputId,
     pub window_start_ms: i64,
     pub window_end_ms: i64,
     /// Producer lineage identity, including source and immutable input payload.
@@ -127,7 +127,7 @@ where
     for (node, key) in outputs {
         if !unique.insert(node.0)
             || !binding.precompute_sinks.contains(node)
-            || !matches!(binding.node(*node), Some(BackendNodeBinding::Materialization { summary_definition }) if *summary_definition == key.summary_definition)
+            || !matches!(binding.node(*node), Some(BackendNodeBinding::Materialization { stored_output }) if *stored_output == key.stored_output)
         {
             return Err(ScheduleError::Invalid(
                 "commit key does not match a unique stored output binding".into(),
@@ -388,8 +388,7 @@ mod tests {
                     (
                         PostAsapNodeId(id),
                         BackendNodeBinding::Materialization {
-                            summary_definition: asap_types::PolicyFingerprint(u64::from(id) + 1)
-                                .into(),
+                            stored_output: asap_types::PolicyFingerprint(u64::from(id) + 1).into(),
                         },
                     )
                 })
@@ -497,7 +496,7 @@ mod tests {
         MaterializationCommitKey {
             plan_id: 7,
             plan_version: 1,
-            summary_definition: asap_types::PolicyFingerprint(u64::from(node_id) + 1).into(),
+            stored_output: asap_types::PolicyFingerprint(u64::from(node_id) + 1).into(),
             window_start_ms: 10,
             window_end_ms: 20,
             input_lineage: b"checkpoint:3".to_vec(),
@@ -699,7 +698,7 @@ mod tests {
                 (
                     PostAsapNodeId(1),
                     BackendNodeBinding::Materialization {
-                        summary_definition: asap_types::PolicyFingerprint(2).into(),
+                        stored_output: asap_types::PolicyFingerprint(2).into(),
                     },
                 ),
             ]

@@ -6,12 +6,12 @@ use planner_types::post_asap::PostAsapNodeId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{executable_plan::OwnedPostAsapDag, sds::SummaryDefinitionId};
+use crate::{executable_plan::OwnedPostAsapDag, sds::StoredOutputId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedInputIdentity {
-    pub inputs: BTreeSet<SummaryDefinitionId>,
+    pub inputs: BTreeSet<StoredOutputId>,
     pub program_sha256: String,
 }
 
@@ -35,7 +35,7 @@ impl DerivedInputIdentity {
     pub fn from_dag(
         document: &OwnedPostAsapDag,
         root: PostAsapNodeId,
-        frontiers: &BTreeMap<PostAsapNodeId, SummaryDefinitionId>,
+        frontiers: &BTreeMap<PostAsapNodeId, StoredOutputId>,
     ) -> Result<Self, String> {
         if ![
             crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn derived_source_is_distinct_and_generation_independent() {
         let raw = config();
-        let raw_id = SummaryDefinitionId::from(raw.policy_fingerprint());
+        let raw_id = StoredOutputId::from(raw.policy_fingerprint());
         let mut derived = raw.clone();
         derived.derived_input = Some(DerivedInputIdentity {
             inputs: BTreeSet::from([raw_id]),
@@ -173,7 +173,7 @@ mod tests {
         let a =
             SummaryCatalog::from_materializations(1, 1, &[raw.clone(), derived.clone()]).unwrap();
         let b = SummaryCatalog::from_materializations(2, 9, &[raw, derived.clone()]).unwrap();
-        assert_eq!(a.definitions, b.definitions);
+        assert_eq!(a.outputs, b.outputs);
         assert_eq!(a.data_descriptors, b.data_descriptors);
         let mut renamed = derived.clone();
         renamed.metric = "output_alias".into();
@@ -187,7 +187,7 @@ mod tests {
     fn raw_utf8_metric_cannot_impersonate_derived_policy_domain() {
         let mut derived = config();
         derived.derived_input = Some(DerivedInputIdentity {
-            inputs: BTreeSet::from([SummaryDefinitionId::from(derived.policy_fingerprint())]),
+            inputs: BTreeSet::from([StoredOutputId::from(derived.policy_fingerprint())]),
             program_sha256: "d".repeat(64),
         });
         let mut raw = derived.clone();
@@ -203,7 +203,7 @@ mod tests {
     fn catalog_rejects_missing_derived_dependencies_and_raw_source_conflicts() {
         let mut derived = config();
         derived.derived_input = Some(DerivedInputIdentity {
-            inputs: BTreeSet::from([SummaryDefinitionId::from(derived.policy_fingerprint())]),
+            inputs: BTreeSet::from([StoredOutputId::from(derived.policy_fingerprint())]),
             program_sha256: "b".repeat(64),
         });
         assert!(SummaryCatalog::from_materializations(1, 1, &[derived.clone()]).is_err());
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn semantic_signature_ignores_node_and_query_numbering_but_not_inputs() {
-        let source = SummaryDefinitionId::from(config().policy_fingerprint());
+        let source = StoredOutputId::from(config().policy_fingerprint());
         let a = program(1, 2);
         let first = DerivedInputIdentity::from_dag(
             &a,
@@ -307,7 +307,7 @@ mod tests {
         };
         let config = config();
         let input = DerivedInputIdentity {
-            inputs: BTreeSet::from([SummaryDefinitionId::from(config.policy_fingerprint())]),
+            inputs: BTreeSet::from([StoredOutputId::from(config.policy_fingerprint())]),
             program_sha256: "f".repeat(64),
         };
         let data = DataDescriptor::new_typed(
@@ -333,7 +333,7 @@ mod tests {
         use crate::precompute_plan::{PlanEnvelope, PrecomputePlan};
         let mut config = config();
         config.derived_input = Some(DerivedInputIdentity {
-            inputs: BTreeSet::from([SummaryDefinitionId::from(config.policy_fingerprint())]),
+            inputs: BTreeSet::from([StoredOutputId::from(config.policy_fingerprint())]),
             program_sha256: "c".repeat(64),
         });
         let envelope = PlanEnvelope {
@@ -369,7 +369,7 @@ mod tests {
         let mut edge = dag.edges[0].clone();
         edge.producer = PostAsapNodeId(3);
         dag.edges.push(edge);
-        let source = SummaryDefinitionId::from(config().policy_fingerprint());
+        let source = StoredOutputId::from(config().policy_fingerprint());
         let frontiers = BTreeMap::from([(PostAsapNodeId(1), source)]);
         let first = DerivedInputIdentity::from_dag(&dag, dag.root, &frontiers).unwrap();
         assert_eq!(first.inputs, BTreeSet::from([source]));

@@ -75,9 +75,52 @@ fn legacy_summary(kind: &AggKind) -> SummaryDescriptor {
     })
 }
 
-/// Normalized stored-output binding shared by its population/window records.
-/// The selected output and catalog generation are durable identity; metadata's
-/// numeric handle only locates the physical rows in this store.
+// A valid deployment reference does not authorize bytes in another state format.
+fn operator_matches(summary: &SummaryDescriptor, actual: &AggKind) -> bool {
+    match &summary.operator {
+        SummaryOperator::Configured {
+            aggregation_type,
+            aggregation_sub_type,
+            parameters,
+            ..
+        } => {
+            let config = asap_types::PrecomputeMaterialization::new(
+                *aggregation_type,
+                aggregation_sub_type.clone(),
+                parameters.clone().into_iter().collect(),
+                asap_types::KeyByLabelNames::empty(),
+                asap_types::KeyByLabelNames::empty(),
+                asap_types::KeyByLabelNames::empty(),
+                String::new(),
+                1,
+                1,
+                asap_types::WindowKind::Tumbling,
+                String::new(),
+                String::new(),
+                None,
+                None,
+                None,
+            );
+            super::data::agg_kind_for_config(&config).operator_canonical_string()
+                == actual.operator_canonical_string()
+        }
+        SummaryOperator::ExactAgg {
+            agg_type,
+            parameters_canonical,
+        } => matches!(actual,
+            AggKind::ExactAgg { agg_type: actual, parameters_canonical: parameters, .. } if actual == agg_type && parameters == parameters_canonical),
+        SummaryOperator::LegacyPartial { operator_canonical } => {
+            actual.operator_canonical_string() == *operator_canonical
+        }
+        // Bound runtime plans carry the complete Configured state contract.
+        SummaryOperator::Sketch { .. } => false,
+    }
+}
+
+/// Runtime foreign-key binding from one SeriesId to shared descriptors. Every pane
+/// row stored under the SeriesId is a Summary Instance: `(binding, interval,
+/// group-values, state)`. Descriptor references are normalized here instead of
+/// copied into every pane row.
 #[derive(Debug, Clone)]
 pub struct SdsBinding {
     pub stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
@@ -109,7 +152,7 @@ pub struct SummaryDescriptorRegistry {
             Arc<asap_types::summary_catalog::SummaryCatalog>,
             Arc<asap_types::sds::CatalogGeneration>,
             std::collections::BTreeMap<
-                asap_types::sds::SummaryDefinitionId,
+                asap_types::sds::StoredOutputId,
                 asap_types::sds::StoredOutputReference,
             >,
         )>,
@@ -123,14 +166,9 @@ impl SummaryDescriptorRegistry {
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
     ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
         let outputs = catalog
-            .definitions
+            .outputs
             .keys()
-            .map(|id| {
-                (
-                    *id,
-                    asap_types::sds::StoredOutputReference::for_definition(*id),
-                )
-            })
+            .map(|id| (*id, catalog.output_reference(*id).unwrap()))
             .collect();
         self.install_catalog_with_outputs(catalog, outputs)
     }
@@ -139,18 +177,23 @@ impl SummaryDescriptorRegistry {
         &self,
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
         outputs: std::collections::BTreeMap<
-            asap_types::sds::SummaryDefinitionId,
+            asap_types::sds::StoredOutputId,
             asap_types::sds::StoredOutputReference,
         >,
     ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
-        catalog.validate().inspect_err(|error| {
-            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
-                %error, "storage descriptor catalog validation failed");
-        })?;
-        let reference = catalog.reference().inspect_err(|error| {
-            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
-                %error, "storage descriptor catalog reference failed");
-        })?;
+        catalog.validate()?;
+        if outputs.len() != catalog.outputs.len()
+            || outputs
+                .iter()
+                .any(|(id, output)| catalog.output_reference(*id).ok().as_ref() != Some(output))
+        {
+            return Err(
+                asap_types::summary_catalog::SummaryCatalogError::Descriptor(
+                    "installed output bindings disagree with semantic definitions".into(),
+                ),
+            );
+        }
+        let reference = catalog.reference()?;
         let generation = Arc::new(asap_types::sds::CatalogGeneration {
             schema_version: reference.schema_version,
             plan_id: reference.plan_id,
@@ -191,13 +234,13 @@ impl SummaryDescriptorRegistry {
 
     pub fn stored_output_reference(
         &self,
-        definition: asap_types::sds::SummaryDefinitionId,
+        definition: asap_types::sds::StoredOutputId,
     ) -> Option<asap_types::sds::StoredOutputReference> {
         let installed = self.authoritative_catalog.read().unwrap();
         match installed.as_ref() {
-            Some((_, _, outputs)) => outputs.get(&definition).copied(),
+            Some((_, _, outputs)) => outputs.get(&definition).cloned(),
             None => (!definition.fingerprint().is_unset())
-                .then(|| asap_types::sds::StoredOutputReference::for_definition(definition)),
+                .then(|| asap_types::sds::StoredOutputReference::for_output(definition)),
         }
     }
 
@@ -205,12 +248,13 @@ impl SummaryDescriptorRegistry {
         let authoritative = self.authoritative_catalog.read().unwrap().clone();
         let stored_output_reference = match &authoritative {
             Some((_, _, outputs)) => Some(
-                *outputs
+                outputs
                     .get(&metadata.policy_fp.into())
+                    .cloned()
                     .ok_or("definition has no selected stored output")?,
             ),
             None => (!metadata.policy_fp.is_unset()).then(|| {
-                asap_types::sds::StoredOutputReference::for_definition(metadata.policy_fp.into())
+                asap_types::sds::StoredOutputReference::for_output(metadata.policy_fp.into())
             }),
         };
         let configured = if let Some((catalog, _, _)) = authoritative.as_ref() {
@@ -219,15 +263,19 @@ impl SummaryDescriptorRegistry {
                     "materialization identity is required by the installed SummaryCatalog".into(),
                 );
             }
-            let materialization = asap_types::sds::SummaryDefinitionId::from(metadata.policy_fp);
-            let identity = catalog.definitions.get(&materialization).ok_or_else(|| {
+            let materialization = asap_types::sds::StoredOutputId::from(metadata.policy_fp);
+            let identity = catalog.outputs.get(&materialization).ok_or_else(|| {
                 format!(
                     "materialization {} is absent from the installed SummaryCatalog",
                     materialization.as_u64()
                 )
             })?;
+            let summary = &catalog.summary_descriptors[&identity.summary_descriptor_id];
+            if !operator_matches(summary, &metadata.agg_kind) {
+                return Err("stored output state format differs from installed definition".into());
+            }
             Some((
-                catalog.summary_descriptors[&identity.summary_descriptor_id].clone(),
+                summary.clone(),
                 catalog.data_descriptors[&identity.data_descriptor_id].clone(),
             ))
         } else {
@@ -456,7 +504,7 @@ mod tests {
         let summary = SummaryDescriptor::new(
             SummaryOperator::ExactAgg {
                 agg_type: AggregationType::Sum,
-                parameters_canonical: "authoritative=true".into(),
+                parameters_canonical: "pane=5000;".into(),
             },
             FidelityGuarantee::Exact,
             1,
@@ -476,8 +524,14 @@ mod tests {
         let registry = SummaryDescriptorRegistry::default();
         registry.install_catalog(Arc::new(catalog)).unwrap();
 
+        assert!(
+            registry
+                .bind(metadata(1, "wrong-local-copy", "", AggregationType::Max, 7))
+                .is_err(),
+            "an output ID must not authorize a different state family"
+        );
         let binding = registry
-            .bind(metadata(1, "wrong-local-copy", "", AggregationType::Max, 7))
+            .bind(metadata(1, "cpu", "", AggregationType::Sum, 7))
             .unwrap();
         assert_eq!(binding.summary_descriptor.as_ref(), &summary);
         assert_eq!(binding.data_descriptor.as_ref(), &data);

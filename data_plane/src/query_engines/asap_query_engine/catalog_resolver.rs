@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use asap_types::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
-use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor, SummaryOperator};
+use asap_types::sds::{StoredOutputId, SummaryDescriptor, SummaryOperator};
 use asap_types::summary_catalog::SummaryCatalog;
 use planner_types::post_asap::{SketchAlgorithm, SummaryFamilyType};
 
@@ -21,10 +21,10 @@ fn miss(reason: impl Into<String>) -> EngineError {
 /// Borrow descriptors; never reconstruct them from bindings or store payloads.
 pub(crate) fn resolve(
     catalog: &SummaryCatalog,
-    id: SummaryDefinitionId,
+    id: StoredOutputId,
 ) -> Result<ResolvedMaterialization<'_>, EngineError> {
     let identity = catalog
-        .definitions
+        .outputs
         .get(&id)
         .ok_or_else(|| miss(format!("unknown materialization {}", id.fingerprint().0)))?;
     let summary = catalog
@@ -119,7 +119,7 @@ pub(crate) fn validate_payload(
     let mut resolved = BTreeMap::new();
     for id in entry.topological_order().map_err(|e| miss(e.to_string()))? {
         let node = &entry.nodes[&id];
-        let state_ids = (|| -> Result<BTreeSet<SummaryDefinitionId>, EngineError> {
+        let state_ids = (|| -> Result<BTreeSet<StoredOutputId>, EngineError> {
             Ok(match node {
                 QueryPlanNode::ReadMaterialization { binding } => {
                     if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -132,7 +132,7 @@ pub(crate) fn validate_payload(
                 QueryPlanNode::SummaryMerge { inputs } => {
                     let mut ids = BTreeSet::new();
                     for input in inputs {
-                        let children: &BTreeSet<SummaryDefinitionId> = states
+                        let children: &BTreeSet<StoredOutputId> = states
                             .get(input)
                             .ok_or_else(|| miss("summary merge has no state input"))?;
                         if children.is_empty() {
@@ -144,7 +144,7 @@ pub(crate) fn validate_payload(
                 }
                 QueryPlanNode::SummaryEstimate { input, .. }
                 | QueryPlanNode::ExactReadout { input, .. } => {
-                    let ids: &BTreeSet<SummaryDefinitionId> = states
+                    let ids: &BTreeSet<StoredOutputId> = states
                         .get(input)
                         .ok_or_else(|| miss("readout has no state input"))?;
                     if ids.is_empty() || ids.iter().any(|id| !resolved[id].supports(node)) {
@@ -240,11 +240,11 @@ mod tests {
     fn resolves_without_descriptor_copies() {
         let bundle = fixture();
         let catalog = &bundle.summary_catalog;
-        let id = *catalog.definitions.keys().next().unwrap();
+        let id = *catalog.outputs.keys().next().unwrap();
         let result = resolve(catalog, id).unwrap();
         assert!(std::ptr::eq(
             result.summary,
-            &catalog.summary_descriptors[&catalog.definitions[&id].summary_descriptor_id]
+            &catalog.summary_descriptors[&catalog.outputs[&id].summary_descriptor_id]
         ));
         let mut broken = catalog.clone();
         broken.data_descriptors.clear();
@@ -254,8 +254,8 @@ mod tests {
     #[test]
     fn rejects_operator_fidelity_mismatch_during_resolution() {
         let mut catalog = catalog_fixture();
-        let id = *catalog.definitions.keys().next().unwrap();
-        let descriptor_id = catalog.definitions[&id].summary_descriptor_id.clone();
+        let id = *catalog.outputs.keys().next().unwrap();
+        let descriptor_id = catalog.outputs[&id].summary_descriptor_id.clone();
         catalog
             .summary_descriptors
             .get_mut(&descriptor_id)

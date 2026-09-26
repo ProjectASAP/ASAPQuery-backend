@@ -657,46 +657,45 @@ mod hybrid_tests {
         )
         .unwrap();
         let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
-        let entry = crate::query_plan::compile_bound_composable_mapped(
-            "hybrid".into(),
-            query.into(),
-            &selected,
-            InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::Reject,
-            |node, _| {
-                let (_, _, spatial_filter) =
-                    crate::physical::compiler::raw_materialization_input_contract(node)
-                        .map_err(QueryPlanError::Invalid)?;
-                Ok(MaterializationBinding {
-                    full_window_slide_ms: None,
-                    item_labels: Vec::new(),
-                    materialization: asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
-                        7
-                    } else {
-                        8
-                    })
-                    .into(),
-                    stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
-                        asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
-                            7
-                        } else {
-                            8
-                        })
+        let entry =
+            crate::query_plan::compile_bound_composable_mapped(
+                "hybrid".into(),
+                query.into(),
+                &selected,
+                InstantExecution {
+                    lookback_ms: 300_000,
+                    full_history: false,
+                    cumulative_readout: false,
+                },
+                FallbackPolicy::Reject,
+                |node, _| {
+                    let (_, _, spatial_filter) =
+                        crate::physical::compiler::raw_materialization_input_contract(node)
+                            .map_err(QueryPlanError::Invalid)?;
+                    Ok(MaterializationBinding {
+                        full_window_slide_ms: None,
+                        item_labels: Vec::new(),
+                        materialization: asap_types::PolicyFingerprint(
+                            if spatial_filter.is_empty() { 7 } else { 8 },
+                        )
                         .into(),
-                    ),
-                    output_grouping: PhysicalGrouping::PerEntity,
-                    window_ms: 300_000,
-                    pane_origin_ms: Some(0),
-                    readout_lookback_ms: Some(300_000),
-                })
-            },
-            |_, _| {},
-        )
-        .unwrap();
+                        stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
+                            asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
+                                7
+                            } else {
+                                8
+                            })
+                            .into(),
+                        ),
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 300_000,
+                        pane_origin_ms: Some(0),
+                        readout_lookback_ms: Some(300_000),
+                    })
+                },
+                |_, _| {},
+            )
+            .unwrap();
         assert_eq!(entry.materialization_bindings().len(), 2);
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
@@ -1376,7 +1375,7 @@ mod remote_boundary_regressions {
     use super::*;
 
     #[test]
-    fn summary_definition_identity_is_independent_of_matcher_order() {
+    fn stored_output_identity_is_independent_of_matcher_order() {
         let first = LabelMatcher {
             name: "job".into(),
             value: "orders".into(),
