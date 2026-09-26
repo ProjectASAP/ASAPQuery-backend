@@ -95,6 +95,13 @@ Logical-to-physical provenance comes from Planner and remains available for
 inspection. It does not drive backend semantic-node classification or re-lowering.
 There is no backend `MaintenanceInput`/`QueryInput` decision in this target model.
 
+Source, filter, grouping and window describe input-data semantics; they are not
+an exhaustive computation schema. The DAG also preserves value expressions,
+upstream transformations, operation parameters and typed output semantics.
+[Summary-definition completeness](summary-catalog-sds-architecture.md#input-semantics-are-necessary-but-not-sufficient)
+defines what storage compatibility must preserve. The example below abbreviates
+these contracts rather than replacing them with a fixed field list.
+
 ## 4. Worked example: shared KLL state
 
 Suppose p50 and p99 use KLL with `k=200` over aligned five-minute windows. Planner
