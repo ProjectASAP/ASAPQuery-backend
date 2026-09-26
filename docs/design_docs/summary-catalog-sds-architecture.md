@@ -1,177 +1,143 @@
-# Self-Describing Summary: Computation Definitions and Stored Results
+# Self-Describing Summary: Semantic Definitions and Stored Results
 
-Status: target design, not an implemented wire schema. Audience: developers
-compiling, storing, recovering and reading summary state.
+Status: target design. Ad-hoc discovery is a future extension, not implemented
+behavior claimed by this document.
 
-## 1. Problem and goals
+## 1. Why SDS?
 
-Stored sketch bytes do not explain what was summarized. Even source, filter,
-grouping and window are insufficient: KLL over `latency` and KLL over
-`log(latency)` have different meanings despite sharing those fields. Reusing
-one as the other changes the query result.
+Stored summary bytes are not enough to determine what they mean.
 
-SDS must preserve the computation that gives a stored result its meaning, and
-associate each record with its concrete data scope and format. It must do this
-without inventing another expression language or requiring a live Planner process.
-
-The design has two stored objects: `SummaryDefinition` describes parameterized
-computation using a Planner-defined semantic representation; `StoredSummary` contains one concrete result and
-references that definition. `SummaryStore` is the persistence authority for both.
-
-Goals are semantic identity, recoverable definitions, explicit read eligibility
-and shared state across compatible consumers. Definitions must also support
-future Planner reasoning about reuse for queries not registered in advance. SDS does not perform planning,
-execute expressions, choose materialization boundaries or schedule maintenance.
-
-## 2. Architecture and ownership
+For example:
 
 ```text
-Planner selected computation
-    ↓ export minimal canonical semantics for persisted output
-SummaryDefinition
-    ↑ definition_id
-StoredSummary: concrete group/window/revision + format + payload
-    ↑ installed stored-output binding
-Precompute writer / query reader
+KLL(latency)
 ```
 
-| Owner | Responsibility |
+and
+
+```text
+KLL(log(latency))
+```
+
+may have the same source, grouping, window, and sketch format, but they cannot
+be used interchangeably to answer queries.
+
+SDS therefore separates:
+
+```text
+SummaryDefinition = what a summary means
+StoredSummary     = one concrete result of that definition
+```
+
+This supports two use cases:
+
+1. **Bound queries:** an installed QueryPlan reads the specific SDS output
+   selected during planning.
+2. **Future ad-hoc queries:** Planner can search existing SummaryDefinitions and
+   determine whether an SDS can legally support a new query.
+
+SDS describes stored computation. It does not plan queries, execute operators,
+or choose materialization boundaries.
+
+## 2. Architecture
+
+```text
+                 Planner
+                    │
+       canonical semantic description
+                    ▼
+            SummaryDefinition
+                    ▲
+                    │ definition_id
+              StoredSummary
+       group + window + payload
+                    ▲
+                    │ stored_output_id
+          installed plan binding
+             /             \
+    PrecomputePlan       QueryPlan
+       writes              reads
+```
+
+| Component | Responsibility |
 | --- | --- |
-| Planner | Computation semantics, canonical semantic export and versioned normalization rules |
-| Deployment compiler | Associate selected physical outputs with semantic definitions and concrete storage bindings; include definitions in the installation bundle |
-| SummaryStore | Act as persistence authority for definitions and concrete stored results; enforce references and read contracts |
-| Shared executor | Execute Planner-provided Physical DAGs; SDS descriptions do not become a second execution path |
+| Planner | Defines computation semantics and decides whether an SDS can support a query |
+| Deployment compiler | Binds Planner-selected physical outputs to deployed stored outputs |
+| SummaryStore | Persists definitions and concrete summary results |
+| Shared executor | Executes Planner-provided Physical DAGs |
 
-This follows the [canonical planning/deployment boundary](https://github.com/ProjectASAP/ASAPPlanner/blob/e9390031fcecd7bc0d611127eddc5c6603a281e5/docs/design_docs/physical-planning-and-deployment.md).
-The [integration design](asapplanner-integration.md) defines deployment binding.
-Definitions accompany the installed plan and are persisted before records can
-reference them. Recovery must work without Planner memory, temporary node IDs
-or fetching a mutable branch from a repository.
+The store knows **what exists**. Planner decides **what can be used**.
 
-## 3. SummaryDefinition: the meaning of a result
+## 3. SummaryDefinition: what does this state mean?
 
-`SummaryDefinition` is a semantic description and identity contract, not an
-executable plan. It uses a Planner-defined canonical semantic representation
-containing only the dependency closure needed to distinguish and interpret the
-persisted output, including the typed expressions and operation contracts needed
-for Planner matching and rewrite-legality checks. It does not promise to reconstruct or execute the original
-logical plan.
+A SummaryDefinition is a canonical semantic description of a persisted result.
 
-Planner owns these semantics. The deployment compiler supplies their definition
-for installation, and SummaryStore persists it. Reusing Planner's typed
-expressions is appropriate; persisting its complete internal IR is not required.
-Unrelated consumers, optimizer annotations, execution phases, physical algorithms
-and deployment locations are outside this description unless they affect the
-meaning of the output itself.
-
-### Input semantics are necessary but not sufficient
-
-Source, filter, grouping and window describe input-data semantics. The full
-computation also defines value expressions, joins/transforms and their order,
-item/weight expressions, operation parameters, types and output representation.
-Operation-defined null, duplicate and numeric behavior comes from versioned
-Planner contracts rather than independent SDS switches.
+It contains enough information to distinguish computations such as:
 
 ```text
-Definition A                      Definition B
+KLL(latency)
 
-Scan(latency)                     Scan(latency)
-      ↓                                 ↓
-KLLBuild(k=200)                    Project(log(latency))
-                                        ↓
-                                  KLLBuild(k=200)
+vs.
+
+Project(log(latency))
+        ↓
+KLL
 ```
 
-The two definitions must have different identities. A display string such as
-`"log(latency)"` is not a sufficient semantic representation: the typed function,
-arguments and their semantics must be resolved in the canonical computation.
+It therefore includes relevant:
 
-The conceptual persisted envelope is:
+- source and filter semantics;
+- value expressions and transformations;
+- grouping and time semantics;
+- summary algorithm and parameters;
+- types and operation semantics.
+
+Conceptually:
 
 ```yaml
 summary_definition:
-  id: <versioned-semantic-fingerprint>
-  semantic_format_version: <supported-description-version>
-  canonicalization_version: <normalization-version>
-  semantics: <canonical-typed-semantic-description>
-  output: <described-result>
-  parameters: <semantic-parameter-contract>
+  id: <semantic-fingerprint>
+  semantic_format_version: <version>
+  semantics: <canonical-typed-description>
+  output: <described-output>
 ```
 
-This envelope illustrates ownership, not a second node schema. `semantics`
-reuses Planner-defined expression and operation meanings without requiring its
-internal plan serialization. Time bounds, time-column interpretation, alignment
-and pane requirements must remain unambiguous. If required semantics cannot be
-exported, the definition is unsupported rather than partially recorded.
+The description reuses Planner-defined semantics, but it is **not an executable
+plan** and does not need to serialize Planner's complete internal IR. It contains
+only the semantic dependencies needed to distinguish and interpret the output.
+Definitions and their required dependencies are persisted so recovery does not
+require a live Planner process.
 
-The semantic format has its own explicit compatibility contract. Internal Planner
-refactoring or a new optimizer annotation must not automatically change persisted
-identity or force a state migration. A change to actual operator semantics may
-require a new semantic version and an explicit compatibility decision. Readers
-need a supported semantic-description decoder, not the original Planner binary
-or executable logical plan.
+Physical placement, encoding, scheduling, retention, readiness, and plan version
+are not part of semantic identity. Identity uses a versioned canonical semantic
+encoding, not display strings or temporary node IDs. Its encoding and compatibility
+rules must be established before persistence; internal Planner refactoring alone
+must not force state migration. Unknown semantic versions fail validation.
 
-### Definition boundary and sharing
+### Definition boundary
 
-For persisted KLL state, the root stops at the state-producing computation.
-p50 and p99 consumers therefore share that definition and its stored state.
-For a persisted p99 value, the root includes the quantile readout and its parameter;
-persisted p50 has a different definition.
+The definition stops at the persisted output.
 
-Group-key expressions and types belong in the definition. Concrete group values
-and interval endpoints normally belong in records. A literal filter restricting
-the source to `service="api"` remains part of the definition; it cannot be removed
-and treated as a harmless record parameter.
+```text
+KLL(latency) ──persist──> state
+                            ├── p50
+                            └── p99
+```
 
-If an input is already materialized, its meaning must remain recoverable. Export
-the semantic dependency closure, or immutable references to definitions installed
-and persisted with that closure. A reference only to a deployment node or store
-address is insufficient. Such references reuse the same definition model, not
-another registry or computation language.
+p50 and p99 can therefore share one KLL SummaryDefinition.
 
-### What is outside the definition
+If p99 itself is persisted:
 
-Storage locations, plan versions, physical operator implementation choices,
-encoding, scheduling, retention, costs and observed readiness are separate
-contracts. A physical implementation may vary only while preserving the
-selected semantics; state compatibility still needs explicit format validation.
-Changing `k`, the value expression or the output operation changes the definition.
-Moving the same state to another store does not.
+```text
+KLL(latency) → p99 ──persist──> value
+```
 
-## 4. Semantic identity
+then the readout becomes part of that definition.
 
-The definition ID fingerprints a versioned canonical encoding of the computation,
-its output and semantic parameter contract. The encoding includes stable source
-identities, types and operator/function semantics, not display names or temporary
-Planner node numbers. Source identity must distinguish different logical datasets
-with identical schemas, including any applicable namespace.
+## 4. StoredSummary: one concrete result
 
-Canonicalization must preserve ordered operands, constants, types, dependencies
-and relevant operation semantics. Equivalent exports differing only in temporary
-node numbering or map iteration order should produce the same ID. It must not
-reorder arithmetic or replace expressions merely because they look algebraically
-equivalent under different null or floating-point behavior.
-
-This is conservative identity, not general equivalence proof. Unless Planner's
-versioned normalization establishes equivalence, different computations have
-different definitions and cannot be substituted by SDS. A legal transformation
-or merge across definitions must appear in Planner's selected computation.
-
-Registration recomputes the fingerprint and validates the canonical content.
-An existing ID with different content is rejected. The canonical bytes are
-retained, so a digest is never the only surviving description of the semantics.
-Do not hash ordinary JSON output or a debug rendering.
-
-The exact canonical encoding, digest algorithm and version compatibility policy
-remain implementation decisions that must be fixed and tested before persistent
-IDs are introduced. Unknown semantic/normalization versions fail validation.
-A Planner source-code revision may be recorded for provenance but is not a
-substitute for a stable semantic format contract.
-
-## 5. StoredSummary: one concrete result
-
-A stored record instantiates a definition for a concrete group, window and data
-revision, and contains the resulting bytes:
+A StoredSummary instantiates a definition for a particular group and time range.
+The examples illustrate the contract, not a finalized wire schema.
 
 ```yaml
 stored_summary:
@@ -180,222 +146,255 @@ stored_summary:
     stored_output_id: latency-kll
     group_key: {service: api}
     window: {start_exclusive: '12:00', end_inclusive: '12:01'}
-  definition_id: <fingerprint-of-latency-kll-definition>
-  revision: <data-revision>
-  coverage:
-    start_exclusive: '12:00'
-    end_inclusive: '12:01'
-    complete: true
+  definition_id: <KLL-latency-definition>
+  revision: <input-revision>
+  coverage: complete
   format: {schema: kll-v1, encoding: kll-binary-v1}
-  payload: <encoded-KLL-state>
+  payload: <bytes>
 ```
 
-The interval identifies intended scope; actual coverage/completeness must be
-established by the producer's input contract, not inferred from endpoints alone.
-Format metadata identifies supported bytes. Integrity and producer sequence
-metadata accompany the record where required by the installed protocol.
+The record answers:
 
-The logical lookup key is `(plan_version, stored_output_id, group_key, window)`.
-Revision is validated record metadata, not permission to combine snapshots.
-Replacement of a record must expose metadata and payload atomically and protect
-in-flight readers from observing mixed revisions. Supporting simultaneous
-historical revisions requires an explicit versioned lookup/storage contract;
-this design does not imply it through the four-part key.
+> Which concrete state is this, what data does it cover, and can it be read?
 
-A stored record contains neither a repeated expression DAG nor a definition
-chosen at write time. Its authorized output binding determines the definition.
-Both definition and record must survive restart.
+The SummaryDefinition answers:
 
-## 6. Deployment references and storage
+> What does this state mean?
 
-SummaryStore is the persistence authority for two logical tables:
+SummaryStore persists both:
 
-| Table | Contents |
-| --- | --- |
-| `summary_definitions` | Definition ID → immutable canonical semantic description and its versioned contract |
-| `stored_summaries` | Concrete lookup key → committed record metadata and payload |
+```text
+summary_definitions
+    definition_id → SummaryDefinition
 
-A `StoredOutputReference` is part of an installed plan:
+stored_summaries
+    plan version + deployed output + group + window → StoredSummary
+```
+
+Metadata and payload become visible together. Completeness is established from
+the producer's input contract, not inferred from interval endpoints alone.
+A replacement snapshot replaces a record's revision; readers must not mix its
+old metadata with new bytes or count both snapshots as separate inputs.
+
+## 5. Semantic identity vs. deployed-output identity
+
+SDS uses two identities because they answer different questions:
+
+```text
+definition_id
+    = What does this state mean?
+
+stored_output_id
+    = Which authorized deployed output does this state belong to?
+```
+
+For example, within the same plan version:
+
+```text
+Definition D = KLL(latency, k=200)
+
+                 D
+              /     \
+           hot      rebuild
+```
+
+Both outputs have identical semantics, but hot may be the active serving output
+while rebuild is still being validated. Even adding plan version to definition
+ID would not distinguish these two outputs.
+
+Therefore:
+
+```text
+definition_id = D
+stored_output_id = hot
+```
+
+must not silently read:
+
+```text
+definition_id = D
+stored_output_id = rebuild
+```
+
+Equal semantics do not imply interchangeable deployed state.
+
+StoredOutputReference binds the two within the enclosing plan version:
 
 ```yaml
 reference:
-  stored_output_id: latency-kll
-  definition_id: <fingerprint-of-latency-kll-definition>
+  stored_output_id: hot
+  definition_id: D
 ```
 
-The enclosing plan supplies its version; the reader supplies group/time selection
-and required revision/coverage. The output identity names the authorized producer,
-while definition identity describes meaning. Equal definitions do not authorize
-reading another plan's output or bypassing its freshness requirements.
+It is a plan binding, not another stored object or Materialization catalog.
 
-### Why semantic and deployed-output identities are separate
+## 6. Reading a bound SDS
 
-Even within one plan version, two authorized outputs can have the same semantic
-definition:
+For an already planned query:
 
 ```text
-Plan version 42, definition D = KLL(latency, k=200)
-
-stored_output_id = hot       → serving output, current committed revision
-stored_output_id = rebuild   → independently rebuilt output under validation
+QueryPlan
+   │
+   ▼
+StoredOutputReference
+   │
+   ▼
+eligible StoredSummary records
+   │
+   ▼
+Physical DAG execution
 ```
 
-Both summarize the same expression, but have different writers, readiness and
-publication policies. A serving reader bound to `hot` must not consume `rebuild`
-merely because its definition matches. The key
-`(plan_version, definition_id, group_key, window)` would collapse these outputs
-even within this single plan version.
+The runtime checks two things.
 
-`definition_id` identifies meaning; `stored_output_id` identifies the authorized
-deployed output. Equal semantics do not imply interchangeable deployment state.
-These IDs do not require a separate Materialization object or registry: the
-output identity and its authorization live in installed boundary bindings.
+**Semantic compatibility**
 
-Installation validates definitions, their dependency closure and matching
-physical-boundary bindings as one bundle. Records become visible only when their
-metadata and payload are committed together. Definitions cannot be reclaimed
-while live records, installed plans or other retained definitions reference them.
-These are logical consistency requirements within the existing store, not a
-proposal for separate metadata/payload services or a third Materialization object.
-
-## 7. Read eligibility
-
-A reader performs two distinct checks:
-
-1. **Semantic compatibility:** the installed input expects this definition and
-   typed output. `KLL(latency)` cannot satisfy `KLL(log(latency))`. A different
-   definition needs an explicit Planner-approved computation, not a store heuristic.
-2. **Instance eligibility:** the record belongs to the authorized output/version,
-   is committed, has the required group, interval, revision and completeness, and
-   uses a supported schema/encoding with valid payload integrity.
-
-For a five-minute query using one-minute panes, definition semantics describe
-each pane's computation. The query Physical DAG describes merging eligible panes
-for the five-minute result. The reader must establish complete, nonoverlapping
-coverage and compatible revisions. It must not assume five arbitrary records
-with the same definition cover the requested interval.
-
-Readout parameters can differ across consumers of the same KLL state. The shared
-executor performs the selected readouts; the store does not execute the definition
-or search for substitute summaries. Failure follows the installed fallback or
-unavailability policy. Installation alone does not establish future readiness.
-
-## 8. Future semantic discovery for unregistered queries
-
-The initial path executes an installed QueryPlan through explicit references:
+The record must have the definition selected by Planner. For a binding expecting
+KLL over latency:
 
 ```text
-QueryPlan → StoredOutputReference → eligible StoredSummary records → execution
+KLL(latency)      ✓
+KLL(log(latency)) ✗
 ```
 
-It does not search for substitutes during a bound read. A future ad-hoc planning
-path can discover reuse before producing such a bound plan:
+**Instance eligibility**
+
+The concrete record must be committed and have the required:
 
 ```text
-New query + available SummaryDefinitions
-    ↓ Planner semantic matching and legal rewrite search
-Selected computation over existing summary definitions
-    ↓ Planner physical compilation + backend deployment resolution
-QueryPlan with authorized stored-output bindings
-    ↓ runtime record eligibility checks
-Shared execution
+authorized output / plan version
+group
+window / coverage
+revision
+schema / encoding
+completeness
 ```
 
-`SummaryDefinition` provides a canonical semantic representation that Planner
-can use both to validate bound reads and to discover whether existing SDS can
-satisfy future queries. It is independent of any one query or deployment binding.
-Discovery needs the semantic content, not merely its fingerprint.
+For example, a five-minute query may consume five compatible one-minute KLL panes:
 
-### Reusability is not definition equality
+```text
+(12:00, 12:01] ─┐
+(12:01, 12:02]  │
+(12:02, 12:03]  ├─→ KLL Merge → p99
+(12:03, 12:04]  │
+(12:04, 12:05] ─┘
+```
 
-A stored `KLL(latency, k=200)` is not semantically identical to `p99(latency)`;
-it can support the query through an explicit quantile readout if the requested
-accuracy and input requirements permit it. Similarly, composing one-minute panes
-for a five-minute query requires a legal merge and complete aligned coverage.
+The runtime verifies complete non-overlapping coverage and compatible revisions.
+It does not decide whether KLL merging is semantically legal; Planner already
+made that decision. Missing or invalid state follows the installed fallback or
+unavailability policy. Plan installation alone does not establish readiness.
 
-For `p99(log(latency))`, `KLL(log(latency))` is a potential matching input.
-`KLL(latency)` is not a direct substitute. Using it would require a separately
-supported and justified transformation, including domain, numeric and accuracy
-semantics; the store must not infer such a rewrite from function names.
+## 7. Future: discovering SDS for an unregistered query
 
-Planner decides mergeability, expression compatibility, grouping, window
-composition, accuracy and residual computation. A summary may satisfy only part
-of a query. When no supported rewrite establishes correctness, it is not a reuse
-candidate, regardless of similar names or matching source metadata.
+The same definitions can later support queries not known when the SDS was created.
 
-### Discovery, binding and availability have different owners
+Suppose the store already contains:
 
-| Step | Owner and contract |
-| --- | --- |
-| Semantic discovery | Backend exposes permitted definitions to Planner; Planner searches for legal computations over them. `stored_output_id` does not determine semantic compatibility. |
-| Deployment resolution | Backend maps a selected definition to authorized deployed outputs and supplies capability/availability/cost evidence for feasible selection. |
-| Runtime resolution | SummaryStore resolves bound outputs for the required groups, windows and revisions and checks committed-state eligibility. |
+```text
+D1 = KLL(latency)
+D2 = KLL(log(latency))
+```
 
-The store reports what definitions and records exist; it does not implement a
-`find_compatible(query)` decision engine. Enumeration and indexes may help narrow
-candidates, but an index match is not proof of rewrite legality. These operations
-use the same persisted definitions, not an additional semantic catalog service.
+and a new query arrives:
 
-The steps can exchange evidence: a definition without an authorized output or
-sufficient state is not necessarily a deployable choice. Availability observations
-can become stale, so runtime eligibility must be checked again. Bindings pin the
-chosen output and applicable plan version; cross-version reuse still needs an
-explicit compatibility decision. A failed read follows the installed failure
-policy; alternative discovery requires replanning, not silent substitution.
+```text
+p99(latency)
+```
 
-This section reserves an extension point, not a new implemented query path.
-It does not require an ad-hoc API, search algorithm or index in the initial
-rollout. It requires preserving enough canonical semantics for future Planner
-reasoning without coupling storage to executable Planner IR.
+Planner can search available definitions:
 
-## 9. Alternatives and tradeoffs
+```text
+New query
+   +
+available SummaryDefinitions
+        │
+        ▼
+Planner semantic matching
+        │
+        ▼
+Can existing SDS support this computation?
+        │
+        ▼
+KLL(latency) → Quantile(0.99)
+        │
+        ▼
+Physical DAG
+        │
+        ▼
+bind to an authorized, eligible stored_output_id
+        │
+        ▼
+QueryPlan
+```
 
-A flat source/filter/grouping/window definition is simple but loses value
-expressions and arbitrary input computation. A separate SDS expression language
-would restore that detail at the cost of duplicating Planner semantics. Reusing
-Planner's canonical semantic representation avoids both problems. Its persistent
-format must be stable independently of internal Planner IR refactoring.
+Importantly:
 
-Embedding the full definition in every record simplifies standalone transfer but
-repeats metadata. Persisting it once and referencing it keeps records small;
-export and recovery must therefore include the definition closure. A payload
-without its required definition is not a complete SDS artifact.
+```text
+KLL(latency) ≠ p99(latency)
+```
 
-Using a physical or deployment graph as semantic identity would make equivalent
-results depend on placement or implementation choices. Logical computation gives
-semantic identity; physical format and runtime eligibility remain separate checks.
+The SDS is **not equivalent** to the query. It is reusable because Planner knows
+a legal computation, subject to the query's accuracy and input requirements:
 
-## 10. Validation and delivery
+```text
+KLL(latency)
+      ↓
+Quantile(0.99)
+```
 
-Acceptance tests must establish:
+Likewise, p99(log(latency)) may reuse KLL(log(latency)), but cannot directly
+substitute KLL(latency). Any transformation requires a supported Planner rewrite
+with justified domain, numeric and accuracy semantics.
 
-- `latency` versus `log(latency)`, different filters/types/weights/window semantics,
-  and different algorithm parameters produce distinct definitions.
-- Temporary node renumbering and serialization map order do not alter identity;
-  ordered operands and semantic constants are preserved.
-- p50/p99 share a persisted KLL definition, while finalized p50/p99 have distinct
-  definitions.
-- Registering altered content under an existing ID, unresolved dependencies and
-  unsupported semantic versions fails explicitly.
-- Installation and recovery resolve the complete definition without a live
-  Planner process; reclamation preserves referenced definitions.
-- Correct definitions with missing coverage, incompatible revisions or corrupt
-  payloads remain unreadable; replacement snapshots are not double-counted.
-- Writers cannot publish a different definition under an authorized output ID.
+### Who decides reuse?
 
-Implementation must first establish the Planner-owned semantic export/canonicalization
-contract. Legacy definitions lacking required expressions cannot be assigned a
-new identity by guessing omitted semantics. They require reconstruction from an
-authoritative plan or an explicit unsupported/rebuild outcome.
+```text
+SummaryStore:
+    What SDS definitions and instances exist?
 
-Plan-schema migration and persisted-payload decoding remain separate. Existing
-bytes can be retained only with justified semantic identity and format
-compatibility. The [migration plan](asapplanner-migration-plan.md) governs rollout;
-these requirements are not claims of completed implementation or tests.
+Planner:
+    Can they legally support all or part of this query?
 
-Future discovery acceptance must additionally demonstrate an unregistered p99
-query reusing eligible KLL state, expression/accuracy-incompatible candidates
-being rejected, legal pane composition, authorized output selection among equal
-definitions, and availability changing between planning and execution. The
-installed-plan fast path must continue to resolve its bound output without
-semantic search. These are follow-up requirements, not initial rollout gates.
+Deployment compiler:
+    Which authorized deployed output realizes the selected definition?
+
+Runtime:
+    Are the required concrete records currently eligible?
+```
+
+SummaryStore therefore does not implement a semantic decision engine such as:
+
+```text
+find_compatible(query)
+```
+
+Semantic compatibility, mergeability, grouping, window composition, accuracy,
+and residual computation remain Planner decisions. Backend capability and
+availability evidence can inform selection; a definition alone does not guarantee
+an executable deployment. Availability must be checked again at execution time.
+This extension does not require another catalog service or a new operator IR.
+
+## 8. Key invariants
+
+1. A SummaryDefinition describes semantics, not execution or deployment.
+2. Different meanings must not share a definition ID; equivalence requires
+   Planner's versioned normalization rather than a store heuristic.
+3. Equal definition IDs do not make different deployed outputs interchangeable.
+4. A writer cannot publish state with a definition different from its installed binding.
+5. Runtime reads require both semantic compatibility and eligible concrete state.
+6. Bound QueryPlans directly resolve their selected outputs; they do not search for alternatives.
+7. Ad-hoc SDS discovery happens through Planner and produces a new bound QueryPlan.
+8. SummaryStore reports available state; it never decides query rewrite legality.
+
+```text
+Planner        → what can compute the query
+Deployment     → which output to use
+SummaryStore   → what state actually exists
+Executor       → run the selected computation
+```
+
+The [deployment design](asapplanner-integration.md) defines compilation and
+execution ownership. The [migration plan](asapplanner-migration-plan.md) defines
+implementation and acceptance gates. This document does not claim that semantic
+fingerprinting or ad-hoc discovery has been implemented.
