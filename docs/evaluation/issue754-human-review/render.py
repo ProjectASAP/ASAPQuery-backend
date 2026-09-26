@@ -20,6 +20,18 @@ def operation(payload):
                     'range': time.get('range')}
     return payload
 
+def label(node):
+    payload = node['payload']
+    kind = payload['kind']
+    if kind == 'fallback':
+        return 'Source / time range'
+    if kind == 'summary_agg':
+        return 'SummaryAgg ' + compact(payload['family'])
+    if kind == 'value':
+        op = payload['operation']
+        return next(iter(op)) if isinstance(op, dict) else op
+    return kind
+
 def dtype(value):
     if isinstance(value, dict) and 'Plain' in value:
         return value['Plain']
@@ -38,6 +50,15 @@ for path in sorted(BASE.glob('*.json')):
              'IDs below are Planner node IDs; QueryPlan adapter IDs are shown separately.', '']
     for dag in plan['query_plan']['selected_dags'].values():
         lines += [f"Root: `{dag['root']}`.", '', '| Node | Dependencies (producer, edge role) | Timing | Operation | Output fields (index: name/type) |', '| --- | --- | --- | --- | --- |']
+        diagram = ['```mermaid', 'flowchart LR']
+        for node in dag['nodes']:
+            text = f"{node['id']}: {label(node)}"
+            text = text.replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+            diagram.append(f'  N{node["id"]}["{text}"]')
+        for edge in dag['edges']:
+            diagram.append(f"  N{edge['producer']} --> N{edge['consumer']}")
+        diagram += ['```', '']
+        lines[-2:-2] = diagram
         for node in dag['nodes']:
             deps = [[e['producer'], e['role']] for e in dag['edges'] if e['consumer'] == node['id']]
             fields = [f"{i}: {f['name']}/{dtype(f['dtype'])}" for i, f in enumerate(node['output_schema']['fields'])]
