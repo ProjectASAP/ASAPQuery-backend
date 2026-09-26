@@ -1130,7 +1130,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                     } else {
                         None
                     };
-                    let series_key = format_series_key(&canonical_name, &dp.attrs);
+                    let series_key = bound_sketch_series_key(
+                        &canonical_name,
+                        &dp.attrs,
+                        frame_identity.as_ref(),
+                    );
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
                     // Sid resolution — registry-allocated, NOT content-
@@ -1315,6 +1319,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     sketch_algorithm_for(&dp),
                                     &dp.container_config,
                                     &dp.attrs.keys().cloned().collect(),
+                                    Some(frame.materialization),
                                 )
                             });
                         if observed_policy != frame.materialization.fingerprint() {
@@ -1393,6 +1398,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 algorithm.clone(),
                                 &cfg,
                                 &group_by_keys,
+                                frame_identity.as_ref().map(|frame| frame.materialization),
                             );
                             // Per-item dimension (item_label) the controller threaded
                             // into the matched policy's parameters — recorded on the sid
@@ -1967,38 +1973,47 @@ fn sketch_config_to_params(
     params
 }
 
-/// Look up the policy fingerprint for a freshly-ingested OTLP sketch
-/// by content-matching against the streaming-config registry.
-///
-/// Sketches arrive with `(metric, attrs, sketch_kind, sketch_config)`
-/// embedded in the DP but no policy reference. The matching pass:
-/// snapshots the current streaming config, derives a
-/// `PolicyRegistry`, and asks `find_policy_by_content` for the
-/// fingerprint of a policy whose contents match. Returns
-/// `PolicyFingerprint::UNSET` when:
-///   1. An unsupported planner algorithm reached this path
-///      (defensive — shouldn't happen).
-///   2. No policy in the registry matches.
-///   3. Multiple policies match (would-have-been-a-bug case;
-///      `find_policy_by_content` returns `None` on ambiguity).
-///
-/// Callers register the sid with the returned fp regardless of
-/// success — UNSET sids are simply absent from the policy_fp →
-/// {sids} reverse index, and remain reachable via the legacy
-/// `instances_matching(metric, gbk)` walk.
+// Snapshot and delta bases are scoped to the producer, never only its semantics.
+fn bound_sketch_series_key(
+    name: &str,
+    labels: &HashMap<String, String>,
+    frame: Option<&asap_types::producer_plan::SummaryFrameIdentity>,
+) -> String {
+    let key = format_series_key(name, labels);
+    match frame {
+        Some(frame) => format!(
+            "{}:{}:{}:{key}",
+            frame.plan_id,
+            frame.plan_version,
+            frame.materialization.as_u64()
+        ),
+        None => key,
+    }
+}
+
+/// Resolve the framed deployed output, then verify its content contract.
+/// Unframed input uses legacy content matching and must have exactly one match.
+/// An absent or ambiguous match returns UNSET and cannot authorize bound writes.
 fn derive_sketch_policy_fp(
     ingest_state: &IngestState,
     metric: &str,
     kind: crate::storage_engines::sketch_db::index::SketchAlgorithm,
     cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
     group_by_keys: &std::collections::BTreeSet<String>,
+    bound_output: Option<asap_types::sds::StoredOutputId>,
 ) -> asap_types::PolicyFingerprint {
     let Some(agg_type) = aggregation_type_for_sketch_algorithm(kind) else {
         return asap_types::PolicyFingerprint::UNSET;
     };
     let params = sketch_config_to_params(cfg);
     let snap = ingest_state.config_snapshot();
-    let index = asap_types::RoutingIndex::build(snap.policy_registry());
+    let registry = snap.policy_registry();
+    let registry = if let Some(output) = bound_output {
+        asap_types::PolicyRegistry::from_configs(registry.get(output.fingerprint()).cloned())
+    } else {
+        registry
+    };
+    let index = asap_types::RoutingIndex::build(registry);
     index
         .find_policy_by_content(metric, group_by_keys, agg_type, &params)
         .unwrap_or(asap_types::PolicyFingerprint::UNSET)
@@ -2279,7 +2294,7 @@ fn preflight_summary_frames(
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         } else {
-            let series_key = format_series_key(canonical_name, &dp.attrs);
+            let series_key = bound_sketch_series_key(canonical_name, &dp.attrs, Some(&frame));
             let (mut base, base_window_start) = ingest_state
                 .sketch_snapshots
                 .get(&series_key)
@@ -2328,6 +2343,7 @@ fn preflight_summary_frames(
                 sketch_algorithm_for(&dp),
                 &dp.container_config,
                 &dp.attrs.keys().cloned().collect(),
+                Some(frame.materialization),
             )
         };
         if observed != frame.materialization.fingerprint() {

@@ -31,7 +31,7 @@ impl RawDagProgram {
             installed.validate()?;
             let dag = installed.document.decode()?;
             for node in &dag.nodes {
-                if !matches!(installed.binding.node(node.id), Some(BackendNodeBinding::Materialization { summary_definition }) if summary_definition.fingerprint() == config.policy_fingerprint())
+                if !matches!(installed.binding.node(node.id), Some(BackendNodeBinding::Materialization { stored_output }) if stored_output.fingerprint() == config.policy_fingerprint())
                 {
                     continue;
                 }

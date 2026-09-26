@@ -718,7 +718,7 @@ mod tests {
                     endpoint_path: "/v1/metrics".into(),
                     timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
                     require_plan_identity: true,
-                    require_summary_definition_identity: true,
+                    require_stored_output_identity: true,
                     require_registered_producer: true,
                 },
                 schemas: Vec::new(),
@@ -775,7 +775,7 @@ mod tests {
                         binding: MaterializationBinding {
                             materialization: asap_types::PolicyFingerprint(id).into(),
                             stored_output_reference:
-                                asap_types::sds::StoredOutputReference::for_definition(
+                                asap_types::sds::StoredOutputReference::for_output(
                                     asap_types::PolicyFingerprint(id).into(),
                                 ),
                             output_grouping: PhysicalGrouping::PerEntity,

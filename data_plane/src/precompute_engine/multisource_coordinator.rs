@@ -24,7 +24,7 @@ pub struct LogicalSourcePartition {
 #[serde(deny_unknown_fields)]
 pub struct CoordinatedInput {
     pub input_node_id: String,
-    pub summary_definition_id: asap_types::sds::SummaryDefinitionId,
+    pub stored_output_id: asap_types::sds::StoredOutputId,
     pub partitions: BTreeSet<LogicalSourcePartition>,
 }
 
@@ -36,7 +36,7 @@ pub struct MultiSourceNodeSpec {
     pub consumer_node_id: String,
     /// The content-addressed installed output binds its source/window contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_definition: Option<asap_types::sds::SummaryDefinitionId>,
+    pub output_definition: Option<asap_types::sds::StoredOutputId>,
     pub inputs: Vec<CoordinatedInput>,
     /// Named output grouping. An empty projection represents one global group.
     pub output_grouping: Vec<String>,
@@ -122,7 +122,7 @@ impl MultiSourceCoordinator {
         let supplied: BTreeSet<_> = spec
             .inputs
             .iter()
-            .map(|input| input.summary_definition_id)
+            .map(|input| input.stored_output_id)
             .collect();
         if &supplied != expected
             || supplied.len() != spec.inputs.len()
@@ -143,15 +143,13 @@ impl MultiSourceCoordinator {
             let source = plan
                 .materializations
                 .iter()
-                .find(|config| {
-                    config.policy_fingerprint() == input.summary_definition_id.fingerprint()
-                })
+                .find(|config| config.policy_fingerprint() == input.stored_output_id.fingerprint())
                 .ok_or_else(|| invalid("coordinator input is not installed"))?;
             sources.push(source);
             let producers: Vec<_> = plan
                 .producers
                 .iter()
-                .filter(|producer| producer.materialization == input.summary_definition_id)
+                .filter(|producer| producer.materialization == input.stored_output_id)
                 .collect();
             if producers.is_empty()
                 || producers
@@ -201,7 +199,7 @@ impl MultiSourceCoordinator {
                         .installed_plan
                         .as_ref()
                         .unwrap()
-                        .validate_watermark_scope(input.summary_definition_id, &barrier)
+                        .validate_watermark_scope(input.stored_output_id, &barrier)
                         .map_err(|error| invalid(error.to_string()))?;
                 }
             }
@@ -265,7 +263,7 @@ impl MultiSourceCoordinator {
                 .iter()
                 .filter(|input| input.partitions.contains(&logical(&barrier.source)))
             {
-                plan.validate_watermark_scope(input.summary_definition_id, &barrier)
+                plan.validate_watermark_scope(input.stored_output_id, &barrier)
                     .map_err(|error| invalid(error.to_string()))?;
             }
         }
@@ -347,7 +345,7 @@ impl MultiSourceCoordinator {
             .iter()
             .find(|requirement| requirement.input_node_id == input.input_node_id)
             .ok_or_else(|| invalid("staged input node is not required"))?;
-        if input.coordinates.summary_definition_id != requirement.summary_definition_id
+        if input.coordinates.stored_output_id != requirement.stored_output_id
             || !requirement.partitions.contains(&logical(&input.source))
         {
             return Err(invalid(
@@ -359,7 +357,7 @@ impl MultiSourceCoordinator {
                 .materializations
                 .iter()
                 .find(|config| {
-                    config.policy_fingerprint() == requirement.summary_definition_id.fingerprint()
+                    config.policy_fingerprint() == requirement.stored_output_id.fingerprint()
                 })
                 .ok_or_else(|| invalid("staged input definition is not installed"))?;
             let window = input.coordinates.time_range;
@@ -544,12 +542,12 @@ mod tests {
             inputs: vec![
                 CoordinatedInput {
                     input_node_id: "left".into(),
-                    summary_definition_id: PolicyFingerprint(1).into(),
+                    stored_output_id: PolicyFingerprint(1).into(),
                     partitions: BTreeSet::from([partition("0")]),
                 },
                 CoordinatedInput {
                     input_node_id: "right".into(),
-                    summary_definition_id: PolicyFingerprint(2).into(),
+                    stored_output_id: PolicyFingerprint(2).into(),
                     partitions: BTreeSet::from([partition("1")]),
                 },
             ],
@@ -569,7 +567,7 @@ mod tests {
             },
             instance_id: SummaryInstanceId::new(format!("{node}-{epoch}")).unwrap(),
             coordinates: SummaryInstanceCoordinates {
-                summary_definition_id: PolicyFingerprint(definition).into(),
+                stored_output_id: PolicyFingerprint(definition).into(),
                 time_range: HalfOpenTimeRange {
                     start_ms: 0,
                     end_ms: 10,
@@ -656,7 +654,7 @@ mod tests {
                 });
             spec.inputs.push(CoordinatedInput {
                 input_node_id: format!("input-{ordinal}"),
-                summary_definition_id: definition,
+                stored_output_id: definition,
                 partitions: partition_ids
                     .into_iter()
                     .map(|partition_id| LogicalSourcePartition {
@@ -695,7 +693,7 @@ mod tests {
                         },
                         instance_id: SummaryInstanceId::new(key.clone()).unwrap(),
                         coordinates: SummaryInstanceCoordinates {
-                            summary_definition_id: requirement.summary_definition_id,
+                            stored_output_id: requirement.stored_output_id,
                             time_range: HalfOpenTimeRange {
                                 start_ms: start,
                                 end_ms: start + 60000,

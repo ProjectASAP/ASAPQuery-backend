@@ -68,19 +68,29 @@ impl InstalledPrecomputePlan {
 
     pub fn stored_output_reference(
         &self,
-        definition: asap_types::sds::SummaryDefinitionId,
+        definition: asap_types::sds::StoredOutputId,
     ) -> Option<asap_types::sds::StoredOutputReference> {
         let selected = self.precompute_plan.as_ref().and_then(|plan| {
             plan.schemas
                 .iter()
                 .find(|schema| schema.materialization == definition)
-                .map(|schema| schema.stored_output_reference)
+                .map(|schema| schema.stored_output_reference.clone())
         });
         #[cfg(test)]
         let selected = selected.or_else(|| {
-            self.materializations_by_policy_fingerprint
-                .contains_key(&definition.as_u64())
-                .then(|| asap_types::sds::StoredOutputReference::for_definition(definition))
+            let materializations = self
+                .materializations_by_policy_fingerprint
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(
+                0,
+                0,
+                &materializations,
+            )
+            .ok()?
+            .output_reference(definition)
+            .ok()
         });
         selected
     }

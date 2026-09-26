@@ -1,50 +1,12 @@
-//! Content-addressed policy identity.
+//! Legacy routing wrapper for a deployed stored output.
 //!
-//! `PolicyFingerprint` is the merged-sid-identity-chain replacement for
-//! the controller-allocated `aggregation_id: u64`. Where `aggregation_id`
-//! is a counter the control plane mints and ships in the streaming-config
-//! YAML, `PolicyFingerprint` is derived deterministically from the
-//! `PrecomputeMaterialization`'s content — so two control planes producing the
-//! same policy independently produce the same fingerprint, and the data
-//! plane can index without a separate id allocation.
-//!
-//! ## Identity contract
-//!
-//! `PolicyFingerprint = h(metric, agg_type, sub_type, parameters,
-//! grouping_labels, aggregated_labels, rollup_labels, window_size,
-//! slide_interval, window_type, pane_origin_ms, spatial_filter_normalized)`
-//!
-//! The hash includes **every** field of `PrecomputeMaterialization` that
-//! determines what the policy does — sketch / exact-agg shape,
-//! group-by + rollup layout, window cadence, spatial filter. Two
-//! configs that compare equal on these dimensions produce the same
-//! fingerprint; two that differ produce different fingerprints.
-//!
-//! Fields *excluded* from the fingerprint:
-//! - `aggregation_id` itself (the thing we're replacing — it's a
-//!   downstream label, not part of identity).
-//! - `original_yaml` (incidental serialization artifact).
-//! - `num_aggregates_to_retain` (retention policy, not aggregation
-//!   semantics — two policies with the same shape but different
-//!   retention are *the same policy* for ingest/query routing
-//!   purposes; retention is a separate concern).
-//!
-//! SQL source table, value projection, timestamp projection, and typed
-//! population are included explicitly; the output metric is not a substitute
-//! for these source semantics.
-//!
-//! ## Hash function
-//!
-//! `xxh64` keyed at 0, matching the existing `compute_agg_config_id`
-//! helper this replaces. 64-bit gives ~4B-policy birthday bound
-//! (collision probability ~10⁻¹¹ at 100K live policies); ample for
-//! foreseeable workloads. Bump to sha256 if the control plane ever
-//! manages >10⁶ live policies and we want deterministic uniqueness.
-//!
-//! The fingerprint is **stable across hosts and versions**: the byte
-//! layout this module produces is the contract. Don't reorder fields,
-//! don't change separator bytes — any such change invalidates every
-//! deployed fingerprint and forces a cold-start rebuild.
+//! An explicit `PrecomputeMaterialization::stored_output_id` takes precedence.
+//! Otherwise the compiler allocates a deterministic default from the existing
+//! policy fields (including pane layout and cadence). This identifier is not
+//! semantic identity: `SummaryDefinitionId` hashes the versioned semantic
+//! definition, and several deployed outputs may share that definition.
+//! Catalog installation checks that an output is never assigned conflicting
+//! computation or format contracts.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,11 +14,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::aggregation_config::PrecomputeMaterialization;
 
-/// Stable, content-addressed handle for an `PrecomputeMaterialization`.
-///
-/// Wrap a `u64` so callers can't accidentally swap a `PolicyFingerprint`
-/// with an `aggregation_id` — they're both u64-shaped but they index
-/// different things (content-addressed vs. controller-allocated).
+/// Routing handle for one deployed stored output. See the module contract.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
@@ -83,6 +41,9 @@ impl PolicyFingerprint {
     /// for nested-shape determinism (matches the existing
     /// `parameters_canonical` form used in `AggKind::ExactAgg`).
     pub fn from_config(cfg: &PrecomputeMaterialization) -> Self {
+        if let Some(output) = cfg.stored_output_id {
+            return output.fingerprint();
+        }
         let mut buf: Vec<u8> = Vec::with_capacity(512);
 
         if !cfg.population_key_encoding.is_legacy() {
