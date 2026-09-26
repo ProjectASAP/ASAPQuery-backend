@@ -140,3 +140,29 @@ Trace a query from Planner selection through physical compilation, deployment
 binding, state publication and query execution. Verify exact operations against
 independent results and sketches against their supported guarantees. The design
 is not accepted solely because example schemas parse or unit tests pass.
+
+## 5. Bound-query SDS implementation across the PR stack
+
+The SDS document is a target contract. The existing definition-keyed storage
+path must not be described as implementing independent deployed-output identity.
+The current migration implements bound queries only; ad-hoc discovery is deferred.
+
+| Implementation owner | Required change | Regression/acceptance gate |
+| --- | --- | --- |
+| Planner shared types and physical integration (#462) | Export a versioned canonical semantic description for a selected persisted output; exclude placement and temporary node IDs. | Different input expressions differ; renumbering preserves identity; state definitions exclude downstream readout parameters. |
+| Backend plan/schema foundation (#749) | Separate semantic definitions from deployed-output bindings; remove the requirement that stored-output ID equals definition ID; version the changed plan contract. | Same-version hot/rebuild outputs can share one definition without aliasing; tampered definitions and mismatched bindings fail installation. |
+| Planner dependency integration (#770) | Consume the shared semantic export and propagate it from selected physical outputs into deployment compilation. | No backend expression normalization or synthetic semantic fingerprint from incomplete config fields. |
+| Precompute/storage integration (#763) | Persist definitions and output-scoped records; authorize writes against installed bindings and recover them consistently. | Restart retains semantic descriptions; wrong-output writes fail; replacement metadata and payload remain consistent. |
+| Query integration (#765) | Resolve the installed deployed output and validate definition, revision, format and coverage before invoking shared execution. | A hot-bound query never reads rebuild state; stale, missing or incompatible records take the explicit failure route. |
+| Acceptance PRs (#728, #742, #759) | Update fixtures and process tests for the new contract; retain existing behavioral and performance gates. | End-to-end producer → persisted definition/record → recovery → bound read, with negative identity and coverage cases. |
+
+This table assigns work, not completed implementation. PR ordering must follow
+actual dependency commits; it must not be inferred from an outdated stack list.
+A semantic definition cannot be replaced by a policy fingerprint containing
+physical layout or cadence. Conversely, relaxing an output-reference validator
+without changing storage keys and authorization is insufficient and unsafe.
+
+The implementation must preserve supported payload decoders independently of
+plan-schema retirement. Keep implementation guides accurate to the code until
+each stage lands; then update the APIs, persistence descriptions and test evidence
+in the same implementation PR.
