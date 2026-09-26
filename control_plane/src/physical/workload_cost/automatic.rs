@@ -221,7 +221,7 @@ pub(super) fn estimate(
             .find(|m| m.policy_fingerprint() == schema.materialization.fingerprint())
             .ok_or_else(|| invalid("missing materialization"))?;
         states.insert(
-            schema.materialization.0,
+            schema.materialization.fingerprint(),
             state(m, request, cardinality as u64)?,
         );
     }
@@ -379,7 +379,7 @@ pub(super) fn estimate(
             return Err(invalid("unknown transmission cadence"));
         }
         let s = states
-            .get(&rule.materialization.0)
+            .get(&rule.materialization.fingerprint())
             .ok_or_else(|| invalid("unknown transport state"))?;
         let checkpoints = rule
             .full_checkpoint_every_ms
@@ -396,7 +396,11 @@ pub(super) fn estimate(
             * s.retained;
         let bytes = frames * s.profile.memory_bytes;
         insert(
-            format!("transport:{}:{}", rule.producer_id, rule.materialization.0),
+            format!(
+                "transport:{}:{}",
+                rule.producer_id,
+                rule.materialization.fingerprint()
+            ),
             resources(
                 bytes * CPU_PER_BYTE * 2.0 + frames * s.profile.merge_cpu_seconds,
                 0.0,
@@ -429,7 +433,7 @@ pub(super) fn estimate(
             let cpu = match node {
                 Node::ReadMaterialization { binding } => {
                     let s = states
-                        .get(&binding.materialization.0)
+                        .get(&binding.materialization.fingerprint())
                         .ok_or_else(|| invalid("unknown read state"))?;
                     let panes = if binding.full_window_slide_ms.is_some() {
                         1.0
