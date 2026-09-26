@@ -411,7 +411,7 @@ pub struct ErpObservedShapeSource {
 #[serde(deny_unknown_fields)]
 pub struct ErpPopulationObservationScope {
     pub catalog_generation: asap_types::sds::CatalogGeneration,
-    pub summary_definition_id: asap_types::sds::SummaryDefinitionId,
+    pub stored_output_id: asap_types::sds::StoredOutputId,
     pub input_semantics: asap_types::erp_observation::ErpObservationInputSemantics,
     pub freshness: asap_types::erp_observation::ErpObservationFreshness,
 }
@@ -437,8 +437,8 @@ impl ErpPlanningInput {
                 return Err("ERP evidence catalog differs from the active catalog".into());
             }
             let materialization = catalog
-                .definitions
-                .get(&populations.summary_definition_id)
+                .outputs
+                .get(&populations.stored_output_id)
                 .ok_or("ERP evidence summary is absent from the active catalog")?;
             let summary = catalog
                 .summary_descriptors
@@ -525,7 +525,7 @@ impl ErpPlanningInput {
                     .map_err(|error| format!("invalid ERP population observations: {error}"))?;
                 observed.validate_identity_and_freshness(
                     &scope.catalog_generation,
-                    scope.summary_definition_id,
+                    scope.stored_output_id,
                     now_ms,
                     scope.freshness,
                 )?;
@@ -543,7 +543,7 @@ impl ErpPlanningInput {
                 asap_types::erp_observation::ErpPopulationObservations {
                     schema_version: 1,
                     catalog_generation: scope.catalog_generation.clone(),
-                    summary_definition_id: scope.summary_definition_id,
+                    stored_output_id: scope.stored_output_id,
                     observed_at_unix_ms: now_ms,
                     window_start_ms: 0,
                     window_end_ms: 0,
@@ -1493,7 +1493,7 @@ mod tests {
         let observed = ErpPopulationObservations {
             schema_version: 1,
             catalog_generation: generation.clone(),
-            summary_definition_id: definition,
+            stored_output_id: definition,
             observed_at_unix_ms: 1_000,
             window_start_ms: 0,
             window_end_ms: 1_000,
@@ -1511,7 +1511,7 @@ mod tests {
             implementation: "asap_sketchlib".into(),
             population_scope: Some(ErpPopulationObservationScope {
                 catalog_generation: generation,
-                summary_definition_id: definition,
+                stored_output_id: definition,
                 input_semantics: ErpObservationInputSemantics::UnitSampleFrequency,
                 freshness: ErpObservationFreshness {
                     max_age_ms: 100,
@@ -1630,12 +1630,12 @@ mod tests {
         .unwrap();
         let (mut policy, mut observed) = online_population_fixture();
         observed.catalog_generation = catalog.reference().unwrap();
-        observed.summary_definition_id = *catalog.definitions.keys().next().unwrap();
+        observed.stored_output_id = *catalog.outputs.keys().next().unwrap();
         observed.input_semantics =
             asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue;
         policy.observed_populations = Some(observed.clone());
         policy.resolve_population_data_descriptor(Some(&catalog));
-        let expected = &catalog.definitions[&observed.summary_definition_id].data_descriptor_id;
+        let expected = &catalog.outputs[&observed.stored_output_id].data_descriptor_id;
         assert_eq!(
             &policy.resolved_data_descriptor.as_ref().unwrap().id,
             expected

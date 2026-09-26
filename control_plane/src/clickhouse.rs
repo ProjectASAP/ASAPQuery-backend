@@ -268,7 +268,7 @@ pub async fn compile_automatic_clickhouse_workload(
                 )
                 .then_some(config.slide_interval.saturating_mul(1_000)),
                 materialization: config.policy_fingerprint().into(),
-                stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
                     config.policy_fingerprint().into(),
                 ),
                 output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
@@ -307,11 +307,10 @@ pub async fn compile_automatic_clickhouse_workload(
     .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut precompute = PrecomputePlan::build_backend_local(request.envelope.clone(), configs)
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
-    precompute.summary_catalog = Some(
-        sds.reference()
-            .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?,
-    );
     precompute.executable_dags = installed_dags;
+    precompute
+        .bind_catalog(&sds)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut transmission = crate::physical::compiler::build_transmission_plan(
         request.envelope.clone(),
         &precompute,
@@ -319,7 +318,7 @@ pub async fn compile_automatic_clickhouse_workload(
     )
     .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     transmission.summary_catalog = precompute.summary_catalog.clone();
-    let publication = crate::physical::publication::PhysicalPlanPublication {
+    let mut publication = crate::physical::publication::PhysicalPlanPublication {
         summary_catalog: sds,
         precompute_plan: precompute,
         collector_plans: Vec::new(),
@@ -336,6 +335,10 @@ pub async fn compile_automatic_clickhouse_workload(
             entries,
         },
     };
+    publication
+        .query_plan
+        .bind_catalog(&publication.summary_catalog)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     publication
         .validate()
         .map_err(ClickHousePlanningError::Lower)?;
@@ -459,7 +462,7 @@ pub async fn compile_clickhouse_workload(
     }
     let mut precompute_plan = request.precompute_plan.clone();
     precompute_plan.executable_dags = installed_dags;
-    let publication = crate::physical::publication::PhysicalPlanPublication {
+    let mut publication = crate::physical::publication::PhysicalPlanPublication {
         summary_catalog: request.summary_catalog.clone(),
         precompute_plan,
         collector_plans: Vec::new(),
@@ -476,6 +479,10 @@ pub async fn compile_clickhouse_workload(
             entries,
         },
     };
+    publication
+        .query_plan
+        .bind_catalog(&publication.summary_catalog)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     publication
         .validate()
         .map_err(ClickHousePlanningError::Lower)?;
@@ -631,7 +638,7 @@ fn bind_selected_node(
         )
         .then_some(selected.slide_interval.saturating_mul(1_000)),
         materialization: selected.policy_fingerprint().into(),
-        stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+        stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
             selected.policy_fingerprint().into(),
         ),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),
@@ -1427,7 +1434,7 @@ mod tests {
         };
         let mut precompute =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
-        precompute.summary_catalog = Some(sds.reference().unwrap());
+        precompute.bind_catalog(&sds).unwrap();
         let mut transmission = crate::physical::compiler::build_transmission_plan(
             envelope,
             &precompute,
@@ -1741,8 +1748,10 @@ mod tests {
         let envelope = request.precompute_plan.envelope.clone();
         request.precompute_plan =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
-        request.precompute_plan.summary_catalog =
-            Some(request.summary_catalog.reference().unwrap());
+        request
+            .precompute_plan
+            .bind_catalog(&request.summary_catalog)
+            .unwrap();
         request.transmission_plan = crate::physical::compiler::build_transmission_plan(
             envelope,
             &request.precompute_plan,
