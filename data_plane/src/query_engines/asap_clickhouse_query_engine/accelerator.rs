@@ -361,10 +361,8 @@ mod tests {
         }
     }
 
-    use crate::{
-        precompute_engine::operators::SumAccumulator,
-        storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata},
-    };
+    use crate::storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata};
+    use asap_physical_operators::summary_kernels::SumAccumulator;
     use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
@@ -458,6 +456,7 @@ mod tests {
             QueryPlanNode::RelationalJoin {
                 inputs: [left, external],
                 join_kind: planner_types::pre_asap::JoinKind::Inner,
+                pruning: None,
                 pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
                     left: Rc::new(QueryExpr::Column(0)),
                     op: CompareOpKind::Eq,
@@ -558,7 +557,7 @@ mod tests {
         config.pane_origin_ms = Some(0);
         config.table_timestamp_column = Some("timestamp_ms".into());
         let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
-        let materialization = *sds.definitions.keys().next().unwrap();
+        let materialization = *sds.outputs.keys().next().unwrap();
         let read = QueryNodeId(0);
         let readout = QueryNodeId(1);
         let input_schema = relation_schema(&[
@@ -590,7 +589,7 @@ mod tests {
                         binding: MaterializationBinding {
             full_window_slide_ms: None,
                             materialization,
-                            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(materialization),
+                            stored_output_reference: sds.output_reference(materialization).unwrap(),
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
                             item_labels: Vec::new(),
                             window_ms: 1_000,
@@ -668,7 +667,7 @@ mod tests {
                     root,
                     QueryPlanNode::Relational {
                         input: sort,
-                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0 })
+                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0, partition_by: planner_types::pre_asap::GroupKeys::none() })
                             .unwrap(),
                         input_schema: projected_schema.clone(),
                         output_schema: projected_schema,
@@ -784,7 +783,7 @@ mod tests {
             &["fixture".into()],
         )
         .unwrap();
-        precompute.summary_catalog = Some(sds.reference().unwrap());
+        precompute.bind_catalog(&sds).unwrap();
         let mut transmission = control_plane::physical::compiler::build_transmission_plan(
             envelope.clone(),
             &precompute,

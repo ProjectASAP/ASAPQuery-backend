@@ -24,7 +24,6 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::precompute_engine::operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::IngestState;
 use crate::query_engines::routing::FreshnessProbeCache;
@@ -35,6 +34,7 @@ use asap_otel_proto::tonic::collector::metrics::v1::{
 };
 use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use asap_otel_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use asap_physical_operators::summary_kernels::sketch_envelope::SketchEnvelopeAccumulator;
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use asap_sketchlib::MessagePackCodec;
 use axum::{body::Bytes, extract::State, routing::post, Json, Router};
@@ -1146,7 +1146,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                     } else {
                         None
                     };
-                    let series_key = format_series_key(&canonical_name, &dp.attrs);
+                    let series_key = bound_sketch_series_key(
+                        &canonical_name,
+                        &dp.attrs,
+                        frame_identity.as_ref(),
+                    );
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
                     // Sid resolution — registry-allocated, NOT content-
@@ -1260,7 +1264,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // policy".
                             spatial_filter_canonical: String::new(),
                         };
-                        let agg_kind_canonical = agg_kind.canonical_string();
+                        let agg_kind_canonical = match frame_identity.as_ref() {
+                            Some(frame) => format!(
+                                "{}|output:{}:{}:{}",
+                                agg_kind.canonical_string(),
+                                frame.plan_id,
+                                frame.plan_version,
+                                frame.materialization.as_u64()
+                            ),
+                            None => agg_kind.canonical_string(),
+                        };
                         let definition = frame_identity
                             .as_ref()
                             .map(|frame| frame.materialization)
@@ -1340,6 +1353,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     sketch_algorithm_for(&dp),
                                     &dp.container_config,
                                     &dp.attrs.keys().cloned().collect(),
+                                    Some(frame.materialization),
                                 )
                             });
                         if observed_policy != frame.materialization.fingerprint() {
@@ -1418,6 +1432,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 algorithm.clone(),
                                 &cfg,
                                 &group_by_keys,
+                                frame_identity.as_ref().map(|frame| frame.materialization),
                             );
                             // Per-item dimension (item_label) the controller threaded
                             // into the matched policy's parameters — recorded on the sid
@@ -1992,38 +2007,47 @@ fn sketch_config_to_params(
     params
 }
 
-/// Look up the policy fingerprint for a freshly-ingested OTLP sketch
-/// by content-matching against the streaming-config registry.
-///
-/// Sketches arrive with `(metric, attrs, sketch_kind, sketch_config)`
-/// embedded in the DP but no policy reference. The matching pass:
-/// snapshots the current streaming config, derives a
-/// `PolicyRegistry`, and asks `find_policy_by_content` for the
-/// fingerprint of a policy whose contents match. Returns
-/// `PolicyFingerprint::UNSET` when:
-///   1. An unsupported planner algorithm reached this path
-///      (defensive — shouldn't happen).
-///   2. No policy in the registry matches.
-///   3. Multiple policies match (would-have-been-a-bug case;
-///      `find_policy_by_content` returns `None` on ambiguity).
-///
-/// Callers register the sid with the returned fp regardless of
-/// success — UNSET sids are simply absent from the policy_fp →
-/// {sids} reverse index, and remain reachable via the legacy
-/// `instances_matching(metric, gbk)` walk.
+// Snapshot and delta bases are scoped to the producer, never only its semantics.
+fn bound_sketch_series_key(
+    name: &str,
+    labels: &HashMap<String, String>,
+    frame: Option<&asap_types::producer_plan::SummaryFrameIdentity>,
+) -> String {
+    let key = format_series_key(name, labels);
+    match frame {
+        Some(frame) => format!(
+            "{}:{}:{}:{key}",
+            frame.plan_id,
+            frame.plan_version,
+            frame.materialization.as_u64()
+        ),
+        None => key,
+    }
+}
+
+/// Resolve the framed deployed output, then verify its content contract.
+/// Unframed input uses legacy content matching and must have exactly one match.
+/// An absent or ambiguous match returns UNSET and cannot authorize bound writes.
 fn derive_sketch_policy_fp(
     ingest_state: &IngestState,
     metric: &str,
     kind: crate::storage_engines::sketch_db::index::SketchAlgorithm,
     cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
     group_by_keys: &std::collections::BTreeSet<String>,
+    bound_output: Option<asap_types::sds::StoredOutputId>,
 ) -> asap_types::PolicyFingerprint {
     let Some(agg_type) = aggregation_type_for_sketch_algorithm(kind) else {
         return asap_types::PolicyFingerprint::UNSET;
     };
     let params = sketch_config_to_params(cfg);
     let snap = ingest_state.config_snapshot();
-    let index = asap_types::RoutingIndex::build(snap.policy_registry());
+    let registry = snap.policy_registry();
+    let registry = if let Some(output) = bound_output {
+        asap_types::PolicyRegistry::from_configs(registry.get(output.fingerprint()).cloned())
+    } else {
+        registry
+    };
+    let index = asap_types::RoutingIndex::build(registry);
     index
         .find_policy_by_content(metric, group_by_keys, agg_type, &params)
         .unwrap_or(asap_types::PolicyFingerprint::UNSET)
@@ -2120,7 +2144,7 @@ fn dp_carries_heap(dp: &ModifiedOtlpSketchDp) -> bool {
                 .unwrap_or(false)
         }
         ENCODING_MSGPACK_DELTA => {
-            use crate::precompute_engine::operators::CountMinSketchWithHeapAccumulator;
+            use asap_physical_operators::summary_kernels::CountMinSketchWithHeapAccumulator;
             CountMinSketchWithHeapAccumulator::from_msgpack_heap_delta_bytes(&dp.sketch)
                 .map(|acc| !acc.inner.topk_heap_items().is_empty())
                 .unwrap_or(false)
@@ -2304,7 +2328,7 @@ fn preflight_summary_frames(
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         } else {
-            let series_key = format_series_key(canonical_name, &dp.attrs);
+            let series_key = bound_sketch_series_key(canonical_name, &dp.attrs, Some(&frame));
             let (mut base, base_window_start) = ingest_state
                 .sketch_snapshots
                 .get(&series_key)
@@ -2353,6 +2377,7 @@ fn preflight_summary_frames(
                 sketch_algorithm_for(&dp),
                 &dp.container_config,
                 &dp.attrs.keys().cloned().collect(),
+                Some(frame.materialization),
             )
         };
         if observed != frame.materialization.fingerprint() {
@@ -2548,7 +2573,7 @@ fn decode_modified_otlp_sketch_bytes(
     encoding: i32,
     bytes: &[u8],
 ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>> {
-    use crate::precompute_engine::operators::{
+    use asap_physical_operators::summary_kernels::{
         CountMinSketchAccumulator, CountSketchAccumulator, DDSketchAccumulator,
         DatasketchesKLLAccumulator, HllSketchAccumulator,
     };
@@ -2619,7 +2644,7 @@ fn decode_modified_otlp_sketch_bytes(
                 use asap_sketchlib::CountSketchWithHeap;
                 if let Ok(heap) = CountSketchWithHeap::from_msgpack(bytes) {
                     if !heap.topk_heap_items().is_empty() {
-                        use crate::precompute_engine::operators::CountSketchWithHeapAccumulator;
+                        use asap_physical_operators::summary_kernels::CountSketchWithHeapAccumulator;
                         return Ok(Box::new(
                             CountSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(bytes)?,
                         ));
@@ -2684,11 +2709,11 @@ fn empty_accumulator_for_delta_bootstrap(
     config: &crate::storage_engines::sketch_db::index::SketchConfig,
     encoding: i32,
 ) -> Option<Box<dyn AggregateCore>> {
-    use crate::precompute_engine::operators::{
+    use crate::storage_engines::sketch_db::index::SketchConfig;
+    use asap_physical_operators::summary_kernels::{
         CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
         HllSketchAccumulator,
     };
-    use crate::storage_engines::sketch_db::index::SketchConfig;
 
     match (algorithm, config) {
         (SketchAlgorithm::Hll, SketchConfig::Hll { precision }) => {
@@ -2758,7 +2783,7 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
     existing: &mut Box<dyn AggregateCore>,
     bytes: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::precompute_engine::operators::{
+    use asap_physical_operators::summary_kernels::{
         CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
         DDSketchAccumulator, HllSketchAccumulator,
     };
@@ -3004,7 +3029,7 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                         // ExactAgg(Sum) path as a plain delta Sum — the backend sums
                         // the per-window/per-shard partials for the same sid.
                         for dp in &sa.data_points {
-                            let value = match crate::precompute_engine::operators::sum_accumulator::SumAccumulator::from_sum_bytes(&dp.sketch) {
+                            let value = match asap_physical_operators::summary_kernels::sum::SumAccumulator::from_sum_bytes(&dp.sketch) {
                                 Ok(acc) => acc.sum,
                                 Err(e) => {
                                     debug!("asap_edge: SumAgg data point decode failed (skipping): {e}");
@@ -3444,8 +3469,8 @@ mod policy_fp_lookup_tests {
 #[cfg(test)]
 mod dispatcher_tests {
     use super::*;
-    use crate::precompute_engine::operators::{DDSketchAccumulator, HllSketchAccumulator};
     use crate::storage_engines::types::AggregateCore;
+    use asap_physical_operators::summary_kernels::{DDSketchAccumulator, HllSketchAccumulator};
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::HllVariant;
 
@@ -3797,8 +3822,8 @@ mod sid_resolution_tests {
     /// directly observable on the bucket counts.
     #[tokio::test]
     async fn delta_apply_rotates_per_series_base_at_window_boundary() {
-        use crate::precompute_engine::operators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_physical_operators::summary_kernels::DDSketchAccumulator;
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
 
@@ -3836,6 +3861,7 @@ mod sid_resolution_tests {
                 alpha: 0.01,
                 store_counts: vec![10, 0, 5],
                 store_offset: 0,
+                ..Default::default()
             })),
             ..Default::default()
         }
@@ -4129,8 +4155,8 @@ mod sid_resolution_tests {
     /// recover after a backend restart.
     #[tokio::test]
     async fn leading_cms_delta_bootstraps_onto_empty_base() {
-        use crate::precompute_engine::operators::CountMinSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
+        use asap_physical_operators::summary_kernels::CountMinSketchAccumulator;
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -4215,8 +4241,8 @@ mod sid_resolution_tests {
     /// the register-max updates.
     #[tokio::test]
     async fn leading_hll_delta_bootstraps_onto_empty_base() {
-        use crate::precompute_engine::operators::HllSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
+        use asap_physical_operators::summary_kernels::HllSketchAccumulator;
         use prost::Message;
 
         let (state, drain) = make_state().await;

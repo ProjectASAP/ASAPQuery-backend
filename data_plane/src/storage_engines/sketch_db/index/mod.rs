@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asap_types::sds::{
     CatalogGeneration, HalfOpenTimeRange, InstanceCompleteness, InstanceLifecycle,
-    ObservedSummaryInventory, SummaryDefinitionId, SummaryInstance, SummaryInstanceStatus,
+    ObservedSummaryInventory, StoredOutputId, SummaryInstance, SummaryInstanceStatus,
     SummaryPlacement, SummaryStateReference,
 };
 use asap_types::PolicyFingerprint;
@@ -91,13 +91,13 @@ fn reconstruct_exact_agg(
     type_name: &str,
     bytes: &[u8],
 ) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
-    use crate::precompute_engine::operators::{
+    use crate::storage_engines::types::AggregateCore;
+    use asap_physical_operators::summary_kernels::{
         IncreaseAccumulator, KeyedCounterState, KeyedSumCountAccumulator, MaxAccumulator,
         MinAccumulator, SumAccumulator,
     };
-    use crate::storage_engines::types::AggregateCore;
     match type_name {
-        "PlannerExactAccumulatorV1" => crate::precompute_engine::operators::exact_accumulator::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
+        "PlannerExactAccumulatorV1" => asap_physical_operators::summary_kernels::exact::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
         "SumAccumulator" => SumAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
@@ -623,7 +623,7 @@ pub struct SketchStore {
     descriptors: SummaryDescriptorRegistry,
     /// Previous payload generations admitted by an explicit definition
     /// compatibility check during plan installation.
-    compatible_source_generations: RwLock<BTreeMap<SummaryDefinitionId, CatalogGeneration>>,
+    compatible_source_generations: RwLock<BTreeMap<StoredOutputId, CatalogGeneration>>,
     /// sid → item_label (the data-point attribute NAME, e.g. "service"
     /// or "endpoint") for CountMin/CountSketch sids registered in
     /// per-item mode. Its presence is what makes a CMS sid answerable by
@@ -704,7 +704,7 @@ pub struct SketchStore {
             u64,
             (
                 Option<Arc<asap_types::sds::CatalogGeneration>>,
-                Option<SummaryDefinitionId>,
+                Option<StoredOutputId>,
             ),
         >,
     >,
@@ -872,6 +872,11 @@ impl SketchStore {
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
     ) -> Result<(), String> {
         let reference = catalog.reference().map_err(|error| error.to_string())?;
+        if let Some(writer) = self.persistence_metadata.read().unwrap().as_ref() {
+            writer
+                .persist_catalog(&catalog)
+                .map_err(|e| e.to_string())?;
+        }
         let mut inventory = self.admission.write().unwrap();
         let generation = CatalogGeneration {
             schema_version: reference.schema_version,
@@ -886,8 +891,8 @@ impl SketchStore {
             if old_catalog.plan_id == catalog.plan_id
                 && old_catalog.plan_version < catalog.plan_version
             {
-                for (id, definition) in &catalog.definitions {
-                    if old_catalog.definitions.get(id) == Some(definition) {
+                for (id, definition) in &catalog.outputs {
+                    if old_catalog.outputs.get(id) == Some(definition) {
                         compatible_sources.insert(
                             *id,
                             previous_sources
@@ -930,11 +935,10 @@ impl SketchStore {
             .descriptors
             .authoritative_catalog()
             .ok_or("summary admission requires an installed catalog")?;
-        if coordinates.iter().any(|coordinate| {
-            !catalog
-                .definitions
-                .contains_key(&coordinate.summary_definition_id)
-        }) {
+        if coordinates
+            .iter()
+            .any(|coordinate| !catalog.outputs.contains_key(&coordinate.stored_output_id))
+        {
             return Err("summary admission references an uninstalled definition".into());
         }
         self.admission
@@ -979,7 +983,7 @@ impl SketchStore {
             .time_range
             .end_ms
             .saturating_sub(i64::try_from(replay_horizon_ms).unwrap_or(i64::MAX));
-        inventory.retire_completed_before(coordinate.summary_definition_id, floor);
+        inventory.retire_completed_before(coordinate.stored_output_id, floor);
         Ok(())
     }
 
@@ -1059,7 +1063,7 @@ impl SketchStore {
 
     pub(crate) fn summary_window_known_empty(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         series_id: u64,
         range: HalfOpenTimeRange,
     ) -> bool {
@@ -1077,7 +1081,7 @@ impl SketchStore {
     /// Overlapping neighboring snapshots do not establish population in this one.
     pub(crate) fn full_summary_window_known_empty(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         series_id: u64,
         range: HalfOpenTimeRange,
     ) -> bool {
@@ -1108,7 +1112,7 @@ impl SketchStore {
 
     pub(crate) fn has_pending_summary_updates(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         range: HalfOpenTimeRange,
         full_window: bool,
     ) -> bool {
@@ -1189,7 +1193,7 @@ impl SketchStore {
     fn instance_visible_for_read(
         binding: &SdsBinding,
         generation: Option<&CatalogGeneration>,
-        compatible_sources: &BTreeMap<SummaryDefinitionId, CatalogGeneration>,
+        compatible_sources: &BTreeMap<StoredOutputId, CatalogGeneration>,
     ) -> bool {
         if Self::instance_visible_in_generation(binding, generation) {
             return true;
@@ -1197,7 +1201,7 @@ impl SketchStore {
         let Some(generation) = generation else {
             return false;
         };
-        let definition = SummaryDefinitionId::from(binding.metadata.policy_fp);
+        let definition = StoredOutputId::from(binding.metadata.policy_fp);
         !matches!(
             binding.data_descriptor.source,
             asap_types::sds::DataSourceIdentity::Derived { .. }
@@ -1251,7 +1255,7 @@ impl SketchStore {
         &self,
         reporter_id: &str,
         storage_node_id: &str,
-        producers: &BTreeMap<SummaryDefinitionId, (asap_types::sds::StoredOutputId, String)>,
+        producers: &BTreeMap<StoredOutputId, (asap_types::sds::StoredOutputId, String)>,
         inventory_version: u64,
         observed_at_ms: i64,
     ) -> Result<ObservedSummaryInventory, String> {
@@ -1278,17 +1282,17 @@ impl SketchStore {
                 != Some(&generation))
             .then(|| binding.catalog_generation.as_deref().cloned())
             .flatten();
-            let summary_definition_id = SummaryDefinitionId::from(binding.metadata.policy_fp);
+            let stored_output_id = StoredOutputId::from(binding.metadata.policy_fp);
             if binding.metadata.policy_fp.is_unset()
-                || !catalog.definitions.contains_key(&summary_definition_id)
+                || !catalog.outputs.contains_key(&stored_output_id)
             {
                 continue;
             }
             let (stored_output_id, producer_id) =
-                producers.get(&summary_definition_id).ok_or_else(|| {
+                producers.get(&stored_output_id).ok_or_else(|| {
                     format!(
                         "materialization {} has no producer in the active PrecomputePlan",
-                        summary_definition_id.as_u64()
+                        stored_output_id.as_u64()
                     )
                 })?;
             let store = self
@@ -1317,7 +1321,7 @@ impl SketchStore {
                     0,
                 );
                 let instance_id = asap_types::sds::SummaryInstanceCoordinates {
-                    summary_definition_id,
+                    stored_output_id: *stored_output_id,
                     time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
                     group_values: group_values.clone(),
                 }
@@ -1326,7 +1330,12 @@ impl SketchStore {
                 let instance = SummaryInstance {
                     instance_id: instance_id.clone(),
                     stored_output_id: *stored_output_id,
-                    summary_definition_id,
+                    summary_definition_id: binding
+                        .stored_output_reference
+                        .as_ref()
+                        .ok_or("missing semantic binding")?
+                        .definition_id
+                        .clone(),
                     summary_descriptor_id: binding.summary_descriptor.id().clone(),
                     data_descriptor_id: binding.data_descriptor.id().clone(),
                     time_range: HalfOpenTimeRange { start_ms, end_ms },
@@ -1571,12 +1580,12 @@ impl SketchStore {
         // string that had to agree with it.
         let rollup_value = payload
             .as_any()
-            .downcast_ref::<crate::precompute_engine::operators::MinAccumulator>()
+            .downcast_ref::<asap_physical_operators::summary_kernels::MinAccumulator>()
             .map(|acc| (RollupReduction::Min, acc.value))
             .or_else(|| {
                 payload
                     .as_any()
-                    .downcast_ref::<crate::precompute_engine::operators::MaxAccumulator>()
+                    .downcast_ref::<asap_physical_operators::summary_kernels::MaxAccumulator>()
                     .map(|acc| (RollupReduction::Max, acc.value))
             });
         let store = self
@@ -2757,7 +2766,9 @@ impl SketchStore {
                 m.first_seen_unix_ms,
             );
         if !m.policy_fp.is_unset() {
-            record.summary_definition_id = Some(SummaryDefinitionId::from(m.policy_fp));
+            record.stored_output_id = Some(StoredOutputId::from(m.policy_fp));
+            record.summary_definition_id =
+                Some(m.stored_output_reference.as_ref()?.definition_id.clone());
             record.catalog_generation = Some(Arc::clone(m.catalog_generation.as_ref()?));
         }
         record.retired_at_ms = m.retired_at_ms;
@@ -2860,7 +2871,7 @@ impl SketchStore {
     pub(crate) fn authorize_series_reactivation(
         &self,
         sid: u64,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
     ) -> Result<Option<Arc<asap_types::sds::CatalogGeneration>>, String> {
         if let Some(binding) = self
             .instances
@@ -2877,7 +2888,7 @@ impl SketchStore {
                     .authoritative_snapshot()
                     .ok_or("derived reactivation requires an authoritative catalog")?;
                 if binding.metadata.policy_fp != definition.fingerprint()
-                    || !catalog.definitions.contains_key(&definition)
+                    || !catalog.outputs.contains_key(&definition)
                 {
                     return Err("derived reactivation differs from its installed definition".into());
                 }
@@ -2897,7 +2908,7 @@ impl SketchStore {
             .descriptors
             .authoritative_snapshot()
             .ok_or("series reactivation requires an authoritative catalog")?;
-        if *old_definition != Some(definition) || !catalog.definitions.contains_key(&definition) {
+        if *old_definition != Some(definition) || !catalog.outputs.contains_key(&definition) {
             return Err("series reactivation does not match the installed materialization".into());
         }
         let old_generation = old_generation
@@ -2938,7 +2949,7 @@ impl SketchStore {
                         record
                             .as_ref()
                             .and_then(|value| value.catalog_generation.clone()),
-                        record.and_then(|value| value.summary_definition_id),
+                        record.and_then(|value| value.stored_output_id),
                     ),
                 );
             }
@@ -3307,6 +3318,9 @@ impl SketchStore {
         // concurrent lifecycle operation cannot succeed without persistence.
         let metadata_writer =
             Arc::new(persistence::metadata::SidMetadataStore::new(&cfg.disk_path));
+        if let Some(catalog) = self.descriptors.authoritative_catalog() {
+            metadata_writer.persist_catalog(&catalog)?;
+        }
         // Restore the generation-wide raw admission barrier before exposing
         // recovered state or accepting another producer after restart.
         if let Some(closed) = metadata_writer.load_finite_closure()? {
@@ -3330,7 +3344,7 @@ impl SketchStore {
                     .map(|record| {
                         (
                             record.sid,
-                            (record.catalog_generation, record.summary_definition_id),
+                            (record.catalog_generation, record.stored_output_id),
                         )
                     }),
             );
@@ -3436,14 +3450,15 @@ impl SketchStore {
                 continue;
             }
             let catalog = self.descriptors.authoritative_snapshot();
-            let policy_fp = match (
-                &rec.summary_definition_id,
-                &rec.catalog_generation,
-                &catalog,
-            ) {
+            let policy_fp = match (&rec.stored_output_id, &rec.catalog_generation, &catalog) {
                 (Some(definition), Some(generation), Some((catalog, installed_generation))) => {
+                    let persisted = persistence::metadata::SidMetadataStore::new(disk_path)
+                        .load_catalog(generation);
                     if generation != installed_generation
-                        || !catalog.definitions.contains_key(definition)
+                        || persisted.as_ref().ok() != Some(catalog.as_ref())
+                        || !catalog.outputs.get(definition).is_some_and(|output| {
+                            Some(&output.definition_id) == rec.summary_definition_id.as_ref()
+                        })
                     {
                         tracing::warn!(
                             sid = rec.sid,
@@ -3745,6 +3760,15 @@ mod tests {
         meta_with_policy(sid, asap_types::PolicyFingerprint::UNSET)
     }
 
+    fn meta_for_config(
+        sid: u64,
+        config: &asap_types::PrecomputeMaterialization,
+    ) -> SummarySeriesMetadata {
+        let mut metadata = meta_with_policy(sid, config.policy_fingerprint());
+        metadata.agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(config);
+        metadata
+    }
+
     fn meta_with_policy(
         sid: u64,
         policy_fp: asap_types::PolicyFingerprint,
@@ -3829,12 +3853,24 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
         let store = SketchStore::new();
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
-        store.register(meta_with_policy(41, fingerprint));
+        store.register(meta_for_config(41, &state_config));
         store.append_sample(
             41,
             BTreeMap::from([("job".to_string(), "api".to_string())]),
@@ -3849,9 +3885,9 @@ mod tests {
         );
 
         let producers = BTreeMap::from([(
-            SummaryDefinitionId::from(fingerprint),
+            StoredOutputId::from(fingerprint),
             (
-                asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+                asap_types::sds::StoredOutputReference::for_output(fingerprint.into())
                     .stored_output_id,
                 "producer-a".to_string(),
             ),
@@ -3862,11 +3898,10 @@ mod tests {
         inventory.validate().unwrap();
         assert_eq!(inventory.instances.len(), 2);
         let instance = inventory.instances.values().next().unwrap();
-        assert_eq!(instance.summary_definition_id.fingerprint(), fingerprint);
+        assert_eq!(instance.stored_output_id.fingerprint(), fingerprint);
         assert_eq!(
             instance.stored_output_id,
-            asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
-                .stored_output_id
+            asap_types::sds::StoredOutputReference::for_output(fingerprint.into()).stored_output_id
         );
         assert_eq!(instance.status, SummaryInstanceStatus::Ready);
         assert_eq!(instance.completeness, InstanceCompleteness::Unknown);
@@ -3891,7 +3926,7 @@ mod tests {
             inventory.instances.keys().collect::<Vec<_>>(),
             next_inventory.instances.keys().collect::<Vec<_>>()
         );
-        let catalog_identity = &plan.summary_catalog.definitions[&instance.summary_definition_id];
+        let catalog_identity = &plan.summary_catalog.outputs[&instance.stored_output_id];
         assert_eq!(
             instance.summary_descriptor_id,
             catalog_identity.summary_descriptor_id
@@ -3912,16 +3947,28 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
         let store = SketchStore::new();
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog))
             .unwrap();
-        store.register(meta_with_policy(42, fingerprint));
+        store.register(meta_for_config(42, &state_config));
         let producers = BTreeMap::from([(
-            SummaryDefinitionId::from(fingerprint),
+            StoredOutputId::from(fingerprint),
             (
-                asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+                asap_types::sds::StoredOutputReference::for_output(fingerprint.into())
                     .stored_output_id,
                 "producer-a".to_string(),
             ),
@@ -4403,7 +4450,7 @@ mod tests {
 
     #[test]
     fn precompute_payload_round_trips_through_storage() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
 
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
@@ -4444,7 +4491,7 @@ mod tests {
 
     #[test]
     fn query_precomputes_by_agg_returns_data_grouped_by_label_values() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
 
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
@@ -4598,7 +4645,7 @@ mod tests {
         assert!(sketch.as_sketch().is_some());
         assert!(sketch.as_exact_agg().is_none());
 
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
         let exact_agg = AggPayload::ExactAgg(Arc::new(SumAccumulator::with_sum(1.0)));
         assert!(exact_agg.as_sketch().is_none());
         assert!(exact_agg.as_exact_agg().is_some());
@@ -5076,8 +5123,20 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
-        let metadata = meta_with_policy(507, fingerprint);
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
+        let metadata = meta_for_config(507, &state_config);
         let record = SidMetaRecord::new(
             metadata.sid,
             metadata.metric_name.clone(),
@@ -5095,7 +5154,7 @@ mod tests {
         assert_eq!(store.register_recovered_disk_series(tmp.path()), 0);
         assert!(store.instance(507).is_none());
         let mut foreign = record;
-        foreign.summary_definition_id = Some(fingerprint.into());
+        foreign.stored_output_id = Some(fingerprint.into());
         let reference = plan.summary_catalog.reference().unwrap();
         foreign.catalog_generation = Some(Arc::new(CatalogGeneration {
             schema_version: reference.schema_version,
@@ -5118,25 +5177,37 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
         let store = SketchStore::new();
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
-        store.register(meta_with_policy(509, fingerprint));
+        store.register(meta_for_config(509, &state_config));
         store.append_sample(509, BTreeMap::new(), (0, 10_000), sample(1));
         let mut next = plan.summary_catalog;
         next.plan_version += 1;
         store.install_summary_catalog(Arc::new(next)).unwrap();
         assert_eq!(store.series_ids_for_policy(fingerprint), vec![509]);
-        let output = asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
-            .stored_output_id;
+        let output =
+            asap_types::sds::StoredOutputReference::for_output(fingerprint.into()).stored_output_id;
         let inventory = store
             .observed_summary_inventory(
                 "backend-a",
                 "store-a",
                 &BTreeMap::from([(
-                    SummaryDefinitionId::from(fingerprint),
+                    StoredOutputId::from(fingerprint),
                     (output, "producer-a".into()),
                 )]),
                 1,
@@ -5172,7 +5243,19 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
         let definition = fingerprint.into();
         let mut next_catalog = plan.summary_catalog.clone();
         next_catalog.plan_version += 1;
@@ -5189,7 +5272,7 @@ mod tests {
                 .unwrap();
             let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
             old_sid = resolver.resolve("metric", "group", "family");
-            store.register(meta_with_policy(old_sid, fingerprint));
+            store.register(meta_for_config(old_sid, &state_config));
             for pane in 0..4 {
                 store.append_sample(
                     old_sid,
@@ -5202,7 +5285,6 @@ mod tests {
                 || !persistence.manifest.live_parts().is_empty(),
                 Duration::from_secs(5)
             ));
-            let old_parts = persistence.manifest.live_parts().len();
             store.remove_instance(old_sid).unwrap();
             assert!(resolver
                 .resolve_with_reactivation("metric", "group", "family", |sid| store
@@ -5217,7 +5299,7 @@ mod tests {
                 })
                 .unwrap();
             assert_ne!(new_sid, old_sid);
-            store.register(meta_with_policy(new_sid, fingerprint));
+            store.register(meta_for_config(new_sid, &state_config));
             for pane in 0..4 {
                 store.append_sample(
                     new_sid,
@@ -5227,7 +5309,20 @@ mod tests {
                 );
             }
             assert!(wait_until(
-                || persistence.manifest.live_parts().len() > old_parts,
+                || {
+                    // Old-series epochs may still publish after reactivation. Wait
+                    // for this series, not an unrelated increase in part count.
+                    persistence.manifest.live_parts().iter().any(|part| {
+                        let path =
+                            persistence::part::part_dir_path(&persistence.parts_root, part.part_id);
+                        persistence::part::PartReader::open(&path).is_ok_and(|reader| {
+                            reader
+                                .index_records()
+                                .iter()
+                                .any(|row| row.agg_id == new_sid && row.start_ts < 90_000)
+                        })
+                    })
+                },
                 Duration::from_secs(5)
             ));
             persistence.shutdown();
@@ -5273,20 +5368,32 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
         let store = SketchStore::new();
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
-        store.register(meta_with_policy(850, fingerprint));
+        store.register(meta_for_config(850, &state_config));
         let generation = store.active_catalog_generation().unwrap();
         let writer = Arc::new(persistence::metadata::SidMetadataStore::new(
             directory.path(),
         ));
         *store.persistence_metadata.write().unwrap() = Some(writer.clone());
         let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-            summary_definition_id: fingerprint.into(),
+            stored_output_id: fingerprint.into(),
             time_range: HalfOpenTimeRange {
                 start_ms: 0,
                 end_ms: 30_000,
@@ -5324,7 +5431,7 @@ mod tests {
         let producers = BTreeMap::from([(
             fingerprint.into(),
             (
-                asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
+                asap_types::sds::StoredOutputReference::for_output(fingerprint.into())
                     .stored_output_id,
                 "producer".to_string(),
             ),
@@ -5342,7 +5449,7 @@ mod tests {
             850,
             BTreeMap::new(),
             (0, 30_000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::new())
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::new())
         ));
         // A flusher that captured metadata before completion cannot reopen it.
         writer.upsert_all(&[stale_record]).unwrap();
@@ -5368,21 +5475,33 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
         {
             let store = Arc::new(SketchStore::new());
             store
                 .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
                 .unwrap();
-            store.register(meta_with_policy(851, fingerprint));
+            store.register(meta_for_config(851, &state_config));
             let mut config = durable_cfg(directory.path().to_path_buf());
             config.hot_window_ms = None;
             config.seal_window_count = 100;
             let mut persistence = store.start_persistence(config).unwrap();
             let generation = store.active_catalog_generation().unwrap();
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                summary_definition_id: fingerprint.into(),
+                stored_output_id: fingerprint.into(),
                 time_range: HalfOpenTimeRange {
                     start_ms: 0,
                     end_ms: 30_000,
@@ -5478,7 +5597,19 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
         let directory = tempfile::tempdir().unwrap();
         let disk = directory.path().to_path_buf();
         let expected_retirement;
@@ -5488,7 +5619,7 @@ mod tests {
                 .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
                 .unwrap();
             for sid in [801, 802, 803] {
-                store.register(meta_with_policy(sid, fingerprint));
+                store.register(meta_for_config(sid, &state_config));
             }
             let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
             for sid in [801, 802, 803] {
@@ -5515,7 +5646,7 @@ mod tests {
             expected_retirement = store.force_retire(801, Duration::from_secs(3600)).unwrap();
             assert!(store.force_expire(802).is_some());
             assert!(store.remove_instance(803).is_some());
-            store.register(meta_with_policy(803, fingerprint));
+            store.register(meta_for_config(803, &state_config));
             assert!(
                 store.instance(803).is_none(),
                 "removed SID reused before restart"
@@ -5545,7 +5676,7 @@ mod tests {
             recovered.instance(803).is_none(),
             "removed state resurrected"
         );
-        recovered.register(meta_with_policy(803, fingerprint));
+        recovered.register(meta_for_config(803, &state_config));
         assert!(
             recovered.instance(803).is_none(),
             "removed SID reused after restart"
@@ -5562,19 +5693,30 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
-        let definition_id = SummaryDefinitionId::from(fingerprint);
+        let state_config = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| {
+                matches!(
+                    config.accumulator_spec().unwrap().family,
+                    planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                )
+            })
+            .unwrap()
+            .clone();
+        let fingerprint = state_config.policy_fingerprint();
+        let definition_id = StoredOutputId::from(fingerprint);
         let producers = BTreeMap::from([(
             definition_id,
             (
-                asap_types::sds::StoredOutputReference::for_definition(definition_id)
-                    .stored_output_id,
+                asap_types::sds::StoredOutputReference::for_output(definition_id).stored_output_id,
                 "producer-a".to_string(),
             ),
         )]);
         let tmp = tempfile::TempDir::new().unwrap();
         let disk = tmp.path().to_path_buf();
-        let mut metadata = meta_with_policy(506, fingerprint);
+        let mut metadata = meta_for_config(506, &state_config);
         metadata.group_by_keys = ["job".to_string()].into_iter().collect();
 
         {
@@ -5767,7 +5909,7 @@ mod tests {
                     lv_zone("z0"),
                     (s, s + 30_000),
                     Box::new(
-                        crate::precompute_engine::operators::SumAccumulator::with_sum(
+                        asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
                             (i + 1) as f64,
                         ),
                     ),
@@ -5986,7 +6128,9 @@ mod tests {
                 lv_zone("z0"),
                 (s, s + 30_000),
                 Box::new(
-                    crate::precompute_engine::operators::SumAccumulator::with_sum((i + 1) as f64),
+                    asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
+                        (i + 1) as f64,
+                    ),
                 ),
             );
         }
@@ -6050,7 +6194,7 @@ mod tests {
                 lv_zone("z0"),
                 (s, s + 30_000),
                 Box::new({
-                    let mut acc = crate::precompute_engine::operators::SumAccumulator::new();
+                    let mut acc = asap_physical_operators::summary_kernels::SumAccumulator::new();
                     acc.update((i + 1) as f64);
                     acc.update(10.0);
                     acc
@@ -6243,8 +6387,8 @@ mod tests {
     // Flush and reopen must preserve Planner family rather than reconstructing Rate as Increase.
     #[test]
     fn planner_exact_families_survive_disk_eviction_and_restart() {
-        use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
         use crate::storage_engines::types::{AggregateCore, AggregationType};
+        use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
         let kinds = [
             AggregationType::Sum,
             AggregationType::Count,

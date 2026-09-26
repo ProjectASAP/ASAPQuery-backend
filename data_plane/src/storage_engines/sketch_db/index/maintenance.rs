@@ -8,7 +8,7 @@ use crate::storage_engines::types::AggregateCore;
 
 pub(crate) struct FrozenExactWindows {
     pub(crate) sid: u64,
-    pub(crate) definition: SummaryDefinitionId,
+    pub(crate) definition: StoredOutputId,
     pub(crate) generation: Arc<CatalogGeneration>,
     pub(crate) group: BTreeMap<String, String>,
     pub(crate) windows: BTreeMap<(u64, u64), Arc<dyn AggregateCore>>,
@@ -49,10 +49,10 @@ impl SketchStore {
     pub(crate) fn read_frozen_exact_cohort(
         &self,
         generation: &Arc<CatalogGeneration>,
-        expected_definitions: &BTreeSet<SummaryDefinitionId>,
+        expected_definitions: &BTreeSet<StoredOutputId>,
         requests: &[(
             u64,
-            SummaryDefinitionId,
+            StoredOutputId,
             BTreeSet<(u64, u64)>,
             BTreeMap<String, String>,
         )],
@@ -89,7 +89,7 @@ impl SketchStore {
     pub(crate) fn read_complete_raw_maintenance_cohort(
         &self,
         generation: &Arc<CatalogGeneration>,
-        definitions: &BTreeSet<SummaryDefinitionId>,
+        definitions: &BTreeSet<StoredOutputId>,
         window: (u64, u64),
     ) -> Result<CompleteRawMaintenanceCohort, String> {
         if definitions.is_empty() || window.0 >= window.1 {
@@ -113,7 +113,7 @@ impl SketchStore {
 
     fn durable_maintenance_population_ids(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
     ) -> Result<BTreeSet<u64>, String> {
         let metadata = self
             .persistence_metadata
@@ -126,7 +126,7 @@ impl SketchStore {
             .load_strict()
             .map_err(|error| error.to_string())?
             .into_iter()
-            .filter(|record| !record.removed && record.summary_definition_id == Some(definition))
+            .filter(|record| !record.removed && record.stored_output_id == Some(definition))
             .map(|record| record.sid)
             .collect())
     }
@@ -135,7 +135,7 @@ impl SketchStore {
     /// coverage and incarnation before reading or publishing any state.
     pub(crate) fn completed_maintenance_coordinates(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         generation: &CatalogGeneration,
     ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
     {
@@ -147,7 +147,7 @@ impl SketchStore {
     /// bind them to the current catalog.
     pub(crate) fn complete_raw_maintenance_population(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         generation: &CatalogGeneration,
     ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
     {
@@ -156,7 +156,7 @@ impl SketchStore {
 
     fn maintenance_coordinates(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         generation: &CatalogGeneration,
         require_complete_population: bool,
     ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
@@ -260,7 +260,7 @@ impl SketchStore {
     pub(crate) fn read_frozen_exact_windows(
         &self,
         sid: u64,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         generation: &Arc<CatalogGeneration>,
         expected_windows: &BTreeSet<(u64, u64)>,
         group: &BTreeMap<String, String>,
@@ -435,7 +435,7 @@ impl SketchStore {
         if !finite_complete {
             return Err("complete raw publication requires the original finite closure".into());
         }
-        let mut supplied = BTreeMap::<SummaryDefinitionId, BTreeSet<u64>>::new();
+        let mut supplied = BTreeMap::<StoredOutputId, BTreeSet<u64>>::new();
         for input in cohort.inputs() {
             supplied
                 .entry(input.definition)
@@ -729,8 +729,8 @@ impl SketchStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precompute_engine::operators::SumAccumulator;
     use crate::storage_engines::types::PrecomputedOutput;
+    use asap_physical_operators::summary_kernels::SumAccumulator;
     use asap_types::traits::SerializableToSink;
 
     #[test]
@@ -775,7 +775,7 @@ mod tests {
             let definition = config.policy_fingerprint().into();
             let population = BTreeMap::from([("instance".to_string(), index.to_string())]);
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                summary_definition_id: definition,
+                stored_output_id: definition,
                 time_range: HalfOpenTimeRange {
                     start_ms: 0,
                     end_ms: 1000,
@@ -891,7 +891,7 @@ mod tests {
         for (index, config) in configs.iter().take(2).enumerate() {
             let definition = config.policy_fingerprint().into();
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                summary_definition_id: definition,
+                stored_output_id: definition,
                 time_range: HalfOpenTimeRange {
                     start_ms: 0,
                     end_ms: 1000,
@@ -926,7 +926,7 @@ mod tests {
         // Only the first population has the next window: completeness must
         // reject the partial cohort even after all writes are durably sealed.
         let extra_coordinate = asap_types::sds::SummaryInstanceCoordinates {
-            summary_definition_id: configs[0].policy_fingerprint().into(),
+            stored_output_id: configs[0].policy_fingerprint().into(),
             time_range: HalfOpenTimeRange {
                 start_ms: 1000,
                 end_ms: 2000,
@@ -1116,7 +1116,7 @@ mod tests {
         for (instance, value) in [("a", 5.0), ("b", 15.0)] {
             let population = BTreeMap::from([("instance".to_string(), instance.to_string())]);
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                summary_definition_id: source.policy_fingerprint().into(),
+                stored_output_id: source.policy_fingerprint().into(),
                 time_range: HalfOpenTimeRange {
                     start_ms: 0,
                     end_ms: 60_000,
@@ -1237,8 +1237,8 @@ mod tests {
             )])
         );
         let assert_complete_output = |store: &SketchStore| {
-            use crate::precompute_engine::operators::DDSketchAccumulator;
             use crate::storage_engines::sketch_db::data::SketchEncoding;
+            use asap_physical_operators::summary_kernels::DDSketchAccumulator;
             let rows = store.query_range(target_sid, 0, 60_000);
             assert_eq!(rows.len(), 1);
             assert!(rows[0].series_label_values.is_empty());
@@ -1315,7 +1315,7 @@ mod tests {
         let mut restored = restarted.start_persistence(restart_config).unwrap();
         let population = BTreeMap::from([("instance".to_string(), "new".to_string())]);
         let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-            summary_definition_id: source_id,
+            stored_output_id: source_id,
             time_range: HalfOpenTimeRange {
                 start_ms: 0,
                 end_ms: 60_000,

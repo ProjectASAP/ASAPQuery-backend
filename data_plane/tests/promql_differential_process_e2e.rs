@@ -8,7 +8,6 @@
 #[path = "support/physical_fixture.rs"]
 mod physical_fixture;
 
-use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -70,6 +69,7 @@ fn ddsketch_export(metric: &str, timestamp_ns: u64, values: &[f64]) -> Vec<u8> {
         alpha: sketch.wire_alpha(),
         store_counts: sketch.store_counts,
         store_offset: sketch.store_offset,
+        ..Default::default()
     };
     let point = DdSketchDataPoint {
         attributes: vec![KeyValue {
@@ -187,39 +187,17 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create log directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    write!(
-        config,
-        r#"aggregations:
-  - aggregationType: DDSketch
-    aggregationSubType: ''
-    labels:
-      grouping: [service]
-      rollup: []
-      aggregated: []
-    metric: differential_e2e_latency_ms
-    parameters:
-      relative_accuracy: 0.01
-    windowSize: 1
-    windowType: tumbling
-    spatialFilter: ''
-"#
-    )
-    .expect("write streaming config");
-
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
-        &serde_yaml::from_slice(&std::fs::read(config.path()).unwrap()).unwrap(),
-    )
-    .unwrap();
-    let install = physical_fixture::artifact(&runtime);
+    let install = physical_fixture::artifact_from_materializations(vec![ddsketch_config()]);
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();
 
+    let bootstrap = output_dir.path().join("bootstrap.json");
+    std::fs::write(&bootstrap, b"{\"aggregations\":[]}").unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--physical-plan")
         .arg(physical.path())
         .arg("--streaming-config")
-        .arg(config.path())
+        .arg(&bootstrap)
         .arg("--http-port")
         .arg(query_port.to_string())
         .arg("--output-dir")
@@ -357,6 +335,197 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
                 .as_str()
                 .is_some_and(|error| error.contains(expected_error)),
             "unexpected validation response: {invalid}"
+        );
+    }
+}
+
+fn ddsketch_config() -> asap_types::PrecomputeMaterialization {
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    PrecomputeMaterialization::new(
+        AggregationType::DDSketch,
+        String::new(),
+        std::collections::HashMap::from([("relative_accuracy".into(), serde_json::json!(ALPHA))]),
+        KeyByLabelNames::new(vec!["service".into()]),
+        KeyByLabelNames::empty(),
+        KeyByLabelNames::empty(),
+        String::new(),
+        1,
+        1,
+        WindowKind::Tumbling,
+        String::new(),
+        METRIC.into(),
+        None,
+        None,
+        None,
+    )
+}
+
+// A real process must range-read the bound output, never a semantic substitute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_sds_keeps_hot_and_rebuild_outputs_and_groups_isolated() {
+    use asap_types::query_plan::QueryPlanNode;
+    use asap_types::sds::StoredOutputId;
+    let mut hot = ddsketch_config();
+    hot.stored_output_id = Some(StoredOutputId(1001));
+    let mut rebuild = hot.clone();
+    rebuild.stored_output_id = Some(StoredOutputId(1002));
+    let mut install = physical_fixture::artifact_from_materializations(vec![hot, rebuild]);
+    assert_eq!(install.summary_catalog.definitions.len(), 1);
+    assert_eq!(install.summary_catalog.outputs.len(), 2);
+    for entry in install.query_plan.entries.values_mut() {
+        let output = if entry.canonical_query.contains("0.99") {
+            1002
+        } else {
+            1001
+        };
+        for node in entry.nodes.values_mut() {
+            if let QueryPlanNode::ReadMaterialization { binding } = node {
+                binding.materialization = StoredOutputId(output);
+            }
+        }
+    }
+    install
+        .query_plan
+        .bind_catalog(&install.summary_catalog)
+        .unwrap();
+    let query_port = unused_port();
+    let otlp_http_port = unused_port();
+    let directory = tempfile::tempdir().unwrap();
+    let plan = directory.path().join("plan.json");
+    std::fs::write(&plan, serde_json::to_vec(&install).unwrap()).unwrap();
+    let bootstrap = directory.path().join("bootstrap.json");
+    std::fs::write(&bootstrap, b"{\"aggregations\":[]}").unwrap();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_data_plane"))
+            .arg("--physical-plan")
+            .arg(&plan)
+            .arg("--streaming-config")
+            .arg(&bootstrap)
+            .arg("--http-port")
+            .arg(query_port.to_string())
+            .arg("--output-dir")
+            .arg(directory.path())
+            .arg("--enable-otel-ingest")
+            .arg("--otel-http-port")
+            .arg(otlp_http_port.to_string())
+            .arg("--otel-grpc-port")
+            .arg(unused_port().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{query_port}");
+    wait_until_ready(&client, &format!("{base}/api/v1/health"), &mut child.0).await;
+    let end = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 2;
+    let send = |output: u64, second: u64, value: f64, service: &'static str| {
+        let mut stamp_plan = install.clone();
+        stamp_plan
+            .precompute_plan
+            .schemas
+            .retain(|s| s.materialization == StoredOutputId(output));
+        let client = client.clone();
+        async move {
+            let bytes = ddsketch_export(METRIC, second * 1_000_000_000, &[value; 32]);
+            let mut message = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
+            let Some(Data::Ddsketch(sketch)) =
+                &mut message.resource_metrics[0].scope_metrics[0].metrics[0].data
+            else {
+                panic!("fixture")
+            };
+            sketch.data_points[0].attributes[0].value = Some(AnyValue {
+                value: Some(any_value::Value::StringValue(service.into())),
+            });
+            physical_fixture::stamp(&mut message, &stamp_plan);
+            let response = client
+                .post(format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"))
+                .header("content-type", "application/x-protobuf")
+                .body(message.encode_to_vec())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            assert!(
+                status.is_success(),
+                "output {output}: {status}: {}",
+                response.text().await.unwrap()
+            );
+        }
+    };
+    let query = |quantile: &str, range: &str| {
+        let expression = format!("quantile_over_time({quantile}, {METRIC}[{range}])");
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            get_json(
+                &client,
+                &format!("{base}/api/v1/query"),
+                &[("query", expression), ("time", end.to_string())],
+            )
+            .await
+        }
+    };
+    for second in end - 2..=end {
+        send(1002, second, 100.0, SERVICE).await;
+    }
+    let mut rebuilt = Value::Null;
+    for _ in 0..50 {
+        rebuilt = query("0.99", "3s").await;
+        if first_instant(&rebuilt).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_approx(
+        100.0,
+        first_instant(&rebuilt).expect("bound rebuild result").2,
+        "rebuild",
+    );
+    assert!(
+        first_instant(&query("0.5", "3s").await).is_none(),
+        "hot must not substitute rebuild state"
+    );
+    send(1001, end - 2, 1.0, SERVICE).await;
+    send(1001, end, 1.0, SERVICE).await;
+    assert!(
+        first_instant(&query("0.5", "3s").await).is_none(),
+        "missing middle pane must not be an empty input"
+    );
+    send(1001, end - 1, 1.0, SERVICE).await;
+    for second in end - 2..=end {
+        send(1001, second, 200.0, "payments").await;
+    }
+    let mut answer = Value::Null;
+    for _ in 0..50 {
+        answer = query("0.5", "3s").await;
+        if answer["data"]["result"]
+            .as_array()
+            .is_some_and(|r| r.len() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rows = answer["data"]["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{answer}"));
+    assert_eq!(rows.len(), 2, "{answer}");
+    for row in rows {
+        let expected = if row["metric"]["service"] == SERVICE {
+            1.0
+        } else {
+            assert_eq!(row["metric"]["service"], "payments");
+            200.0
+        };
+        assert_approx(
+            expected,
+            row["value"][1].as_str().unwrap().parse().unwrap(),
+            "isolated group",
         );
     }
 }

@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn capability_for_cardinality_with_epsilon_returns_cardinality_approx() {
         let intent = AggIntent::Cardinality {
-            col: None,
+            cols: vec![],
             accuracy: AccuracyTarget::Epsilon(0.01),
         };
         assert_eq!(capability_for(&intent), Some(Capability::CardinalityApprox));
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn capability_for_cardinality_with_epsilon_delta_returns_cardinality_approx() {
         let intent = AggIntent::Cardinality {
-            col: None,
+            cols: vec![],
             accuracy: AccuracyTarget::EpsilonDelta {
                 epsilon: 0.01,
                 delta: 0.001,
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn capability_for_cardinality_with_exact_returns_none() {
         let intent = AggIntent::Cardinality {
-            col: None,
+            cols: vec![],
             accuracy: AccuracyTarget::Exact,
         };
         assert_eq!(capability_for(&intent), None);
@@ -490,7 +490,7 @@ mod tests {
             accuracy: approximate.clone(),
         });
         let cardinality = capability_for(&AggIntent::Cardinality {
-            col: None,
+            cols: vec![],
             accuracy: approximate,
         });
         assert_eq!(count, Some(Capability::FrequencyEstimate(None)));

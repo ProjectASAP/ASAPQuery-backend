@@ -85,9 +85,9 @@ fn leaves(
                 }
                 _ => pending.extend(inputs.iter().map(|input| (*input, at))),
             },
-            // CandidateTopK is a typed composition node rather than a Logical
+            // A join is a typed composition node rather than a Logical
             // wrapper, but its value input can still be a Prometheus leaf.
-            QueryPlanNode::CandidateTopK { inputs, .. } => {
+            QueryPlanNode::RelationalJoin { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
             QueryPlanNode::ExternalExact { request, inputs } => {
@@ -650,22 +650,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_exact_is_discovered_and_prepared_behind_candidate_topk_root() {
-        use asap_types::query_plan::{residual::Grouping, CandidateCompleteness};
+    async fn candidate_exact_is_discovered_and_prepared_behind_semi_join_root() {
+        use asap_types::query_plan::CandidateCompleteness;
         let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");
+        entry.nodes.insert(QueryNodeId(2), {
+            let schema = planner_types::post_asap::SummarySchema {
+                fields: vec![planner_types::post_asap::SummaryField {
+                    name: "job".into(),
+                    dtype: planner_types::post_asap::SummaryFamilyType::Plain(
+                        planner_types::pre_asap::DataType::Utf8,
+                    ),
+                    nullable: false,
+                }],
+                time_index: None,
+            };
+            QueryPlanNode::RelationalJoin {
+                inputs: [QueryNodeId(0), QueryNodeId(1)],
+                join_kind: planner_types::pre_asap::JoinKind::Semi,
+                pred: serde_json::to_value(planner_types::pre_asap::Predicate(std::rc::Rc::new(
+                    planner_types::pre_asap::QueryExpr::Compare {
+                        left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(0)),
+                        op: planner_types::pre_asap::CompareOpKind::Eq,
+                        right: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(1)),
+                    },
+                )))
+                .unwrap(),
+                pruning: Some(CandidateCompleteness::BestEffort { guarantee: None }),
+                left_schema: schema.clone(),
+                right_schema: schema.clone(),
+                output_schema: schema,
+            }
+        });
         entry.nodes.insert(
-            QueryNodeId(2),
-            QueryPlanNode::CandidateTopK {
-                inputs: [QueryNodeId(1), QueryNodeId(0)],
-                k: 2,
-                grouping: Grouping {
-                    labels: vec![],
-                    without: false,
+            QueryNodeId(3),
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::Limit {
+                    offset: 0,
+                    n: 2,
+                    grouping: asap_types::query_plan::residual::Grouping {
+                        labels: vec![],
+                        without: false,
+                    },
                 },
-                completeness: CandidateCompleteness::BestEffort { guarantee: None },
+                inputs: vec![QueryNodeId(2)],
             },
         );
-        entry.root = QueryNodeId(2);
+        entry.root = QueryNodeId(3);
         let dependencies = external_dependencies(&entry, &[1_000]).unwrap();
         assert_eq!(dependencies, vec![(QueryNodeId(0), QueryNodeId(1), 1_000)]);
         let prepared = prepare_external(
@@ -880,13 +910,13 @@ mod tests {
 
     #[tokio::test]
     async fn five_minute_error_ratio_combines_prometheus_cut_with_summary_store() {
-        use crate::precompute_engine::operators::IncreaseAccumulator;
         use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
         use crate::storage_engines::sketch_db::{
             data::AggKind,
             index::{Capability, SummarySeriesMetadata},
         };
         use crate::storage_engines::types::{KeyByLabelValues, Measurement};
+        use asap_physical_operators::summary_kernels::IncreaseAccumulator;
         use asap_types::query_plan::{
             residual::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
         };
@@ -960,10 +990,10 @@ mod tests {
                         full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: MATERIALIZATION.into(),
-                        stored_output_reference:
-                            asap_types::sds::StoredOutputReference::for_definition(
-                                MATERIALIZATION.into(),
-                            ),
+                        stored_output_reference: super::super::test_plan::bound_reference(
+                            &store,
+                            MATERIALIZATION.into(),
+                        ),
                         output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
                         window_ms: AT,
                         pane_origin_ms: Some(0),

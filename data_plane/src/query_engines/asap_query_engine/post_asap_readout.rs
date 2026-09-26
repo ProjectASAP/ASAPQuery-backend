@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::utils::arithmetic::evaluate_float64_arithmetic as arithmetic;
+use asap_physical_operators::arithmetic::evaluate_float64_arithmetic as arithmetic;
 
 use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
 
@@ -154,7 +154,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                         .catalog
                         .as_ref()
                         .and_then(|catalog| {
-                            let definition = catalog.definitions.get(&binding.materialization)?;
+                            let definition = catalog.outputs.get(&binding.materialization)?;
                             catalog
                                 .data_descriptors
                                 .get(&definition.data_descriptor_id)?
@@ -305,7 +305,6 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     })
             }
             QueryPlanNode::Logical { .. }
-            | QueryPlanNode::CandidateTopK { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
             | QueryPlanNode::RelationalJoin { .. } => Err(PhysicalNodeError::Fallback(
@@ -882,10 +881,10 @@ mod tests {
                         binding: MaterializationBinding {
                             full_window_slide_ms: None,
                             materialization: config.policy_fingerprint().into(),
-                            stored_output_reference:
-                                asap_types::sds::StoredOutputReference::for_definition(
-                                    config.policy_fingerprint().into(),
-                                ),
+                            stored_output_reference: super::super::test_plan::bound_reference(
+                                &idx,
+                                config.policy_fingerprint().into(),
+                            ),
                             output_grouping: PhysicalGrouping::PerEntity,
                             item_labels: vec![],
                             window_ms: 1000,
@@ -1050,7 +1049,7 @@ mod tests {
             1,
             BTreeMap::new(),
             (1_000, 2_000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(42.0)),
         );
         let config =
             test_plan::materialization("bytes_total", "Sum", serde_json::json!({}), &[], 1000);
@@ -1077,7 +1076,9 @@ mod tests {
     #[test]
     fn compiled_window_schedules_execute_exact_ranges() {
         use crate::precompute_engine::window_manager::WindowManager;
-        use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
+        use control_plane::physical::compiler::{
+            BackendLocalPlanningInput, DeploymentPlanCompiler,
+        };
         for evaluation_secs in [20, 45, 60, 120, 90] {
             for phase_ms in [0, 5_000] {
                 for full in [false, true] {
@@ -1124,16 +1125,16 @@ mod tests {
                         }
                     }
                     let idx = SketchStore::new();
+                    idx.install_summary_catalog(std::sync::Arc::new(plan.summary_catalog.clone()))
+                        .unwrap();
                     idx.register(SummarySeriesMetadata {
                         sid: 7,
                         metric_name: "a".into(),
                         group_by_keys: Default::default(),
                         capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
-                        agg_kind: AggKind::ExactAgg {
-                            agg_type: asap_types::AggregationType::Sum,
-                            parameters_canonical: String::new(),
-                            spatial_filter_canonical: String::new(),
-                        },
+                        agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_config(
+                            config,
+                        ),
                         accuracy: None,
                         first_seen_unix_ms: 0,
                         retired_at_ms: None,
@@ -1146,7 +1147,9 @@ mod tests {
                             BTreeMap::new(),
                             bounds,
                             Box::new(
-                                crate::precompute_engine::operators::SumAccumulator::with_sum(sum),
+                                asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
+                                    sum,
+                                ),
                             ),
                         );
                     }
@@ -1176,7 +1179,9 @@ mod tests {
     // Compile the two readouts, store one pane series, and execute the actual ratio.
     #[test]
     fn compiled_shared_sum_panes_preserve_each_lookback() {
-        use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
+        use control_plane::physical::compiler::{
+            BackendLocalPlanningInput, DeploymentPlanCompiler,
+        };
         let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -1192,16 +1197,14 @@ mod tests {
         let config = &plan.precompute_plan.materializations[0];
         let policy = config.policy_fingerprint();
         let idx = SketchStore::new();
+        idx.install_summary_catalog(std::sync::Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
         idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "a".into(),
             group_by_keys: Default::default(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
-            agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::AggregationType::Sum,
-                parameters_canonical: String::new(),
-                spatial_filter_canonical: String::new(),
-            },
+            agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_config(config),
             accuracy: None,
             first_seen_unix_ms: 0,
             retired_at_ms: None,
@@ -1214,7 +1217,7 @@ mod tests {
                 BTreeMap::new(),
                 (pane * 60_000, (pane + 1) * 60_000),
                 Box::new(
-                    crate::precompute_engine::operators::SumAccumulator::with_sum(
+                    asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
                         (pane + 1) as f64,
                     ),
                 ),
@@ -1289,7 +1292,7 @@ mod tests {
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
                 Box::new(
-                    crate::precompute_engine::operators::SumAccumulator::with_sum(
+                    asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
                         (pane + 1) as f64,
                     ),
                 ),
@@ -1317,10 +1320,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
-                            stored_output_reference:
-                                asap_types::sds::StoredOutputReference::for_definition(
-                                    policy.into(),
-                                ),
+                            stored_output_reference: super::super::test_plan::bound_reference(
+                                &idx,
+                                policy.into(),
+                            ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
                             pane_origin_ms: Some(0),
@@ -1356,7 +1359,7 @@ mod tests {
                 7,
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
-                Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(1.0)),
+                Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(1.0)),
             );
         }
         assert!(
@@ -1386,7 +1389,7 @@ mod tests {
             policy_fp: policy,
         });
         use crate::storage_engines::types::Measurement;
-        let mut accumulator = crate::precompute_engine::operators::IncreaseAccumulator::new(
+        let mut accumulator = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
             Measurement::new(10.0),
             10_000,
             Measurement::new(10.0),
@@ -1418,10 +1421,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
-                            stored_output_reference:
-                                asap_types::sds::StoredOutputReference::for_definition(
-                                    policy.into(),
-                                ),
+                            stored_output_reference: super::super::test_plan::bound_reference(
+                                &idx,
+                                policy.into(),
+                            ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
                             pane_origin_ms: Some(0),

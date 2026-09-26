@@ -1,16 +1,16 @@
-#[cfg(test)]
-use crate::precompute_engine::accumulator_factory::create_fixture_accumulator;
-use crate::precompute_engine::accumulator_factory::AccumulatorUpdater;
 use crate::precompute_engine::config::LateDataPolicy;
 use crate::precompute_engine::group_key::GroupKey;
 use crate::precompute_engine::metrics::record_late_input;
-use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
     AggregateCore, KeyByLabelValues, PrecomputedOutput, StreamingConfigHandle,
 };
+#[cfg(test)]
+use crate::tests::accumulator_fixture::create_fixture_accumulator;
+use asap_physical_operators::factory::AccumulatorUpdater;
+use asap_physical_operators::summary_kernels::sum::SumAccumulator;
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 use asap_types::SampleUpdateRule;
@@ -637,7 +637,7 @@ impl Worker {
                                 observer.observe(
                                     &revision.generation,
                                     asap_types::sds::SummaryInstanceCoordinates {
-                                        summary_definition_id: policy_fp.into(),
+                                        stored_output_id: policy_fp.into(),
                                         time_range: asap_types::sds::HalfOpenTimeRange {
                                             start_ms: bucket_start,
                                             end_ms: bucket_end,
@@ -695,7 +695,7 @@ impl Worker {
                         observer.observe(
                             &revision.generation,
                             asap_types::sds::SummaryInstanceCoordinates {
-                                summary_definition_id: policy_fp.into(),
+                                stored_output_id: policy_fp.into(),
                                 time_range: asap_types::sds::HalfOpenTimeRange {
                                     start_ms: bucket_start,
                                     end_ms: bucket_end,
@@ -1874,11 +1874,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::precompute_engine::config::LateDataPolicy;
-    use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
-    use crate::precompute_engine::operators::keyed_sum_count_accumulator::KeyedSumCountAccumulator;
-    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::StreamingConfig;
+    use asap_physical_operators::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
+    use asap_physical_operators::summary_kernels::keyed_sum_count::KeyedSumCountAccumulator;
+    use asap_physical_operators::summary_kernels::sum::SumAccumulator;
     use asap_sketchlib::KllSketch;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -3169,7 +3169,7 @@ mod tests {
     // OTLP ingest dispatch builds via `decode_modified_otlp_sketch_bytes`.
     // -----------------------------------------------------------------------
 
-    use crate::precompute_engine::operators::DDSketchAccumulator;
+    use asap_physical_operators::summary_kernels::DDSketchAccumulator;
     use asap_sketchlib::DdSketch;
 
     /// Build a fresh DDSketch holding `vals` so each test has a real,
@@ -3934,7 +3934,7 @@ mod tests {
     // A pooled Sum is correct only for an explicit cross-entity reduction.
     #[test]
     fn pooled_sum_does_not_preserve_per_entity_output_rows() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
         let config = make_agg_config(
             1,
             "gauge",
@@ -3988,7 +3988,7 @@ mod tests {
     // The physical compiler rejects raw counter producers until series state is preserved.
     #[test]
     fn pooled_counter_samples_lose_independent_same_timestamp_reset() {
-        use crate::precompute_engine::operators::IncreaseAccumulator;
+        use asap_physical_operators::summary_kernels::IncreaseAccumulator;
         let config = make_agg_config(
             1,
             "requests_total",
@@ -4280,9 +4280,9 @@ mod tests {
 #[cfg(test)]
 mod dag_execution_tests {
     use super::*;
-    use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::StreamingConfig;
+    use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
     use asap_types::query_plan::ExactReadout;
 
     fn plan(query: &str) -> control_plane::physical::compiler::CompiledPhysicalPlan {
@@ -4446,9 +4446,11 @@ mod dag_execution_tests {
             &dag,
         )
         .unwrap();
-        assert!(StreamingConfig::from_precompute_plan(plan)
+        installed.document.schema_version =
+            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+        let error = StreamingConfig::from_precompute_plan(plan)
             .unwrap_err()
-            .to_string()
-            .contains("update"));
+            .to_string();
+        assert!(error.contains("update"), "{error}");
     }
 }

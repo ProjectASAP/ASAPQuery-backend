@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::QueryLanguage;
-use crate::{sds::SummaryDefinitionId, PolicyFingerprint};
+use crate::{sds::StoredOutputId, PolicyFingerprint};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +93,25 @@ impl QueryPlan {
         self.lookup_canonical(QueryLanguage::ClickHouseSql, canonical_sql)
     }
 
+    pub fn bind_catalog(
+        &mut self,
+        catalog: &crate::summary_catalog::SummaryCatalog,
+    ) -> Result<(), QueryPlanError> {
+        catalog
+            .validate()
+            .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+        for entry in self.entries.values_mut() {
+            for node in entry.nodes.values_mut() {
+                if let QueryPlanNode::ReadMaterialization { binding } = node {
+                    binding.stored_output_reference = catalog
+                        .output_reference(binding.materialization)
+                        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                }
+            }
+        }
+        self.validate_against_catalog(catalog)
+    }
+
     /// Validate semantic bindings against the authoritative snapshot before use.
     pub fn validate_against_catalog(
         &self,
@@ -106,23 +125,23 @@ impl QueryPlan {
                 "QueryPlan and SummaryCatalog have different plan identity/version".into(),
             ));
         }
-        let available = catalog
-            .definitions
-            .keys()
-            .copied()
-            .map(Into::into)
-            .collect();
+        let available = catalog.outputs.keys().copied().map(Into::into).collect();
         self.validate(&available)?;
         for entry in self.entries.values() {
             for binding in entry.materialization_bindings() {
                 let identity = catalog
-                    .definitions
+                    .outputs
                     .get(&binding.materialization)
                     .ok_or_else(|| {
                         QueryPlanError::Invalid(
                             "query binding references absent catalog materialization".into(),
                         )
                     })?;
+                if binding.stored_output_reference.definition_id != identity.definition_id {
+                    return Err(QueryPlanError::Invalid(
+                        "read definition differs from installed output".into(),
+                    ));
+                }
                 let _data = &catalog.data_descriptors[&identity.data_descriptor_id];
                 if binding.window_ms == 0 {
                     return Err(QueryPlanError::Invalid(
@@ -148,7 +167,7 @@ impl QueryPlan {
                         "counter readout must directly consume one catalog materialization".into(),
                     ));
                 };
-                let identity = &catalog.definitions[&binding.materialization];
+                let identity = &catalog.outputs[&binding.materialization];
                 let descriptor = &catalog.summary_descriptors[&identity.summary_descriptor_id];
                 if !matches!(
                     descriptor.fidelity,
@@ -391,13 +410,15 @@ impl QueryPlanEntry {
                     ));
                 }
             }
-            if let QueryPlanNode::CandidateTopK {
-                k, completeness, ..
+            if let QueryPlanNode::RelationalJoin {
+                pruning: Some(completeness),
+                join_kind,
+                ..
             } = node
             {
-                if *k == 0 {
+                if *join_kind != planner_types::pre_asap::JoinKind::Semi {
                     return Err(QueryPlanError::Invalid(
-                        "CandidateTopK requires k > 0".into(),
+                        "pruning evidence requires a semi-join".into(),
                     ));
                 }
                 if matches!(
@@ -409,7 +430,7 @@ impl QueryPlanEntry {
                             || guarantee.failure_probability.evaluate().is_none()
                 ) {
                     return Err(QueryPlanError::Invalid(
-                        "invalid CandidateTopK completeness certificate".into(),
+                        "invalid semi-join pruning certificate".into(),
                     ));
                 }
             }
@@ -422,9 +443,7 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
-                if binding.stored_output_reference.validate().is_err()
-                    || binding.stored_output_reference.definition_id != binding.materialization
-                {
+                if binding.stored_output_reference.stored_output_id != binding.materialization {
                     return Err(QueryPlanError::Invalid(
                         "read binding has invalid stored output or definition".into(),
                     ));
@@ -471,7 +490,7 @@ pub struct MaterializationBinding {
     /// None denotes disjoint pane storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_window_slide_ms: Option<u64>,
-    pub materialization: SummaryDefinitionId,
+    pub materialization: StoredOutputId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     /// Labels whose values form an item identity inside a keyed sketch.
@@ -571,6 +590,7 @@ pub enum QueryPlanNode {
     RelationalJoin {
         inputs: [QueryNodeId; 2],
         join_kind: planner_types::pre_asap::JoinKind,
+        pruning: Option<CandidateCompleteness>,
         pred: serde_json::Value,
         left_schema: planner_types::post_asap::SummarySchema,
         right_schema: planner_types::post_asap::SummarySchema,
@@ -613,15 +633,6 @@ pub enum QueryPlanNode {
     SummaryMerge {
         inputs: Vec<QueryNodeId>,
     },
-    /// Use an approximate heap only as a membership sidecar, then rerank the
-    /// matching exact counter readouts. `inputs[0]` is candidate membership;
-    /// `inputs[1]` is the authoritative exact value vector.
-    CandidateTopK {
-        inputs: [QueryNodeId; 2],
-        k: u64,
-        grouping: residual::Grouping,
-        completeness: CandidateCompleteness,
-    },
     /// An exact subtree evaluated outside ASAP. Its results enter the query DAG
     /// like any other node output and may depend on summary-produced inputs.
     ExternalExact {
@@ -647,7 +658,6 @@ impl QueryPlanNode {
             Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
-            Self::CandidateTopK { inputs, .. } => inputs,
         }
     }
 }

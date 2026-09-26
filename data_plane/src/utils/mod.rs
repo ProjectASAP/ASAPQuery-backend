@@ -1,4 +1,3 @@
-pub(crate) mod arithmetic;
 pub mod file_io;
 pub mod http;
 

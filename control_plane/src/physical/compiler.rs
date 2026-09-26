@@ -472,7 +472,7 @@ pub struct CompiledPhysicalPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MaterializationLifecycleEstimate {
-    pub materialization: asap_types::sds::SummaryDefinitionId,
+    pub materialization: asap_types::sds::StoredOutputId,
     pub consumer_query_ids: Vec<String>,
     #[serde(rename = "window_implementation_id")]
     pub window_realization_id: String,
@@ -807,7 +807,7 @@ fn has_unsafe_raw_entity_leaf(
         SummaryExpr::SummaryEstimate { summary_input, .. } => {
             has_unsafe_raw_entity_leaf(summary_input, selected, false)
         }
-        SummaryExpr::SummaryMerge { children } => children
+        SummaryExpr::SummaryMerge { children, .. } => children
             .iter()
             .any(|child| has_unsafe_raw_entity_leaf(child, selected, false)),
         _ => false,
@@ -1467,6 +1467,25 @@ impl DeploymentPlanCompiler {
                         })?,
                     );
                 }
+                let compiled_dag = executable_dags[query_index].as_ref().expect("selected DAG");
+                let semantic_root =
+                    compiled_dag
+                        .node_ids
+                        .node_id(&selected.node)
+                        .ok_or_else(|| CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason: "persisted semantic root is absent".into(),
+                        })?;
+                runtime_materialization.semantic_fragment = Some(
+                    asap_types::semantic_fragment::SemanticFragment::from_stored_output(
+                        &compiled_dag.dag,
+                        semantic_root,
+                    )
+                    .map_err(|reason| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason,
+                    })?,
+                );
                 let materialization = runtime_materialization.policy_fingerprint();
                 let consumer_query_ids = state_consumers
                     .iter()
@@ -1620,6 +1639,17 @@ impl DeploymentPlanCompiler {
         // summary. PrecomputePlan is keyed by physical identity, not query ID.
         let mut materializations_by_fingerprint = BTreeMap::new();
         for materialization in compiled_materializations {
+            if materializations_by_fingerprint
+                .get(&materialization.policy_fingerprint())
+                .is_some_and(|old: &asap_types::PrecomputeMaterialization| {
+                    old.semantic_fragment != materialization.semantic_fragment
+                })
+            {
+                return Err(CompileError::Query {
+                    query_id: "shared-output".into(),
+                    reason: "one deployed output cannot have different semantic definitions".into(),
+                });
+            }
             materializations_by_fingerprint
                 .entry(materialization.policy_fingerprint())
                 .or_insert(materialization);
@@ -1710,7 +1740,7 @@ impl DeploymentPlanCompiler {
                             .then_some(materialization.slide_interval.saturating_mul(1_000)),
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
-                        stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(fingerprint.into()),
+                        stored_output_reference: asap_types::sds::StoredOutputReference::for_output(fingerprint.into()),
                         output_grouping: PhysicalGrouping::Reduce(
                             materialization.grouping_labels.names(),
                         ),
@@ -2026,7 +2056,7 @@ impl DeploymentPlanCompiler {
                     reason: error.to_string(),
                 })?;
         }
-        query_plan.validate_against_catalog(&summary_catalog)?;
+        query_plan.bind_catalog(&summary_catalog)?;
         let storage_routing = crate::emit::backend_wire::storage_routing_document(
             crate::emit::backend_wire::DEFAULT_TENANT,
             &routed_algorithms.into_iter().collect::<Vec<_>>(),
@@ -2056,15 +2086,10 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
-            SummaryExpr::CandidateTopK {
-                candidates, values, ..
-            } => {
-                walk(candidates, metrics);
-                walk(values, metrics);
-            }
+
             SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     walk(child, metrics);
                 }
@@ -2130,12 +2155,12 @@ fn observed_population_matches_root(
     };
     if measures.is_empty()
         || !measures.iter().all(|intent| {
-            matches!(
-                intent,
-                AggIntent::Cardinality { col: None, .. }
-                    | AggIntent::FrequencyL2 { col: None, .. }
-                    | AggIntent::FrequencyEntropy { col: None, .. }
-            )
+            matches!(intent, AggIntent::Cardinality { cols, .. } if cols.is_empty())
+                || matches!(
+                    intent,
+                    AggIntent::FrequencyL2 { col: None, .. }
+                        | AggIntent::FrequencyEntropy { col: None, .. }
+                )
         })
     {
         return false;
@@ -2321,7 +2346,7 @@ fn requires_exact_erp_fallback(
                 child: summary_input,
                 ..
             } => walk(summary_input, out),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 children.iter().for_each(|child| walk(child, out))
             }
             SummaryExpr::SummaryJoin { outer, inner, .. } => {
@@ -2338,12 +2363,7 @@ fn requires_exact_erp_fallback(
                 walk(left, out);
                 walk(right, out);
             }
-            SummaryExpr::CandidateTopK {
-                candidates, values, ..
-            } => {
-                walk(candidates, out);
-                walk(values, out);
-            }
+
             SummaryExpr::KeepPreAsap(_) => {}
         }
     }
@@ -2391,9 +2411,49 @@ pub fn select_post_asap(
             delete: false,
         },
     );
+    // These fixtures exercise collector heap transport. Collector fixtures do
+    // not offer backend-only temporal value readouts as a physical capability.
+    struct CollectorFixtureModel(ControlPlaneCostModel);
+    impl asap_aware_mapping::CostModel for CollectorFixtureModel {
+        fn rank_candidates(
+            &self,
+            intent: &planner_types::pre_asap::AggIntent,
+            candidates: &[planner_types::post_asap::SketchAlgorithm],
+        ) -> Vec<planner_types::post_asap::SketchAlgorithm> {
+            self.0.rank_candidates(intent, candidates)
+        }
+        fn size_params(
+            &self,
+            kind: planner_types::post_asap::SketchAlgorithm,
+            intent: &planner_types::pre_asap::AggIntent,
+            eps: f64,
+            delta: f64,
+        ) -> planner_types::post_asap::SketchParams {
+            self.0.size_params(kind, intent, eps, delta)
+        }
+        fn candidate_cost(
+            &self,
+            candidate: &asap_aware_mapping::ReplacementSubDAG,
+            target: &asap_aware_mapping::TargetSubDAG<'_>,
+        ) -> Option<Cost> {
+            self.0.candidate_cost(candidate, target)
+        }
+        fn summary_support_evidence(&self, summary: &SummaryNode) -> Option<bool> {
+            if matches!(
+                summary.expr,
+                SummaryExpr::ValueOperation {
+                    operation: planner_types::post_asap::ValueOperation::Limit { .. },
+                    ..
+                }
+            ) {
+                return Some(false);
+            }
+            self.0.summary_support_evidence(summary)
+        }
+    }
     crate::planner_selection::select_query_with_models(
         expr,
-        &model,
+        &CollectorFixtureModel(model),
         &DefaultAccuracyModel,
         &QueryEvidence(evidence),
     )
@@ -3206,7 +3266,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
                 lhs,
                 rhs,
                 operator,
-                timing: ExecutionTiming::MaintenanceTime,
+                timing: ExecutionTiming::IngestionTime,
             } if operator.vector_match.is_none()
                 && matches!(
                     operator.kind,
@@ -3219,7 +3279,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
             SummaryExpr::ValueOperation {
                 child: source,
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                timing: ExecutionTiming::MaintenanceTime,
+                timing: ExecutionTiming::IngestionTime,
             } if matches!(&source.expr,
                     SummaryExpr::SummaryAgg { family: SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), child, .. }
                     if matches!(child.expr, SummaryExpr::KeepPreAsap(_))) =>
@@ -3535,13 +3595,15 @@ fn collect_selected_materializations(
             }
         }
         match &node.expr {
-            SummaryExpr::CandidateTopK {
-                candidates, values, ..
+            SummaryExpr::RelationalJoin {
+                left: values,
+                right: candidates,
+                kind: planner_types::pre_asap::JoinKind::Semi,
+                pruning: Some(_),
+                ..
             } => {
                 walk(candidates, readout, composable, grouping.clone(), selected)?;
-                // In a hybrid TopK, the sketch is only a candidate-membership
-                // sidecar. Prometheus owns the authoritative value subtree;
-                // provisioning local exact state here duplicates that work.
+                // Explicit external authoritative values do not need duplicate local state.
                 if !composable {
                     walk(values, readout, composable, grouping.clone(), selected)?;
                 }
@@ -3589,7 +3651,7 @@ fn collect_selected_materializations(
                 grouping.clone(),
                 selected,
             )?,
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     walk(child, readout, composable, grouping.clone(), selected)?;
                 }
@@ -3630,25 +3692,9 @@ fn collect_selected_materializations(
                             SummaryInputExpr::Column(
                                 planner_types::pre_asap::ColumnRef::SampleValue,
                             ) => "value",
-                            SummaryInputExpr::ResetAwareCounterDelta { .. }
-                                if matches!(
-                                    input.weight_domain,
-                                    planner_types::post_asap::WeightDomain::NonNegative {
-                                        proof: planner_types::post_asap::NonNegativeWeightProof::ResetAwareCounterDerivative
-                                    }
-                                ) => "counter_delta",
-                            SummaryInputExpr::ResetAwareCounterDelta { .. } => {
-                                return Err("counter-delta TopK input lacks a non-negative reset-aware proof".into())
-                            }
                             _ => return Err("unsupported TopK SummaryUpdate weight".into()),
                         };
                         parameters["weight_mode"] = mode.into();
-                        if mode == "counter_delta" {
-                            // CMS/CountSketch heap implementations quantize
-                            // weights to integer counters. Preserve sub-unit
-                            // counter increments used by CPU metrics.
-                            parameters["weight_scale"] = 1_000_000.into();
-                        }
                     }
                     let (metric, window_secs, spatial_filter) = match selected_input_contract(node)
                     {
@@ -4342,7 +4388,7 @@ pub(crate) mod tests {
         raw.ingest.endpoint_path = "/api/v1/write".into();
         raw.ingest.timestamp_unit = TimestampUnit::UnixMilliseconds;
         raw.ingest.require_plan_identity = false;
-        raw.ingest.require_summary_definition_identity = false;
+        raw.ingest.require_stored_output_identity = false;
         raw.ingest.require_registered_producer = false;
         raw.producers.clear();
         raw.bind_catalog(&catalog).unwrap();
@@ -4426,8 +4472,9 @@ pub(crate) mod tests {
         }
     }
 
+    // The explicit rate-value frontier cannot be rebound as raw counter deltas.
     #[test]
-    fn weighted_counter_topk_keeps_heap_membership_separate_from_exact_values() {
+    fn unsupported_rate_heap_uses_explicit_exact_route() {
         let query = "topk(2, sum by (job) (rate(m[1m])))";
         let evidence = TopKMembershipEvidence {
             selected_lower_bound: 101.0,
@@ -4440,82 +4487,22 @@ pub(crate) mod tests {
         let plan = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .unwrap();
-        let entry = plan.query_plan.entries.values().next().unwrap();
-        let crate::query_plan::QueryPlanNode::CandidateTopK { inputs, .. } =
-            &entry.nodes[&entry.root]
-        else {
-            panic!("Planner weighted TopK must lower to CandidateTopK: {entry:#?}");
-        };
+        let entry = plan.query_plan.lookup(query).unwrap();
         assert!(matches!(
-            entry.nodes[&inputs[0]],
-            crate::query_plan::QueryPlanNode::SummaryEstimate {
-                query: crate::query_plan::QueryReadout::TopK { .. },
-                ..
-            }
+            &entry.nodes[&entry.root],
+            crate::query_plan::QueryPlanNode::ExactFallback { .. }
         ));
-        let candidate_read = match &entry.nodes[&inputs[0]] {
-            crate::query_plan::QueryPlanNode::SummaryEstimate { input, .. } => *input,
-            _ => unreachable!(),
-        };
-        assert!(matches!(
-            entry.nodes[&candidate_read],
-            crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
-        ));
-        assert!(!entry
-            .nodes
-            .values()
-            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. })));
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            crate::query_plan::QueryPlanNode::ExactReadout {
-                readout: crate::query_plan::ExactReadout::Rate,
-                ..
-            }
-        )));
-        let heaps = plan
-            .precompute_plan
-            .materializations
-            .iter()
-            .filter(|materialization| {
-                materialization.aggregation_type
-                    == asap_types::AggregationType::CountMinSketchWithHeap
-                    && materialization.parameters["weight_mode"] == "counter_delta"
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(heaps.len(), 1, "unpartitioned TopK owns one global CMS");
-        assert!(heaps[0].grouping_labels.names().is_empty());
-        assert_eq!(heaps[0].aggregated_labels.labels, vec!["job"]);
-        assert_eq!(heaps[0].parameters["weight_scale"], 1_000_000);
-        assert_eq!(retained_partition_count(heaps[0], Some(5)), 1);
-        let crate::query_plan::QueryPlanNode::ReadMaterialization { binding } =
-            &entry.nodes[&candidate_read]
-        else {
-            unreachable!()
-        };
-        assert!(matches!(
-            binding.output_grouping,
-            crate::query_plan::PhysicalGrouping::Reduce(ref labels) if labels.is_empty()
-        ));
-        assert_eq!(binding.item_labels, vec!["job"]);
-        let counter = plan
-            .precompute_plan
-            .materializations
-            .iter()
-            .find(|materialization| {
-                matches!(
-                    materialization.aggregation_type,
-                    asap_types::AggregationType::Rate
-                )
-            })
-            .expect("reset-aware exact counter");
-        assert_eq!(retained_partition_count(counter, Some(5)), 5);
+        assert_eq!(
+            entry.fallback,
+            crate::query_plan::FallbackPolicy::ExactBackend
+        );
+        assert_eq!(entry.canonical_query, query);
+        assert!(plan.precompute_plan.materializations.is_empty());
     }
 
+    // Native exact values remain explicit; unsupported heaps publish no stored state.
     #[test]
-    fn hybrid_weighted_topk_installs_only_candidates_and_delegates_filtered_exact_values() {
-        use crate::query_plan::{
-            residual::ResidualQueryOperator, ExternalExactInput, ExternalExactOutput, QueryPlanNode,
-        };
+    fn hybrid_rate_topk_preserves_the_original_exact_subquery() {
         let query = "topk(2, sum by (job) (rate(m[1m])))";
         let evidence = TopKMembershipEvidence {
             selected_lower_bound: 101.0,
@@ -4533,75 +4520,31 @@ pub(crate) mod tests {
         let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
-
-        assert_eq!(plan.precompute_plan.materializations.len(), 1);
-        assert_eq!(
-            plan.precompute_plan.materializations[0].aggregation_type,
-            asap_types::AggregationType::CountMinSketchWithHeap
-        );
         let entry = plan.query_plan.lookup(query).unwrap();
-        let QueryPlanNode::CandidateTopK { inputs, .. } = &entry.nodes[&entry.root] else {
-            panic!("expected candidate TopK: {entry:#?}");
-        };
+        use crate::query_plan::{residual::ResidualQueryOperator, QueryPlanNode};
         assert!(matches!(
-            &entry.nodes[&inputs[1]],
-            QueryPlanNode::ExternalExact {
-                request,
-                inputs: exact_inputs,
-            } if request.language == crate::query_plan::QueryLanguage::PromQl
-                && request.expression == "sum by (job) (rate(m[1m]))"
-                && request.output == ExternalExactOutput::InstantVector
-                && request.input_contracts == vec![ExternalExactInput::CandidateMembership {
-                    item_label: "job".into(),
-                }]
-                && exact_inputs == &vec![inputs[0]]
+            &entry.nodes[&entry.root],
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::Limit { n: 2, .. },
+                ..
+            }
         ));
-        assert!(entry.nodes.values().all(|node| !matches!(
-            node,
-            QueryPlanNode::ExactReadout { .. }
-                | QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Scan { .. },
-                    ..
-                }
-        )));
-        let installed = plan
-            .precompute_plan
-            .executable_dags
-            .get(&entry.query_id)
-            .expect("compiled query retains its maintenance projection");
-        installed
-            .validate()
-            .expect("typed maintenance DAG document");
         assert_eq!(
-            installed.document.schema_version,
-            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+            entry
+                .nodes
+                .values()
+                .filter(|node| matches!(node, QueryPlanNode::Logical {
+            operator: ResidualQueryOperator::ExactSubquery { query }, ..
+        } if query == "sum by (job) (rate(m[1m]))"))
+                .count(),
+            1
         );
-        assert!(installed
-            .document
-            .nodes
-            .iter()
-            .all(|node| node.output_state.timing
-                == planner_types::post_asap::ExecutionTiming::MaintenanceTime));
-        assert_eq!(installed.binding.query_plan_sink, entry.root);
-        let mut mismatched = plan.to_publication_artifact().unwrap();
-        let projected = mismatched
-            .precompute_plan
-            .executable_dags
-            .get_mut(&entry.query_id)
-            .unwrap();
-        projected.binding.query_plan_sink = asap_types::executable_plan::QueryNodeId(u64::MAX);
-        assert!(mismatched.validate().is_err());
-        assert!(installed.binding.nodes.values().any(|placement| matches!(
-            placement,
-            crate::physical::executable_binding::BackendNodeBinding::Materialization { .. }
-        )));
-        let encoded = serde_json::to_value(installed).unwrap();
-        let decoded: crate::physical::executable_binding::InstalledPostAsapDag =
-            serde_json::from_value(encoded).unwrap();
-        assert_eq!(&decoded, installed);
-        decoded
-            .validate()
-            .expect("round-tripped typed DAG document");
+        assert!(entry.materialization_bindings().is_empty());
+        assert!(plan.precompute_plan.materializations.is_empty());
+        let artifact = plan.to_publication_artifact().unwrap();
+        artifact.validate().unwrap();
+        let encoded = serde_json::to_value(&artifact).unwrap();
+        assert!(!encoded.to_string().contains("counter_delta"));
     }
 
     #[test]
@@ -4617,7 +4560,7 @@ pub(crate) mod tests {
             .compile_promql(
                 request_with_evidence(
                     "topk-rate",
-                    "topk(2, sum by (job) (rate(m[1m])))",
+                    "topk(2, count_over_time(m[1m]))",
                     Some(evidence),
                 )
                 .unwrap(),
@@ -5337,7 +5280,7 @@ pub(crate) mod tests {
             .compile_promql(with_evidence, backend)
             .unwrap();
         assert!(
-            !plan.summary_catalog.definitions.is_empty(),
+            !plan.summary_catalog.outputs.is_empty(),
             "measured exact-composition evidence must expose the rate child as a SummaryStore binding"
         );
     }
@@ -5372,7 +5315,7 @@ pub(crate) mod tests {
         // ExactComposition candidate. The absence of evidence must therefore
         // leave that direct legal path intact rather than inventing a composed
         // cost or forcing an exact fallback.
-        assert!(!plan.summary_catalog.definitions.is_empty());
+        assert!(!plan.summary_catalog.outputs.is_empty());
         let entry = plan
             .query_plan
             .entries
@@ -5582,7 +5525,7 @@ pub(crate) mod tests {
                 .compile_promql(workload, env)
                 .expect("shared compile");
             assert_eq!(bundle.query_plan.entries.len(), 2);
-            assert_eq!(bundle.summary_catalog.definitions.len(), 1);
+            assert_eq!(bundle.summary_catalog.outputs.len(), 1);
             assert_eq!(bundle.precompute_plan.materializations.len(), 1);
             assert_eq!(bundle.precompute_plan.schemas.len(), 1);
             let bindings = bundle
@@ -5625,7 +5568,7 @@ pub(crate) mod tests {
         let bundle = DeploymentPlanCompiler
             .compile_promql(workload, environment(10_000))
             .unwrap();
-        assert_eq!(bundle.summary_catalog.definitions.len(), 2);
+        assert_eq!(bundle.summary_catalog.outputs.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         for collector in &bundle.collector_plans {
             assert_eq!(collector.materializations.len(), 2);
@@ -5766,7 +5709,7 @@ pub(crate) mod tests {
         };
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 lhs: selected.clone(),
                 rhs: selected.clone(),
                 operator: planner_types::post_asap::BinaryOperator {
@@ -5900,7 +5843,7 @@ pub(crate) mod tests {
         let actual = bindings
             .iter()
             .map(|binding| {
-                let identity = &plan.summary_catalog.definitions[&binding.materialization];
+                let identity = &plan.summary_catalog.outputs[&binding.materialization];
                 let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
                 (
                     data.time_series_metric().unwrap(),
@@ -5967,7 +5910,7 @@ pub(crate) mod tests {
         let right = right.queries[0].selected_plan_root.clone();
         let right = Rc::new(SummaryNode {
             expr: SummaryExpr::ValueOperation {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
                 child: right.clone(),
             },
@@ -5976,7 +5919,7 @@ pub(crate) mod tests {
         });
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 lhs: left.clone(),
                 rhs: right,
                 operator: planner_types::post_asap::BinaryOperator {
@@ -6799,7 +6742,7 @@ pub(crate) mod tests {
         let bound = bindings
             .iter()
             .map(|binding| {
-                let identity = &plan.summary_catalog.definitions[&binding.materialization];
+                let identity = &plan.summary_catalog.outputs[&binding.materialization];
                 let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
                 (
                     data.time_series_metric().unwrap(),
@@ -6979,7 +6922,7 @@ pub(crate) mod tests {
             .entries
             .values()
             .flat_map(|entry| entry.materialization_bindings())
-            .map(|binding| binding.stored_output_reference)
+            .map(|binding| binding.stored_output_reference.clone())
             .collect::<Vec<_>>();
         assert_eq!(stored_outputs.len(), 2);
         assert_eq!(stored_outputs[0], stored_outputs[1]);
@@ -7103,7 +7046,7 @@ pub(crate) mod tests {
         assert_eq!(
             bundle
                 .summary_catalog
-                .definitions
+                .outputs
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>(),
@@ -7154,7 +7097,7 @@ pub(crate) mod tests {
             bundle.transmission_plan.validate_frame(&wrong_version),
             Err(TransmissionPlanError::InvalidFrame(_))
         ));
-        assert_eq!(bundle.summary_catalog.definitions.len(), 1);
+        assert_eq!(bundle.summary_catalog.outputs.len(), 1);
         assert_eq!(
             bundle
                 .query_plan
@@ -7246,7 +7189,7 @@ pub(crate) mod tests {
             endpoint_path: "/api/v1/write".into(),
             timestamp_unit: TimestampUnit::UnixMilliseconds,
             require_plan_identity: false,
-            require_summary_definition_identity: false,
+            require_stored_output_identity: false,
             require_registered_producer: false,
         };
         envelope_plan.producers.clear();
@@ -7405,8 +7348,8 @@ pub(crate) mod tests {
             bundle.precompute_plan.schemas[0].window.pane_origin_ms,
             Some(7_000)
         );
-        assert!(bundle.summary_catalog.definitions.contains_key(
-            &asap_types::sds::SummaryDefinitionId::from(config.policy_fingerprint())
+        assert!(bundle.summary_catalog.outputs.contains_key(
+            &asap_types::sds::StoredOutputId::from(config.policy_fingerprint())
         ));
         assert_eq!(
             bundle
@@ -7446,7 +7389,7 @@ pub(crate) mod tests {
             let compiled =
                 DeploymentPlanCompiler.compile_promql(request(query_id, promql), deployment);
             let plan = compiled.unwrap_or_else(|error| panic!("{promql} must compile: {error}"));
-            assert_eq!(plan.summary_catalog.definitions.len(), 1, "{promql}");
+            assert_eq!(plan.summary_catalog.outputs.len(), 1, "{promql}");
             assert_eq!(plan.query_plan.entries.len(), 1, "{promql}");
             assert!(plan.collector_plans.is_empty(), "{promql}");
             let entry = plan.query_plan.entries.values().next().unwrap();
@@ -7573,7 +7516,7 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(bundle.query_plan.entries.len(), 4);
-        assert_eq!(bundle.summary_catalog.definitions.len(), 1);
+        assert_eq!(bundle.summary_catalog.outputs.len(), 1);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.schemas.len(), 1);
         assert_eq!(bundle.precompute_plan.producers.len(), 2);
@@ -7598,6 +7541,7 @@ pub(crate) mod tests {
         };
         let merge = Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryMerge {
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 children: vec![left.clone(), right.clone()],
             },
             schema: left.schema.clone(),
@@ -7615,7 +7559,7 @@ pub(crate) mod tests {
         let bundle = DeploymentPlanCompiler
             .compile_promql(compilation_request, environment(10_000))
             .expect("compile merged post-ASAP DAG");
-        assert_eq!(bundle.summary_catalog.definitions.len(), 2);
+        assert_eq!(bundle.summary_catalog.outputs.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         assert_eq!(
             bundle
@@ -7647,7 +7591,7 @@ pub(crate) mod tests {
             .values()
             .filter_map(|node| match node {
                 crate::query_plan::QueryPlanNode::ReadMaterialization { binding } => Some(
-                    bundle.summary_catalog.data_descriptors[&bundle.summary_catalog.definitions
+                    bundle.summary_catalog.data_descriptors[&bundle.summary_catalog.outputs
                         [&binding.materialization]
                         .data_descriptor_id]
                         .time_series_metric()
@@ -7798,7 +7742,9 @@ pub(crate) mod tests {
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         env.target_collector_ids.clear();
-        let bundle = DeploymentPlanCompiler.compile_promql(workload, env).unwrap();
+        let bundle = DeploymentPlanCompiler
+            .compile_promql(workload, env)
+            .unwrap();
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
     }
 
@@ -7948,7 +7894,7 @@ pub(crate) mod tests {
         let bundle = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .expect("certified TopK compiles");
-        assert_eq!(bundle.summary_catalog.definitions.len(), 1);
+        assert_eq!(bundle.summary_catalog.outputs.len(), 1);
         assert_eq!(
             bundle.collector_plans[0].materializations[0]
                 .evidence_source

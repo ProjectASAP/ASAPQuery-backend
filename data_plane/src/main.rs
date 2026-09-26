@@ -750,7 +750,7 @@ async fn main() -> Result<()> {
             endpoint_path: "/v1/metrics".into(),
             timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
             require_plan_identity: false,
-            require_summary_definition_identity: false,
+            require_stored_output_identity: false,
             require_registered_producer: false,
         },
         schemas: Vec::new(),

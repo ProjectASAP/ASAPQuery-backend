@@ -9,17 +9,17 @@ pub fn install_selected_dag(
     query_plan_sink: QueryNodeId,
     materialization: impl Fn(
         planner_types::post_asap::PostAsapNodeId,
-    ) -> Option<asap_types::sds::SummaryDefinitionId>,
+    ) -> Option<asap_types::sds::StoredOutputId>,
     query_node: impl Fn(planner_types::post_asap::PostAsapNodeId) -> Option<QueryNodeId>,
 ) -> Result<InstalledPostAsapDag, String> {
     let mut nodes = std::collections::BTreeMap::new();
     let mut precompute_sinks = Vec::new();
     for node in &dag.nodes {
-        let binding = if let Some(summary_definition) = materialization(node.id) {
+        let binding = if let Some(stored_output) = materialization(node.id) {
             precompute_sinks.push(node.id);
-            BackendNodeBinding::Materialization { summary_definition }
+            BackendNodeBinding::Materialization { stored_output }
         } else if node.output_state.timing
-            == planner_types::post_asap::ExecutionTiming::MaintenanceTime
+            == planner_types::post_asap::ExecutionTiming::IngestionTime
         {
             BackendNodeBinding::MaintenanceInput
         } else {
