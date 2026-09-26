@@ -158,6 +158,8 @@ pub struct PhysicalCompilationRequest {
     pub planner_selection_trace: Vec<serde_json::Value>,
     /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
     pub allow_mixed_summary_and_exact_execution: bool,
+    /// Deployment feasibility: external exact dependencies cannot be bound.
+    pub require_backend_local_execution: bool,
     /// Enabled optional candidate keys: None enables all eligible keys; an
     /// explicitly empty set enables none. These are not catalog definition IDs.
     pub enabled_materialization_keys: Option<BTreeSet<String>>,
@@ -370,6 +372,9 @@ pub struct BackendLocalPlanningInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPhysicalInputs {
+    /// Constrain selection to local execution when no exact upstream is available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_backend_local_execution: bool,
     pub lifecycle_costs: LifecycleUnitCosts,
     pub evidence_observed_at_unix_ms: u64,
     pub evidence_valid_for_ms: u64,
@@ -949,6 +954,9 @@ impl BackendLocalPlanningInput {
             PhysicalCompilationRequest {
                 planner_selection_trace,
                 allow_mixed_summary_and_exact_execution: true,
+                require_backend_local_execution: self
+                    .physical_inputs
+                    .require_backend_local_execution,
                 enabled_materialization_keys: None,
                 query_workload: Some(workload),
                 data_workload: Some(data_workload),
@@ -2251,6 +2259,20 @@ impl DeploymentPlanCompiler {
                     query_id: "summary-catalog".into(),
                     reason: error.to_string(),
                 })?;
+        }
+        if request.require_backend_local_execution {
+            for entry in query_plan.entries.values() {
+                if entry.nodes.values().any(|node| matches!(node,
+                    crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                        | crate::query_plan::QueryPlanNode::Logical {
+                            operator: crate::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
+                                | crate::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }, .. })) {
+                    return Err(CompileError::Query {
+                        query_id: entry.query_id.clone(),
+                        reason: "external execution is unavailable in this deployment".into(),
+                    });
+                }
+            }
         }
         query_plan.validate_against_catalog(&summary_catalog)?;
         let storage_routing = crate::emit::backend_wire::storage_routing_document(
@@ -4901,6 +4923,7 @@ pub(crate) mod tests {
             planner_selection_trace: Vec::new(),
             canonical_roots: Vec::new(),
             allow_mixed_summary_and_exact_execution: false,
+            require_backend_local_execution: false,
             enabled_materialization_keys: None,
             query_workload: None,
             data_workload: None,
@@ -7813,6 +7836,7 @@ pub(crate) mod tests {
             query_workload,
             data_workload,
             physical_inputs: BackendLocalPhysicalInputs {
+                require_backend_local_execution: false,
                 lifecycle_costs: template.summary_lifecycle_inputs.costs,
                 evidence_observed_at_unix_ms: 9_500,
                 evidence_valid_for_ms: 60_000,
