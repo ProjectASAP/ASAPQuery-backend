@@ -327,3 +327,17 @@ fn snapshot_preserves_replay_evaluation_phase() {
     assert_eq!(demand["interval"], 1000);
     assert_eq!(demand["evaluation_phase"], 396);
 }
+
+/// Declared replay cadence must cover actual input gaps for spatial history.
+#[test]
+fn differential_snapshot_uses_actual_fixture_cadence() {
+    let data = Dataset::load(Path::new("../datasets/aggregations-dense-cadence.yaml")).unwrap();
+    let suite = Suite::load(Path::new("../suites/issue-702.yaml")).unwrap();
+    let snapshot = planning::snapshot(&suite, &data, 10000, 0, false).unwrap();
+    let value = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(value["implementation"]["scrape_interval_ms"], 60000);
+    assert_eq!(
+        value["data_workload"]["data_ingestion_interval"]["value"],
+        60000
+    );
+}

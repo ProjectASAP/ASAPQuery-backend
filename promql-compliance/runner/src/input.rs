@@ -215,6 +215,33 @@ impl Dataset {
         }
         Ok(data)
     }
+    /// Complete replay bounds: total source rate and largest per-series gap.
+    pub fn replay_demand(&self) -> Result<(f64, u64, usize)> {
+        let mut rate = 0.;
+        let mut cadence = 0;
+        let mut count = 0;
+        for series in &self.series {
+            ensure!(
+                series.samples.len() >= 2,
+                "replay cadence needs two samples per series"
+            );
+            let first = offset_ms(series.samples.first().unwrap().offset_seconds)?;
+            let last = offset_ms(series.samples.last().unwrap().offset_seconds)?;
+            rate += (series.samples.len() - 1) as f64 * 1000. / (last - first) as f64;
+            for pair in series.samples.windows(2) {
+                let gap = offset_ms(pair[1].offset_seconds)? - offset_ms(pair[0].offset_seconds)?;
+                ensure!(gap > 0, "replay timestamps must increase");
+                cadence = cadence.max(gap as u64);
+            }
+            count += series.samples.len();
+        }
+        ensure!(
+            cadence > 0 && rate.is_finite() && rate > 0.,
+            "empty replay demand"
+        );
+        Ok((rate, cadence, count))
+    }
+
     pub fn uniform_demand(&self) -> Result<(f64, u64, usize)> {
         let mut cadence = None;
         let mut count = 0;
