@@ -24,10 +24,92 @@ pub struct RuntimePhysicalPlan {
     pub transmission_plan: asap_types::producer_plan::TransmissionPlan,
     pub installed_precompute_plan: Arc<InstalledPrecomputePlan>,
     pub query_plan: Arc<asap_types::query_plan::QueryPlan>,
+    /// Immutable readout-boundary programs for this snapshot. This holds plan
+    /// metadata only; data, coverage and readiness are resolved on every run.
+    pub readout_programs: Arc<PreparedReadoutPrograms>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 }
 
+type ReadoutRoots =
+    BTreeMap<asap_types::query_plan::QueryNodeId, Arc<asap_types::query_plan::QueryPlanEntry>>;
+
+#[derive(Debug, Default)]
+struct ReadoutProgramRegistry {
+    query_plan: Option<Arc<asap_types::query_plan::QueryPlan>>,
+    entries: std::collections::HashMap<asap_types::QueryLanguage, BTreeMap<String, ReadoutRoots>>,
+}
+
+#[derive(Debug, Default)]
+pub struct PreparedReadoutPrograms {
+    registry: std::sync::Mutex<ReadoutProgramRegistry>,
+}
+
 impl RuntimePhysicalPlan {
+    /// Prepare an already-selected readout boundary once for this immutable
+    /// deployment snapshot. No rows, state, results or readiness are retained.
+    pub(crate) fn readout_program(
+        &self,
+        entry: &asap_types::query_plan::QueryPlanEntry,
+        root: asap_types::query_plan::QueryNodeId,
+    ) -> Result<Arc<asap_types::query_plan::QueryPlanEntry>, String> {
+        let mut programs = self
+            .readout_programs
+            .registry
+            .lock()
+            .map_err(|_| "readout program registry poisoned".to_string())?;
+        // Cloning a snapshot and replacing its QueryPlan must not preserve
+        // bindings from the previous immutable plan, even with identical names.
+        if programs
+            .query_plan
+            .as_ref()
+            .is_none_or(|installed| !Arc::ptr_eq(installed, &self.query_plan))
+        {
+            programs.entries.clear();
+            programs.query_plan = Some(Arc::clone(&self.query_plan));
+        }
+        if let Some(program) = programs
+            .entries
+            .get(&entry.language)
+            .and_then(|queries| queries.get(&entry.canonical_query))
+            .and_then(|roots| roots.get(&root))
+        {
+            return Ok(Arc::clone(program));
+        }
+        let reachable = entry
+            .topological_order_from(root)
+            .map_err(|error| error.to_string())?;
+        let mut program = entry.clone();
+        program.root = root;
+        program.nodes = reachable
+            .into_iter()
+            .map(|id| (id, entry.nodes[&id].clone()))
+            .collect();
+        let windows: std::collections::BTreeSet<_> = program
+            .materialization_bindings()
+            .iter()
+            .map(|binding| binding.readout_lookback_ms)
+            .collect();
+        if windows.len() != 1 || windows.contains(&None) || windows.contains(&Some(0)) {
+            return Err("bound subtree requires one explicit positive window".into());
+        }
+        program.instant.lookback_ms = windows
+            .first()
+            .copied()
+            .flatten()
+            .expect("explicit semantic lookback checked");
+        program.instant.full_history = false;
+        program.instant.cumulative_readout = true;
+        let program = Arc::new(program);
+        programs
+            .entries
+            .entry(entry.language)
+            .or_default()
+            .entry(entry.canonical_query.clone())
+            .or_default()
+            .insert(root, Arc::clone(&program));
+        Ok(program)
+    }
+
     pub fn plan_id(&self) -> u64 {
         self.envelope.plan_id
     }
@@ -625,6 +707,7 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         RuntimePhysicalPlan {
+            readout_programs: Default::default(),
             envelope: envelope.clone(),
             summary_catalog: None,
             precompute_plan: asap_types::precompute_plan::PrecomputePlan {
@@ -674,6 +757,75 @@ mod tests {
             }),
             storage_routing: Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         }
+    }
+
+    #[test]
+    fn readout_programs_follow_replaced_query_plan_bindings() {
+        use asap_types::query_plan::*;
+        let entry = |id: u64| QueryPlanEntry {
+            language: asap_types::QueryLanguage::PromQl,
+            query_id: "sum_over_time(m[1m])".into(),
+            canonical_query: "sum_over_time(m[1m])".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(1),
+            nodes: BTreeMap::from([
+                (
+                    QueryNodeId(0),
+                    QueryPlanNode::ReadMaterialization {
+                        binding: MaterializationBinding {
+                            materialization: asap_types::PolicyFingerprint(id).into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    asap_types::PolicyFingerprint(id).into(),
+                                ),
+                            output_grouping: PhysicalGrouping::PerEntity,
+                            item_labels: vec![],
+                            window_ms: 5000,
+                            pane_origin_ms: Some(0),
+                            readout_lookback_ms: Some(60000),
+                            full_window_slide_ms: None,
+                        },
+                    },
+                ),
+                (
+                    QueryNodeId(1),
+                    QueryPlanNode::ExactReadout {
+                        input: QueryNodeId(0),
+                        readout: ExactReadout::Sum,
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 60000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let mut original = physical_plan(1, 1, 0, None);
+        let first_entry = entry(1);
+        Arc::make_mut(&mut original.query_plan)
+            .entries
+            .insert(first_entry.canonical_query.clone(), first_entry.clone());
+        let first = original
+            .readout_program(&first_entry, first_entry.root)
+            .unwrap();
+        let mut successor = original.clone();
+        let second_entry = entry(2);
+        Arc::make_mut(&mut successor.query_plan)
+            .entries
+            .insert(second_entry.canonical_query.clone(), second_entry.clone());
+        let second = successor
+            .readout_program(&second_entry, second_entry.root)
+            .unwrap();
+        assert_eq!(
+            first.materialization_bindings()[0].materialization,
+            asap_types::PolicyFingerprint(1).into()
+        );
+        assert_eq!(
+            second.materialization_bindings()[0].materialization,
+            asap_types::PolicyFingerprint(2).into()
+        );
     }
 
     fn dummy_agg(id: u64) -> PrecomputeMaterialization {
