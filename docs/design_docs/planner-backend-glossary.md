@@ -49,6 +49,8 @@ Migration of existing types and fields is covered in the
 | `SummaryStore` | Persistence authority for summary definitions and concrete stored results; Planner defines semantics and deployment installs them. The current implementation is `SketchStore`; no separate metadata or payload service is required. |
 | `plan_version` | Version shared by an installed plan bundle and its catalog bindings. Creating or updating state instances does not itself change this version. |
 | Schema / encoding | Schema describes the state structure; encoding describes how that structure is represented as bytes. |
+| Semantic discovery | Future Planner search for legal query rewrites over persisted definitions; distinct from fingerprint equality and record lookup. |
+| Deployment resolution | Backend selection of authorized stored outputs realizing a selected definition. |
 | Definition ID | Fingerprint of a versioned canonical semantic description; different input expressions must remain distinguishable. |
 | Provenance | Mapping from physical plan operations back to the selected Planner computation. |
 
