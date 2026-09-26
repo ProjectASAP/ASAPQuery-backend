@@ -670,13 +670,7 @@ pub fn select_candidates(
     let mut comparison_workload = None;
     let mut comparison_inputs = None;
     let mut candidate_evaluations = Vec::new();
-    let mut best_index = 0;
-    let mut best: Option<(
-        Cost,
-        CompiledPhysicalPlan,
-        WorkloadCostManifest,
-        BTreeMap<String, f64>,
-    )> = None;
+    let mut priced_candidates = Vec::new();
     for candidate in candidates {
         if evidence.is_none() {
             let inputs = json!({"data":candidate.data_workload,"erp":candidate.erp});
@@ -737,10 +731,13 @@ pub fn select_candidates(
                 description.status = CandidateEvaluationStatus::Unselected;
                 description.total_cost = Some(cost.0);
                 candidate_evaluations.push(description);
-                if best.as_ref().is_none_or(|(previous, ..)| cost < *previous) {
-                    best_index = candidate_evaluations.len() - 1;
-                    best = Some((cost, plan, manifest, components));
-                }
+                priced_candidates.push(Ok((
+                    cost,
+                    plan,
+                    manifest,
+                    components,
+                    candidate_evaluations.len() - 1,
+                )));
             }
             Err((status, reason)) => {
                 description.status = status;
@@ -749,13 +746,27 @@ pub fn select_candidates(
             }
         }
     }
-    let (_, mut plan, selected_manifest, component_costs) = best.ok_or_else(|| {
+    let selected = asap_physical_operators::physical_planner::select_candidate(
+        priced_candidates,
+        |(cost, _, manifest, _, _)| {
+            Ok(Some(
+                asap_physical_operators::physical_planner::CandidateCost {
+                    workload_scope: serde_json::to_string(&manifest.workload).map_err(|error| {
+                        asap_physical_operators::Error::Invalid(error.to_string())
+                    })?,
+                    horizon_seconds: manifest.horizon_seconds,
+                    total_cost: cost.0,
+                },
+            ))
+        },
+    )
+    .map_err(|error| {
         CompileError::Candidates(
             json!({"status": "all_infeasible", "logical_selection": planner_selection_trace,
-            "candidates": candidate_evaluations}),
+            "candidates": candidate_evaluations, "selection_error": error.to_string()}),
         )
     })?;
-    // Exactly the winner retained by the existing strict-less-than selector.
+    let (_, mut plan, selected_manifest, component_costs, best_index) = selected.candidate;
     candidate_evaluations[best_index].status = CandidateEvaluationStatus::Selected;
     plan.cost_comparison = Some(CandidatePlanSelectionReport {
         planner_selection_trace,
