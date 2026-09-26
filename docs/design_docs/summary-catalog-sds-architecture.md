@@ -15,8 +15,8 @@ associate each record with its concrete data scope and format. It must do this
 without inventing another expression language or requiring a live Planner process.
 
 The design has two stored objects: `SummaryDefinition` describes parameterized
-computation using Planner IR; `StoredSummary` contains one concrete result and
-references that definition. One `SummaryStore` owns both.
+computation using a Planner-defined semantic representation; `StoredSummary` contains one concrete result and
+references that definition. `SummaryStore` is the persistence authority for both.
 
 Goals are semantic identity, recoverable definitions, explicit read eligibility
 and shared state across compatible consumers. SDS does not perform planning,
@@ -26,7 +26,7 @@ execute expressions, choose materialization boundaries or schedule maintenance.
 
 ```text
 Planner selected computation
-    ↓ export normalized, typed computation rooted at persisted output
+    ↓ export minimal canonical semantics for persisted output
 SummaryDefinition
     ↑ definition_id
 StoredSummary: concrete group/window/revision + format + payload
@@ -36,9 +36,9 @@ Precompute writer / query reader
 
 | Owner | Responsibility |
 | --- | --- |
-| Planner | Canonical computation semantics, typed IR export and versioned normalization rules |
-| Deployment compiler | Associate selected physical outputs with definitions and concrete storage bindings |
-| SummaryStore | Persist immutable definitions and committed records; enforce their references and read contracts |
+| Planner | Computation semantics, canonical semantic export and versioned normalization rules |
+| Deployment compiler | Associate selected physical outputs with semantic definitions and concrete storage bindings; include definitions in the installation bundle |
+| SummaryStore | Act as persistence authority for definitions and concrete stored results; enforce references and read contracts |
 | Shared executor | Execute Planner-provided Physical DAGs; SDS descriptions do not become a second execution path |
 
 This follows the [canonical planning/deployment boundary](https://github.com/ProjectASAP/ASAPPlanner/blob/e9390031fcecd7bc0d611127eddc5c6603a281e5/docs/design_docs/physical-planning-and-deployment.md).
@@ -49,10 +49,18 @@ or fetching a mutable branch from a repository.
 
 ## 3. SummaryDefinition: the meaning of a result
 
-A definition contains a normalized, typed logical Post-ASAP computation fragment
-rooted at the persisted output. It includes all dependencies needed to interpret
-that output, including retained Pre-ASAP expressions. It excludes unrelated
-query consumers and physical storage locations.
+`SummaryDefinition` is a semantic description and identity contract, not an
+executable plan. It uses a Planner-defined canonical semantic representation
+containing only the dependency closure needed to distinguish and interpret the
+persisted output. It does not promise to reconstruct or execute the original
+logical plan.
+
+Planner owns these semantics. The deployment compiler supplies their definition
+for installation, and SummaryStore persists it. Reusing Planner's typed
+expressions is appropriate; persisting its complete internal IR is not required.
+Unrelated consumers, optimizer annotations, execution phases, physical algorithms
+and deployment locations are outside this description unless they affect the
+meaning of the output itself.
 
 ### Input semantics are necessary but not sufficient
 
@@ -81,20 +89,25 @@ The conceptual persisted envelope is:
 ```yaml
 summary_definition:
   id: <versioned-semantic-fingerprint>
-  planner_ir_version: <supported-semantic-format-version>
+  semantic_format_version: <supported-description-version>
   canonicalization_version: <normalization-version>
-  computation: <serialized-normalized-typed-Planner-fragment>
-  output: <root-in-that-fragment>
-  parameters: <typed-parameter-contract-exported-by-Planner>
+  semantics: <canonical-typed-semantic-description>
+  output: <described-result>
+  parameters: <semantic-parameter-contract>
 ```
 
-This is an ownership illustration, not a new node schema. `computation` reuses
-Planner IR, including schemas and summary parameters; SDS does not define its own
-Scan/Project/Build variants or copy them into separate source/filter fields.
-`parameters` represents Planner-owned placeholders such as an evaluation endpoint
-or input interval. Time bounds, time-column interpretation, alignment and pane
-requirements must be unambiguous in the exported contract. If required semantics
-are not exportable, that definition is unsupported rather than partially recorded.
+This envelope illustrates ownership, not a second node schema. `semantics`
+reuses Planner-defined expression and operation meanings without requiring its
+internal plan serialization. Time bounds, time-column interpretation, alignment
+and pane requirements must remain unambiguous. If required semantics cannot be
+exported, the definition is unsupported rather than partially recorded.
+
+The semantic format has its own explicit compatibility contract. Internal Planner
+refactoring or a new optimizer annotation must not automatically change persisted
+identity or force a state migration. A change to actual operator semantics may
+require a new semantic version and an explicit compatibility decision. Readers
+need a supported semantic-description decoder, not the original Planner binary
+or executable logical plan.
 
 ### Definition boundary and sharing
 
@@ -193,11 +206,11 @@ Both definition and record must survive restart.
 
 ## 6. Deployment references and storage
 
-One store owns two logical tables:
+SummaryStore is the persistence authority for two logical tables:
 
 | Table | Contents |
 | --- | --- |
-| `summary_definitions` | Definition ID → immutable canonical computation and its versioned contract |
+| `summary_definitions` | Definition ID → immutable canonical semantic description and its versioned contract |
 | `stored_summaries` | Concrete lookup key → committed record metadata and payload |
 
 A `StoredOutputReference` is part of an installed plan:
@@ -212,6 +225,29 @@ The enclosing plan supplies its version; the reader supplies group/time selectio
 and required revision/coverage. The output identity names the authorized producer,
 while definition identity describes meaning. Equal definitions do not authorize
 reading another plan's output or bypassing its freshness requirements.
+
+### Why semantic and deployed-output identities are separate
+
+Even within one plan version, two authorized outputs can have the same semantic
+definition:
+
+```text
+Plan version 42, definition D = KLL(latency, k=200)
+
+stored_output_id = hot       → serving output, current committed revision
+stored_output_id = rebuild   → independently rebuilt output under validation
+```
+
+Both summarize the same expression, but have different writers, readiness and
+publication policies. A serving reader bound to `hot` must not consume `rebuild`
+merely because its definition matches. The key
+`(plan_version, definition_id, group_key, window)` would collapse these outputs
+even within this single plan version.
+
+`definition_id` identifies meaning; `stored_output_id` identifies the authorized
+deployed output. Equal semantics do not imply interchangeable deployment state.
+These IDs do not require a separate Materialization object or registry: the
+output identity and its authorization live in installed boundary bindings.
 
 Installation validates definitions, their dependency closure and matching
 physical-boundary bindings as one bundle. Records become visible only when their
@@ -247,7 +283,8 @@ unavailability policy. Installation alone does not establish future readiness.
 A flat source/filter/grouping/window definition is simple but loses value
 expressions and arbitrary input computation. A separate SDS expression language
 would restore that detail at the cost of duplicating Planner semantics. Reusing
-Planner's canonical typed computation avoids both problems.
+Planner's canonical semantic representation avoids both problems. Its persistent
+format must be stable independently of internal Planner IR refactoring.
 
 Embedding the full definition in every record simplifies standalone transfer but
 repeats metadata. Persisting it once and referencing it keeps records small;
@@ -276,7 +313,7 @@ Acceptance tests must establish:
   payloads remain unreadable; replacement snapshots are not double-counted.
 - Writers cannot publish a different definition under an authorized output ID.
 
-Implementation must first establish the Planner-owned export/canonicalization
+Implementation must first establish the Planner-owned semantic export/canonicalization
 contract. Legacy definitions lacking required expressions cannot be assigned a
 new identity by guessing omitted semantics. They require reconstruction from an
 authoritative plan or an explicit unsupported/rebuild outcome.
