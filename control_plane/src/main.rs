@@ -662,6 +662,7 @@ fn compile_physical_plan_request(
         queries,
         allow_mixed_summary_and_exact_execution: request.target
             == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+        require_backend_local_execution: false,
         enabled_materialization_keys: None,
         topk_membership_evidence_by_query_id: request.evidence,
         exact_composition_costs: request.exact_composition_costs,
