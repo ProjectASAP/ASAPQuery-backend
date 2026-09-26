@@ -1,387 +1,400 @@
-# Summary storage and Self-Describing Summary architecture
+# Self-Describing Summary: Semantic Definitions and Stored Results
 
-Status: proposed contract with current-backend migration notes. The names below
-are design vocabulary; existing Rust types and persisted wire fields are not
-renamed by this documentation change. Audience:
-developers compiling, storing, recovering or reading summary state.
+Status: target design. Ad-hoc discovery is a future extension, not implemented
+behavior claimed by this document.
 
-Terminology: [Planner/backend glossary](planner-backend-glossary.md).
+## 1. Why SDS?
 
-## Purpose and scope
+Stored summary bytes are not enough to determine what they mean.
 
-The Self-Describing Summary (SDS) model defines the meaning and representation
-of summary records in one `SummaryStore`. It connects PrecomputePlan writers to QueryPlan readers
-without requiring either runtime to reinterpret Planner IR.
+For example:
 
-This document owns summary identity, schema, state references and the conditions
-for reading an instance. The [integration design](asapplanner-integration.md) owns
-executable plan splitting; the [migration plan](asapplanner-migration-plan.md)
-owns delivery.
-Cost ranking, operator scheduling and transmission policy are outside SDS.
-
-## Document map
-
-1. [Architecture at a glance](#architecture-at-a-glance)
-2. [Worked example](#worked-example)
-3. [Core objects](#core-objects)
-4. [Identity and reference rules](#identity-and-reference-rules)
-5. [Plan and storage contract](#plan-and-storage-contract)
-6. [Read eligibility](#read-eligibility)
-7. [Validation and migration](#validation-and-migration)
-8. [Deferred work](#deferred-work)
-
-## Architecture at a glance
-
-V1 has exactly two stored data objects: `SummaryDefinition` and `StoredSummary`.
-One `SummaryStore` owns their two logical tables:
-
-| Table | Row type | What it stores |
-| --- | --- | --- |
-| `summary_definitions` | `SummaryDefinition` | Definition ID → source/filter, input value, family, parameters, grouping and time semantics |
-| `stored_summaries` | `StoredSummary` | Concrete record key → definition ID, actual format, coverage and payload |
-
-The compiler supplies a definitions snapshot with the plan bundle. Installation
-validates it and registers its rows in `summary_definitions`. The snapshot is an
-installation artifact, not another storage service. Precompute execution writes
-complete records to `stored_summaries`; query execution reads those records using
-its installed output reference and partition selection. A row is visible to
-readers only after its metadata and payload are committed together logically.
-
-These are logical tables within the existing storage engine; this design does
-not require a new SQL database. The store may use separate files or indexes
-internally. V1 introduces neither `SummaryMetadataStore` nor
-`SummaryPayloadStore`, nor a separate catalog `Materialization` object.
-
-Shared semantic metadata lives once in `SummaryDefinition`; each `StoredSummary`
-references it by `definition_id`. Instance-specific metadata (population, window,
-actual coverage and format) and payload together form that `StoredSummary`.
-Separating an internal index from payload files does not introduce a third data
-object. V1 reuses existing storage facilities without requiring either physical
-co-location or a new metadata/payload storage split.
-
-```mermaid
-flowchart LR
-  C[Compiler and plan installation] -->|register definitions| D
-  P[PrecomputePlan writer] -->|publish committed record| R
-  Q[QueryPlan reader] -->|lookup and validate record| R
-  subgraph S[SummaryStore: one storage engine]
-    D[summary_definitions: summary meaning]
-    R[stored_summaries: metadata and payload]
-    R -->|definition_id| D
-  end
+```text
+KLL(latency)
 ```
 
-The compiler assigns a `stored_output_id` to each PrecomputePlan DAG output that
-is persisted. The PrecomputePlan writer and QueryPlan readers use this ID to name
-the same output within one plan version. It is a binding ID, not a memory slot or
-a separate storage object.
+and
 
-## Worked example
+```text
+KLL(log(latency))
+```
 
-`plan_version` identifies the coherent version of PrecomputePlan, QueryPlans
-and their catalog bindings installed together. The value `42` below is an
-illustrative version identifier. Updating summary contents or publishing a new
-time partition does not change the plan version. State readiness is tracked
-separately; installing a plan version does not make its required state ready.
+may have the same source, grouping, window, and sketch format, but they cannot
+be used interchangeably to answer queries.
 
-Two queries request different percentiles from the same five-minute KLL summary:
+SDS therefore separates:
+
+```text
+SummaryDefinition = what a summary means
+StoredSummary     = one concrete result of that definition
+```
+
+This supports two use cases:
+
+1. **Bound queries:** an installed QueryPlan reads the specific SDS output
+   selected during planning.
+2. **Future ad-hoc queries:** Planner can search existing SummaryDefinitions and
+   determine whether an SDS can legally support a new query.
+
+SDS describes stored computation. It does not plan queries, execute operators,
+or choose materialization boundaries.
+
+## 2. Architecture
+
+```text
+                 Planner
+                    │
+       canonical semantic description
+                    ▼
+            SummaryDefinition
+                    ▲
+                    │ definition_id
+              StoredSummary
+       group + window + payload
+                    ▲
+                    │ stored_output_id
+          installed plan binding
+             /             \
+    PrecomputePlan       QueryPlan
+       writes              reads
+```
+
+| Component | Responsibility |
+| --- | --- |
+| Planner | Defines computation semantics and decides whether an SDS can support a query |
+| Deployment compiler | Binds Planner-selected physical outputs to deployed stored outputs |
+| SummaryStore | Persists definitions and concrete summary results |
+| Shared executor | Executes Planner-provided Physical DAGs |
+
+The store knows **what exists**. Planner decides **what can be used**.
+
+## 3. SummaryDefinition: what does this state mean?
+
+A SummaryDefinition is a canonical semantic description of a persisted result.
+
+It contains enough information to distinguish computations such as:
+
+```text
+KLL(latency)
+
+vs.
+
+Project(log(latency))
+        ↓
+KLL
+```
+
+It therefore includes relevant:
+
+- source and filter semantics;
+- value expressions and transformations;
+- grouping and time semantics;
+- summary algorithm and parameters;
+- types and operation semantics.
+
+Conceptually:
 
 ```yaml
-installed_plan:
-  plan_version: 42
-  definitions_snapshot:
-    summary_definition:
-      id: def-api-latency-kll
-      input: request_latency_seconds
-      group_by: [service]
-      range: 5m
-      algorithm: {kind: kll, k: 200}
-
-  precompute_plan:
-    write_state:
-      node_id: write-kll
-      reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
-      schema: kll-v1
-      encoding: kll-binary-v1
-      partition_by: [service, window_end]
-
-  query_plans:
-    q50:
-      read_state:
-        reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
-        expected_schema: kll-v1
-        expected_encoding: kll-binary-v1
-        partition: {service: api, window_end: evaluation_time}
-      estimate: {quantile: 0.50}
-    q99:
-      read_state:
-        reference: {stored_output_id: latency-kll, definition_id: def-api-latency-kll}
-        expected_schema: kll-v1
-        expected_encoding: kll-binary-v1
-        partition: {service: api, window_end: evaluation_time}
-      estimate: {quantile: 0.99}
-
-runtime_summary_store:
-  summary_definitions:
-    def-api-latency-kll:
-      input: request_latency_seconds
-      group_by: [service]
-      range: 5m
-      algorithm: {kind: kll, k: 200}
-  stored_summaries:
-    - key:
-        plan_version: 42
-        stored_output_id: latency-kll
-        population_key: {service: api}
-        window: {start_exclusive: '12:00', end_inclusive: '12:05'}
-      definition_id: def-api-latency-kll
-      format: {schema: kll-v1, encoding: kll-binary-v1}
-      coverage: {start_exclusive: '12:00', end_inclusive: '12:05'}
-      payload: <encoded KLL state>
+summary_definition:
+  id: <semantic-fingerprint>
+  semantic_format_version: <version>
+  semantics: <canonical-typed-description>
+  output: <described-output>
 ```
 
-One shared PrecomputePlan producer writes the required state partitions. Both
-QueryPlans resolve the same stored output and apply different readout parameters.
-They neither create duplicate producers nor search the catalog for alternatives
-at serving time.
+The description reuses Planner-defined semantics, but it is **not an executable
+plan** and does not need to serialize Planner's complete internal IR. It contains
+only the semantic dependencies needed to distinguish and interpret the output.
+Definitions and their required dependencies are persisted so recovery does not
+require a live Planner process.
 
-`runtime_summary_store` is observed runtime data, not part of the installed
-plan. Its example entry says that the `service=api` partition contains encoded
-KLL state covering `(12:00, 12:05]`. The format fields let the reader reject
-incompatible bytes. The row becomes visible only after its payload and metadata
-are committed. No abstract payload locator is required by this design.
+Physical placement, encoding, scheduling, retention, readiness, and plan version
+are not part of semantic identity. Identity uses a versioned canonical semantic
+encoding, not display strings or temporary node IDs. Its encoding and compatibility
+rules must be established before persistence; internal Planner refactoring alone
+must not force state migration. Unknown semantic versions fail validation.
 
-## Core objects
+### Definition boundary
 
-| Object | Meaning | Changes when |
-| --- | --- | --- |
-| `SummaryDefinition` | Canonical input, operation, grouping, time semantics, algorithm and parameters | Summary semantics change |
-| `StoredSummary` | One `SummaryStore` entry: instance metadata plus its associated summary payload | Runtime publishes a new or replacement partition or completed aggregate |
+The definition stops at the persisted output.
 
-`StoredOutputReference` is a reader/writer binding inside an installed plan. It
-names a stored producer output and definition; it is not a third stored data
-object, table, or independently managed entity. The reference example below
-shows how plans locate the two-object storage model.
+```text
+KLL(latency) ──persist──> state
+                            ├── p50
+                            └── p99
+```
 
-### Example: `summary_definitions` describes what to compute
+p50 and p99 can therefore share one KLL SummaryDefinition.
 
-One row says: summarize `request_latency_seconds` values separately for each
-service over a five-minute window using KLL with `k=200`. It applies to all
-services and evaluation windows; it contains no computed sketch bytes.
-The following examples illustrate the design, not a serialized Rust API.
+If p99 itself is persisted:
+
+```text
+KLL(latency) → p99 ──persist──> value
+```
+
+then the readout becomes part of that definition.
+
+## 4. StoredSummary: one concrete result
+
+A StoredSummary instantiates a definition for a particular group and time range.
+The examples illustrate the contract, not a finalized wire schema.
 
 ```yaml
-summary_definitions:
-  def-api-latency-kll:
-    input: {metric: request_latency_seconds, value: sample_value}
-    family: {kind: Sketch, algorithm: KLL, parameters: {k: 200}}
-    group_by: [service]
-    time_semantics: {range: 5m, bounds: "(start, end]"}
-    output_type: kll_state
+stored_summary:
+  key:
+    plan_version: 42
+    stored_output_id: latency-kll
+    group_key: {service: api}
+    window: {start_exclusive: '12:00', end_inclusive: '12:01'}
+  definition_id: <KLL-latency-definition>
+  revision: <input-revision>
+  coverage: complete
+  format: {schema: kll-v1, encoding: kll-binary-v1}
+  payload: <bytes>
 ```
 
-`def-api-latency-kll` is the definition ID. A record for `service=worker` or a
-later five-minute window can refer to this same definition.
+The record answers:
 
-### Example: `stored_summaries` contains an actual computed result
+> Which concrete state is this, what data does it cover, and can it be read?
 
-After precompute finishes the `service=api` window `(12:00, 12:05]`, it publishes
-one committed record containing the identifying metadata and the encoded KLL
-payload. The placeholder below stands for real sketch bytes, not raw samples.
+The SummaryDefinition answers:
 
-```yaml
-stored_summaries:
-  - key:
-      plan_version: 42
-      stored_output_id: latency-kll
-      population_key: {service: api}
-      window: {start_exclusive: '12:00', end_inclusive: '12:05'}
-    definition_id: def-api-latency-kll
-    format: {schema: kll-v1, encoding: kll-binary-v1}
-    coverage: {start_exclusive: '12:00', end_inclusive: '12:05'}
-    payload: <encoded KLL state for these samples>
+> What does this state mean?
+
+SummaryStore persists both:
+
+```text
+summary_definitions
+    definition_id → SummaryDefinition
+
+stored_summaries
+    plan version + deployed output + group + window → StoredSummary
 ```
 
-The `definition_id` connects this result to its meaning in `summary_definitions`.
-A result for `service=worker`, or for `(12:01, 12:06]`, is another record with a
-different key even if it uses the same definition and stored output.
+Metadata and payload become visible together. Completeness is established from
+the producer's input contract, not inferred from interval endpoints alone.
+A replacement snapshot replaces a record's revision; readers must not mix its
+old metadata with new bytes or count both snapshots as separate inputs.
 
-### Example: `StoredOutputReference` connects a reader to its writer
+## 5. Semantic identity vs. deployed-output identity
 
-Within installed plan version `42`, the writer and both percentile readers carry
-the following reference:
+SDS uses two identities because they answer different questions:
+
+```text
+definition_id
+    = What does this state mean?
+
+stored_output_id
+    = Which authorized deployed output does this state belong to?
+```
+
+For example, within the same plan version:
+
+```text
+Definition D = KLL(latency, k=200)
+
+                 D
+              /     \
+           hot      rebuild
+```
+
+Both outputs have identical semantics, but hot may be the active serving output
+while rebuild is still being validated. Even adding plan version to definition
+ID would not distinguish these two outputs.
+
+Therefore:
+
+```text
+definition_id = D
+stored_output_id = hot
+```
+
+must not silently read:
+
+```text
+definition_id = D
+stored_output_id = rebuild
+```
+
+Equal semantics do not imply interchangeable deployed state.
+
+StoredOutputReference binds the two within the enclosing plan version:
 
 ```yaml
 reference:
-  stored_output_id: latency-kll
-  definition_id: def-api-latency-kll
+  stored_output_id: hot
+  definition_id: D
 ```
 
-This names the producer output and its definition; it does not contain a payload
-or select a concrete window. For a request at `12:05` for `service=api`, the
-reader's population and time selection completes the lookup key:
+It is a plan binding, not another stored object or Materialization catalog.
+
+## 6. Reading a bound SDS
+
+For an already planned query:
 
 ```text
-(42, latency-kll, {service: api}, (12:00, 12:05])
-```
-
-The q50 and q99 QueryPlans can resolve that same stored record. Their downstream
-readouts use `quantile=0.50` and `quantile=0.99`, respectively. The reference is
-identical because a different readout does not require another KLL producer.
-The reader still checks the record's definition, format and actual coverage
-before using its payload.
-
-A definition includes every field needed to decide semantic equivalence: source
-and filters, input value, operation or sketch parameters, grouping, time
-semantics, accuracy fields that affect state, and output type. Display names,
-costs, locations, readiness and retention status are excluded.
-
-The former standalone `Materialization` catalog object was an over-abstraction:
-its fields already belong to the definition, executable bindings or runtime
-instance metadata. Their ownership is explicit below.
-
-| Former field | Owner in this design |
-| --- | --- |
-| Materialization ID | Replaced by a compiler-assigned `stored_output_id`, scoped to the plan version, in reader/writer references. |
-| Definition ID | `StoredOutputReference` points to `SummaryDefinition` in `summary_definitions`. |
-| Plan version | Installed plan bundle; persisted instance metadata repeats it for recovery validation. |
-| State family and algorithm parameters | `SummaryDefinition`. |
-| Schema and encoding | Writer configuration and matching reader expectations; instances declare the actual payload format. |
-| Physical partition layout | Writer partitioning and matching reader partition selection. |
-| Permitted writer | PrecomputePlan write binding; runtime validates writes against the installed binding. |
-| Provenance | Compiler's physical-to-semantic node mapping. |
-
-The compiler emits both bindings from one decision and validates agreement
-before installation. Repetition of format fields in the serialized plans does
-not authorize independent selection. The catalog does not need a second registry
-for those fields. The selected deployment guarantee and schedule/retention belong
-to Planner's deployment decision and the installed PrecomputePlan binding;
-observed readiness belongs to instance metadata in `SummaryStore`.
-
-A `StoredSummary` means the complete logical entry in `SummaryStore`: its
-metadata and its associated payload. The metadata records plan version,
-stored-output ID, definition, actual format, partition key,
-coverage/completion, producer sequence where applicable, and integrity data.
-The payload bytes may be stored separately inside the `SummaryStore`
-implementation, but they are not a separate architecture component and never
-belong in definition rows.
-
-## Identity and reference rules
-
-| Identity | Answers |
-| --- | --- |
-| Definition ID | What semantics does the state represent? |
-| Plan version + stored output ID | Which installed producer output does this state belong to? |
-| Stored-summary key | Which concrete population/window record is it? |
-| Plan version | With which atomic installation may it be used? |
-| Schema/encoding ID | How are its bytes interpreted? |
-
-Definition IDs identify rows in `summary_definitions`; plan versions come from
-installation and stored-output IDs from the compiler. The runtime addresses a
-`StoredSummary` by the composite key:
-
-```text
-(plan_version, stored_output_id, population_key, window)
-```
-
-`population_key` contains canonical label names and values. `window` identifies
-the intended time partition, including its boundary convention; actual coverage
-must still satisfy the reader. V1 needs no additional instance UUID. A
-`StoredOutputReference` identifies the output across its records, not a pointer
-to one payload; reader partition/time selection supplies the rest of the lookup.
-Schema/encoding IDs identify supported formats.
-Human-readable names are diagnostics, not join keys. Reuse across plan versions
-requires an explicit compatibility decision; a matching definition ID is
-insufficient.
-
-A `StoredOutputReference` identifies a stored output and definition within the enclosing
-plan version. The reader/writer binding constrains acceptable partition, schema,
-plan version and coverage. A reader binding may select several instances, such
-as panes covering one range, but cannot broaden semantics or substitute another
-algorithm. QueryPlan and derived PrecomputePlan nodes resolve references through
-exact indexed lookup, never serving-time candidate selection.
-
-## Plan and storage contract
-
-```text
-PrecomputePlan
-  Input -> BuildKLL -> Write(output-17, kll-v1)
-
-SDS
-  SummaryStore.summary_definitions: def-9 -> KLL(k=200) and input semantics
-  Plan bundle: version 42; writer/reader bind output-17 to def-9
-  SummaryStore.stored_summaries: key -> definition, format, coverage and payload
-
 QueryPlan
-  Read(output-17, kll-v1) -> SummaryEstimate -> Result
+   │
+   ▼
+StoredOutputReference
+   │
+   ▼
+eligible StoredSummary records
+   │
+   ▼
+Physical DAG execution
 ```
 
-Writer, instance metadata and reader must agree on stored-output ID, definition ID,
-schema/encoding, grouping, time partition and plan version. State family and
-parameters must match the referenced `summary_definitions` row.
-The query runtime follows the installed reference instead of scanning the catalog.
+The runtime checks two things.
 
-A stored summary derived from existing state has a distinct stored-output ID and an explicit
-reference to completed source state:
+**Semantic compatibility**
+
+The record must have the definition selected by Planner. For a binding expecting
+KLL over latency:
 
 ```text
-PrecomputePlan: Read state A -> derive -> Write state B
-QueryPlan:      Read state B -> estimate -> result
+KLL(latency)      ✓
+KLL(log(latency)) ✗
 ```
 
-Source and destination are never represented as the same instance.
+**Instance eligibility**
 
-## Read eligibility
+The concrete record must be committed and have the required:
 
-The immediate use case needs one decision: can this installed QueryPlan read the
-state bound by its `StoredOutputReference`? A read is eligible only when `SummaryStore`
-contains the referenced instance, its payload has been committed, and its plan
-version, definition, schema/encoding, partition and coverage satisfy the reader
-binding. Otherwise the query uses its configured exact fallback or reports that
-the result is unavailable.
+```text
+authorized output / plan version
+group
+window / coverage
+revision
+schema / encoding
+completeness
+```
 
-This design does not introduce a general instance lifecycle. Terms such as
-`Building`, `Draining` and `Retired` belong to existing runtime scheduling and
-cleanup mechanisms where needed; they are not new SDS states. Plan installation
-authorizes a binding but does not by itself make an instance readable.
+For example, a five-minute query may consume five compatible one-minute KLL panes:
 
-## Validation and migration
+```text
+(12:00, 12:01] ─┐
+(12:01, 12:02]  │
+(12:02, 12:03]  ├─→ KLL Merge → p99
+(12:03, 12:04]  │
+(12:04, 12:05] ─┘
+```
 
-Compilation, installation, writes, recovery and reads enforce:
+The runtime verifies complete non-overlapping coverage and compatible revisions.
+It does not decide whether KLL merging is semantically legal; Planner already
+made that decision. Missing or invalid state follows the installed fallback or
+unavailability policy. Plan installation alone does not establish readiness.
 
-1. Each stored-output ID resolves to one definition and authorized producer
-   binding within its plan version; each instance identifies that version and
-   stored output.
-2. Instance metadata declares the payload's actual schema and encoding.
-3. References preserve definition semantics and compatible plan version.
-4. Writer and reader grouping, time partition, schema and coverage agree.
-5. Derived reads meet their completion requirement.
-6. Retirement blocks new bindings before state reclamation.
-7. Unknown schemas, malformed payloads and unauthorized updates fail closed.
+## 7. Future: discovering SDS for an unregistered query
 
-The current backend distributes these responsibilities across `asap_types`,
-control-plane publication and the existing `SketchStore`. Migration reuses its
-authoritative IDs, instance metadata and payload storage rather than creating a
-parallel store. Legacy artifacts are normalized at the backend boundary and
-supported payloads retain versioned readers and fixtures.
+The same definitions can later support queries not known when the SDS was created.
 
-Remove the proposed `materializations` catalog collection and standalone object
-from new plan examples and schemas. Preserve the existing
-`BackendNodeBinding::Materialization` variant as the node-placement marker for
-stored output; it does not imply a catalog object. At the compatibility boundary,
-map legacy stored-output identifiers into version-scoped output IDs and copy their
-format/partition constraints into matching bindings. Preserve payload locators
-and reject unresolved or conflicting mappings; do not rename existing persisted
-IDs or reinterpret legacy wire fields in place. Legacy formats keep their
-versioned readers during the supported migration window.
+Suppose the store already contains:
 
-Runtime-independent contracts and sketch reconstruction belong in neutral
-libraries. Backend storage, scheduling and query execution remain backend-owned;
-the backend must not depend on ASAPCollector.
+```text
+D1 = KLL(latency)
+D2 = KLL(log(latency))
+```
 
-## Deferred work
+and a new query arrives:
 
-SDS does not define CollectorPlan, TransmissionPlan, distributed activation, a
-new checkpoint protocol, a general instance lifecycle, cost/ERP evidence or
-retention-policy selection. Those systems may reference SDS identities without
-becoming part of this model.
+```text
+p99(latency)
+```
+
+Planner can search available definitions:
+
+```text
+New query
+   +
+available SummaryDefinitions
+        │
+        ▼
+Planner semantic matching
+        │
+        ▼
+Can existing SDS support this computation?
+        │
+        ▼
+KLL(latency) → Quantile(0.99)
+        │
+        ▼
+Physical DAG
+        │
+        ▼
+bind to an authorized, eligible stored_output_id
+        │
+        ▼
+QueryPlan
+```
+
+Importantly:
+
+```text
+KLL(latency) ≠ p99(latency)
+```
+
+The SDS is **not equivalent** to the query. It is reusable because Planner knows
+a legal computation, subject to the query's accuracy and input requirements:
+
+```text
+KLL(latency)
+      ↓
+Quantile(0.99)
+```
+
+Likewise, p99(log(latency)) may reuse KLL(log(latency)), but cannot directly
+substitute KLL(latency). Any transformation requires a supported Planner rewrite
+with justified domain, numeric and accuracy semantics.
+
+### Who decides reuse?
+
+```text
+SummaryStore:
+    What SDS definitions and instances exist?
+
+Planner:
+    Can they legally support all or part of this query?
+
+Deployment compiler:
+    Which authorized deployed output realizes the selected definition?
+
+Runtime:
+    Are the required concrete records currently eligible?
+```
+
+SummaryStore therefore does not implement a semantic decision engine such as:
+
+```text
+find_compatible(query)
+```
+
+Semantic compatibility, mergeability, grouping, window composition, accuracy,
+and residual computation remain Planner decisions. Backend capability and
+availability evidence can inform selection; a definition alone does not guarantee
+an executable deployment. Availability must be checked again at execution time.
+This extension does not require another catalog service or a new operator IR.
+
+## 8. Key invariants
+
+1. A SummaryDefinition describes semantics, not execution or deployment.
+2. Different meanings must not share a definition ID; equivalence requires
+   Planner's versioned normalization rather than a store heuristic.
+3. Equal definition IDs do not make different deployed outputs interchangeable.
+4. A writer cannot publish state with a definition different from its installed binding.
+5. Runtime reads require both semantic compatibility and eligible concrete state.
+6. Bound QueryPlans directly resolve their selected outputs; they do not search for alternatives.
+7. Ad-hoc SDS discovery happens through Planner and produces a new bound QueryPlan.
+8. SummaryStore reports available state; it never decides query rewrite legality.
+
+```text
+Planner        → what can compute the query
+Deployment     → which output to use
+SummaryStore   → what state actually exists
+Executor       → run the selected computation
+```
+
+The [deployment design](asapplanner-integration.md) defines compilation and
+execution ownership. The [migration plan](asapplanner-migration-plan.md) defines
+implementation and acceptance gates. This document does not claim that semantic
+fingerprinting or ad-hoc discovery has been implemented.

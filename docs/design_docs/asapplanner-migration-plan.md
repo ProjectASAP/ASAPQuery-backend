@@ -1,172 +1,168 @@
-# PrecomputePlan and QueryPlan migration plan
+# Migration to Planner Physical DAG Deployment
 
-Status: proposed delivery sequence. Audience: backend implementers.
+Status: delivery plan for the [target design](asapplanner-integration.md).
+Audience: backend implementers. This plan does not introduce a second operator
+IR or backend lowering path.
 
-Terminology: [Planner/backend glossary](planner-backend-glossary.md).
+## 1. Outcome
 
-## Goal and scope
+PrecomputePlan and QueryPlan carry Planner-compiled Physical DAGs and backend
+boundary bindings. Both engines execute through the shared physical library.
+The backend owns storage, scheduling, installation and serving; Planner owns
+operator selection and materialization frontiers.
 
-Replace complete post-ASAP DAGs stored under PrecomputePlan with separate
-PrecomputePlan and QueryPlan executable subgraphs connected by SDS state
-references. Also remove the backend build/runtime dependency on ASAPCollector by
-moving shared contracts and reconstruction code to neutral libraries.
+The migration also removes the backend dependency on ASAPCollector. Distributed
+activation, CollectorPlan/TransmissionPlan compilation and new transport
+protocols are outside this delivery.
 
-CollectorPlan, TransmissionPlan, distributed activation, new transport behavior
-and a general ASAPPlanner API redesign are deferred.
-
-## Document map
-
-1. [Migration at a glance](#migration-at-a-glance)
-2. [Worked example](#worked-example)
-3. [Stage 1: inventory and fixtures](#stage-1-inventory-and-fixtures)
-4. [Stage 2: extract common code](#stage-2-extract-common-code)
-5. [Stage 3: bind and split plans](#stage-3-bind-and-split-plans)
-6. [Stage 4: validate and install](#stage-4-validate-and-install)
-7. [Stage 5: migrate and retire](#stage-5-migrate-and-retire)
-8. [Completion evidence](#completion-evidence)
-
-## Migration at a glance
-
-| Stage | Change | Exit gate |
-| --- | --- | --- |
-| 1. Inventory | Freeze current contracts and behavior as fixtures | Every supported path has a fixture or explicit unsupported result |
-| 2. Extract | Move neutral contracts/codecs out of Collector | Backend dependencies and tests contain no ASAPCollector |
-| 3. Split | Derive catalog, maintenance DAGs and query DAGs from one binding | Ownership and state references match selected semantics |
-| 4. Install | Validate and atomically activate one plan version | Invalid snapshots fail without disturbing the active plan version |
-| 5. Retire | Normalize old artifacts and remove superseded paths | Compatibility and end-to-end gates pass |
-
-Do not combine payload-format changes with dependency extraction. Version the new
-plan representation separately from any later wire/schema change.
-
-## Worked example
-
-The current artifact may store this complete DAG under PrecomputePlan:
+## 2. Migration boundaries
 
 ```text
-Input -> BuildKLL -> SummaryEstimate -> Result
+Before
+  full logical DAG + backend semantic-node bindings
+      → backend-specific computation and phase interpretation
+
+After
+  Planner-provided maintenance/query Physical DAGs
+      → backend input/output bindings and operational policy
+      → shared physical execution
 ```
 
-The migration produces:
+The runtime accepts the new deployment artifact. Obsolete plan schemas are
+rejected before activation rather than interpreted through a parallel logical-DAG
+executor. Producers and fixtures move together.
 
-```yaml
-plan_version: 42
-summary_definitions:
-  definition: {id: def-9, algorithm: kll, k: 200}
+Plan-format migration is separate from stored payload compatibility. Supported
+historical payloads retain versioned decoders and fixtures; this does not require
+retaining obsolete plan readers. Do not change sketch byte formats as a side
+effect of moving execution code.
 
-precompute_plan:
-  nodes: [Input, BuildKLL, 'WriteState(output-17)']
-  write_binding: {stored_output_id: output-17, definition_id: def-9, schema: kll-v1}
+## 3. Delivery stages
 
-query_plan:
-  nodes: ['ReadState(output-17)', SummaryEstimate, Result]
-  read_binding: {stored_output_id: output-17, definition_id: def-9, expected_schema: kll-v1}
+| Stage | Work | Exit condition |
+| --- | --- | --- |
+| Inventory | Record current supported computation, state formats and deployment behavior. | Each supported path has a fixture or an explicit unsupported result. |
+| Shared dependencies | Adopt shared operator/runtime and codec contracts; remove Collector dependencies. | Backend builds and tests without ASAPCollector. |
+| Deployment binding | Consume Planner Physical DAGs; bind their typed boundaries and lifecycle. | No backend logical lowering or frontier selection remains in the new path. |
+| Execution and installation | Drive both kinds of DAG through the shared executor and install one coherent bundle. | Identity, resource, failure and readiness tests pass. |
+| Retirement | Switch publications and remove superseded computation paths. | Full-path and recovery tests pass; obsolete plans are rejected. |
 
-provenance:
-  selected_dag: Input -> BuildKLL -> SummaryEstimate -> Result
-```
+### 3.1 Inventory and shared dependencies
 
-The runtime accepts only the current split artifact. Reject obsolete schemas
-before activation; do not retain a parallel reader or complete-DAG executor.
-Migrate producers and fixtures together, and verify the new path against
-independent exact results before deployment.
+Capture fixtures for full/delta decoding, reconstruction, maintenance and
+readout, completion, restart, staging, activation and fallback. Record revision
+and schema provenance. Use semantic checks when randomized bytes are unstable.
+Fixtures may originate from Collector but must run independently of it.
 
-## Stage 1: inventory and fixtures
+Reuse `asap-physical-operators`, `asap_sketch_codec` and sketch-library APIs for
+neutral execution and encoding work. Storage adapters, scheduling and publication
+remain backend-owned. Remove reconstruct-serialize-decode detours and duplicate
+family execution paths when replacing them, with parity evidence.
 
-Inventory Planner output, plan/SDS types, state schemas, envelopes,
-`asap_precompute_rs` imports, Cargo patches, build scripts and tests that invoke
-Collector.
+Inspect manifests, lockfiles, build scripts and tests for direct or transitive
+Collector dependencies, including `asap-precompute-rs` and Collector patches.
 
-Capture fixtures for:
+### 3.2 Deployment binding
 
-- full and delta decoding under the current envelope;
-- summary reconstruction, maintenance updates and query readout;
-- completion, restart and recovery;
-- staging, activation, readiness and fallback.
+Adopt the Planner-owned semantic-description export and versioned canonicalization
+contract for SDS definitions, independent of internal executable IR serialization.
+Persist only the semantic dependency closure needed to interpret each output before records
+can reference semantic fingerprints. Definitions derived from incomplete legacy
+metadata must be reconstructed from authoritative plans or rejected for rebuild;
+do not infer missing expressions from source and grouping alone.
 
-Fixtures may originate from Collector but must run without a Collector checkout
-or process. Record source revision and schema provenance; use semantic assertions
-when randomized sketch bytes are unstable.
+Consume the selected Physical DAGs, physical boundary identities, query
+associations and maintenance requirements. Replace semantic-node classification
+with mappings from declared input/output boundaries to deployment resources.
 
-Preserve each selected deployment guarantee and its schedule/retention from
-Planner selection. A backend that only supports batch construction from data at
-rest must not infer incremental support from recurring query demand.
+- Bind raw slots to readers satisfying source, filter, grouping, window, schema and boundedness requirements.
+- Assign version-scoped stored-output identities to persisted physical outputs.
+- Bind stored inputs to matching outputs and validate grouping, format, coverage
+  and revision requirements.
+- Package the original physical computation with schedules, retention, result
+  routing and publication policy.
 
-## Stage 2: extract common code
+The old `Materialization`, `MaintenanceInput`, `Query` and `QueryInput` semantic
+classification is not a target contract. Logical provenance is diagnostic data
+from Planner, not an instruction to rebuild operators or split a graph.
 
-| Neutral responsibility | Excludes |
-| --- | --- |
-| Envelope metadata, shared IDs/schema references and validation | Planner optimization and runtime executors |
-| Sketch schemas, encode/decode/reconstruction and supported state operations | Window scheduling, host adapters and backend storage |
+No build/readout phase whitelist is introduced. Follow the selected physical
+candidate. If the backend cannot persist a selected scalar or result output,
+report that capability limitation instead of moving operators across a boundary.
 
-Prefer existing sketch-library APIs. Move reusable DDSketch/KLL reconstruction
-out of Collector wrappers and remove reconstruct-serialize-decode round trips.
-Remove obsolete readers and duplicate family-specific execution paths when
-introducing their replacements; require parity evidence before merging.
+A new plan schema version expresses this boundary. Do not reinterpret an old
+field under an unchanged version. Normalize supported legacy stored identities
+during migration with an explicit mapping; preserve payload identity and reject
+unresolved/conflicting mappings.
 
-Remove `asap-precompute-rs` and Collector-specific Cargo patches. Inspect
-manifests, lockfiles, dependency graphs, scripts and required tests for direct or
-transitive Collector dependencies.
+### 3.3 Installation and execution
 
-## Stage 3: bind and split plans
+Validate definitions and boundary bindings against the supplied Physical DAGs.
+Verify all stored-output references, schemas, encodings, partitions and versions,
+then perform deployment resource and capability checks.
 
-Create compiler bindings for semantic nodes, summary definitions,
-version-scoped stored-output IDs, schemas and state references. Derive the
-catalog and both plans from those bindings using the
-[materialization-boundary rules](asapplanner-integration.md#executable-subgraphs-and-materialization-boundaries):
+Stage definitions and both plans as one snapshot. Failed staging leaves the
+active version unchanged. Activation does not establish state readiness; runtime
+input resolution checks actual committed state and applies the installed fallback
+or unavailability policy.
 
-- PrecomputePlan contains maintenance inputs/operators and state sinks.
-- QueryPlan contains state reads, `SummaryEstimate`, exact residuals and results.
-- Derived maintenance uses explicit completed-state references.
-- Shared producers retain one identity and update path.
-- Provenance records semantic operations absorbed into physical nodes.
+Precompute and query engines resolve inputs and drive the shared executor. They
+must not retain a second node traversal that recomputes shared producers. Plan
+visualizations show the supplied DAGs connected by deployed stored-output bindings.
 
-Version the split representation. Do not reinterpret an old field under an
-unchanged schema version.
+### 3.4 Retirement
 
-Do not introduce a standalone catalog `Materialization` object. Keep definitions
-in `SummaryStore.summary_definitions`, format/partition/writer configuration in
-executable bindings, and actual coverage with payloads in
-`SummaryStore.stored_summaries`. Require version-scoped `stored_output_id` values;
-validate all consumers against the same writer configuration. The existing
-`BackendNodeBinding::Materialization` remains a placement marker for stored output.
+Migrate publishers and consumers together with pinned dependencies and matching
+rollback artifacts. Remove obsolete plan adapters, full-logical-DAG execution
+and duplicated operators after the new path passes its gates.
 
-## Stage 4: validate and install
+Storage payload readers remain governed by the supported format policy. Reuse
+across plan versions requires an explicit compatibility decision independently
+of a binary rollback.
 
-Validate definition, stored output, schema, encoding, grouping, time partition,
-coverage and plan version across the catalog and both plans. Then perform local
-resource checks.
+## 4. Acceptance evidence
 
-Stage and activate the three artifacts as one snapshot. Readiness remains
-separate: until coverage is ready, QueryPlan follows its configured fallback or
-explicit unavailability. Failed staging preserves the previous plan version.
+Record tested revisions, supported families/output types and fixture results.
+Acceptance includes:
 
-Render PrecomputePlan and QueryPlan separately, joined by state references.
-Each view labels maintenance-owned and query-owned nodes.
+- Planner computation and boundaries are preserved through installation.
+- One producer serves multiple queries without duplicate maintenance; one query
+  can consume multiple compatible outputs.
+- Shared producers execute once per run; separate runs remain isolated.
+- Supported query-time construction and precomputed finalized outputs follow the
+  selected phases; unsupported output bindings fail explicitly.
+- Missing, overlapping, incomplete or incompatible state fails eligibility.
+- Staging failure, cancellation, resource limits, restart and version switching
+  preserve documented behavior.
+- Obsolete plans are rejected and backend builds/tests do not require Collector.
 
-## Stage 5: migrate and retire
+Trace a query from Planner selection through physical compilation, deployment
+binding, state publication and query execution. Verify exact operations against
+independent results and sketches against their supported guarantees. The design
+is not accepted solely because example schemas parse or unit tests pass.
 
-Release pinned neutral-library versions and matching rollback artifacts.
-Migrate publications and their producers together; do not retain versioned
-adapters for obsolete plan formats.
+## 5. Bound-query SDS implementation across the PR stack
 
-Remove complete-DAG precompute execution and Collector adapter code only after
-fixtures and end-to-end tests pass. State reuse across plan versions requires an
-explicit SDS compatibility decision independently of binary rollback.
+The SDS document is a target contract. The existing definition-keyed storage
+path must not be described as implementing independent deployed-output identity.
+The current migration implements bound queries only; ad-hoc discovery is deferred.
 
-## Completion evidence
+| Implementation owner | Required change | Regression/acceptance gate |
+| --- | --- | --- |
+| Planner shared types and physical integration (#462) | Export a versioned canonical semantic description for a selected persisted output; exclude placement and temporary node IDs. | Different input expressions differ; renumbering preserves identity; state definitions exclude downstream readout parameters. |
+| Backend plan/schema foundation (#749) | Separate semantic definitions from deployed-output bindings; remove the requirement that stored-output ID equals definition ID; version the changed plan contract. | Same-version hot/rebuild outputs can share one definition without aliasing; tampered definitions and mismatched bindings fail installation. |
+| Planner dependency integration (#770) | Consume the shared semantic export and propagate it from selected physical outputs into deployment compilation. | No backend expression normalization or synthetic semantic fingerprint from incomplete config fields. |
+| Precompute/storage integration (#763) | Persist definitions and output-scoped records; authorize writes against installed bindings and recover them consistently. | Restart retains semantic descriptions; wrong-output writes fail; replacement metadata and payload remain consistent. |
+| Query integration (#765) | Resolve the installed deployed output and validate definition, revision, format and coverage before invoking shared execution. | A hot-bound query never reads rebuild state; stale, missing or incompatible records take the explicit failure route. |
+| Acceptance PRs (#728, #742, #759) | Update fixtures and process tests for the new contract; retain existing behavioral and performance gates. | End-to-end producer → persisted definition/record → recovery → bound read, with negative identity and coverage cases. |
 
-Completion requires:
+This table assigns work, not completed implementation. PR ordering must follow
+actual dependency commits; it must not be inferred from an outdated stack list.
+A semantic definition cannot be replaced by a policy fingerprint containing
+physical layout or cadence. Conversely, relaxing an output-reference validator
+without changing storage keys and authorization is insufficient and unsafe.
 
-- summary construction runs only in PrecomputePlan and estimation only in
-  QueryPlan;
-- one query can read multiple summaries and two queries can share one producer;
-- derived state observes completion and schema requirements;
-- invalid bindings fail before activation;
-- restart and plan version switching preserve consistency and fallback;
-- obsolete artifacts are rejected, and the split path matches exact reference
-  results and expected update counts;
-- backend builds and required tests do not fetch, build or run ASAPCollector.
-
-Record tested revisions, supported state families, fixture results and dependency
-checks. Trace one query from its selected semantic root through the state
-writer, SDS reference and QueryPlan reader.
+The implementation must preserve supported payload decoders independently of
+plan-schema retirement. Keep implementation guides accurate to the code until
+each stage lands; then update the APIs, persistence descriptions and test evidence
+in the same implementation PR.
