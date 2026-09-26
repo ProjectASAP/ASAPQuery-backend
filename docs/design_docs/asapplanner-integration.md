@@ -109,7 +109,7 @@ There is no backend `MaintenanceInput`/`QueryInput` decision in this target mode
 Source, filter, grouping and window describe input-data semantics; they are not
 an exhaustive computation schema. The DAG also preserves value expressions,
 upstream transformations, operation parameters and typed output semantics.
-[Summary-definition completeness](summary-catalog-sds-architecture.md#input-semantics-are-necessary-but-not-sufficient)
+[Summary-definition completeness](summary-catalog-sds-architecture.md#3-summarydefinition-what-does-this-state-mean)
 defines what storage compatibility must preserve. The example below abbreviates
 these contracts rather than replacing them with a fixed field list.
 
@@ -264,5 +264,5 @@ A future unregistered-query path may ask Planner to search available SDS
 definitions and rewrite the query over reusable state. Backend then resolves
 authorized outputs and binds the selected Physical DAG normally. This is
 planning before execution, not substitute-summary search inside an installed
-reader. See [SDS semantic discovery](summary-catalog-sds-architecture.md#8-future-semantic-discovery-for-unregistered-queries).
+reader. See [SDS semantic discovery](summary-catalog-sds-architecture.md#7-future-discovering-sds-for-an-unregistered-query).
 It remains outside the initial deployment rollout.
