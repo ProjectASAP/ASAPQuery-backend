@@ -171,9 +171,11 @@ struct Args {
     #[arg(long, default_value = "/var/log/asap")]
     output_dir: String,
 
-    /// Log level
-    #[arg(long, default_value = "INFO")]
-    log_level: String,
+    #[command(flatten)]
+    runtime: data_plane::runtime_config::RuntimeConfig,
+
+    #[command(flatten)]
+    logging: data_plane::runtime_config::LogConfig,
 
     /// Enable profiling (currently unused, kept for compatibility)
     #[arg(long)]
@@ -508,10 +510,13 @@ async fn verify_prometheus_fallback(base_url: &str) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
+    let runtime = args.runtime.build()?;
+    runtime.block_on(run(args))
+}
 
+async fn run(args: Args) -> Result<()> {
     validate_profile(&args)?;
 
     // Create output directory
@@ -519,7 +524,19 @@ async fn main() -> Result<()> {
 
     // Initialize logging similar to Python's create_loggers function
     // Keep the guard alive for the entire lifetime of the application
-    let _log_guard = setup_logging(&args.output_dir, &args.log_level)?;
+    let _log_guard = args.logging.init(std::path::Path::new(&args.output_dir))?;
+    // Persist independently of the log filter, including when all logs are off.
+    let configuration = serde_json::json!({
+        "runtime_workers": tokio::runtime::Handle::current().metrics().num_workers(),
+        "max_blocking_threads": args.runtime.runtime_max_blocking_threads,
+        "precompute_worker_tasks": args.precompute_num_workers,
+        "logging": args.logging, "effective_log_filter": args.logging.filter(),
+        "process_at_startup": data_plane::runtime_config::process_snapshot()
+    });
+    fs::write(
+        std::path::Path::new(&args.output_dir).join("runtime-config.json"),
+        serde_json::to_vec_pretty(&configuration)?,
+    )?;
 
     info!("Starting Query Engine Rust");
     info!("Output directory: {}", args.output_dir);
@@ -1193,6 +1210,10 @@ async fn main() -> Result<()> {
             }
         })
     });
+    fs::write(
+        std::path::Path::new(&args.output_dir).join("runtime-ready.json"),
+        serde_json::to_vec_pretty(&data_plane::runtime_config::process_snapshot())?,
+    )?;
     // Wait for shutdown signal
     tokio::select! {
         result = server.run() => {
@@ -1323,47 +1344,6 @@ async fn spawn_memory_diagnostics(
             }
         }
     }
-}
-
-fn setup_logging(
-    output_dir: &str,
-    log_level: &str,
-) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-    // Create env filter that respects RUST_LOG, with fallback to command line arg
-    let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(log_level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-
-    // Create file appender for logging to file
-    let file_appender = tracing_appender::rolling::never(output_dir, "query_engine.log");
-    let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
-
-    // Create console layer for stdout
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_file(true)
-        .with_line_number(true)
-        .with_target(true)
-        .with_writer(std::io::stdout);
-
-    // Create file layer for file output
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_file(true)
-        .with_line_number(true)
-        .with_target(true)
-        .with_ansi(false) // Disable ANSI color codes in log file
-        .with_writer(non_blocking_file);
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(console_layer)
-        .with(file_layer)
-        .init();
-
-    info!("Logging initialized (respects RUST_LOG environment variable)");
-    info!("Logs will be written to: {}/query_engine.log", output_dir);
-    Ok(guard)
 }
 
 #[cfg(test)]
