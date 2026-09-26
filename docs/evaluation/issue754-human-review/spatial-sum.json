@@ -1,0 +1,2189 @@
+{
+  "envelope": {
+    "plan_id": 3688256239081920855,
+    "plan_version": 1,
+    "generated_at_unix_ms": 10000,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1",
+    "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+    "capability_snapshot_id": "asapquery-local-v1"
+  },
+  "summary_catalog": {
+    "schema_version": 4,
+    "plan_id": 3688256239081920855,
+    "plan_version": 1,
+    "summary_descriptors": {
+      "summary:v3:{\"fidelity\":{\"kind\":\"exact\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"Sum\",\"family\":{\"ExactAggregate\":[\"Sum\",\"Sum\"]},\"kind\":\"configured\",\"parameters\":{\"promql_right_closed\":true}},\"state_schema_version\":1}": {
+        "id": "summary:v3:{\"fidelity\":{\"kind\":\"exact\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"Sum\",\"family\":{\"ExactAggregate\":[\"Sum\",\"Sum\"]},\"kind\":\"configured\",\"parameters\":{\"promql_right_closed\":true}},\"state_schema_version\":1}",
+        "operator": {
+          "kind": "configured",
+          "family": {
+            "ExactAggregate": [
+              "Sum",
+              "Sum"
+            ]
+          },
+          "aggregation_type": "Sum",
+          "aggregation_sub_type": "",
+          "parameters": {
+            "promql_right_closed": true
+          }
+        },
+        "fidelity": {
+          "kind": "exact"
+        },
+        "state_schema_version": 1
+      }
+    },
+    "data_descriptors": {
+      "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:Grouped|7:label_0|32:asap.timestamped-observations.v2": {
+        "id": "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:Grouped|7:label_0|32:asap.timestamped-observations.v2",
+        "source": {
+          "time_series": {
+            "metric": "data"
+          }
+        },
+        "value_projection": "sample_value",
+        "population_filter_canonical": "",
+        "group_by_keys": [
+          "label_0"
+        ],
+        "partitioning": "grouped",
+        "observation_semantics": "asap.timestamped-observations.v2"
+      }
+    },
+    "outputs": {
+      "10394281891663284740": {
+        "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119",
+        "summary_descriptor_id": "summary:v3:{\"fidelity\":{\"kind\":\"exact\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"Sum\",\"family\":{\"ExactAggregate\":[\"Sum\",\"Sum\"]},\"kind\":\"configured\",\"parameters\":{\"promql_right_closed\":true}},\"state_schema_version\":1}",
+        "data_descriptor_id": "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:Grouped|7:label_0|32:asap.timestamped-observations.v2"
+      }
+    },
+    "definitions": {
+      "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119": {
+        "semantic_format_version": 1,
+        "semantics": {
+          "kind": "planner",
+          "fragment": {
+            "format_version": 1,
+            "output": "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65",
+            "nodes": {
+              "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748": {
+                "operation": {
+                  "expression": {
+                    "Scan": {
+                      "predicates": [],
+                      "schema": {
+                        "closed": false,
+                        "columns": [
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "utf8",
+                            "name": "label_0",
+                            "nullable": true,
+                            "table": null
+                          }
+                        ],
+                        "time_index": 0,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "TimeSeries": {
+                          "metric": "data"
+                        }
+                      }
+                    }
+                  },
+                  "kind": "fallback"
+                },
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    }
+                  ],
+                  "time_index": 0
+                },
+                "inputs": [],
+                "record_range": true
+              },
+              "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65": {
+                "operation": {
+                  "family": {
+                    "ExactAggregate": [
+                      "Sum",
+                      "Sum"
+                    ]
+                  },
+                  "grouping": "PerSubpopulationInstance",
+                  "input": {
+                    "item": null,
+                    "weight": {
+                      "Column": "SampleValue"
+                    },
+                    "weight_domain": {
+                      "kind": "unknown_or_signed"
+                    }
+                  },
+                  "kind": "summary_agg",
+                  "reduction": {
+                    "Reduce": [
+                      2
+                    ]
+                  }
+                },
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "ExactAggregate": [
+                          "Sum",
+                          "Sum"
+                        ]
+                      },
+                      "name": "sum",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                },
+                "inputs": [
+                  {
+                    "role": "Input",
+                    "node": "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "collector_plans": [],
+  "precompute_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 3688256239081920855,
+      "plan_version": 1,
+      "snapshot_sha256": "0b3a5b3b0b1a16b1c4159c9faf7339d5d2c04e1d6483dc1b2f227742c28e5222"
+    },
+    "envelope": {
+      "plan_id": 3688256239081920855,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "ingest": {
+      "protocol": "prometheus_remote_write_v1",
+      "endpoint_path": "/api/v1/write",
+      "timestamp_unit": "unix_milliseconds",
+      "require_plan_identity": false,
+      "require_stored_output_identity": false,
+      "require_registered_producer": false
+    },
+    "schemas": [
+      {
+        "stored_output_reference": {
+          "stored_output_id": 10394281891663284740,
+          "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119"
+        },
+        "schema_id": "asap-query-backend.v1:summary-state:v1:10394281891663284740",
+        "schema_version": 1,
+        "materialization": 10394281891663284740,
+        "family": {
+          "family": "exact",
+          "kind": "sum"
+        },
+        "source": {
+          "TimeSeries": {
+            "metric": "data"
+          }
+        },
+        "value_projection": "sample_value",
+        "group_by": [
+          "label_0"
+        ],
+        "window": {
+          "kind": "sliding",
+          "size_ms": 5000,
+          "slide_ms": 10000,
+          "pane_origin_ms": 5000
+        },
+        "encodings": [
+          "exact_accumulator_v1",
+          "planner_exact_accumulator_v1"
+        ]
+      }
+    ],
+    "producers": [],
+    "materializations": [
+      {
+        "semantic_fragment": {
+          "format_version": 1,
+          "output": "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65",
+          "nodes": {
+            "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748": {
+              "operation": {
+                "expression": {
+                  "Scan": {
+                    "predicates": [],
+                    "schema": {
+                      "closed": false,
+                      "columns": [
+                        {
+                          "dtype": "timestamp",
+                          "name": "ts",
+                          "nullable": false,
+                          "table": null
+                        },
+                        {
+                          "dtype": "float64",
+                          "name": "value",
+                          "nullable": false,
+                          "table": null
+                        },
+                        {
+                          "dtype": "utf8",
+                          "name": "label_0",
+                          "nullable": true,
+                          "table": null
+                        }
+                      ],
+                      "time_index": 0,
+                      "unique_keys": []
+                    },
+                    "source": {
+                      "TimeSeries": {
+                        "metric": "data"
+                      }
+                    }
+                  }
+                },
+                "kind": "fallback"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  }
+                ],
+                "time_index": 0
+              },
+              "inputs": [],
+              "record_range": true
+            },
+            "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65": {
+              "operation": {
+                "family": {
+                  "ExactAggregate": [
+                    "Sum",
+                    "Sum"
+                  ]
+                },
+                "grouping": "PerSubpopulationInstance",
+                "input": {
+                  "item": null,
+                  "weight": {
+                    "Column": "SampleValue"
+                  },
+                  "weight_domain": {
+                    "kind": "unknown_or_signed"
+                  }
+                },
+                "kind": "summary_agg",
+                "reduction": {
+                  "Reduce": [
+                    2
+                  ]
+                }
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  },
+                  {
+                    "dtype": {
+                      "ExactAggregate": [
+                        "Sum",
+                        "Sum"
+                      ]
+                    },
+                    "name": "sum",
+                    "nullable": false
+                  }
+                ],
+                "time_index": null
+              },
+              "inputs": [
+                {
+                  "role": "Input",
+                  "node": "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748"
+                }
+              ]
+            }
+          }
+        },
+        "aggregation_type": "Sum",
+        "aggregation_sub_type": "",
+        "parameters": {
+          "promql_right_closed": true
+        },
+        "grouping_labels": {
+          "labels": [
+            "label_0"
+          ]
+        },
+        "partitioning": "grouped",
+        "aggregated_labels": {
+          "labels": []
+        },
+        "rollup_labels": {
+          "labels": []
+        },
+        "original_yaml": "",
+        "window_size": 5,
+        "slide_interval": 10,
+        "window_type": "sliding",
+        "window_layout": {
+          "kind": "full_window"
+        },
+        "pane_origin_ms": 5000,
+        "spatial_filter": "",
+        "spatial_filter_normalized": "",
+        "metric": "data",
+        "num_aggregates_to_retain": 1,
+        "table_name": null,
+        "value_projection": null
+      }
+    ],
+    "executable_dags": {
+      "compat-query-0": {
+        "document": {
+          "schema_version": 6,
+          "query_id": "compat-query-0",
+          "nodes": [
+            {
+              "id": 0,
+              "payload": {
+                "expression": {
+                  "TimeRange": {
+                    "child": {
+                      "Scan": {
+                        "predicates": [],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "value",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            }
+                          ],
+                          "time_index": 0,
+                          "unique_keys": []
+                        },
+                        "source": {
+                          "TimeSeries": {
+                            "metric": "data"
+                          }
+                        }
+                      }
+                    },
+                    "range": {
+                      "nanos": 0,
+                      "secs": 5
+                    }
+                  }
+                },
+                "kind": "fallback"
+              },
+              "output_state": {
+                "timing": "ingestion_time",
+                "primitive": "Raw"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  }
+                ],
+                "time_index": 0
+              },
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "KeepPreAsap"
+                  }
+                ]
+              }
+            },
+            {
+              "id": 1,
+              "payload": {
+                "family": {
+                  "ExactAggregate": [
+                    "Sum",
+                    "Sum"
+                  ]
+                },
+                "grouping": "PerSubpopulationInstance",
+                "input": {
+                  "item": null,
+                  "weight": {
+                    "Column": "SampleValue"
+                  },
+                  "weight_domain": {
+                    "kind": "unknown_or_signed"
+                  }
+                },
+                "kind": "summary_agg",
+                "reduction": {
+                  "Reduce": [
+                    2
+                  ]
+                }
+              },
+              "output_state": {
+                "timing": "ingestion_time",
+                "primitive": "SummaryState"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  },
+                  {
+                    "dtype": {
+                      "ExactAggregate": [
+                        "Sum",
+                        "Sum"
+                      ]
+                    },
+                    "name": "sum",
+                    "nullable": false
+                  }
+                ],
+                "time_index": null
+              },
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "ExactAggregate(Sum)"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "exact_sum"
+                    },
+                    "rule": "exact_input"
+                  }
+                ]
+              }
+            }
+          ],
+          "edges": [
+            {
+              "producer": 0,
+              "consumer": 1,
+              "role": "Input",
+              "intermediate_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  }
+                ],
+                "time_index": 0
+              },
+              "data_state": {
+                "timing": "ingestion_time",
+                "primitive": "Raw"
+              },
+              "grouping": "NotApplicable",
+              "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+            }
+          ],
+          "root": 1
+        },
+        "binding": {
+          "nodes": {
+            "0": {
+              "placement": "maintenance_input"
+            },
+            "1": {
+              "placement": "materialization",
+              "stored_output": 10394281891663284740
+            }
+          },
+          "query_sink": 1,
+          "query_plan_sink": 0,
+          "precompute_sinks": [
+            1
+          ]
+        }
+      }
+    }
+  },
+  "transmission_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 3688256239081920855,
+      "plan_version": 1,
+      "snapshot_sha256": "0b3a5b3b0b1a16b1c4159c9faf7339d5d2c04e1d6483dc1b2f227742c28e5222"
+    },
+    "envelope": {
+      "plan_id": 3688256239081920855,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "frame_identity": {
+      "identity_version": 1,
+      "sequence_scope": "materialization_series_producer_epoch",
+      "require_checkpoint_for_full": true,
+      "require_base_checkpoint_for_delta": true
+    },
+    "rules": []
+  },
+  "query_plan": {
+    "plan_id": 3688256239081920855,
+    "plan_version": 1,
+    "selected_dags": {
+      "compat-query-0": {
+        "schema_version": 5,
+        "query_id": "compat-query-0",
+        "nodes": [
+          {
+            "id": 0,
+            "payload": {
+              "expression": {
+                "TimeRange": {
+                  "child": {
+                    "Scan": {
+                      "predicates": [],
+                      "schema": {
+                        "closed": false,
+                        "columns": [
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "utf8",
+                            "name": "label_0",
+                            "nullable": true,
+                            "table": null
+                          }
+                        ],
+                        "time_index": 0,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "TimeSeries": {
+                          "metric": "data"
+                        }
+                      }
+                    }
+                  },
+                  "range": {
+                    "nanos": 0,
+                    "secs": 5
+                  }
+                }
+              },
+              "kind": "fallback"
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "KeepPreAsap"
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "payload": {
+              "family": {
+                "ExactAggregate": [
+                  "Sum",
+                  "Sum"
+                ]
+              },
+              "grouping": "PerSubpopulationInstance",
+              "input": {
+                "item": null,
+                "weight": {
+                  "Column": "SampleValue"
+                },
+                "weight_domain": {
+                  "kind": "unknown_or_signed"
+                }
+              },
+              "kind": "summary_agg",
+              "reduction": {
+                "Reduce": [
+                  2
+                ]
+              }
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "SummaryState"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                },
+                {
+                  "dtype": {
+                    "ExactAggregate": [
+                      "Sum",
+                      "Sum"
+                    ]
+                  },
+                  "name": "sum",
+                  "nullable": false
+                }
+              ],
+              "time_index": null
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "ExactAggregate(Sum)"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "zero"
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "absolute_value",
+                    "provenance": [
+                      {
+                        "kind": "exact",
+                        "reason": "KeepPreAsap"
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "exact_sum"
+                  },
+                  "rule": "exact_input"
+                }
+              ]
+            }
+          }
+        ],
+        "edges": [
+          {
+            "producer": 0,
+            "consumer": 1,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+          }
+        ],
+        "root": 1
+      }
+    },
+    "entries": {
+      "sum by (label_0) (data)": {
+        "language": "prom_ql",
+        "query_id": "compat-query-0",
+        "canonical_query": "sum by (label_0) (data)",
+        "root": 0,
+        "nodes": {
+          "0": {
+            "op": "exact_readout",
+            "input": 1,
+            "readout": "sum"
+          },
+          "1": {
+            "op": "read_materialization",
+            "binding": {
+              "stored_output_reference": {
+                "stored_output_id": 10394281891663284740,
+                "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119"
+              },
+              "full_window_slide_ms": 10000,
+              "materialization": 10394281891663284740,
+              "output_grouping": {
+                "mode": "reduce",
+                "keys": [
+                  "label_0"
+                ]
+              },
+              "window_ms": 5000,
+              "pane_origin_ms": 5000,
+              "readout_lookback_ms": 5000
+            }
+          }
+        },
+        "instant": {
+          "lookback_ms": 5000,
+          "full_history": false,
+          "cumulative_readout": true
+        },
+        "fallback": "exact_backend"
+      }
+    }
+  },
+  "storage_routing": {
+    "default_engine": "asap_query",
+    "metrics": [],
+    "tenant": "default"
+  },
+  "lifecycle_estimates": [
+    {
+      "materialization": 10394281891663284740,
+      "consumer_query_ids": [
+        "compat-query-0"
+      ],
+      "window_implementation_id": "backend-tumbling-v1-5s-slide-10s-full-window",
+      "horizon_seconds": 300.0,
+      "expected_reads": 30.0,
+      "expected_updates": 30000.0,
+      "lifecycle_cost": 44.3
+    }
+  ],
+  "cost_comparison": {
+    "logical_selection": [
+      {
+        "committed_roots": [
+          {
+            "logical_root_id": "asap-explain-v1:root:83e02641b9301f119eee7e8a5fc38237fe3361a296db04ca4c14bea5a235b2d2",
+            "query_index": 0
+          }
+        ],
+        "deployment_overrides": [],
+        "group_id_scope": "this_selection",
+        "groups": [
+          {
+            "candidates": [
+              {
+                "accuracy_status": "known",
+                "candidate_id": "asap-explain-v1:candidate:0e8ec2e29e2ee3e9d29e92d9cd0163ff88c400c101387750fe6f4736c76e62b3",
+                "cost_estimate": {
+                  "erp_record_ids": [],
+                  "model": "backend_state_footprint_v1",
+                  "source": "analytical",
+                  "unit": "bytes_per_state_partition",
+                  "value": 256.0
+                },
+                "decision_reason": "planner_selected_pending_backend_binding",
+                "estimated_cost": 256.0,
+                "estimated_cost_status": "available",
+                "guarantee": {
+                  "bound": {
+                    "op": "zero"
+                  },
+                  "failure_probability": {
+                    "op": "zero"
+                  },
+                  "metric": "absolute_value",
+                  "provenance": [
+                    {
+                      "kind": "exact",
+                      "reason": "ExactAggregate(Sum)"
+                    },
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "zero"
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "absolute_value",
+                        "provenance": [
+                          {
+                            "kind": "exact",
+                            "reason": "KeepPreAsap"
+                          }
+                        ]
+                      },
+                      "input_index": 0,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "kind": "composition_step",
+                      "operator": {
+                        "op": "exact_sum"
+                      },
+                      "rule": "exact_input"
+                    }
+                  ]
+                },
+                "provenance": "SummaryRealization",
+                "rank": 0,
+                "rationale": "Sum { col: None } realizes as an exact Sum accumulator — the only realization realizations_for_intent produces for this intent (no approximate candidate applies)",
+                "replacement_kind": "summary",
+                "runtime_support_status": "unknown_pending_backend_binding",
+                "selected": true,
+                "status": "selected",
+                "strategy": "SketchAlgorithmStrategy"
+              }
+            ],
+            "consumer_count": 1,
+            "group_id": 0,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:e641ec19f0e39893ed797d0e6f1b69267b437ba26f391604251122e6b8ed66e9"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 1,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:b13ee0ae563e5e37c2578890a4bdd96221657389150c4ad4eb46f2c9c4410b93"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 2,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:e783e17c1544b382e37e5f2e9044762b2690f41d6bfbb80f8b2b7db8881ec1fd"
+          }
+        ],
+        "roots": [
+          {
+            "logical_root_id": "asap-explain-v1:root:83e02641b9301f119eee7e8a5fc38237fe3361a296db04ca4c14bea5a235b2d2",
+            "query_index": 0
+          }
+        ],
+        "schema_version": 1
+      }
+    ],
+    "materialization_search_coverage": null,
+    "data_snapshot_id": "issue-754-level1",
+    "model_version": "deterministic-test-costs",
+    "selected_plan_id": 3688256239081920855,
+    "selected_manifest": {
+      "plan_id": 3688256239081920855,
+      "plan_version": 1,
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1",
+      "backend_compat": "asap-query-backend.v1",
+      "horizon_seconds": 300.0,
+      "workload": {
+        "compat-query-0": {
+          "accuracy": {
+            "EpsilonDelta": {
+              "delta": 0.01,
+              "epsilon": 0.01
+            }
+          },
+          "evaluation_interval_ms": 10000,
+          "query": "sum by (label_0) (data)",
+          "source": {
+            "TimeSeries": {
+              "metric": "data"
+            }
+          }
+        }
+      },
+      "components": {
+        "query:compat-query-0:0": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 5000
+            },
+            "node": {
+              "input": 1,
+              "op": "exact_readout",
+              "readout": "sum"
+            },
+            "query": "sum by (label_0) (data)"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "query:compat-query-0:1": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 5000
+            },
+            "node": {
+              "binding": {
+                "full_window_slide_ms": 10000,
+                "materialization": 10394281891663284740,
+                "output_grouping": {
+                  "keys": [
+                    "label_0"
+                  ],
+                  "mode": "reduce"
+                },
+                "pane_origin_ms": 5000,
+                "readout_lookback_ms": 5000,
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119",
+                  "stored_output_id": 10394281891663284740
+                },
+                "window_ms": 5000
+              },
+              "op": "read_materialization"
+            },
+            "query": "sum by (label_0) (data)"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "result:compat-query-0": {
+          "implementation": {
+            "query_id": "compat-query-0",
+            "root": 0
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "source:{\"ingest\":{\"endpoint_path\":\"/api/v1/write\",\"protocol\":\"prometheus_remote_write_v1\",\"require_plan_identity\":false,\"require_registered_producer\":false,\"require_stored_output_identity\":false,\"timestamp_unit\":\"unix_milliseconds\"},\"location\":\"backend\",\"source\":{\"TimeSeries\":{\"metric\":\"data\"}}}": {
+          "implementation": {
+            "ingest": {
+              "endpoint_path": "/api/v1/write",
+              "protocol": "prometheus_remote_write_v1",
+              "require_plan_identity": false,
+              "require_registered_producer": false,
+              "require_stored_output_identity": false,
+              "timestamp_unit": "unix_milliseconds"
+            },
+            "location": "backend",
+            "source": {
+              "TimeSeries": {
+                "metric": "data"
+              }
+            }
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:10394281891663284740:build": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Sum",
+                "grouping_labels": {
+                  "labels": [
+                    "label_0"
+                  ]
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 1,
+                "original_yaml": "",
+                "pane_origin_ms": 5000,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "grouped",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "utf8",
+                                  "name": "label_0",
+                                  "nullable": true,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65": {
+                      "inputs": [
+                        {
+                          "node": "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Sum",
+                            "Sum"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": {
+                          "Reduce": [
+                            2
+                          ]
+                        }
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Sum",
+                                "Sum"
+                              ]
+                            },
+                            "name": "sum",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": null
+                      }
+                    }
+                  },
+                  "output": "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "full_window"
+                },
+                "window_size": 5,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_accumulator_v1",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "sum"
+                },
+                "group_by": [
+                  "label_0"
+                ],
+                "materialization": 10394281891663284740,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:10394281891663284740",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119",
+                  "stored_output_id": 10394281891663284740
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 5000,
+                  "size_ms": 5000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-5s-slide-10s-full-window"
+            },
+            "operation": "build"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:10394281891663284740:residency": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Sum",
+                "grouping_labels": {
+                  "labels": [
+                    "label_0"
+                  ]
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 1,
+                "original_yaml": "",
+                "pane_origin_ms": 5000,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "grouped",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "utf8",
+                                  "name": "label_0",
+                                  "nullable": true,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65": {
+                      "inputs": [
+                        {
+                          "node": "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Sum",
+                            "Sum"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": {
+                          "Reduce": [
+                            2
+                          ]
+                        }
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Sum",
+                                "Sum"
+                              ]
+                            },
+                            "name": "sum",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": null
+                      }
+                    }
+                  },
+                  "output": "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "full_window"
+                },
+                "window_size": 5,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_accumulator_v1",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "sum"
+                },
+                "group_by": [
+                  "label_0"
+                ],
+                "materialization": 10394281891663284740,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:10394281891663284740",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119",
+                  "stored_output_id": 10394281891663284740
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 5000,
+                  "size_ms": 5000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-5s-slide-10s-full-window"
+            },
+            "operation": "residency"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:10394281891663284740:retire": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Sum",
+                "grouping_labels": {
+                  "labels": [
+                    "label_0"
+                  ]
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 1,
+                "original_yaml": "",
+                "pane_origin_ms": 5000,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "grouped",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "utf8",
+                                  "name": "label_0",
+                                  "nullable": true,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65": {
+                      "inputs": [
+                        {
+                          "node": "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Sum",
+                            "Sum"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": {
+                          "Reduce": [
+                            2
+                          ]
+                        }
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Sum",
+                                "Sum"
+                              ]
+                            },
+                            "name": "sum",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": null
+                      }
+                    }
+                  },
+                  "output": "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "full_window"
+                },
+                "window_size": 5,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_accumulator_v1",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "sum"
+                },
+                "group_by": [
+                  "label_0"
+                ],
+                "materialization": 10394281891663284740,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:10394281891663284740",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119",
+                  "stored_output_id": 10394281891663284740
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 5000,
+                  "size_ms": 5000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-5s-slide-10s-full-window"
+            },
+            "operation": "retire"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:10394281891663284740:update": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Sum",
+                "grouping_labels": {
+                  "labels": [
+                    "label_0"
+                  ]
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 1,
+                "original_yaml": "",
+                "pane_origin_ms": 5000,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "grouped",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "utf8",
+                                  "name": "label_0",
+                                  "nullable": true,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65": {
+                      "inputs": [
+                        {
+                          "node": "603b601c88e633b90bbee06d5c2042f5d6e05258ec3fb73fc9db57c2c596c748",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Sum",
+                            "Sum"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": {
+                          "Reduce": [
+                            2
+                          ]
+                        }
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "utf8"
+                            },
+                            "name": "label_0",
+                            "nullable": true
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Sum",
+                                "Sum"
+                              ]
+                            },
+                            "name": "sum",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": null
+                      }
+                    }
+                  },
+                  "output": "c2620675a77ee87d83acef92d346cdba9937dd15ad2e7d7283acf45f2c81ed65"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "full_window"
+                },
+                "window_size": 5,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_accumulator_v1",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "sum"
+                },
+                "group_by": [
+                  "label_0"
+                ],
+                "materialization": 10394281891663284740,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:10394281891663284740",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:25186a3b39fd0bf46b5def7edafbbeeece9dee5451578e92992346e544008119",
+                  "stored_output_id": 10394281891663284740
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 5000,
+                  "size_ms": 5000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-5s-slide-10s-full-window"
+            },
+            "operation": "update"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        }
+      }
+    },
+    "component_costs": {
+      "query:compat-query-0:0": 30.0,
+      "query:compat-query-0:1": 30.0,
+      "result:compat-query-0": 30.0,
+      "source:{\"ingest\":{\"endpoint_path\":\"/api/v1/write\",\"protocol\":\"prometheus_remote_write_v1\",\"require_plan_identity\":false,\"require_registered_producer\":false,\"require_stored_output_identity\":false,\"timestamp_unit\":\"unix_milliseconds\"},\"location\":\"backend\",\"source\":{\"TimeSeries\":{\"metric\":\"data\"}}}": 1.0,
+      "state:backend:10394281891663284740:build": 1.0,
+      "state:backend:10394281891663284740:residency": 1.0,
+      "state:backend:10394281891663284740:retire": 1.0,
+      "state:backend:10394281891663284740:update": 1.0
+    },
+    "candidates": [
+      {
+        "candidate_id": "asap-explain-v1:alternative:4a70fea518d6dab33c2f2a78f298c42abea71bb66fd9485e8c74cbfb94b42e25",
+        "logical_root_ids": [
+          "asap-explain-v1:root:83e02641b9301f119eee7e8a5fc38237fe3361a296db04ca4c14bea5a235b2d2"
+        ],
+        "physical_candidate_id": "asap-explain-v1:physical:0bba025e586d38df56827bd240a843e616a26e5a7588efd6672636e9d9a3fb1b",
+        "identity_unavailable_reason": null,
+        "status": "selected",
+        "plan_id": 3688256239081920855,
+        "total_cost": 95.0,
+        "unavailable_reason": null
+      },
+      {
+        "candidate_id": "asap-explain-v1:alternative:05db2206cb2aa389f9ee353e1096458dfe1a228be0fd79a4eeb9fc33e762501f",
+        "logical_root_ids": [
+          "asap-explain-v1:root:4a279f73bd64bf260f10e694b5946239cb55b0ce56642e9ea11ff79be45c773b"
+        ],
+        "physical_candidate_id": "asap-explain-v1:physical:d941312282d378c3a4b611e0c968aefd5b1f4fbaae5fc18c51a8720ce9c38484",
+        "identity_unavailable_reason": null,
+        "status": "unselected",
+        "plan_id": 17875413431231421451,
+        "total_cost": 61000000000000.0,
+        "unavailable_reason": null
+      },
+      {
+        "candidate_id": "asap-explain-v1:alternative:e6fe46188ba81ced66746ee84f20c831ddf66cfa846d5bbd9f8c0ea60f3b92df",
+        "logical_root_ids": [
+          "asap-explain-v1:root:8429626574248c9dd9fd1ef599028f6dde2d6a2a6bc3beba0cdd9db290df10ce"
+        ],
+        "physical_candidate_id": "asap-explain-v1:physical:e7f2ddb58b1e23ab7b3d0955e9f7c5953e6aa146b00d183681e0bfcf4340c002",
+        "identity_unavailable_reason": null,
+        "status": "unselected",
+        "plan_id": 8064649510529993241,
+        "total_cost": 130.0,
+        "unavailable_reason": null
+      }
+    ]
+  },
+  "planner_selection_trace": [
+    {
+      "committed_roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:83e02641b9301f119eee7e8a5fc38237fe3361a296db04ca4c14bea5a235b2d2",
+          "query_index": 0
+        }
+      ],
+      "deployment_overrides": [],
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:0e8ec2e29e2ee3e9d29e92d9cd0163ff88c400c101387750fe6f4736c76e62b3",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 256.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 256.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "ExactAggregate(Sum)"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "exact_sum"
+                    },
+                    "rule": "exact_input"
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "Sum { col: None } realizes as an exact Sum accumulator — the only realization realizations_for_intent produces for this intent (no approximate candidate applies)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 0,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:e641ec19f0e39893ed797d0e6f1b69267b437ba26f391604251122e6b8ed66e9"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 1,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:b13ee0ae563e5e37c2578890a4bdd96221657389150c4ad4eb46f2c9c4410b93"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 2,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:e783e17c1544b382e37e5f2e9044762b2690f41d6bfbb80f8b2b7db8881ec1fd"
+        }
+      ],
+      "roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:83e02641b9301f119eee7e8a5fc38237fe3361a296db04ca4c14bea5a235b2d2",
+          "query_index": 0
+        }
+      ],
+      "schema_version": 1
+    }
+  ]
+}

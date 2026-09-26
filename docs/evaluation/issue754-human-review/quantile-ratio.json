@@ -1,0 +1,3376 @@
+{
+  "envelope": {
+    "plan_id": 14871479243635342203,
+    "plan_version": 1,
+    "generated_at_unix_ms": 10000,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1",
+    "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+    "capability_snapshot_id": "asapquery-local-v1"
+  },
+  "summary_catalog": {
+    "schema_version": 4,
+    "plan_id": 14871479243635342203,
+    "plan_version": 1,
+    "summary_descriptors": {
+      "summary:v3:{\"fidelity\":{\"alpha\":0.0049751243781094535,\"kind\":\"dd_sketch_relative_error\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"DDSketch\",\"family\":{\"Sketch\":[{\"algorithm\":\"DDSketch\",\"category\":\"Quantile\",\"params\":{\"DDSketch\":{\"alpha\":0.0049751243781094535}}},\"PerSubpopulationInstance\"]},\"kind\":\"configured\",\"parameters\":{\"alpha\":0.0049751243781094535,\"promql_right_closed\":true}},\"state_schema_version\":1}": {
+        "id": "summary:v3:{\"fidelity\":{\"alpha\":0.0049751243781094535,\"kind\":\"dd_sketch_relative_error\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"DDSketch\",\"family\":{\"Sketch\":[{\"algorithm\":\"DDSketch\",\"category\":\"Quantile\",\"params\":{\"DDSketch\":{\"alpha\":0.0049751243781094535}}},\"PerSubpopulationInstance\"]},\"kind\":\"configured\",\"parameters\":{\"alpha\":0.0049751243781094535,\"promql_right_closed\":true}},\"state_schema_version\":1}",
+        "operator": {
+          "kind": "configured",
+          "family": {
+            "Sketch": [
+              {
+                "category": "Quantile",
+                "algorithm": "DDSketch",
+                "params": {
+                  "DDSketch": {
+                    "alpha": 0.0049751243781094535
+                  }
+                }
+              },
+              "PerSubpopulationInstance"
+            ]
+          },
+          "aggregation_type": "DDSketch",
+          "aggregation_sub_type": "",
+          "parameters": {
+            "alpha": 0.0049751243781094535,
+            "promql_right_closed": true
+          }
+        },
+        "fidelity": {
+          "kind": "dd_sketch_relative_error",
+          "alpha": 0.0049751243781094535
+        },
+        "state_schema_version": 1
+      }
+    },
+    "data_descriptors": {
+      "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:PerEntity|32:asap.timestamped-observations.v2": {
+        "id": "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:PerEntity|32:asap.timestamped-observations.v2",
+        "source": {
+          "time_series": {
+            "metric": "data"
+          }
+        },
+        "value_projection": "sample_value",
+        "population_filter_canonical": "",
+        "group_by_keys": [],
+        "partitioning": "per_entity",
+        "observation_semantics": "asap.timestamped-observations.v2"
+      }
+    },
+    "outputs": {
+      "2776719732314936823": {
+        "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744",
+        "summary_descriptor_id": "summary:v3:{\"fidelity\":{\"alpha\":0.0049751243781094535,\"kind\":\"dd_sketch_relative_error\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"DDSketch\",\"family\":{\"Sketch\":[{\"algorithm\":\"DDSketch\",\"category\":\"Quantile\",\"params\":{\"DDSketch\":{\"alpha\":0.0049751243781094535}}},\"PerSubpopulationInstance\"]},\"kind\":\"configured\",\"parameters\":{\"alpha\":0.0049751243781094535,\"promql_right_closed\":true}},\"state_schema_version\":1}",
+        "data_descriptor_id": "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:PerEntity|32:asap.timestamped-observations.v2"
+      }
+    },
+    "definitions": {
+      "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744": {
+        "semantic_format_version": 1,
+        "semantics": {
+          "kind": "planner",
+          "fragment": {
+            "format_version": 1,
+            "output": "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681",
+            "nodes": {
+              "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                "operation": {
+                  "expression": {
+                    "Scan": {
+                      "predicates": [],
+                      "schema": {
+                        "closed": false,
+                        "columns": [
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": null
+                          }
+                        ],
+                        "time_index": 0,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "TimeSeries": {
+                          "metric": "data"
+                        }
+                      }
+                    }
+                  },
+                  "kind": "fallback"
+                },
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                },
+                "inputs": [],
+                "record_range": true
+              },
+              "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681": {
+                "operation": {
+                  "family": {
+                    "Sketch": [
+                      {
+                        "algorithm": "DDSketch",
+                        "category": "Quantile",
+                        "params": {
+                          "DDSketch": {
+                            "alpha": 0.0049751243781094535
+                          }
+                        }
+                      },
+                      "PerSubpopulationInstance"
+                    ]
+                  },
+                  "grouping": "PerSubpopulationInstance",
+                  "input": {
+                    "item": null,
+                    "weight": {
+                      "Column": "SampleValue"
+                    },
+                    "weight_domain": {
+                      "kind": "unknown_or_signed"
+                    }
+                  },
+                  "kind": "summary_agg",
+                  "reduction": "PerEntity"
+                },
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Sketch": [
+                          {
+                            "algorithm": "DDSketch",
+                            "category": "Quantile",
+                            "params": {
+                              "DDSketch": {
+                                "alpha": 0.0049751243781094535
+                              }
+                            }
+                          },
+                          "PerSubpopulationInstance"
+                        ]
+                      },
+                      "name": "value",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                },
+                "inputs": [
+                  {
+                    "role": "Input",
+                    "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "collector_plans": [],
+  "precompute_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 14871479243635342203,
+      "plan_version": 1,
+      "snapshot_sha256": "3d8fa2fbb6da37ac39d10ba6067e349e03926d30855d59b1e40f1e81fa6ee83e"
+    },
+    "envelope": {
+      "plan_id": 14871479243635342203,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "ingest": {
+      "protocol": "prometheus_remote_write_v1",
+      "endpoint_path": "/api/v1/write",
+      "timestamp_unit": "unix_milliseconds",
+      "require_plan_identity": false,
+      "require_stored_output_identity": false,
+      "require_registered_producer": false
+    },
+    "schemas": [
+      {
+        "stored_output_reference": {
+          "stored_output_id": 2776719732314936823,
+          "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744"
+        },
+        "schema_id": "asap-query-backend.v1:summary-state:v1:2776719732314936823",
+        "schema_version": 1,
+        "materialization": 2776719732314936823,
+        "family": {
+          "family": "sketch",
+          "algorithm": "DDSketch",
+          "parameters": {
+            "DDSketch": {
+              "alpha": 0.0049751243781094535
+            }
+          }
+        },
+        "source": {
+          "TimeSeries": {
+            "metric": "data"
+          }
+        },
+        "value_projection": "sample_value",
+        "group_by": [],
+        "window": {
+          "kind": "sliding",
+          "size_ms": 60000,
+          "slide_ms": 10000,
+          "pane_origin_ms": 0
+        },
+        "encodings": [
+          "sketchlib_protobuf_v1",
+          "sketch_core_msgpack_v1"
+        ]
+      }
+    ],
+    "producers": [],
+    "materializations": [
+      {
+        "semantic_fragment": {
+          "format_version": 1,
+          "output": "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681",
+          "nodes": {
+            "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+              "operation": {
+                "expression": {
+                  "Scan": {
+                    "predicates": [],
+                    "schema": {
+                      "closed": false,
+                      "columns": [
+                        {
+                          "dtype": "timestamp",
+                          "name": "ts",
+                          "nullable": false,
+                          "table": null
+                        },
+                        {
+                          "dtype": "float64",
+                          "name": "value",
+                          "nullable": false,
+                          "table": null
+                        }
+                      ],
+                      "time_index": 0,
+                      "unique_keys": []
+                    },
+                    "source": {
+                      "TimeSeries": {
+                        "metric": "data"
+                      }
+                    }
+                  }
+                },
+                "kind": "fallback"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              },
+              "inputs": [],
+              "record_range": true
+            },
+            "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681": {
+              "operation": {
+                "family": {
+                  "Sketch": [
+                    {
+                      "algorithm": "DDSketch",
+                      "category": "Quantile",
+                      "params": {
+                        "DDSketch": {
+                          "alpha": 0.0049751243781094535
+                        }
+                      }
+                    },
+                    "PerSubpopulationInstance"
+                  ]
+                },
+                "grouping": "PerSubpopulationInstance",
+                "input": {
+                  "item": null,
+                  "weight": {
+                    "Column": "SampleValue"
+                  },
+                  "weight_domain": {
+                    "kind": "unknown_or_signed"
+                  }
+                },
+                "kind": "summary_agg",
+                "reduction": "PerEntity"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Sketch": [
+                        {
+                          "algorithm": "DDSketch",
+                          "category": "Quantile",
+                          "params": {
+                            "DDSketch": {
+                              "alpha": 0.0049751243781094535
+                            }
+                          }
+                        },
+                        "PerSubpopulationInstance"
+                      ]
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              },
+              "inputs": [
+                {
+                  "role": "Input",
+                  "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd"
+                }
+              ]
+            }
+          }
+        },
+        "aggregation_type": "DDSketch",
+        "aggregation_sub_type": "",
+        "parameters": {
+          "promql_right_closed": true,
+          "alpha": 0.0049751243781094535
+        },
+        "grouping_labels": {
+          "labels": []
+        },
+        "partitioning": "per_entity",
+        "aggregated_labels": {
+          "labels": []
+        },
+        "rollup_labels": {
+          "labels": []
+        },
+        "original_yaml": "",
+        "window_size": 60,
+        "slide_interval": 10,
+        "window_type": "sliding",
+        "window_layout": {
+          "kind": "pane",
+          "pane_secs": 10
+        },
+        "pane_origin_ms": 0,
+        "spatial_filter": "",
+        "spatial_filter_normalized": "",
+        "metric": "data",
+        "num_aggregates_to_retain": 7,
+        "table_name": null,
+        "value_projection": null
+      }
+    ],
+    "executable_dags": {
+      "compat-query-0": {
+        "document": {
+          "schema_version": 6,
+          "query_id": "compat-query-0",
+          "nodes": [
+            {
+              "id": 0,
+              "payload": {
+                "expression": {
+                  "TimeRange": {
+                    "child": {
+                      "Scan": {
+                        "predicates": [],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "value",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": 0,
+                          "unique_keys": []
+                        },
+                        "source": {
+                          "TimeSeries": {
+                            "metric": "data"
+                          }
+                        }
+                      }
+                    },
+                    "range": {
+                      "nanos": 0,
+                      "secs": 60
+                    }
+                  }
+                },
+                "kind": "fallback"
+              },
+              "output_state": {
+                "timing": "ingestion_time",
+                "primitive": "Raw"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              },
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "KeepPreAsap"
+                  }
+                ]
+              }
+            },
+            {
+              "id": 1,
+              "payload": {
+                "family": {
+                  "Sketch": [
+                    {
+                      "algorithm": "DDSketch",
+                      "category": "Quantile",
+                      "params": {
+                        "DDSketch": {
+                          "alpha": 0.0049751243781094535
+                        }
+                      }
+                    },
+                    "PerSubpopulationInstance"
+                  ]
+                },
+                "grouping": "PerSubpopulationInstance",
+                "input": {
+                  "item": null,
+                  "weight": {
+                    "Column": "SampleValue"
+                  },
+                  "weight_domain": {
+                    "kind": "unknown_or_signed"
+                  }
+                },
+                "kind": "summary_agg",
+                "reduction": "PerEntity"
+              },
+              "output_state": {
+                "timing": "ingestion_time",
+                "primitive": "SummaryState"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Sketch": [
+                        {
+                          "algorithm": "DDSketch",
+                          "category": "Quantile",
+                          "params": {
+                            "DDSketch": {
+                              "alpha": 0.0049751243781094535
+                            }
+                          }
+                        },
+                        "PerSubpopulationInstance"
+                      ]
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              },
+              "guarantee": null
+            }
+          ],
+          "edges": [
+            {
+              "producer": 0,
+              "consumer": 1,
+              "role": "Input",
+              "intermediate_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              },
+              "data_state": {
+                "timing": "ingestion_time",
+                "primitive": "Raw"
+              },
+              "grouping": "NotApplicable",
+              "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+            }
+          ],
+          "root": 1
+        },
+        "binding": {
+          "nodes": {
+            "0": {
+              "placement": "maintenance_input"
+            },
+            "1": {
+              "placement": "materialization",
+              "stored_output": 2776719732314936823
+            }
+          },
+          "query_sink": 4,
+          "query_plan_sink": 0,
+          "precompute_sinks": [
+            1
+          ]
+        }
+      }
+    }
+  },
+  "transmission_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 14871479243635342203,
+      "plan_version": 1,
+      "snapshot_sha256": "3d8fa2fbb6da37ac39d10ba6067e349e03926d30855d59b1e40f1e81fa6ee83e"
+    },
+    "envelope": {
+      "plan_id": 14871479243635342203,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "frame_identity": {
+      "identity_version": 1,
+      "sequence_scope": "materialization_series_producer_epoch",
+      "require_checkpoint_for_full": true,
+      "require_base_checkpoint_for_delta": true
+    },
+    "rules": []
+  },
+  "query_plan": {
+    "plan_id": 14871479243635342203,
+    "plan_version": 1,
+    "selected_dags": {
+      "compat-query-0": {
+        "schema_version": 5,
+        "query_id": "compat-query-0",
+        "nodes": [
+          {
+            "id": 0,
+            "payload": {
+              "expression": {
+                "TimeRange": {
+                  "child": {
+                    "Scan": {
+                      "predicates": [],
+                      "schema": {
+                        "closed": false,
+                        "columns": [
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": null
+                          }
+                        ],
+                        "time_index": 0,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "TimeSeries": {
+                          "metric": "data"
+                        }
+                      }
+                    }
+                  },
+                  "range": {
+                    "nanos": 0,
+                    "secs": 60
+                  }
+                }
+              },
+              "kind": "fallback"
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "KeepPreAsap"
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "payload": {
+              "family": {
+                "Sketch": [
+                  {
+                    "algorithm": "DDSketch",
+                    "category": "Quantile",
+                    "params": {
+                      "DDSketch": {
+                        "alpha": 0.0049751243781094535
+                      }
+                    }
+                  },
+                  "PerSubpopulationInstance"
+                ]
+              },
+              "grouping": "PerSubpopulationInstance",
+              "input": {
+                "item": null,
+                "weight": {
+                  "Column": "SampleValue"
+                },
+                "weight_domain": {
+                  "kind": "unknown_or_signed"
+                }
+              },
+              "kind": "summary_agg",
+              "reduction": "PerEntity"
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "SummaryState"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Sketch": [
+                      {
+                        "algorithm": "DDSketch",
+                        "category": "Quantile",
+                        "params": {
+                          "DDSketch": {
+                            "alpha": 0.0049751243781094535
+                          }
+                        }
+                      },
+                      "PerSubpopulationInstance"
+                    ]
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": null
+          },
+          {
+            "id": 2,
+            "payload": {
+              "kind": "summary_estimate",
+              "query": {
+                "Quantile": {
+                  "q": 0.9
+                }
+              }
+            },
+            "output_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "constant",
+                "value": 0.0049751243781094535
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "relative_value",
+              "provenance": [
+                {
+                  "algorithm": "DDSketch",
+                  "contract": "ddsketch_relative_error_alpha_v1",
+                  "kind": "sketch_readout",
+                  "params": {
+                    "DDSketch": {
+                      "alpha": 0.0049751243781094535
+                    }
+                  },
+                  "query": "Quantile { q: 0.9 }"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "zero"
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "absolute_value",
+                    "provenance": [
+                      {
+                        "kind": "exact",
+                        "reason": "KeepPreAsap"
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "approximate_aggregate"
+                  },
+                  "rule": "exact_input"
+                },
+                {
+                  "kind": "accuracy_target",
+                  "target": {
+                    "EpsilonDelta": {
+                      "delta": 0.01,
+                      "epsilon": 0.0049751243781094535
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": 3,
+            "payload": {
+              "kind": "summary_estimate",
+              "query": {
+                "Quantile": {
+                  "q": 0.5
+                }
+              }
+            },
+            "output_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "constant",
+                "value": 0.0049751243781094535
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "relative_value",
+              "provenance": [
+                {
+                  "algorithm": "DDSketch",
+                  "contract": "ddsketch_relative_error_alpha_v1",
+                  "kind": "sketch_readout",
+                  "params": {
+                    "DDSketch": {
+                      "alpha": 0.0049751243781094535
+                    }
+                  },
+                  "query": "Quantile { q: 0.5 }"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "zero"
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "absolute_value",
+                    "provenance": [
+                      {
+                        "kind": "exact",
+                        "reason": "KeepPreAsap"
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "approximate_aggregate"
+                  },
+                  "rule": "exact_input"
+                },
+                {
+                  "kind": "accuracy_target",
+                  "target": {
+                    "EpsilonDelta": {
+                      "delta": 0.01,
+                      "epsilon": 0.0049751243781094535
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": 4,
+            "payload": {
+              "kind": "binary",
+              "operator": {
+                "checked_finite_division": false,
+                "checked_relative_division": false,
+                "kind": {
+                  "Arithmetic": "Div"
+                },
+                "vector_match": null
+              }
+            },
+            "output_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "constant",
+                "value": 0.010000000000000002
+              },
+              "failure_probability": {
+                "op": "union_bound",
+                "terms": [
+                  {
+                    "op": "zero"
+                  },
+                  {
+                    "op": "zero"
+                  }
+                ]
+              },
+              "metric": "relative_value",
+              "provenance": [
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "constant",
+                      "value": 0.0049751243781094535
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "relative_value",
+                    "provenance": [
+                      {
+                        "algorithm": "DDSketch",
+                        "contract": "ddsketch_relative_error_alpha_v1",
+                        "kind": "sketch_readout",
+                        "params": {
+                          "DDSketch": {
+                            "alpha": 0.0049751243781094535
+                          }
+                        },
+                        "query": "Quantile { q: 0.9 }"
+                      },
+                      {
+                        "guarantee": {
+                          "bound": {
+                            "op": "zero"
+                          },
+                          "failure_probability": {
+                            "op": "zero"
+                          },
+                          "metric": "absolute_value",
+                          "provenance": [
+                            {
+                              "kind": "exact",
+                              "reason": "KeepPreAsap"
+                            }
+                          ]
+                        },
+                        "input_index": 0,
+                        "kind": "child_guarantee"
+                      },
+                      {
+                        "kind": "composition_step",
+                        "operator": {
+                          "op": "approximate_aggregate"
+                        },
+                        "rule": "exact_input"
+                      },
+                      {
+                        "kind": "accuracy_target",
+                        "target": {
+                          "EpsilonDelta": {
+                            "delta": 0.01,
+                            "epsilon": 0.0049751243781094535
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "constant",
+                      "value": 0.0049751243781094535
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "relative_value",
+                    "provenance": [
+                      {
+                        "algorithm": "DDSketch",
+                        "contract": "ddsketch_relative_error_alpha_v1",
+                        "kind": "sketch_readout",
+                        "params": {
+                          "DDSketch": {
+                            "alpha": 0.0049751243781094535
+                          }
+                        },
+                        "query": "Quantile { q: 0.5 }"
+                      },
+                      {
+                        "guarantee": {
+                          "bound": {
+                            "op": "zero"
+                          },
+                          "failure_probability": {
+                            "op": "zero"
+                          },
+                          "metric": "absolute_value",
+                          "provenance": [
+                            {
+                              "kind": "exact",
+                              "reason": "KeepPreAsap"
+                            }
+                          ]
+                        },
+                        "input_index": 0,
+                        "kind": "child_guarantee"
+                      },
+                      {
+                        "kind": "composition_step",
+                        "operator": {
+                          "op": "approximate_aggregate"
+                        },
+                        "rule": "exact_input"
+                      },
+                      {
+                        "kind": "accuracy_target",
+                        "target": {
+                          "EpsilonDelta": {
+                            "delta": 0.01,
+                            "epsilon": 0.0049751243781094535
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  "input_index": 1,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "contract": "complete finite issue-754 generator population",
+                  "input_index": 0,
+                  "kind": "input_value_domain",
+                  "lower": 10.0,
+                  "max_samples": 14408,
+                  "upper": 1600.0
+                },
+                {
+                  "contract": "complete finite issue-754 generator population",
+                  "input_index": 1,
+                  "kind": "input_value_domain",
+                  "lower": 10.0,
+                  "max_samples": 14408,
+                  "upper": 1600.0
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "exact_division"
+                  },
+                  "rule": "relative_division"
+                }
+              ]
+            }
+          }
+        ],
+        "edges": [
+          {
+            "producer": 0,
+            "consumer": 1,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+          },
+          {
+            "producer": 1,
+            "consumer": 2,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Sketch": [
+                      {
+                        "algorithm": "DDSketch",
+                        "category": "Quantile",
+                        "params": {
+                          "DDSketch": {
+                            "alpha": 0.0049751243781094535
+                          }
+                        }
+                      },
+                      "PerSubpopulationInstance"
+                    ]
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "SummaryState"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          },
+          {
+            "producer": 1,
+            "consumer": 3,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Sketch": [
+                      {
+                        "algorithm": "DDSketch",
+                        "category": "Quantile",
+                        "params": {
+                          "DDSketch": {
+                            "alpha": 0.0049751243781094535
+                          }
+                        }
+                      },
+                      "PerSubpopulationInstance"
+                    ]
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "SummaryState"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          },
+          {
+            "producer": 2,
+            "consumer": 4,
+            "role": "Left",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          },
+          {
+            "producer": 3,
+            "consumer": 4,
+            "role": "Right",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          }
+        ],
+        "root": 4
+      }
+    },
+    "entries": {
+      "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])": {
+        "language": "prom_ql",
+        "query_id": "compat-query-0",
+        "canonical_query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])",
+        "root": 0,
+        "nodes": {
+          "0": {
+            "op": "binary",
+            "inputs": [
+              1,
+              3
+            ],
+            "operator": "Div"
+          },
+          "1": {
+            "op": "summary_estimate",
+            "input": 2,
+            "query": {
+              "kind": "quantile",
+              "q": 0.9
+            }
+          },
+          "2": {
+            "op": "read_materialization",
+            "binding": {
+              "stored_output_reference": {
+                "stored_output_id": 2776719732314936823,
+                "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744"
+              },
+              "materialization": 2776719732314936823,
+              "output_grouping": {
+                "mode": "per_entity"
+              },
+              "window_ms": 10000,
+              "pane_origin_ms": 0,
+              "readout_lookback_ms": 60000
+            }
+          },
+          "3": {
+            "op": "summary_estimate",
+            "input": 2,
+            "query": {
+              "kind": "quantile",
+              "q": 0.5
+            }
+          }
+        },
+        "instant": {
+          "lookback_ms": 60000,
+          "full_history": false,
+          "cumulative_readout": true
+        },
+        "fallback": "exact_backend"
+      }
+    }
+  },
+  "storage_routing": {
+    "default_engine": "asap_query",
+    "metrics": [
+      {
+        "asap_tier_native_shapes": [
+          "quantile",
+          "quantile_over_time",
+          "rate",
+          "sum",
+          "avg",
+          "min",
+          "max"
+        ],
+        "name": "data",
+        "targets": [
+          {
+            "engine": "asap_query"
+          }
+        ]
+      }
+    ],
+    "tenant": "default"
+  },
+  "lifecycle_estimates": [
+    {
+      "materialization": 2776719732314936823,
+      "consumer_query_ids": [
+        "compat-query-0"
+      ],
+      "window_implementation_id": "backend-tumbling-v1-60s-slide-10s-pane-10s",
+      "horizon_seconds": 300.0,
+      "expected_reads": 30.0,
+      "expected_updates": 30000.0,
+      "lifecycle_cost": 44.3
+    }
+  ],
+  "cost_comparison": {
+    "logical_selection": [
+      {
+        "accuracy_evidence_scope": {
+          "data_snapshot_id": "issue-754-level1",
+          "hll": null,
+          "observed_at_unix_ms": 9500,
+          "query_id": "compat-query-0",
+          "source": "issue-754-finite-generator"
+        },
+        "committed_roots": [
+          {
+            "logical_root_id": "asap-explain-v1:root:2b05d26be253722469c57a458456405cf59f61a401b5230bd2c88077a55c529c",
+            "query_index": 0
+          }
+        ],
+        "deployment_overrides": [],
+        "group_id_scope": "this_selection",
+        "groups": [
+          {
+            "candidates": [
+              {
+                "accuracy_status": "known",
+                "candidate_id": "asap-explain-v1:candidate:5315807d41445e58cc908ca80736716b0a548c0ab37be11f9408f1df13846652",
+                "cost_estimate": {
+                  "erp_record_ids": [],
+                  "model": "backend_state_footprint_v1",
+                  "source": "analytical",
+                  "unit": "bytes_per_state_partition",
+                  "value": 131072.0
+                },
+                "decision_reason": "planner_selected_pending_backend_binding",
+                "estimated_cost": 131072.0,
+                "estimated_cost_status": "available",
+                "guarantee": {
+                  "bound": {
+                    "op": "constant",
+                    "value": 0.010000000000000002
+                  },
+                  "failure_probability": {
+                    "op": "union_bound",
+                    "terms": [
+                      {
+                        "op": "zero"
+                      },
+                      {
+                        "op": "zero"
+                      }
+                    ]
+                  },
+                  "metric": "relative_value",
+                  "provenance": [
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "constant",
+                          "value": 0.0049751243781094535
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "relative_value",
+                        "provenance": [
+                          {
+                            "algorithm": "DDSketch",
+                            "contract": "ddsketch_relative_error_alpha_v1",
+                            "kind": "sketch_readout",
+                            "params": {
+                              "DDSketch": {
+                                "alpha": 0.0049751243781094535
+                              }
+                            },
+                            "query": "Quantile { q: 0.9 }"
+                          },
+                          {
+                            "guarantee": {
+                              "bound": {
+                                "op": "zero"
+                              },
+                              "failure_probability": {
+                                "op": "zero"
+                              },
+                              "metric": "absolute_value",
+                              "provenance": [
+                                {
+                                  "kind": "exact",
+                                  "reason": "KeepPreAsap"
+                                }
+                              ]
+                            },
+                            "input_index": 0,
+                            "kind": "child_guarantee"
+                          },
+                          {
+                            "kind": "composition_step",
+                            "operator": {
+                              "op": "approximate_aggregate"
+                            },
+                            "rule": "exact_input"
+                          },
+                          {
+                            "kind": "accuracy_target",
+                            "target": {
+                              "EpsilonDelta": {
+                                "delta": 0.01,
+                                "epsilon": 0.0049751243781094535
+                              }
+                            }
+                          }
+                        ]
+                      },
+                      "input_index": 0,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "constant",
+                          "value": 0.0049751243781094535
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "relative_value",
+                        "provenance": [
+                          {
+                            "algorithm": "DDSketch",
+                            "contract": "ddsketch_relative_error_alpha_v1",
+                            "kind": "sketch_readout",
+                            "params": {
+                              "DDSketch": {
+                                "alpha": 0.0049751243781094535
+                              }
+                            },
+                            "query": "Quantile { q: 0.5 }"
+                          },
+                          {
+                            "guarantee": {
+                              "bound": {
+                                "op": "zero"
+                              },
+                              "failure_probability": {
+                                "op": "zero"
+                              },
+                              "metric": "absolute_value",
+                              "provenance": [
+                                {
+                                  "kind": "exact",
+                                  "reason": "KeepPreAsap"
+                                }
+                              ]
+                            },
+                            "input_index": 0,
+                            "kind": "child_guarantee"
+                          },
+                          {
+                            "kind": "composition_step",
+                            "operator": {
+                              "op": "approximate_aggregate"
+                            },
+                            "rule": "exact_input"
+                          },
+                          {
+                            "kind": "accuracy_target",
+                            "target": {
+                              "EpsilonDelta": {
+                                "delta": 0.01,
+                                "epsilon": 0.0049751243781094535
+                              }
+                            }
+                          }
+                        ]
+                      },
+                      "input_index": 1,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "contract": "complete finite issue-754 generator population",
+                      "input_index": 0,
+                      "kind": "input_value_domain",
+                      "lower": 10.0,
+                      "max_samples": 14408,
+                      "upper": 1600.0
+                    },
+                    {
+                      "contract": "complete finite issue-754 generator population",
+                      "input_index": 1,
+                      "kind": "input_value_domain",
+                      "lower": 10.0,
+                      "max_samples": 14408,
+                      "upper": 1600.0
+                    },
+                    {
+                      "kind": "composition_step",
+                      "operator": {
+                        "op": "exact_division"
+                      },
+                      "rule": "relative_division"
+                    }
+                  ]
+                },
+                "provenance": "SummaryRealization",
+                "rank": 0,
+                "rationale": "preserve exact PromQL arithmetic over independently realized summary operands",
+                "replacement_kind": "summary",
+                "runtime_support_status": "unknown_pending_backend_binding",
+                "selected": true,
+                "status": "selected",
+                "strategy": "SketchAlgorithmStrategy"
+              }
+            ],
+            "consumer_count": 1,
+            "group_id": 0,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:612b6b11c321c663ec092e983ee396ec294bd79fe0be44f3bd7f20379deb7c9c"
+          },
+          {
+            "candidates": [
+              {
+                "accuracy_status": "known",
+                "candidate_id": "asap-explain-v1:candidate:46c180553e09a8d74b1ce0913ac52b6e9cb2224060d5661714e13fc29f7f9d81",
+                "cost_estimate": {
+                  "erp_record_ids": [],
+                  "model": "backend_state_footprint_v1",
+                  "source": "analytical",
+                  "unit": "bytes_per_state_partition",
+                  "value": 65536.0
+                },
+                "decision_reason": "planner_selected_pending_backend_binding",
+                "estimated_cost": 65536.0,
+                "estimated_cost_status": "available",
+                "guarantee": {
+                  "bound": {
+                    "op": "constant",
+                    "value": 0.01
+                  },
+                  "failure_probability": {
+                    "op": "zero"
+                  },
+                  "metric": "relative_value",
+                  "provenance": [
+                    {
+                      "algorithm": "DDSketch",
+                      "contract": "ddsketch_relative_error_alpha_v1",
+                      "kind": "sketch_readout",
+                      "params": {
+                        "DDSketch": {
+                          "alpha": 0.01
+                        }
+                      },
+                      "query": "Quantile { q: 0.9 }"
+                    },
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "zero"
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "absolute_value",
+                        "provenance": [
+                          {
+                            "kind": "exact",
+                            "reason": "KeepPreAsap"
+                          }
+                        ]
+                      },
+                      "input_index": 0,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "kind": "composition_step",
+                      "operator": {
+                        "op": "approximate_aggregate"
+                      },
+                      "rule": "exact_input"
+                    },
+                    {
+                      "kind": "accuracy_target",
+                      "target": {
+                        "EpsilonDelta": {
+                          "delta": 0.01,
+                          "epsilon": 0.01
+                        }
+                      }
+                    }
+                  ]
+                },
+                "provenance": "SummaryRealization",
+                "rank": 0,
+                "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "replacement_kind": "summary",
+                "runtime_support_status": "unknown_pending_backend_binding",
+                "selected": true,
+                "status": "selected",
+                "strategy": "SketchAlgorithmStrategy"
+              }
+            ],
+            "consumer_count": 1,
+            "group_id": 1,
+            "rejected": [
+              {
+                "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
+                "status": "rejected",
+                "strategy": "SketchAlgorithmStrategy"
+              }
+            ],
+            "target_id": "asap-explain-v1:target:828b3226db7194d7afcdfbb059d50408f61e79816fab03ebfd54186a606857d1"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 2,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:adac5d1e201f9102c71aa380d5df8fd70f255641e8858165035b21a5c59bcb72"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 3,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:02597f2a8bd34c77f16a905fc986a4b7019710a0f146e4e1cf8a13c13970b53f"
+          },
+          {
+            "candidates": [
+              {
+                "accuracy_status": "known",
+                "candidate_id": "asap-explain-v1:candidate:b5ccd7f3d5846d3abc31910f4a8707a1936f62136a2eea7c9153282db63187f8",
+                "cost_estimate": {
+                  "erp_record_ids": [],
+                  "model": "backend_state_footprint_v1",
+                  "source": "analytical",
+                  "unit": "bytes_per_state_partition",
+                  "value": 65536.0
+                },
+                "decision_reason": "planner_selected_pending_backend_binding",
+                "estimated_cost": 65536.0,
+                "estimated_cost_status": "available",
+                "guarantee": {
+                  "bound": {
+                    "op": "constant",
+                    "value": 0.01
+                  },
+                  "failure_probability": {
+                    "op": "zero"
+                  },
+                  "metric": "relative_value",
+                  "provenance": [
+                    {
+                      "algorithm": "DDSketch",
+                      "contract": "ddsketch_relative_error_alpha_v1",
+                      "kind": "sketch_readout",
+                      "params": {
+                        "DDSketch": {
+                          "alpha": 0.01
+                        }
+                      },
+                      "query": "Quantile { q: 0.5 }"
+                    },
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "zero"
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "absolute_value",
+                        "provenance": [
+                          {
+                            "kind": "exact",
+                            "reason": "KeepPreAsap"
+                          }
+                        ]
+                      },
+                      "input_index": 0,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "kind": "composition_step",
+                      "operator": {
+                        "op": "approximate_aggregate"
+                      },
+                      "rule": "exact_input"
+                    },
+                    {
+                      "kind": "accuracy_target",
+                      "target": {
+                        "EpsilonDelta": {
+                          "delta": 0.01,
+                          "epsilon": 0.01
+                        }
+                      }
+                    }
+                  ]
+                },
+                "provenance": "SummaryRealization",
+                "rank": 0,
+                "rationale": "quantile(q=0.5) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "replacement_kind": "summary",
+                "runtime_support_status": "unknown_pending_backend_binding",
+                "selected": true,
+                "status": "selected",
+                "strategy": "SketchAlgorithmStrategy"
+              }
+            ],
+            "consumer_count": 1,
+            "group_id": 4,
+            "rejected": [
+              {
+                "description": "quantile(q=0.5) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
+                "status": "rejected",
+                "strategy": "SketchAlgorithmStrategy"
+              }
+            ],
+            "target_id": "asap-explain-v1:target:12d0483f8c18a35ba1dc127a322b3963ff83e3838e1f084d743cdda6471061e2"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 5,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:adac5d1e201f9102c71aa380d5df8fd70f255641e8858165035b21a5c59bcb72"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 6,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:02597f2a8bd34c77f16a905fc986a4b7019710a0f146e4e1cf8a13c13970b53f"
+          }
+        ],
+        "roots": [
+          {
+            "logical_root_id": "asap-explain-v1:root:2b05d26be253722469c57a458456405cf59f61a401b5230bd2c88077a55c529c",
+            "query_index": 0
+          }
+        ],
+        "schema_version": 1
+      }
+    ],
+    "materialization_search_coverage": null,
+    "data_snapshot_id": "issue-754-level1",
+    "model_version": "deterministic-test-costs",
+    "selected_plan_id": 14871479243635342203,
+    "selected_manifest": {
+      "plan_id": 14871479243635342203,
+      "plan_version": 1,
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1",
+      "backend_compat": "asap-query-backend.v1",
+      "horizon_seconds": 300.0,
+      "workload": {
+        "compat-query-0": {
+          "accuracy": {
+            "EpsilonDelta": {
+              "delta": 0.01,
+              "epsilon": 0.01
+            }
+          },
+          "evaluation_interval_ms": 10000,
+          "query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])",
+          "source": {
+            "TimeSeries": {
+              "metric": "data"
+            }
+          }
+        }
+      },
+      "components": {
+        "query:compat-query-0:0": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "inputs": [
+                1,
+                3
+              ],
+              "op": "binary",
+              "operator": "Div"
+            },
+            "query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "query:compat-query-0:1": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "input": 2,
+              "op": "summary_estimate",
+              "query": {
+                "kind": "quantile",
+                "q": 0.9
+              }
+            },
+            "query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "query:compat-query-0:2": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "binding": {
+                "materialization": 2776719732314936823,
+                "output_grouping": {
+                  "mode": "per_entity"
+                },
+                "pane_origin_ms": 0,
+                "readout_lookback_ms": 60000,
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744",
+                  "stored_output_id": 2776719732314936823
+                },
+                "window_ms": 10000
+              },
+              "op": "read_materialization"
+            },
+            "query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "query:compat-query-0:3": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "input": 2,
+              "op": "summary_estimate",
+              "query": {
+                "kind": "quantile",
+                "q": 0.5
+              }
+            },
+            "query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "result:compat-query-0": {
+          "implementation": {
+            "query_id": "compat-query-0",
+            "root": 0
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "source:{\"ingest\":{\"endpoint_path\":\"/api/v1/write\",\"protocol\":\"prometheus_remote_write_v1\",\"require_plan_identity\":false,\"require_registered_producer\":false,\"require_stored_output_identity\":false,\"timestamp_unit\":\"unix_milliseconds\"},\"location\":\"backend\",\"source\":{\"TimeSeries\":{\"metric\":\"data\"}}}": {
+          "implementation": {
+            "ingest": {
+              "endpoint_path": "/api/v1/write",
+              "protocol": "prometheus_remote_write_v1",
+              "require_plan_identity": false,
+              "require_registered_producer": false,
+              "require_stored_output_identity": false,
+              "timestamp_unit": "unix_milliseconds"
+            },
+            "location": "backend",
+            "source": {
+              "TimeSeries": {
+                "metric": "data"
+              }
+            }
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:2776719732314936823:build": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "DDSketch",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "alpha": 0.0049751243781094535,
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "Sketch": [
+                            {
+                              "algorithm": "DDSketch",
+                              "category": "Quantile",
+                              "params": {
+                                "DDSketch": {
+                                  "alpha": 0.0049751243781094535
+                                }
+                              }
+                            },
+                            "PerSubpopulationInstance"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Sketch": [
+                                {
+                                  "algorithm": "DDSketch",
+                                  "category": "Quantile",
+                                  "params": {
+                                    "DDSketch": {
+                                      "alpha": 0.0049751243781094535
+                                    }
+                                  }
+                                },
+                                "PerSubpopulationInstance"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "sketchlib_protobuf_v1",
+                  "sketch_core_msgpack_v1"
+                ],
+                "family": {
+                  "algorithm": "DDSketch",
+                  "family": "sketch",
+                  "parameters": {
+                    "DDSketch": {
+                      "alpha": 0.0049751243781094535
+                    }
+                  }
+                },
+                "group_by": [],
+                "materialization": 2776719732314936823,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:2776719732314936823",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744",
+                  "stored_output_id": 2776719732314936823
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "build"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:2776719732314936823:residency": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "DDSketch",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "alpha": 0.0049751243781094535,
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "Sketch": [
+                            {
+                              "algorithm": "DDSketch",
+                              "category": "Quantile",
+                              "params": {
+                                "DDSketch": {
+                                  "alpha": 0.0049751243781094535
+                                }
+                              }
+                            },
+                            "PerSubpopulationInstance"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Sketch": [
+                                {
+                                  "algorithm": "DDSketch",
+                                  "category": "Quantile",
+                                  "params": {
+                                    "DDSketch": {
+                                      "alpha": 0.0049751243781094535
+                                    }
+                                  }
+                                },
+                                "PerSubpopulationInstance"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "sketchlib_protobuf_v1",
+                  "sketch_core_msgpack_v1"
+                ],
+                "family": {
+                  "algorithm": "DDSketch",
+                  "family": "sketch",
+                  "parameters": {
+                    "DDSketch": {
+                      "alpha": 0.0049751243781094535
+                    }
+                  }
+                },
+                "group_by": [],
+                "materialization": 2776719732314936823,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:2776719732314936823",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744",
+                  "stored_output_id": 2776719732314936823
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "residency"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:2776719732314936823:retire": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "DDSketch",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "alpha": 0.0049751243781094535,
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "Sketch": [
+                            {
+                              "algorithm": "DDSketch",
+                              "category": "Quantile",
+                              "params": {
+                                "DDSketch": {
+                                  "alpha": 0.0049751243781094535
+                                }
+                              }
+                            },
+                            "PerSubpopulationInstance"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Sketch": [
+                                {
+                                  "algorithm": "DDSketch",
+                                  "category": "Quantile",
+                                  "params": {
+                                    "DDSketch": {
+                                      "alpha": 0.0049751243781094535
+                                    }
+                                  }
+                                },
+                                "PerSubpopulationInstance"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "sketchlib_protobuf_v1",
+                  "sketch_core_msgpack_v1"
+                ],
+                "family": {
+                  "algorithm": "DDSketch",
+                  "family": "sketch",
+                  "parameters": {
+                    "DDSketch": {
+                      "alpha": 0.0049751243781094535
+                    }
+                  }
+                },
+                "group_by": [],
+                "materialization": 2776719732314936823,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:2776719732314936823",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744",
+                  "stored_output_id": 2776719732314936823
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "retire"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:2776719732314936823:update": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "DDSketch",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "alpha": 0.0049751243781094535,
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "Sketch": [
+                            {
+                              "algorithm": "DDSketch",
+                              "category": "Quantile",
+                              "params": {
+                                "DDSketch": {
+                                  "alpha": 0.0049751243781094535
+                                }
+                              }
+                            },
+                            "PerSubpopulationInstance"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Sketch": [
+                                {
+                                  "algorithm": "DDSketch",
+                                  "category": "Quantile",
+                                  "params": {
+                                    "DDSketch": {
+                                      "alpha": 0.0049751243781094535
+                                    }
+                                  }
+                                },
+                                "PerSubpopulationInstance"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "95e9ce0bc81d6b435731c7bb97168c14dfda24cbe6e7a8e3049b205f0bbfb681"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "sketchlib_protobuf_v1",
+                  "sketch_core_msgpack_v1"
+                ],
+                "family": {
+                  "algorithm": "DDSketch",
+                  "family": "sketch",
+                  "parameters": {
+                    "DDSketch": {
+                      "alpha": 0.0049751243781094535
+                    }
+                  }
+                },
+                "group_by": [],
+                "materialization": 2776719732314936823,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:2776719732314936823",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:f20a6a984012173d96b103e5ca9cc19db0140c191f7f40b1f323f2d48c1a5744",
+                  "stored_output_id": 2776719732314936823
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "update"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        }
+      }
+    },
+    "component_costs": {
+      "query:compat-query-0:0": 30.0,
+      "query:compat-query-0:1": 30.0,
+      "query:compat-query-0:2": 30.0,
+      "query:compat-query-0:3": 30.0,
+      "result:compat-query-0": 30.0,
+      "source:{\"ingest\":{\"endpoint_path\":\"/api/v1/write\",\"protocol\":\"prometheus_remote_write_v1\",\"require_plan_identity\":false,\"require_registered_producer\":false,\"require_stored_output_identity\":false,\"timestamp_unit\":\"unix_milliseconds\"},\"location\":\"backend\",\"source\":{\"TimeSeries\":{\"metric\":\"data\"}}}": 1.0,
+      "state:backend:2776719732314936823:build": 1.0,
+      "state:backend:2776719732314936823:residency": 1.0,
+      "state:backend:2776719732314936823:retire": 1.0,
+      "state:backend:2776719732314936823:update": 1.0
+    },
+    "candidates": [
+      {
+        "candidate_id": "asap-explain-v1:alternative:b0105d61d875bc883cfc596871f46b08cec8a8b3b07911bdc2de504e982e32b7",
+        "logical_root_ids": [
+          "asap-explain-v1:root:2b05d26be253722469c57a458456405cf59f61a401b5230bd2c88077a55c529c"
+        ],
+        "physical_candidate_id": "asap-explain-v1:physical:eb80befd041f21a1ef1f4361b31b8eb059116c72791e7ca7d9471882deb0fc4d",
+        "identity_unavailable_reason": null,
+        "status": "selected",
+        "plan_id": 14871479243635342203,
+        "total_cost": 155.0,
+        "unavailable_reason": null
+      },
+      {
+        "candidate_id": "asap-explain-v1:alternative:938638be7c5bc3ebbd96e5fc998b1f9091bd3f4d224aadb5e75fb58be466299f",
+        "logical_root_ids": [
+          "asap-explain-v1:root:46f5e2592c1bfa71a74045bfd35806d0e3c763ac56002d25e0c5e4f657c25ebe"
+        ],
+        "physical_candidate_id": "asap-explain-v1:physical:39887308c366236c09380e80937606fd5b69c2de333031b5760f11ec2359f6e1",
+        "identity_unavailable_reason": null,
+        "status": "unselected",
+        "plan_id": 5752356276213301876,
+        "total_cost": 61000000000000.0,
+        "unavailable_reason": null
+      }
+    ]
+  },
+  "planner_selection_trace": [
+    {
+      "accuracy_evidence_scope": {
+        "data_snapshot_id": "issue-754-level1",
+        "hll": null,
+        "observed_at_unix_ms": 9500,
+        "query_id": "compat-query-0",
+        "source": "issue-754-finite-generator"
+      },
+      "committed_roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:2b05d26be253722469c57a458456405cf59f61a401b5230bd2c88077a55c529c",
+          "query_index": 0
+        }
+      ],
+      "deployment_overrides": [],
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:5315807d41445e58cc908ca80736716b0a548c0ab37be11f9408f1df13846652",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 131072.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 131072.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "constant",
+                  "value": 0.010000000000000002
+                },
+                "failure_probability": {
+                  "op": "union_bound",
+                  "terms": [
+                    {
+                      "op": "zero"
+                    },
+                    {
+                      "op": "zero"
+                    }
+                  ]
+                },
+                "metric": "relative_value",
+                "provenance": [
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "constant",
+                        "value": 0.0049751243781094535
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "relative_value",
+                      "provenance": [
+                        {
+                          "algorithm": "DDSketch",
+                          "contract": "ddsketch_relative_error_alpha_v1",
+                          "kind": "sketch_readout",
+                          "params": {
+                            "DDSketch": {
+                              "alpha": 0.0049751243781094535
+                            }
+                          },
+                          "query": "Quantile { q: 0.9 }"
+                        },
+                        {
+                          "guarantee": {
+                            "bound": {
+                              "op": "zero"
+                            },
+                            "failure_probability": {
+                              "op": "zero"
+                            },
+                            "metric": "absolute_value",
+                            "provenance": [
+                              {
+                                "kind": "exact",
+                                "reason": "KeepPreAsap"
+                              }
+                            ]
+                          },
+                          "input_index": 0,
+                          "kind": "child_guarantee"
+                        },
+                        {
+                          "kind": "composition_step",
+                          "operator": {
+                            "op": "approximate_aggregate"
+                          },
+                          "rule": "exact_input"
+                        },
+                        {
+                          "kind": "accuracy_target",
+                          "target": {
+                            "EpsilonDelta": {
+                              "delta": 0.01,
+                              "epsilon": 0.0049751243781094535
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "constant",
+                        "value": 0.0049751243781094535
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "relative_value",
+                      "provenance": [
+                        {
+                          "algorithm": "DDSketch",
+                          "contract": "ddsketch_relative_error_alpha_v1",
+                          "kind": "sketch_readout",
+                          "params": {
+                            "DDSketch": {
+                              "alpha": 0.0049751243781094535
+                            }
+                          },
+                          "query": "Quantile { q: 0.5 }"
+                        },
+                        {
+                          "guarantee": {
+                            "bound": {
+                              "op": "zero"
+                            },
+                            "failure_probability": {
+                              "op": "zero"
+                            },
+                            "metric": "absolute_value",
+                            "provenance": [
+                              {
+                                "kind": "exact",
+                                "reason": "KeepPreAsap"
+                              }
+                            ]
+                          },
+                          "input_index": 0,
+                          "kind": "child_guarantee"
+                        },
+                        {
+                          "kind": "composition_step",
+                          "operator": {
+                            "op": "approximate_aggregate"
+                          },
+                          "rule": "exact_input"
+                        },
+                        {
+                          "kind": "accuracy_target",
+                          "target": {
+                            "EpsilonDelta": {
+                              "delta": 0.01,
+                              "epsilon": 0.0049751243781094535
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "input_index": 1,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "contract": "complete finite issue-754 generator population",
+                    "input_index": 0,
+                    "kind": "input_value_domain",
+                    "lower": 10.0,
+                    "max_samples": 14408,
+                    "upper": 1600.0
+                  },
+                  {
+                    "contract": "complete finite issue-754 generator population",
+                    "input_index": 1,
+                    "kind": "input_value_domain",
+                    "lower": 10.0,
+                    "max_samples": 14408,
+                    "upper": 1600.0
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "exact_division"
+                    },
+                    "rule": "relative_division"
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "preserve exact PromQL arithmetic over independently realized summary operands",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 0,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:612b6b11c321c663ec092e983ee396ec294bd79fe0be44f3bd7f20379deb7c9c"
+        },
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:46c180553e09a8d74b1ce0913ac52b6e9cb2224060d5661714e13fc29f7f9d81",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 65536.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 65536.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "constant",
+                  "value": 0.01
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "relative_value",
+                "provenance": [
+                  {
+                    "algorithm": "DDSketch",
+                    "contract": "ddsketch_relative_error_alpha_v1",
+                    "kind": "sketch_readout",
+                    "params": {
+                      "DDSketch": {
+                        "alpha": 0.01
+                      }
+                    },
+                    "query": "Quantile { q: 0.9 }"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "approximate_aggregate"
+                    },
+                    "rule": "exact_input"
+                  },
+                  {
+                    "kind": "accuracy_target",
+                    "target": {
+                      "EpsilonDelta": {
+                        "delta": 0.01,
+                        "epsilon": 0.01
+                      }
+                    }
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 1,
+          "rejected": [
+            {
+              "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
+              "status": "rejected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "target_id": "asap-explain-v1:target:828b3226db7194d7afcdfbb059d50408f61e79816fab03ebfd54186a606857d1"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 2,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:adac5d1e201f9102c71aa380d5df8fd70f255641e8858165035b21a5c59bcb72"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 3,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:02597f2a8bd34c77f16a905fc986a4b7019710a0f146e4e1cf8a13c13970b53f"
+        },
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:b5ccd7f3d5846d3abc31910f4a8707a1936f62136a2eea7c9153282db63187f8",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 65536.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 65536.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "constant",
+                  "value": 0.01
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "relative_value",
+                "provenance": [
+                  {
+                    "algorithm": "DDSketch",
+                    "contract": "ddsketch_relative_error_alpha_v1",
+                    "kind": "sketch_readout",
+                    "params": {
+                      "DDSketch": {
+                        "alpha": 0.01
+                      }
+                    },
+                    "query": "Quantile { q: 0.5 }"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "approximate_aggregate"
+                    },
+                    "rule": "exact_input"
+                  },
+                  {
+                    "kind": "accuracy_target",
+                    "target": {
+                      "EpsilonDelta": {
+                        "delta": 0.01,
+                        "epsilon": 0.01
+                      }
+                    }
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "quantile(q=0.5) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 4,
+          "rejected": [
+            {
+              "description": "quantile(q=0.5) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
+              "status": "rejected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "target_id": "asap-explain-v1:target:12d0483f8c18a35ba1dc127a322b3963ff83e3838e1f084d743cdda6471061e2"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 5,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:adac5d1e201f9102c71aa380d5df8fd70f255641e8858165035b21a5c59bcb72"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 6,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:02597f2a8bd34c77f16a905fc986a4b7019710a0f146e4e1cf8a13c13970b53f"
+        }
+      ],
+      "roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:2b05d26be253722469c57a458456405cf59f61a401b5230bd2c88077a55c529c",
+          "query_index": 0
+        }
+      ],
+      "schema_version": 1
+    }
+  ]
+}

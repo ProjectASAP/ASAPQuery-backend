@@ -1,0 +1,46 @@
+name: issue-754
+comparison_defaults:
+  value_tolerance:
+    relative: 0.01
+    absolute: 0.000001
+queries:
+  - name: spatial-sum
+    expr: 'sum by (label_0) (data)'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: spatial-topk
+    expr: 'topk by (label_0) (3, data)'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: spatial-quantile
+    expr: 'quantile by (label_0) (0.9, data)'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: temporal-sum
+    expr: 'sum_over_time(data[1m])'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: temporal-quantile
+    expr: 'quantile_over_time(0.9, data[1m])'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: temporal-rate
+    expr: 'rate(data[1m])'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: grouped-rate
+    expr: 'sum by (label_0) (rate(data[1m]))'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: grouped-temporal-sum
+    expr: 'sum by (label_0) (sum_over_time(data[1m]))'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: topk-rate
+    expr: 'topk by (label_0) (3, rate(data[1m]))'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
+  - name: quantile-ratio
+    expr: 'quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])'
+    instant_offsets_seconds: [120, 180]
+    range: {start_offset_seconds: 120, end_offset_seconds: 180, step_seconds: 60}
