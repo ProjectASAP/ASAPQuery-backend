@@ -121,7 +121,7 @@ impl PhysicalQueryRuntime<'_> {
         &self,
         _id: QueryNodeId,
         node: &QueryPlanNode,
-        inputs: &[PhysicalQueryOutput],
+        inputs: &[&PhysicalQueryOutput],
         context: &dag::RunContext,
     ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
         match node {
@@ -664,7 +664,7 @@ impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
                 .await?;
             let values = values
                 .iter()
-                .map(|value| value.value().clone())
+                .map(|value| value.value())
                 .collect::<Vec<_>>();
             self.runtime
                 .execute_node(self.id, self.node, &values, &context)
@@ -945,7 +945,7 @@ mod tests {
                     input: QueryNodeId(1),
                     readout: control_plane::query_plan::ExactReadout::Rate,
                 },
-                &[PhysicalQueryOutput::State {
+                &[&PhysicalQueryOutput::State {
                     groups,
                     item_labels: vec![],
                 }],

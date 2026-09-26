@@ -232,7 +232,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         id: QueryNodeId,
         at: i64,
         node: &QueryPlanNode,
-        inputs: &[Value],
+        inputs: &[&Value],
         dependencies: &[(QueryNodeId, i64)],
         context: &physical::RunContext,
     ) -> Result<Value, EngineError> {
@@ -284,8 +284,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                 let [values, candidates] = inputs else {
                     return Err(miss("semi-join requires two inputs"));
                 };
-                let values = vector(values.clone())?;
-                let candidates = vector(candidates.clone())?;
+                let values = vector((**values).clone())?;
+                let candidates = vector((**candidates).clone())?;
                 let predicate = serde_json::from_value(pred)
                     .map_err(|_| miss("invalid semi-join predicate"))?;
                 let keys = asap_physical_operators::dag::planner::equijoin_keys(
@@ -322,7 +322,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
     fn logical(
         &mut self,
         operator: ResidualQueryOperator,
-        inputs: &[Value],
+        inputs: &[&Value],
         dependencies: &[(QueryNodeId, i64)],
         at: i64,
         context: &physical::RunContext,
@@ -330,7 +330,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         let input = |index: usize| {
             inputs
                 .get(index)
-                .cloned()
+                .map(|value| (**value).clone())
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
@@ -450,7 +450,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     return Err(miss("subquery grid input mismatch"));
                 }
                 for (value, (_, time)) in inputs.iter().zip(dependencies) {
-                    for (labels, value) in vector(value.clone())? {
+                    for (labels, value) in vector((**value).clone())? {
                         values.entry(labels).or_default().push((*time, value));
                     }
                 }
@@ -572,7 +572,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
                     })?
                 }))
                 .await?;
-            let values = values.iter().map(|v| v.value().clone()).collect::<Vec<_>>();
+            let values = values.iter().map(|v| v.value()).collect::<Vec<_>>();
             self.runtime
                 .borrow_mut()
                 .execute_node(
