@@ -914,6 +914,51 @@ mod tests {
     use super::super::compiler::BackendLocalPlanningInput;
     use super::*;
 
+    /// A deployment without external execution rejects native candidates before pricing.
+    #[test]
+    fn local_only_deployment_rejects_external_candidate_before_pricing() {
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["implementation"]["require_backend_local_execution"] = json!(true);
+        let input: BackendLocalPlanningInput = serde_json::from_value(value).unwrap();
+        let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let native = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.queries.iter().all(|query| {
+                    matches!(
+                        query.selected_plan_root.expr,
+                        planner_types::post_asap::SummaryExpr::KeepPreAsap(_)
+                    )
+                })
+            })
+            .expect("native candidate remains inspectable")
+            .clone();
+        let error = DeploymentPlanCompiler
+            .compile_promql(native, environment)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external execution is unavailable"),
+            "{error}"
+        );
+        let selected = input.compile_promql().unwrap();
+        assert!(selected.query_plan.entries.values().all(|entry| entry
+            .nodes
+            .values()
+            .all(|node| !matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. }))));
+        let report = selected.cost_comparison.unwrap();
+        assert!(report
+            .candidate_evaluations
+            .iter()
+            .any(|candidate| candidate
+                .unavailable_reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("external execution is unavailable"))
+                && candidate.total_cost.is_none()));
+    }
+
     /// Deployment computes and compares complete costs without external quotes.
     #[test]
     fn deployment_automatically_prices_workload() {
