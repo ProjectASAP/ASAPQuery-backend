@@ -231,10 +231,38 @@ identical because a different readout does not require another KLL producer.
 The reader still checks the record's definition, format and actual coverage
 before using its payload.
 
-A definition includes every field needed to decide semantic equivalence: source
-and filters, input value, operation or sketch parameters, grouping, time
-semantics, accuracy fields that affect state, and output type. Display names,
-costs, locations, readiness and retention status are excluded.
+### Input semantics are necessary but not sufficient
+
+`source`, `filter`, `grouping` and `window` describe input-data semantics, not a
+complete summary definition. They identify the origin, selection, grouping and
+time scope of records. They do not identify the value being summarized, all
+upstream transformations, or the resulting summary operation.
+
+A compatible definition must preserve:
+
+| Concern | Semantic content |
+| --- | --- |
+| Input computation | Canonical source identities and schemas, filters and upstream joins/transforms in the selected input sub-DAG |
+| Values and grouping | Value expressions, item/weight expressions where applicable, group keys/types and operation-defined null/duplicate behavior |
+| Time | Time interpretation, interval bounds and alignment, including query range versus maintained pane coverage |
+| Summary operation | Exact operation or sketch algorithm/parameters and compatible build/merge semantics |
+| Output | State/value representation and type; readout parameters if the persisted output is finalized |
+
+KLL over latency and KLL over log-latency therefore have different definitions
+even if the four input-scope fields match. Two quantile readouts can share a KLL
+state definition because their readout parameters do not change that stored
+state; persisting the finalized quantile makes the readout part of its semantics.
+
+These are completeness requirements, not another expression model. Preserve or
+reference canonical Planner computation and operator contracts instead of
+flattening arbitrary DAGs into four fields or copying rules into a second IR.
+Unknown semantics must fail compatibility checks. Identity/canonicalization
+must distinguish different computations; a shared display name is insufficient.
+
+Locations, encoding, schedules, retention, costs and observed readiness are not
+summary semantics. Definition compatibility is necessary but not sufficient for
+reuse: bindings and records must also satisfy supported format, actual coverage,
+revision and completion requirements.
 
 Boundary bindings connect Planner's typed physical inputs and outputs to stored
 records. The backend does not classify semantic nodes or choose where to cut
