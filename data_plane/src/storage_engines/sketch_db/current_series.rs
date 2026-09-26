@@ -32,17 +32,19 @@ impl Ord for Ranked {
             .then(self.labels.cmp(&other.labels))
     }
 }
+#[derive(Clone)]
 struct Member {
     timestamp: i64,
     value: Option<f64>,
     group: Labels,
     bytes: u64,
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Group {
     ordered: BTreeSet<Ranked>,
     cached: Option<(Vec<f64>, Vector, f64, f64)>,
 }
+#[derive(Clone)]
 struct Population {
     definition: SeriesPopulation,
     members: BTreeMap<Labels, Member>,
@@ -275,6 +277,9 @@ pub struct CurrentSeriesStore {
     populations: BTreeMap<String, Population>,
     first: Option<i64>,
     watermark: Option<i64>,
+    // Completed population versions, bounded by the same declared state budget.
+    history: BTreeMap<String, BTreeMap<i64, (i64, Population)>>,
+    history_bytes: BTreeMap<String, u64>,
 }
 impl CurrentSeriesStore {
     /// Called only after the complete Remote Write batch was admitted successfully.
@@ -300,35 +305,80 @@ impl CurrentSeriesStore {
         if self.populations.is_empty() || samples.is_empty() {
             return;
         }
-        let mut timestamps: Vec<_> = samples.iter().map(|s| s.timestamp_ms).collect();
-        timestamps.sort_unstable();
-        timestamps.dedup();
+        let mut batches = BTreeMap::<i64, Vec<&CanonicalSample>>::new();
+        for sample in samples {
+            batches.entry(sample.timestamp_ms).or_default().push(sample);
+        }
+        if self
+            .watermark
+            .is_some_and(|w| batches.keys().any(|t| *t <= w))
+        {
+            // Late writes invalidate completed versions; never serve a stale revision.
+            self.history.clear();
+            self.history_bytes.clear();
+        }
         let max_lag = self
             .populations
             .values()
             .map(|p| p.definition.max_input_lag_ms)
             .min()
             .unwrap() as i64;
-        for timestamp in timestamps {
+        for (timestamp, batch) in batches {
             if self
                 .watermark
                 .is_some_and(|w| timestamp > w.saturating_add(max_lag))
             {
-                // A gap cannot prove that every still-live series was observed.
                 self.first = Some(timestamp);
             }
             self.first.get_or_insert(timestamp);
             self.watermark = Some(self.watermark.unwrap_or(timestamp).max(timestamp));
-        }
-        let watermark = self.watermark.unwrap();
-        for population in self.populations.values_mut() {
-            let cutoff = watermark.saturating_sub(population.definition.lookback_ms as i64);
-            population.expire(cutoff);
-            for sample in samples {
-                population.update(sample, cutoff);
+            let watermark = self.watermark.unwrap();
+            for (key, population) in &mut self.populations {
+                let cutoff = watermark.saturating_sub(population.definition.lookback_ms as i64);
+                population.expire(cutoff);
+                for sample in &batch {
+                    population.update(sample, cutoff);
+                }
+                let retention = population.definition.history_retention_ms;
+                if retention == 0 || timestamp < watermark {
+                    continue;
+                }
+                let history = self.history.entry(key.clone()).or_default();
+                let bytes = self.history_bytes.entry(key.clone()).or_default();
+                let oldest = watermark.saturating_sub(retention as i64);
+                let checkpoint_bytes = population.bytes.saturating_add(1024);
+                // Include fixed per-version metadata even for an empty population.
+                while history.first_key_value().is_some_and(|(t, _)| *t < oldest)
+                    || (!history.is_empty()
+                        && bytes
+                            .saturating_add(checkpoint_bytes)
+                            .saturating_add(population.bytes)
+                            > population.definition.max_bytes)
+                {
+                    let (_, (_, expired)) = history.pop_first().unwrap();
+                    *bytes -= expired.bytes.saturating_add(1024);
+                }
+                if population.unavailable.is_none()
+                    && bytes
+                        .saturating_add(checkpoint_bytes)
+                        .saturating_add(population.bytes)
+                        <= population.definition.max_bytes
+                {
+                    if let Some((_, previous)) =
+                        history.insert(timestamp, (self.first.unwrap(), population.clone()))
+                    {
+                        *bytes -= previous.bytes.saturating_add(1024);
+                    }
+                    *bytes += checkpoint_bytes;
+                } else {
+                    // A missing version must not let a historical read reuse an older value.
+                    history.clear();
+                    *bytes = 0;
+                }
             }
         }
     }
+
     pub fn read(
         &mut self,
         generation: (u64, u64),
@@ -341,8 +391,31 @@ impl CurrentSeriesStore {
         }
         let at = i64::try_from(at).map_err(|_| "invalid evaluation timestamp")?;
         let watermark = self.watermark.ok_or("current-series state is cold")?;
-        if at < watermark {
-            return Err("current-series state cannot answer historical evaluations".into());
+        if at < watermark
+            || (at == watermark
+                && self
+                    .history
+                    .get(&definition.key())
+                    .is_some_and(|h| h.contains_key(&at)))
+        {
+            if definition.history_retention_ms == 0
+                || at < watermark.saturating_sub(definition.history_retention_ms as i64)
+            {
+                return Err("current-series state cannot answer historical evaluations outside declared retention".into());
+            }
+            let (timestamp, (first, saved)) = self
+                .history
+                .get(&definition.key())
+                .and_then(|h| h.range(..=at).next_back())
+                .ok_or("current-series historical coverage is unavailable")?;
+            if at > timestamp.saturating_add(definition.max_input_lag_ms as i64)
+                || at.saturating_sub(definition.lookback_ms as i64) < *first
+            {
+                return Err("current-series historical lookback is not covered".into());
+            }
+            let mut population = saved.clone();
+            population.expire(at.saturating_sub(definition.lookback_ms as i64));
+            return Ok(population.read(readout));
         }
         if at > watermark.saturating_add(definition.max_input_lag_ms as i64) {
             return Err("current-series input is behind evaluation time".into());
@@ -395,6 +468,7 @@ mod tests {
             },
             lookback_ms: 300_000,
             max_input_lag_ms: 60_000,
+            history_retention_ms: 0,
             max_series: 100,
             max_bytes: 1_000_000,
             max_k: 3,
@@ -423,6 +497,88 @@ mod tests {
             .unwrap();
         assert!(values.is_empty());
     }
+    // Historical reads use the state at that timestamp, never the latest values.
+    #[test]
+    fn declared_history_retains_as_of_population_within_budget() {
+        let mut population = definition();
+        population.lookback_ms = 1_000;
+        population.max_input_lag_ms = 1_000;
+        population.history_retention_ms = 2_000;
+        let plan = plan(&population);
+        let mut store = CurrentSeriesStore::default();
+        store.ingest(
+            &plan,
+            &[
+                sample("one", "api", 0, Some(1.)),
+                sample("one", "api", 1_000, Some(2.)),
+                sample("one", "api", 2_000, Some(3.)),
+                sample("one", "api", 3_000, Some(4.)),
+            ],
+        );
+        assert_eq!(
+            store
+                .read((7, 1), &population, &SeriesReadout::Sum, 1_000)
+                .unwrap()[0]
+                .1,
+            2.
+        );
+        assert_eq!(
+            store
+                .read((7, 1), &population, &SeriesReadout::Sum, 3_000)
+                .unwrap()[0]
+                .1,
+            4.
+        );
+        assert!(store
+            .read((7, 1), &population, &SeriesReadout::Sum, 999)
+            .is_err());
+        assert!(
+            store.history_bytes[&population.key()] + store.populations[&population.key()].bytes
+                <= population.max_bytes
+        );
+    }
+
+    // Resource exhaustion and late revisions cannot masquerade as historical coverage.
+    #[test]
+    fn retained_history_rejects_evicted_and_late_revisions() {
+        let mut population = definition();
+        population.lookback_ms = 1_000;
+        population.max_input_lag_ms = 1_000;
+        population.history_retention_ms = 2_000;
+        let installed = plan(&population);
+        let mut store = CurrentSeriesStore::default();
+        store.ingest(
+            &installed,
+            &[
+                sample("one", "api", 0, Some(1.)),
+                sample("one", "api", 1_000, Some(2.)),
+                sample("one", "api", 2_000, Some(3.)),
+            ],
+        );
+        store.ingest(&installed, &[sample("two", "api", 1_500, Some(20.))]);
+        assert!(store
+            .read((7, 1), &population, &SeriesReadout::Sum, 1_000)
+            .is_err());
+        let mut bounded = population.clone();
+        bounded.max_bytes = 2_500;
+        let mut store = CurrentSeriesStore::default();
+        store.ingest(
+            &plan(&bounded),
+            &[
+                sample("one", "api", 0, Some(1.)),
+                sample("one", "api", 1_000, Some(2.)),
+                sample("one", "api", 2_000, Some(3.)),
+            ],
+        );
+        assert!(store
+            .read((7, 1), &bounded, &SeriesReadout::Sum, 1_000)
+            .is_err());
+        assert!(
+            store.history_bytes[&bounded.key()] + store.populations[&bounded.key()].bytes
+                <= bounded.max_bytes
+        );
+    }
+
     fn plan(p: &SeriesPopulation) -> QueryPlan {
         let mut plan = QueryPlan::empty();
         plan.plan_id = 7;

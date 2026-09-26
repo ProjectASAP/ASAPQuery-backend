@@ -1109,6 +1109,11 @@ async fn try_answer_freshness_probe(
 /// gorilla engine's `plan_from_ast` does.
 fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
     use promql_parser::parser::{parse, Expr};
+    // Every accepted probe contains this function token. Avoid constructing
+    // the PromQL grammar for unrelated installed queries on each HTTP request.
+    if !query.contains("last_over_time") {
+        return None;
+    }
     let expr = parse(query).ok()?;
     fn unwrap<'a>(expr: &'a Expr) -> &'a Expr {
         match expr {
@@ -2497,6 +2502,7 @@ mod tests {
             .unwrap();
         let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(
             crate::storage_engines::types::RuntimePhysicalPlan {
+                readout_programs: Default::default(),
                 envelope: envelope.clone(),
                 summary_catalog: Some(Arc::clone(&catalog)),
                 precompute_plan: PrecomputePlan {
@@ -5364,6 +5370,7 @@ pub fn validate_and_build_runtime_plan(
         None => default_routing,
     };
     Ok(crate::storage_engines::types::RuntimePhysicalPlan {
+        readout_programs: Default::default(),
         envelope: envelope.clone(),
         summary_catalog: Some(Arc::new(request.summary_catalog)),
         precompute_plan: request.precompute_plan,

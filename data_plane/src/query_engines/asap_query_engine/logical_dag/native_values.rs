@@ -23,16 +23,7 @@ fn schema(fields: &[(&str, DataType)]) -> Schema {
         time_index: None,
     })
 }
-fn context() -> Result<dag::RunContext, EngineError> {
-    dag::RunContext::new(
-        dag::Scope::Query {
-            evaluation_time_ms: 0,
-            revision: 0,
-        },
-        dag::Limits::default(),
-    )
-    .map_err(|e| miss(e.to_string()))
-}
+
 fn key<T: serde::Serialize>(value: &T) -> Value {
     Value::Utf8(
         serde_json::to_string(value)
@@ -79,6 +70,7 @@ pub(super) fn sort(
     values: Vector,
     grouping: &Grouping,
     descending: bool,
+    context: &dag::RunContext,
 ) -> Result<Vector, EngineError> {
     let batch = ranked_batch(&values, grouping)?;
     let op = Operator::sort(
@@ -91,7 +83,7 @@ pub(super) fn sort(
         vec![1],
     )
     .map_err(|e| miss(e.to_string()))?;
-    let result = batch_execution::evaluate_batch(batch, vec![op], context()?)
+    let result = batch_execution::evaluate_batch(batch, vec![op], context.clone())
         .map_err(|e| miss(e.to_string()))?;
     output(values, result)
 }
@@ -100,11 +92,12 @@ pub(super) fn limit(
     grouping: &Grouping,
     n: u64,
     offset: u64,
+    context: &dag::RunContext,
 ) -> Result<Vector, EngineError> {
     let batch = ranked_batch(&values, grouping)?;
     let op = Operator::limit(batch.schema().clone(), n, offset, vec![1])
         .map_err(|e| miss(e.to_string()))?;
-    let result = batch_execution::evaluate_batch(batch, vec![op], context()?)
+    let result = batch_execution::evaluate_batch(batch, vec![op], context.clone())
         .map_err(|e| miss(e.to_string()))?;
     output(values, result)
 }
@@ -113,6 +106,7 @@ pub(super) fn semi_join(
     candidates: &Vector,
     left_key: &impl Fn(&Labels) -> Vec<String>,
     right_key: &impl Fn(&Labels) -> Vec<String>,
+    context: &dag::RunContext,
 ) -> Result<Vector, EngineError> {
     let schema = schema(&[("index", DataType::Int64), ("key", DataType::Utf8)]);
     let batch = |rows: &Vector, identity: &dyn Fn(&Labels) -> Vec<String>| {
@@ -130,7 +124,7 @@ pub(super) fn semi_join(
     let result = batch_execution::evaluate_inputs(
         vec![batch(&values, left_key)?, batch(candidates, right_key)?],
         op,
-        context()?,
+        context.clone(),
     )
     .map_err(|e| miss(e.to_string()))?;
     output(values, result)

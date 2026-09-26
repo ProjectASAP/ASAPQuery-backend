@@ -1,5 +1,6 @@
 //! Catalog-backed ClickHouse acceleration boundary.
 
+use asap_physical_operators::summary_kernels::SumAccumulator;
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -856,7 +857,12 @@ mod tests {
             "SELECT sum(value) FROM requests WHERE timestamp >= 2000 AND timestamp < 3000".into();
         let uncovered = accelerator.execute(&request).await;
         assert!(
-            matches!(&uncovered, ClickHouseAccelerationOutcome::Fallback(ClickHouseAccelerationFallback::Execution(detail)) if detail.contains("NoCandidates")),
+            matches!(
+                &uncovered,
+                ClickHouseAccelerationOutcome::Fallback(
+                    ClickHouseAccelerationFallback::IncompleteCoverage
+                )
+            ),
             "{uncovered:?}"
         );
         request.sql =

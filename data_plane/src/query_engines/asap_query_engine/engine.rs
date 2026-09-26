@@ -283,6 +283,22 @@ impl ASAPQueryEngine {
             physical.query_plan.plan_id,
             physical.query_plan.plan_version,
         )?;
+        // Native installed DAGs require no remote request preparation. Avoid
+        // constructing evaluation-grid maps for this common deployment path.
+        // Subqueries and raw scans still take the checked preparation path.
+        if entry.nodes.values().all(|node| match node {
+            asap_types::query_plan::QueryPlanNode::ExternalExact { .. } => false,
+            asap_types::query_plan::QueryPlanNode::Logical { operator, .. } => !matches!(
+                operator,
+                asap_types::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
+                    | asap_types::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }
+                    | asap_types::query_plan::residual::ResidualQueryOperator::Subquery { .. }
+                    | asap_types::query_plan::residual::ResidualQueryOperator::Scan { .. }
+            ),
+            _ => true,
+        }) {
+            return Ok(super::logical_dag::PreparedLeaves::new());
+        }
         // Candidate-filtered exact cuts have a data dependency: read the
         // installed membership subtree once, then use that vector to build the
         // Prometheus selector. Keeping the result as a prepared leaf also means
@@ -420,32 +436,10 @@ impl ASAPQueryEngine {
                             .with_label_keys_override(labels.into_keys().collect())
                     }).collect(), evaluation_ms));
                 }
-                let mut subtree = entry.clone();
-                subtree.root = root;
-                let reachable = subtree.topological_order().map_err(|e| {
-                    EngineError::capability_miss("installed_logical_dag", e.to_string())
+                let subtree = physical.readout_program(entry, root).map_err(|error| {
+                    EngineError::capability_miss("installed_logical_dag", error)
                 })?;
-                subtree.nodes.retain(|id, _| reachable.contains(id));
-                let bindings: Vec<_> = subtree
-                    .materialization_bindings()
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                let windows: std::collections::BTreeSet<Option<u64>> =
-                    bindings.iter().map(|b| b.readout_lookback_ms).collect();
-                if windows.len() != 1 || windows.contains(&None) || windows.contains(&Some(0)) {
-                    return Err(EngineError::capability_miss(
-                        "installed_logical_dag",
-                        "bound subtree requires one explicit positive window",
-                    ));
-                }
-                subtree.instant.lookback_ms = windows
-                    .first()
-                    .copied()
-                    .flatten()
-                    .expect("explicit semantic lookback checked");
-                subtree.instant.full_history = false;
-                subtree.instant.cumulative_readout = true;
+                let bindings = subtree.materialization_bindings();
                 let requirement = readiness_requirement(&subtree);
                 let index = self.summary_store.as_ref().ok_or_else(|| {
                     EngineError::capability_miss(
@@ -750,13 +744,9 @@ impl ASAPQueryEngine {
     {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                if entry.nodes.values().any(|node| {
-                    matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
-                }) {
-                    return self
-                        .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
-                        .await;
-                }
+                return self
+                    .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
+                    .await;
             }
         }
         let Some(idx) = self.summary_store.as_ref() else {
@@ -2718,6 +2708,15 @@ mod range_stitch_tests {
                 matches!(result, Err(EngineError::CapabilityMiss { .. })),
                 "a missing first pane must fail closed with a CapabilityMiss: {result:?}"
             );
+            // Stored-only range execution reports the actual shared-runtime work.
+            let complete = engine
+                .execute_range_promql_modern(query, 60_000, 60_000, 30_000)
+                .await
+                .unwrap();
+            assert!(complete
+                .warnings()
+                .iter()
+                .any(|w| w.starts_with("asap_logical_stats:raw=0,summary=1,")));
         }
     }
 

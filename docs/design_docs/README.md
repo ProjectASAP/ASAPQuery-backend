@@ -13,6 +13,8 @@ integration.
 - [Summary definitions table and SDS](summary-catalog-sds-architecture.md) owns definition
   and instance identity, version-scoped state references, read eligibility and
   committed-state metadata.
+- [QueryPlan DAG execution](query-dag-execution.md) explains how the query
+  engine evaluates installed query sub-DAGs and reads bound stored summaries.
 - [Architecture migration delivery plan](asapplanner-migration-plan.md) defines
   common-library extraction, removal of ASAPCollector dependencies, the two-plan
   rollout, and backend acceptance/retirement gates.

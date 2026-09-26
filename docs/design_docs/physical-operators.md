@@ -51,3 +51,17 @@ input contracts before opening sources. Deployment resolves those inputs and
 instantiates the compiled DAG. `CompiledPhysicalDag::from_operators` supports
 adapters that already have a concrete physical fragment. Unsupported deployment
 input frontiers are reported to Planner as feasibility evidence, before selection.
+
+## Deployment retention and execution evidence
+
+The backend `DeploymentPlanCompiler` binds declared historical query delay to
+retention; it does not change a logical selector's lookback. Current-series
+populations retain bounded versions only when the deployment requests historical
+coverage. Their current and retained versions share the population memory budget.
+Late revisions invalidate old coverage; missing or evicted state fails explicitly.
+Candidate costing includes version residency, copying and retirement.
+
+Every installed range evaluation uses the shared DAG execution path and reports
+its actual local-summary and external-exact work. The differential and benefit
+runners require successful local execution evidence as well as matching values.
+Routing to the ASAP endpoint alone is insufficient.

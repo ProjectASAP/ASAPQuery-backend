@@ -1460,14 +1460,10 @@ mod tests {
                 ("telemetry".into(), timestamped("timestamp_ms", "value")),
                 (
                     "divisors".into(),
-                    Schema::with_time_index(
-                        vec![
-                            Column::new("timestamp", DataType::Int64, false),
-                            Column::new("divisor", DataType::Float64, false),
-                        ],
-                        0,
-                        vec![],
-                    ),
+                    Schema::new(vec![
+                        Column::new("timestamp", DataType::Int64, false),
+                        Column::new("divisor", DataType::Float64, false),
+                    ]),
                 ),
             ]),
             accuracy: AccuracyTarget::Exact,

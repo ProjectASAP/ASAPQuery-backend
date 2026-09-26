@@ -6,7 +6,8 @@ use asap_physical_operators::arithmetic::evaluate_float64_arithmetic as arithmet
 
 use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
 
-use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
+use asap_physical_operators::dag::{self, PhysicalOperator};
+use futures::StreamExt;
 /// A planned warm query cannot be served; callers may route to an exact backend.
 #[derive(Debug)]
 pub enum LoweringSkip {
@@ -113,20 +114,22 @@ struct PhysicalQueryRuntime<'a> {
     language: control_plane::query_plan::QueryLanguage,
     catalog: Option<std::sync::Arc<asap_types::summary_catalog::SummaryCatalog>>,
     context: QueryExecutionContext<'a>,
+    // All counter groups in a run use the same resolved evaluation range.
+    counter_parameters: std::cell::OnceCell<std::collections::HashMap<String, String>>,
 }
 
-impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
-    type Output = PhysicalQueryOutput;
-    type Error = PhysicalNodeError;
-
+impl PhysicalQueryRuntime<'_> {
     fn execute_node(
         &self,
         _id: QueryNodeId,
         node: &QueryPlanNode,
-        inputs: &[Self::Output],
-    ) -> Result<Self::Output, Self::Error> {
+        inputs: &[&PhysicalQueryOutput],
+        context: &dag::RunContext,
+    ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
         match node {
-            QueryPlanNode::Scalar { value } => Ok(PhysicalQueryOutput::Scalar(*value)),
+            QueryPlanNode::Scalar { value } => super::logical_dag::native_scalar(*value, context)
+                .map(PhysicalQueryOutput::Scalar)
+                .map_err(|error| PhysicalNodeError::Fallback(error.to_string())),
             QueryPlanNode::Binary { operator, .. } => {
                 let [lhs, rhs] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
@@ -137,7 +140,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 let [PhysicalQueryOutput::Value(values, coverage)] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
-                reduce_sum_values(grouping, values, *coverage)
+                reduce_sum_values_in_context(grouping, values, *coverage, context)
             }
             QueryPlanNode::ReadMaterialization { binding } => {
                 let mut groups = self
@@ -223,41 +226,55 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 let [PhysicalQueryOutput::State { groups, .. }] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
+                let no_parameters = std::collections::HashMap::new();
+                let parameters = if matches!(
+                    readout,
+                    control_plane::query_plan::ExactReadout::Rate
+                        | control_plane::query_plan::ExactReadout::Increase
+                ) {
+                    self.counter_parameters.get_or_init(|| {
+                        std::collections::HashMap::from([
+                            ("range_start_ms".into(), self.context.t0_ms.to_string()),
+                            ("range_end_ms".into(), self.context.t1_ms.to_string()),
+                        ])
+                    })
+                } else {
+                    &no_parameters
+                };
                 let mut coverage = None;
                 let values = groups
                     .iter()
-                    .map(|(key, state)| {
-                        fold_coverage(&mut coverage, state.exact_coverage());
-                        state
-                            .exact_value_for(
-                                *readout,
-                                &None,
-                                self.context.t0_ms,
-                                self.context.t1_ms,
-                            )
-                            .map(|value| {
-                                (
+                    .filter_map(|(key, state)| {
+                        let state_coverage = state.exact_coverage();
+                        fold_coverage(&mut coverage, state_coverage);
+                        let value =
+                            match state.exact_value_with_parameters(*readout, &None, parameters) {
+                                Ok(Some(value)) => value,
+                                Ok(None) => return None,
+                                Err(error) => return Some(Err(PhysicalNodeError::Fallback(error))),
+                            };
+                        Some(Ok({
+                            (
+                                {
+                                    let mut labels = key.clone();
+                                    if self.language
+                                        == control_plane::query_plan::QueryLanguage::MetricsQl
+                                        && !matches!(
+                                            readout,
+                                            control_plane::query_plan::ExactReadout::Max
+                                                | control_plane::query_plan::ExactReadout::Min
+                                        )
                                     {
-                                        let mut labels = key.clone();
-                                        if self.language
-                                            == control_plane::query_plan::QueryLanguage::MetricsQl
-                                            && !matches!(
-                                                readout,
-                                                control_plane::query_plan::ExactReadout::Max
-                                                    | control_plane::query_plan::ExactReadout::Min
-                                            )
-                                        {
-                                            labels.remove("__name__");
-                                        }
-                                        labels
-                                    },
-                                    SummaryValue::Points(
-                                        vec![(self.context.t1_ms as i64, value)],
-                                        state.exact_coverage(),
-                                    ),
-                                )
-                            })
-                            .ok_or(PhysicalNodeError::ExpectedState)
+                                        labels.remove("__name__");
+                                    }
+                                    labels
+                                },
+                                SummaryValue::Points(
+                                    vec![(self.context.t1_ms as i64, value)],
+                                    state_coverage,
+                                ),
+                            )
+                        }))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(PhysicalQueryOutput::Value(values, coverage))
@@ -480,17 +497,42 @@ fn intersect_coverage(left: Option<(u64, u64)>, right: Option<(u64, u64)>) -> Op
     (result.0 <= result.1).then_some(result)
 }
 
+#[cfg(test)]
 fn reduce_sum_values(
     grouping: &asap_types::query_plan::PhysicalGrouping,
     values: &[(BTreeMap<String, String>, SummaryValue)],
     coverage: Option<(u64, u64)>,
 ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
+    let context = dag::RunContext::new(
+        dag::Scope::Query {
+            evaluation_time_ms: 0,
+            revision: 0,
+        },
+        dag::Limits::default(),
+    )
+    .unwrap();
+    reduce_sum_values_in_context(grouping, values, coverage, &context)
+}
+fn reduce_sum_values_in_context(
+    grouping: &asap_types::query_plan::PhysicalGrouping,
+    values: &[(BTreeMap<String, String>, SummaryValue)],
+    coverage: Option<(u64, u64)>,
+    context: &dag::RunContext,
+) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
+    use dag::{
+        operators::{Operator, Reduction},
+        values::{Batch, Value},
+    };
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::DataType,
+    };
     let asap_types::query_plan::PhysicalGrouping::Reduce(keys) = grouping else {
         return Ok(PhysicalQueryOutput::Value(values.to_vec(), coverage));
     };
     let mut groups = BTreeMap::new();
     for (labels, value) in values {
-        let SummaryValue::Points(points, coverage) = value else {
+        let SummaryValue::Points(points, row_coverage) = value else {
             return Err(PhysicalNodeError::ExpectedState);
         };
         let labels = labels
@@ -499,27 +541,52 @@ fn reduce_sum_values(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<BTreeMap<_, _>>();
         for (timestamp, value) in points {
-            groups
+            let group = groups
                 .entry((labels.clone(), *timestamp))
-                .and_modify(|(sum, cover): &mut (f64, Option<(u64, u64)>)| {
-                    *sum += value;
-                    *cover = intersect_coverage(*cover, *coverage);
-                })
-                .or_insert((*value, *coverage));
+                .or_insert_with(|| (Vec::new(), *row_coverage));
+            group.0.push(*value);
+            group.1 = intersect_coverage(group.1, *row_coverage);
         }
     }
-    Ok(PhysicalQueryOutput::Value(
-        groups
+    let groups = groups.into_iter().collect::<Vec<_>>();
+    let schema = std::sync::Arc::new(SummarySchema {
+        fields: vec![("group", DataType::Int64), ("value", DataType::Float64)]
             .into_iter()
-            .map(|((labels, timestamp), (sum, coverage))| {
-                (
-                    labels,
-                    SummaryValue::Points(vec![(timestamp, sum)], coverage),
-                )
+            .map(|(name, dtype)| SummaryField {
+                name: name.into(),
+                dtype: SummaryFamilyType::Plain(dtype),
+                nullable: false,
             })
             .collect(),
-        coverage,
-    ))
+        time_index: None,
+    });
+    let rows = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (_, (values, _)))| {
+            values
+                .iter()
+                .map(move |value| vec![Value::Int64(index as i64), Value::Float64(*value)])
+        })
+        .collect();
+    let error = |error: dag::Error| PhysicalNodeError::Fallback(error.to_string());
+    let batch = Batch::try_new(schema.clone(), rows).map_err(error)?;
+    let operator = Operator::aggregate(schema, vec![0], vec![("value".into(), Reduction::Sum(1))])
+        .map_err(error)?;
+    let output = dag::batch_execution::evaluate_batch(batch, vec![operator], context.clone())
+        .map_err(error)?;
+    let mut result = Vec::new();
+    for row in output.iter().flat_map(|batch| batch.rows()) {
+        let [Value::Int64(index), Value::Float64(sum)] = row.as_slice() else {
+            return Err(PhysicalNodeError::ExpectedState);
+        };
+        let ((labels, time), (_, row_coverage)) = &groups[*index as usize];
+        result.push((
+            labels.clone(),
+            SummaryValue::Points(vec![(*time, *sum)], *row_coverage),
+        ));
+    }
+    Ok(PhysicalQueryOutput::Value(result, coverage))
 }
 
 fn execute_physical_query_plan(
@@ -530,6 +597,145 @@ fn execute_physical_query_plan(
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
     execute_physical_query_payload(index, entry, entry.root, t0_ms, t1_ms, is_cumulative)
+}
+
+// Store adapters retain backend coverage/population metadata; dependency execution
+// and shared-node lifetime are owned by the independent physical DAG runtime.
+struct BoundQueryOperator<'a, 'store> {
+    id: QueryNodeId,
+    node: &'a QueryPlanNode,
+    runtime: &'a PhysicalQueryRuntime<'store>,
+}
+impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
+    fn name(&self) -> &str {
+        "InstalledQueryOperator"
+    }
+    fn input_schemas(&self) -> Vec<()> {
+        vec![(); self.node.inputs().len()]
+    }
+    fn output_schema(&self) {}
+    fn output_bytes(&self, value: &PhysicalQueryOutput) -> usize {
+        match value {
+            PhysicalQueryOutput::Scalar(_) => 8,
+            PhysicalQueryOutput::State {
+                groups,
+                item_labels,
+            } => {
+                groups
+                    .iter()
+                    .map(|(labels, state)| {
+                        labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                            + match state {
+                                GroupState::Sketch { entries, .. } => entries
+                                    .iter()
+                                    .flat_map(|entry| entry.samples.values())
+                                    .flatten()
+                                    .map(|sample| {
+                                        sample.bytes.len() + std::mem::size_of_val(sample)
+                                    })
+                                    .sum::<usize>(),
+                                GroupState::ExactAgg { entries, .. } => entries
+                                    .iter()
+                                    .flat_map(|entry| entry.values())
+                                    .map(|state| state.approx_memory_bytes() + 8)
+                                    .sum::<usize>(),
+                            }
+                    })
+                    .sum::<usize>()
+                    + item_labels.iter().map(String::len).sum::<usize>()
+            }
+            PhysicalQueryOutput::Value(values, _) => values
+                .iter()
+                .map(|(labels, value)| {
+                    labels.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                        + match value {
+                            SummaryValue::Points(points, _) => {
+                                points.len() * std::mem::size_of::<(i64, f64)>()
+                            }
+                            SummaryValue::TopK(points, _) => points
+                                .iter()
+                                .map(|(_, items)| {
+                                    8 + items.iter().map(|(key, _)| key.len() + 8).sum::<usize>()
+                                })
+                                .sum::<usize>(),
+                        }
+                })
+                .sum(),
+        }
+    }
+    fn start<'a>(
+        &'a self,
+        inputs: Vec<dag::Input<'a, PhysicalQueryOutput>>,
+        context: dag::RunContext,
+    ) -> Result<dag::OutputStream<'a, PhysicalQueryOutput>, dag::Error> {
+        Ok(futures::stream::once(async move {
+            let values =
+                futures::future::try_join_all(inputs.into_iter().map(|mut input| async move {
+                    input.next().await.ok_or_else(|| {
+                        dag::Error::Operator("query input produced no value".into())
+                    })?
+                }))
+                .await?;
+            let values = values.iter().map(|value| value.value()).collect::<Vec<_>>();
+            self.runtime
+                .execute_node(self.id, self.node, &values, &context)
+                .map_err(|e| dag::Error::Operator(format!("query node {}: {e}", self.id.0)))
+        })
+        .boxed_local())
+    }
+}
+fn execute_bound_queries(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    roots: &[QueryNodeId],
+    runtime: &PhysicalQueryRuntime<'_>,
+    context: dag::RunContext,
+) -> Result<Vec<PhysicalQueryOutput>, dag::Error> {
+    let mut order = std::collections::BTreeSet::new();
+    for root in roots {
+        order.extend(
+            entry
+                .topological_order_from(*root)
+                .map_err(|e| dag::Error::Invalid(e.to_string()))?,
+        );
+    }
+    let mut graph = dag::PhysicalDag::default();
+    for id in order {
+        let node = &entry.nodes[&id];
+        graph.add(
+            id.0,
+            node.inputs().iter().map(|id| id.0).collect(),
+            BoundQueryOperator { id, node, runtime },
+        )?;
+    }
+    let outputs = graph.execute(
+        &roots.iter().map(|root| root.0).collect::<Vec<_>>(),
+        context,
+    )?;
+    futures::executor::block_on(futures::future::try_join_all(outputs.into_iter().map(
+        |mut output| async move {
+            output
+                .next()
+                .await
+                .ok_or_else(|| dag::Error::Operator("query root produced no value".into()))?
+                .map(|output| output.value().clone())
+        },
+    )))
+}
+fn execute_bound_query(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    root: QueryNodeId,
+    runtime: &PhysicalQueryRuntime<'_>,
+    revision: u64,
+) -> Result<PhysicalQueryOutput, dag::Error> {
+    let context = dag::RunContext::new(
+        dag::Scope::Query {
+            evaluation_time_ms: i64::try_from(runtime.context.t1_ms)
+                .map_err(|_| dag::Error::Invalid("query time exceeds i64".into()))?,
+            revision,
+        },
+        dag::Limits::default(),
+    )?;
+    Ok(execute_bound_queries(entry, &[root], runtime, context)?.remove(0))
 }
 
 fn execute_physical_query_payload(
@@ -543,6 +749,7 @@ fn execute_physical_query_payload(
     let revision = index.summary_update_revision();
     let result = (|| {
         let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
             language: entry.language,
             catalog: index.summary_catalog_snapshot(),
             context: QueryExecutionContext {
@@ -553,31 +760,11 @@ fn execute_physical_query_payload(
                 allowed_materializations: None,
             },
         };
-        let output = physical_dag::execute_from(entry, root, &runtime)
-            .map_err(|error| LoweringSkip::ExecuteFailed(format!("{error:?}")))?;
-        match output {
-            PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(
-                "scalar-only query is not a warm vector result".into(),
-            )),
-            PhysicalQueryOutput::Value(values, coverage) => {
-                let mut series = Vec::new();
-                for (group_key, value) in &values {
-                    series.extend(summary_value_to_series(group_key, value));
-                }
-                Ok(PostAsapReadoutOutcome { series, coverage })
-            }
-            PhysicalQueryOutput::State { groups, .. } => {
-                let mut coverage = None;
-                let mut series = Vec::new();
-                for (group_key, state) in &groups {
-                    fold_coverage(&mut coverage, state.exact_coverage());
-                    if let Some(value) = state.exact_value(&None) {
-                        series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
-                    }
-                }
-                Ok(PostAsapReadoutOutcome { series, coverage })
-            }
-        }
+        let output = execute_bound_query(entry, root, &runtime, revision.mutation_sequence())
+            .map_err(|error| {
+                LoweringSkip::ExecuteFailed(format!("query {}: {error}", entry.query_id))
+            })?;
+        readout_outcome(output, t1_ms)
     })();
     if !revision.matches(index.summary_update_revision()) {
         return Err(LoweringSkip::ExecuteFailed(
@@ -628,12 +815,374 @@ pub(crate) fn fold_coverage(coverage: &mut Option<(u64, u64)>, next: Option<(u64
     });
 }
 
+fn readout_outcome(
+    output: PhysicalQueryOutput,
+    t1_ms: u64,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    match output {
+        PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(
+            "scalar-only query is not a warm vector result".into(),
+        )),
+        PhysicalQueryOutput::Value(values, coverage) => {
+            let mut series = Vec::new();
+            for (group_key, value) in &values {
+                series.extend(summary_value_to_series(group_key, value));
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+        PhysicalQueryOutput::State { groups, .. } => {
+            let mut coverage = None;
+            let mut series = Vec::new();
+            for (group_key, state) in &groups {
+                if let GroupState::Sketch { entries, .. } = state {
+                    for entry in entries {
+                        for time in entry.samples.keys() {
+                            let time = (*time).max(0) as u64;
+                            fold_coverage(&mut coverage, Some((time, time)));
+                        }
+                    }
+                } else {
+                    fold_coverage(&mut coverage, state.exact_coverage());
+                }
+                if let Some(value) = state.exact_value(&None) {
+                    series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
+                }
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+    }
+}
+
+/// Evaluate all storage frontiers in one run so common dependencies are shared.
+pub(crate) fn execute_query_plan_readouts(
+    index: &SketchStore,
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    roots: &[QueryNodeId],
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+    context: dag::RunContext,
+) -> Result<BTreeMap<QueryNodeId, PostAsapReadoutOutcome>, LoweringSkip> {
+    if roots.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let revision = index.summary_update_revision();
+    let runtime = PhysicalQueryRuntime {
+        counter_parameters: Default::default(),
+        language: entry.language,
+        catalog: index.summary_catalog_snapshot(),
+        context: QueryExecutionContext {
+            index,
+            t0_ms,
+            t1_ms,
+            is_cumulative,
+            allowed_materializations: None,
+        },
+    };
+    let output = execute_bound_queries(entry, roots, &runtime, context)
+        .map_err(|e| LoweringSkip::ExecuteFailed(e.to_string()))?;
+    let result = roots
+        .iter()
+        .copied()
+        .zip(output)
+        .map(|(id, value)| readout_outcome(value, t1_ms).map(|value| (id, value)))
+        .collect();
+    if !revision.matches(index.summary_update_revision()) {
+        return Err(LoweringSkip::ExecuteFailed(
+            "summary input changed during query DAG evaluation".into(),
+        ));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::query_engines::asap_query_engine::test_plan;
     use asap_types::query_plan::{ExactReadout, PhysicalGrouping, QueryReadout};
     use planner_types::pre_asap::ArithmeticOpKind;
+
+    // A sparse counter is omitted without dropping other series in the vector.
+    #[test]
+    fn counter_readout_omits_only_series_with_fewer_than_two_samples() {
+        use crate::storage_engines::types::Measurement;
+        let idx = SketchStore::new();
+        let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
+            language: control_plane::query_plan::QueryLanguage::PromQl,
+            catalog: None,
+            context: QueryExecutionContext {
+                index: &idx,
+                t0_ms: 0,
+                t1_ms: 60_000,
+                is_cumulative: true,
+                allowed_materializations: None,
+            },
+        };
+        let groups = [1, 2]
+            .into_iter()
+            .map(|samples| {
+                let mut state = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
+                    Measurement::new(10.0),
+                    10_000,
+                    Measurement::new(10.0),
+                    10_000,
+                );
+                if samples == 2 {
+                    state.update(Measurement::new(20.0), 20_000);
+                }
+                (
+                    BTreeMap::from([("instance".into(), samples.to_string())]),
+                    GroupState::ExactAgg {
+                        entries: vec![std::rc::Rc::new(BTreeMap::from([(
+                            60_000,
+                            std::sync::Arc::new(state)
+                                as std::sync::Arc<dyn crate::storage_engines::types::AggregateCore>,
+                        )]))],
+                        agg_type: asap_types::AggregationType::Rate,
+                    },
+                )
+            })
+            .collect();
+        let context = dag::RunContext::new(
+            dag::Scope::Query {
+                evaluation_time_ms: 60_000,
+                revision: 0,
+            },
+            dag::Limits::default(),
+        )
+        .unwrap();
+        let output = runtime
+            .execute_node(
+                QueryNodeId(0),
+                &QueryPlanNode::ExactReadout {
+                    input: QueryNodeId(1),
+                    readout: control_plane::query_plan::ExactReadout::Rate,
+                },
+                &[&PhysicalQueryOutput::State {
+                    groups,
+                    item_labels: vec![],
+                }],
+                &context,
+            )
+            .unwrap();
+        let PhysicalQueryOutput::Value(rows, _) = output else {
+            panic!("value rows required")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0["instance"], "2");
+    }
+
+    // Empty leading/trailing panes do not invalidate a bounded counter window.
+    #[test]
+    fn sparse_counter_panes_preserve_full_requested_range() {
+        use crate::storage_engines::types::Measurement;
+        let idx = SketchStore::new();
+        let policy = asap_types::PolicyFingerprint(778);
+        idx.register(SummarySeriesMetadata {
+            storage_handle: 7,
+            metric_name: "requests_total".into(),
+            group_by_keys: std::collections::BTreeSet::new(),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: asap_types::AggregationType::Rate,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: policy,
+        });
+        for (start, time, value) in [(20_000, 25_000, 10.), (40_000, 45_000, 20.)] {
+            let state = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
+                Measurement::new(value),
+                time,
+                Measurement::new(value),
+                time,
+            );
+            idx.append_precompute(7, BTreeMap::new(), (start, start + 10_000), Box::new(state));
+        }
+        let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
+            item_labels: vec![],
+            materialization: policy.into(),
+            stored_output_reference: super::super::test_plan::bound_reference(&idx, policy.into()),
+            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
+            window_ms: 10_000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: Some(60_000),
+        };
+        let context = QueryExecutionContext {
+            index: &idx,
+            t0_ms: 0,
+            t1_ms: 60_000,
+            is_cumulative: true,
+            allowed_materializations: None,
+        };
+        let groups = context.read_bound_materialization(&binding).unwrap();
+        assert_eq!(groups.len(), 1);
+        let result = groups[0]
+            .1
+            .exact_value_for(
+                control_plane::query_plan::ExactReadout::Rate,
+                &None,
+                0,
+                60_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert!((result - 11. / 24.).abs() < 1e-12);
+        let partial = QueryExecutionContext {
+            t0_ms: 25_000,
+            ..context
+        };
+        assert!(partial.read_bound_materialization(&binding).is_err());
+    }
+
+    // Per-series reads preserve source order so stable ranking retains tied inputs.
+    #[test]
+    fn per_entity_read_preserves_source_order() {
+        let idx = SketchStore::new();
+        let policy = asap_types::PolicyFingerprint(779);
+        for (sid, instance) in [(1, "z"), (2, "a")] {
+            idx.register(SummarySeriesMetadata {
+                storage_handle: sid,
+                metric_name: "m".into(),
+                group_by_keys: std::collections::BTreeSet::new(),
+                capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
+                agg_kind: AggKind::ExactAgg {
+                    agg_type: asap_types::AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: policy,
+            });
+            idx.append_precompute(
+                sid,
+                BTreeMap::from([("instance".into(), instance.into())]),
+                (0, 1_000),
+                Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(1.)),
+            );
+        }
+        let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
+            item_labels: vec![],
+            materialization: policy.into(),
+            stored_output_reference: super::super::test_plan::bound_reference(&idx, policy.into()),
+            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
+            window_ms: 1_000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: Some(1_000),
+        };
+        let context = QueryExecutionContext {
+            index: &idx,
+            t0_ms: 0,
+            t1_ms: 1_000,
+            is_cumulative: true,
+            allowed_materializations: None,
+        };
+        let groups = context.read_bound_materialization(&binding).unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(labels, _)| labels["instance"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["z", "a"]
+        );
+    }
+
+    // A stored sketch frontier exposes pane coverage without treating it as exact state.
+    #[test]
+    fn sketch_frontier_retains_coverage_for_relation_binding() {
+        use crate::storage_engines::sketch_db::{
+            data::SketchTimeSeries, query::delta_apply::DeltaSketchKind,
+        };
+        let state = GroupState::Sketch {
+            kind: DeltaSketchKind::Hll { precision: 10 },
+            entries: vec![std::rc::Rc::new(SketchTimeSeries {
+                sid: 1,
+                series_label_values: BTreeMap::new(),
+                samples: BTreeMap::from([(1000, vec![]), (2000, vec![])]),
+            })],
+        };
+        let outcome = readout_outcome(
+            PhysicalQueryOutput::State {
+                groups: vec![(BTreeMap::new(), state)],
+                item_labels: vec![],
+            },
+            2000,
+        )
+        .unwrap();
+        assert_eq!(outcome.coverage, Some((1000, 2000)));
+        assert!(outcome.series.is_empty());
+    }
+
+    // Multiple storage frontiers share one run and inherit parent cancellation.
+    #[test]
+    fn multi_root_readout_uses_one_parent_context() {
+        let entry = asap_types::query_plan::QueryPlanEntry {
+            language: asap_types::query_plan::QueryLanguage::PromQl,
+            query_id: "shared".into(),
+            canonical_query: "1+1".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(1),
+            nodes: BTreeMap::from([
+                (QueryNodeId(0), QueryPlanNode::Scalar { value: 1. }),
+                (
+                    QueryNodeId(1),
+                    QueryPlanNode::Binary {
+                        operator: ArithmeticOpKind::Add,
+                        inputs: [QueryNodeId(0), QueryNodeId(0)],
+                    },
+                ),
+            ]),
+            instant: asap_types::query_plan::InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: asap_types::query_plan::FallbackPolicy::Reject,
+        };
+        let index = SketchStore::new();
+        let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
+            language: entry.language,
+            catalog: None,
+            context: QueryExecutionContext {
+                index: &index,
+                t0_ms: 0,
+                t1_ms: 1,
+                is_cumulative: false,
+                allowed_materializations: None,
+            },
+        };
+        let context = dag::RunContext::new(
+            dag::Scope::Query {
+                evaluation_time_ms: 1,
+                revision: 1,
+            },
+            dag::Limits::default(),
+        )
+        .unwrap();
+        let outputs = execute_bound_queries(
+            &entry,
+            &[QueryNodeId(1), QueryNodeId(0)],
+            &runtime,
+            context.clone(),
+        )
+        .unwrap();
+        assert!(
+            matches!(outputs.as_slice(),[PhysicalQueryOutput::Scalar(a),PhysicalQueryOutput::Scalar(b)] if *a==2. && *b==1.)
+        );
+        context.cancel();
+        assert!(execute_bound_queries(&entry, &[QueryNodeId(1)], &runtime, context).is_err());
+    }
 
     fn exact_points(metric: &str, service: &str, value: f64) -> PhysicalQueryOutput {
         PhysicalQueryOutput::Value(
@@ -1445,6 +1994,7 @@ mod tests {
         let value = outcome.series[0].1[0].1;
         assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
         let native_runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
             language: control_plane::query_plan::QueryLanguage::MetricsQl,
             catalog: None,
             context: QueryExecutionContext {
@@ -1460,7 +2010,7 @@ mod tests {
             control_plane::query_plan::ExactReadout::Increase,
         ] {
             assert!(matches!(native_runtime.execute_node(QueryNodeId(0),
-                &QueryPlanNode::ExactReadout { input:QueryNodeId(1),readout }, &[]),
+                &QueryPlanNode::ExactReadout { input:QueryNodeId(1),readout }, &[], &dag::RunContext::new(dag::Scope::Query { evaluation_time_ms: 0, revision: 0 }, dag::Limits::default()).unwrap()),
                 Err(PhysicalNodeError::Fallback(reason))
                     if reason.contains("native MetricsQL counter semantics require external exact execution")));
         }
