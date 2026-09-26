@@ -34,6 +34,7 @@ pub fn snapshot(
             "predictability":{"predictable":{"known_at":null}},"time_selection":{"scope":"real_time","lookback":null,"as_of":null}}))
     }).collect::<Result<_>>()?;
     value["query_workload"]["repeating_queries"] = json!(queries);
+    value["implementation"]["require_backend_local_execution"] = json!(true);
     let newest = dataset
         .series
         .iter()
