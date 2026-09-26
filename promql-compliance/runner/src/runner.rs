@@ -50,7 +50,9 @@ pub struct Args {
     pub base_time_ms: Option<i64>,
     #[arg(long, default_value_t = 3)]
     pub warmups: usize,
-    #[arg(long, default_value_t = 10)]
+    // With ten samples nearest-rank p95 is the maximum. Use enough samples
+    // to measure the tail percentile while retaining every observation.
+    #[arg(long, default_value_t = 100)]
     pub trials: usize,
 }
 pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
@@ -236,6 +238,16 @@ pub async fn compare_suite(
     }
     json!({"suite":suite.name,"dataset":dataset,"baseTimeMs":base,"queries":results,"passed":passed})
 }
+fn victoria_query(query: &input::Query) -> String {
+    // MetricsQL preserves the name for this rollup; PromQL removes it.
+    // https://docs.victoriametrics.com/MetricsQL.html#label_del
+    if query.name == "temporal-quantile" {
+        format!(r#"label_del({}, "__name__")"#, query.expr)
+    } else {
+        query.expr.clone()
+    }
+}
+
 async fn verify_baselines(
     client: &Client,
     args: &Args,
@@ -252,9 +264,17 @@ async fn verify_baselines(
     for q in &suite.queries {
         let at = input::at_ms(base, q.instant_offsets_seconds[0])?;
         let prom = transport::query(client, &args.reference, &q.expr, at, None, false).await?;
-        let vm = transport::query(client, &args.victoria_url, &q.expr, at, None, false).await?;
-        compare::compare(&prom, &vm, &q.policy(&suite.comparison_defaults))
-            .with_context(|| format!("VictoriaMetrics {}", q.name))?;
+        transport::wait_for_visible_query(
+            client,
+            &args.victoria_url,
+            &victoria_query(q),
+            at,
+            &prom,
+            &q.policy(&suite.comparison_defaults),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .with_context(|| format!("VictoriaMetrics {}", q.name))?;
         let sql = sql::baseline(&q.name, at, sql::window_ms(&q.expr)?)?;
         let rows = sql::rows(client, &args.clickhouse_url, &sql).await?;
         let mut values = vec![];
@@ -319,7 +339,13 @@ async fn execute_query(
             "victoria" => &args.victoria_url,
             _ => &args.reference,
         };
-        let response = transport::query(client, url, &q.expr, at, None, name == "backend").await?;
+        let expression = if name == "victoria" {
+            victoria_query(q)
+        } else {
+            q.expr.clone()
+        };
+        let response =
+            transport::query(client, url, &expression, at, None, name == "backend").await?;
         ensure!(
             response["status"] == "success",
             "measurement query failed: {response}"
@@ -385,7 +411,12 @@ async fn measure(
                 execute_query(client, args, name, q, at).await?;
                 samples.push(start.elapsed().as_secs_f64() * 1000.);
             }
-            queries.insert(q.name.clone(),json!({"p50Ms":percentile(&samples,0.5)?,"p95Ms":percentile(&samples,0.95)?,"samplesMs":samples}));
+            let expression = match name {
+                "victoria" => victoria_query(q),
+                "clickhouse" => sql::baseline(&q.name, at, sql::window_ms(&q.expr)?)?,
+                _ => q.expr.clone(),
+            };
+            queries.insert(q.name.clone(),json!({"expression":expression,"p50Ms":percentile(&samples,0.5)?,"p95Ms":percentile(&samples,0.95)?,"samplesMs":samples}));
         }
         let after = compose.usage(service)?;
         let cpu = after
@@ -406,12 +437,13 @@ pub fn benefit_failures(targets: &Value, suite: &Suite) -> Result<Vec<String>> {
     let mut failures = vec![];
     for name in ["prometheus", "victoria", "clickhouse"] {
         for metric in ["cpuUsec", "memoryPeakBytes"] {
-            let backend = targets["backend"][metric]
-                .as_u64()
-                .context("missing backend usage")?;
-            let baseline = targets[name][metric]
-                .as_u64()
-                .context("missing baseline usage")?;
+            let (Some(backend), Some(baseline)) = (
+                targets["backend"][metric].as_u64(),
+                targets[name][metric].as_u64(),
+            ) else {
+                failures.push(format!("{metric} unavailable for backend or {name}"));
+                continue;
+            };
             if backend >= baseline {
                 failures.push(format!("backend {metric} >= {name}"));
             }

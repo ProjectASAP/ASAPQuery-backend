@@ -65,7 +65,7 @@ impl Compose {
         }
         Ok(())
     }
-    pub fn usage(&self, service: &str) -> Result<(u64, u64)> {
+    pub fn usage(&self, service: &str) -> Result<(u64, Option<u64>)> {
         ensure!(!self.files.is_empty(), "resource measurement needs Compose");
         let id = self.run(&["ps", "-q", service])?;
         ensure!(
@@ -85,7 +85,12 @@ impl Compose {
         };
         let cpu = read("/sys/fs/cgroup/cpu.stat")?;
         let usage = parse_cpu_stat(&cpu)?;
-        let peak = read("/sys/fs/cgroup/memory.peak")?.trim().parse()?;
+        // Older cgroup-v2 kernels omit this counter. Keep other evidence, but
+        // never substitute current usage for the peak required by the gate.
+        let peak = read("/sys/fs/cgroup/memory.peak")
+            .ok()
+            .map(|value| value.trim().parse())
+            .transpose()?;
         Ok((usage, peak))
     }
     pub fn finish(&mut self) -> Result<()> {

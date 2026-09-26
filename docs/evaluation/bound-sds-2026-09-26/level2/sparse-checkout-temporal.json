@@ -1,0 +1,579 @@
+{
+  "baseTimeMs": 1790443039540,
+  "dataset": "sparse-checkout",
+  "passed": true,
+  "queries": [
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 300.0,
+          "timeMs": 1790443339540
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 600.0,
+          "timeMs": 1790443639540
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 1200.0,
+          "timeMs": 1790444239540
+        }
+      ],
+      "expr": "rate(http_requests_total[5m])",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 300.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443339.54,
+                      "1"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "host": "b"
+                    },
+                    "value": [
+                      1790443339.54,
+                      "2"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443339.54,
+                      "1"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "host": "b"
+                    },
+                    "value": [
+                      1790443339.54,
+                      "2"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790443339540
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 600.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443639.54,
+                      "1"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "host": "b"
+                    },
+                    "value": [
+                      1790443639.54,
+                      "2"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443639.54,
+                      "1"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "host": "b"
+                    },
+                    "value": [
+                      1790443639.54,
+                      "2"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790443639540
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 1200.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790444239.54,
+                      "1"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "host": "b"
+                    },
+                    "value": [
+                      1790444239.54,
+                      "2"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790444239.54,
+                      "1"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "host": "b"
+                    },
+                    "value": [
+                      1790444239.54,
+                      "2"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444239540
+        }
+      ],
+      "name": "request-rate",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "host": "a"
+                },
+                "values": [
+                  [
+                    1790443339.54,
+                    "1"
+                  ],
+                  [
+                    1790443399.54,
+                    "1"
+                  ],
+                  [
+                    1790443459.54,
+                    "1"
+                  ],
+                  [
+                    1790443519.54,
+                    "1"
+                  ],
+                  [
+                    1790443579.54,
+                    "1"
+                  ],
+                  [
+                    1790443639.54,
+                    "1"
+                  ],
+                  [
+                    1790443699.54,
+                    "1"
+                  ],
+                  [
+                    1790443759.54,
+                    "1"
+                  ],
+                  [
+                    1790443819.54,
+                    "1"
+                  ],
+                  [
+                    1790443879.54,
+                    "1"
+                  ],
+                  [
+                    1790443939.54,
+                    "1"
+                  ],
+                  [
+                    1790443999.54,
+                    "1"
+                  ],
+                  [
+                    1790444059.54,
+                    "1"
+                  ],
+                  [
+                    1790444119.54,
+                    "1"
+                  ],
+                  [
+                    1790444179.54,
+                    "1"
+                  ],
+                  [
+                    1790444239.54,
+                    "1"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "host": "b"
+                },
+                "values": [
+                  [
+                    1790443339.54,
+                    "2"
+                  ],
+                  [
+                    1790443399.54,
+                    "2"
+                  ],
+                  [
+                    1790443459.54,
+                    "2"
+                  ],
+                  [
+                    1790443519.54,
+                    "2"
+                  ],
+                  [
+                    1790443579.54,
+                    "2"
+                  ],
+                  [
+                    1790443639.54,
+                    "2"
+                  ],
+                  [
+                    1790443699.54,
+                    "2"
+                  ],
+                  [
+                    1790443759.54,
+                    "2"
+                  ],
+                  [
+                    1790443819.54,
+                    "2"
+                  ],
+                  [
+                    1790443879.54,
+                    "2"
+                  ],
+                  [
+                    1790443939.54,
+                    "2"
+                  ],
+                  [
+                    1790443999.54,
+                    "2"
+                  ],
+                  [
+                    1790444059.54,
+                    "2"
+                  ],
+                  [
+                    1790444119.54,
+                    "2"
+                  ],
+                  [
+                    1790444179.54,
+                    "2"
+                  ],
+                  [
+                    1790444239.54,
+                    "2"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "host": "a"
+                },
+                "values": [
+                  [
+                    1790443339.54,
+                    "1"
+                  ],
+                  [
+                    1790443399.54,
+                    "1"
+                  ],
+                  [
+                    1790443459.54,
+                    "1"
+                  ],
+                  [
+                    1790443519.54,
+                    "1"
+                  ],
+                  [
+                    1790443579.54,
+                    "1"
+                  ],
+                  [
+                    1790443639.54,
+                    "1"
+                  ],
+                  [
+                    1790443699.54,
+                    "1"
+                  ],
+                  [
+                    1790443759.54,
+                    "1"
+                  ],
+                  [
+                    1790443819.54,
+                    "1"
+                  ],
+                  [
+                    1790443879.54,
+                    "1"
+                  ],
+                  [
+                    1790443939.54,
+                    "1"
+                  ],
+                  [
+                    1790443999.54,
+                    "1"
+                  ],
+                  [
+                    1790444059.54,
+                    "1"
+                  ],
+                  [
+                    1790444119.54,
+                    "1"
+                  ],
+                  [
+                    1790444179.54,
+                    "1"
+                  ],
+                  [
+                    1790444239.54,
+                    "1"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "host": "b"
+                },
+                "values": [
+                  [
+                    1790443339.54,
+                    "2"
+                  ],
+                  [
+                    1790443399.54,
+                    "2"
+                  ],
+                  [
+                    1790443459.54,
+                    "2"
+                  ],
+                  [
+                    1790443519.54,
+                    "2"
+                  ],
+                  [
+                    1790443579.54,
+                    "2"
+                  ],
+                  [
+                    1790443639.54,
+                    "2"
+                  ],
+                  [
+                    1790443699.54,
+                    "2"
+                  ],
+                  [
+                    1790443759.54,
+                    "2"
+                  ],
+                  [
+                    1790443819.54,
+                    "2"
+                  ],
+                  [
+                    1790443879.54,
+                    "2"
+                  ],
+                  [
+                    1790443939.54,
+                    "2"
+                  ],
+                  [
+                    1790443999.54,
+                    "2"
+                  ],
+                  [
+                    1790444059.54,
+                    "2"
+                  ],
+                  [
+                    1790444119.54,
+                    "2"
+                  ],
+                  [
+                    1790444179.54,
+                    "2"
+                  ],
+                  [
+                    1790444239.54,
+                    "2"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 300.0,
+          "timeMs": 1790443339540
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 600.0,
+          "timeMs": 1790443639540
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 1200.0,
+          "timeMs": 1790444239540
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.0
+        }
+      }
+    }
+  ],
+  "suite": "temporal"
+}

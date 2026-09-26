@@ -119,3 +119,18 @@ cargo clippy --locked -p promql-compliance --all-targets -- -D warnings
 ```
 
 There is no Go toolchain, runner, module or generated Go code in this harness.
+
+## Three-baseline benefit gate
+
+Run `make benefit` from `promql-compliance/runner`. It validates all ten shared
+queries before measuring Prometheus, VictoriaMetrics, ClickHouse and the backend.
+The gate requires lower CPU, peak memory and per-query p95 than each baseline.
+A missing cgroup `memory.peak` counter is recorded as null and fails the gate,
+while preserving the available CPU and latency measurements.
+
+For the temporal quantile baseline, VictoriaMetrics uses explicit
+`label_del(..., "__name__")` to match PromQL output labels. The report records
+the actual expression sent to every target; strict label comparison is retained.
+
+See the [2026-09-25 validation report](../docs/evaluation/physical-deployment-2026-09-25/README.md)
+for passing correctness results and unresolved acceptance failures.

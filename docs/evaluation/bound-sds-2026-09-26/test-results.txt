@@ -1,0 +1,113 @@
+Workspace sweep and corrective rerun (2026-09-26)
+
+Production source is unchanged by the final transport-fixture correction.
+Optional ClickHouse tests early-return without CLICKHOUSE_URL; they are not established by this sweep.
+
+ASAP_E2E_CONTROL_PLANE_BIN=/mydata/sds-stack-target/debug/control_plane cargo test --workspace --no-fail-fast --locked --offline -j 2 -- --test-threads=1
+
+Running unittests src/lib.rs
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/coupling_wire_compat.rs
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/monitor_interop.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running unittests src/lib.rs
+test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+Running unittests src/lib.rs
+test result: ok. 447 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.42s
+Running unittests src/main.rs
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+Running unittests src/bin/control_plane_quote_snapshot.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.93s
+Running tests/discovery_snapshot.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+Running tests/issue754_level1.rs
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.49s
+Running tests/o11y_exact_fallback.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+Running tests/offline_evidence.rs
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+Running unittests src/lib.rs
+test result: ok. 892 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 85.12s
+Running unittests src/main.rs
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+Running unittests src/bin/monitor_coordinator_harness.rs
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/all_sketches_process_oracle_e2e.rs
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+Running tests/asapquery_compatibility_process_e2e.rs
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 54.88s
+Running tests/backend_process_e2e.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s
+Running tests/clickhouse_differential_e2e.rs
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/clickhouse_q05_process_e2e.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/component_process_e2e.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+Running tests/disable_query_forwarding_process_e2e.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+Running tests/e2e_controller_plans_and_backend_serves.rs
+test result: FAILED. 1 passed; 12 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.58s
+Running tests/edge_sketch_codec.rs
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/monitor_grpc.rs
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.35s
+Running tests/monitor_process_e2e.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+Running tests/o11y_remote_write_wire.rs
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/promql_differential_process_e2e.rs
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+Running unittests src/lib.rs
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running unittests src/bin/benefit-runner.rs
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running unittests src/bin/differential-runner.rs
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running unittests src/bin/report-card.rs
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Running tests/contracts.rs
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.94s
+Running tests/http.rs
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+Doc-tests asap_otel_proto
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Doc-tests asap_types
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Doc-tests control_plane
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Doc-tests data_plane
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Doc-tests promql_compliance
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Correction: imported-state semantic binding and explicit CMS wire fixtures.
+cargo test -p data_plane --test e2e_controller_plans_and_backend_serves --locked --offline -j 2 -- --test-threads=1
+
+   Compiling control_plane v0.1.0 (/mydata/ASAPQuery-backend/.worktrees/sds-stack-759/control_plane)
+   Compiling data_plane v0.1.0 (/mydata/ASAPQuery-backend/.worktrees/sds-stack-759/data_plane)
+    Finished `test` profile [unoptimized] target(s) in 55.50s
+     Running tests/e2e_controller_plans_and_backend_serves.rs (/mydata/sds-stack-target/debug/deps/e2e_controller_plans_and_backend_serves-6e1eed815317c44e)
+
+running 13 tests
+test controller_plan_to_query_ddsketch_delta_subwindow_roundtrip ... ok
+test controller_plan_to_query_full_roundtrip_ddsketch ... ok
+test controller_plan_to_query_full_roundtrip_kll ... ok
+test controller_plans_with_grouping_and_backend_parses_grouping_labels ... ok
+test controller_streaming_config_round_trips_through_backend_http ... ok
+test imported_cms_frequency_wire_roundtrip ... ok
+test imported_cms_state_serves_count_query ... ok
+test imported_cms_state_serves_range_query ... ok
+test imported_cms_top_endpoint_wire_roundtrip ... ok
+test live_serve_actually_answers_ddsketch_quantile ... ok
+test live_serve_cms_reads_independent_series ... ok
+test probe_queryplan ... ok
+test shadow_mode_does_not_change_served_ddsketch_quantile ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.29s
+
+
+
+Strict workspace Clippy passed; final fixture-target strict Clippy passed.
+cargo fmt --all -- --check and git diff --check passed.
