@@ -341,10 +341,24 @@ fn differential_snapshot_uses_actual_fixture_cadence() {
     let suite = Suite::load(Path::new("../suites/issue-702.yaml")).unwrap();
     let snapshot = planning::snapshot(&suite, &data, 10000, 0, false).unwrap();
     let value = serde_json::to_value(snapshot).unwrap();
-    assert_eq!(value["implementation"]["require_backend_local_execution"], true);
+    assert_eq!(
+        value["implementation"]["require_backend_local_execution"],
+        true
+    );
     assert_eq!(value["implementation"]["scrape_interval_ms"], 60000);
     assert_eq!(
         value["data_workload"]["data_ingestion_interval"]["value"],
         60000
     );
+}
+
+/// Every aggregation workload must bind locally before the replay is opened.
+#[test]
+fn aggregation_workload_has_local_deployment() {
+    let suite = Suite::load(Path::new("../suites/aggregations.yaml")).unwrap();
+    let data = Dataset::load(Path::new("../datasets/aggregations-dense-cadence.yaml")).unwrap();
+    let input =
+        planning::snapshot(&suite, &data, 1_700_000_000_000, 1_700_000_000_000, false).unwrap();
+    let result = input.compile_promql();
+    assert!(result.is_ok(), "{}", result.unwrap_err());
 }
