@@ -150,8 +150,8 @@ The current migration implements bound queries only; ad-hoc discovery is deferre
 | Implementation owner | Required change | Regression/acceptance gate |
 | --- | --- | --- |
 | Planner shared types and physical integration (#462) | Export a versioned canonical semantic description for a selected persisted output; exclude placement and temporary node IDs. | Different input expressions differ; renumbering preserves identity; state definitions exclude downstream readout parameters. |
-| Backend plan/schema foundation (#749) | Separate semantic definitions from deployed-output bindings; remove the requirement that stored-output ID equals definition ID; version the changed plan contract. | Same-version hot/rebuild outputs can share one definition without aliasing; tampered definitions and mismatched bindings fail installation. |
-| Planner dependency integration (#770) | Consume the shared semantic export and propagate it from selected physical outputs into deployment compilation. | No backend expression normalization or synthetic semantic fingerprint from incomplete config fields. |
+| Backend plan/schema foundation (#749), completed with the shared semantic contract in #774 | Separate semantic definitions from deployed-output bindings; remove the requirement that stored-output ID equals definition ID; version the changed plan contract. | Same-version hot/rebuild outputs can share one definition without aliasing; tampered definitions and mismatched bindings fail installation. |
+| Planner dependency integration (#774) | Consume the shared semantic export and propagate it from selected physical outputs into deployment compilation. | No backend expression normalization or synthetic semantic fingerprint from incomplete config fields. |
 | Precompute/storage integration (#763) | Persist definitions and output-scoped records; authorize writes against installed bindings and recover them consistently. | Restart retains semantic descriptions; wrong-output writes fail; replacement metadata and payload remain consistent. |
 | Query integration (#765) | Resolve the installed deployed output and validate definition, revision, format and coverage before invoking shared execution. | A hot-bound query never reads rebuild state; stale, missing or incompatible records take the explicit failure route. |
 | Acceptance PRs (#728, #742, #759) | Update fixtures and process tests for the new contract; retain existing behavioral and performance gates. | End-to-end producer → persisted definition/record → recovery → bound read, with negative identity and coverage cases. |
@@ -166,3 +166,7 @@ The implementation must preserve supported payload decoders independently of
 plan-schema retirement. Keep implementation guides accurate to the code until
 each stage lands; then update the APIs, persistence descriptions and test evidence
 in the same implementation PR.
+
+The open shared-library integration PR is #774, replacing the already merged
+#770. The active order after #771 is #774 → #763 → #765 → #761 → #728
+→ #742 → #759; old #770 base metadata is not part of this chain.
