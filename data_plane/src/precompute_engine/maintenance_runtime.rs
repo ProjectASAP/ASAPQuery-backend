@@ -4160,6 +4160,7 @@ mod tests {
             },
         )]);
         let active = RuntimePhysicalPlan {
+            readout_programs: Default::default(),
             envelope: bundle.precompute_plan.envelope.clone(),
             summary_catalog: Some(Arc::new(bundle.summary_catalog)),
             precompute_plan: bundle.precompute_plan,
