@@ -52,7 +52,7 @@ fn dd_meta(sid: u64) -> SummarySeriesMetadata {
         relative_accuracy: 0.01,
     };
     SummarySeriesMetadata {
-        sid,
+        storage_handle: sid,
         metric_name: "bench_metric".into(),
         group_by_keys: BTreeSet::new(),
         capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),

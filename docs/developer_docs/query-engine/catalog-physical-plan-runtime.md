@@ -24,3 +24,7 @@ for the downstream acceptance requirements. Ad-hoc discovery is not implemented.
 The HTTP lifecycle is exposed through `/api/v1/physical-plan`,
 `/api/v1/physical-plan/activate`, `/api/v1/physical-plan/discard`, and
 `/api/v1/physical-plan/status`.
+
+The current V1 storage path reads only the installed plan version. Matching
+definition identity does not authorize cross-version payload reuse; that would
+require an explicit reader binding and separate compatibility support.

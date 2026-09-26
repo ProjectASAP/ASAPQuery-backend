@@ -6935,8 +6935,8 @@ pub(crate) mod tests {
             &query_plan,
         )
         .unwrap();
-        // V1 has one stored output per definition; arbitrary output IDs are
-        // rejected before writer/reader agreement is considered.
+        // Output identity is independent of definition identity, but changing
+        // only the writer must still invalidate every unchanged reader binding.
         let mut rebound_writer = bundle.precompute_plan.clone();
         rebound_writer.schemas[0]
             .stored_output_reference
@@ -6944,6 +6944,13 @@ pub(crate) mod tests {
         assert!(rebound_writer
             .validate_against_catalog(&bundle.summary_catalog)
             .is_err());
+        assert!(
+            asap_types::plan_publication::validate_stored_output_references(
+                &rebound_writer,
+                &query_plan,
+            )
+            .is_err()
+        );
     }
 
     #[test]

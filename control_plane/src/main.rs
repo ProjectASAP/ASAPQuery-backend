@@ -41,7 +41,7 @@ struct AppState {
     /// input identity; incoming telemetry cannot supply its own descriptors.
     active_summary_catalog:
         Arc<tokio::sync::Mutex<Option<Arc<asap_types::summary_catalog::SummaryCatalog>>>>,
-    /// Shared client for posting streaming configs from HTTP planning and replanning.
+    /// Shared client for publishing physical plans from HTTP planning and replanning.
     /// `None` when `CONTROLLER_BACKEND_ENDPOINT` is unset; pushes are then skipped.
     backend_client: Option<Arc<backend_client::BackendClient>>,
 }
@@ -69,13 +69,13 @@ async fn main() {
         backend_endpoint.as_ref().map(|endpoint| {
             info!(
                 endpoint = %endpoint,
-                "ASAPQuery-backend StreamingConfig push enabled"
+                "ASAPQuery-backend InstalledPrecomputePlan push enabled"
             );
             Arc::new(backend_client::BackendClient::new(endpoint.clone()))
         });
     if backend_client_shared.is_none() {
         info!(
-            "ASAPQuery-backend StreamingConfig push disabled \
+            "ASAPQuery-backend physical-plan publication disabled \
              (set CONTROLLER_BACKEND_ENDPOINT=<url> to enable)"
         );
     }
@@ -996,9 +996,9 @@ mod api_tests {
     #[test]
     fn app_state_backend_client_some_when_constructed_with_url() {
         let (state, _router) =
-            test_app_with_backend(Some("http://127.0.0.1:1/api/v1/streaming-config".into()));
+            test_app_with_backend(Some("http://127.0.0.1:1/api/v1/physical-plan".into()));
         let bc = state.backend_client.expect("backend_client must be Some");
-        assert_eq!(bc.endpoint(), "http://127.0.0.1:1/api/v1/streaming-config");
+        assert_eq!(bc.endpoint(), "http://127.0.0.1:1/api/v1/physical-plan");
     }
 
     // ── POST /api/v1/plan ─────────────────────────────────────────────────────

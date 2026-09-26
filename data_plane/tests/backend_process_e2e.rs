@@ -5,7 +5,9 @@
 //! data plane, sends a modified-OTLP DDSketch, and verifies the resulting
 //! PromQL value. No server or planner is constructed in the test process.
 
-use std::io::Write;
+#[path = "support/empty_physical_plan.rs"]
+mod empty_physical_plan;
+
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -374,10 +376,10 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
 
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
     let mut bootstrap = tempfile::NamedTempFile::new().expect("create bootstrap config");
-    writeln!(bootstrap, "aggregations: []").expect("write bootstrap config");
+    serde_json::to_writer(&mut bootstrap, &empty_physical_plan::empty()).unwrap();
 
     let data_child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
-        .arg("--streaming-config")
+        .arg("--physical-plan")
         .arg(bootstrap.path())
         .arg("--http-port")
         .arg(port(&data_api).to_string())
@@ -416,7 +418,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         .env("CONTROLLER_GRPC_ADDR", &control_grpc)
         .env(
             "CONTROLLER_BACKEND_ENDPOINT",
-            format!("{data_base}/api/v1/streaming-config"),
+            format!("{data_base}/api/v1/physical-plan"),
         )
         .env(
             "CONTROLLER_WORKLOADS",
@@ -536,7 +538,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
     assert_eq!(publication["collector_ids"][0], "whole-e2e-collector");
 
     let active: serde_json::Value = client
-        .get(format!("{data_base}/api/v1/streaming-config"))
+        .get(format!("{data_base}/api/v1/physical-plan/status"))
         .send()
         .await
         .expect("read installed streaming config")
@@ -544,12 +546,13 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         .await
         .expect("decode installed streaming config");
     assert_eq!(
-        active["aggregation_count"], 1,
+        active["materializations"].as_array().unwrap().len(),
+        1,
         "physical plan was not installed: {active}"
     );
-    let installed_aggregation = active["streaming_config"]["aggregation_configs"]
-        .as_object()
-        .and_then(|configs| configs.values().next())
+    let installed_aggregation = active["precompute_plan"]["materializations"]
+        .as_array()
+        .and_then(|configs| configs.first())
         .expect("installed aggregation details");
     let planned_alpha = installed_aggregation["parameters"]["alpha"]
         .as_f64()
@@ -723,8 +726,9 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .await
                 .unwrap();
             assert_eq!(first_scalar(&still_warm), Some(value));
-            // Retry the staged successor while queries are in flight. Each
-            // request must retain a complete active snapshot through cutover.
+            // Retry while queries are in flight. Old-generation reads may finish,
+            // but the successor must stay cold until its own output is published.
+            // Reusing the old payload would violate StoredOutputReference identity.
             request["activation_unix_ms"] = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -747,11 +751,12 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                         .json()
                         .await
                         .unwrap();
-                    assert_eq!(
-                        first_scalar(&response),
-                        Some(value),
-                        "torn serving snapshot: {response}"
-                    );
+                    if let Some(actual) = first_scalar(&response) {
+                        assert_eq!(actual, value, "incorrect old-generation result: {response}");
+                    } else {
+                        assert_eq!(response["status"], "error", "{response}");
+                        assert_eq!(response["error"], "No result for query", "{response}");
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             });
@@ -774,6 +779,27 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
             assert_eq!(activated["plan_version"], 2);
             let (successor, _collector_socket) = collector.await.unwrap();
             readers.await.unwrap();
+            let cold_successor: serde_json::Value = client
+                .get(format!("{data_base}/api/v1/query"))
+                .query(&[
+                    ("query", query.to_string()),
+                    ("time", (window_end_ms as f64 / 1000.0).to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(cold_successor["status"], "error", "{cold_successor}");
+            assert_eq!(
+                cold_successor["error"], "No result for query",
+                "{cold_successor}"
+            );
+            assert!(
+                first_scalar(&cold_successor).is_none(),
+                "successor reused old state"
+            );
             let old_frame = client
                 .post(format!("http://{otlp_http}/v1/metrics"))
                 .header("content-type", "application/x-protobuf")

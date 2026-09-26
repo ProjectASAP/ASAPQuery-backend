@@ -35,7 +35,7 @@
 //!
 //! ## Format
 //!
-//! A single JSON object `{ "<sid>": SidMetaRecord, ... }` written
+//! A single JSON object `{ "<sid>": StoredOutputMetadataRecord, ... }` written
 //! atomically (tmp + rename) on every upsert. JSON (not the custom
 //! binary part format) because the record count equals live sid
 //! cardinality (small) and the schema is human-inspectable for
@@ -300,8 +300,10 @@ impl AggKindRec {
 /// `capability` and `accuracy` are DERIVED from `agg_kind` on load, the
 /// same way the ingest path derives them, so the record stays minimal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SidMetaRecord {
-    pub sid: u64,
+pub struct StoredOutputMetadataRecord {
+    #[serde(default)]
+    pub stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
+    pub storage_handle: u64,
     /// Authoritative identity and provenance, absent on legacy sidecars.
     #[serde(default)]
     pub stored_output_id: Option<asap_types::sds::StoredOutputId>,
@@ -330,7 +332,7 @@ pub struct SidMetaRecord {
     pub last_immutable: Option<super::immutable_output::ImmutableOutputReservation>,
 }
 
-impl SidMetaRecord {
+impl StoredOutputMetadataRecord {
     /// Build a record from the live store-side fields. `agg_kind` is the
     /// structured `AggKind`; `capability`/`accuracy` are intentionally
     /// NOT stored (re-derived on load).
@@ -342,7 +344,8 @@ impl SidMetaRecord {
         first_seen_unix_ms: i64,
     ) -> Self {
         Self {
-            sid,
+            storage_handle: sid,
+            stored_output_reference: None,
             stored_output_id: None,
             summary_definition_id: None,
             catalog_generation: None,
@@ -412,8 +415,10 @@ struct DataDescriptorRec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct SidBindingRec {
-    sid: u64,
+struct StoredOutputBindingRecord {
+    #[serde(default)]
+    stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
+    storage_handle: u64,
     #[serde(default)]
     stored_output_id: Option<asap_types::sds::StoredOutputId>,
     #[serde(default)]
@@ -446,15 +451,15 @@ struct SdsSidecar {
     catalog_generations: HashMap<String, std::sync::Arc<asap_types::sds::CatalogGeneration>>,
     summary_descriptors: HashMap<String, AggKindRec>,
     data_descriptors: HashMap<String, DataDescriptorRec>,
-    bindings: HashMap<String, SidBindingRec>,
+    bindings: HashMap<String, StoredOutputBindingRecord>,
 }
 
 impl SdsSidecar {
-    fn from_records(records: impl IntoIterator<Item = SidMetaRecord>) -> Self {
+    fn from_records(records: impl IntoIterator<Item = StoredOutputMetadataRecord>) -> Self {
         use crate::storage_engines::sketch_db::sds::{data_descriptor_id, summary_descriptor_id};
 
         let mut sidecar = Self {
-            schema_version: 4,
+            schema_version: 5,
             catalog_generations: HashMap::new(),
             summary_descriptors: HashMap::new(),
             data_descriptors: HashMap::new(),
@@ -494,9 +499,10 @@ impl SdsSidecar {
                 digest
             });
             sidecar.bindings.insert(
-                record.sid.to_string(),
-                SidBindingRec {
-                    sid: record.sid,
+                record.storage_handle.to_string(),
+                StoredOutputBindingRecord {
+                    storage_handle: record.storage_handle,
+                    stored_output_reference: record.stored_output_reference,
                     stored_output_id: record.stored_output_id,
                     summary_definition_id: record.summary_definition_id,
                     catalog_generation_sha256: generation_sha256,
@@ -515,7 +521,7 @@ impl SdsSidecar {
         sidecar
     }
 
-    fn into_records(self) -> PersistResult<Vec<SidMetaRecord>> {
+    fn into_records(self) -> PersistResult<Vec<StoredOutputMetadataRecord>> {
         self.bindings
             .into_values()
             .map(|binding| {
@@ -525,7 +531,7 @@ impl SdsSidecar {
                     .ok_or_else(|| {
                         PersistError::Format(format!(
                             "SeriesId {} references missing summary descriptor {}",
-                            binding.sid, binding.summary_descriptor_id
+                            binding.storage_handle, binding.summary_descriptor_id
                         ))
                     })?;
                 let data = self
@@ -534,11 +540,12 @@ impl SdsSidecar {
                     .ok_or_else(|| {
                         PersistError::Format(format!(
                             "SeriesId {} references missing data descriptor {}",
-                            binding.sid, binding.data_descriptor_id
+                            binding.storage_handle, binding.data_descriptor_id
                         ))
                     })?;
-                Ok(SidMetaRecord {
-                    sid: binding.sid,
+                Ok(StoredOutputMetadataRecord {
+                    storage_handle: binding.storage_handle,
+                    stored_output_reference: binding.stored_output_reference.clone(),
                     stored_output_id: binding.stored_output_id,
                     summary_definition_id: binding.summary_definition_id,
                     catalog_generation: binding
@@ -551,7 +558,7 @@ impl SdsSidecar {
                                 .ok_or_else(|| {
                                     PersistError::Format(format!(
                                         "SeriesId {} references missing catalog generation",
-                                        binding.sid
+                                        binding.storage_handle
                                     ))
                                 })
                         })
@@ -577,12 +584,12 @@ impl SdsSidecar {
 /// rewrite per flush tick is cheap and keeps the on-disk file always
 /// consistent with no log-replay machinery.
 #[derive(Debug)]
-pub struct SidMetadataStore {
+pub struct StoredOutputMetadataFile {
     path: PathBuf,
     writer: std::sync::Mutex<()>,
 }
 
-impl SidMetadataStore {
+impl StoredOutputMetadataFile {
     /// Open (or lazily create on first write) the sidecar at
     /// `<disk_path>/sid_metadata.json`.
     pub fn new(disk_path: &Path) -> Self {
@@ -691,7 +698,7 @@ impl SidMetadataStore {
     /// doesn't exist yet (fresh dir, or parts written before this feature
     /// landed) or when it is unparsable (treated as "no recoverable
     /// metadata" — the live ingest path still re-registers on first DP).
-    pub fn load(&self) -> PersistResult<Vec<SidMetaRecord>> {
+    pub fn load(&self) -> PersistResult<Vec<StoredOutputMetadataRecord>> {
         let mut f = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -715,7 +722,7 @@ impl SidMetadataStore {
         };
         if matches!(
             value.get("schema_version").and_then(|v| v.as_u64()),
-            Some(2 | 3 | 4)
+            Some(5)
         ) {
             let sidecar: SdsSidecar = match serde_json::from_value(value) {
                 Ok(sidecar) => sidecar,
@@ -740,35 +747,29 @@ impl SidMetadataStore {
                 }
             };
         }
-        // Version 1 was a flat SeriesId map. Read it and normalize on the next write.
-        let map: HashMap<String, SidMetaRecord> = match serde_json::from_value(value) {
-            Ok(map) => map,
-            Err(error) => {
-                tracing::warn!(path = %self.path.display(), %error, "legacy sid metadata is invalid; ignoring");
-                return Ok(Vec::new());
-            }
-        };
-        Ok(map.into_values().collect())
+        Err(PersistError::Format(
+            "stored-output metadata requires schema version 4".into(),
+        ))
     }
 
     /// Upsert a batch of records, merging with whatever is already on
     /// disk (last write wins per sid). Atomic via tmp + rename + dir
     /// fsync, matching the manifest's durability discipline.
-    pub fn upsert_all(&self, records: &[SidMetaRecord]) -> PersistResult<()> {
+    pub fn upsert_all(&self, records: &[StoredOutputMetadataRecord]) -> PersistResult<()> {
         let _writer = self.writer.lock().map_err(|_| {
             PersistError::Io(std::io::Error::other("summary metadata writer poisoned"))
         })?;
         if records.is_empty() {
             return Ok(());
         }
-        let mut map: HashMap<String, SidMetaRecord> = self
+        let mut map: HashMap<String, StoredOutputMetadataRecord> = self
             .load_strict()?
             .into_iter()
-            .map(|r| (r.sid.to_string(), r))
+            .map(|r| (r.storage_handle.to_string(), r))
             .collect();
         let mut changed = false;
         for r in records {
-            let key = r.sid.to_string();
+            let key = r.storage_handle.to_string();
             let mut next = r.clone();
             if let Some(existing) = map.get(&key) {
                 // Lifecycle is monotone for a SeriesId. An older flush snapshot
@@ -798,7 +799,7 @@ impl SidMetadataStore {
         self.write_atomic(json.as_bytes())
     }
 
-    pub fn load_strict(&self) -> PersistResult<Vec<SidMetaRecord>> {
+    pub fn load_strict(&self) -> PersistResult<Vec<StoredOutputMetadataRecord>> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -807,7 +808,7 @@ impl SidMetadataStore {
         let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| PersistError::Format(format!("invalid SID metadata: {error}")))?;
         if let Some(version) = value.get("schema_version") {
-            if !matches!(version.as_u64(), Some(2 | 3 | 4)) {
+            if !matches!(version.as_u64(), Some(5)) {
                 return Err(PersistError::Format(
                     "unsupported SID metadata version".into(),
                 ));
@@ -816,15 +817,18 @@ impl SidMetadataStore {
                 .map_err(|error| PersistError::Format(error.to_string()))?;
             sidecar.into_records()
         } else {
-            let records: HashMap<String, SidMetaRecord> = serde_json::from_value(value)
-                .map_err(|error| PersistError::Format(error.to_string()))?;
-            Ok(records.into_values().collect())
+            Err(PersistError::Format(
+                "stored-output metadata requires schema version 4".into(),
+            ))
         }
     }
 
     pub(super) fn transaction<T>(
         &self,
-        operation: impl FnOnce(&mut HashMap<String, SidMetaRecord>, &Self) -> PersistResult<T>,
+        operation: impl FnOnce(
+            &mut HashMap<String, StoredOutputMetadataRecord>,
+            &Self,
+        ) -> PersistResult<T>,
     ) -> PersistResult<T> {
         let _writer = self
             .writer
@@ -833,13 +837,13 @@ impl SidMetadataStore {
         let mut records = self
             .load_strict()?
             .into_iter()
-            .map(|r| (r.sid.to_string(), r))
+            .map(|r| (r.storage_handle.to_string(), r))
             .collect();
         operation(&mut records, self)
     }
     pub(super) fn write_records(
         &self,
-        records: &HashMap<String, SidMetaRecord>,
+        records: &HashMap<String, StoredOutputMetadataRecord>,
     ) -> PersistResult<()> {
         let sidecar = SdsSidecar::from_records(records.values().cloned());
         let bytes =
@@ -878,8 +882,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn sketch_meta(sid: u64) -> SidMetaRecord {
-        SidMetaRecord::new(
+    fn sketch_meta(sid: u64) -> StoredOutputMetadataRecord {
+        StoredOutputMetadataRecord::new(
             sid,
             "http_latency".into(),
             vec!["host".into(), "zone".into()],
@@ -892,8 +896,8 @@ mod tests {
         )
     }
 
-    fn exact_meta(sid: u64) -> SidMetaRecord {
-        SidMetaRecord::new(
+    fn exact_meta(sid: u64) -> StoredOutputMetadataRecord {
+        StoredOutputMetadataRecord::new(
             sid,
             "http_requests_total".into(),
             vec!["zone".into()],
@@ -909,7 +913,7 @@ mod tests {
     #[test]
     fn load_on_missing_file_is_empty() {
         let tmp = TempDir::new().unwrap();
-        let s = SidMetadataStore::new(tmp.path());
+        let s = StoredOutputMetadataFile::new(tmp.path());
         assert!(s.load().unwrap().is_empty());
     }
 
@@ -917,7 +921,7 @@ mod tests {
     #[test]
     fn persisted_definitions_roundtrip_and_reject_tampering() {
         let directory = tempfile::tempdir().unwrap();
-        let store = SidMetadataStore::new(directory.path());
+        let store = StoredOutputMetadataFile::new(directory.path());
         let catalog = asap_types::summary_catalog::SummaryCatalog::build(7, 2, []).unwrap();
         store.persist_catalog(&catalog).unwrap();
         let generation = catalog.reference().unwrap();
@@ -936,7 +940,7 @@ mod tests {
     #[test]
     fn authoritative_bindings_share_one_persisted_catalog_generation() {
         let directory = tempfile::tempdir().unwrap();
-        let store = SidMetadataStore::new(directory.path());
+        let store = StoredOutputMetadataFile::new(directory.path());
         let generation = std::sync::Arc::new(asap_types::sds::CatalogGeneration {
             schema_version: 1,
             plan_id: 7,
@@ -947,7 +951,7 @@ mod tests {
         first.stored_output_id = Some(asap_types::PolicyFingerprint(7).into());
         first.catalog_generation = Some(std::sync::Arc::clone(&generation));
         let mut second = first.clone();
-        second.sid = 2;
+        second.storage_handle = 2;
         store.upsert_all(&[first, second]).unwrap();
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
@@ -967,18 +971,18 @@ mod tests {
     #[test]
     fn upsert_then_load_round_trips() {
         let tmp = TempDir::new().unwrap();
-        let s = SidMetadataStore::new(tmp.path());
+        let s = StoredOutputMetadataFile::new(tmp.path());
         s.upsert_all(&[sketch_meta(1), exact_meta(2)]).unwrap();
 
         let mut got = s.load().unwrap();
-        got.sort_by_key(|r| r.sid);
+        got.sort_by_key(|r| r.storage_handle);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], sketch_meta(1));
         assert_eq!(got[1], exact_meta(2));
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(s.path()).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 4);
+        assert_eq!(persisted["schema_version"], 5);
         assert_eq!(
             persisted["summary_descriptors"].as_object().unwrap().len(),
             2
@@ -990,7 +994,7 @@ mod tests {
     #[test]
     fn equivalent_sids_persist_one_copy_of_each_descriptor() {
         let tmp = TempDir::new().unwrap();
-        let store = SidMetadataStore::new(tmp.path());
+        let store = StoredOutputMetadataFile::new(tmp.path());
         let mut second = sketch_meta(2);
         second.first_seen_unix_ms = 9999;
         store.upsert_all(&[sketch_meta(1), second]).unwrap();
@@ -1009,7 +1013,7 @@ mod tests {
     #[test]
     fn broken_descriptor_reference_does_not_partially_recover() {
         let tmp = TempDir::new().unwrap();
-        let store = SidMetadataStore::new(tmp.path());
+        let store = StoredOutputMetadataFile::new(tmp.path());
         store.upsert_all(&[sketch_meta(1), exact_meta(2)]).unwrap();
 
         let mut persisted: serde_json::Value =
@@ -1028,24 +1032,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_flat_sidecar_is_read_and_migrated_on_write() {
+    fn legacy_flat_sidecar_is_rejected_without_rewriting_it() {
         let tmp = TempDir::new().unwrap();
-        let store = SidMetadataStore::new(tmp.path());
-        let legacy = HashMap::from([("1".to_string(), sketch_meta(1))]);
-        std::fs::write(store.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
-
-        assert_eq!(store.load().unwrap(), vec![sketch_meta(1)]);
-        store.upsert_all(&[exact_meta(2)]).unwrap();
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 4);
-        assert_eq!(store.load().unwrap().len(), 2);
+        let store = StoredOutputMetadataFile::new(tmp.path());
+        let legacy =
+            serde_json::to_vec(&HashMap::from([("1".to_string(), sketch_meta(1))])).unwrap();
+        std::fs::write(store.path(), &legacy).unwrap();
+        assert!(store.load().is_err());
+        assert!(store.upsert_all(&[exact_meta(2)]).is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), legacy);
     }
 
     #[test]
     fn upsert_merges_and_overwrites_per_sid() {
         let tmp = TempDir::new().unwrap();
-        let s = SidMetadataStore::new(tmp.path());
+        let s = StoredOutputMetadataFile::new(tmp.path());
         s.upsert_all(&[sketch_meta(1)]).unwrap();
         // New sid + updated metric for sid 1.
         let mut updated = sketch_meta(1);
@@ -1053,7 +1054,7 @@ mod tests {
         s.upsert_all(&[updated.clone(), exact_meta(2)]).unwrap();
 
         let mut got = s.load().unwrap();
-        got.sort_by_key(|r| r.sid);
+        got.sort_by_key(|r| r.storage_handle);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].metric_name, "http_latency_v2");
         assert_eq!(got[1], exact_meta(2));
@@ -1079,7 +1080,7 @@ mod tests {
     #[test]
     fn unparsable_file_loads_as_empty() {
         let tmp = TempDir::new().unwrap();
-        let s = SidMetadataStore::new(tmp.path());
+        let s = StoredOutputMetadataFile::new(tmp.path());
         std::fs::write(s.path(), b"{not json").unwrap();
         assert!(s.load().unwrap().is_empty());
     }

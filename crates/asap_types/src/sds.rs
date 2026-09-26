@@ -75,7 +75,7 @@ impl SummaryDefinitionId {
 }
 
 /// The installed writer/reader binding joins deployment identity and semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredOutputReference {
     pub stored_output_id: StoredOutputId,
@@ -91,7 +91,38 @@ impl StoredOutputReference {
         }
     }
     pub fn validate(&self) -> Result<(), SdsError> {
+        if self.stored_output_id.0 == 0 {
+            return Err(SdsError("stored output identity must be set".into()));
+        }
         self.definition_id.validate()
+    }
+}
+
+/// Canonical address of one stored DAG output for one population and window.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredSummaryKey {
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub stored_output_id: StoredOutputId,
+    pub population: BTreeMap<String, String>,
+    pub window: HalfOpenTimeRange,
+}
+
+impl StoredSummaryKey {
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if self.stored_output_id.0 == 0 {
+            return Err(SdsError("stored output identity must be set".into()));
+        }
+        if self.window.start_ms >= self.window.end_ms {
+            return Err(SdsError("stored summary requires a nonempty window".into()));
+        }
+        Ok(())
+    }
+
+    pub fn storage_key(&self) -> Result<String, SdsError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|e| SdsError(e.to_string()))
     }
 }
 
@@ -1394,6 +1425,49 @@ mod tests {
             instances: BTreeMap::from([(instance.instance_id.clone(), instance)]),
         };
         inventory.validate().unwrap();
+    }
+
+    // Every component of the persisted output address participates in identity.
+    #[test]
+    fn stored_summary_key_binds_plan_output_population_and_window() {
+        let key = StoredSummaryKey {
+            plan_id: 1,
+            plan_version: 2,
+            stored_output_id: StoredOutputId(101),
+            population: BTreeMap::from([("service".into(), "api".into())]),
+            window: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 1000,
+            },
+        };
+        let mut variants = vec![key.clone(); 5];
+        variants[0].plan_id += 1;
+        variants[1].plan_version += 1;
+        variants[2].stored_output_id.0 += 1;
+        variants[3].population.insert("service".into(), "db".into());
+        variants[4].window.end_ms += 1;
+        let canonical = key.storage_key().unwrap();
+        for other in variants {
+            assert_ne!(canonical, other.storage_key().unwrap());
+        }
+        assert_eq!(
+            serde_json::from_str::<StoredSummaryKey>(&canonical).unwrap(),
+            key
+        );
+    }
+
+    // A DAG output has its own identity even when its definition is shared.
+    #[test]
+    fn stored_output_identity_is_independent_of_definition() {
+        let definition_id = SummaryDefinitionId::from_semantics(b"fixture");
+        for stored_output_id in [StoredOutputId(101), StoredOutputId(102)] {
+            StoredOutputReference {
+                stored_output_id,
+                definition_id: definition_id.clone(),
+            }
+            .validate()
+            .unwrap();
+        }
     }
 
     #[test]
