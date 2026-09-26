@@ -1,6 +1,6 @@
 //! Catalog consistency checks for the precompute execution plan.
 use super::*;
-use crate::sds::{SummaryDefinitionId, SummaryDescriptor};
+use crate::sds::{StoredOutputId, SummaryDescriptor};
 use crate::summary_catalog::SummaryCatalog;
 use planner_types::pre_asap::Source;
 use std::collections::BTreeSet;
@@ -13,10 +13,15 @@ impl PrecomputePlan {
     /// only the immutable snapshot reference; descriptors are installed once.
     pub fn bind_catalog(&mut self, catalog: &SummaryCatalog) -> Result<(), PrecomputePlanError> {
         for config in &self.materializations {
-            let id = SummaryDefinitionId::from(config.policy_fingerprint());
-            catalog.definitions.get(&id).ok_or_else(|| {
+            let id = StoredOutputId::from(config.policy_fingerprint());
+            catalog.outputs.get(&id).ok_or_else(|| {
                 invalid(format!("missing catalog materialization {}", id.as_u64()))
             })?;
+        }
+        for schema in &mut self.schemas {
+            schema.stored_output_reference = catalog
+                .output_reference(schema.materialization)
+                .map_err(|e| invalid(e.to_string()))?;
         }
         self.summary_catalog = Some(
             catalog
@@ -39,6 +44,52 @@ impl PrecomputePlan {
         catalog: &SummaryCatalog,
     ) -> Result<(), PrecomputePlanError> {
         catalog.validate().map_err(|e| invalid(e.to_string()))?;
+        let expected = SummaryCatalog::from_materializations(
+            catalog.plan_id,
+            catalog.plan_version,
+            &self.materializations,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        if catalog.outputs != expected.outputs || catalog.definitions != expected.definitions {
+            return Err(invalid(
+                "stored output semantics differ from installed writer computation",
+            ));
+        }
+        for config in &self.materializations {
+            if config.derived_input.is_some() && config.semantic_fragment.is_none() {
+                return Err(invalid(
+                    "derived stored output requires its complete Planner semantic closure",
+                ));
+            }
+            if let Some(expected) = &config.semantic_fragment {
+                let mut found = false;
+                for installed in self.executable_dags.values() {
+                    let dag = installed.document.decode().map_err(invalid)?;
+                    for (id, binding) in &installed.binding.nodes {
+                        if matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { stored_output }
+                            if stored_output.fingerprint() == config.policy_fingerprint())
+                        {
+                            found = true;
+                            let actual =
+                                crate::semantic_fragment::SemanticFragment::from_stored_output(
+                                    &dag, *id,
+                                )
+                                .map_err(invalid)?;
+                            if &actual != expected {
+                                return Err(invalid(
+                                    "semantic definition differs from Planner-selected producer",
+                                ));
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    return Err(invalid(
+                        "semantic definition has no Planner-selected producer",
+                    ));
+                }
+            }
+        }
         let expected_reference = catalog
             .reference()
             .map_err(|error| invalid(error.to_string()))?;
@@ -51,14 +102,14 @@ impl PrecomputePlan {
         let ids: BTreeSet<_> = self
             .materializations
             .iter()
-            .map(|m| SummaryDefinitionId::from(m.policy_fingerprint()))
+            .map(|m| StoredOutputId::from(m.policy_fingerprint()))
             .collect();
-        if ids != catalog.definitions.keys().copied().collect() {
+        if ids != catalog.outputs.keys().copied().collect() {
             return Err(invalid("catalog/reference/materialization sets differ"));
         }
         for config in &self.materializations {
-            let id = SummaryDefinitionId::from(config.policy_fingerprint());
-            let binding = &catalog.definitions[&id];
+            let id = StoredOutputId::from(config.policy_fingerprint());
+            let binding = &catalog.outputs[&id];
             let expected =
                 SummaryDescriptor::from_config(config).map_err(|e| invalid(e.to_string()))?;
             if binding.summary_descriptor_id != expected.id {
@@ -138,7 +189,11 @@ impl PrecomputePlan {
                     return Err(invalid("session lifecycle is not supported"))
                 }
             };
-            if schema.schema_id != state_schema_id(id.fingerprint())
+            if schema.stored_output_reference
+                != catalog
+                    .output_reference(id)
+                    .map_err(|e| invalid(e.to_string()))?
+                || schema.schema_id != state_schema_id(id.fingerprint())
                 || schema.family != expected_family
                 || schema.source != source
                 || &schema.value_projection != projection

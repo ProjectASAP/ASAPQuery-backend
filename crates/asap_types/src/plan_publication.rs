@@ -97,7 +97,7 @@ pub fn validate_stored_output_references(
         .materializations
         .iter()
         .map(|config| (config.policy_fingerprint().into(), config))
-        .collect::<std::collections::BTreeMap<crate::sds::SummaryDefinitionId, _>>();
+        .collect::<std::collections::BTreeMap<crate::sds::StoredOutputId, _>>();
     for entry in query.entries.values() {
         for binding in entry.materialization_bindings() {
             let writer = writers.get(&binding.materialization).ok_or_else(|| {

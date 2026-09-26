@@ -2528,7 +2528,7 @@ mod tests {
                         endpoint_path: "/api/v1/write".into(),
                         timestamp_unit: TimestampUnit::UnixMilliseconds,
                         require_plan_identity: false,
-                        require_summary_definition_identity: false,
+                        require_stored_output_identity: false,
                         require_registered_producer: false,
                     },
                     schemas: Vec::new(),
@@ -3536,6 +3536,8 @@ aggregations:
         for marker in active_agg_ids {
             let metric = format!("metric_{marker}");
             let cfg = AggregationConfig {
+                stored_output_id: None,
+                semantic_fragment: None,
                 population_key_encoding: Default::default(),
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
@@ -6018,7 +6020,7 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
         .producers
         .iter()
         .map(|producer| {
-            let definition = asap_types::sds::SummaryDefinitionId::from(producer.materialization);
+            let definition = asap_types::sds::StoredOutputId::from(producer.materialization);
             active
                 .precompute_plan
                 .schemas

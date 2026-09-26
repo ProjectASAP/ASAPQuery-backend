@@ -45,7 +45,7 @@ pub fn artifact_from_materializations(
     .unwrap();
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), configs, &["fixture".into()]).unwrap();
-    precompute.summary_catalog = Some(catalog.reference().unwrap());
+    precompute.bind_catalog(&catalog).unwrap();
     let mut transmission = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute,
@@ -131,7 +131,7 @@ pub fn artifact_from_materializations(
                                     full_window_slide_ms: None,
                                     materialization: config.policy_fingerprint().into(),
                                     stored_output_reference:
-                                        asap_types::sds::StoredOutputReference::for_definition(
+                                        asap_types::sds::StoredOutputReference::for_output(
                                             config.policy_fingerprint().into(),
                                         ),
                                     output_grouping,
@@ -160,6 +160,7 @@ pub fn artifact_from_materializations(
             );
         }
     }
+    query_plan.bind_catalog(&catalog).unwrap();
     PhysicalPlanInstallRequest {
         summary_catalog: catalog,
         collector_plans: vec![],
@@ -233,7 +234,7 @@ pub fn stamp(
                 ("backend_compat", BACKEND_COMPAT.into()),
                 (
                     "materialization",
-                    schema.materialization.0.as_u64().to_string(),
+                    schema.materialization.as_u64().to_string(),
                 ),
                 ("schema_id", schema.schema_id.clone()),
                 ("producer_id", "fixture".into()),

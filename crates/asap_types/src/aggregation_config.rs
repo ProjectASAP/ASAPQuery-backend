@@ -91,6 +91,12 @@ impl WindowMaterializationLayout {
 /// An `aggregationId` field in input YAML is ignored for compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputeMaterialization {
+    /// Explicit deployment output allocation; independent of semantic identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_output_id: Option<crate::sds::StoredOutputId>,
+    /// Planner-selected dependency closure ending at the persisted output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_fragment: Option<crate::semantic_fragment::SemanticFragment>,
     pub aggregation_type: AggregationType,
     pub aggregation_sub_type: String,
     pub parameters: HashMap<String, Value>,
@@ -296,6 +302,8 @@ impl PrecomputeMaterialization {
         let spatial_filter_normalized = normalize_spatial_filter(&spatial_filter);
 
         Self {
+            stored_output_id: None,
+            semantic_fragment: None,
             aggregation_type,
             aggregation_sub_type,
             parameters,

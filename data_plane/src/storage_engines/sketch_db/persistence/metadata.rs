@@ -304,6 +304,8 @@ pub struct SidMetaRecord {
     pub sid: u64,
     /// Authoritative identity and provenance, absent on legacy sidecars.
     #[serde(default)]
+    pub stored_output_id: Option<asap_types::sds::StoredOutputId>,
+    #[serde(default)]
     pub summary_definition_id: Option<asap_types::sds::SummaryDefinitionId>,
     #[serde(default)]
     pub catalog_generation: Option<std::sync::Arc<asap_types::sds::CatalogGeneration>>,
@@ -341,6 +343,7 @@ impl SidMetaRecord {
     ) -> Self {
         Self {
             sid,
+            stored_output_id: None,
             summary_definition_id: None,
             catalog_generation: None,
             metric_name,
@@ -412,6 +415,8 @@ struct DataDescriptorRec {
 struct SidBindingRec {
     sid: u64,
     #[serde(default)]
+    stored_output_id: Option<asap_types::sds::StoredOutputId>,
+    #[serde(default)]
     summary_definition_id: Option<asap_types::sds::SummaryDefinitionId>,
     #[serde(default)]
     catalog_generation_sha256: Option<String>,
@@ -449,7 +454,7 @@ impl SdsSidecar {
         use crate::storage_engines::sketch_db::sds::{data_descriptor_id, summary_descriptor_id};
 
         let mut sidecar = Self {
-            schema_version: 3,
+            schema_version: 4,
             catalog_generations: HashMap::new(),
             summary_descriptors: HashMap::new(),
             data_descriptors: HashMap::new(),
@@ -492,6 +497,7 @@ impl SdsSidecar {
                 record.sid.to_string(),
                 SidBindingRec {
                     sid: record.sid,
+                    stored_output_id: record.stored_output_id,
                     summary_definition_id: record.summary_definition_id,
                     catalog_generation_sha256: generation_sha256,
                     summary_descriptor_id: summary_id,
@@ -533,6 +539,7 @@ impl SdsSidecar {
                     })?;
                 Ok(SidMetaRecord {
                     sid: binding.sid,
+                    stored_output_id: binding.stored_output_id,
                     summary_definition_id: binding.summary_definition_id,
                     catalog_generation: binding
                         .catalog_generation_sha256
@@ -583,6 +590,67 @@ impl SidMetadataStore {
             path: disk_path.join(SERIES_ID_METADATA_FILE),
             writer: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Definitions are durable before any output may refer to this generation.
+    pub(crate) fn persist_catalog(
+        &self,
+        catalog: &asap_types::summary_catalog::SummaryCatalog,
+    ) -> PersistResult<()> {
+        let reference = catalog
+            .reference()
+            .map_err(|e| PersistError::Format(e.to_string()))?;
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| PersistError::Internal("SID metadata writer poisoned".into()))?;
+        let path = self.path.with_file_name(format!(
+            "sds-definitions-{}.json",
+            reference.snapshot_sha256
+        ));
+        if path.exists() {
+            let existing = self.load_catalog(&reference)?;
+            if existing != *catalog {
+                return Err(PersistError::Format(
+                    "immutable SDS definitions changed".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let bytes =
+            serde_json::to_vec(catalog).map_err(|e| PersistError::Serialize(e.to_string()))?;
+        Self::write_atomic_at(&path, &bytes)
+    }
+
+    pub(crate) fn load_catalog(
+        &self,
+        generation: &asap_types::sds::CatalogGeneration,
+    ) -> PersistResult<asap_types::summary_catalog::SummaryCatalog> {
+        if generation.snapshot_sha256.len() != 64
+            || !generation
+                .snapshot_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(PersistError::Format("invalid SDS generation digest".into()));
+        }
+        let path = self.path.with_file_name(format!(
+            "sds-definitions-{}.json",
+            generation.snapshot_sha256
+        ));
+        let catalog: asap_types::summary_catalog::SummaryCatalog =
+            serde_json::from_slice(&fs::read(path)?)
+                .map_err(|e| PersistError::Format(e.to_string()))?;
+        if catalog
+            .reference()
+            .map_err(|e| PersistError::Format(e.to_string()))?
+            != *generation
+        {
+            return Err(PersistError::Format(
+                "persisted SDS definitions differ from generation".into(),
+            ));
+        }
+        Ok(catalog)
     }
 
     /// One bounded generation checkpoint closes raw producers across restart.
@@ -647,7 +715,7 @@ impl SidMetadataStore {
         };
         if matches!(
             value.get("schema_version").and_then(|v| v.as_u64()),
-            Some(2 | 3)
+            Some(2 | 3 | 4)
         ) {
             let sidecar: SdsSidecar = match serde_json::from_value(value) {
                 Ok(sidecar) => sidecar,
@@ -739,7 +807,7 @@ impl SidMetadataStore {
         let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| PersistError::Format(format!("invalid SID metadata: {error}")))?;
         if let Some(version) = value.get("schema_version") {
-            if !matches!(version.as_u64(), Some(2 | 3)) {
+            if !matches!(version.as_u64(), Some(2 | 3 | 4)) {
                 return Err(PersistError::Format(
                     "unsupported SID metadata version".into(),
                 ));
@@ -845,6 +913,26 @@ mod tests {
         assert!(s.load().unwrap().is_empty());
     }
 
+    // Restart must validate the immutable semantic document, not just its filename.
+    #[test]
+    fn persisted_definitions_roundtrip_and_reject_tampering() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SidMetadataStore::new(directory.path());
+        let catalog = asap_types::summary_catalog::SummaryCatalog::build(7, 2, []).unwrap();
+        store.persist_catalog(&catalog).unwrap();
+        let generation = catalog.reference().unwrap();
+        assert_eq!(store.load_catalog(&generation).unwrap(), catalog);
+        let path = store.path.with_file_name(format!(
+            "sds-definitions-{}.json",
+            generation.snapshot_sha256
+        ));
+        let mut altered = serde_json::to_value(&catalog).unwrap();
+        altered["plan_version"] = serde_json::json!(3);
+        std::fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(store.load_catalog(&generation).is_err());
+        assert!(store.persist_catalog(&catalog).is_err());
+    }
+
     #[test]
     fn authoritative_bindings_share_one_persisted_catalog_generation() {
         let directory = tempfile::tempdir().unwrap();
@@ -856,7 +944,7 @@ mod tests {
             snapshot_sha256: "catalog".into(),
         });
         let mut first = sketch_meta(1);
-        first.summary_definition_id = Some(asap_types::PolicyFingerprint(7).into());
+        first.stored_output_id = Some(asap_types::PolicyFingerprint(7).into());
         first.catalog_generation = Some(std::sync::Arc::clone(&generation));
         let mut second = first.clone();
         second.sid = 2;
@@ -871,7 +959,7 @@ mod tests {
             records[1].catalog_generation.as_ref().unwrap()
         ));
         assert_eq!(
-            records[0].summary_definition_id,
+            records[0].stored_output_id,
             Some(asap_types::PolicyFingerprint(7).into())
         );
     }
@@ -890,7 +978,7 @@ mod tests {
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(s.path()).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 3);
+        assert_eq!(persisted["schema_version"], 4);
         assert_eq!(
             persisted["summary_descriptors"].as_object().unwrap().len(),
             2
@@ -950,7 +1038,7 @@ mod tests {
         store.upsert_all(&[exact_meta(2)]).unwrap();
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 3);
+        assert_eq!(persisted["schema_version"], 4);
         assert_eq!(store.load().unwrap().len(), 2);
     }
 

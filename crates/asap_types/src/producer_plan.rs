@@ -10,7 +10,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollectorMaterialization {
     pub query_id: String,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub metric: String,
     pub algorithm: String,
     pub parameters: Value,
@@ -76,7 +76,7 @@ pub struct FrameIdentityContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionRule {
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub producer_id: String,
     pub schema_id: String,
     pub mode: TransmissionMode,
@@ -194,7 +194,7 @@ pub struct RuntimeRulePolicy {
 pub struct RuntimeAdaptationEvidence {
     pub plan_id: u64,
     pub plan_version: u64,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub producer_id: String,
     pub schema_id: String,
     pub producer_version: String,
@@ -230,7 +230,7 @@ pub struct SummaryFrameIdentity {
     pub plan_id: u64,
     pub plan_version: u64,
     pub backend_compat: String,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     /// Canonical producer-side identity for one concrete retained-label group.
     pub series_identity: String,
     pub schema_id: String,
@@ -275,7 +275,7 @@ pub enum TransmissionPlanError {
 fn validate_catalog_projection(
     reference: Option<&crate::sds::CatalogGeneration>,
     envelope: &PlanEnvelope,
-    materializations: impl IntoIterator<Item = crate::sds::SummaryDefinitionId>,
+    materializations: impl IntoIterator<Item = crate::sds::StoredOutputId>,
     catalog: &crate::summary_catalog::SummaryCatalog,
 ) -> Result<(), TransmissionPlanError> {
     let expected = catalog
@@ -290,7 +290,7 @@ fn validate_catalog_projection(
         ));
     }
     for id in materializations {
-        if !catalog.definitions.contains_key(&id) {
+        if !catalog.outputs.contains_key(&id) {
             return Err(TransmissionPlanError::Catalog(format!(
                 "unknown materialization {}",
                 id.as_u64()
