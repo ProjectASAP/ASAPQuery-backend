@@ -5,10 +5,13 @@ use crate::query_engines::{
     EngineError,
 };
 use crate::storage_engines::types::KeyByLabelValues;
+use asap_physical_operators::dag as physical;
 use asap_types::query_plan::residual::{
     Aggregation, BinaryOperation, Grouping, ResidualQueryOperator, TemporalOperation,
 };
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
+use futures::{FutureExt, StreamExt};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 type Labels = BTreeMap<String, String>;
@@ -105,17 +108,91 @@ fn execute_values<F>(
 where
     F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
 {
-    let mut evaluator = Evaluator {
+    let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
+    let runtime = RefCell::new(ValueRuntime {
         entry,
         leaves,
         callback,
         stats: ExecutionStats::default(),
-        memo: BTreeMap::new(),
-        active: BTreeSet::new(),
-        warnings: Vec::new(),
+        warnings: vec![],
+    });
+    let error = RefCell::new(None);
+    let mut graph = physical::PhysicalDag::default();
+    let mut identities = BTreeMap::from([((entry.root, at_signed), 0u64)]);
+    let mut pending = vec![(entry.root, at_signed)];
+    let mut depths = BTreeMap::from([((entry.root, at_signed), 1usize)]);
+    while let Some((id, time)) = pending.pop() {
+        let node = entry
+            .nodes
+            .get(&id)
+            .ok_or_else(|| miss("missing installed node"))?;
+        let dependencies = if leaves.contains_key(&(id, time)) {
+            vec![]
+        } else {
+            expanded_inputs(node, time)?
+        };
+        let mut input_ids = Vec::new();
+        for dependency in &dependencies {
+            if let Some(id) = identities.get(dependency) {
+                runtime.borrow_mut().stats.memo_hits += 1;
+                input_ids.push(*id);
+            } else {
+                if identities.len() >= 200_000 {
+                    return Err(miss("installed DAG evaluation budget exceeded"));
+                }
+                let depth = depths[&(id, time)] + 1;
+                if depth > 128 {
+                    return Err(miss("installed DAG exceeds execution depth of 128"));
+                }
+                depths.insert(*dependency, depth);
+                let id = identities.len() as u64;
+                identities.insert(*dependency, id);
+                pending.push(*dependency);
+                input_ids.push(id);
+            }
+        }
+        graph
+            .add(
+                identities[&(id, time)],
+                input_ids,
+                BoundValueOperator {
+                    id,
+                    time,
+                    node,
+                    dependencies,
+                    runtime: &runtime,
+                    error: &error,
+                },
+            )
+            .map_err(|error| miss(error.to_string()))?;
+    }
+    let context = physical::RunContext::new(
+        physical::Scope::Query {
+            evaluation_time_ms: at_signed,
+            revision: 0,
+        },
+        physical::Limits::default(),
+    )
+    .map_err(|error| miss(error.to_string()))?;
+    let mut output = graph
+        .execute(&[0], context)
+        .map_err(|error| miss(error.to_string()))?
+        .remove(0);
+    // These adapters have synchronous callbacks and prepared I/O leaves. A
+    // single poll avoids nesting a blocking futures executor inside a readout.
+    let evaluated = match output.next().now_or_never().flatten() {
+        Some(Ok(value)) => value.value().clone(),
+        Some(Err(failure)) => {
+            return Err(error
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| miss(failure.to_string())))
+        }
+        None => return Err(miss("synchronous query adapter did not produce a result")),
     };
-    let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
-    let evaluated = evaluator.eval(entry.root, at_signed)?;
+    drop(output);
+    drop(graph);
+    let mut evaluator = runtime.into_inner();
     if matches!(evaluated, Value::Scalar(_)) {
         // QueryResult currently models vectors/matrices only. Preserve a scalar
         // root's HTTP type by routing it to native, while scalar intermediates
@@ -142,21 +219,23 @@ where
     Ok((output, evaluator.stats))
 }
 
-struct Evaluator<'a, F> {
+struct ValueRuntime<'a, F> {
     entry: &'a QueryPlanEntry,
     leaves: &'a PreparedLeaves,
     stats: ExecutionStats,
     callback: F,
-    memo: BTreeMap<(QueryNodeId, i64), Value>,
-    active: BTreeSet<(QueryNodeId, i64)>,
     warnings: Vec<String>,
 }
-impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'_, F> {
-    fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
-        if let Some(value) = self.memo.get(&(id, at)) {
-            self.stats.memo_hits += 1;
-            return Ok(value.clone());
-        }
+impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntime<'_, F> {
+    fn execute_node(
+        &mut self,
+        id: QueryNodeId,
+        at: i64,
+        node: &QueryPlanNode,
+        inputs: &[Value],
+        dependencies: &[(QueryNodeId, i64)],
+        context: &physical::RunContext,
+    ) -> Result<Value, EngineError> {
         if let Some(leaf) = self.leaves.get(&(id, at)) {
             if leaf.remote {
                 self.stats.remote_branch_evaluations += 1;
@@ -166,23 +245,10 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 self.stats.summary_readout_evaluations += 1;
             }
             let value = leaf.value.clone();
-            self.memo.insert((id, at), value.clone());
             return Ok(value);
         }
-        if self.active.len() >= 256 || !self.active.insert((id, at)) {
-            return Err(miss("cyclic or excessively deep installed DAG"));
-        }
-        if self.memo.len() >= 200_000 {
-            return Err(miss("installed DAG evaluation budget exceeded"));
-        }
-        let node = self
-            .entry
-            .nodes
-            .get(&id)
-            .ok_or_else(|| miss("missing installed node"))?
-            .clone();
-        let value = match node {
-            QueryPlanNode::Scalar { value } => Value::Scalar(value),
+        let value = match node.clone() {
+            QueryPlanNode::Scalar { value } => Value::Scalar(native_scalar(value, context)?),
             QueryPlanNode::Logical {
                 operator: ResidualQueryOperator::CurrentSeries { .. },
                 ..
@@ -193,7 +259,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                     u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
                 )?)?
             }
-            QueryPlanNode::Logical { operator, inputs } => {
+            QueryPlanNode::Logical { operator, .. } => {
                 if matches!(
                     operator,
                     ResidualQueryOperator::Scan { .. }
@@ -204,10 +270,10 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
                     ));
                 }
-                self.logical(operator, &inputs, at)?
+                self.logical(operator, inputs, dependencies, at, context)?
             }
             QueryPlanNode::RelationalJoin {
-                inputs,
+                inputs: _,
                 join_kind: planner_types::pre_asap::JoinKind::Semi,
                 pred,
                 pruning,
@@ -215,8 +281,11 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 right_schema,
                 ..
             } => {
-                let values = vector(self.eval(inputs[0], at)?)?;
-                let candidates = vector(self.eval(inputs[1], at)?)?;
+                let [values, candidates] = inputs else {
+                    return Err(miss("semi-join requires two inputs"));
+                };
+                let values = vector(values.clone())?;
+                let candidates = vector(candidates.clone())?;
                 let predicate = serde_json::from_value(pred)
                     .map_err(|_| miss("invalid semi-join predicate"))?;
                 let keys = asap_physical_operators::dag::planner::equijoin_keys(
@@ -233,7 +302,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                     )
                 })
                 .collect::<Vec<_>>();
-                let (selected, warning) = semi_join(candidates, values, &keys, pruning.as_ref())?;
+                let (selected, warning) =
+                    semi_join(candidates, values, &keys, pruning.as_ref(), context)?;
                 if let Some(warning) = warning {
                     self.warnings.push(warning);
                 }
@@ -247,20 +317,20 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 )?)?
             }
         };
-        self.active.remove(&(id, at));
-        self.memo.insert((id, at), value.clone());
         Ok(value)
     }
     fn logical(
         &mut self,
         operator: ResidualQueryOperator,
-        inputs: &[QueryNodeId],
+        inputs: &[Value],
+        dependencies: &[(QueryNodeId, i64)],
         at: i64,
+        context: &physical::RunContext,
     ) -> Result<Value, EngineError> {
         let input = |index: usize| {
             inputs
                 .get(index)
-                .copied()
+                .cloned()
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
@@ -274,169 +344,254 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             ResidualQueryOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
-            ResidualQueryOperator::UnaryNegate => match self.eval(input(0)?, at)? {
-                Value::Scalar(value) => Ok(Value::Scalar(-value)),
-                Value::Vector(values) => Ok(Value::Vector(
-                    values
-                        .into_iter()
-                        .map(|(labels, value)| (labels, -value))
-                        .collect(),
-                )),
-                _ => Err(miss("cannot negate range vector")),
-            },
-            ResidualQueryOperator::VectorToScalar => {
-                let values = vector(self.eval(input(0)?, at)?)?;
-                Ok(Value::Scalar(if values.len() == 1 {
-                    values[0].1
-                } else {
-                    f64::NAN
-                }))
-            }
+            ResidualQueryOperator::UnaryNegate => negate(input(0)?, context),
+            ResidualQueryOperator::VectorToScalar => vector_to_scalar(vector(input(0)?)?, context),
             ResidualQueryOperator::Aggregate {
                 operation,
                 grouping,
             } => {
-                let values = vector(self.eval(input(0)?, at)?)?;
-                Ok(Value::Vector(aggregate(operation, &grouping, values)))
+                let values = vector(input(0)?)?;
+                Ok(Value::Vector(aggregate(
+                    operation, &grouping, values, context,
+                )?))
             }
             ResidualQueryOperator::Limit {
                 n,
                 offset,
                 grouping,
             } => {
-                let values = vector(self.eval(input(0)?, at)?)?;
+                let values = vector(input(0)?)?;
                 Ok(Value::Vector(native_values::limit(
-                    values, &grouping, n, offset,
+                    values, &grouping, n, offset, context,
                 )?))
             }
             ResidualQueryOperator::Binary {
                 operation,
                 return_bool,
             } => {
-                let left = self.eval(input(0)?, at)?;
-                let right = self.eval(input(1)?, at)?;
-                binary(operation, return_bool, left, right)
+                let left = input(0)?;
+                let right = input(1)?;
+                binary_in_context(operation, return_bool, left, right, context)
             }
             ResidualQueryOperator::Temporal { operation } => {
-                let Value::Matrix(values, start, end) = self.eval(input(0)?, at)? else {
+                let Value::Matrix(values, start, end) = input(0)? else {
                     return Err(miss("temporal operator requires range vector"));
                 };
+                let preserve_name = self.entry.language
+                    == control_plane::query_plan::QueryLanguage::MetricsQl
+                    && matches!(
+                        operation,
+                        TemporalOperation::Min | TemporalOperation::Max | TemporalOperation::Avg
+                    );
+                let result = native_temporal(values, operation, start, end, context)?;
                 Ok(Value::Vector(
-                    values
+                    result
                         .into_iter()
-                        .filter_map(|(labels, points)| {
-                            if points.is_empty() {
-                                return None;
-                            }
-                            let value = match operation {
-                                TemporalOperation::Rate => rate(&points, start, end),
-                                TemporalOperation::Increase => rate(&points, start, end)
-                                    .map(|r| r * (end - start) as f64 / 1000.),
-                                TemporalOperation::Sum => Some(points.iter().map(|p| p.1).sum()),
-                                TemporalOperation::Avg => Some(
-                                    points.iter().map(|p| p.1).sum::<f64>() / points.len() as f64,
-                                ),
-                                TemporalOperation::Count => Some(points.len() as f64),
-                                TemporalOperation::Max => {
-                                    Some(points.iter().fold(f64::NAN, |a, p| {
-                                        if a.is_nan() || p.1 > a {
-                                            p.1
-                                        } else {
-                                            a
-                                        }
-                                    }))
-                                }
-                                TemporalOperation::Min => {
-                                    Some(points.iter().fold(f64::NAN, |a, p| {
-                                        if a.is_nan() || p.1 < a {
-                                            p.1
-                                        } else {
-                                            a
-                                        }
-                                    }))
-                                }
-                            };
-                            value.map(|v| {
-                                let preserve_name = self.entry.language
-                                    == control_plane::query_plan::QueryLanguage::MetricsQl
-                                    && matches!(
-                                        operation,
-                                        TemporalOperation::Min
-                                            | TemporalOperation::Max
-                                            | TemporalOperation::Avg
-                                    );
-                                (
-                                    if preserve_name {
-                                        labels
-                                    } else {
-                                        no_name(labels)
-                                    },
-                                    v,
-                                )
-                            })
+                        .map(|(labels, value)| {
+                            (
+                                if preserve_name {
+                                    labels
+                                } else {
+                                    no_name(labels)
+                                },
+                                value,
+                            )
                         })
                         .collect(),
                 ))
             }
+
             ResidualQueryOperator::Sort {
                 descending,
                 grouping,
             } => {
-                let values = vector(self.eval(input(0)?, at)?)?;
+                let values = vector(input(0)?)?;
                 Ok(Value::Vector(native_values::sort(
-                    values, &grouping, descending,
+                    values, &grouping, descending, context,
                 )?))
             }
             ResidualQueryOperator::HistogramQuantile => {
-                let Value::Scalar(quantile) = self.eval(input(0)?, at)? else {
+                let Value::Scalar(quantile) = input(0)? else {
                     return Err(miss("quantile requires scalar"));
                 };
                 let mut groups: BTreeMap<Labels, Vec<(f64, f64)>> = BTreeMap::new();
-                for (mut labels, value) in vector(self.eval(input(1)?, at)?)? {
+                for (mut labels, value) in vector(input(1)?)? {
                     if let Some(le) = labels.remove("le").and_then(|s| s.parse::<f64>().ok()) {
                         groups.entry(no_name(labels)).or_default().push((le, value));
                     }
                 }
-                Ok(Value::Vector(
-                    groups
-                        .into_iter()
-                        .map(|(labels, buckets)| (labels, bucket_quantile(quantile, buckets)))
-                        .collect(),
-                ))
+                let rows = groups
+                    .into_iter()
+                    .flat_map(|(labels, buckets)| {
+                        buckets.into_iter().map(move |(bound, count)| {
+                            vec![
+                                native_labels(&labels),
+                                physical::values::Value::Float64(bound),
+                                physical::values::Value::Float64(count),
+                            ]
+                        })
+                    })
+                    .collect();
+                Ok(Value::Vector(native_window(
+                    rows,
+                    planner_types::pre_asap::AggIntent::HistogramQuantile { q: quantile },
+                    None,
+                    context,
+                )?))
             }
             ResidualQueryOperator::Subquery {
                 range_ms,
                 step_ms,
                 offset_ms,
             } => {
-                let end = at
-                    .checked_sub(offset_ms)
-                    .ok_or_else(|| miss("offset overflow"))?;
-                let range = i64::try_from(range_ms).map_err(|_| miss("range overflow"))?;
-                let step = i64::try_from(step_ms).map_err(|_| miss("step overflow"))?;
-                if step <= 0 || range / step > 100_000 {
-                    return Err(miss("invalid or excessive subquery steps"));
-                }
-                let start = end
-                    .checked_sub(range)
-                    .ok_or_else(|| miss("range overflow"))?;
-                let mut t = start
-                    .div_euclid(step)
-                    .checked_add(1)
-                    .and_then(|n| n.checked_mul(step))
-                    .ok_or_else(|| miss("subquery grid overflow"))?;
+                let (start, end, _) = subquery_grid(at, range_ms, step_ms, offset_ms)?;
                 let mut values: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
-                while t <= end {
-                    for (labels, value) in vector(self.eval(input(0)?, t)?)? {
-                        values.entry(labels).or_default().push((t, value));
+                if inputs.len() != dependencies.len() {
+                    return Err(miss("subquery grid input mismatch"));
+                }
+                for (value, (_, time)) in inputs.iter().zip(dependencies) {
+                    for (labels, value) in vector(value.clone())? {
+                        values.entry(labels).or_default().push((*time, value));
                     }
-                    t = t
-                        .checked_add(step)
-                        .ok_or_else(|| miss("subquery time overflow"))?;
                 }
                 Ok(Value::Matrix(values.into_iter().collect(), start, end))
             }
         }
+    }
+}
+
+fn subquery_grid(
+    at: i64,
+    range_ms: u64,
+    step_ms: u64,
+    offset_ms: i64,
+) -> Result<(i64, i64, Vec<i64>), EngineError> {
+    let end = at
+        .checked_sub(offset_ms)
+        .ok_or_else(|| miss("offset overflow"))?;
+    let range = i64::try_from(range_ms).map_err(|_| miss("range overflow"))?;
+    let step = i64::try_from(step_ms).map_err(|_| miss("step overflow"))?;
+    if step <= 0 || range / step > 100_000 {
+        return Err(miss("invalid or excessive subquery steps"));
+    }
+    let start = end
+        .checked_sub(range)
+        .ok_or_else(|| miss("range overflow"))?;
+    let mut time = start
+        .div_euclid(step)
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(step))
+        .ok_or_else(|| miss("subquery grid overflow"))?;
+    let mut times = Vec::new();
+    while time <= end {
+        times.push(time);
+        time = time
+            .checked_add(step)
+            .ok_or_else(|| miss("subquery time overflow"))?;
+    }
+    Ok((start, end, times))
+}
+fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i64)>, EngineError> {
+    match node {
+        QueryPlanNode::Logical {
+            operator:
+                ResidualQueryOperator::Scan { .. }
+                | ResidualQueryOperator::ExactSubquery { .. }
+                | ResidualQueryOperator::CandidateExactSubquery { .. },
+            ..
+        } => Err(miss(
+            "installed leaf was not prepared; local raw execution is forbidden",
+        )),
+        QueryPlanNode::Logical {
+            operator:
+                ResidualQueryOperator::Subquery {
+                    range_ms,
+                    step_ms,
+                    offset_ms,
+                },
+            inputs,
+        } => {
+            let [input] = inputs.as_slice() else {
+                return Err(miss("subquery requires one input"));
+            };
+            let (_, _, times) = subquery_grid(at, *range_ms, *step_ms, *offset_ms)?;
+            Ok(times.into_iter().map(|time| (*input, time)).collect())
+        }
+        QueryPlanNode::Logical {
+            operator: ResidualQueryOperator::CurrentSeries { .. },
+            ..
+        } => Ok(vec![]),
+        QueryPlanNode::Logical { inputs, .. } => Ok(inputs.iter().map(|&id| (id, at)).collect()),
+        QueryPlanNode::RelationalJoin { inputs, .. } => {
+            Ok(inputs.iter().map(|&id| (id, at)).collect())
+        }
+        _ => Ok(vec![]),
+    }
+}
+struct BoundValueOperator<'a, 'entry, F> {
+    id: QueryNodeId,
+    time: i64,
+    node: &'entry QueryPlanNode,
+    dependencies: Vec<(QueryNodeId, i64)>,
+    runtime: &'a RefCell<ValueRuntime<'entry, F>>,
+    error: &'a RefCell<Option<EngineError>>,
+}
+impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
+    physical::PhysicalOperator<Value, ()> for BoundValueOperator<'_, '_, F>
+{
+    fn name(&self) -> &str {
+        "InstalledValueOperator"
+    }
+    fn input_schemas(&self) -> Vec<()> {
+        vec![(); self.dependencies.len()]
+    }
+    fn output_schema(&self) {}
+    fn output_bytes(&self, value: &Value) -> usize {
+        fn labels(value: &Labels) -> usize {
+            value.iter().map(|(k, v)| k.len() + v.len()).sum()
+        }
+        match value {
+            Value::Scalar(_) => 8,
+            Value::Vector(values) => values.iter().map(|(key, _)| labels(key) + 8).sum(),
+            Value::Matrix(values, ..) => values
+                .iter()
+                .map(|(key, points)| labels(key) + points.len() * 16)
+                .sum(),
+        }
+    }
+    fn start<'a>(
+        &'a self,
+        inputs: Vec<physical::Input<'a, Value>>,
+        context: physical::RunContext,
+    ) -> Result<physical::OutputStream<'a, Value>, physical::Error> {
+        Ok(futures::stream::once(async move {
+            let values =
+                futures::future::try_join_all(inputs.into_iter().map(|mut input| async move {
+                    input.next().await.ok_or_else(|| {
+                        physical::Error::Operator("query input produced no value".into())
+                    })?
+                }))
+                .await?;
+            let values = values.iter().map(|v| v.value().clone()).collect::<Vec<_>>();
+            self.runtime
+                .borrow_mut()
+                .execute_node(
+                    self.id,
+                    self.time,
+                    self.node,
+                    &values,
+                    &self.dependencies,
+                    &context,
+                )
+                .map_err(|error| {
+                    *self.error.borrow_mut() = Some(error);
+                    physical::Error::Operator(format!(
+                        "query node {} at {} failed",
+                        self.id.0, self.time
+                    ))
+                })
+        })
+        .boxed_local())
     }
 }
 
@@ -445,6 +600,7 @@ fn semi_join(
     values: Vector,
     keys: &[(String, String)],
     completeness: Option<&CandidateCompleteness>,
+    context: &physical::RunContext,
 ) -> Result<(Vector, Option<String>), EngineError> {
     let left_key = |labels: &Labels| {
         keys.iter()
@@ -465,7 +621,7 @@ fn semi_join(
         .map(|(labels, _)| right_key(labels))
         .filter(|key| !available.contains(key))
         .collect::<Vec<_>>();
-    let selected = native_values::semi_join(values, &candidates, &left_key, &right_key)?;
+    let selected = native_values::semi_join(values, &candidates, &left_key, &right_key, context)?;
     if !missing.is_empty() && matches!(completeness, Some(CandidateCompleteness::Certified { .. }))
     {
         return Err(miss("certified pruning key has no authoritative value"));
@@ -483,42 +639,200 @@ fn semi_join(
     Ok((selected, warning))
 }
 
-fn aggregate(operation: Aggregation, grouping: &Grouping, values: Vector) -> Vector {
-    let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
-    for (labels, value) in values {
-        let key = labels
-            .into_iter()
-            .filter(|(key, _)| {
-                if grouping.without {
-                    key != "__name__" && !grouping.labels.contains(key)
-                } else {
-                    grouping.labels.contains(key)
-                }
-            })
-            .collect();
-        groups.entry(key).or_default().push(value);
+pub(super) fn native_scalar(
+    value: f64,
+    context: &physical::RunContext,
+) -> Result<f64, EngineError> {
+    use physical::{batch_execution::evaluate_source, operators::Operator, values::Value as Cell};
+    let source = Operator::scalar(
+        Cell::Float64(value),
+        planner_types::pre_asap::DataType::Float64,
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    let batches = evaluate_source(source, context.clone()).map_err(|e| miss(e.to_string()))?;
+    match batches
+        .first()
+        .and_then(|b| b.rows().first())
+        .and_then(|r| r.first())
+    {
+        Some(Cell::Float64(value)) => Ok(*value),
+        _ => Err(miss("native scalar source returned invalid output")),
     }
-    groups
+}
+
+fn native_labels(labels: &Labels) -> physical::values::Value {
+    physical::values::Value::Map(
+        labels
+            .iter()
+            .map(|(k, v)| {
+                (
+                    physical::values::Value::Utf8(k.as_str().into()),
+                    physical::values::Value::Utf8(v.as_str().into()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    )
+}
+fn native_vector_batch(
+    values: Vector,
+    grouping: &Grouping,
+) -> Result<physical::values::Batch, EngineError> {
+    use physical::values::{Batch, Value as Cell};
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::DataType,
+    };
+    let label_type = DataType::Map {
+        key: Box::new(DataType::Utf8),
+        value: Box::new(DataType::Utf8),
+        value_nullable: false,
+    };
+    let schema = std::sync::Arc::new(SummarySchema {
+        fields: vec![
+            ("labels", label_type.clone()),
+            ("group", label_type),
+            ("value", DataType::Float64),
+        ]
         .into_iter()
-        .map(|(labels, values)| {
-            let value = match operation {
-                Aggregation::Sum => values.iter().sum(),
-                Aggregation::Avg => values.iter().sum::<f64>() / values.len() as f64,
-                Aggregation::Count => values.len() as f64,
-                Aggregation::Max => {
-                    values
-                        .into_iter()
-                        .fold(f64::NAN, |a, b| if a.is_nan() || b > a { b } else { a })
-                }
-                Aggregation::Min => {
-                    values
-                        .into_iter()
-                        .fold(f64::NAN, |a, b| if a.is_nan() || b < a { b } else { a })
+        .map(|(name, dtype)| SummaryField {
+            name: name.into(),
+            dtype: SummaryFamilyType::Plain(dtype),
+            nullable: false,
+        })
+        .collect(),
+        time_index: None,
+    });
+    let rows = values
+        .into_iter()
+        .map(|(labels, value)| {
+            vec![
+                native_labels(&labels),
+                native_labels(&grouping_key(&labels, grouping)),
+                Cell::Float64(value),
+            ]
+        })
+        .collect();
+    Batch::try_new(schema, rows).map_err(|e| miss(e.to_string()))
+}
+fn native_batch_rows(
+    batch: physical::values::Batch,
+    ops: Vec<physical::operators::Operator>,
+    context: &physical::RunContext,
+) -> Result<Vec<Vec<physical::values::Value>>, EngineError> {
+    physical::batch_execution::evaluate_batch(batch, ops, context.clone())
+        .map(|batches| {
+            batches
+                .into_iter()
+                .flat_map(|batch| batch.rows().to_vec())
+                .collect()
+        })
+        .map_err(|e| miss(e.to_string()))
+}
+fn native_vector_output(
+    rows: Vec<Vec<physical::values::Value>>,
+    label_column: usize,
+    value_column: usize,
+) -> Result<Vector, EngineError> {
+    use physical::values::Value as Cell;
+    rows.into_iter()
+        .map(|row| {
+            let Some(Cell::Map(entries)) = row.get(label_column) else {
+                return Err(miss("native operator returned invalid labels"));
+            };
+            let labels = entries
+                .iter()
+                .map(|(k, v)| match (k, v) {
+                    (Cell::Utf8(k), Cell::Utf8(v)) => Ok((k.to_string(), v.to_string())),
+                    _ => Err(miss("native label map is not Utf8")),
+                })
+                .collect::<Result<Labels, _>>()?;
+            let value = match row.get(value_column) {
+                Some(Cell::Float64(value)) => *value,
+                Some(Cell::Int64(value)) if value.unsigned_abs() <= (1u64 << 53) => *value as f64,
+                _ => {
+                    return Err(miss(
+                        "native result is not representable in the query Float64 protocol",
+                    ))
                 }
             };
-            (labels, value)
+            Ok((labels, value))
         })
         .collect()
+}
+fn aggregate(
+    operation: Aggregation,
+    grouping: &Grouping,
+    values: Vector,
+    context: &physical::RunContext,
+) -> Result<Vector, EngineError> {
+    use physical::operators::{Operator, Reduction};
+    let batch = native_vector_batch(values, grouping)?;
+    let reduction = match operation {
+        Aggregation::Sum => Reduction::Sum(2),
+        Aggregation::Avg => Reduction::Avg(2),
+        Aggregation::Count => Reduction::Count,
+        Aggregation::Max => Reduction::Max(2),
+        Aggregation::Min => Reduction::Min(2),
+    };
+    let operator = Operator::aggregate(
+        batch.schema().clone(),
+        vec![1],
+        vec![("value".into(), reduction)],
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
+}
+
+fn negate(value: Value, context: &physical::RunContext) -> Result<Value, EngineError> {
+    use physical::operators::{Expression, Operator};
+    let scalar = matches!(value, Value::Scalar(_));
+    let values = match value {
+        Value::Scalar(v) => vec![(Labels::new(), v)],
+        Value::Vector(v) => v,
+        _ => return Err(miss("cannot negate range vector")),
+    };
+    let batch = native_vector_batch(
+        values,
+        &Grouping {
+            labels: vec![],
+            without: false,
+        },
+    )?;
+    let operator = Operator::project(
+        batch.schema().clone(),
+        vec![
+            ("labels".into(), Expression::Column(0)),
+            (
+                "value".into(),
+                Expression::Negate(Box::new(Expression::Column(2))),
+            ),
+        ],
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    let result = native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)?;
+    Ok(if scalar {
+        Value::Scalar(result[0].1)
+    } else {
+        Value::Vector(result)
+    })
+}
+fn vector_to_scalar(values: Vector, context: &physical::RunContext) -> Result<Value, EngineError> {
+    use physical::{operators::Operator, values::Value as Cell};
+    let batch = native_vector_batch(
+        values,
+        &Grouping {
+            labels: vec![],
+            without: false,
+        },
+    )?;
+    let operator =
+        Operator::vector_to_scalar(batch.schema().clone(), 2).map_err(|e| miss(e.to_string()))?;
+    let rows = native_batch_rows(batch, vec![operator], context)?;
+    match rows.first().and_then(|row| row.first()) {
+        Some(Cell::Float64(value)) => Ok(Value::Scalar(*value)),
+        _ => Err(miss("native scalar conversion returned invalid output")),
+    }
 }
 
 fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
@@ -539,137 +853,102 @@ fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
 /// labels. NaN ranks below every numeric value, matching Prometheus' TOPK heap.
 /// Stable sorting also leaves equal-valued series in the child's order.
 #[cfg(test)]
-fn topk_selection(k: u64, grouping: &Grouping, values: Vector) -> Vector {
-    native_values::limit(
-        native_values::sort(values, grouping, true).unwrap(),
-        grouping,
-        k,
-        0,
+fn topk_selection(
+    k: u64,
+    grouping: &Grouping,
+    values: Vector,
+    context: &physical::RunContext,
+) -> Result<Vector, EngineError> {
+    use physical::operators::{Operator, SortKey};
+    let batch = native_vector_batch(values, grouping)?;
+    let sort = Operator::sort(
+        batch.schema().clone(),
+        vec![SortKey {
+            column: 2,
+            descending: true,
+            nulls_first: false,
+        }],
+        vec![1],
     )
-    .unwrap()
+    .map_err(|e| miss(e.to_string()))?;
+    let limit = Operator::limit(sort.schema(), k, 0, vec![1]).map_err(|e| miss(e.to_string()))?;
+    let mut output =
+        native_vector_output(native_batch_rows(batch, vec![sort, limit], context)?, 0, 2)?;
+    // The HTTP adapter preserves canonical label-group presentation; native Sort
+    // already determined score order within each group.
+    output.sort_by_key(|(labels, _)| grouping_key(labels, grouping));
+    Ok(output)
 }
 
+#[cfg(test)]
 fn binary(
     operation: BinaryOperation,
     boolean: bool,
     left: Value,
     right: Value,
 ) -> Result<Value, EngineError> {
-    if matches!(
-        operation,
-        BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv
-    ) {
-        let valid = |value: &Value, denominator: bool| match value {
-            Value::Scalar(v) => v.is_finite() && (!denominator || *v != 0.0),
-            Value::Vector(rows) => rows
-                .iter()
-                .all(|(_, v)| v.is_finite() && (!denominator || *v != 0.0)),
-            Value::Matrix(..) => false,
-        };
-        if boolean || !valid(&left, false) || !valid(&right, true) {
-            return Err(miss(
-                "checked division requires finite operands and a nonzero divisor",
-            ));
-        }
-        let result = binary(BinaryOperation::Div, false, left, right)?;
-        let valid_result = |v: &f64| {
-            if operation == BinaryOperation::FiniteDiv {
-                v.is_finite()
-            } else {
-                v.is_normal()
-            }
-        };
-        let normal = match &result {
-            Value::Scalar(v) => valid_result(v),
-            Value::Vector(rows) => rows.iter().all(|(_, v)| valid_result(v)),
-            Value::Matrix(..) => false,
-        };
-        return if normal {
-            Ok(result)
-        } else {
-            Err(miss(
-                "checked division result is outside the declared floating-point domain",
-            ))
-        };
-    }
-    let arithmetic = matches!(
-        operation,
-        BinaryOperation::Add
-            | BinaryOperation::Sub
-            | BinaryOperation::Mul
-            | BinaryOperation::Div
-            | BinaryOperation::Mod
-            | BinaryOperation::Pow
-    );
-    let combine = |a: f64, b: f64| -> Option<f64> {
-        Some(match operation {
-            BinaryOperation::Add => a + b,
-            BinaryOperation::Sub => a - b,
-            BinaryOperation::Mul => a * b,
-            BinaryOperation::Div => a / b,
-            BinaryOperation::Mod => a % b,
-            BinaryOperation::Pow => a.powf(b),
-            _ => {
-                let pass = match operation {
-                    BinaryOperation::Equal => a == b,
-                    BinaryOperation::NotEqual => a != b,
-                    BinaryOperation::Less => a < b,
-                    BinaryOperation::LessEqual => a <= b,
-                    BinaryOperation::Greater => a > b,
-                    BinaryOperation::GreaterEqual => a >= b,
-                    _ => unreachable!(),
-                };
-                if boolean {
-                    if pass {
-                        1.
-                    } else {
-                        0.
-                    }
-                } else if pass {
-                    a
-                } else {
-                    return None;
-                }
-            }
-        })
+    binary_in_context(operation, boolean, left, right, &test_native_context())
+}
+fn binary_in_context(
+    operation: BinaryOperation,
+    boolean: bool,
+    left: Value,
+    right: Value,
+    context: &physical::RunContext,
+) -> Result<Value, EngineError> {
+    use physical::{
+        operators::{Expression, Operator},
+        values::{Batch, Value as Cell},
     };
-    let values = match (left, right) {
-        (Value::Scalar(a), Value::Scalar(b)) => {
-            if !arithmetic && !boolean {
-                return Err(miss("scalar comparison requires bool"));
-            }
-            return Ok(Value::Scalar(combine(a, b).unwrap_or(0.)));
+    use planner_types::{
+        post_asap::{BinaryOperator, SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::{ArithmeticOpKind as A, BinaryOpKind, CompareOpKind as C, DataType},
+    };
+    let kind = match operation {
+        BinaryOperation::Add => BinaryOpKind::Arithmetic(A::Add),
+        BinaryOperation::Sub => BinaryOpKind::Arithmetic(A::Sub),
+        BinaryOperation::Mul => BinaryOpKind::Arithmetic(A::Mul),
+        BinaryOperation::Div | BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv => {
+            BinaryOpKind::Arithmetic(A::Div)
         }
-        (Value::Vector(values), Value::Scalar(scalar)) => vector(Value::Vector(values))?
-            .into_iter()
-            .filter_map(|(labels, value)| {
-                combine(value, scalar).map(|v| {
-                    (
-                        if arithmetic || boolean {
-                            no_name(labels)
-                        } else {
-                            labels
-                        },
-                        v,
-                    )
-                })
-            })
-            .collect(),
-        (Value::Scalar(scalar), Value::Vector(values)) => vector(Value::Vector(values))?
-            .into_iter()
-            .filter_map(|(labels, value)| {
-                combine(scalar, value).map(|v| {
-                    (
-                        if arithmetic || boolean {
-                            no_name(labels)
-                        } else {
-                            labels
-                        },
-                        if arithmetic || boolean { v } else { value },
-                    )
-                })
-            })
-            .collect(),
+        BinaryOperation::Mod => BinaryOpKind::Arithmetic(A::Mod),
+        BinaryOperation::Pow => BinaryOpKind::Arithmetic(A::Pow),
+        BinaryOperation::Equal => BinaryOpKind::Compare(C::Eq),
+        BinaryOperation::NotEqual => BinaryOpKind::Compare(C::Ne),
+        BinaryOperation::Less => BinaryOpKind::Compare(C::Lt),
+        BinaryOperation::LessEqual => BinaryOpKind::Compare(C::Le),
+        BinaryOperation::Greater => BinaryOpKind::Compare(C::Gt),
+        BinaryOperation::GreaterEqual => BinaryOpKind::Compare(C::Ge),
+    };
+    let arithmetic = matches!(kind, BinaryOpKind::Arithmetic(_));
+    let scalar_output = matches!((&left, &right), (Value::Scalar(_), Value::Scalar(_)));
+    if scalar_output && !arithmetic && !boolean {
+        return Err(miss("scalar comparison requires bool"));
+    }
+    if boolean
+        && matches!(
+            operation,
+            BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv
+        )
+    {
+        return Err(miss("checked division cannot return bool"));
+    }
+    // Matching and metric-name presentation are protocol bindings; all numeric
+    // computation and checked arithmetic execute in the shared operator.
+    let mut pairs = Vec::new();
+    let scalar_left = matches!(left, Value::Scalar(_));
+    match (left, right) {
+        (Value::Scalar(a), Value::Scalar(b)) => pairs.push((Labels::new(), a, b)),
+        (Value::Vector(values), Value::Scalar(b)) => {
+            for (labels, a) in vector(Value::Vector(values))? {
+                pairs.push((labels, a, b));
+            }
+        }
+        (Value::Scalar(a), Value::Vector(values)) => {
+            for (labels, b) in vector(Value::Vector(values))? {
+                pairs.push((labels, a, b));
+            }
+        }
         (Value::Vector(left), Value::Vector(right)) => {
             let mut rhs = BTreeMap::new();
             for (labels, value) in right {
@@ -678,104 +957,185 @@ fn binary(
                 }
             }
             let mut seen = BTreeSet::new();
-            let mut out = Vec::new();
             for (labels, value) in left {
                 let key = no_name(labels.clone());
                 if !seen.insert(key.clone()) {
                     return Err(miss("duplicate vector matching labels"));
                 }
                 if let Some(right) = rhs.get(&key) {
-                    if let Some(v) = combine(value, *right) {
-                        out.push((if arithmetic || boolean { key } else { labels }, v));
-                    }
+                    pairs.push((labels, value, *right));
                 }
             }
-            out
         }
         _ => return Err(miss("binary matrix unsupported")),
-    };
-    Ok(Value::Vector(vector(Value::Vector(values))?))
-}
-
-fn rate(points: &[(i64, f64)], start: i64, end: i64) -> Option<f64> {
-    if points.len() < 2 {
-        return None;
     }
-    let (first_t, first) = points[0];
-    let (last_t, last) = *points.last()?;
-    let span = (last_t - first_t) as f64 / 1000.;
-    if span <= 0. {
-        return None;
-    }
-    let mut delta = last - first;
-    for pair in points.windows(2) {
-        if pair[1].1 < pair[0].1 {
-            delta += pair[0].1;
-        }
-    }
-    let average = span / (points.len() - 1) as f64;
-    let mut to_start = (first_t - start) as f64 / 1000.;
-    let mut to_end = (end - last_t) as f64 / 1000.;
-    if to_start >= average * 1.1 {
-        to_start = average / 2.;
-    }
-    // Apply the zero bound after the sparse-window half-interval cap.
-    if delta > 0. && first >= 0. {
-        to_start = to_start.min(span * first / delta);
-    }
-    if to_end >= average * 1.1 {
-        to_end = average / 2.;
-    }
-    Some(delta * (span + to_start + to_end) / span / ((end - start) as f64 / 1000.))
-}
-
-fn bucket_quantile(q: f64, mut b: Vec<(f64, f64)>) -> f64 {
-    if q.is_nan() {
-        return f64::NAN;
-    }
-    if q < 0. {
-        return f64::NEG_INFINITY;
-    }
-    if q > 1. {
-        return f64::INFINITY;
-    }
-    b.retain(|p| !p.0.is_nan());
-    b.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut buckets: Vec<(f64, f64)> = Vec::new();
-    for p in b {
-        if let Some(last) = buckets.last_mut() {
-            if last.0 == p.0 {
-                last.1 += p.1;
-                continue;
+    let schema = std::sync::Arc::new(SummarySchema {
+        fields: ["left", "right"]
+            .into_iter()
+            .map(|name| SummaryField {
+                name: name.into(),
+                dtype: SummaryFamilyType::Plain(DataType::Float64),
+                nullable: false,
+            })
+            .collect(),
+        time_index: None,
+    });
+    let batch = Batch::try_new(
+        schema.clone(),
+        pairs
+            .iter()
+            .map(|(_, a, b)| vec![Cell::Float64(*a), Cell::Float64(*b)])
+            .collect(),
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    let operator = Operator::project(
+        schema,
+        vec![(
+            "value".into(),
+            Expression::Binary {
+                operator: BinaryOperator {
+                    kind,
+                    vector_match: None,
+                    checked_relative_division: operation == BinaryOperation::CheckedDiv,
+                    checked_finite_division: operation == BinaryOperation::FiniteDiv,
+                },
+                left: Box::new(Expression::Column(0)),
+                right: Box::new(Expression::Column(1)),
+            },
+        )],
+    )
+    .map_err(|e| miss(e.to_string()))?;
+    let rows = native_batch_rows(batch, vec![operator], context)?;
+    let mut output = Vec::new();
+    for ((labels, a, b), row) in pairs.into_iter().zip(rows) {
+        let value = match row.first() {
+            Some(Cell::Float64(value)) => *value,
+            Some(Cell::Bool(value)) if boolean => {
+                if *value {
+                    1.
+                } else {
+                    0.
+                }
             }
-        }
-        buckets.push(p);
+            Some(Cell::Bool(true)) => {
+                if scalar_left {
+                    b
+                } else {
+                    a
+                }
+            }
+            Some(Cell::Bool(false)) => continue,
+            _ => return Err(miss("native binary result schema mismatch")),
+        };
+        output.push((
+            if arithmetic || boolean {
+                no_name(labels)
+            } else {
+                labels
+            },
+            value,
+        ));
     }
-    if buckets.len() < 2 || buckets.last().unwrap().0 != f64::INFINITY {
-        return f64::NAN;
+    if scalar_output {
+        return Ok(Value::Scalar(
+            output
+                .first()
+                .ok_or_else(|| miss("missing scalar result"))?
+                .1,
+        ));
     }
-    let mut prev = buckets[0].1;
-    for p in buckets.iter_mut().skip(1) {
-        if p.1 < prev || (p.1 - prev).abs() <= 1e-12 * (p.1.abs() + prev.abs()) {
-            p.1 = prev;
-        }
-        prev = p.1;
-    }
-    let count = buckets.last().unwrap().1;
-    if count == 0. {
-        return f64::NAN;
-    }
-    let rank = q * count;
-    let idx = buckets[..buckets.len() - 1].partition_point(|p| p.1 < rank);
-    if idx == buckets.len() - 1 {
-        return buckets[idx - 1].0;
-    }
-    if idx == 0 && buckets[0].0 <= 0. {
-        return buckets[0].0;
-    }
-    let (start, base) = if idx == 0 { (0., 0.) } else { buckets[idx - 1] };
-    let (end, upper) = buckets[idx];
-    start + (end - start) * (rank - base) / (upper - base)
+    Ok(Value::Vector(vector(Value::Vector(output))?))
+}
+
+fn native_temporal(
+    values: Matrix,
+    operation: TemporalOperation,
+    start: i64,
+    end: i64,
+    context: &physical::RunContext,
+) -> Result<Vector, EngineError> {
+    use planner_types::pre_asap::AggIntent;
+    let intent = match operation {
+        TemporalOperation::Rate => AggIntent::Rate,
+        TemporalOperation::Increase => AggIntent::Increase,
+        TemporalOperation::Sum => AggIntent::Sum { col: None },
+        TemporalOperation::Avg => AggIntent::Avg { col: None },
+        TemporalOperation::Min => AggIntent::Min { col: None },
+        TemporalOperation::Max => AggIntent::Max { col: None },
+        TemporalOperation::Count => AggIntent::Count {
+            accuracy: planner_types::types::AccuracyTarget::Exact,
+        },
+    };
+    let rows = values
+        .into_iter()
+        .flat_map(|(labels, points)| {
+            points.into_iter().map(move |(time, value)| {
+                vec![
+                    native_labels(&labels),
+                    physical::values::Value::Timestamp(time),
+                    physical::values::Value::Float64(value),
+                ]
+            })
+        })
+        .collect();
+    native_window(rows, intent, Some((start, end)), context)
+}
+fn native_window(
+    rows: Vec<Vec<physical::values::Value>>,
+    intent: planner_types::pre_asap::AggIntent<planner_types::pre_asap::ColumnRef>,
+    window: Option<(i64, i64)>,
+    context: &physical::RunContext,
+) -> Result<Vector, EngineError> {
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::DataType,
+    };
+    let schema = std::sync::Arc::new(SummarySchema {
+        fields: vec![
+            (
+                "labels",
+                DataType::Map {
+                    key: Box::new(DataType::Utf8),
+                    value: Box::new(DataType::Utf8),
+                    value_nullable: false,
+                },
+            ),
+            (
+                "coordinate",
+                if window.is_some() {
+                    DataType::Timestamp
+                } else {
+                    DataType::Float64
+                },
+            ),
+            ("value", DataType::Float64),
+        ]
+        .into_iter()
+        .map(|(name, dtype)| SummaryField {
+            name: name.into(),
+            dtype: SummaryFamilyType::Plain(dtype),
+            nullable: false,
+        })
+        .collect(),
+        time_index: None,
+    });
+    let batch =
+        physical::values::Batch::try_new(schema.clone(), rows).map_err(|e| miss(e.to_string()))?;
+    let operator = physical::operators::Operator::window(schema, intent, 1, 2, vec![0], window)
+        .map_err(|e| miss(e.to_string()))?;
+    native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
+}
+
+#[cfg(test)]
+fn test_native_context() -> physical::RunContext {
+    physical::RunContext::new(
+        physical::Scope::Query {
+            evaluation_time_ms: 0,
+            revision: 0,
+        },
+        physical::Limits::default(),
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -886,7 +1246,9 @@ mod topk_tests {
                 without: false,
             },
             values,
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].0["pod"], "b");
         assert_eq!(selected[0].1, 9.0);
@@ -910,7 +1272,9 @@ mod topk_tests {
                 (labels(&[("series", "low")]), -1.0),
                 (labels(&[("series", "high")]), 3.0),
             ],
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         let selected = topk_selection(
             2,
             &Grouping {
@@ -918,7 +1282,9 @@ mod topk_tests {
                 without: false,
             },
             selected,
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -1209,6 +1575,7 @@ mod topk_tests {
             Some(&CandidateCompleteness::Certified {
                 guarantee: topk_membership_guarantee(),
             }),
+            &test_native_context(),
         )
         .unwrap();
         let selected = topk_selection(
@@ -1218,7 +1585,9 @@ mod topk_tests {
                 without: false,
             },
             selected,
-        );
+            &test_native_context(),
+        )
+        .unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -1374,6 +1743,7 @@ mod topk_tests {
             exact.clone(),
             &[("pod".into(), "pod".into())],
             Some(&CandidateCompleteness::BestEffort { guarantee: None }),
+            &test_native_context(),
         )
         .unwrap();
         assert!(warning.unwrap().contains("approximate"));
@@ -1388,7 +1758,132 @@ mod topk_tests {
             exact,
             &[("pod".into(), "pod".into())],
             Some(&certified),
+            &test_native_context(),
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod shared_runtime_tests {
+    use super::*;
+    use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryLanguage};
+
+    fn entry() -> QueryPlanEntry {
+        QueryPlanEntry {
+            language: QueryLanguage::PromQl,
+            query_id: "shared-grid".into(),
+            canonical_query: "shared-grid".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(3),
+            // The callback owns the absorbed summary dependencies. Only its
+            // declared readout boundary participates in this value graph.
+            nodes: BTreeMap::from([
+                (
+                    QueryNodeId(0),
+                    QueryPlanNode::ExactReadout {
+                        input: QueryNodeId(99),
+                        readout: asap_types::query_plan::ExactReadout::Sum,
+                    },
+                ),
+                (
+                    QueryNodeId(1),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Subquery {
+                            range_ms: 2000,
+                            step_ms: 1000,
+                            offset_ms: 0,
+                        },
+                        inputs: vec![QueryNodeId(0)],
+                    },
+                ),
+                (
+                    QueryNodeId(2),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Temporal {
+                            operation: TemporalOperation::Sum,
+                        },
+                        inputs: vec![QueryNodeId(1)],
+                    },
+                ),
+                (
+                    QueryNodeId(3),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Binary {
+                            operation: BinaryOperation::Add,
+                            return_bool: false,
+                        },
+                        inputs: vec![QueryNodeId(2), QueryNodeId(2)],
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 2000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        }
+    }
+
+    // A shared time-grid node runs once per query; distinct times and runs stay isolated.
+    #[test]
+    fn shared_subquery_scopes_do_not_duplicate_or_leak_values() {
+        let entry = entry();
+        let mut calls = Vec::new();
+        for (at, expected) in [(3000, 10.), (4000, 14.)] {
+            let (result, stats) = execute_installed(&entry, &BTreeMap::new(), at, |id, time| {
+                assert_eq!(id, QueryNodeId(0));
+                calls.push(time);
+                Ok(QueryResult::vector(
+                    vec![InstantVectorElement::new(
+                        KeyByLabelValues::new_with_labels(vec!["a".into()]),
+                        time as f64 / 1000.,
+                    )
+                    .with_label_keys_override(vec!["pod".into()])],
+                    time,
+                ))
+            })
+            .unwrap();
+            let QueryResult::Vector(result) = result else {
+                panic!("vector required");
+            };
+            assert_eq!(result.values[0].value, expected);
+            assert_eq!(stats.summary_readout_evaluations, 2);
+            assert!(stats.memo_hits >= 1);
+        }
+        assert_eq!(calls, vec![2000, 3000, 3000, 4000]);
+    }
+
+    // Query adapters use native computation and its parent execution budget.
+    #[test]
+    fn native_scalar_and_aggregation_share_parent_resource_control() {
+        let context = test_native_context();
+        assert_eq!(native_scalar(7., &context).unwrap(), 7.);
+        let output = aggregate(
+            Aggregation::Sum,
+            &Grouping {
+                labels: vec![],
+                without: false,
+            },
+            vec![(Labels::new(), 2.), (Labels::new(), 5.)],
+            &context,
+        )
+        .unwrap();
+        assert_eq!(output, vec![(Labels::new(), 7.)]);
+        assert!(context.peak_bytes() > 0);
+        context.cancel();
+        assert!(native_scalar(7., &context).is_err());
+        assert!(negate(Value::Scalar(1.), &context).is_err());
+    }
+
+    // Source failures keep their routing classification across the shared runtime.
+    #[test]
+    fn source_error_classification_survives_execution() {
+        let error = execute_installed(&entry(), &BTreeMap::new(), 3000, |_, _| {
+            Err(EngineError::capability_miss("source", "failed"))
+        })
+        .unwrap_err();
+        assert!(matches!(error,EngineError::CapabilityMiss{engine_id,..} if engine_id=="source"));
     }
 }

@@ -750,13 +750,9 @@ impl ASAPQueryEngine {
     {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                if entry.nodes.values().any(|node| {
-                    matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
-                }) {
-                    return self
-                        .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
-                        .await;
-                }
+                return self
+                    .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
+                    .await;
             }
         }
         let Some(idx) = self.summary_store.as_ref() else {
@@ -2718,6 +2714,15 @@ mod range_stitch_tests {
                 matches!(result, Err(EngineError::CapabilityMiss { .. })),
                 "a missing first pane must fail closed with a CapabilityMiss: {result:?}"
             );
+            // Stored-only range execution reports the actual shared-runtime work.
+            let complete = engine
+                .execute_range_promql_modern(query, 60_000, 60_000, 30_000)
+                .await
+                .unwrap();
+            assert!(complete
+                .warnings()
+                .iter()
+                .any(|w| w.starts_with("asap_logical_stats:raw=0,summary=1,")));
         }
     }
 

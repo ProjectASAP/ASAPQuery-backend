@@ -566,6 +566,10 @@ pub(crate) struct SummaryReadRevision {
     in_flight: usize,
 }
 impl SummaryReadRevision {
+    pub(crate) fn mutation_sequence(self) -> u64 {
+        self.mutation
+    }
+
     fn capture(
         admission: u64,
         mutation: &std::sync::atomic::AtomicU64,

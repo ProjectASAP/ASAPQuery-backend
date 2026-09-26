@@ -1,9 +1,11 @@
 //! ClickHouse row semantics for planner-owned relational wrappers.
 
+#[cfg(test)]
 mod aggregate;
 mod collection;
+pub(super) mod native;
 
-use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{
@@ -16,10 +18,12 @@ use arrow::{
 use chrono::{DateTime, NaiveDateTime, TimeZone};
 use planner_types::{
     post_asap::{SummaryFamilyType, SummarySchema, ValueOperation},
-    pre_asap::{ArithmeticOpKind, CompareOpKind, DataType, QueryExpr, ScalarValue, SortKey},
+    pre_asap::DataType,
 };
 
 use super::clickhouse_result_adapter::ClickHouseQueryResult;
+#[cfg(test)]
+use planner_types::pre_asap::{ArithmeticOpKind, CompareOpKind, QueryExpr, ScalarValue, SortKey};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ClickHouseRelationalError {
@@ -371,134 +375,51 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
 pub struct ClickHouseRelationalAdapter;
 
 impl ClickHouseRelationalAdapter {
-    pub fn apply_inner_equi_join(
+    pub fn apply_join(
         &self,
+        kind: &planner_types::pre_asap::JoinKind,
         pred: &planner_types::pre_asap::Predicate,
         output_schema: &SummarySchema,
         left: ClickHouseRelation,
         right: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
-        let coverage = match (left.coverage, right.coverage) {
-            (Some((left_start, left_end)), Some((right_start, right_end))) => {
-                let start = left_start.max(right_start);
-                let end = left_end.min(right_end);
-                (start <= end).then_some((start, end))
-            }
-            _ => None,
-        };
-        let mut fields = left.fields.clone();
-        fields.extend(right.fields.clone());
-        let schema = scalar_schema(&fields);
-        let mut rows = Vec::new();
-        for left_row in &left.rows {
-            for right_row in &right.rows {
-                let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
-                joined.extend(left_row.iter().cloned());
-                joined.extend(right_row.iter().cloned());
-                if matches!(eval(&pred.0, &joined, &schema)?, Cell::Bool(true)) {
-                    rows.push(joined);
-                }
-            }
-        }
-        Ok(ClickHouseRelation {
-            rows,
-            fields: fields_from_schema(output_schema),
-            coverage,
-        })
+        native::execute(
+            planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin {
+                join_kind: kind.clone(),
+                pred: pred.clone(),
+                pruning: None,
+            },
+            output_schema,
+            vec![left, right],
+        )
     }
 
     pub fn apply_filter(
         &self,
         pred: &planner_types::pre_asap::Predicate,
-        mut input: ClickHouseRelation,
+        input: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
-        let schema = scalar_schema(&input.fields);
-        input.rows = input
-            .rows
-            .into_iter()
-            .filter_map(|row| match eval(&pred.0, &row, &schema) {
-                Ok(Cell::Bool(true)) => Some(Ok(row)),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(input)
+        let schema = native::schema(&input);
+        self.apply_operation(
+            &ValueOperation::Filter { pred: pred.clone() },
+            &schema,
+            input,
+        )
     }
 
     pub fn apply_operation(
         &self,
         operation: &ValueOperation,
         output_schema: &SummarySchema,
-        mut input: ClickHouseRelation,
+        input: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
-        let schema = scalar_schema(&input.fields);
-        match operation {
-            ValueOperation::Exact(planner_types::post_asap::ExactOperation::Aggregate {
-                reduction,
-                measures,
-                having,
-                ..
-            }) => {
-                return aggregate::apply(
-                    reduction,
-                    measures,
-                    having.as_ref(),
-                    output_schema,
-                    input,
-                );
-            }
-            ValueOperation::Project { cols, .. } => {
-                let mut rows = Vec::with_capacity(input.rows.len());
-                for row in &input.rows {
-                    rows.push(
-                        cols.iter()
-                            .map(|item| eval(&item.expr, row, &schema))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
-                }
-                input.rows = rows;
-                input.fields = fields_from_schema(output_schema);
-            }
-            ValueOperation::Sort { keys, partition_by } => {
-                if partition_by.is_without() || !partition_by.is_empty() {
-                    return Err(ClickHouseRelationalError::Unsupported(
-                        "partitioned sort".into(),
-                    ));
-                }
-                for row in &input.rows {
-                    for key in keys {
-                        let value = eval(&key.expr, row, &schema)?;
-                        if contains_nan(&value) {
-                            return Err(ClickHouseRelationalError::Unsupported(
-                                "NaN sort key".into(),
-                            ));
-                        }
-                        if !matches!(value, Cell::Null) && cell_cmp(&value, &value).is_none() {
-                            return Err(ClickHouseRelationalError::Unsupported(
-                                "unsupported sort key value type".into(),
-                            ));
-                        }
-                    }
-                }
-                input
-                    .rows
-                    .sort_by(|left, right| compare_sort_keys(left, right, keys, &schema));
-            }
-            ValueOperation::Limit {
-                n,
-                offset,
-                partition_by,
-            } => {
-                if !partition_by.keys().is_empty() || partition_by.is_without() {
-                    return Err(ClickHouseRelationalError::Unsupported(
-                        "partitioned relation Limit is not bound".into(),
-                    ));
-                }
-                input.rows = input.rows.into_iter().skip(*offset).take(*n).collect();
-            }
-            other => return Err(ClickHouseRelationalError::Unsupported(format!("{other:?}"))),
-        }
-        Ok(input)
+        native::execute(
+            planner_types::post_asap::ExecutableOperatorPayload::Value {
+                operation: operation.clone(),
+            },
+            output_schema,
+            vec![input],
+        )
     }
 }
 
@@ -560,420 +481,54 @@ fn row_from_value(
         .collect()
 }
 
-fn scalar_schema(fields: &[(String, DataType, bool)]) -> planner_types::pre_asap::Schema {
-    planner_types::pre_asap::Schema::new(
-        fields
-            .iter()
-            .map(|(name, dtype, nullable)| {
-                planner_types::pre_asap::Column::new(name.clone(), dtype.clone(), *nullable)
-            })
-            .collect(),
-    )
-}
-
+#[cfg(test)]
 fn eval(
     expr: &QueryExpr,
     row: &[Cell],
     schema: &planner_types::pre_asap::Schema,
 ) -> Result<Cell, ClickHouseRelationalError> {
-    match expr {
-        QueryExpr::Column(index) => {
-            row.get(*index)
-                .cloned()
-                .ok_or(ClickHouseRelationalError::ColumnOutOfRange(
-                    *index,
-                    row.len(),
-                ))
-        }
-        QueryExpr::Literal(value) => Ok(match value {
-            ScalarValue::Interval { .. } => {
-                return Err(ClickHouseRelationalError::Unsupported(
-                    "interval literal".into(),
-                ))
-            }
-            ScalarValue::Int64(value) => Cell::Int64(*value),
-            ScalarValue::Float64(value) => Cell::Float64(*value),
-            ScalarValue::Utf8(value) => Cell::Utf8(value.clone()),
-            ScalarValue::Boolean(value) => Cell::Bool(*value),
-            ScalarValue::Null => Cell::Null,
-        }),
-        QueryExpr::Compare { left, op, right } => {
-            let left = eval(left, row, schema)?;
-            let right = eval(right, row, schema)?;
-            compare(op, left, right)
-        }
-        QueryExpr::Arithmetic { op, left, right } => {
-            arithmetic(op, eval(left, row, schema)?, eval(right, row, schema)?)
-        }
-        QueryExpr::FunctionCall { name, args } => {
-            use planner_types::pre_asap::scalar_signature::MapScalarFunction;
-            if name.eq_ignore_ascii_case("asap_struct_field") {
-                expr.scalar_type(schema)
-                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
-                let DataType::Struct { fields } = args[0]
-                    .scalar_type(schema)
-                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?
-                    .0
-                else {
-                    unreachable!()
-                };
-                let offset = match &args[1] {
-                    QueryExpr::Literal(ScalarValue::Int64(index)) => {
-                        usize::try_from(index - 1).ok()
-                    }
-                    QueryExpr::Literal(ScalarValue::Utf8(name)) => {
-                        fields.iter().position(|field| &field.name == name)
-                    }
-                    _ => None,
-                }
-                .ok_or_else(|| {
-                    ClickHouseRelationalError::Invalid("struct field selector".into())
-                })?;
-                let Cell::Struct(values) = eval(&args[0], row, schema)? else {
-                    return Err(ClickHouseRelationalError::Invalid(
-                        "struct field input".into(),
-                    ));
-                };
-                return values.get(offset).cloned().ok_or_else(|| {
-                    ClickHouseRelationalError::Invalid("struct field value".into())
-                });
-            }
-            if name.eq_ignore_ascii_case("asap_element_access") {
-                let (output_type, _) = expr
-                    .scalar_type(schema)
-                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
-                if let DataType::List { element } = args[0]
-                    .scalar_type(schema)
-                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?
-                    .0
-                {
-                    let Cell::List(values) = eval(&args[0], row, schema)? else {
-                        return Err(ClickHouseRelationalError::Invalid(
-                            "array access input".into(),
-                        ));
-                    };
-                    let index = match eval(&args[1], row, schema)? {
-                        Cell::Null => return Ok(Cell::Null),
-                        Cell::Int64(index) => index,
-                        _ => {
-                            return Err(ClickHouseRelationalError::Invalid(
-                                "array access index".into(),
-                            ))
-                        }
-                    };
-                    let offset = if index > 0 {
-                        usize::try_from(index - 1).ok()
-                    } else if index < 0 {
-                        usize::try_from(index.unsigned_abs())
-                            .ok()
-                            .and_then(|distance| values.len().checked_sub(distance))
-                    } else {
-                        None
-                    };
-                    return match offset.and_then(|offset| values.get(offset)) {
-                        Some(value) => Ok(value.clone()),
-                        None => default_collection_element(&output_type, element.nullable),
-                    };
-                }
-            }
-            let function = (if name.eq_ignore_ascii_case("asap_element_access") {
-                Some(MapScalarFunction::Access)
-            } else {
-                MapScalarFunction::from_name(name)
-            })
-            .ok_or_else(|| {
-                ClickHouseRelationalError::Unsupported(format!("scalar function {name}"))
-            })?;
-            expr.scalar_type(schema)
-                .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
-            let values = args
-                .iter()
-                .map(|arg| eval(arg, row, schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            match function {
-                MapScalarFunction::Construct => {
-                    let mut values = values.into_iter();
-                    let mut entries = Vec::new();
-                    while let Some(key) = values.next() {
-                        if !matches!(key, Cell::Int64(_) | Cell::Utf8(_) | Cell::Bool(_)) {
-                            return Err(ClickHouseRelationalError::Unsupported(
-                                "map key value type".into(),
-                            ));
-                        }
-                        entries.push((
-                            key,
-                            values.next().ok_or_else(|| {
-                                ClickHouseRelationalError::Invalid("odd map argument count".into())
-                            })?,
-                        ));
-                    }
-                    Ok(Cell::Map(entries))
-                }
-                MapScalarFunction::Concat => {
-                    let mut entries = Vec::new();
-                    for value in values {
-                        let Cell::Map(mut next) = value else {
-                            return Err(ClickHouseRelationalError::Invalid(
-                                "map concat argument".into(),
-                            ));
-                        };
-                        entries.append(&mut next);
-                    }
-                    Ok(Cell::Map(entries))
-                }
-                MapScalarFunction::Access => {
-                    let [Cell::Map(entries), key] = values.as_slice() else {
-                        return Err(ClickHouseRelationalError::Invalid(
-                            "map access arguments".into(),
-                        ));
-                    };
-                    if matches!(key, Cell::Null) {
-                        return Ok(Cell::Null);
-                    }
-                    if !matches!(key, Cell::Int64(_) | Cell::Utf8(_) | Cell::Bool(_)) {
-                        return Err(ClickHouseRelationalError::Unsupported(
-                            "map lookup key type".into(),
-                        ));
-                    }
-                    if let Some((_, value)) = entries.iter().find(|(candidate, _)| candidate == key)
-                    {
-                        return Ok(value.clone());
-                    }
-                    let (
-                        DataType::Map {
-                            value,
-                            value_nullable,
-                            ..
-                        },
-                        _,
-                    ) = args[0]
-                        .scalar_type(schema)
-                        .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?
-                    else {
-                        unreachable!()
-                    };
-                    default_collection_element(&value, value_nullable)
-                }
-            }
-        }
-        other => Err(ClickHouseRelationalError::Unsupported(format!(
-            "scalar expression {other:?}"
-        ))),
-    }
-}
-
-fn default_collection_element(
-    dtype: &DataType,
-    nullable: bool,
-) -> Result<Cell, ClickHouseRelationalError> {
-    if nullable {
-        return Ok(Cell::Null);
-    }
-    Ok(match dtype {
-        DataType::Interval | DataType::Date => {
-            return Err(ClickHouseRelationalError::Unsupported(
-                "temporal value transport".into(),
-            ))
-        }
-        DataType::Null => Cell::Null,
-        DataType::Int64 => Cell::Int64(0),
-        DataType::Float64 => Cell::Float64(0.0),
-        DataType::Utf8 => Cell::Utf8(String::new()),
-        DataType::Bool => Cell::Bool(false),
-        DataType::Map { .. } => Cell::Map(Vec::new()),
-        DataType::List { .. } => Cell::List(Arc::from([])),
-        DataType::Struct { fields } => Cell::Struct(
-            fields
-                .iter()
-                .map(|field| default_collection_element(&field.dtype, field.nullable))
-                .collect::<Result<Vec<_>, _>>()?
-                .into(),
-        ),
-        _ => {
-            return Err(ClickHouseRelationalError::Unsupported(
-                "collection missing-element default type".into(),
-            ))
-        }
-    })
-}
-
-fn compare(op: &CompareOpKind, left: Cell, right: Cell) -> Result<Cell, ClickHouseRelationalError> {
-    if matches!(left, Cell::Null) || matches!(right, Cell::Null) {
-        return Ok(Cell::Null);
-    }
-    let ordering = cell_cmp(&left, &right).ok_or_else(|| {
-        ClickHouseRelationalError::Invalid("comparison of incompatible values".into())
-    })?;
-    let value = match op {
-        CompareOpKind::Eq => ordering == Ordering::Equal,
-        CompareOpKind::Ne => ordering != Ordering::Equal,
-        CompareOpKind::Lt => ordering == Ordering::Less,
-        CompareOpKind::Le => ordering != Ordering::Greater,
-        CompareOpKind::Gt => ordering == Ordering::Greater,
-        CompareOpKind::Ge => ordering != Ordering::Less,
-        _ => {
-            return Err(ClickHouseRelationalError::Unsupported(format!(
-                "comparison {op:?}"
-            )))
-        }
+    let relation = ClickHouseRelation {
+        fields: schema
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.dtype.clone(), c.nullable))
+            .collect(),
+        rows: vec![],
+        coverage: None,
     };
-    Ok(Cell::Bool(value))
+    let compiled = asap_physical_operators::dag::expressions::CompiledExpression::compile(
+        expr,
+        &Arc::new(native::schema(&relation)),
+    )
+    .map_err(|error| ClickHouseRelationalError::Unsupported(error.to_string()))?;
+    let value = compiled
+        .evaluate(&row.iter().map(native::value).collect::<Vec<_>>())
+        .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
+    native::cell(&value)
 }
-
+#[cfg(test)]
 fn arithmetic(
     op: &ArithmeticOpKind,
     left: Cell,
     right: Cell,
 ) -> Result<Cell, ClickHouseRelationalError> {
-    if matches!(left, Cell::Null) || matches!(right, Cell::Null) {
-        return Ok(Cell::Null);
-    }
-    if let (Cell::Int64(left), Cell::Int64(right)) = (&left, &right) {
-        let integer = match op {
-            ArithmeticOpKind::Add => Some(left.checked_add(*right)),
-            ArithmeticOpKind::Sub => Some(left.checked_sub(*right)),
-            ArithmeticOpKind::Mul => Some(left.checked_mul(*right)),
-            ArithmeticOpKind::Mod => Some(left.checked_rem(*right)),
-            _ => None,
-        };
-        if let Some(value) = integer {
-            return value.map(Cell::Int64).ok_or_else(|| {
-                ClickHouseRelationalError::Invalid(
-                    "integer arithmetic overflow or zero divisor".into(),
-                )
-            });
-        }
-    }
-    let (left, right) = match (left, right) {
-        (Cell::Int64(left), Cell::Int64(right)) => (left as f64, right as f64),
-        (Cell::Int64(left), Cell::Float64(right)) => (left as f64, right),
-        (Cell::Float64(left), Cell::Int64(right)) => (left, right as f64),
-        (Cell::Float64(left), Cell::Float64(right)) => (left, right),
-        _ => {
-            return Err(ClickHouseRelationalError::Invalid(
-                "arithmetic on non-numeric values".into(),
-            ))
-        }
+    let dtype = |value: &Cell| match value {
+        Cell::Int64(_) => DataType::Int64,
+        _ => DataType::Float64,
     };
-    let value = match op {
-        ArithmeticOpKind::Add => left + right,
-        ArithmeticOpKind::Sub => left - right,
-        ArithmeticOpKind::Mul => left * right,
-        ArithmeticOpKind::Div if right != 0.0 => left / right,
-        ArithmeticOpKind::Mod if right != 0.0 => left % right,
-        ArithmeticOpKind::Pow => left.powf(right),
-        _ => {
-            return Err(ClickHouseRelationalError::Unsupported(format!(
-                "arithmetic {op:?}"
-            )))
-        }
-    };
-    Ok(Cell::Float64(value))
-}
-
-fn compare_sort_keys(
-    left: &[Cell],
-    right: &[Cell],
-    keys: &[SortKey],
-    schema: &planner_types::pre_asap::Schema,
-) -> Ordering {
-    for key in keys {
-        let Ok(left) = eval(&key.expr, left, schema) else {
-            return Ordering::Equal;
-        };
-        let Ok(right) = eval(&key.expr, right, schema) else {
-            return Ordering::Equal;
-        };
-        let (ordering, order_depends_on_direction) = match (&left, &right) {
-            (Cell::Null, Cell::Null) => (Ordering::Equal, false),
-            (Cell::Null, _) => {
-                if key.nulls_first {
-                    (Ordering::Less, false)
-                } else {
-                    (Ordering::Greater, false)
-                }
-            }
-            (_, Cell::Null) => {
-                if key.nulls_first {
-                    (Ordering::Greater, false)
-                } else {
-                    (Ordering::Less, false)
-                }
-            }
-            _ => (cell_cmp(&left, &right).unwrap_or(Ordering::Equal), true),
-        };
-        let ordering = if key.ascending || !order_depends_on_direction {
-            ordering
-        } else {
-            ordering.reverse()
-        };
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    Ordering::Equal
-}
-
-fn contains_nan(value: &Cell) -> bool {
-    match value {
-        Cell::Float64(value) => value.is_nan(),
-        Cell::List(values) | Cell::Struct(values) => values.iter().any(contains_nan),
-        Cell::Map(entries) => entries
-            .iter()
-            .any(|(key, value)| contains_nan(key) || contains_nan(value)),
-        _ => false,
-    }
-}
-
-fn integer_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
-    if float.is_nan() {
-        return None;
-    }
-    // These bounds are powers of two, exactly representable as Float64.
-    if float >= 9_223_372_036_854_775_808.0 {
-        return Some(Ordering::Less);
-    }
-    if float < -9_223_372_036_854_775_808.0 {
-        return Some(Ordering::Greater);
-    }
-    let integral = float as i64;
-    match integer.cmp(&integral) {
-        Ordering::Equal => 0.0_f64.partial_cmp(&float.fract()),
-        other => Some(other),
-    }
-}
-
-fn cell_cmp(left: &Cell, right: &Cell) -> Option<Ordering> {
-    match (left, right) {
-        (Cell::Int64(left), Cell::Int64(right)) => Some(left.cmp(right)),
-        (Cell::Float64(left), Cell::Float64(right)) => left.partial_cmp(right),
-        (Cell::Int64(left), Cell::Float64(right)) => integer_float_cmp(*left, *right),
-        (Cell::Float64(left), Cell::Int64(right)) => {
-            integer_float_cmp(*right, *left).map(Ordering::reverse)
-        }
-        (Cell::Utf8(left), Cell::Utf8(right)) => Some(left.cmp(right)),
-        (Cell::Bool(left), Cell::Bool(right)) => Some(left.cmp(right)),
-        (Cell::Timestamp(left), Cell::Timestamp(right)) => Some(left.cmp(right)),
-        (Cell::Map(left), Cell::Map(right)) => {
-            for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right) {
-                let order = cell_cmp(left_key, right_key)?;
-                if order != Ordering::Equal {
-                    return Some(order);
-                }
-                let order = match (left_value, right_value) {
-                    (Cell::Null, Cell::Null) => Ordering::Equal,
-                    (Cell::Null, _) => Ordering::Greater,
-                    (_, Cell::Null) => Ordering::Less,
-                    _ => cell_cmp(left_value, right_value)?,
-                };
-                if order != Ordering::Equal {
-                    return Some(order);
-                }
-            }
-            Some(left.len().cmp(&right.len()))
-        }
-        _ => None,
-    }
+    let schema = planner_types::pre_asap::Schema::new(vec![
+        planner_types::pre_asap::Column::new("left", dtype(&left), false),
+        planner_types::pre_asap::Column::new("right", dtype(&right), false),
+    ]);
+    eval(
+        &QueryExpr::Arithmetic {
+            op: op.clone(),
+            left: std::rc::Rc::new(QueryExpr::Column(0)),
+            right: std::rc::Rc::new(QueryExpr::Column(1)),
+        },
+        &[left, right],
+        &schema,
+    )
 }
 
 fn arrow_type(dtype: &DataType) -> ArrowDataType {
@@ -1248,30 +803,6 @@ mod scalar_contract_tests {
         assert!(ClickHouseRelationalAdapter
             .apply_operation(&operation, &schema, input)
             .is_err());
-    }
-
-    #[test]
-    fn mixed_comparison_preserves_integer_precision_and_boundaries() {
-        assert_eq!(
-            integer_float_cmp(9_007_199_254_740_993, 9_007_199_254_740_992.0),
-            Some(Ordering::Greater)
-        );
-        assert_eq!(
-            integer_float_cmp(i64::MAX, 9_223_372_036_854_775_808.0),
-            Some(Ordering::Less)
-        );
-        assert_eq!(
-            integer_float_cmp(i64::MIN, -9_223_372_036_854_775_808.0),
-            Some(Ordering::Equal)
-        );
-        assert_eq!(integer_float_cmp(-1, -1.5), Some(Ordering::Greater));
-        assert_eq!(integer_float_cmp(1, 1.5), Some(Ordering::Less));
-        assert_eq!(integer_float_cmp(0, f64::INFINITY), Some(Ordering::Less));
-        assert_eq!(
-            integer_float_cmp(0, f64::NEG_INFINITY),
-            Some(Ordering::Greater)
-        );
-        assert_eq!(integer_float_cmp(0, f64::NAN), None);
     }
 
     #[test]
@@ -1652,7 +1183,10 @@ mod tests {
     fn unsupported_scalar_expression_fails_closed() {
         let row = vec![Cell::Float64(1.0)];
         let error = eval(
-            &QueryExpr::BoolAnd(vec![]),
+            &QueryExpr::FunctionCall {
+                name: "unsupported_function".into(),
+                args: vec![],
+            },
             &row,
             &planner_types::pre_asap::Schema::new(vec![]),
         )
@@ -1685,7 +1219,13 @@ mod tests {
             right: Rc::new(QueryExpr::Column(2)),
         }));
         let joined = ClickHouseRelationalAdapter
-            .apply_inner_equi_join(&pred, &joined_schema, left, right)
+            .apply_join(
+                &planner_types::pre_asap::JoinKind::Inner,
+                &pred,
+                &joined_schema,
+                left,
+                right,
+            )
             .unwrap();
         let output_schema = schema(&[("service", DataType::Utf8), ("ratio", DataType::Float64)]);
         let projected = ClickHouseRelationalAdapter
@@ -1723,6 +1263,61 @@ mod tests {
                 .unwrap()
                 .value(0),
             0.2
+        );
+    }
+
+    // Every standardized Planner join kind has concrete row semantics.
+    #[test]
+    fn executes_all_post_asap_relational_join_kinds() {
+        use planner_types::pre_asap::JoinKind;
+
+        let side_schema = schema(&[("key", DataType::Int64)]);
+        let relation = |values: &[i64]| ClickHouseRelation {
+            rows: values
+                .iter()
+                .map(|value| vec![Cell::Int64(*value)])
+                .collect(),
+            fields: fields_from_schema(&side_schema),
+            coverage: Some((0, 10)),
+        };
+        let mut joined_schema = schema(&[("left", DataType::Int64), ("right", DataType::Int64)]);
+        for field in &mut joined_schema.fields {
+            field.nullable = true;
+        }
+        let pred = Predicate(Rc::new(QueryExpr::Compare {
+            left: Rc::new(QueryExpr::Column(0)),
+            op: CompareOpKind::Eq,
+            right: Rc::new(QueryExpr::Column(1)),
+        }));
+        let adapter = ClickHouseRelationalAdapter;
+        let execute = |kind, output_schema: &SummarySchema| {
+            adapter
+                .apply_join(
+                    &kind,
+                    &pred,
+                    output_schema,
+                    relation(&[1, 2]),
+                    relation(&[2, 3]),
+                )
+                .unwrap()
+                .rows
+        };
+
+        assert_eq!(
+            execute(JoinKind::Inner, &joined_schema),
+            vec![vec![Cell::Int64(2), Cell::Int64(2)]]
+        );
+        assert_eq!(execute(JoinKind::Left, &joined_schema).len(), 2);
+        assert_eq!(execute(JoinKind::Right, &joined_schema).len(), 2);
+        assert_eq!(execute(JoinKind::Full, &joined_schema).len(), 3);
+        assert_eq!(execute(JoinKind::Cross, &joined_schema).len(), 4);
+        assert_eq!(
+            execute(JoinKind::Semi, &side_schema),
+            vec![vec![Cell::Int64(2)]]
+        );
+        assert_eq!(
+            execute(JoinKind::Anti, &side_schema),
+            vec![vec![Cell::Int64(1)]]
         );
     }
 }

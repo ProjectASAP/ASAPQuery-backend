@@ -12,9 +12,6 @@ pub mod installed_precompute_plan;
 pub mod precomputed_output;
 pub mod storage_backend;
 
-pub use asap_physical_operators::key_by_label_values::*;
-pub use asap_physical_operators::measurement::*;
-pub use asap_physical_operators::traits::*;
 pub use enums::*;
 pub use hot_reload_config::*;
 pub use installed_precompute_plan::*;
@@ -32,3 +29,5 @@ pub use crate::query_engines::routing::{
     classify_query_shape, BackendStorageRouting, HotReloadBackendStorageRouting,
     QueryOperatorShape, RoutingTarget,
 };
+
+pub use asap_physical_operators::{traits::*, KeyByLabelValues, Measurement};
