@@ -105,6 +105,19 @@ impl GroupState {
         range_start_ms: u64,
         range_end_ms: u64,
     ) -> Result<Option<f64>, String> {
+        let parameters = std::collections::HashMap::from([
+            ("range_start_ms".to_string(), range_start_ms.to_string()),
+            ("range_end_ms".to_string(), range_end_ms.to_string()),
+        ]);
+        self.exact_value_with_parameters(readout, key, &parameters)
+    }
+
+    pub(crate) fn exact_value_with_parameters(
+        &self,
+        readout: asap_types::query_plan::ExactReadout,
+        key: &Option<KeyByLabelValues>,
+        parameters: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<f64>, String> {
         let GroupState::ExactAgg { entries, agg_type } = self else {
             return Err("exact readout requires matching exact state".into());
         };
@@ -120,15 +133,11 @@ impl GroupState {
             asap_types::query_plan::ExactReadout::Max => asap_types::Statistic::Max,
         };
 
-        let query_kwargs = std::collections::HashMap::from([
-            ("range_start_ms".to_string(), range_start_ms.to_string()),
-            ("range_end_ms".to_string(), range_end_ms.to_string()),
-        ]);
         asap_physical_operators::stored_state::readout::exact_readout_optional(
             entries.iter().flat_map(|windows| windows.values().cloned()),
             stat,
             key,
-            &query_kwargs,
+            parameters,
         )
     }
 
