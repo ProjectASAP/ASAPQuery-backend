@@ -629,6 +629,138 @@ pub enum QueryPlanNode {
 }
 
 impl QueryPlanNode {
+    /// Operator label for logs: the serialized `op` tag, plus the residual
+    /// `kind` for logical nodes, including the operation where applicable
+    /// (e.g. `logical/aggregate/sum`).
+    pub fn op_label(&self) -> &'static str {
+        use residual::ResidualQueryOperator as R;
+        match self {
+            Self::RelationalJoin { .. } => "relational_join",
+            Self::Relational { .. } => "relational",
+            Self::Logical { operator, .. } => match operator {
+                R::CurrentSeries { .. } => "logical/current_series",
+                R::ExactSubquery { .. } => "logical/exact_subquery",
+                R::CandidateExactSubquery { .. } => "logical/candidate_exact_subquery",
+                R::Scan { .. } => "logical/scan",
+                R::UnaryNegate => "logical/unary_negate",
+                R::VectorToScalar => "logical/vector_to_scalar",
+                R::Aggregate { operation, .. } => match operation {
+                    residual::Aggregation::Sum => "logical/aggregate/sum",
+                    residual::Aggregation::Max => "logical/aggregate/max",
+                    residual::Aggregation::Min => "logical/aggregate/min",
+                    residual::Aggregation::Avg => "logical/aggregate/avg",
+                    residual::Aggregation::Count => "logical/aggregate/count",
+                },
+                R::Limit { .. } => "logical/limit",
+                R::Binary { .. } => "logical/binary",
+                R::Temporal { .. } => "logical/temporal",
+                R::Sort { .. } => "logical/sort",
+                R::HistogramQuantile => "logical/histogram_quantile",
+                R::Subquery { .. } => "logical/subquery",
+            },
+            Self::Scalar { .. } => "scalar",
+            Self::Binary { .. } => "binary",
+            Self::ReduceSum { .. } => "reduce_sum",
+            Self::ReadMaterialization { .. } => "read_materialization",
+            Self::SummaryEstimate { .. } => "summary_estimate",
+            Self::ExactReadout { readout, .. } => match readout {
+                ExactReadout::Sum => "exact_readout/sum",
+                ExactReadout::Count => "exact_readout/count",
+                ExactReadout::Increase => "exact_readout/increase",
+                ExactReadout::Rate => "exact_readout/rate",
+                ExactReadout::Min => "exact_readout/min",
+                ExactReadout::Max => "exact_readout/max",
+            },
+            Self::SummaryMerge { .. } => "summary_merge",
+            Self::ExternalExact { .. } => "external_exact",
+            Self::ExactFallback { .. } => "exact_fallback",
+        }
+    }
+
+    /// Bounded, query-text-free operator arguments for execution logs.
+    /// The query ID links these details to the full installed plan when needed.
+    pub fn log_syntax(&self) -> String {
+        use residual::ResidualQueryOperator as R;
+        match self {
+            Self::RelationalJoin { join_kind, .. } => format!("join_kind={join_kind:?}"),
+            Self::Relational { .. } => String::new(),
+            Self::Logical { operator, .. } => match operator {
+                R::CurrentSeries { readout, .. } => format!("readout={readout:?}"),
+                R::ExactSubquery { .. } => String::new(),
+                R::CandidateExactSubquery { .. } => String::new(),
+                R::Scan {
+                    metric,
+                    matchers,
+                    range_ms,
+                    offset_ms,
+                } => format!(
+                    "metric={} matcher_count={} range_ms={range_ms:?} offset_ms={offset_ms}",
+                    metric
+                        .as_deref()
+                        .map(|name| name.chars().take(64).collect::<String>())
+                        .unwrap_or_default(),
+                    matchers.len(),
+                ),
+                R::UnaryNegate | R::VectorToScalar | R::HistogramQuantile => String::new(),
+                R::Aggregate {
+                    operation,
+                    grouping,
+                } => format!(
+                    "operation={operation:?} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
+                R::Limit {
+                    n,
+                    offset,
+                    grouping,
+                } => format!(
+                    "n={n} offset={offset} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
+                R::Binary {
+                    operation,
+                    return_bool,
+                } => format!("operation={operation:?} return_bool={return_bool}"),
+                R::Temporal { operation } => format!("operation={operation:?}"),
+                R::Sort {
+                    descending,
+                    grouping,
+                } => format!(
+                    "descending={descending} grouping={}",
+                    log_grouping(&grouping.labels, grouping.without)
+                ),
+                R::Subquery {
+                    range_ms,
+                    step_ms,
+                    offset_ms,
+                } => format!("range_ms={range_ms} step_ms={step_ms} offset_ms={offset_ms}"),
+            },
+            Self::Scalar { value } => format!("value={value}"),
+            Self::Binary { operator, .. } => format!("operation={operator:?}"),
+            Self::ReduceSum { grouping, .. } => match grouping {
+                PhysicalGrouping::PerEntity => "grouping=per_entity".into(),
+                PhysicalGrouping::Reduce(labels) => {
+                    format!("grouping=reduce({})", log_labels(labels))
+                }
+            },
+            Self::ReadMaterialization { binding } => format!(
+                "window_ms={} lookback_ms={:?}",
+                binding.window_ms, binding.readout_lookback_ms
+            ),
+            Self::SummaryEstimate { query, .. } => match query {
+                QueryReadout::FrequencyL2 => "readout=frequency_l2".into(),
+                QueryReadout::FrequencyEntropy => "readout=frequency_entropy".into(),
+                QueryReadout::Quantile { q } => format!("readout=quantile q={q}"),
+                QueryReadout::PointCount { .. } => "readout=point_count".into(),
+                QueryReadout::Cardinality => "readout=cardinality".into(),
+                QueryReadout::TopK { k } => format!("readout=top_k k={k}"),
+            },
+            Self::ExactReadout { readout, .. } => format!("readout={readout:?}"),
+            Self::SummaryMerge { .. } => String::new(),
+            Self::ExternalExact { .. } | Self::ExactFallback { .. } => String::new(),
+        }
+    }
+
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
             Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
@@ -644,6 +776,26 @@ impl QueryPlanNode {
             | Self::ExternalExact { inputs, .. } => inputs,
         }
     }
+}
+
+fn log_labels(labels: &[String]) -> String {
+    let mut names = labels
+        .iter()
+        .take(8)
+        .map(|label| label.chars().take(64).collect::<String>())
+        .collect::<Vec<_>>();
+    if labels.len() > 8 {
+        names.push("...".into());
+    }
+    names.join(",")
+}
+
+fn log_grouping(labels: &[String], without: bool) -> String {
+    format!(
+        "{}({})",
+        if without { "without" } else { "by" },
+        log_labels(labels)
+    )
 }
 
 pub use planner_types::post_asap::CandidateCompleteness;
@@ -739,12 +891,74 @@ pub fn canonical_promql(query: &str) -> Result<String, QueryPlanError> {
 
 #[cfg(test)]
 mod contract_tests {
+    use super::{residual, QueryPlanNode};
+
     // Installed plans cross producer/query threads without Planner Rc state.
     #[test]
     fn installed_query_contract_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<super::QueryPlan>();
         assert_send_sync::<super::QueryPlanEntry>();
+    }
+
+    #[test]
+    fn aggregate_log_labels_identify_the_operation() {
+        for (operation, expected) in [
+            (residual::Aggregation::Sum, "logical/aggregate/sum"),
+            (residual::Aggregation::Count, "logical/aggregate/count"),
+            (residual::Aggregation::Avg, "logical/aggregate/avg"),
+        ] {
+            let node = QueryPlanNode::Logical {
+                operator: residual::ResidualQueryOperator::Aggregate {
+                    operation,
+                    grouping: residual::Grouping {
+                        labels: vec!["service".into()],
+                        without: false,
+                    },
+                },
+                inputs: vec![],
+            };
+            assert_eq!(node.op_label(), expected);
+            assert!(node.log_syntax().contains("grouping=by(service)"));
+        }
+        for (readout, expected) in [
+            (super::ExactReadout::Sum, "exact_readout/sum"),
+            (super::ExactReadout::Count, "exact_readout/count"),
+        ] {
+            assert_eq!(
+                QueryPlanNode::ExactReadout {
+                    input: super::QueryNodeId(1),
+                    readout,
+                }
+                .op_label(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn execution_log_syntax_identifies_operator_without_query_text() {
+        let binary = QueryPlanNode::Logical {
+            operator: residual::ResidualQueryOperator::Binary {
+                operation: residual::BinaryOperation::CheckedDiv,
+                return_bool: false,
+            },
+            inputs: vec![super::QueryNodeId(1), super::QueryNodeId(2)],
+        };
+        assert_eq!(binary.op_label(), "logical/binary");
+        assert_eq!(
+            binary.log_syntax(),
+            "operation=CheckedDiv return_bool=false"
+        );
+
+        let exact = QueryPlanNode::Logical {
+            operator: residual::ResidualQueryOperator::ExactSubquery {
+                query: "secret_metric{credential=\"secret\"}".into(),
+            },
+            inputs: vec![],
+        };
+        assert_eq!(exact.op_label(), "logical/exact_subquery");
+        assert!(exact.log_syntax().is_empty());
     }
 }
 

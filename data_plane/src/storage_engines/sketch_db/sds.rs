@@ -143,8 +143,14 @@ impl SummaryDescriptorRegistry {
             asap_types::sds::StoredOutputReference,
         >,
     ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
-        catalog.validate()?;
-        let reference = catalog.reference()?;
+        catalog.validate().inspect_err(|error| {
+            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
+                %error, "storage descriptor catalog validation failed");
+        })?;
+        let reference = catalog.reference().inspect_err(|error| {
+            tracing::warn!(plan_id = catalog.plan_id, plan_version = catalog.plan_version,
+                %error, "storage descriptor catalog reference failed");
+        })?;
         let generation = Arc::new(asap_types::sds::CatalogGeneration {
             schema_version: reference.schema_version,
             plan_id: reference.plan_id,
@@ -152,6 +158,11 @@ impl SummaryDescriptorRegistry {
             snapshot_sha256: reference.snapshot_sha256,
         });
         *self.authoritative_catalog.write().unwrap() = Some((catalog, generation, outputs));
+        tracing::info!(
+            plan_id = reference.plan_id,
+            plan_version = reference.plan_version,
+            "storage descriptor catalog installed"
+        );
         Ok(())
     }
 
@@ -257,6 +268,16 @@ impl SummaryDescriptorRegistry {
             }
         };
 
+        let catalog_generation = authoritative
+            .as_ref()
+            .map(|(_, generation, _)| generation.clone());
+        tracing::debug!(target: "asap_runtime_debug", sid = metadata.storage_handle,
+            policy_fp = %metadata.policy_fp,
+            summary_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(summary_descriptor.id().canonical().as_bytes(), 0)),
+            data_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(data_id.canonical().as_bytes(), 0)),
+            plan_id = catalog_generation.as_ref().map(|g| g.plan_id),
+            plan_version = catalog_generation.as_ref().map(|g| g.plan_version),
+            "SDS descriptor binding resolved");
         Ok(SdsBinding {
             stored_output_reference,
             metadata: Arc::new(metadata),
