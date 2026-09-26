@@ -111,7 +111,7 @@ kll-state output                         ↓       ↓
                                      p50 readout p99 readout
 ```
 
-The raw input must contain the complete one-minute population. The query input
+The raw input must contain the complete set of input samples for the one-minute pane. The query input
 requires compatible panes covering the requested aligned five-minute interval.
 These are Planner contracts, not a backend decision to cut the logical graph.
 
@@ -124,7 +124,7 @@ summary_definitions:
   - id: latency-kll-1m
     input: request_latency_seconds
     group_by: [service]
-    population_interval: 1m
+    pane_duration: 1m
     algorithm: {kind: kll, k: 200}
 
 precompute_plan:
@@ -150,12 +150,12 @@ query_plan:
 ```
 
 For `(12:00, 12:05]`, the query engine resolves five one-minute records for the
-requested population, validates their format, coverage and revision compatibility,
+requested group, validates their format, coverage and revision compatibility,
 and supplies them to the query DAG. Merge runs once for its two consumers within
 that run. Separate query runs do not implicitly share mutable execution state.
 
 Each maintained pane contributes once. Replacing a pane snapshot does not add
-another population to a query merge. Missing, overlapping or incomplete panes
+the same input samples again to a query merge. Missing, overlapping or incomplete panes
 cannot be treated as the requested complete range.
 
 A delayed build keeps its original coverage interval; publication time does not
@@ -234,7 +234,7 @@ Tests must establish:
 
 1. Deployment binding preserves Planner's operators, boundaries and shared
    dependencies; unsupported bindings fail before activation.
-2. The KLL example writes one pane population once and serves both readouts with
+2. The KLL example summarizes each pane’s input samples once and serves both readouts with
    one merge per shared run. Missing/overlapping panes and incompatible revisions
    fail read eligibility.
 3. A supported query-only build and precomputed readout/result follow their

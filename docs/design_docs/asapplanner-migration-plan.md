@@ -68,7 +68,7 @@ Consume the selected Physical DAGs, physical boundary identities, query
 associations and maintenance requirements. Replace semantic-node classification
 with mappings from declared input/output boundaries to deployment resources.
 
-- Bind raw slots to readers satisfying population, schema and boundedness.
+- Bind raw slots to readers satisfying source, filter, grouping, window, schema and boundedness requirements.
 - Assign version-scoped stored-output identities to persisted physical outputs.
 - Bind stored inputs to matching outputs and validate grouping, format, coverage
   and revision requirements.

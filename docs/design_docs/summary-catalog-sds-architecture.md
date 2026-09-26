@@ -53,7 +53,7 @@ internally. V1 introduces neither `SummaryMetadataStore` nor
 `SummaryPayloadStore`, nor a separate catalog `Materialization` object.
 
 Shared semantic metadata lives once in `SummaryDefinition`; each `StoredSummary`
-references it by `definition_id`. Instance-specific metadata (population, window,
+references it by `definition_id`. Instance-specific metadata (group key, window,
 actual coverage and format) and payload together form that `StoredSummary`.
 Separating an internal index from payload files does not introduce a third data
 object. V1 reuses existing storage facilities without requiring either physical
@@ -132,7 +132,7 @@ runtime_summary_store:
     - key:
         plan_version: 42
         stored_output_id: latency-kll
-        population_key: {service: api}
+        group_key: {service: api}
         window: {start_exclusive: '12:00', end_inclusive: '12:05'}
       definition_id: def-api-latency-kll
       format: {schema: kll-v1, encoding: kll-binary-v1}
@@ -194,7 +194,7 @@ stored_summaries:
   - key:
       plan_version: 42
       stored_output_id: latency-kll
-      population_key: {service: api}
+      group_key: {service: api}
       window: {start_exclusive: '12:00', end_inclusive: '12:05'}
     definition_id: def-api-latency-kll
     format: {schema: kll-v1, encoding: kll-binary-v1}
@@ -219,7 +219,7 @@ reference:
 
 This names the producer output and its definition; it does not contain a payload
 or select a concrete window. For a request at `12:05` for `service=api`, the
-reader's population and time selection completes the lookup key:
+reader's group and time selection completes the lookup key:
 
 ```text
 (42, latency-kll, {service: api}, (12:00, 12:05])
@@ -272,7 +272,7 @@ belong in definition rows.
 | --- | --- |
 | Definition ID | What semantics does the state represent? |
 | Plan version + stored output ID | Which installed producer output does this state belong to? |
-| Stored-summary key | Which concrete population/window record is it? |
+| Stored-summary key | Which concrete group/window record is it? |
 | Plan version | With which atomic installation may it be used? |
 | Schema/encoding ID | How are its bytes interpreted? |
 
@@ -281,10 +281,10 @@ installation and stored-output IDs from the compiler. The runtime addresses a
 `StoredSummary` by the composite key:
 
 ```text
-(plan_version, stored_output_id, population_key, window)
+(plan_version, stored_output_id, group_key, window)
 ```
 
-`population_key` contains canonical label names and values. `window` identifies
+`group_key` contains canonical label names and values. `window` identifies
 the intended time partition, including its boundary convention; actual coverage
 must still satisfy the reader. V1 needs no additional instance UUID. A
 `StoredOutputReference` identifies the output across its records, not a pointer
