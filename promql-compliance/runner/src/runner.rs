@@ -50,7 +50,9 @@ pub struct Args {
     pub base_time_ms: Option<i64>,
     #[arg(long, default_value_t = 3)]
     pub warmups: usize,
-    #[arg(long, default_value_t = 10)]
+    // With ten samples nearest-rank p95 is the maximum. Use enough samples
+    // to measure the tail percentile while retaining every observation.
+    #[arg(long, default_value_t = 100)]
     pub trials: usize,
 }
 pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
