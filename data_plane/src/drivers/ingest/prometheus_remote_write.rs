@@ -960,6 +960,7 @@ mod tests {
             snapshot_sha256: reference.snapshot_sha256,
         };
         let active = RuntimePhysicalPlan {
+            readout_programs: Default::default(),
             envelope: envelope.clone(),
             summary_catalog: Some(catalog),
             precompute_plan: PrecomputePlan {
