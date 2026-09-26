@@ -15,7 +15,7 @@ without requiring either runtime to reinterpret Planner IR.
 
 This document owns summary identity, schema, state references and the conditions
 for reading an instance. The [integration design](asapplanner-integration.md) owns
-executable plan splitting; the [migration plan](asapplanner-migration-plan.md)
+deployment binding of Planner-provided Physical DAGs; the [migration plan](asapplanner-migration-plan.md)
 owns delivery.
 Cost ranking, operator scheduling and transmission policy are outside SDS.
 
@@ -236,27 +236,27 @@ and filters, input value, operation or sketch parameters, grouping, time
 semantics, accuracy fields that affect state, and output type. Display names,
 costs, locations, readiness and retention status are excluded.
 
-The former standalone `Materialization` catalog object was an over-abstraction:
-its fields already belong to the definition, executable bindings or runtime
-instance metadata. Their ownership is explicit below.
+Boundary bindings connect Planner's typed physical inputs and outputs to stored
+records. The backend does not classify semantic nodes or choose where to cut
+computation. One stored output corresponds to a selected persisted physical
+output, with all compatible consumers referencing that identity.
 
-| Former field | Owner in this design |
+| Field | Owner |
 | --- | --- |
-| Materialization ID | Replaced by a compiler-assigned `stored_output_id`, scoped to the plan version, in reader/writer references. |
-| Definition ID | `StoredOutputReference` points to `SummaryDefinition` in `summary_definitions`. |
-| Plan version | Installed plan bundle; persisted instance metadata repeats it for recovery validation. |
-| State family and algorithm parameters | `SummaryDefinition`. |
-| Schema and encoding | Writer configuration and matching reader expectations; instances declare the actual payload format. |
-| Physical partition layout | Writer partitioning and matching reader partition selection. |
-| Permitted writer | PrecomputePlan write binding; runtime validates writes against the installed binding. |
-| Provenance | Compiler's physical-to-semantic node mapping. |
+| Stored-output ID | Backend-assigned, plan-version-scoped identity shared by writer and readers |
+| Definition ID | Semantic definition referenced by the stored-output binding |
+| State family and parameters | Planner output contract, recorded in `SummaryDefinition` |
+| Schema and encoding | Supported writer format and matching reader expectations; records declare actual format |
+| Grouping and coverage requirement | Planner boundary contract, realized by backend record selection |
+| Physical storage layout and permitted writer | Backend output binding |
+| Provenance | Planner logical-to-physical mapping |
+| Schedule and retention | Backend operational configuration satisfying the selected lifecycle |
+| Actual readiness | Committed record metadata checked at execution time |
 
-The compiler emits both bindings from one decision and validates agreement
-before installation. Repetition of format fields in the serialized plans does
-not authorize independent selection. The catalog does not need a second registry
-for those fields. The selected deployment guarantee and schedule/retention belong
-to Planner's deployment decision and the installed PrecomputePlan binding;
-observed readiness belongs to instance metadata in `SummaryStore`.
+Bindings are compiled together and validated against the physical boundary
+contracts. Repeated format expectations on a reader do not authorize an
+independent format choice. No standalone catalog Materialization object or
+additional binding registry is required.
 
 A `StoredSummary` means the complete logical entry in `SummaryStore`: its
 metadata and its associated payload. The metadata records plan version,
@@ -302,6 +302,10 @@ algorithm. QueryPlan and derived PrecomputePlan nodes resolve references through
 exact indexed lookup, never serving-time candidate selection.
 
 ## Plan and storage contract
+
+The following diagram shows deployed data flow. Build/readout computation is
+carried by Planner Physical DAGs; Read/Write denote backend boundary adapters,
+not a second backend operator IR.
 
 ```text
 PrecomputePlan
@@ -359,25 +363,15 @@ Compilation, installation, writes, recovery and reads enforce:
 6. Retirement blocks new bindings before state reclamation.
 7. Unknown schemas, malformed payloads and unauthorized updates fail closed.
 
-The current backend distributes these responsibilities across `asap_types`,
-control-plane publication and the existing `SketchStore`. Migration reuses its
-authoritative IDs, instance metadata and payload storage rather than creating a
-parallel store. Legacy artifacts are normalized at the backend boundary and
-supported payloads retain versioned readers and fixtures.
+The backend implements these checks using shared state codecs and its existing
+storage engine. No parallel metadata/payload service is introduced. The
+[migration plan](asapplanner-migration-plan.md) separates plan-schema retirement
+from supported persisted-payload compatibility and defines identity conversion
+and recovery gates.
 
-Remove the proposed `materializations` catalog collection and standalone object
-from new plan examples and schemas. Preserve the existing
-`BackendNodeBinding::Materialization` variant as the node-placement marker for
-stored output; it does not imply a catalog object. At the compatibility boundary,
-map legacy stored-output identifiers into version-scoped output IDs and copy their
-format/partition constraints into matching bindings. Preserve payload locators
-and reject unresolved or conflicting mappings; do not rename existing persisted
-IDs or reinterpret legacy wire fields in place. Legacy formats keep their
-versioned readers during the supported migration window.
-
-Runtime-independent contracts and sketch reconstruction belong in neutral
-libraries. Backend storage, scheduling and query execution remain backend-owned;
-the backend must not depend on ASAPCollector.
+Runtime-independent state formats and reconstruction belong in shared libraries.
+Backend storage, scheduling and publication remain backend-owned; physical
+computation runs through the shared executor without an ASAPCollector dependency.
 
 ## Deferred work
 

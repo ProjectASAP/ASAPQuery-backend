@@ -15,10 +15,10 @@ in the serialized API.
 | Deployment plan | System instantiation of physical computation with concrete source/state bindings and operational policy. |
 | Summary producer | An operation or subgraph that builds summary state. Multiple queries may share its stored output. |
 | `SummaryMaintenanceLifecyclePlan` | Planner result associating a post-ASAP root with selected maintenance requirements for its unique reachable summary producers, plus workload and costing context. |
-| Selected deployment guarantee and schedule/retention | The selected `SummaryMaintenanceLifecycleGuarantee` for one producer, together with its concrete scheduling and retention binding. This is part of a deployment in `SummaryMaintenanceLifecyclePlan`, not a separate model. |
+| Selected deployment guarantee and schedule/retention | The selected `SummaryMaintenanceLifecycleGuarantee` for one producer, together with its concrete scheduling and retention binding. Planner supplies the selected lifecycle requirements; backend scheduling and retention must realize them without changing their semantics. |
 | Maintenance | Work that constructs, refreshes or derives stored summary state, including batch rebuilds and incremental updates. |
-| `PrecomputePlan` | Backend executable plan for maintenance and state writes. |
-| `QueryPlan` | Backend executable plan for state reads, query readouts and remaining query operations. |
+| `PrecomputePlan` | Planner maintenance Physical DAGs plus backend input/output bindings, scheduling and publication policy. |
+| `QueryPlan` | Planner query Physical DAGs plus backend input bindings, query/result associations and fallback policy. |
 | Readout / `SummaryEstimate` | Operation that obtains a query value from summary state, such as p99 from KLL. |
 | Derived summary state | Stored summary state computed from existing summary states. Earlier discussion calls this a “derived materialization”; it does not require a separate catalog object. |
 | Exact residual | Part of the selected query computed exactly around summary operations, such as supported filtering or arithmetic after readout. It does not make the whole approximate result exact. |
@@ -31,16 +31,11 @@ compatible grouping, coverage and accuracy.
 
 ## State and identity
 
-These are proposed design names, not a rename of existing Rust APIs or wire
-fields. `SummaryDefinition` retains its meaning. The former Summary Catalog is
-the internal `summary_definitions` table and its installation snapshot;
-`SummaryStateInstance` is now `StoredSummary`, and `StateReference` is now
-`StoredOutputReference`. The latter names a producer output, while the composite
-record key locates one population/window payload. V1 stores only two kinds of
-objects: `SummaryDefinition` and `StoredSummary`. `StoredOutputReference` belongs
-to installed plan bindings, not a third storage table. Instance metadata and
-payload are both part of `StoredSummary`; their internal physical layout is an
-implementation detail.
+The storage contract has two stored objects: `SummaryDefinition` and
+`StoredSummary`. `StoredOutputReference` belongs to installed boundary bindings,
+not a third storage table. Metadata and payload form one logical stored record.
+Migration of existing types and fields is covered in the
+[migration plan](asapplanner-migration-plan.md).
 
 | Term | Meaning |
 | --- | --- |
@@ -56,10 +51,9 @@ implementation detail.
 | Schema / encoding | Schema describes the state structure; encoding describes how that structure is represented as bytes. |
 | Provenance | Mapping from physical plan operations back to the selected Planner computation. |
 
-The existing `BackendNodeBinding::Materialization` marks a node whose output is
-stored. It remains a node binding; this design has no standalone catalog
-`Materialization` object. A materialization boundary is simply where a producer
-writes stored state and a consumer reads it.
+A materialization boundary is a Planner-selected physical output consumed
+through typed inputs. Backend binding assigns its storage identity without
+reclassifying logical nodes or changing that boundary.
 
 ## Time, selection and validation
 
@@ -73,3 +67,11 @@ writes stored state and a consumer reads it.
 | Backend capability | Declaration of supported implementation combinations: algorithm/parameters, maintenance mode, input kind, window behavior and format. |
 | Physical cost evidence | Scoped measurements or estimates used to compare executable alternatives; includes workload and implementation context. |
 | Compiler contract | Required inputs, outputs, validation rules and guarantees, including matching writer/reader definitions, formats, partitions and plan versions. |
+
+## Compilation ownership
+
+The [canonical Planner design at e9390031](https://github.com/ProjectASAP/ASAPPlanner/blob/e9390031fcecd7bc0d611127eddc5c6603a281e5/docs/design_docs/physical-planning-and-deployment.md)
+defines physical lowering and frontier selection as Planner responsibilities.
+The backend Deployment Plan Compiler binds declared physical inputs and outputs;
+it does not reinterpret the logical DAG. Operator kind alone does not determine
+maintenance versus query placement.
