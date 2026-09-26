@@ -224,12 +224,12 @@ impl GroupState {
         key: &Option<KeyByLabelValues>,
         range_start_ms: u64,
         range_end_ms: u64,
-    ) -> Option<f64> {
+    ) -> Result<Option<f64>, String> {
         let GroupState::ExactAgg { entries, agg_type } = self else {
-            return None;
+            return Err("exact readout requires matching exact state".into());
         };
         if agg_type.planner_exact_family().as_ref() != Some(&readout.planner_family()) {
-            return None;
+            return Err("exact readout requires matching exact state".into());
         }
         let stat = match readout {
             asap_types::query_plan::ExactReadout::Count => asap_types::Statistic::Count,
@@ -244,13 +244,12 @@ impl GroupState {
             ("range_start_ms".to_string(), range_start_ms.to_string()),
             ("range_end_ms".to_string(), range_end_ms.to_string()),
         ]);
-        asap_physical_operators::stored_state::readout::exact_readout(
+        asap_physical_operators::stored_state::readout::exact_readout_optional(
             entries.iter().flat_map(|windows| windows.values().cloned()),
             stat,
             key,
             &query_kwargs,
         )
-        .ok()
     }
 
     /// Coverage analog of `exact_value` — folds `(min_window_end_ms,
@@ -442,6 +441,7 @@ impl QueryExecutionContext<'_> {
         sids.dedup();
         let mut matched_metadata = 0usize;
         let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> = BTreeMap::new();
+        let mut source_order = BTreeMap::new();
 
         for sid in sids.iter().copied() {
             if self
@@ -505,6 +505,7 @@ impl QueryExecutionContext<'_> {
                             project_group_key(keys, &series.series_label_values)
                         }
                     };
+                    source_order.entry(key.clone()).or_insert(sid);
                     by_group.entry(key).or_default().push(GroupState::Sketch {
                         entries: vec![Rc::new(series)],
                         kind,
@@ -519,15 +520,20 @@ impl QueryExecutionContext<'_> {
                             _
                         ))
                     ) {
-                        // Counter pane statistics are sufficient for Prometheus
-                        // extrapolatedRate only when no query boundary cuts a
-                        // pane. A partial pane would require its first/last
-                        // in-range raw sample, which this SDS intentionally
-                        // does not retain. Fail closed to the exact subtree.
+                        // Sparse counters may have empty edge panes. Every
+                        // stored pane must still lie wholly within the requested
+                        // range and on its declared grid; cutting a pane would
+                        // require raw boundary samples that this state lacks.
                         let coverage = self
                             .index
                             .exact_agg_coverage_bounds(sid, self.t0_ms, self.t1_ms);
-                        if coverage != Some((self.t0_ms, self.t1_ms)) {
+                        let Some((start, end)) = coverage else {
+                            continue;
+                        };
+                        if start < self.t0_ms
+                            || end > self.t1_ms
+                            || !binding.covers_range(start, end)
+                        {
                             return Err(SummaryExecutorError::Unsupported(
                                 "counter SDS requires full-pane query coverage",
                             ));
@@ -565,6 +571,7 @@ impl QueryExecutionContext<'_> {
                                 } else {
                                     Arc::new(MaxAccumulator::with_value(value))
                                 };
+                                source_order.entry(key.clone()).or_insert(sid);
                                 by_group.entry(key).or_default().push(GroupState::ExactAgg {
                                     entries: vec![Rc::new(BTreeMap::from([(
                                         self.t1_ms as i64,
@@ -602,6 +609,7 @@ impl QueryExecutionContext<'_> {
                         PhysicalGrouping::PerEntity => labels,
                         PhysicalGrouping::Reduce(keys) => project_group_key(keys, &labels),
                     };
+                    source_order.entry(key.clone()).or_insert(sid);
                     by_group.entry(key).or_default().push(GroupState::ExactAgg {
                         entries: vec![Rc::new(windows)],
                         agg_type,
@@ -620,18 +628,23 @@ impl QueryExecutionContext<'_> {
             );
             return Err(SummaryExecutorError::NoCandidates);
         }
-        let result = by_group
+        let mut result: Vec<_> = by_group
             .into_iter()
             .map(|(key, states)| {
                 <Self as SummaryExecutor>::merge_states(self, states).map(|state| (key, state))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
+        if binding.output_grouping == PhysicalGrouping::PerEntity {
+            // Stable native ranking retains the first source on equal values.
+            // Grouping by labels must not replace the source's series order.
+            result.sort_by_key(|(key, _)| source_order[key]);
+        }
         if !inventory_revision.matches(self.index.summary_update_revision()) {
             return Err(SummaryExecutorError::Unsupported(
                 "summary input changed during read",
             ));
         }
-        result
+        Ok(result)
     }
 
     pub fn readout_bound(
@@ -1314,12 +1327,11 @@ mod tests {
         };
         assert_eq!(
             state.exact_value_for(ExactReadout::Count, &Some(key.clone()), 0, 60_000),
-            Some(2.0)
+            Ok(Some(2.0))
         );
-        assert_eq!(
-            state.exact_value_for(ExactReadout::Sum, &Some(key), 0, 60_000),
-            None
-        );
+        assert!(state
+            .exact_value_for(ExactReadout::Sum, &Some(key), 0, 60_000)
+            .is_err());
     }
 
     #[test]
