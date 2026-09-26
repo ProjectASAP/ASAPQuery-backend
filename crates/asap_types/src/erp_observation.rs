@@ -1,6 +1,6 @@
 //! Versioned runtime evidence about the inputs of one installed summary.
 //! Shape is generic so the transport contract does not depend on a planner.
-use crate::sds::{CatalogGeneration, SummaryDefinitionId, SummaryInstanceId};
+use crate::sds::{CatalogGeneration, StoredOutputId, SummaryInstanceId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,7 +22,7 @@ pub struct ErpPopulationObservation<Shape> {
 pub struct ErpPopulationObservations<Shape> {
     pub schema_version: u32,
     pub catalog_generation: CatalogGeneration,
-    pub summary_definition_id: SummaryDefinitionId,
+    pub stored_output_id: StoredOutputId,
     pub observed_at_unix_ms: u64,
     pub window_start_ms: i64,
     pub window_end_ms: i64,
@@ -44,13 +44,13 @@ impl<S> ErpPopulationObservations<S> {
     pub fn validate_identity_and_freshness(
         &self,
         expected_generation: &CatalogGeneration,
-        expected_definition: SummaryDefinitionId,
+        expected_definition: StoredOutputId,
         now_ms: u64,
         freshness: ErpObservationFreshness,
     ) -> Result<(), &'static str> {
         if self.schema_version != 1
             || &self.catalog_generation != expected_generation
-            || self.summary_definition_id != expected_definition
+            || self.stored_output_id != expected_definition
         {
             return Err("ERP observation belongs to a different catalog or summary");
         }
@@ -189,7 +189,7 @@ impl<S> ErpPopulationObservations<S> {
         Some(ErpPopulationObservations {
             schema_version: self.schema_version,
             catalog_generation: self.catalog_generation,
-            summary_definition_id: self.summary_definition_id,
+            stored_output_id: self.stored_output_id,
             observed_at_unix_ms: self.observed_at_unix_ms,
             window_start_ms: self.window_start_ms,
             window_end_ms: self.window_end_ms,

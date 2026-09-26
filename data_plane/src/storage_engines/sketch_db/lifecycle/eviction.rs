@@ -202,6 +202,8 @@ mod tests {
 
     fn sum_agg_config(id: u64) -> PrecomputeMaterialization {
         PrecomputeMaterialization {
+            stored_output_id: None,
+            semantic_fragment: None,
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),

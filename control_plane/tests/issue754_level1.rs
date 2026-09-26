@@ -123,9 +123,27 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
     for materialization in &plan.precompute_plan.materializations {
         let definition = plan
             .summary_catalog
-            .definitions
+            .outputs
             .get(&materialization.policy_fingerprint().into())
             .expect("precompute producer has no catalog definition");
+        let semantics = &plan.summary_catalog.definitions[&definition.definition_id];
+        assert_eq!(
+            semantics.id().unwrap(),
+            definition.definition_id,
+            "{name}: stored output's semantic identity must match its persisted description"
+        );
+        let writer = plan
+            .precompute_plan
+            .schemas
+            .iter()
+            .find(|schema| {
+                schema.materialization.fingerprint() == materialization.policy_fingerprint()
+            })
+            .unwrap();
+        assert_eq!(
+            writer.stored_output_reference.definition_id,
+            definition.definition_id
+        );
         let descriptor =
             &plan.summary_catalog.summary_descriptors[&definition.summary_descriptor_id];
         let SummaryOperator::Configured { family, .. } = &descriptor.operator else {

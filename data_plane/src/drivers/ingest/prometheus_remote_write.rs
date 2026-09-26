@@ -429,9 +429,9 @@ impl PrometheusRemoteWriteReceiver {
             }
             for start in starts {
                 let (start_ms, end_ms) = manager.stored_bucket_bounds(start);
-                for summary_definition_id in &affected {
+                for stored_output_id in &affected {
                     coordinates.insert(asap_types::sds::SummaryInstanceCoordinates {
-                        summary_definition_id: *summary_definition_id,
+                        stored_output_id: *stored_output_id,
                         time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
                         group_values: labels.clone(),
                     });
@@ -971,7 +971,7 @@ mod tests {
                     endpoint_path: "/api/v1/write".into(),
                     timestamp_unit: TimestampUnit::UnixMilliseconds,
                     require_plan_identity: false,
-                    require_summary_definition_identity: false,
+                    require_stored_output_identity: false,
                     require_registered_producer: false,
                 },
                 schemas: Vec::new(),
@@ -1023,6 +1023,8 @@ mod tests {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
         let aggregation = PrecomputeMaterialization {
+            stored_output_id: None,
+            semantic_fragment: None,
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
@@ -1150,6 +1152,8 @@ mod tests {
 
         let config = |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| {
             PrecomputeMaterialization {
+                stored_output_id: None,
+                semantic_fragment: None,
                 population_key_encoding: Default::default(),
                 aggregation_type,
                 aggregation_sub_type: String::new(),
@@ -1612,9 +1616,12 @@ mod tests {
         let binding = asap_types::query_plan::MaterializationBinding {
             full_window_slide_ms: None,
             materialization: asap_types::PolicyFingerprint(policy).into(),
-            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
-                asap_types::PolicyFingerprint(policy).into(),
-            ),
+            stored_output_reference: ingest
+                .summary_store
+                .summary_catalog_snapshot()
+                .unwrap()
+                .output_reference(asap_types::PolicyFingerprint(policy).into())
+                .unwrap(),
             output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
             item_labels: vec![],
             window_ms: 60_000,

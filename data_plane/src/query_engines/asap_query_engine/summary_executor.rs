@@ -244,7 +244,7 @@ impl QueryExecutionContext<'_> {
         use asap_types::query_plan::PhysicalGrouping;
 
         if binding.stored_output_reference.validate().is_err()
-            || binding.stored_output_reference.definition_id != binding.materialization
+            || binding.stored_output_reference.stored_output_id != binding.materialization
         {
             return Err(SummaryExecutorError::Unsupported(
                 "read binding has invalid stored output",
@@ -260,6 +260,21 @@ impl QueryExecutionContext<'_> {
                 "materialization is not authorized by the installed query",
             ));
         }
+        let catalog =
+            self.index
+                .summary_catalog_snapshot()
+                .ok_or(SummaryExecutorError::Unsupported(
+                    "bound read requires installed SDS definitions",
+                ))?;
+        let expected = catalog
+            .output_reference(binding.materialization)
+            .map_err(|_| SummaryExecutorError::Unsupported("stored output is not installed"))?;
+        if binding.stored_output_reference != expected {
+            return Err(SummaryExecutorError::Unsupported(
+                "bound read semantic identity differs from installed output",
+            ));
+        }
+
         let inventory_revision = self.index.summary_update_revision();
         let query_range = asap_types::sds::HalfOpenTimeRange {
             start_ms: i64::try_from(self.t0_ms).map_err(|_| {
@@ -324,7 +339,7 @@ impl QueryExecutionContext<'_> {
         };
         let mut sids = self
             .index
-            .storage_handles_for_output(binding.stored_output_reference);
+            .storage_handles_for_output(&binding.stored_output_reference);
         sids.sort_unstable();
         sids.dedup();
         let mut matched_metadata = 0usize;
@@ -1047,7 +1062,7 @@ mod tests {
             full_window_slide_ms: None,
             item_labels: Vec::new(),
             materialization: asap_types::PolicyFingerprint(7).into(),
-            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
                 asap_types::PolicyFingerprint(7).into(),
             ),
             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
@@ -1154,9 +1169,7 @@ mod tests {
         let binding = MaterializationBinding {
             full_window_slide_ms: Some(20_000),
             materialization: fp.into(),
-            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
-                fp.into(),
-            ),
+            stored_output_reference: super::super::test_plan::bound_reference(&index, fp.into()),
             output_grouping: PhysicalGrouping::PerEntity,
             item_labels: vec![],
             window_ms: 60_000,
@@ -1232,9 +1245,7 @@ mod tests {
         let binding = MaterializationBinding {
             full_window_slide_ms: None,
             materialization: fp.into(),
-            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
-                fp.into(),
-            ),
+            stored_output_reference: super::super::test_plan::bound_reference(&index, fp.into()),
             output_grouping: PhysicalGrouping::PerEntity,
             item_labels: vec![],
             window_ms: 1000,
