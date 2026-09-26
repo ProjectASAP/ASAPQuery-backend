@@ -20,8 +20,11 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY . ASAPQuery-backend
-
-RUN cd ASAPQuery-backend && cargo build --locked --release --bin data_plane
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/ASAPQuery-backend/target \
+    cd ASAPQuery-backend && cargo build --locked --release --bin data_plane && \
+    install -m 755 target/release/data_plane /usr/local/bin/data_plane
 
 # Runtime image: binary + CA certs.
 FROM debian:bookworm-slim
@@ -30,7 +33,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 # Default --output-dir for the rolling log file.
 RUN mkdir -p /var/log/asap
-COPY --from=build /src/ASAPQuery-backend/target/release/data_plane \
+COPY --from=build /usr/local/bin/data_plane \
     /usr/local/bin/data_plane
 
 ENV RUST_LOG=info \

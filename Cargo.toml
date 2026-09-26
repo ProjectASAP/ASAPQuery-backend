@@ -5,6 +5,7 @@ members = [
     "crates/asap_types",
     "data_plane",
     "control_plane",
+    "promql-compliance/runner",
 ]
 
 [workspace.package]
