@@ -71,7 +71,7 @@ pub struct QueryCompilationInput {
     /// materialization sources are derived from each post-ASAP SummaryAgg;
     /// it also remains part of the cost manifest workload identity.
     pub legacy_query_source: Source,
-    pub query_lookback_seconds: u64,
+    pub query_lookback_ms: u64,
     /// Label names are deployment metadata because Planner's canonical IR
     /// currently carries positional column IDs at this boundary.
     pub group_by_labels: Vec<String>,
@@ -196,6 +196,134 @@ pub struct TopKMembershipEvidence {
     pub source: String,
 }
 
+/// A proof for one exact Planner operand, including the enforced source
+/// domain rather than an observed sample minimum or maximum.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct QuantileOperandDomainEvidence {
+    pub operand: Value,
+    pub lower: f64,
+    pub upper: f64,
+    pub max_samples: u64,
+    pub contract: String,
+}
+
+/// Optional accuracy facts bound to one registered query and data snapshot.
+/// Missing fields stay unknown to Planner. The data workload and snapshot
+/// identity prevent reusing a proof for a different source population.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedAccuracyEvidence {
+    pub query_string: String,
+    pub data_snapshot_id: String,
+    pub data_workload: DataWorkload,
+    pub source: String,
+    pub observed_at_unix_ms: u64,
+    pub valid_for_ms: u64,
+    #[serde(default)]
+    pub quantile_operand_domains: Vec<QuantileOperandDomainEvidence>,
+    #[serde(default)]
+    pub hll: Option<super::erp::HllConfidenceContract>,
+    #[serde(default)]
+    pub values_non_negative: Option<bool>,
+    #[serde(default)]
+    pub input_row_count: Option<u64>,
+    #[serde(default)]
+    pub hydra_shared_grid_collision_bound: Option<f64>,
+    #[serde(default)]
+    pub hydra_shared_grid_failure_probability: Option<f64>,
+    #[serde(default)]
+    pub topk_selected_lower_bound: Option<f64>,
+    #[serde(default)]
+    pub topk_excluded_upper_bound: Option<f64>,
+    #[serde(default)]
+    pub topk_interval_failure_probability: Option<f64>,
+}
+
+impl ScopedAccuracyEvidence {
+    pub fn validate(
+        &self,
+        query_id: &str,
+        query_string: &str,
+        data: &DataWorkload,
+        snapshot_id: Option<&str>,
+        now_ms: u64,
+        max_age_ms: u64,
+    ) -> Result<(), CompileError> {
+        let valid_scope = self.query_string == query_string
+            && &self.data_workload == data
+            && snapshot_id.is_some_and(|id| id == self.data_snapshot_id)
+            && !self.data_snapshot_id.trim().is_empty()
+            && !self.source.trim().is_empty();
+        let valid_time = self.observed_at_unix_ms <= now_ms
+            && self.valid_for_ms > 0
+            && now_ms - self.observed_at_unix_ms <= self.valid_for_ms.min(max_age_ms);
+        let topk_bounds = (
+            self.topk_selected_lower_bound,
+            self.topk_excluded_upper_bound,
+            self.topk_interval_failure_probability,
+        );
+        let valid_topk = match topk_bounds {
+            (None, None, None) => true,
+            (Some(lower), Some(upper), Some(failure)) => {
+                lower.is_finite()
+                    && upper.is_finite()
+                    && lower > upper
+                    && (0.0..=1.0).contains(&failure)
+            }
+            _ => false,
+        };
+        let valid_stats = valid_topk
+            && self
+                .hll
+                .as_ref()
+                .is_none_or(super::erp::HllConfidenceContract::valid)
+            && self.input_row_count != Some(0)
+            && self
+                .hydra_shared_grid_collision_bound
+                .is_none_or(|v| v.is_finite() && v >= 0.0)
+            && self
+                .hydra_shared_grid_failure_probability
+                .is_none_or(|v| (0.0..=1.0).contains(&v))
+            && self
+                .quantile_operand_domains
+                .iter()
+                .enumerate()
+                .all(|(index, domain)| {
+                    domain.lower.is_finite()
+                        && domain.upper.is_finite()
+                        && domain.lower <= domain.upper
+                        && (1..=(1u64 << 53)).contains(&domain.max_samples)
+                        && !domain.contract.trim().is_empty()
+                        && !self.quantile_operand_domains[..index]
+                            .iter()
+                            .any(|earlier| earlier.operand == domain.operand)
+                });
+        if valid_scope && valid_time && valid_stats {
+            return Ok(());
+        }
+        let reason = if self.query_string != query_string {
+            "accuracy evidence belongs to a different query"
+        } else if &self.data_workload != data {
+            "accuracy evidence belongs to a different data workload"
+        } else if !snapshot_id.is_some_and(|id| id == self.data_snapshot_id)
+            || self.data_snapshot_id.trim().is_empty()
+        {
+            "accuracy evidence belongs to a different or unspecified data snapshot"
+        } else if self.source.trim().is_empty() {
+            "accuracy evidence has no provenance source"
+        } else if !valid_time {
+            "accuracy evidence is expired, future-dated, or has no validity window"
+        } else {
+            "accuracy evidence contains invalid or ambiguous bounds"
+        };
+        Err(CompileError::InvalidEvidence {
+            query_id: query_id.into(),
+            reason: reason.into(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDeploymentContext {
@@ -219,7 +347,7 @@ pub enum PhysicalDeploymentTarget {
 }
 
 /// Startup and candidate-discovery input for backend-local planning.
-/// Version 2 is the sole supported schema; deployment always requires quotes.
+/// Version 2 is the sole supported schema; deployment compares complete workload costs.
 /// Query/data semantics use ASAPPlanner's canonical workload types directly;
 /// this wrapper adds only backend-owned implementation evidence and lifecycle
 /// identity required to choose a concrete physical realization.
@@ -228,7 +356,7 @@ pub enum PhysicalDeploymentTarget {
 pub struct BackendLocalPlanningInput {
     #[serde(rename = "snapshot_version")]
     pub schema_version: u32,
-    /// May be absent during candidate discovery, never during deployment.
+    /// Optional complete provider override; absent evidence uses backend ERP/analytical workload costing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     #[serde(deserialize_with = "deserialize_snapshot_query_workload")]
@@ -266,6 +394,12 @@ pub struct BackendLocalPhysicalInputs {
     /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
+    /// Data generation used by scoped accuracy certificates during candidate
+    /// discovery, before complete workload quotes are available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accuracy_evidence: HashMap<String, ScopedAccuracyEvidence>,
     /// Measured exact/summary composition profiles keyed by registered
     /// PromQL. Missing rows keep the corresponding Planner site opaque.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -505,24 +639,75 @@ pub enum CompileError {
     QueryPlan(#[from] crate::query_plan::QueryPlanError),
 }
 
-struct QueryEvidence<'a>(Option<&'a TopKMembershipEvidence>);
+struct QueryEvidence<'a> {
+    topk: Option<&'a TopKMembershipEvidence>,
+    scoped: Option<&'a ScopedAccuracyEvidence>,
+    now_ms: u64,
+}
 
 impl AccuracyEvidenceProvider for QueryEvidence<'_> {
+    fn quantile_input_domain(
+        &self,
+        operand: &QueryExpr,
+    ) -> Option<asap_aware_mapping::accuracy::QuantileInputDomain> {
+        let operand = serde_json::to_value(operand).ok()?;
+        let domain = self
+            .scoped?
+            .quantile_operand_domains
+            .iter()
+            .find(|entry| entry.operand == operand)?;
+        Some(asap_aware_mapping::accuracy::QuantileInputDomain {
+            lower: domain.lower,
+            upper: domain.upper,
+            max_samples: domain.max_samples,
+            contract: domain.contract.clone(),
+        })
+    }
+
     fn propagation_stats(
         &self,
         op: &CompositionOperator,
         _family: &SummaryFamilyType,
         _query: Option<&SketchQuery>,
     ) -> PropagationStats {
-        match (op, self.0) {
-            (CompositionOperator::TopKSelection, Some(e)) => PropagationStats {
-                topk_selected_lower_bound: Some(e.selected_lower_bound),
-                topk_excluded_upper_bound: Some(e.excluded_upper_bound),
-                topk_interval_failure_probability: Some(e.interval_failure_probability),
+        let mut stats = self
+            .scoped
+            .map_or_else(PropagationStats::default, |evidence| PropagationStats {
+                values_non_negative: evidence.values_non_negative,
+                input_row_count: evidence.input_row_count.or_else(|| {
+                    evidence
+                        .data_workload
+                        .input_cardinality
+                        .value_at(self.now_ms)
+                        .copied()
+                }),
+                data_distribution: evidence
+                    .data_workload
+                    .distribution
+                    .value_at(self.now_ms)
+                    .cloned(),
+                hydra_shared_grid_collision_bound: evidence.hydra_shared_grid_collision_bound,
+                hydra_shared_grid_failure_probability: evidence
+                    .hydra_shared_grid_failure_probability,
                 ..Default::default()
-            },
-            _ => PropagationStats::default(),
+            });
+        if matches!(op, CompositionOperator::TopKSelection) {
+            if let Some(evidence) = self
+                .scoped
+                .filter(|e| e.topk_selected_lower_bound.is_some())
+            {
+                stats.topk_selected_lower_bound = evidence.topk_selected_lower_bound;
+                stats.topk_excluded_upper_bound = evidence.topk_excluded_upper_bound;
+                stats.topk_interval_failure_probability =
+                    evidence.topk_interval_failure_probability;
+            } else if let Some(evidence) = self.topk {
+                stats.topk_selected_lower_bound = Some(evidence.selected_lower_bound);
+                stats.topk_excluded_upper_bound = Some(evidence.excluded_upper_bound);
+                stats.topk_interval_failure_probability =
+                    Some(evidence.interval_failure_probability);
+            }
         }
+        stats
     }
 }
 
@@ -546,23 +731,16 @@ impl BackendLocalPlanningInput {
         self,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
-        let evidence = self.workload_cost_evidence.clone().ok_or_else(|| {
-            CompileError::Snapshot(
-                "deployment requires complete workload cost evidence; export candidates and price them before compiling".into(),
-            )
-        })?;
+        let evidence = self.workload_cost_evidence.clone();
         let (request, environment) = self.into_physical_compilation_request()?;
         let candidates =
             super::workload_cost::enumerate_exact_and_materialized_candidates(request)?;
-        if frontend == QueryFrontend::MetricsQl {
-            super::workload_cost::select_lowest_cost_metricsql_candidate(
-                candidates,
-                environment,
-                &evidence,
-            )
-        } else {
-            super::workload_cost::select_lowest_cost_candidate(candidates, environment, &evidence)
-        }
+        super::workload_cost::select_candidates(
+            candidates,
+            environment,
+            evidence.as_ref(),
+            frontend,
+        )
     }
 
     /// Build Planner-authorized candidates for evidence collection without publishing.
@@ -582,6 +760,29 @@ impl BackendLocalPlanningInput {
         }
         let workload = self.query_workload;
         let mut data_workload = self.data_workload.clone();
+        let scoped_snapshot_id = self
+            .physical_inputs
+            .data_snapshot_id
+            .as_deref()
+            .or_else(|| {
+                self.workload_cost_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.data_snapshot_id.as_str())
+            });
+        if self
+            .physical_inputs
+            .data_snapshot_id
+            .as_ref()
+            .is_some_and(|id| {
+                self.workload_cost_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.data_snapshot_id != *id)
+            })
+        {
+            return Err(CompileError::Snapshot(
+                "accuracy evidence data snapshot differs from workload cost evidence".into(),
+            ));
+        }
         if data_workload.data_ingestion_interval.value.is_none()
             && self.physical_inputs.scrape_interval_ms > 0
         {
@@ -627,6 +828,7 @@ impl BackendLocalPlanningInput {
         let mut queries = Vec::with_capacity(entries.len());
         let mut canonical_roots = Vec::with_capacity(entries.len());
         let mut topk_evidence_by_id = HashMap::new();
+        let mut scoped_evidence_by_id = HashMap::new();
         for (index, (entry, parsed)) in entries.into_iter().zip(canonical_queries).enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
                 QueryRecurrence::Repeated(RepeatedDemand::FixedIntervalAt {
@@ -638,14 +840,9 @@ impl BackendLocalPlanningInput {
                     )))
                 }
             };
-            if self.physical_inputs.scrape_interval_ms == 0
-                || !self
-                    .physical_inputs
-                    .scrape_interval_ms
-                    .is_multiple_of(1_000)
-            {
+            if self.physical_inputs.scrape_interval_ms == 0 {
                 return Err(CompileError::Snapshot(
-                    "scrape_interval_ms must be a positive whole number of seconds".into(),
+                    "scrape_interval_ms must be positive".into(),
                 ));
             }
             let accuracy = entry.requirements.accuracy.target();
@@ -673,6 +870,17 @@ impl BackendLocalPlanningInput {
             if let Some(evidence) = self.physical_inputs.topk_evidence.get(&query_string) {
                 topk_evidence_by_id.insert(query_id.clone(), evidence.clone());
             }
+            if let Some(evidence) = self.physical_inputs.accuracy_evidence.get(&query_string) {
+                evidence.validate(
+                    &query_id,
+                    &query_string,
+                    &data_workload,
+                    scoped_snapshot_id,
+                    self.environment.observed_at_unix_ms,
+                    self.environment.max_evidence_age_ms,
+                )?;
+                scoped_evidence_by_id.insert(query_id.clone(), evidence.clone());
+            }
             queries.push(QueryCompilationInput {
                 query_id,
                 query_string: query_string.clone(),
@@ -680,13 +888,23 @@ impl BackendLocalPlanningInput {
                 legacy_query_source: Source::TimeSeries {
                     metric: source_hint,
                 },
-                query_lookback_seconds: lookback_ms / 1_000,
+                query_lookback_ms: lookback_ms,
                 group_by_labels: metadata.group_by_labels,
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
                 window_realization_candidates: Vec::new(),
                 materialization_runtime_policy: RuntimeRulePolicy::default(),
             });
+        }
+        if self
+            .physical_inputs
+            .accuracy_evidence
+            .keys()
+            .any(|query| !queries.iter().any(|entry| &entry.query_string == query))
+        {
+            return Err(CompileError::Snapshot(
+                "accuracy evidence names a query absent from this workload".into(),
+            ));
         }
         let mut exact_costs_by_id = HashMap::new();
         for (index, entry) in workload.entries().enumerate() {
@@ -709,12 +927,14 @@ impl BackendLocalPlanningInput {
                 exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
             }
         }
-        let planner_selection_trace = select_logical_roots_with_trace(
+        let planner_selection_trace = select_logical_roots_with_scoped_evidence_and_trace(
             &mut queries,
             canonical_roots.clone(),
             &topk_evidence_by_id,
+            &scoped_evidence_by_id,
             &exact_costs_by_id,
             self.physical_inputs.erp.as_ref(),
+            self.environment.observed_at_unix_ms,
         )?;
         for query in &mut queries {
             prepare_window_implementations(
@@ -1083,7 +1303,7 @@ impl DeploymentPlanCompiler {
                 validate_evidence(&query.query_id, e, &environment)?;
             }
             let node = query.selected_plan_root.clone();
-            reject_uncertified_readouts(&query.query_id, &node)?;
+            reject_uncertified_readouts(&query.query_id, &node, environment.target)?;
             let selected = collect_selected_materializations(
                 &node,
                 request.allow_mixed_summary_and_exact_execution,
@@ -1092,6 +1312,9 @@ impl DeploymentPlanCompiler {
                 query_id: query.query_id.clone(),
                 reason,
             })?;
+            if !selected.is_empty() {
+                reject_uncertified_readouts(&query.query_id, &node, environment.target)?;
+            }
             let selected = selected
                 .into_iter()
                 .filter(|state| {
@@ -1210,8 +1433,10 @@ impl DeploymentPlanCompiler {
             let cohort_nodes = windows::cohort_nodes(&selected);
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let mut branch_query = query.clone();
-                branch_query.query_lookback_seconds =
-                    selected.window_secs.unwrap_or(query.query_lookback_seconds);
+                branch_query.query_lookback_ms = selected
+                    .window_secs
+                    .map(|seconds| seconds.saturating_mul(1_000))
+                    .unwrap_or(query.query_lookback_ms);
                 branch_query.group_by_labels = selected
                     .group_by
                     .clone()
@@ -1219,7 +1444,8 @@ impl DeploymentPlanCompiler {
                 branch_query
                     .window_realization_candidates
                     .retain(|candidate| {
-                        candidate.window_secs == branch_query.query_lookback_seconds
+                        candidate.window_secs.saturating_mul(1_000)
+                            == branch_query.query_lookback_ms
                             && if cohort_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
                                 windows::is_full_cohort(candidate)
                             } else {
@@ -1306,7 +1532,7 @@ impl DeploymentPlanCompiler {
                                 let cadence = u64::from(
                                     query.summary_lifecycle_inputs.evaluation_interval_ms,
                                 );
-                                let window = query.query_lookback_seconds.saturating_mul(1_000);
+                                let window = query.query_lookback_ms;
                                 a % cadence == b % cadence && a % window == b % window
                             }
                             _ => index == query_index,
@@ -1697,7 +1923,7 @@ impl DeploymentPlanCompiler {
                     let window_ms = materialization.window_size.saturating_mul(1_000);
                     if materialization_family != *node_family
                         || window_ms == 0
-                        || source_window.unwrap_or(query.query_lookback_seconds).saturating_mul(1_000)
+                        || source_window.map(|seconds| seconds.saturating_mul(1_000)).unwrap_or(query.query_lookback_ms)
                             % window_ms != 0
                     {
                         return Err(crate::query_plan::QueryPlanError::Invalid(format!(
@@ -1720,7 +1946,7 @@ impl DeploymentPlanCompiler {
                     })
             };
             let instant = InstantExecution {
-                lookback_ms: query.query_lookback_seconds.saturating_mul(1_000),
+                lookback_ms: query.query_lookback_ms,
                 full_history: false,
                 cumulative_readout: true,
             };
@@ -2101,7 +2327,7 @@ pub fn select_logical_roots_for_queries(
     select_logical_roots_with_error_resource_profiles(queries, roots, evidence, exact_costs, None)
 }
 
-fn observed_population_matches_root(
+pub(crate) fn observed_population_matches_root(
     policy: &super::erp::ErpPlanningInput,
     root: &QueryExpr,
 ) -> bool {
@@ -2165,6 +2391,26 @@ pub fn select_logical_roots_with_trace(
     exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
     erp: Option<&super::erp::ErpPlanningInput>,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
+    select_logical_roots_with_scoped_evidence_and_trace(
+        queries,
+        roots,
+        evidence,
+        &HashMap::new(),
+        exact_costs,
+        erp,
+        0,
+    )
+}
+
+pub fn select_logical_roots_with_scoped_evidence_and_trace(
+    queries: &mut [QueryCompilationInput],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+    scoped_evidence: &HashMap<String, ScopedAccuracyEvidence>,
+    exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
+    erp: Option<&super::erp::ErpPlanningInput>,
+    now_ms: u64,
+) -> Result<Vec<serde_json::Value>, CompileError> {
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(
@@ -2177,6 +2423,7 @@ pub fn select_logical_roots_with_trace(
     for (index, root) in roots.into_iter().enumerate() {
         let accuracy = &queries[index].accuracy_target;
         let certificate_scope = (evidence.contains_key(&queries[index].query_id)
+            || scoped_evidence.contains_key(&queries[index].query_id)
             || exact_costs.contains_key(&queries[index].query_id))
         .then(|| queries[index].query_id.clone());
         if let Some((_, _, roots)) = cohorts
@@ -2189,13 +2436,8 @@ pub fn select_logical_roots_with_trace(
         }
     }
     for (accuracy, scope, roots) in cohorts {
-        // ERP v1 has no calibrated failure probability. Preserve explicit
-        // confidence requirements through theoretical/exact fallback.
         let scoped_erp = erp.map(|policy| {
             let mut policy = policy.clone();
-            if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
-                policy.artifact.records.clear();
-            }
             if policy.observed_populations.is_some()
                 && !roots
                     .iter()
@@ -2218,7 +2460,15 @@ pub fn select_logical_roots_with_trace(
             });
             policy
         });
-        let erp = scoped_erp.as_ref();
+        // Confidence limitations invalidate an empirical accuracy decision,
+        // not the independently matched resource measurements.
+        let accuracy_erp = scoped_erp.clone().map(|mut policy| {
+            if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
+                policy.artifact.records.clear();
+            }
+            policy
+        });
+        let erp = accuracy_erp.as_ref();
         let mut model = ControlPlaneCostModel::new(accuracy.clone()).with_exact_composition_costs(
             scope
                 .as_ref()
@@ -2229,8 +2479,17 @@ pub fn select_logical_roots_with_trace(
         if let Some(erp) = erp {
             model = model.with_erp(erp.clone());
         }
+        if let Some(costs) = &scoped_erp {
+            model = model.with_erp_costs(costs.clone());
+        }
         let certificate = scope.as_ref().and_then(|id| evidence.get(id));
+        let scoped_certificate = scope.as_ref().and_then(|id| scoped_evidence.get(id));
+        let hll = scoped_certificate.and_then(|evidence| evidence.hll.as_ref());
+        if let Some(contract) = hll {
+            model = model.with_hll_confidence(contract.clone());
+        }
         let accuracy_model = super::erp::ErpAccuracyModel {
+            hll,
             policy: erp,
             max_error: match accuracy {
                 AccuracyTarget::Epsilon(e) | AccuracyTarget::EpsilonDelta { epsilon: e, .. } => e,
@@ -2242,10 +2501,23 @@ pub fn select_logical_roots_with_trace(
                 roots,
                 accuracy,
                 &model,
-                &QueryEvidence(certificate),
+                &QueryEvidence {
+                    topk: certificate,
+                    scoped: scoped_certificate,
+                    now_ms,
+                },
                 &accuracy_model,
             )
             .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        if let Some(evidence) = scoped_certificate {
+            trace["accuracy_evidence_scope"] = serde_json::json!({
+                "query_id": scope,
+                "source": evidence.source,
+                "data_snapshot_id": evidence.data_snapshot_id,
+                "observed_at_unix_ms": evidence.observed_at_unix_ms,
+                "hll": evidence.hll,
+            });
+        }
         trace["deployment_overrides"] = serde_json::json!([]);
         let selected_indices = selected.iter().map(|(index, _)| *index).collect::<Vec<_>>();
         for (index, node) in selected {
@@ -2385,7 +2657,11 @@ pub fn select_post_asap(
         expr,
         &model,
         &DefaultAccuracyModel,
-        &QueryEvidence(evidence),
+        &QueryEvidence {
+            topk: evidence,
+            scoped: None,
+            now_ms: 0,
+        },
     )
 }
 
@@ -2545,10 +2821,9 @@ pub(super) fn derived_window_cost(
 /// example, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
 fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<u64, CompileError> {
     fn duration_ms(duration: std::time::Duration) -> Result<u64, CompileError> {
-        if duration.subsec_nanos() != 0 {
+        if !duration.subsec_nanos().is_multiple_of(1_000_000) {
             return Err(CompileError::Snapshot(
-                "PromQL ranges must be a whole number of seconds in the backend-local profile"
-                    .into(),
+                "PromQL ranges must have millisecond precision".into(),
             ));
         }
         u64::try_from(duration.as_millis())
@@ -2577,17 +2852,10 @@ fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<
                 duration_ms(*range)?,
                 visit(child, scrape_interval_ms, true)?,
             ),
-            QueryExpr::TimeShift { shift, child } => {
-                if !shift.offset_ms.unsigned_abs().is_multiple_of(1_000) {
-                    return Err(CompileError::Snapshot(
-                        "PromQL offsets must be a whole number of seconds in the backend-local profile".into(),
-                    ));
-                }
-                add(
-                    shift.offset_ms.max(0) as u64,
-                    visit(child, scrape_interval_ms, in_range)?,
-                )
-            }
+            QueryExpr::TimeShift { shift, child } => add(
+                shift.offset_ms.max(0) as u64,
+                visit(child, scrape_interval_ms, in_range)?,
+            ),
             QueryExpr::PromqlScalarBridge(child)
             | QueryExpr::PromqlVectorFromScalar(child)
             | QueryExpr::PromqlScalarFromVector(child)
@@ -2733,7 +3001,7 @@ pub(super) fn validate_window_implementations(
             && evidence.cpu_cost >= 0.0
             && evidence.weighted_cost.is_finite()
             && evidence.weighted_cost >= 0.0
-            && candidate.window_secs == query.query_lookback_seconds
+            && candidate.window_secs.saturating_mul(1_000) == query.query_lookback_ms
             && candidate
                 .layout
                 .validate(candidate.window_secs, candidate.slide_secs)
@@ -2796,8 +3064,8 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
     )
 }
 
-pub(super) fn estimated_state_bytes(
-    aggregation: &asap_types::AggregationType,
+pub(crate) fn estimated_state_bytes(
+    aggregation_type: &asap_types::AggregationType,
     parameters: &HashMap<String, Value>,
 ) -> u128 {
     use asap_types::AggregationType as A;
@@ -2808,7 +3076,7 @@ pub(super) fn estimated_state_bytes(
             .find_map(|name| parameters.get(*name).and_then(Value::as_u64))
             .unwrap_or(fallback) as u128
     };
-    match aggregation {
+    match aggregation_type {
         A::CountMinSketch | A::CountSketch => {
             parameter(&["width", "w", "col_num", "col"], 1)
                 * parameter(&["depth", "d", "row_num", "row"], 1)
@@ -2840,7 +3108,7 @@ pub(super) fn estimated_state_bytes(
     }
 }
 
-fn retained_partition_count(
+pub(crate) fn retained_partition_count(
     materialization: &asap_types::PrecomputeMaterialization,
     input_cardinality: Option<u64>,
 ) -> u128 {
@@ -2945,8 +3213,8 @@ fn select_lifecycle(
                             raw_materialization_input_contract(node)
                                 .ok()
                                 .and_then(|(_, window, _)| window)
-                                .unwrap_or(query.query_lookback_seconds)
-                                .saturating_mul(1_000),
+                                .map(|seconds| seconds.saturating_mul(1_000))
+                                .unwrap_or(query.query_lookback_ms),
                         )),
                         as_of: None,
                     },
@@ -3261,7 +3529,11 @@ fn validate_executable_subdag(node: &Rc<SummaryNode>) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_uncertified_readouts(query_id: &str, root: &Rc<SummaryNode>) -> Result<(), CompileError> {
+fn reject_uncertified_readouts(
+    query_id: &str,
+    root: &Rc<SummaryNode>,
+    target: PhysicalDeploymentTarget,
+) -> Result<(), CompileError> {
     let dag = planner_types::post_asap::compile_executable_dag(root).map_err(|error| {
         CompileError::Query {
             query_id: query_id.into(),
@@ -3269,6 +3541,21 @@ fn reject_uncertified_readouts(query_id: &str, root: &Rc<SummaryNode>) -> Result
         }
     })?;
     for node in &dag.nodes {
+        if target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
+            && node.guarantee.as_ref().is_some_and(|guarantee| {
+                guarantee.provenance.iter().any(|source| {
+                    matches!(source,
+                planner_types::post_asap::GuaranteeSource::SketchReadout { contract, .. }
+                    if contract == "classic_hll_linear_counting_collision_bound_v1")
+                })
+            })
+        {
+            return Err(CompileError::Query {
+                query_id: query_id.into(),
+                reason: "classic HLL confidence is bound to the backend-local Regular estimator"
+                    .into(),
+            });
+        }
         if matches!(
             node.payload,
             planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
@@ -3296,7 +3583,9 @@ fn physical_aggregation(
         aggregation_id,
         metric_name: selected.metric.clone(),
         family: selected.family.clone(),
-        window_secs: selected.window_secs.unwrap_or(query.query_lookback_seconds),
+        window_secs: selected
+            .window_secs
+            .unwrap_or(query.query_lookback_ms.div_ceil(1_000)),
         spatial_filter: selected.spatial_filter.clone(),
         grouping: selected
             .group_by
@@ -3691,7 +3980,7 @@ fn collect_selected_materializations(
     Ok(selected)
 }
 
-pub(super) fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
+pub(crate) fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
         P::UnivMon {
@@ -4620,7 +4909,7 @@ pub(crate) mod tests {
                 query_string: promql.into(),
                 selected_plan_root: post_asap,
                 legacy_query_source: Source::TimeSeries { metric: "m".into() },
-                query_lookback_seconds: 60,
+                query_lookback_ms: 60_000,
                 group_by_labels: vec![],
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
@@ -4871,6 +5160,273 @@ pub(crate) mod tests {
         workload.allow_mixed_summary_and_exact_execution = true;
         let result = DeploymentPlanCompiler.compile_metricsql(workload, deployment);
         assert!(result.unwrap().precompute_plan.materializations.is_empty());
+    }
+
+    fn bounded_hll_snapshot_wire() -> serde_json::Value {
+        let mut wire = serde_json::to_value(planning_snapshot()).unwrap();
+        let query = "distinct_over_time(data[5s])";
+        wire["query_workload"]["repeating_queries"][0]["query"] = query.into();
+        wire["query_workload"]["repeating_queries"][0]["requirements"]["accuracy"] =
+            serde_json::json!({"explicit":{"EpsilonDelta":{"epsilon":0.05,"delta":0.01}}});
+        wire["implementation"]["data_snapshot_id"] = "hll-bounded-population".into();
+        let now = wire["environment"]["observed_at_unix_ms"].clone();
+        wire["implementation"]["accuracy_evidence"] = serde_json::json!({query: {
+            "query_string": query, "data_snapshot_id": "hll-bounded-population",
+            "data_workload": wire["data_workload"], "source": "enforced-distinct-domain-v1",
+            "observed_at_unix_ms": now, "valid_for_ms": 60000,
+            "hll": {"model":"asap-classic64-uniform-hash-linear-counting-v1",
+                "max_distinct_per_readout": 128}
+        }});
+        wire
+    }
+
+    /// An applicable classic-HLL confidence contract restores normal selection.
+    #[test]
+    fn bounded_hll_confidence_selects_and_binds_a_materialization() {
+        let wire = bounded_hll_snapshot_wire();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1, "{plan:#?}");
+        assert_eq!(
+            plan.precompute_plan.materializations[0].aggregation_type,
+            asap_types::AggregationType::HLL
+        );
+    }
+
+    /// A backend-local estimator proof cannot certify an unverified collector implementation.
+    #[test]
+    fn hll_confidence_cannot_be_rebound_to_collectors() {
+        let snapshot: BackendLocalPlanningInput =
+            serde_json::from_value(bounded_hll_snapshot_wire()).unwrap();
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        let error = reject_uncertified_readouts(
+            "q",
+            &request.queries[0].selected_plan_root,
+            PhysicalDeploymentTarget::DistributedCollectors,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("backend-local Regular estimator"));
+    }
+
+    /// Missing contracts and unattainable targets cannot acquire a confidence proof.
+    #[test]
+    fn hll_confidence_keeps_exact_when_absent_or_insufficient() {
+        for missing in [true, false] {
+            let mut wire = bounded_hll_snapshot_wire();
+            if missing {
+                wire["implementation"]["accuracy_evidence"] = serde_json::json!({});
+            } else {
+                wire["query_workload"]["repeating_queries"][0]["requirements"]["accuracy"] =
+                    serde_json::json!({"explicit":{"EpsilonDelta":{"epsilon":0.05,"delta":1e-12}}});
+            }
+            let snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+            let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+            let plan = DeploymentPlanCompiler
+                .compile_promql(request, environment)
+                .unwrap();
+            assert!(
+                plan.precompute_plan.materializations.is_empty(),
+                "{plan:#?}"
+            );
+        }
+    }
+
+    /// An estimator mismatch or unsupported population must be rejected at admission.
+    #[test]
+    fn hll_confidence_rejects_invalid_source_contracts() {
+        for contract in [
+            serde_json::json!({"model":"asap-classic64-uniform-hash-linear-counting-v1","max_distinct_per_readout":0}),
+            serde_json::json!({"model":"asap-classic64-uniform-hash-linear-counting-v1","max_distinct_per_readout":4097}),
+            serde_json::json!({"model":"hip-rse","max_distinct_per_readout":128}),
+        ] {
+            let mut wire = bounded_hll_snapshot_wire();
+            wire["implementation"]["accuracy_evidence"]["distinct_over_time(data[5s])"]["hll"] =
+                contract;
+            let snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+            assert!(snapshot.into_physical_compilation_request().is_err());
+        }
+    }
+
+    /// Accuracy facts must belong to the same query, workload, snapshot and
+    /// evidence window before they enter Planner.
+    #[test]
+    fn scoped_accuracy_evidence_rejects_wrong_or_stale_facts() {
+        let snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let evidence = ScopedAccuracyEvidence {
+            query_string: "quantile_over_time(0.9,m[1m])".into(),
+            data_snapshot_id: "snapshot-a".into(),
+            data_workload: snapshot.data_workload.clone(),
+            source: "enforced-source-contract".into(),
+            observed_at_unix_ms: 9_000,
+            valid_for_ms: 2_000,
+            hll: None,
+            quantile_operand_domains: vec![],
+            values_non_negative: Some(true),
+            input_row_count: Some(10),
+            hydra_shared_grid_collision_bound: None,
+            hydra_shared_grid_failure_probability: None,
+            topk_selected_lower_bound: None,
+            topk_excluded_upper_bound: None,
+            topk_interval_failure_probability: None,
+        };
+        let validate = |evidence: &ScopedAccuracyEvidence, query: &str, snapshot_id: &str, now| {
+            evidence.validate(
+                "q",
+                query,
+                &snapshot.data_workload,
+                Some(snapshot_id),
+                now,
+                2_000,
+            )
+        };
+        assert!(validate(&evidence, &evidence.query_string, "snapshot-a", 10_000).is_ok());
+        assert!(validate(&evidence, "another query", "snapshot-a", 10_000).is_err());
+        assert!(validate(&evidence, &evidence.query_string, "snapshot-b", 10_000).is_err());
+        assert!(validate(&evidence, &evidence.query_string, "snapshot-a", 12_000).is_err());
+        let mut invalid = evidence.clone();
+        invalid.hydra_shared_grid_failure_probability = Some(1.5);
+        assert!(validate(&invalid, &invalid.query_string, "snapshot-a", 10_000).is_err());
+        let mut partial_topk = evidence.clone();
+        partial_topk.topk_selected_lower_bound = Some(10.0);
+        assert!(validate(
+            &partial_topk,
+            &partial_topk.query_string,
+            "snapshot-a",
+            10_000
+        )
+        .is_err());
+        let mut valid_topk = partial_topk;
+        valid_topk.topk_excluded_upper_bound = Some(8.0);
+        valid_topk.topk_interval_failure_probability = Some(0.01);
+        assert!(validate(&valid_topk, &valid_topk.query_string, "snapshot-a", 10_000).is_ok());
+        let stats = QueryEvidence {
+            topk: None,
+            scoped: Some(&valid_topk),
+            now_ms: 10_000,
+        }
+        .propagation_stats(
+            &CompositionOperator::TopKSelection,
+            &SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Count,
+                planner_types::post_asap::ExactParams::Count,
+            ),
+            None,
+        );
+        assert_eq!(stats.topk_selected_lower_bound, Some(10.0));
+        assert_eq!(stats.topk_excluded_upper_bound, Some(8.0));
+    }
+
+    /// Quantile domain proof applies only to the operand named by its AST,
+    /// even when both operands read the same metric.
+    #[test]
+    fn scoped_quantile_domain_matches_one_exact_operand() {
+        let snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let accuracy = AccuracyTarget::EpsilonDelta {
+            epsilon: 0.05,
+            delta: 0.01,
+        };
+        let root = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.9,m[5m]) / quantile_over_time(0.5,m[5m])",
+            accuracy.clone(),
+        )
+        .unwrap();
+        let QueryExpr::BinaryOp { lhs, rhs, .. } = &root else {
+            panic!("expected ratio expression")
+        };
+        let scoped = ScopedAccuracyEvidence {
+            query_string: "quantile_over_time(0.9,m[5m]) / quantile_over_time(0.5,m[5m])".into(),
+            data_snapshot_id: "snapshot-a".into(),
+            data_workload: snapshot.data_workload,
+            source: "enforced-source-contract".into(),
+            observed_at_unix_ms: 9_000,
+            valid_for_ms: 2_000,
+            hll: None,
+            quantile_operand_domains: vec![QuantileOperandDomainEvidence {
+                operand: serde_json::to_value(lhs.as_ref()).unwrap(),
+                lower: 1.0,
+                upper: 100.0,
+                max_samples: 10_000,
+                contract: "source-schema-v1".into(),
+            }],
+            values_non_negative: None,
+            input_row_count: None,
+            hydra_shared_grid_collision_bound: None,
+            hydra_shared_grid_failure_probability: None,
+            topk_selected_lower_bound: None,
+            topk_excluded_upper_bound: None,
+            topk_interval_failure_probability: None,
+        };
+        let provider = QueryEvidence {
+            topk: None,
+            scoped: Some(&scoped),
+            now_ms: 10_000,
+        };
+        assert!(provider.quantile_input_domain(lhs).is_some());
+        assert!(provider.quantile_input_domain(rhs).is_none());
+        let inspect = |provider: &dyn AccuracyEvidenceProvider| {
+            let (_, trace) =
+                crate::planner_selection::select_workload_with_accuracy_model_and_trace(
+                    vec![(0, Rc::new(root.clone()))],
+                    accuracy.clone(),
+                    &ControlPlaneCostModel::new(accuracy.clone()),
+                    provider,
+                    &DefaultAccuracyModel,
+                )
+                .unwrap();
+            trace
+        };
+        let unknown = inspect(&provider);
+        assert!(unknown["groups"].as_array().unwrap().iter().any(|group| {
+            group["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| {
+                    candidate["accuracy_status"] == "unknown" && candidate["selected"] == false
+                })
+        }));
+        let mut complete = scoped.clone();
+        complete
+            .quantile_operand_domains
+            .push(QuantileOperandDomainEvidence {
+                operand: serde_json::to_value(rhs.as_ref()).unwrap(),
+                lower: 1.0,
+                upper: 100.0,
+                max_samples: 10_000,
+                contract: "source-schema-v1".into(),
+            });
+        let complete_provider = QueryEvidence {
+            topk: None,
+            scoped: Some(&complete),
+            now_ms: 10_000,
+        };
+        assert!(complete_provider.quantile_input_domain(rhs).is_some());
+        let complete_trace = inspect(&complete_provider);
+        assert!(complete_trace["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| {
+                group["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|candidate| {
+                        candidate["accuracy_status"] == "known"
+                            && candidate["replacement_kind"] == "summary"
+                    })
+            }));
     }
 
     #[test]
@@ -6050,6 +6606,29 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// ERP memory remains usable under an explicit confidence target, even
+    /// though ERP v1 error observations cannot certify that target.
+    #[test]
+    fn erp_resource_costs_survive_confidence_target() {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("quantile_over_time(0.9,m[1m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::EpsilonDelta {
+            epsilon: 0.1,
+            delta: 0.01,
+        });
+        snapshot.physical_inputs.erp =
+            Some(crate::physical::post_asap::cost_model::tests::erp_cost_fixture());
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        assert!(request
+            .planner_selection_trace
+            .iter()
+            .flat_map(|trace| trace["groups"].as_array().unwrap())
+            .flat_map(|group| group["candidates"].as_array().unwrap())
+            .any(|candidate| candidate["cost_estimate"]["source"] == "erp"
+                && candidate["estimated_cost"] == 7777.0));
+    }
+
     fn derived_query_window_secs(query: &str) -> u64 {
         let mut snapshot = planning_snapshot();
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
@@ -6060,7 +6639,8 @@ pub(crate) mod tests {
             .unwrap()
             .0
             .queries[0]
-            .query_lookback_seconds
+            .query_lookback_ms
+            / 1_000
     }
 
     fn set_data_ingestion_interval(
@@ -6085,7 +6665,7 @@ pub(crate) mod tests {
         set_data_ingestion_interval(&mut snapshot, Some(1_000));
 
         let (request, _) = snapshot.into_physical_compilation_request().unwrap();
-        assert_eq!(request.queries[0].query_lookback_seconds, 1);
+        assert_eq!(request.queries[0].query_lookback_ms, 1_000);
     }
 
     // Snapshot lowering must use the environment clock for cadence freshness.
@@ -6125,7 +6705,7 @@ pub(crate) mod tests {
             request.data_workload.unwrap().data_ingestion_interval.value,
             Some(DurationMs(5_000))
         );
-        assert_eq!(request.queries[0].query_lookback_seconds, 5);
+        assert_eq!(request.queries[0].query_lookback_ms, 5_000);
     }
 
     // An explicitly invalid interval must not be replaced by the migration value.
@@ -6160,29 +6740,48 @@ pub(crate) mod tests {
         assert_eq!(derived_query_window_secs("sum_over_time(a[1s])"), 1);
     }
 
-    // The seconds-based backend must fail explicitly instead of shrinking history.
+    /// Fractional ranges, subqueries and offsets preserve their exact history.
     #[test]
-    fn derived_history_rejects_fractional_seconds() {
-        for query in [
-            "sum_over_time(a[1500ms])",
-            "sum_over_time(a[500ms])",
-            "sum_over_time(a[1500ms] offset 500ms)",
-            "sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))",
-            "avg_over_time((sum(a))[1500ms:])",
-            "sum(a offset 500ms)",
+    fn derived_history_preserves_milliseconds() {
+        for (query, expected) in [
+            ("sum_over_time(a[1500ms])", 1500),
+            ("sum_over_time(a[500ms])", 500),
+            ("sum_over_time(a[1500ms] offset 500ms)", 2000),
+            ("sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))", 1000),
+            ("avg_over_time((sum(a))[1500ms:])", 6500),
+            ("sum(a offset 500ms)", 5500),
         ] {
             let mut snapshot = planning_snapshot();
             snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
                 Query(query.into());
-            let error = snapshot
-                .into_physical_compilation_request()
-                .expect_err(query)
-                .to_string();
-            assert!(
-                error.contains("whole number of seconds"),
-                "{query}: {error}"
-            );
+            let (request, _) = snapshot.into_physical_compilation_request().expect(query);
+            assert_eq!(request.queries[0].query_lookback_ms, expected, "{query}");
         }
+    }
+
+    /// A real 100 ms source stays at 100 ms through lowering and query publication.
+    #[test]
+    fn hundred_millisecond_source_compiles_without_rounding() {
+        let mut snapshot = planning_snapshot();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum(data)".into());
+        snapshot.physical_inputs.scrape_interval_ms = 100;
+        set_data_ingestion_interval(&mut snapshot, Some(100));
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        assert_eq!(request.queries[0].query_lookback_ms, 100);
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        assert_eq!(
+            plan.query_plan
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .instant
+                .lookback_ms,
+            100
+        );
     }
 
     #[test]
@@ -6343,7 +6942,7 @@ pub(crate) mod tests {
             (60_000, 90_000),
         ] {
             let mut query = request.queries[0].clone();
-            query.query_lookback_seconds = lookback_ms / 1_000;
+            query.query_lookback_ms = lookback_ms;
             let expr = crate::query_parser::parse_query_expr_canonical(
                 &format!("quantile_over_time(0.5, data[{}s])", lookback_ms / 1_000),
                 AccuracyTarget::Exact,
@@ -7227,6 +7826,8 @@ pub(crate) mod tests {
                 query_retention_margin_ms: 0,
                 retained_summary_memory_budget_bytes: DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
                 topk_evidence: HashMap::new(),
+                data_snapshot_id: None,
+                accuracy_evidence: HashMap::new(),
                 exact_composition_costs: HashMap::new(),
                 erp: None,
             },
@@ -7358,8 +7959,13 @@ pub(crate) mod tests {
         assert_eq!(encoded, fixture);
 
         assert!(
-            snapshot.clone().compile_promql().is_err(),
-            "discovery fixtures must be priced before deployment"
+            snapshot
+                .clone()
+                .compile_promql()
+                .unwrap()
+                .cost_comparison
+                .is_some(),
+            "deployment computes complete workload costs automatically"
         );
         let (local, env) = snapshot
             .clone()
@@ -7398,8 +8004,13 @@ pub(crate) mod tests {
         let snapshot: BackendLocalPlanningInput =
             serde_json::from_str(source).expect("strict compatibility demo fixture");
         assert!(
-            snapshot.clone().compile_promql().is_err(),
-            "discovery fixtures must be priced before deployment"
+            snapshot
+                .clone()
+                .compile_promql()
+                .unwrap()
+                .cost_comparison
+                .is_some(),
+            "deployment computes complete workload costs automatically"
         );
         let (local, env) = snapshot
             .clone()
@@ -7663,9 +8274,9 @@ pub(crate) mod tests {
         let mut second = request("q40", "sum(sum_over_time(m[40s]))")
             .queries
             .remove(0);
-        workload.queries[0].query_lookback_seconds = 20;
+        workload.queries[0].query_lookback_ms = 20_000;
         workload.queries[0].window_realization_candidates[0].window_secs = 20;
-        second.query_lookback_seconds = 40;
+        second.query_lookback_ms = 40_000;
         second.summary_lifecycle_inputs.evaluation_interval_ms = 20_000;
         second.window_realization_candidates[0].window_secs = 40;
         workload.queries.push(second);

@@ -387,6 +387,16 @@ that output a `stored_output_id` and emits matching writer/reader bindings; see
 | Plan read/write bindings | State references, format, partition rules and writer ownership |
 | `SummaryStore` | Owns `summary_definitions` and `stored_summaries`; the latter holds committed metadata and payload together |
 
+Costs include initialization, ingestion updates, overlapping and retained state,
+transmission, storage, merges, readouts, recurring queries, and shared producer
+construction once. Compare candidates over the same data and demand scope.
+Missing evidence is not zero cost. The backend supplies candidate estimates
+through `candidate_cost()`, preferring applicable ERP benchmarks and otherwise
+using its analytical model. Unsupported estimates remain unavailable;
+the backend combines unit resources, data size, recurrence, and the bound
+physical DAG into complete workload costs before publication. See the
+[calculation model](evidence-dependent-candidates.md#backend-owned-workload-calculation).
+
 ## Compiler contract
 
 The compiler consumes:
