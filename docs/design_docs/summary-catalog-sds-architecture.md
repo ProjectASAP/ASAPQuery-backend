@@ -19,7 +19,8 @@ computation using a Planner-defined semantic representation; `StoredSummary` con
 references that definition. `SummaryStore` is the persistence authority for both.
 
 Goals are semantic identity, recoverable definitions, explicit read eligibility
-and shared state across compatible consumers. SDS does not perform planning,
+and shared state across compatible consumers. Definitions must also support
+future Planner reasoning about reuse for queries not registered in advance. SDS does not perform planning,
 execute expressions, choose materialization boundaries or schedule maintenance.
 
 ## 2. Architecture and ownership
@@ -52,7 +53,8 @@ or fetching a mutable branch from a repository.
 `SummaryDefinition` is a semantic description and identity contract, not an
 executable plan. It uses a Planner-defined canonical semantic representation
 containing only the dependency closure needed to distinguish and interpret the
-persisted output. It does not promise to reconstruct or execute the original
+persisted output, including the typed expressions and operation contracts needed
+for Planner matching and rewrite-legality checks. It does not promise to reconstruct or execute the original
 logical plan.
 
 Planner owns these semantics. The deployment compiler supplies their definition
@@ -278,7 +280,75 @@ executor performs the selected readouts; the store does not execute the definiti
 or search for substitute summaries. Failure follows the installed fallback or
 unavailability policy. Installation alone does not establish future readiness.
 
-## 8. Alternatives and tradeoffs
+## 8. Future semantic discovery for unregistered queries
+
+The initial path executes an installed QueryPlan through explicit references:
+
+```text
+QueryPlan → StoredOutputReference → eligible StoredSummary records → execution
+```
+
+It does not search for substitutes during a bound read. A future ad-hoc planning
+path can discover reuse before producing such a bound plan:
+
+```text
+New query + available SummaryDefinitions
+    ↓ Planner semantic matching and legal rewrite search
+Selected computation over existing summary definitions
+    ↓ Planner physical compilation + backend deployment resolution
+QueryPlan with authorized stored-output bindings
+    ↓ runtime record eligibility checks
+Shared execution
+```
+
+`SummaryDefinition` provides a canonical semantic representation that Planner
+can use both to validate bound reads and to discover whether existing SDS can
+satisfy future queries. It is independent of any one query or deployment binding.
+Discovery needs the semantic content, not merely its fingerprint.
+
+### Reusability is not definition equality
+
+A stored `KLL(latency, k=200)` is not semantically identical to `p99(latency)`;
+it can support the query through an explicit quantile readout if the requested
+accuracy and input requirements permit it. Similarly, composing one-minute panes
+for a five-minute query requires a legal merge and complete aligned coverage.
+
+For `p99(log(latency))`, `KLL(log(latency))` is a potential matching input.
+`KLL(latency)` is not a direct substitute. Using it would require a separately
+supported and justified transformation, including domain, numeric and accuracy
+semantics; the store must not infer such a rewrite from function names.
+
+Planner decides mergeability, expression compatibility, grouping, window
+composition, accuracy and residual computation. A summary may satisfy only part
+of a query. When no supported rewrite establishes correctness, it is not a reuse
+candidate, regardless of similar names or matching source metadata.
+
+### Discovery, binding and availability have different owners
+
+| Step | Owner and contract |
+| --- | --- |
+| Semantic discovery | Backend exposes permitted definitions to Planner; Planner searches for legal computations over them. `stored_output_id` does not determine semantic compatibility. |
+| Deployment resolution | Backend maps a selected definition to authorized deployed outputs and supplies capability/availability/cost evidence for feasible selection. |
+| Runtime resolution | SummaryStore resolves bound outputs for the required groups, windows and revisions and checks committed-state eligibility. |
+
+The store reports what definitions and records exist; it does not implement a
+`find_compatible(query)` decision engine. Enumeration and indexes may help narrow
+candidates, but an index match is not proof of rewrite legality. These operations
+use the same persisted definitions, not an additional semantic catalog service.
+
+The steps can exchange evidence: a definition without an authorized output or
+sufficient state is not necessarily a deployable choice. Availability observations
+can become stale, so runtime eligibility must be checked again. Bindings pin the
+chosen output and applicable plan version; cross-version reuse still needs an
+explicit compatibility decision. A failed read follows the installed failure
+policy; alternative discovery requires replanning, not silent substitution.
+
+This section reserves an extension point, not a new implemented query path.
+It does not require an ad-hoc API, search algorithm or index in the initial
+rollout. It requires preserving enough canonical semantics for future Planner
+reasoning without coupling storage to executable Planner IR.
+
+## 9. Alternatives and tradeoffs
 
 A flat source/filter/grouping/window definition is simple but loses value
 expressions and arbitrary input computation. A separate SDS expression language
@@ -295,7 +365,7 @@ Using a physical or deployment graph as semantic identity would make equivalent
 results depend on placement or implementation choices. Logical computation gives
 semantic identity; physical format and runtime eligibility remain separate checks.
 
-## 9. Validation and delivery
+## 10. Validation and delivery
 
 Acceptance tests must establish:
 
@@ -322,3 +392,10 @@ Plan-schema migration and persisted-payload decoding remain separate. Existing
 bytes can be retained only with justified semantic identity and format
 compatibility. The [migration plan](asapplanner-migration-plan.md) governs rollout;
 these requirements are not claims of completed implementation or tests.
+
+Future discovery acceptance must additionally demonstrate an unregistered p99
+query reusing eligible KLL state, expression/accuracy-incompatible candidates
+being rejected, legal pane composition, authorized output selection among equal
+definitions, and availability changing between planning and execution. The
+installed-plan fast path must continue to resolve its bound output without
+semantic search. These are follow-up requirements, not initial rollout gates.

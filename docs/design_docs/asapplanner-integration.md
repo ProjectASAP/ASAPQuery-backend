@@ -259,3 +259,10 @@ IR, alter the Planner API's ownership, or introduce another maintenance model.
 Distributed activation, Collector and transmission plans, and new checkpoint
 protocols remain separate work. Changes to physical algorithms or materialization
 frontiers belong in Planner and its shared physical library.
+
+A future unregistered-query path may ask Planner to search available SDS
+definitions and rewrite the query over reusable state. Backend then resolves
+authorized outputs and binds the selected Physical DAG normally. This is
+planning before execution, not substitute-summary search inside an installed
+reader. See [SDS semantic discovery](summary-catalog-sds-architecture.md#8-future-semantic-discovery-for-unregistered-queries).
+It remains outside the initial deployment rollout.
