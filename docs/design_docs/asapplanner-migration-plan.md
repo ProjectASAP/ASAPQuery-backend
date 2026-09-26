@@ -143,9 +143,10 @@ is not accepted solely because example schemas parse or unit tests pass.
 
 ## 5. Bound-query SDS implementation across the PR stack
 
-The SDS document is a target contract. The existing definition-keyed storage
-path must not be described as implementing independent deployed-output identity.
-The current migration implements bound queries only; ad-hoc discovery is deferred.
+The SDS contract separates semantic identity from deployed-output identity.
+The bound-query path locates state by plan version, output and group, then
+selects its time range and validates semantics, format, revision and coverage.
+Ad-hoc discovery is deferred.
 
 | Implementation owner | Required change | Regression/acceptance gate |
 | --- | --- | --- |
@@ -156,8 +157,8 @@ The current migration implements bound queries only; ad-hoc discovery is deferre
 | Query integration (#765) | Resolve the installed deployed output and validate definition, revision, format and coverage before invoking shared execution. | A hot-bound query never reads rebuild state; stale, missing or incompatible records take the explicit failure route. |
 | Acceptance PRs (#728, #742, #759) | Update fixtures and process tests for the new contract; retain existing behavioral and performance gates. | End-to-end producer → persisted definition/record → recovery → bound read, with negative identity and coverage cases. |
 
-This table assigns work, not completed implementation. PR ordering must follow
-actual dependency commits; it must not be inferred from an outdated stack list.
+These are implementation responsibilities and acceptance gates. PR ordering
+must follow actual dependency commits, not an outdated stack list.
 A semantic definition cannot be replaced by a policy fingerprint containing
 physical layout or cadence. Conversely, relaxing an output-reference validator
 without changing storage keys and authorization is insufficient and unsafe.
