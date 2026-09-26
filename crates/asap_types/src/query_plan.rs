@@ -62,6 +62,13 @@ impl QueryPlan {
     }
 
     pub fn lookup(&self, promql: &str) -> Result<&QueryPlanEntry, QueryPlanError> {
+        // Installed entries already carry validated canonical identities. The
+        // common exact spelling requires no serving-time parser invocation.
+        if let Some(entry) = self.entries.get(promql).filter(|entry| {
+            entry.language == QueryLanguage::PromQl && entry.canonical_query == promql
+        }) {
+            return Ok(entry);
+        }
         let identity = canonical_promql(promql)?;
         self.lookup_canonical(QueryLanguage::PromQl, &identity)
     }
