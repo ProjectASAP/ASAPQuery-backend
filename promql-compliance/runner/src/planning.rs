@@ -68,16 +68,13 @@ pub fn snapshot(
     value["environment"]["activation_unix_ms"] = json!(now);
     value["environment"]["max_evidence_age_ms"] = json!(600_000);
     value["environment"]["capability_snapshot_id"] = json!("promql-compliance");
-    // Differential fixtures retain their declared compatibility defaults;
-    // benefit uses the exact replay population and refuses ambiguous cadence.
+    // Both paths describe the actual finite replay. Differential data can
+    // have irregular gaps; its cadence contract bounds the largest gap.
+    // Benefit requires uniform cadence for comparable maintenance demand.
     let (rate, cadence, count) = if benefit {
         dataset.uniform_demand()?
     } else {
-        (
-            100.,
-            1000,
-            dataset.series.iter().map(|s| s.samples.len()).sum(),
-        )
+        dataset.replay_demand()?
     };
     value["data_workload"]["ingestion_rate"]["value"] = json!(rate);
     for (name, n) in [

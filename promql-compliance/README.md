@@ -101,9 +101,10 @@ its named sources. `runner/src/planning.rs` builds a typed backend planning inpu
 a recurrence and phase covering the actual evaluation timestamps, with explicit
 1% epsilon/delta accuracy. The replay declares the historical retention needed
 between its latest input and earliest evaluation. Complete finite fixture bounds
-supply scoped operand-domain proofs; these are not inferred guarantees about live data. Differential fixtures retain declared
-compatibility defaults (100 samples/second and 1-second cadence). Dataset-derived
-population and cadence inputs are available to acceptance clients.
+supply scoped operand-domain proofs; these are not inferred guarantees about live data. Differential fixtures derive total arrival rate from each series' replay span
+and use the largest per-series sample gap as the declared cadence bound.
+Benefit fixtures require uniform source cadence. Both paths retain the actual
+series count and sample volume; no synthetic one-second cadence is supplied.
 
 The differential runner invokes the Rust control-plane compiler directly, with no external
 workload quotes. It validates automatic costs and the selected local plan before
