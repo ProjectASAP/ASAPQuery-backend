@@ -2500,6 +2500,7 @@ mod tests {
             .unwrap();
         let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(
             crate::storage_engines::types::RuntimePhysicalPlan {
+                readout_programs: Default::default(),
                 envelope: envelope.clone(),
                 summary_catalog: Some(Arc::clone(&catalog)),
                 precompute_plan: PrecomputePlan {
@@ -5369,6 +5370,7 @@ pub fn validate_and_build_runtime_plan(
         None => default_routing,
     };
     Ok(crate::storage_engines::types::RuntimePhysicalPlan {
+        readout_programs: Default::default(),
         envelope: envelope.clone(),
         summary_catalog: Some(Arc::new(request.summary_catalog)),
         precompute_plan: request.precompute_plan,

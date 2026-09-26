@@ -522,32 +522,10 @@ impl ASAPQueryEngine {
                             .with_label_keys_override(labels.into_keys().collect())
                     }).collect(), evaluation_ms));
                 }
-                let mut subtree = entry.clone();
-                subtree.root = root;
-                let reachable = subtree.topological_order().map_err(|e| {
-                    EngineError::capability_miss("installed_logical_dag", e.to_string())
+                let subtree = physical.readout_program(entry, root).map_err(|error| {
+                    EngineError::capability_miss("installed_logical_dag", error)
                 })?;
-                subtree.nodes.retain(|id, _| reachable.contains(id));
-                let bindings: Vec<_> = subtree
-                    .materialization_bindings()
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                let windows: std::collections::BTreeSet<Option<u64>> =
-                    bindings.iter().map(|b| b.readout_lookback_ms).collect();
-                if windows.len() != 1 || windows.contains(&None) || windows.contains(&Some(0)) {
-                    return Err(EngineError::capability_miss(
-                        "installed_logical_dag",
-                        "bound subtree requires one explicit positive window",
-                    ));
-                }
-                subtree.instant.lookback_ms = windows
-                    .first()
-                    .copied()
-                    .flatten()
-                    .expect("explicit semantic lookback checked");
-                subtree.instant.full_history = false;
-                subtree.instant.cumulative_readout = true;
+                let bindings = subtree.materialization_bindings();
                 let requirement = readiness_requirement(&subtree);
                 let index = self.summary_store.as_ref().ok_or_else(|| {
                     EngineError::capability_miss(
