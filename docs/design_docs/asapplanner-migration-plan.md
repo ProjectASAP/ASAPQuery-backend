@@ -1,313 +1,173 @@
-# ASAPPlanner integration: migration delivery plan
+# Migration to Planner Physical DAG Deployment
 
-Status: implementation sequence for the
-[system architecture proposal](asapplanner-integration.md). A checked milestone
-requires executable evidence; publishing this plan or opening a PR does not
-complete migration.
+Status: delivery plan for the [target design](asapplanner-integration.md).
+Audience: backend implementers. This plan does not introduce a second operator
+IR or backend lowering path.
 
-## Baseline and completion definition
+## 1. Outcome
 
-The inspected baseline is backend `95131d83972bb7a07d338e2a5af925a20c15ddce`.
-The compiler already deduplicates backend PrecomputePlan state by physical
-fingerprint and binds QueryPlan leaves explicitly. It still builds Collector
-materialization declarations per query, and lifecycle selection builds a
-single-query demand. Therefore, do not describe all sharing as absent, or
-treat existing fingerprint deduplication as workload-wide optimization.
+PrecomputePlan and QueryPlan carry Planner-compiled Physical DAGs and backend
+boundary bindings. Both engines execute through the shared physical library.
+The backend owns storage, scheduling, installation and serving; Planner owns
+operator selection and materialization frontiers.
 
-Migration is complete for a declared supported workload/profile when:
+The migration also removes the backend dependency on ASAPCollector. Distributed
+activation, CollectorPlan/TransmissionPlan compilation and new transport
+protocols are outside this delivery.
 
-- one Planner-authorized semantic decision governs all result roots;
-- compatible shared producers have one physical maintenance path per source
-  partition and generation;
-- unsupported sharing or operators are rejected or explicitly fall back;
-- activation, readiness, query execution and feedback refer to matching
-  bindings and generations;
-- supported entry points no longer independently select a different summary;
-- parity and producer-update tests pass for the promised deployment profile.
+## 2. Migration boundaries
 
-Backend-local and distributed profiles have separate acceptance evidence.
-Neither arbitrary PromQL coverage nor ProjectASAP-wide engine coverage is a
-completion prerequisite.
+```text
+Before
+  full logical DAG + backend semantic-node bindings
+      → backend-specific computation and phase interpretation
 
-## Delivery sequence and dependencies
+After
+  Planner-provided maintenance/query Physical DAGs
+      → backend input/output bindings and operational policy
+      → shared physical execution
+```
 
-Implementation tracking (PRs are not merged automatically):
+The runtime accepts the new deployment artifact. Obsolete plan schemas are
+rejected before activation rather than interpreted through a parallel logical-DAG
+executor. Producers and fixtures move together.
 
-| PR | Implemented scope |
-| --- | --- |
-| [Backend #513](https://github.com/ProjectASAP/ASAPQuery-backend/pull/513) | A: compatible physical producer deduplication and conflicting deployment-contract rejection |
-| [Backend #514](https://github.com/ProjectASAP/ASAPQuery-backend/pull/514) | B prerequisite: port the backend from its divergent historical pin to merged Planner APIs, including typed summary inputs |
-| [Planner #356](https://github.com/ProjectASAP/ASAPPlanner/pull/356) | B: reusable, scope-local typed post-ASAP subtree interning; includes schemas and guarantees in equivalence |
-| [Backend #515](https://github.com/ProjectASAP/ASAPQuery-backend/pull/515) | B: workload search, shared producer bindings and persistent query-root mapping |
-| [Backend #516](https://github.com/ProjectASAP/ASAPQuery-backend/pull/516) | C: backend-local packed SUM/observation-count state, exact readouts, additive reductions and constrained arithmetic; production HTTP acceptance |
-| [Backend #517](https://github.com/ProjectASAP/ASAPQuery-backend/pull/517) | E: current distributed publication/frame protocol, actual Collector validator, two shared readouts, failed staging and inactive-generation rejection |
-| [Backend #518](https://github.com/ProjectASAP/ASAPQuery-backend/pull/518) | B/F: one workload-selection adapter for canonical startup and compile-and-publish; query-scoped accuracy certificates |
-| [Backend #519](https://github.com/ProjectASAP/ASAPQuery-backend/pull/519) | D component: joint producer lifecycle demand, incompatible-evidence rejection and identity-keyed lifecycle estimates |
-| [Backend #520](https://github.com/ProjectASAP/ASAPQuery-backend/pull/520) | E: published config drives the actual Collector Rust update/window/emission loop; N raw observations yield N updates and one shared output |
-| [Backend #521](https://github.com/ProjectASAP/ASAPQuery-backend/pull/521) | E: failed staging cleanup permits retry; concurrent readers survive successful same-semantic generation cutover; retired frames are rejected |
-| [Backend #522](https://github.com/ProjectASAP/ASAPQuery-backend/pull/522) | D: provider-priced complete bound-workload selection, strict v2 startup evidence, read-only quote preparation, live publication/reporting and process acceptance |
+Plan-format migration is separate from stored payload compatibility. Supported
+historical payloads retain versioned decoders and fixtures; this does not require
+retaining obsolete plan readers. Do not change sketch byte formats as a side
+effect of moving execution code.
 
-The backend PRs form a sequential review stack from #513 through #522;
-#515 uses merged Planner #356 at revision
-`378a7547ede629a64e84c9f7c810226ce196cce9`. #516 includes the fail-closed
-arithmetic regression fix, propagated through its dependent branches.
-The backend-local dashboard and distributed single-partition quantile examples
-have executable acceptance evidence, including complete cost-based selection
-and same-semantic generation cutover. The supported-profile implementation
-is in the review stack, not yet merged or deployed. Production calibration,
-platform-specific rollout and broader semantic workload replacement are not
-claimed complete by these fixtures.
+## 3. Delivery stages
 
-Local verification of the original combined migration stack: 654 control-plane
-library tests, 28 control-plane binary tests, one control-plane integration
-test, 977 data-plane library tests and three production-process tests passed. Planner
-#356 passed its 156 type-library tests and GitHub formatting/lint/test checks.
-The backend process tests cover the actual binaries and Collector Rust library,
-not production traffic or every Collector platform adapter. Local passes do
-not replace PR CI, review or the remaining migration gates.
+| Stage | Work | Exit condition |
+| --- | --- | --- |
+| Inventory | Record current supported computation, state formats and deployment behavior. | Each supported path has a fixture or an explicit unsupported result. |
+| Shared dependencies | Adopt shared operator/runtime and codec contracts; remove Collector dependencies. | Backend builds and tests without ASAPCollector. |
+| Deployment binding | Consume Planner Physical DAGs; bind their typed boundaries and lifecycle. | No backend logical lowering or frontier selection remains in the new path. |
+| Execution and installation | Drive both kinds of DAG through the shared executor and install one coherent bundle. | Identity, resource, failure and readiness tests pass. |
+| Retirement | Switch publications and remove superseded computation paths. | Full-path and recovery tests pass; obsolete plans are rejected. |
 
-| Slice | Repository | Depends on | Deliverable and acceptance |
-| --- | --- | --- | --- |
-| A. Safe physical state sharing | ASAPQuery-backend | Existing compiler | Deduplicate Collector declarations for compatible state; reject conflicting implementation/layout/lifecycle contracts; keep both query roots bound to one backend state |
-| B. Workload semantic planning adapter | ASAPQuery-backend, with Planner changes only for demonstrated gaps | A and Planner API audit | Batch registered canonical roots through reusable Planner search; preserve root mapping and producer identity; do not implement backend-local semantic CSE |
-| C. Aggregate-state fusion and readouts | ASAPPlanner for rules; backend for execution | B | SUM/COUNT example with per-consumer projections, label/time equivalence and fully executable division; reuse existing decomposition/rollup rules |
-| D. Workload-wide implementation evidence | ASAPQuery-backend and Planner evidence boundary | B; C for fused states | Compare complete alternatives with shared build/update cost once and per-consumer read costs; joint state lifecycle/implementation agreement |
-| E. Bound execution and lifecycle acceptance | ASAPQuery-backend; Collector only where public runtime gaps require it | A–D | Producer update counts, readiness/fallback, generation isolation, failed rollout, and distributed projection tests |
-| F. Compatibility-path retirement | ASAPQuery-backend | E for each affected profile | Route supported entry points through the validated path; remove duplicate selection only after call-site and parity audit |
+### 3.1 Inventory and shared dependencies
 
-Slices are reviewable PR units, not an instruction to open empty placeholder
-PRs. If a slice spans semantic changes and physical execution, split by
-repository and stack the dependent PR explicitly. Do not merge automatically
-or make one unverified pin bump cover unrelated Planner changes.
+Capture fixtures for full/delta decoding, reconstruction, maintenance and
+readout, completion, restart, staging, activation and fallback. Record revision
+and schema provenance. Use semantic checks when randomized bytes are unstable.
+Fixtures may originate from Collector but must run independently of it.
 
-## A. Safe physical state sharing
+Reuse `asap-physical-operators`, `asap_sketch_codec` and sketch-library APIs for
+neutral execution and encoding work. Storage adapters, scheduling and publication
+remain backend-owned. Remove reconstruct-serialize-decode detours and duplicate
+family execution paths when replacing them, with parity evidence.
 
-The immediate regression fixture is two different quantile readouts over the
-same source, parameters and window. It exercises existing supported operations
-without depending on future SUM/COUNT fusion.
+Inspect manifests, lockfiles, build scripts and tests for direct or transitive
+Collector dependencies, including `asap-precompute-rs` and Collector patches.
 
-Implementation scope:
+### 3.2 Deployment binding
 
-1. Compare concrete contracts when multiple selected leaves resolve to the
-   same physical fingerprint. Include algorithm/parameters, grouping, window
-   framework, implementation, pane layout and lifecycle. Runtime transmission
-   policies must also agree.
-2. Emit one Collector producer declaration for a compatible shared state while
-   preserving every query's binding and readout.
-3. Keep evidence conservative: differing evidence cannot silently disappear
-   during deduplication. A future certificate-union design is a separate step.
-4. Reject conflicting contracts before any plan is published. Do not pick
-   whichever query happened to be visited first.
+Adopt the Planner-owned semantic-description export and versioned canonicalization
+contract for SDS definitions, independent of internal executable IR serialization.
+Persist only the semantic dependency closure needed to interpret each output before records
+can reference semantic fingerprints. Definitions derived from incomplete legacy
+metadata must be reconstructed from authoritative plans or rejected for rebuild;
+do not infer missing expressions from source and grouping alone.
 
-> Historical note: this acceptance text predates the SummaryCatalog migration;
-> the former BackendPlan state is now represented by a catalog materialization
-> and its execution-plan references.
+Consume the selected Physical DAGs, physical boundary identities, query
+associations and maintenance requirements. Replace semantic-node classification
+with mappings from declared input/output boundaries to deployment resources.
 
-Acceptance: both query roots exist; one catalog materialization and one PrecomputePlan
-state exist; each Collector has one producer declaration; both bindings point
-to that state. A different implementation/layout for the same fingerprint
-fails compilation. Distinct source/window/parameters must remain distinct.
+- Bind raw slots to readers satisfying source, filter, grouping, window, schema and boundedness requirements.
+- Assign version-scoped stored-output identities to persisted physical outputs.
+- Bind stored inputs to matching outputs and validate grouping, format, coverage
+  and revision requirements.
+- Package the original physical computation with schedules, retention, result
+  routing and publication policy.
 
-This slice establishes deployment consistency, not workload search or a claim
-that all query-time computations execute once across separate HTTP requests.
+The old `Materialization`, `MaintenanceInput`, `Query` and `QueryInput` semantic
+classification is not a target contract. Logical provenance is diagnostic data
+from Planner, not an instruction to rebuild operators or split a graph.
 
-## B. Workload semantic planning adapter
+No build/readout phase whitelist is introduced. Follow the selected physical
+candidate. If the backend cannot persist a selected scalar or result output,
+report that capability limitation instead of moving operators across a boundary.
 
-Audit the pinned Planner workload/search APIs before defining another backend
-plan representation. Inputs must preserve canonical query identity, source
-selection, requirements, recurrence and time scope.
+A new plan schema version expresses this boundary. Do not reinterpret an old
+field under an unchanged version. Normalize supported legacy stored identities
+during migration with an explicit mapping; preserve payload identity and reject
+unresolved/conflicting mappings.
 
-The result must retain all original roots and shared logical producers.
-Backend bindings must be keyed by workload-scoped producer identity, not only
-a per-query pointer. Physical IDs stay downstream. Preserve explicit mappings
-from each query root to its required materializations and fallback.
+### 3.3 Installation and execution
 
-Acceptance fixtures:
+Validate definitions and boundary bindings against the supplied Physical DAGs.
+Verify all stored-output references, schemas, encodings, partitions and versions,
+then perform deployment resource and capability checks.
 
-- identical producers used by two different roots;
-- a diamond within one query and sharing across queries;
-- incompatible filters, grouping, windows or accuracy do not share;
-- round-trip compilation retains roots and sharing;
-- unsupported alternatives cannot become partially executable warm routes.
+Stage definitions and both plans as one snapshot. Failed staging leaves the
+active version unchanged. Activation does not establish state readiness; runtime
+input resolution checks actual committed state and applies the installed fallback
+or unavailability policy.
 
-Pointer sharing in memory alone is not persistent identity. A serialized
-execution projection must preserve the relationship explicitly.
+Precompute and query engines resolve inputs and drive the shared executor. They
+must not retain a second node traversal that recomputes shared producers. Plan
+visualizations show the supplied DAGs connected by deployed stored-output bindings.
 
-## C. Aggregate-state fusion and complete readouts
+### 3.4 Retirement
 
-Use the system document's sample-weighted mean example as the target.
-Planner owns the equivalence rule: union compatible SUM/COUNT states and
-project the needed results to consumers. The backend owns physical state
-implementations and exact output operators.
+Migrate publishers and consumers together with pinned dependencies and matching
+rollback artifacts. Remove obsolete plan adapters, full-logical-DAG execution
+and duplicated operators after the new path passes its gates.
 
-First inspect existing AVG decomposition, CSE and rollup rules. Add only missing
-semantics upstream; do not copy DQC transformation objects or hard-code metric
-names in Planner.
+Storage payload readers remain governed by the supported format policy. Reuse
+across plan versions requires an explicit compatibility decision independently
+of a binary rollback.
 
-Acceptance includes uneven per-instance sample counts, missing/stale series,
-multiple services, exact interval endpoints, range evaluation steps and
-denominator edge cases. Query results must match Prometheus labels, timestamps
-and numeric semantics. Until the whole expression is supported, preserve
-explicit fallback rather than claiming partial integration.
+## 4. Acceptance evidence
 
-The implemented backend-local example uses one raw accumulator that retains
-both sum and observation count. This is native physical packing of selected
-Planner operations, not a new backend semantic rewrite. The process test has
-two services: observations `[10]` and `[2, 4, 8]` across two API instances give
-SUM = 24, COUNT = 4 and weighted mean = 6; worker observations `[9, 15]` give
-SUM = 24, COUNT = 2 and mean = 12. Three registered consumers still configure
-one producer; a Remote Write retry does not double the counts. Range steps,
-output labels/timestamps and unaligned-window fallback are checked.
+Record tested revisions, supported families/output types and fixture results.
+Acceptance includes:
 
-Do not generalize that execution contract to `sum(sum_over_time(m) /
-count_over_time(m))`: summing per-instance means cannot pool samples first.
-Non-additive entity reduction, mismatched operand grouping/windows, shifted
-selectors and unverified instantaneous/temporal combinations remain explicit
-fallbacks. Unknown legacy observation counts also fail closed. Distributed
-observation-count readout is not advertised by this implementation.
+- Planner computation and boundaries are preserved through installation.
+- One producer serves multiple queries without duplicate maintenance; one query
+  can consume multiple compatible outputs.
+- Shared producers execute once per run; separate runs remain isolated.
+- Supported query-time construction and precomputed finalized outputs follow the
+  selected phases; unsupported output bindings fail explicitly.
+- Missing, overlapping, incomplete or incompatible state fails eligibility.
+- Staging failure, cancellation, resource limits, restart and version switching
+  preserve documented behavior.
+- Obsolete plans are rejected and backend builds/tests do not require Collector.
 
-## D. Workload-wide evidence and selection
+Trace a query from Planner selection through physical compilation, deployment
+binding, state publication and query execution. Verify exact operations against
+independent results and sketches against their supported guarantees. The design
+is not accepted solely because example schemas parse or unit tests pass.
 
-Today per-query lifecycle inputs are not proof of joint workload costing.
-Aggregate demand for each shared producer while retaining consumer-specific
-requirements. Compare alternatives over one horizon and data scope.
+## 5. Bound-query SDS implementation across the PR stack
 
-Charge shared initialization and maintenance once, account for all consumer
-readouts and live/retained state, and include applicable placement and
-transmission costs. Feasibility checks cover the entire selected DAG, not
-only a summary family. The winning evidence must resolve to the same concrete
-implementation that compilation installs.
+The SDS contract separates semantic identity from deployed-output identity.
+The bound-query path locates state by plan version, output and group, then
+selects its time range and validates semantics, format, revision and coverage.
+Ad-hoc discovery is deferred.
 
-Acceptance: a shared alternative wins when its complete cost is lower, loses
-when retention/materialization overhead dominates, and is unavailable when
-any required capability/evidence is absent or stale. Adding another consumer
-must not double-count the producer's update stream.
+| Implementation owner | Required change | Regression/acceptance gate |
+| --- | --- | --- |
+| Planner shared types and physical integration (#462) | Export a versioned canonical semantic description for a selected persisted output; exclude placement and temporary node IDs. | Different input expressions differ; renumbering preserves identity; state definitions exclude downstream readout parameters. |
+| Backend plan/schema foundation (#749), completed with the shared semantic contract in #774 | Separate semantic definitions from deployed-output bindings; remove the requirement that stored-output ID equals definition ID; version the changed plan contract. | Same-version hot/rebuild outputs can share one definition without aliasing; tampered definitions and mismatched bindings fail installation. |
+| Planner dependency integration (#774) | Consume the shared semantic export and propagate it from selected physical outputs into deployment compilation. | No backend expression normalization or synthetic semantic fingerprint from incomplete config fields. |
+| Precompute/storage integration (#763) | Persist definitions and output-scoped records; authorize writes against installed bindings and recover them consistently. | Restart retains semantic descriptions; wrong-output writes fail; replacement metadata and payload remain consistent. |
+| Query integration (#765) | Resolve the installed deployed output and validate definition, revision, format and coverage before invoking shared execution. | A hot-bound query never reads rebuild state; stale, missing or incompatible records take the explicit failure route. |
+| Acceptance PRs (#728, #742, #759) | Update fixtures and process tests for the new contract; retain existing behavioral and performance gates. | End-to-end producer → persisted definition/record → recovery → bound read, with negative identity and coverage cases. |
 
-Implemented component: #519 gives each unique physical producer a
-`WorkloadDemand` containing all its consuming query entries. For a 300-second
-horizon, 100 updates/second and two consumers reading every 10 and 20 seconds,
-the demand is 30,000 updates and 45 reads. With build = 10, update = 0.001,
-read = 0.1, retention/second = 0.001 and retirement = 1, the lifecycle cost is
-45.8. Adding the second consumer increases cost by 1.5, not another build and
-update stream. Publication reports this component against the materialization
-and implementation identities; it is not a complete-plan total.
+These are implementation responsibilities and acceptance gates. PR ordering
+must follow actual dependency commits, not an outdated stack list.
+A semantic definition cannot be replaced by a policy fingerprint containing
+physical layout or cadence. Conversely, relaxing an output-reference validator
+without changing storage keys and authorization is insufficient and unsafe.
 
-Implemented selection: #522 compares complete bound alternatives before
-commitment. A provider prices source upkeep, each shared state's build/update/
-residency/retirement per location, transport, every reachable query operator,
-and results over one common horizon. Query work is multiplied by recurrence;
-shared maintenance is not multiplied by consumer count. Native exact fallback
-includes its service's input upkeep as well as full native query execution.
+The implementation must preserve supported payload decoders independently of
+plan-schema retirement. Keep implementation guides accurate to the code until
+each stage lands; then update the APIs, persistence descriptions and test evidence
+in the same implementation PR.
 
-The default inventory is the Planner-selected continuously maintained workload
-and its whole-workload exact alternative. The comparison interface also accepts
-additional Planner-authorized, bindable forests; this is not exhaustive search
-over all engines or lifecycle variants. Tests prove both the sharing win and
-high-retention loss, and reject missing, stale, mismatched or infeasible quotes.
-
-Implementation refinement: pricing uses a flat coverage manifest over the
-existing bound physical projection, not another semantic DAG. It does not
-populate `PlannerPhysicalPlanProvider` with guessed source statistics or split
-the older opaque per-query window scalar into fabricated components. Providers
-must quote the actual source scope, state layout, implementation and capability
-generation. The selected plan and report retain those identities.
-
-Version-2 canonical snapshots require complete evidence. Live requests can
-obtain requirements from the read-only `cost-manifests` endpoint before
-publication. Version 1 and live requests without quotes remain explicitly
-uncosted compatibility paths. See the [provider workflow in #522](https://github.com/ProjectASAP/ASAPQuery-backend/blob/feat/complete-workload-cost-selection/docs/examples/workload-cost-evidence.md).
-
-Production calibration still requires evidence from the intended deployment;
-the deterministic fixture costs are not production measurements. The provider
-attests exact-backend access and resource feasibility; a low cost alone does
-not establish either.
-
-## E. Runtime and deployment acceptance
-
-Start backend-local, then validate the distributed profile independently.
-
-- Replay deterministic raw samples through production ingestion.
-- Count state creation and updates: one compatible producer per generation,
-  with no duplicated updates when a second query subscribes.
-- Query both roots through HTTP and compare with an exact reference.
-- Test incomplete coverage, stale state, absent routes and unavailable fallback.
-- Stage a successor while requests run; each request observes one generation.
-- Fail staging or producer acknowledgement and verify the active generation
-  remains unchanged.
-- For distributed collection, decode emitted plans through the actual Collector
-  validator and assert one producer per source partition, not one producer
-  globally across independent sources.
-
-Unit-level declaration counts do not replace runtime update-count tests.
-
-Current evidence combines real backend executables with the actual Collector
-Rust runtime library. The test's host adapter supplies OpAMP acknowledgements
-and frame metadata; it does not launch a platform-specific Collector binary.
-In #521, failed Collector staging is discarded without touching the active
-snapshot; the same successor version can then be retried successfully while
-queries run. Old-generation frames are rejected after cutover and successor
-frames become queryable. #522 exercises this flow with costed publication.
-This verifies same-semantic runtime generation replacement, not arbitrary
-semantic workload replacement or a platform-specific production rollout.
-Platform adapter rollout remains a deployment acceptance step.
-
-## F. Retire duplicate selection safely
-
-Inventory canonical startup compilation, explicit compile-and-publish,
-legacy workload adapters and serving-time binding helpers. Distinguish dead
-code from intentionally supported profiles using call-site inspection.
-
-For each path, either route it through the selected workload contract, retain
-it as an explicitly unsupported/fallback adapter, or remove it after parity.
-Parsing and canonicalization at serving time are fine; family/parameter,
-grouping or lifecycle reselection is not.
-
-Do not remove QueryPlan, PrecomputePlan, physical deployment selection,
-exact fallback, or profile-specific adapters merely because their types are
-different from post-ASAP IR.
-
-Call-site audit: production instant/range serving already requires an active
-physical QueryPlan and declines absent or unregistered routes. The old
-summary-selection serving branches in `engine.rs` are `cfg(test)` fixtures.
-#518 unifies the two first-class compilation entry points. Legacy flat-workload
-demo/configuration adapters remain separate compatibility paths; they must not
-be presented as migrated canonical-workload entry points or removed without
-their own parity/retirement decision.
-
-## Existing PR coordination
-
-At the baseline inspection, open PRs
-[#505](https://github.com/ProjectASAP/ASAPQuery-backend/pull/505),
-[#506](https://github.com/ProjectASAP/ASAPQuery-backend/pull/506),
-[#509](https://github.com/ProjectASAP/ASAPQuery-backend/pull/509) and
-[#511](https://github.com/ProjectASAP/ASAPQuery-backend/pull/511) cover PromQL,
-process-E2E and TopK-related work. Re-check their status and changed files
-before touching overlapping paths. Their presence is not evidence that the
-workload-sharing migration is complete.
-
-Review follow-up (2026-09-08): #505 is now stacked on #522 and uses the merged
-Planner revision above. Typed TopK update weights belong to the selected
-producer, not its readout. Its multi-series fixture distinguishes count ranking
-(`api=4`) from value ranking (`worker=200`). #509 compares complete vectors at
-each range step, including changing winners. #506 tests unregistered-query
-fallback; it is not evidence that registered arithmetic is unsupported.
-
-#515 preserves duplicate algorithm candidates during cost ranking; removing
-them violates Planner's candidate-multiset contract and can panic. #522 quote
-preparation enumerates bindable alternatives without requiring the default
-warm alternative to compile, so missing warm implementations do not hide an
-available exact quote. Publication still requires a selected, validated plan.
-
-#511 retains evidence-aware legacy binding and preserves count update semantics
-in emitted heap configuration. Its two heap TopK acceptance tests now use
-registered `topk(3, count_over_time(top_endpoint_qps[5s]))`, a compiled physical
-QueryPlan, and the production backend-local Remote Write path. Both CMS-with-heap
-and CountSketch-with-heap return gamma=200, zeta=150 and alpha=100 over two
-windows, with exact item identities, timestamps and retry deduplication checked.
-Unregistered instantaneous TopK still follows the explicit exact fallback.
-This replaces the two obsolete no-QueryPlan tests; it does not restore that
-serving contract or claim migration of other legacy OTLP fixtures.
-
-The [architecture PR #512](https://github.com/ProjectASAP/ASAPQuery-backend/pull/512)
-tracks the design and this delivery plan. Implementation PRs should report the
-slice they complete, tests actually run, and remaining acceptance gaps.
+The open shared-library integration PR is #774, replacing the already merged
+#770. The active order after #771 is #774 → #763 → #765 → #761 → #728
+→ #742 → #759; old #770 base metadata is not part of this chain.

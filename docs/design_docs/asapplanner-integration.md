@@ -1,308 +1,268 @@
-# ASAPPlanner and ASAPQuery-backend: integrated architecture
+# Binding Planner Physical DAGs to Backend Deployment Plans
 
-Status: proposed system-level consolidation and high-level migration, grounded
-in existing integration. This is not a claim that every target capability is
-implemented. No repository rename is proposed.
+Status: target design. Audience: developers implementing deployment compilation
+and the precompute/query engines. This document defines required behavior, not
+completed backend integration.
 
-This document owns the Planner/backend integration proposal, not a second copy
-of the [shared ASAP system contracts](https://github.com/ProjectASAP/ASAPCollector/tree/main/docs/design_docs).
-The existing physical-plan, collection, transmission, and storage contracts
-remain authoritative for their respective interfaces.
+## 1. Problem and goals
 
-## Design decision
+Precompute and query execution must agree on what state is produced, where it
+is stored and which query inputs may consume it. A full logical DAG embedded in
+PrecomputePlan obscures these boundaries. Reconstructing computation independently
+in the backend also duplicates Planner's lowering and permits operator or
+materialization decisions to diverge.
 
-<p align="center"><strong>Figure 1. Integrated ASAPPlanner–ASAPQuery-backend architecture and workflow.</strong></p>
+The backend will consume Planner-compiled Physical DAGs and bind their typed
+boundaries into one coherent deployment plan. PrecomputePlan and QueryPlan reuse
+those DAGs and the shared executor; they do not define another computation IR.
 
-```mermaid
-flowchart TD
-    subgraph PlannerBoundary["ASAPPlanner boundary — reusable optimization"]
-        Canonical[Canonical QueryExpr and workload semantics]
-        Canonical --> Strategies[CSE and reusable replacement strategies]
-        Strategies --> Candidates[Candidate post-ASAP workload DAGs]
-        Candidates --> Ranking[Semantic legality, accuracy and evidence-based ranking]
-    end
+Goals:
 
-    subgraph BackendBoundary["ASAPQuery-backend boundary — observability application"]
-        Inputs[PromQL registrations, QueryWorkload and DataWorkload]
-        Evidence[Runtime capabilities and complete deployment cost evidence]
-        Commit[Control plane commits a feasible post-ASAP workload DAG]
-        Compile[Physical binding and deployment selection]
-        Bundle[One versioned physical plan bundle]
-        Activate[Validate, stage and activate]
-        Precompute[Ingest, precompute and summary store]
-        Serve[Bound query execution and explicit exact fallback]
-        Feedback[Readiness, accuracy and resource observations]
-        Inputs --> Commit
-        Commit --> Compile --> Bundle --> Activate
-        Activate --> Precompute
-        Activate --> Serve
-        Precompute --> Serve
-        Precompute --> Feedback
-        Serve --> Feedback
-        Feedback --> Evidence
-    end
+- Preserve Planner's selected operators, sharing and materialization boundaries.
+- Bind every physical input/output to an explicit source, stored output or result.
+- Install matching producer and consumer contracts atomically.
+- Execute through the shared physical library while keeping storage, scheduling,
+  readiness and serving backend-owned.
 
-    Inputs -->|Planning request| Canonical
-    Candidates -->|Implementation evaluation request| Evidence
-    Evidence -->|Feasibility and cost evidence| Ranking
-    Ranking -->|Legal ranked post-ASAP alternatives| Commit
-    Bundle -->|CollectorPlan in distributed profile| Collector[ASAPCollector — external runtime]
-    Collector -->|Planned data or summary frames| Precompute
-    Clients[PromQL clients] --> Serve
-    Serve -->|Configured exact route| Exact[Prometheus or archive query service]
-```
+Non-goals are backend operator lowering, a second maintenance-selection model,
+CollectorPlan/TransmissionPlan compilation, distributed activation and new
+transport protocols. Backend integration must not depend on ASAPCollector.
 
-**ASAPPlanner's selected post-ASAP workload DAG is the authoritative semantic
-plan. ASAPQuery-backend binds and executes that decision through its control
-plane and data plane.** Backend physical plans remain necessary, but must be
-traceable projections of that DAG, not independently optimized replacements
-for its dependencies, shared state, or query-result semantics.
+## 2. Architecture and ownership
 
-Planner provides reusable legal alternatives and ranking. The backend owns
-deployment commitment, concrete realization, and operational policy. A
-deployment choice cannot silently change Planner-owned grouping, statistic,
-summary parameters, logical window, accuracy, or lifecycle: it must return to
-the legal candidate-selection boundary.
-
-## Architecture boundaries and reuse
-
-ASAPQuery-backend is the observability downstream application, including the
-MetricsObservabilityQuery use case. DQC (the proposed name for the current
-asap-fusion repository) is a separate downstream application, not an execution
-dependency of this backend.
-
-| Responsibility | ASAPPlanner | ASAPQuery-backend |
-| --- | --- | --- |
-| Query semantics | Canonical expressions, equivalence, grouping and time semantics | PromQL API, workload registration and profile restrictions |
-| Optimization | CSE, legal sharing, rollup, decomposition, summary and accuracy alternatives | Feasibility evidence, deployment commitment and concrete assignments |
-| Time and state | Logical windows, abstract window framework and maintenance lifecycle | Panes, retention layout, update implementation and placement |
-| Plan identity | Logical producer identities and result dependencies | Plan versions, physical materializations, SID bindings and runtime handles |
-| Execution | Deployment-independent semantic contract | Ingest, precompute, store, serving, readiness and fallback |
-| Operations | Reusable models consuming scoped evidence | Activation, rollback, telemetry, freshness and resource enforcement |
-
-Reuse works in both directions. The backend consumes Planner strategies;
-general-purpose rules discovered while optimizing repeated observability
-queries belong in Planner so DQC and other applications can reuse them.
-Prometheus staleness handling, SID resolution, Collector placement, and OpAMP
-publication remain downstream responsibilities.
-
-## Inspection: what already exists
-
-Inspected backend main at
-[`95131d83972bb7a07d338e2a5af925a20c15ddce`](https://github.com/ProjectASAP/ASAPQuery-backend/tree/95131d83972bb7a07d338e2a5af925a20c15ddce),
-using its pinned Planner revision
-[`cb50219c582d43f53ab77d3a595bd1ea4a9aa119`](https://github.com/ProjectASAP/ASAPPlanner/tree/cb50219c582d43f53ab77d3a595bd1ea4a9aa119).
-The baseline is merged code, not the completion of open PRs.
-
-| Area | Existing foundation | Consolidation needed |
-| --- | --- | --- |
-| Frontend and selection | Planner dependency, canonical query parsing, backend selection from Planner alternatives | Make workload-wide sharing and strategy composition explicit across supported entry points |
-| Physical compilation | One bundle with precompute, transmission, backend and query projections; Collector projections when applicable | Preserve all selected shared producers and provenance through every projection |
-| Serving | Bound QueryPlan execution, exact materialization identities and explicit fallback | Audit remaining compatibility paths; serving must not make a new summary choice |
-| Deployment | Versioned staging and activation, runtime capability and evidence checks | Verify profile-specific failure and readiness behavior end to end |
-| Compatibility | Backend-local ASAPQuery profile alongside distributed collection | Keep distinct deployment profiles on the same semantic contract |
-
-Evidence:
-[selection adapter](../../control_plane/src/planner_selection.rs),
-[physical compiler](../../control_plane/src/physical/compiler.rs),
-[legacy workload adapter](../../control_plane/src/physical/workload_planner.rs),
-[shared QueryPlan](../../crates/asap_types/src/query_plan.rs),
-[query lowering](../../control_plane/src/query_plan.rs), and
-[bound serving executor](../../data_plane/src/query_engines/asap_query_engine/post_asap_readout.rs).
-The selection adapter explicitly commits a ranked Planner candidate downstream.
-Consequently, the figure does not imply that the Planner library deploys or
-commits a complete backend configuration by itself.
-
-This is an extension of existing integration, not a proposal to replace it
-wholesale. Implementation guides sometimes describe a broader target than an
-individual runtime path supports; migration acceptance must be demonstrated
-against executable paths, not inferred from interface names.
-
-## One authoritative semantic DAG, derived runtime plans
-
-The shared contract must preserve sources and filters, label/grouping identity,
-exact operators surrounding summaries, summary build/merge/readout, shared
-producers, query roots, logical time coverage, accuracy, and maintenance
-requirements. Audit the pinned post-ASAP representation for genuine gaps;
-extend Planner semantics where necessary.
-
-Do not put concrete engine or implementation IDs into Planner IR. The backend
-retains a binding from logical producer identity to implementation, placement,
-materialization, state schema, and active generation. This follows the
-[planner-runtime contract](https://github.com/ProjectASAP/ASAPPlanner/blob/f46cbf6c5738db2f4460d419baa8af5572f5276a/docs/design_docs/architecture/planner-runtime-contract.md).
-
-One selected DAG can produce several execution projections:
-
-- PrecomputePlan: how the selected state is built and maintained.
-- TransmissionPlan and optional CollectorPlan: how distributed producers
-  implement and deliver that state.
-- SummaryCatalog: canonical summary/data descriptors and stable materialization identities.
-- QueryPlan: executable reads, merges, readouts and remaining exact operations.
-
-These projections may expand one semantic node into several physical tasks.
-They must not invent a different semantic sharing graph. QueryPlan need not be
-a byte-for-byte serialization of post-ASAP IR, nor should ingestion and query
-serving literally run an identical task schedule. They implement different
-phases of the same selected computation.
-
-Sharing has explicit scope: maintain a shared producer once per compatible
-source/window/plan generation; reuse its state across query roots. Memoizing a
-query DAG within one request is useful but does not, by itself, prove
-cross-query or cross-request sharing.
-
-## End-to-end workflow
-
-1. **Register demand.** Collect canonical queries, evaluation cadence, time
-   windows, accuracy scope, source arrival facts and optimization horizon.
-2. **Generate alternatives.** Planner applies legal rewrites and sharing,
-   choosing among summary, abstract-window and lifecycle alternatives.
-3. **Evaluate implementations.** The backend checks runtime feasibility and
-   supplies complete, fresh costs over the same workload horizon.
-4. **Commit and bind.** The control plane selects a legal workload alternative,
-   retains its concrete realization, and compiles one coherent plan bundle.
-5. **Publish.** Validate and stage matching projections. For distributed
-   deployment, require the corresponding Collector application evidence
-   before activation. A failed rollout preserves the prior active generation.
-6. **Maintain and serve.** Ingest updates the selected state; a request uses one
-   active snapshot and exact bindings. Warm execution requires complete,
-   fresh coverage. Otherwise follow the configured exact route or return an
-   explicit failure if that route is unavailable.
-7. **Observe and replan.** Attribute cost, readiness and accuracy evidence to
-   the plan generation and producer. Semantic changes require a new planning
-   decision and activation, not an ad-hoc serving-time substitution.
-
-The backend-local profile uses Remote Write, local precompute and Prometheus
-fallback without requiring Collector/OpAMP. The distributed profile may use
-Collector-maintained summaries and configured archive services. Neither
-profile's optional infrastructure becomes a prerequisite for the other.
-
-## Example: repeated dashboard queries sharing one state producer
-
-Consider a gauge `request_size_bytes`, one scalar series per
-`(service, instance)`, without extra labels. Register these instant-query
-expressions repeatedly at the same evaluation cadence:
-
-```promql
-# Q1: sum of observed sample values per service over the last five minutes
-sum by (service) (sum_over_time(request_size_bytes[5m]))
-
-# Q2: sample-weighted mean per service over that same interval
-sum by (service) (sum_over_time(request_size_bytes[5m]))
-/
-sum by (service) (count_over_time(request_size_bytes[5m]))
-```
-
-Q2 is deliberately not the unweighted mean of per-instance means. Its
-denominator counts actual observations, which matters when instances have
-different sample counts. These are gauge samples, not counter increases.
-
-A legal target alternative is:
+The authoritative boundary is [Physical Planning, Summary Maintenance, and
+Deployment at e9390031](https://github.com/ProjectASAP/ASAPPlanner/blob/e9390031fcecd7bc0d611127eddc5c6603a281e5/docs/design_docs/physical-planning-and-deployment.md).
 
 ```text
-Selected samples and logical five-minute coverage
-                    |
-       Shared state per (service, instance)
-          SUM(value), COUNT(observations)
-                    |
-          Merge/reduce by service
-             SUM(sum), SUM(count)
-                    |
-             +------+------+
-             |             |
-          sum -> Q1    sum / count -> Q2
+ASAPPlanner
+  Logical Post-ASAP DAG + selected Summary Maintenance Lifecycle
+      ↓ Physical Plan Compiler
+  Physical DAGs + typed input/output boundaries
+      ↓
+Backend
+  Deployment Plan Compiler + sources/store + operational policy
+      ↓
+  PrecomputePlan + QueryPlan + summary definitions
+      ↓ atomic installation
+  Deployment engines → shared physical executor
 ```
 
-Planner recognizes the common sum computation and can propose aggregate-state
-fusion with per-consumer readouts. The backend implements the selected window
-framework with compatible runtime state and binds both query roots to the
-same producer. It must preserve PromQL range boundaries, labels, absent-series
-behavior and division semantics; a missing denominator is not invented as
-zero. Physical panes may be used only when their coverage matches the selected
-logical interval, including boundary handling.
-
-This diagram is a target acceptance example, not a claim that today's compiler
-already fuses these complete PromQL expressions. If an operator or window
-cannot be realized end to end, the current supported behavior is explicit
-fallback rather than partial warm execution with changed semantics.
-
-For the first milestone, use exact sum/count state and compare against
-Prometheus at identical timestamps. Verify both numerical/label equivalence
-and one maintained producer shared by the two roots. Exact aggregate state
-does not eliminate the separate requirement to verify data completeness.
-
-Approximate extensions must declare what epsilon measures and what delta
-covers. For a whole 20-row result with failure probability at most 0.05,
-20 valid per-row failure bounds of at most 0.0025 suffice by the union bound;
-independence is not required. Per-row 95% intervals alone do not establish
-95% confidence for the complete result. Multiple dashboard evaluations need
-their own declared scope; a result-level guarantee is not automatically
-session-wide. Shared state also does not make separate errors independent.
-
-## Capabilities, costs and feedback
-
-Capabilities answer **can this deployment faithfully execute this alternative?**
-Costs answer **which feasible alternative is preferable?**
-
-| Capability question | Why it constrains selection |
+| Owner | Decisions |
 | --- | --- |
-| Can the producer build/update the selected family and parameters? | A readout implementation alone does not make a state maintainable |
-| Can storage and readout preserve the selected windows and labels? | A tumbling-only path cannot silently implement arbitrary sliding coverage |
-| Are merge operations and full/delta encodings compatible? | Distributed producers must construct the same logical state |
-| Can the runtime perform every exact operator after readout? | A supported sketch is insufficient for an unsupported full expression |
-| Can readiness, staleness and exact fallback be enforced? | Mathematical legality does not establish runtime answerability |
+| Planner logical and maintenance selection | Computation semantics, guarantees, window/retention/reuse requirements |
+| Planner Physical Plan Compiler | Concrete operators, schemas, dependencies, roots, sharing and materialization frontiers |
+| Backend Deployment Plan Compiler | Concrete source/state bindings, stored-output identities, placement, scheduling and installation version |
+| Backend engines | Resolve inputs, drive execution, publish results, check actual readiness and apply installed fallback policy |
+| Shared physical library | Operator execution, per-run sharing, backpressure, cancellation and resource contracts |
+| SummaryStore | Committed definitions and stored records, lookup, recovery and reclamation |
 
-Costs include initialization, ingestion updates, overlapping/retained state,
-transmission, storage, merges, readouts, recurring queries, and shared producer
-construction once. Compare alternatives over the same data and demand scope.
-Missing evidence is not zero cost; stale or incomplete implementation evidence
-cannot justify selection.
+The Deployment Plan Compiler binds a realization satisfying Planner requirements;
+it does not repair an unsupported candidate or repeat lifecycle planning. For
+example, Planner may require retention of at least ten minutes, the compiler
+may bind a permitted fifteen-minute retention configuration, and the runtime
+actually retains and reclaims records. If the requirement specifies an exact
+policy rather than a minimum, the binding must preserve that policy.
 
-Runtime observations reference the concrete binding and selected semantic
-producer. Physical controls may vary only within already-authorized
-guardrails. Changing grouping, family, parameters, windows or sharing returns
-to planning.
+**Build, merge and readout are reusable operators, not deployment-phase classes.**
+Planner may place a build in a query DAG or a readout before a persisted scalar
+output. Backend execution respects the selected graph boundaries.
 
-## Reuse across various ASAP workload scenarios
+Capabilities and scoped cost evidence flow from the backend to Planner selection.
+Missing support makes a candidate unavailable. Deployment compilation validates
+the selected realization; it does not repair an unsupported candidate by changing
+operators, windows or boundaries. Such changes require replanning.
 
-| Scenario | Reusable Planner strategy | Application-specific responsibility |
-| --- | --- | --- |
-| Repeated dashboards (MetricsObservabilityQuery) | Shared aggregates and prepared/maintained state | PromQL semantics, freshness and serving |
-| Multiple dashboard resolutions | Legal rollup and window alternatives | Compatible retention and exact time coverage |
-| Distributed telemetry aggregation | Mergeable summary and grouping alternatives | Collector placement, transmission and activation |
-| DQC analytical workloads | CSE, aggregate fusion and rollup | DQC engine adapters and batch execution policy |
+A maintenance lifecycle is a contract associated with computation, not another
+operator IR. A deployment plan is an operational wrapper around Physical DAGs,
+not another lowering stage.
 
-General semantic rules belong in Planner. Backend-local metric-name fixtures,
-SID lookup or deployment-specific placement must not become universal Planner
-rules. No dependency on DQC is needed to reuse strategies contributed by it.
+## 3. Deployment plan structure
 
-## High-level migration
+One installed version contains:
 
-See the [migration delivery plan](asapplanner-migration-plan.md) for PR-sized
-implementation slices, dependencies, regression fixtures and completion gates.
+| Part | Content |
+| --- | --- |
+| Summary definitions | Persisted semantic definitions referenced by stored outputs |
+| PrecomputePlan | Planner-provided maintenance Physical DAGs, input/output bindings, schedules and retention/publication policy |
+| QueryPlan | Planner-provided query Physical DAGs, input bindings, query associations and explicit fallback policy |
 
-| Milestone | System outcome | Acceptance |
-| --- | --- | --- |
-| 1. Audit the shared contract and entry points | Current canonical compilation and compatibility paths have explicit ownership | Document supported operators, sharing scope, profile limits and true IR gaps |
-| 2. Complete one workload-wide semantic path | Registered queries use Planner alternatives with preserved shared producers | The two-query example has one selected producer and both result roots |
-| 3. Preserve bindings through all projections | Precompute, storage and serving implement the same selected decision | No duplicate maintenance; exact state/schema/window and generation agreement |
-| 4. Consolidate reusable strategies | Missing general fusion/rollup rules extend Planner | Rules work without backend metric names, SID objects or placement assumptions |
-| 5. Close capability and cost feedback | Only fully executable, properly costed alternatives are committed | Unsupported or stale evidence fails closed; estimated and observed costs are traceable |
-| 6. Validate profiles and retire redundant selection paths | Serving executes installed bindings without independent semantic planning | Prometheus parity, sharing, readiness, fallback and activation-failure tests pass |
-| 7. Broaden coverage (ProjectASAP-wide; not required for this repository) | Other applications, engines, sketches and lifecycles reuse the contract | Each participating provider demonstrates capability and semantic conformance |
+A physical graph may be embedded or referenced within the bundle; either way,
+its operator vocabulary and computation remain Planner-owned. The backend does
+not copy it into a second set of Build/Merge/Estimate node variants.
 
-The first milestone demonstration should use backend-local ingestion and the
-exact two-query example. Distributed rollout follows the same contract with
-additional producer and activation checks. Existing paths may remain as
-comparison baselines until parity is established; remove duplicate semantic
-selection, not necessary physical plans or profile-specific runtime adapters.
+Bindings attach only to declared physical boundaries:
 
-Step 7 is an ecosystem extension, not a prerequisite for completing this
-backend's scoped consolidation through steps 1–6.
+```text
+physical input slot → concrete raw source or stored-output reference
+physical output     → persisted output or query result
+```
 
-## Related contracts and implementation guides
+The compiler assigns each persisted output a `stored_output_id` within the plan
+version. Its writer and all readers refer to the same definition and compatible
+format. A `StoredOutputReference` is a binding, not a separately managed catalog
+object. [SDS](summary-catalog-sds-architecture.md) defines the storage contract.
 
-- [Physical compiler](../developer_docs/control-plane/physical-compiler.md)
-- [Plan publication](../developer_docs/control-plane/plan-publication.md)
-- [Catalog-backed physical-plan runtime](../developer_docs/query-engine/catalog-physical-plan-runtime.md)
-- [ASAPQuery compatibility profile](asapquery-compatibility-profile.md)
-- [Runtime accuracy feedback](../developer_docs/control-plane/runtime-accuracy-feedback.md)
+Logical-to-physical provenance comes from Planner and remains available for
+inspection. It does not drive backend semantic-node classification or re-lowering.
+There is no backend `MaintenanceInput`/`QueryInput` decision in this target model.
+
+Source, filter, grouping and window describe input-data semantics; they are not
+an exhaustive computation schema. The DAG also preserves value expressions,
+upstream transformations, operation parameters and typed output semantics.
+[Summary-definition completeness](summary-catalog-sds-architecture.md#3-summarydefinition-what-does-this-state-mean)
+defines what storage compatibility must preserve. The example below abbreviates
+these contracts rather than replacing them with a fixed field list.
+
+## 4. Worked example: shared KLL state
+
+Suppose p50 and p99 use KLL with `k=200` over aligned five-minute windows. Planner
+selects one-minute panes and compiles:
+
+```text
+Maintenance Physical DAG             Query Physical DAG
+
+raw-pane input                       compatible-pane input
+      ↓                                      ↓
+NativeKllBuild(k=200)                 NativeKllMerge(k=200)
+      ↓                                  ┌───┴───┐
+kll-state output                         ↓       ↓
+                                     p50 readout p99 readout
+```
+
+The raw input must contain the complete set of input samples for the one-minute pane. The query input
+requires compatible panes covering the requested aligned five-minute interval.
+These are Planner contracts, not a backend decision to cut the logical graph.
+
+The backend adds operational bindings. This YAML illustrates ownership and is
+not a proposed Rust or wire schema:
+
+```yaml
+precompute:
+  dag: planner.maintenance_dag
+  inputs: {raw-pane: latency_source}
+  outputs: {kll-state: stored_output.latency-panes}
+
+query:
+  dag: planner.query_dag
+  inputs: {compatible-pane: stored_output.latency-panes}
+  outputs: {p50: query_p50, p99: query_p99}
+```
+
+SDS defines semantic identity, format, coverage and version validation. The
+installed bundle also binds the selected maintenance schedule, retention and
+unavailability policy; those fields are omitted here to show the shared-output
+connection clearly. DAG references resolve within the installed bundle, not to
+live Planner objects.
+
+For `(12:00, 12:05]`, the query engine resolves five one-minute records for the
+requested group, validates their format, coverage and revision compatibility,
+and supplies them to the query DAG. Merge runs once for its two consumers within
+that run. Separate query runs do not implicitly share mutable execution state.
+
+Each maintained pane contributes once. Replacing a pane snapshot does not add
+the same input samples again to a query merge. Missing, overlapping or incomplete panes
+cannot be treated as the requested complete range.
+
+A delayed build keeps its original coverage interval; publication time does not
+change query semantics. If required state is missing, the installed fallback or
+unavailability policy applies. The backend must not substitute older state or
+change the maintained window to make a read succeed.
+
+## 5. Deployment compilation contract
+
+Inputs are selected Physical DAGs and boundaries, the selected lifecycle,
+query associations, source/store capabilities and installation context.
+Compilation opens no readers and does not establish future state readiness.
+
+For each selected physical candidate, the compiler:
+
+1. Verifies that the backend runtime can supply every input and fulfill the selected
+   maintenance requirements without changing their semantics.
+2. Binds raw inputs and assigns identities to persisted physical outputs.
+3. Connects stored-state inputs to those outputs, with matching definitions,
+   grouping, coverage rules, revision scope and supported format.
+4. Binds schedules and retention that satisfy the selected lifecycle, then
+   packages the provided DAGs and bindings into precompute/query plans.
+5. Validates the complete bundle before it can be staged.
+
+Backend feasibility includes persisting the selected output type. Planner may
+produce scalar/result frontiers as well as sketches; this does not imply the
+backend supports all of them. An unsupported output is rejected or excluded
+through Planner feasibility selection, never silently replaced with another
+frontier.
+
+A query-only candidate can build state during a query; a precompute candidate
+can finalize values before persisting them. The backend follows the selected
+Physical DAGs rather than enforcing build-only/estimate-only phase rules.
+
+## 6. Installation and execution contracts
+
+| Contract | Requirement |
+| --- | --- |
+| Preserve computation | Binding does not change physical operators, ordered edges, roots or sharing. |
+| Bind completely | Every required boundary resolves to one compatible input/output contract. |
+| Install atomically | Definitions and both plans become active as one version; failed staging leaves the previous version active. |
+| Distinguish readiness | Installation authorizes a plan; actual state coverage and readiness are checked when resolving inputs. |
+| Execute once per run | Shared physical producers are driven by the shared runtime, not duplicated by separate backend traversals. |
+| Publish consistently | Stored metadata and payload become visible together under the authorized output binding. |
+| Fail explicitly | Unsupported bindings or unreadable state follow rejection, fallback or unavailability policy without changing computation. |
+
+The precompute engine schedules work, resolves bounded inputs, invokes the shared
+executor and commits output. The query engine resolves request-specific inputs,
+invokes the same executor and adapts results. Both propagate cancellation and
+resource limits. Neither interprets logical Post-ASAP nodes at runtime.
+
+Cleanup respects retention and active readers/dependent producers. Storage lookup
+uses installed references; it does not search for an alternative summary at
+serving time. See SDS for record eligibility and recovery requirements.
+
+## 7. Alternatives and tradeoffs
+
+Re-lowering logical nodes in the backend would duplicate physical selection and
+allow deployment and Planner graphs to drift. Consuming Physical DAGs avoids that
+second compiler, at the cost of requiring an explicit capability/replanning
+boundary when the backend cannot realize a candidate.
+
+Keeping one full logical DAG under PrecomputePlan would require runtime phase
+filtering and obscure which inputs are stored. Separate Planner-provided physical
+subgraphs make execution ownership explicit without inventing separate operator
+systems for precompute and queries.
+
+A separate catalog Materialization object would repeat fields already owned by
+definitions, boundary bindings and stored records. Two stored object types and
+plan-local references are sufficient for the selected scope.
+
+## 8. Validation and acceptance
+
+Tests must establish:
+
+1. Deployment binding preserves Planner's operators, boundaries and shared
+   dependencies; unsupported bindings fail before activation.
+2. The KLL example summarizes each pane’s input samples once and serves both readouts with
+   one merge per shared run. Missing/overlapping panes and incompatible revisions
+   fail read eligibility.
+3. A supported query-only build and precomputed readout/result follow their
+   selected phases. Unsupported persisted types are rejected explicitly.
+4. Multiple queries can reference one producer, and one query can consume multiple
+   compatible outputs. Derived maintenance checks its source completeness.
+5. Compilation, installation and runtime agree on identity, schema and version.
+   Staging failure, restart and version switching preserve consistency.
+6. The complete path runs without an ASAPCollector checkout or process.
+
+These are acceptance requirements, not claims of completed deployment tests.
+The [migration plan](asapplanner-migration-plan.md) defines delivery gates.
+
+## 9. Scope and follow-up work
+
+Backend work binds and operates Planner computation. It does not add an execution
+IR, alter the Planner API's ownership, or introduce another maintenance model.
+Distributed activation, Collector and transmission plans, and new checkpoint
+protocols remain separate work. Changes to physical algorithms or materialization
+frontiers belong in Planner and its shared physical library.
+
+A future unregistered-query path may ask Planner to search available SDS
+definitions and rewrite the query over reusable state. Backend then resolves
+authorized outputs and binds the selected Physical DAG normally. This is
+planning before execution, not substitute-summary search inside an installed
+reader. See [SDS semantic discovery](summary-catalog-sds-architecture.md#7-future-discovering-sds-for-an-unregistered-query).
+It remains outside the initial deployment rollout.
