@@ -60,6 +60,10 @@ pub(super) fn entry(
                         )
                         .then_some(config.slide_interval * 1000),
                         materialization: config.policy_fingerprint().into(),
+                        stored_output_reference:
+                            asap_types::sds::StoredOutputReference::for_definition(
+                                config.policy_fingerprint().into(),
+                            ),
                         output_grouping: grouping,
                         item_labels: config.aggregated_labels.labels.clone(),
                         window_ms: config.stored_window_ms(),
@@ -128,6 +132,7 @@ pub(super) fn install(
                 plan_id: 1,
                 plan_version: 1,
                 clickhouse_context: None,
+                selected_dags: Default::default(),
                 entries: entries
                     .into_iter()
                     .map(|e| (e.canonical_query.clone(), e))

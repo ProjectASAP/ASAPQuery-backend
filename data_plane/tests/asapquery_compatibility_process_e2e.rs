@@ -46,7 +46,7 @@ fn quote_snapshot_for_frontend_test(
     metricsql: bool,
 ) -> control_plane::physical::compiler::BackendLocalPlanningInput {
     use control_plane::physical::{
-        compiler::{PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION},
+        compiler::{DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION},
         workload_cost::{self, WorkloadCostEvidence, WorkloadQuote},
     };
     let (request, environment) = snapshot
@@ -59,9 +59,9 @@ fn quote_snapshot_for_frontend_test(
         .into_iter()
         .filter_map(|candidate| {
             let plan = if metricsql {
-                PhysicalPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
+                DeploymentPlanCompiler.compile_metricsql(candidate.clone(), environment.clone())
             } else {
-                PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone())
+                DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone())
             }
             .ok()?;
             let unit_cost = if preferred { 1.0 } else { 1e12 };
@@ -313,17 +313,13 @@ fn is_warm(response: &Value) -> bool {
     })
 }
 
-// Measured ERP parameters must reach the real accumulator and answer held-out
+// Confidence-sized KLL parameters must reach the real accumulator and answer
 // raw samples through the installed QueryPlan, without native fallback.
+// Uncertified ERP maxima have separate exact-routing process coverage.
 #[tokio::test]
-#[ignore = "requires ASAPCollector CollectorPlan schema compatibility; run explicitly after Collector is updated"]
-async fn erp_measured_kll_collector_to_query_oracle() {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+async fn certified_kll_state_to_query_oracle() {
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
     const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
-    let artifact: Value = serde_json::from_str(include_str!(
-        "../../control_plane/tests/fixtures/erp-kll-measured.json"
-    ))
-    .unwrap();
     let mut fixture: Value = serde_json::from_str(include_str!(
         "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
     ))
@@ -332,15 +328,19 @@ async fn erp_measured_kll_collector_to_query_oracle() {
     entry["query"] = QUERY.into();
     entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.06}});
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+    // This collector fixture exports KLL state only. An empty ERP artifact
+    // keeps runtime capability filtering while requiring theoretical sizing.
     fixture["implementation"]["erp"] = serde_json::json!({
-        "distribution": artifact["records"][0]["distribution"],
-        "artifact": artifact, "implementation": "lib", "error_metric": "max_rank_err",
+        "distribution": {"workload": {"external": {"dataset": "kll-process-fixture"}}},
+        "artifact": {"schema_version": 1, "producer_version": "test", "records": []},
+        "implementation": "lib", "error_metric": "max_rank_err",
         "min_trials": 10, "expected_updates": 1000.0, "expected_queries": 10.0,
         "expected_merges": 0.0, "retention_seconds": 60.0, "cpu_weight": 1.0,
         "byte_second_weight": 1e-9, "mode": "hybrid",
         "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
     });
     let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+    let window_model = snapshot.physical_inputs.window_cost_model.clone();
     let (mut request, mut environment) = snapshot.into_physical_compilation_request().unwrap();
     request.allow_mixed_summary_and_exact_execution = false;
     request.queries[0].group_by_labels = vec!["service".into()];
@@ -355,11 +355,34 @@ async fn erp_measured_kll_collector_to_query_oracle() {
     environment.target =
         control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
     environment.target_collector_ids = vec!["erp-collector".into()];
-    let plan = PhysicalPlanCompiler
+    control_plane::physical::compiler::prepare_window_implementations(
+        &mut request.queries[0],
+        &window_model,
+        environment.target,
+        request.query_retention_margin_ms,
+    )
+    .unwrap();
+    let plan = DeploymentPlanCompiler
         .compile_promql(request, environment)
         .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
-    assert_eq!(plan.precompute_plan.materializations[0].parameters["k"], 32);
+    let k = plan.precompute_plan.materializations[0].parameters["k"]
+        .as_u64()
+        .unwrap() as u32;
+    let guarantee = asap_aware_mapping::DefaultAccuracyModel::sketch_guarantee(
+        &planner_types::post_asap::SketchAlgorithm::Kll,
+        &planner_types::post_asap::SketchParams::Kll { k },
+        &planner_types::post_asap::SketchQuery::Quantile { q: 0.9 },
+    )
+    .unwrap();
+    assert!(asap_aware_mapping::AccuracyModel::satisfies(
+        &asap_aware_mapping::DefaultAccuracyModel,
+        &guarantee,
+        &planner_types::types::AccuracyTarget::EpsilonDelta {
+            epsilon: 0.06,
+            delta: 0.01
+        }
+    ));
     let collector = serde_json::to_value(&plan.collector_plans[0]).unwrap();
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
@@ -416,8 +439,7 @@ async fn erp_measured_kll_collector_to_query_oracle() {
         .unwrap()
         .as_millis() as i64;
     let base = now - now.rem_euclid(5000) - 20000;
-    // A different deterministic stream from training seed 42; the oracle
-    // evaluates rank error, not the unrelated relative error of the value.
+    // The oracle evaluates rank error, not relative error of the value.
     let raw: Vec<f64> = (0..1000)
         .map(|i| ((i * 7919 + 17) % 1009) as f64 / 1009.0)
         .collect();
@@ -457,7 +479,7 @@ async fn erp_measured_kll_collector_to_query_oracle() {
         }
     })
     .await
-    .expect("ERP plan must answer without exact fallback");
+    .expect("certified KLL plan must answer without exact fallback");
     let estimate = first_value(&response, "value").expect("numeric estimate");
     let rank = raw.iter().filter(|v| **v <= estimate).count() as f64 / raw.len() as f64;
     assert!(
@@ -475,45 +497,20 @@ fn erp_collector_kll_export(plan: &Value, end_ms: u64, raw: &[f64], sequence: u6
             ResourceMetrics, ScopeMetrics,
         },
     };
-    use asap_precompute_rs::Precompute;
     use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
-    let decoded = asap_precompute_rs::CollectorPlan::from_json(
-        &serde_json::to_vec(plan).unwrap(),
-        "erp-collector",
-    )
-    .unwrap();
-    let config = decoded
-        .to_precompute_config_set()
+    let decoded: asap_types::producer_plan::CollectorPlan =
+        serde_json::from_value(plan.clone()).unwrap();
+    assert_eq!(decoded.materializations.len(), 1);
+    let k = decoded.materializations[0].parameters["k"]
+        .as_u64()
         .unwrap()
-        .configs
-        .remove(0);
-    let k = config.sketch_params["k"] as i32;
-    assert_eq!(k, 32);
-    let runtime = asap_precompute_rs::precompute::PrecomputeImpl::new(
-        Some(config),
-        Some(Box::new(move || {
-            Box::new(asap_precompute_rs::sketches::KLLWrapper::new(k, Some(123)))
-        })),
-        Some(Box::new(asap_precompute_rs::sketches::KLLObserver)),
-    );
+        .try_into()
+        .unwrap();
+    let mut sketch = asap_sketchlib::sketches::kll::KLL::<f64>::init_kll_with_seed(k, 123);
     for value in raw {
-        runtime
-            .observe(&asap_precompute_rs::Observation::new(
-                end_ms - 500,
-                "erp_latency",
-                vec![],
-                vec![asap_precompute_rs::KeyValue::new("service", "erp")],
-                asap_precompute_rs::ObservationValue {
-                    kind: asap_precompute_rs::ObservationValueKind::Float,
-                    float: *value,
-                    ..Default::default()
-                },
-            ))
-            .unwrap();
+        sketch.update(value);
     }
-    let envelopes = runtime.tick(end_ms);
-    assert_eq!(envelopes.len(), 1);
-    let wire = SketchEnvelope::decode(envelopes[0].payload.as_slice()).unwrap();
+    let wire = SketchEnvelope::decode(asap_sketch_codec::encode_kll(&sketch).as_slice()).unwrap();
     let Some(sketch_envelope::SketchState::Kll(state)) = wire.sketch_state else {
         panic!("KLL state required")
     };
@@ -576,7 +573,12 @@ fn erp_collector_kll_export(plan: &Value, end_ms: u64, raw: &[f64], sequence: u6
                             attributes,
                             start_time_unix_nano: (end_ms - 5000) * 1_000_000,
                             time_unix_nano: end_ms * 1_000_000,
-                            sketch: state.encode_to_vec(),
+                            sketch: SketchEnvelope {
+                                format_version: 1,
+                                sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
                             encoding: KllSketchEncoding::Proto as i32,
                             flags: 0,
                             series_id: 0,
@@ -602,7 +604,7 @@ async fn registered_temporal_topk_count_sketch_heap() {
 }
 
 async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlgorithm) {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
     use planner_types::post_asap::{CompositionOperator, SketchQuery, SummaryFamilyType};
     const QUERY: &str = "topk(3, count_over_time(top_endpoint_qps[5s]))";
     struct Evidence;
@@ -660,7 +662,7 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         &Evidence,
     )
     .unwrap();
-    let plan = PhysicalPlanCompiler
+    let plan = DeploymentPlanCompiler
         .compile_promql(request, environment)
         .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
@@ -922,7 +924,7 @@ async fn run_shared_dashboard(multi_pane: bool) {
         .into_iter()
         .enumerate()
         .map(|(index, candidate)| {
-            let plan = control_plane::physical::compiler::PhysicalPlanCompiler
+            let plan = control_plane::physical::compiler::DeploymentPlanCompiler
                 .compile_promql(candidate.clone(), environment.clone())
                 .unwrap();
             let manifest =
@@ -957,6 +959,12 @@ async fn run_shared_dashboard(multi_pane: bool) {
     assert!(plan.cost_comparison.is_some());
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
+    assert!(plan
+        .precompute_plan
+        .executable_dags
+        .values()
+        .all(|installed| installed.document.schema_version
+            == asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION));
     if multi_pane {
         assert!(plan.lifecycle_estimates[0]
             .window_realization_id

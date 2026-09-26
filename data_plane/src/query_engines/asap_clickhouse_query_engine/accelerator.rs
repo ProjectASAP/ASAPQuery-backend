@@ -558,7 +558,7 @@ mod tests {
         config.pane_origin_ms = Some(0);
         config.table_timestamp_column = Some("timestamp_ms".into());
         let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
-        let materialization = *sds.materializations.keys().next().unwrap();
+        let materialization = *sds.definitions.keys().next().unwrap();
         let read = QueryNodeId(0);
         let readout = QueryNodeId(1);
         let input_schema = relation_schema(&[
@@ -590,6 +590,7 @@ mod tests {
                         binding: MaterializationBinding {
             full_window_slide_ms: None,
                             materialization,
+                            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(materialization),
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
                             item_labels: Vec::new(),
                             window_ms: 1_000,
@@ -728,6 +729,7 @@ mod tests {
                 tables,
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
+            selected_dags: Default::default(),
             entries: BTreeMap::from([(
                 QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &canonical_sql),
                 entry,

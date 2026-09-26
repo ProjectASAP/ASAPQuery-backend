@@ -1,7 +1,7 @@
 use super::*;
 use control_plane::physical::{
     compiler::{
-        BackendLocalPlanningInput, PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
+        BackendLocalPlanningInput, DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
     },
     workload_cost::{self, WorkloadCostEvidence, WorkloadQuote},
 };
@@ -68,7 +68,7 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
     let quotes = candidates
         .into_iter()
         .filter_map(|candidate| {
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(candidate.clone(), env.clone())
                 .ok()?;
             let warm = candidate.queries.iter().all(|query| {
