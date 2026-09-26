@@ -71,7 +71,7 @@ One installed version contains:
 
 | Part | Content |
 | --- | --- |
-| Summary definitions | Semantic descriptions referenced by stored outputs |
+| Summary definitions | Persisted canonical Planner computation definitions referenced by stored outputs |
 | PrecomputePlan | Planner-provided maintenance Physical DAGs, input/output bindings, schedules and retention/publication policy |
 | QueryPlan | Planner-provided query Physical DAGs, input bindings, query associations and explicit fallback policy |
 
@@ -128,11 +128,12 @@ not a proposed Rust or wire schema:
 ```yaml
 plan_version: 42
 summary_definitions:
-  - id: latency-kll-1m
-    input: request_latency_seconds
-    group_by: [service]
-    pane_duration: 1m
-    algorithm: {kind: kll, k: 200}
+  - id: <latency-kll-1m-semantic-fingerprint>
+    planner_ir_version: <supported-version>
+    canonicalization_version: <normalization-version>
+    computation: <canonical-typed-Planner-fragment-for-one-minute-KLL-output>
+    output: <state-root>
+    parameters: <Planner-exported-time-and-input-contract>
 
 precompute_plan:
   physical_dag: planner.maintenance_dag
@@ -140,7 +141,7 @@ precompute_plan:
     raw-pane: {source: latency_source, scope: scheduled_complete_pane}
   outputs:
     kll-state:
-      reference: {stored_output_id: latency-panes, definition_id: latency-kll-1m}
+      reference: {stored_output_id: latency-panes, definition_id: <latency-kll-1m-semantic-fingerprint>}
       format: {schema: kll-v1, encoding: kll-binary-v1}
   schedule: {every: 1m, anchor: unix_epoch, require: complete_input}
   retention: {minimum: selected_lifecycle_requirement}
@@ -149,7 +150,7 @@ query_plan:
   physical_dag: planner.query_dag
   inputs:
     compatible-pane:
-      reference: {stored_output_id: latency-panes, definition_id: latency-kll-1m}
+      reference: {stored_output_id: latency-panes, definition_id: <latency-kll-1m-semantic-fingerprint>}
       selection: complete_nonoverlapping_panes_for_requested_range
       expected_format: {schema: kll-v1, encoding: kll-binary-v1}
   outputs: {p50: query_p50, p99: query_p99}
