@@ -20,7 +20,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_read_streaming_config() {
+    fn flat_streaming_file_is_rejected() {
         // PR 5: `aggregationId: 1` is silently dropped on read — the
         // streaming-config map key is the policy fingerprint derived
         // from content. The legacy field stays in this fixture to
@@ -47,9 +47,6 @@ aggregations:
         let mut streaming_temp_file = NamedTempFile::new().unwrap();
         write!(streaming_temp_file, "{streaming_yaml_content}").unwrap();
 
-        let config = read_streaming_config(streaming_temp_file.path().to_str().unwrap()).unwrap();
-        assert!(!config.materializations_by_policy_fingerprint.is_empty());
-        let agg = config.materializations().values().next().expect("one agg");
-        assert_eq!(agg.num_aggregates_to_retain, Some(6));
+        assert!(read_streaming_config(streaming_temp_file.path().to_str().unwrap()).is_err());
     }
 }

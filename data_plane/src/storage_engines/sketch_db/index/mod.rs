@@ -92,11 +92,12 @@ fn reconstruct_exact_agg(
     bytes: &[u8],
 ) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
     use crate::precompute_engine::operators::{
-        IncreaseAccumulator, MaxAccumulator, MinAccumulator, MultipleIncreaseAccumulator,
-        MultipleSumAccumulator, SumAccumulator,
+        IncreaseAccumulator, KeyedCounterState, KeyedSumCountAccumulator, MaxAccumulator,
+        MinAccumulator, SumAccumulator,
     };
     use crate::storage_engines::types::AggregateCore;
     match type_name {
+        "PlannerExactAccumulatorV1" => crate::precompute_engine::operators::exact_accumulator::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
         "SumAccumulator" => SumAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
@@ -109,10 +110,12 @@ fn reconstruct_exact_agg(
         "MaxAccumulator" => MaxAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "MultipleSumAccumulator" => MultipleSumAccumulator::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "MultipleIncreaseAccumulator" => MultipleIncreaseAccumulator::deserialize_from_bytes(bytes)
+        "KeyedSumCountAccumulator" => {
+            KeyedSumCountAccumulator::deserialize_from_bytes(bytes)
+                .ok()
+                .map(|a| Box::new(a) as Box<dyn AggregateCore>)
+        }
+        "KeyedCounterState" => KeyedCounterState::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
         // The keyed `MultipleMin`/`MultipleMax` forms and the
@@ -138,7 +141,7 @@ fn reconstruct_exact_agg(
 /// so the mint-driven path (B7.6) and the sid-direct path (B7.7) stay
 /// byte-identical on the values they hand to the index.
 fn build_attrs_fp_and_label_map(
-    agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+    agg_cfg: &asap_types::aggregation_config::PrecomputeMaterialization,
     output: &crate::storage_engines::types::PrecomputedOutput,
 ) -> Result<(String, BTreeMap<String, String>), String> {
     if let Some(labels) = &output.population_labels {
@@ -232,7 +235,7 @@ pub struct SummarySeriesMetadata {
     /// the query path a direct `policy_fp → [sid]` index without
     /// walking the metadata map. `PolicyFingerprint::UNSET` is reserved
     /// for the legacy registration path that doesn't carry a source
-    /// `AggregationConfig` (test fixtures + the early-Phase-5 sketch
+    /// `PrecomputeMaterialization` (test fixtures + the early-Phase-5 sketch
     /// ingest path that didn't thread the config through); the index
     /// skips those entries — they're reachable through the legacy
     /// `instances_matching(metric, gbk)` walk if a query needs them.
@@ -2301,7 +2304,7 @@ impl SketchStore {
     }
 
     /// Phase 5 M2.3.5 — query the precompute payloads across every sid
-    /// belonging to one `AggregationConfig` (identified by `metric` +
+    /// belonging to one `PrecomputeMaterialization` (identified by `metric` +
     /// `agg_cfg.aggregation_type`), shaped as the legacy `Store`
     /// trait's `TimestampedBucketsMap`. Lets the query engine swap
     /// `Store::query_precomputed_output` for `SketchStore` without
@@ -3005,7 +3008,7 @@ impl SketchStore {
     }
 
     /// Phase 5 M2.3.6e — write-side helper. Given an
-    /// `AggregationConfig` and one `(PrecomputedOutput, AggregateCore)`
+    /// `PrecomputeMaterialization` and one `(PrecomputedOutput, AggregateCore)`
     /// pair (the shape both the live worker AND the backfill processor
     /// emit), compute the precompute sid, register a metadata entry on
     /// first sight, and append the payload window. Used by
@@ -3025,7 +3028,7 @@ impl SketchStore {
     pub fn ingest_precompute_for_agg_config<R: Into<Option<u64>>>(
         &self,
         mint_sid: impl FnOnce(&str, &str, &str) -> R,
-        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+        agg_cfg: &asap_types::aggregation_config::PrecomputeMaterialization,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -3157,7 +3160,7 @@ impl SketchStore {
     pub fn ingest_precompute_with_series_id(
         &self,
         sid: u64,
-        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+        agg_cfg: &asap_types::aggregation_config::PrecomputeMaterialization,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -3175,6 +3178,18 @@ impl SketchStore {
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
+        let expected = agg_cfg.accumulator_spec().ok()?.family;
+        if matches!(
+            expected,
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(..)
+        ) && accumulator
+            .get_accumulator_type()
+            .planner_exact_family()
+            .as_ref()
+            != Some(&expected)
+        {
+            return None;
+        }
         let label_values_map = self.register_precompute_output(sid, agg_cfg, output)?;
 
         // Keep the physical lifetime alive through publication. Removal takes
@@ -6224,5 +6239,92 @@ mod tests {
             "recent + pending-data sids are spared"
         );
         assert_eq!(idx.series.len(), 2);
+    }
+    // Flush and reopen must preserve Planner family rather than reconstructing Rate as Increase.
+    #[test]
+    fn planner_exact_families_survive_disk_eviction_and_restart() {
+        use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
+        use crate::storage_engines::types::{AggregateCore, AggregationType};
+        let kinds = [
+            AggregationType::Sum,
+            AggregationType::Count,
+            AggregationType::Min,
+            AggregationType::Max,
+            AggregationType::Rate,
+            AggregationType::Increase,
+        ];
+        let stats = [
+            asap_types::Statistic::Sum,
+            asap_types::Statistic::Count,
+            asap_types::Statistic::Min,
+            asap_types::Statistic::Max,
+            asap_types::Statistic::Rate,
+            asap_types::Statistic::Increase,
+        ];
+        let expected = [16.0, 3.0, 2.0, 8.0, 3.0, 6.0];
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let store = Arc::new(SketchStore::new());
+            for (i, kind) in kinds.iter().enumerate() {
+                let mut metadata = meta(9000 + i as u64);
+                metadata.agg_kind = AggKind::ExactAgg {
+                    agg_type: *kind,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                };
+                metadata.capability = Some(Capability::ExactAgg(*kind));
+                metadata.accuracy = None;
+                store.register(metadata);
+            }
+            let mut persistence = store
+                .start_persistence(durable_cfg(temp.path().to_path_buf()))
+                .unwrap();
+            for (i, kind) in kinds.iter().enumerate() {
+                for window in 0..10u64 {
+                    let mut state =
+                        ExactAccumulator::new(kind.planner_exact_family().unwrap(), false).unwrap();
+                    for (time, value) in [(1000, 8.0), (2000, 2.0), (3000, 6.0)] {
+                        state.update(None, value, time);
+                    }
+                    store.append_precompute(
+                        9000 + i as u64,
+                        BTreeMap::new(),
+                        (window * 30000, (window + 1) * 30000),
+                        Box::new(state),
+                    );
+                }
+            }
+            assert!(wait_until(
+                || !persistence.manifest.live_parts().is_empty()
+                    && store.approx_memory_bytes() == 0
+                    && store.list_sealed_epochs_len() == 0,
+                std::time::Duration::from_secs(5)
+            ));
+            persistence.shutdown();
+        }
+        let store = Arc::new(SketchStore::new());
+        let mut persistence = store
+            .start_persistence(durable_cfg(temp.path().to_path_buf()))
+            .unwrap();
+        for (i, kind) in kinds.iter().enumerate() {
+            let series = store.query_exact_agg_range(9000 + i as u64, 0, 30001);
+            assert_eq!(series.len(), 1, "{kind:?}");
+            let state = &series[0].1[&30000];
+            assert_eq!(state.get_accumulator_type(), *kind);
+            assert_eq!(
+                state
+                    .query_statistic(stats[i], &None, &HashMap::new())
+                    .unwrap(),
+                expected[i]
+            );
+            for (j, stat) in stats.iter().enumerate() {
+                if i != j {
+                    assert!(state
+                        .query_statistic(*stat, &None, &HashMap::new())
+                        .is_err());
+                }
+            }
+        }
+        persistence.shutdown();
     }
 }
