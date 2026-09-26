@@ -1,8 +1,8 @@
 # Shared physical deployment validation — 2026-09-26
 
 The independent Level 1 branch and all seven live Level 2 suites pass. Strict
-Level 3 performance acceptance passes the recorded probe-parser run. The final
-Planner-pin measurement failed two p95 comparisons and is retained below. No thresholds or expected
+Level 3 performance acceptance passes the latest per-run range-parameter run
+with final Planner pin `751e5e02`. Earlier failures are retained below. No thresholds or expected
 results have been relaxed.
 
 ## Ownership and dependency order
@@ -31,7 +31,7 @@ its former base during restacking; this did not merge the stack into main.
 | Level 1 #728 | Both independent-branch planning tests passed |
 | Level 2 #742 | Seven suites, 161 queries, 759 local responses, zero fallback |
 | Level 3 runner #759 | 12 contract and four HTTP tests passed |
-| Level 3 performance | Not passed; see retained measurements below |
+| Level 3 performance | Passed: CI 36227354805; all strict CPU, peak-memory and per-query p95 comparisons |
 
 [Level 2 report card](level2-summary.md) records the seven live suites. That run
 used backend `b098629c` and Planner
@@ -169,7 +169,7 @@ failed strict performance acceptance on PR head `de44e3bd` / tested merge
 peak memory (46018560 bytes) pass all baselines, but temporal-sum p95 is
 1.159219 ms versus VictoriaMetrics 1.114215 ms, and topk-rate p95 is 1.009188 ms
 versus 0.99007 ms. The previous passing run does not make this run pass.
-Further per-run parameter-allocation work is undergoing validation.
+The subsequent per-run parameter change passes the strict measurement below.
 
 ## Per-run exact readout parameters
 
@@ -183,4 +183,25 @@ the shared readout on reset-sensitive 12-pane states for eight groups. Results
 are equal: Rate allocations fall from 49 to 14 and Sum from 49 to 9. This is
 an allocation measurement, not an end-to-end latency claim. Build the probe
 against the physical library rlib with rustc and its dependency directory.
-The next strict end-to-end run is pending.
+The strict end-to-end run passes; see the latest measurement below.
+
+## Latest strict measurement
+
+[CI run 36227354805](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36227354805)
+passes on PR head `35c0f44c58f9d57a684155fe1c93d04f91661f72`, tested merge
+`f9f64ca664bc0e04577de8565b32512eb0297f20`, Planner `751e5e02`.
+[Complete raw measurements](benefit-ci-range-parameters.json) retain all 100
+trials per query and three warmups. Semantic and local-execution checks pass;
+CPU, actual peak memory, and all ten query p95 values are strictly below each
+exact baseline. No acceptance threshold was changed.
+
+| Target | CPU usec | Peak bytes |
+| --- | ---: | ---: |
+| backend | 258115 | 46370816 |
+| clickhouse | 13093800 | 423636992 |
+| prometheus | 1194584 | 88354816 |
+| victoria | 605754 | 63549440 |
+
+Independent #742 head `e93df71a` passes [Level 2 CI 36227354017](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36227354017);
+#759 also passes [Level 2 CI 36227354781](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36227354781).
+This small-fixture result does not establish the full cardinality/time scaling matrix.
