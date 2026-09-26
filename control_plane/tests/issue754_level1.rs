@@ -36,8 +36,8 @@ enum ExpectedFamily {
     QuantileSketch,
 }
 
-// These are semantic contracts for the installed query DAG, not a snapshot of
-// generated node IDs or cost-dependent summary IDs.
+// Expectations below are specific to this controlled fixture. Candidate
+// semantics and cost-dependent placement are validated separately.
 fn expected_plan(name: &str) -> ExpectedPlan {
     match name {
         "spatial-sum" => ExpectedPlan {
@@ -137,7 +137,7 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
             "{name}: precompute producer and catalog disagree about Planner family"
         );
     }
-    let expected = expected_plan(name);
+    let mut expected = expected_plan(name);
     let artifact = serde_json::to_value(plan).unwrap();
     let entries = artifact["query_plan"]["entries"].as_object().unwrap();
     assert_eq!(entries.len(), 1, "{name}: expected one query plan");
@@ -165,7 +165,10 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
         return None;
     }
     if name == "grouped-temporal-sum" && node["op"] == "logical" {
-        return Some("grouped-temporal-sum: Planner left a per-series temporal Sum and an outer exact grouped Sum; expected one time-and-label grouped Sum producer".into());
+        // Both frontiers are legal: grouped maintained state, or maintained
+        // per-series temporal state followed by a query-side grouped Sum.
+        expected.partitioning = "per_entity";
+        expected.root_operation = Some("aggregate");
     }
     if name == "quantile-ratio" {
         if node["op"] == "exact_fallback" {
@@ -405,6 +408,16 @@ fn issue754_queries_have_valid_physical_plans() {
                             "summary plan must retain its Planner DAG"
                         );
                     }
+                    if matches!(case.name.as_str(), "grouped-rate" | "grouped-temporal-sum") {
+                        let local = entry.nodes.values().all(|node| !matches!(node,
+                            QueryPlanNode::ExactFallback { .. } | QueryPlanNode::Logical {
+                                operator: control_plane::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
+                                    | control_plane::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }, .. }));
+                        if local {
+                            assert_eq!(assert_selected_plan(&case.name, &plan), None,
+                                "every admitted local candidate must preserve grouped/window semantics");
+                        }
+                    }
                     let dot = control_plane::physical::plan_dot::render(&plan);
                     assert!(dot.contains("PrecomputePlan") && dot.contains("QueryPlan:"));
                     if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
@@ -419,8 +432,9 @@ fn issue754_queries_have_valid_physical_plans() {
                         .unwrap();
                         std::fs::write(base.with_extension("dot"), &dot).unwrap();
                     }
-                    // The level-1 acceptance target is a backend-local plan.
-                    // Price explicit exact fallbacks above every local candidate.
+                    // Fixture-specific admission/selection costs. These do not
+                    // establish a production optimum or require one split for
+                    // every workload; the reversal test below covers placement.
                     let cost = if plan.query_plan.entries.values().any(|entry| {
                         entry
                             .nodes
@@ -519,4 +533,151 @@ fn issue754_queries_have_valid_physical_plans() {
         "{}",
         missing_local_plans.join("\n")
     );
+}
+
+/// Workload cost must reverse the admitted grouped temporal Sum split.
+#[test]
+fn grouped_temporal_sum_candidates_preserve_coverage_and_reverse_selection() {
+    use asap_aware_mapping::cost_model::Cost;
+    use asap_aware_mapping::{CostModel, Replacement, ReplacementSubDAG, TargetSubDAG};
+    use planner_types::post_asap::SummaryExpr;
+    use planner_types::pre_asap::{AggIntent, Reduction};
+    struct PreferSplit {
+        grouped: bool,
+    }
+    impl CostModel for PreferSplit {
+        fn rank_candidates(
+            &self,
+            _: &AggIntent,
+            candidates: &[SketchAlgorithm],
+        ) -> Vec<SketchAlgorithm> {
+            candidates.to_vec()
+        }
+        fn candidate_cost(
+            &self,
+            candidate: &ReplacementSubDAG,
+            _: &TargetSubDAG<'_>,
+        ) -> Option<Cost> {
+            let grouped = matches!(&candidate.replacement, Replacement::Summary(node)
+                if matches!(&node.expr, SummaryExpr::SummaryAgg { reduction: Reduction::Reduce(_), child, .. }
+                    if matches!(child.expr, SummaryExpr::KeepPreAsap(_))));
+            Some(Cost(if grouped == self.grouped { 1. } else { 1000. }))
+        }
+    }
+    let expression = "sum by (label_0) (sum_over_time(data[1m]))";
+    let canonical = control_plane::query_parser::parse_query_expr_canonical(
+        expression,
+        planner_types::types::AccuracyTarget::Exact,
+    )
+    .unwrap();
+    let mut snapshot: Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-planning-snapshot.json"
+    ))
+    .unwrap();
+    snapshot["query_workload"]["repeating_queries"][0]["query"] = json!(expression);
+    let input: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
+    let (request, environment) = input.into_physical_compilation_request().unwrap();
+    let mut plans = Vec::new();
+    let mut candidates = Vec::new();
+    for grouped in [false, true] {
+        let mut candidate = request.clone();
+        candidate.queries[0].selected_plan_root =
+            control_plane::planner_selection::select_query(&canonical, &PreferSplit { grouped })
+                .unwrap();
+        let plan = DeploymentPlanCompiler
+            .compile_promql(candidate.clone(), environment.clone())
+            .unwrap();
+        candidates.push(candidate);
+        assert_eq!(assert_selected_plan("grouped-temporal-sum", &plan), None);
+        // A stored five-second pane cannot shorten the semantic minute read.
+        let mut incomplete = plan.clone();
+        for entry in incomplete.query_plan.entries.values_mut() {
+            for node in entry.nodes.values_mut() {
+                if let QueryPlanNode::ReadMaterialization { binding } = node {
+                    binding.readout_lookback_ms = Some(5_000);
+                }
+            }
+        }
+        assert!(std::panic::catch_unwind(|| assert_selected_plan(
+            "grouped-temporal-sum",
+            &incomplete
+        ))
+        .is_err());
+        let entry = plan.query_plan.lookup(expression).unwrap();
+        let root = &entry.nodes[&entry.root];
+        let is_grouped = matches!(root, QueryPlanNode::ExactReadout { .. });
+        assert_eq!(
+            is_grouped, grouped,
+            "controlled cost must change the executable split"
+        );
+        plans.push(plan);
+    }
+    assert_ne!(plans[0].query_plan, plans[1].query_plan);
+    // Controlled scoped resource prices, not observed production measurements.
+    // Maintenance-heavy grouped output loses in the first fixture; expensive
+    // repeated query-side reduction makes it win in the second fixture.
+    for prefer_grouped in [false, true] {
+        let quotes = plans
+            .iter()
+            .zip(&candidates)
+            .enumerate()
+            .map(|(index, (plan, candidate))| {
+                let manifest = manifest(plan, &candidate.queries).unwrap();
+                let unit_costs = manifest
+                    .components
+                    .iter()
+                    .map(|(key, demand)| {
+                        let grouped_state = index == 1 && key.starts_with("state:");
+                        let query_reduction =
+                            demand.implementation["node"]["operator"]["kind"] == "aggregate";
+                        let cost = if (!prefer_grouped && grouped_state)
+                            || (prefer_grouped && query_reduction)
+                        {
+                            10_000.
+                        } else {
+                            1.
+                        };
+                        (key.clone(), cost)
+                    })
+                    .collect();
+                WorkloadQuote {
+                    manifest,
+                    unit_costs,
+                    executable: true,
+                }
+            })
+            .collect();
+        let evidence = WorkloadCostEvidence {
+            backend_revision: BACKEND_REVISION.into(),
+            planner_revision: PLANNER_REVISION.into(),
+            data_snapshot_id: "grouped-sum-frontier-fixture".into(),
+            model_version: "controlled-maintenance-query-costs".into(),
+            observed_at_unix_ms: environment.observed_at_unix_ms,
+            valid_for_ms: environment.max_evidence_age_ms,
+            quotes,
+        };
+        let selected = control_plane::physical::workload_cost::select_lowest_cost_candidate(
+            candidates.clone(),
+            environment.clone(),
+            &evidence,
+        )
+        .unwrap();
+        assert_eq!(
+            assert_selected_plan("grouped-temporal-sum", &selected),
+            None
+        );
+        let entry = selected.query_plan.lookup(expression).unwrap();
+        assert_eq!(
+            matches!(entry.nodes[&entry.root], QueryPlanNode::ExactReadout { .. }),
+            prefer_grouped
+        );
+        let report = selected.cost_comparison.unwrap();
+        let selected_cost = report.component_costs.values().sum::<f64>();
+        let minimum = report
+            .candidate_evaluations
+            .iter()
+            .filter_map(|candidate| candidate.total_cost)
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(selected_cost, minimum);
+    }
 }
