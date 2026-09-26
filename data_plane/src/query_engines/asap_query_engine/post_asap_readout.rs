@@ -227,38 +227,40 @@ impl PhysicalQueryRuntime<'_> {
                 let mut coverage = None;
                 let values = groups
                     .iter()
-                    .map(|(key, state)| {
+                    .filter_map(|(key, state)| {
                         fold_coverage(&mut coverage, state.exact_coverage());
-                        state
-                            .exact_value_for(
-                                *readout,
-                                &None,
-                                self.context.t0_ms,
-                                self.context.t1_ms,
-                            )
-                            .map(|value| {
-                                (
+                        let value = match state.exact_value_for(
+                            *readout,
+                            &None,
+                            self.context.t0_ms,
+                            self.context.t1_ms,
+                        ) {
+                            Ok(Some(value)) => value,
+                            Ok(None) => return None,
+                            Err(error) => return Some(Err(PhysicalNodeError::Fallback(error))),
+                        };
+                        Some(Ok({
+                            (
+                                {
+                                    let mut labels = key.clone();
+                                    if self.language
+                                        == control_plane::query_plan::QueryLanguage::MetricsQl
+                                        && !matches!(
+                                            readout,
+                                            control_plane::query_plan::ExactReadout::Max
+                                                | control_plane::query_plan::ExactReadout::Min
+                                        )
                                     {
-                                        let mut labels = key.clone();
-                                        if self.language
-                                            == control_plane::query_plan::QueryLanguage::MetricsQl
-                                            && !matches!(
-                                                readout,
-                                                control_plane::query_plan::ExactReadout::Max
-                                                    | control_plane::query_plan::ExactReadout::Min
-                                            )
-                                        {
-                                            labels.remove("__name__");
-                                        }
-                                        labels
-                                    },
-                                    SummaryValue::Points(
-                                        vec![(self.context.t1_ms as i64, value)],
-                                        state.exact_coverage(),
-                                    ),
-                                )
-                            })
-                            .ok_or(PhysicalNodeError::ExpectedState)
+                                        labels.remove("__name__");
+                                    }
+                                    labels
+                                },
+                                SummaryValue::Points(
+                                    vec![(self.context.t1_ms as i64, value)],
+                                    state.exact_coverage(),
+                                ),
+                            )
+                        }))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(PhysicalQueryOutput::Value(values, coverage))
@@ -886,6 +888,204 @@ mod tests {
     use crate::query_engines::asap_query_engine::test_plan;
     use asap_types::query_plan::{ExactReadout, PhysicalGrouping, QueryReadout};
     use planner_types::pre_asap::ArithmeticOpKind;
+
+    // A sparse counter is omitted without dropping other series in the vector.
+    #[test]
+    fn counter_readout_omits_only_series_with_fewer_than_two_samples() {
+        use crate::storage_engines::types::Measurement;
+        let idx = SketchStore::new();
+        let runtime = PhysicalQueryRuntime {
+            language: control_plane::query_plan::QueryLanguage::PromQl,
+            catalog: None,
+            context: QueryExecutionContext {
+                index: &idx,
+                t0_ms: 0,
+                t1_ms: 60_000,
+                is_cumulative: true,
+                allowed_materializations: None,
+            },
+        };
+        let groups = [1, 2]
+            .into_iter()
+            .map(|samples| {
+                let mut state = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
+                    Measurement::new(10.0),
+                    10_000,
+                    Measurement::new(10.0),
+                    10_000,
+                );
+                if samples == 2 {
+                    state.update(Measurement::new(20.0), 20_000);
+                }
+                (
+                    BTreeMap::from([("instance".into(), samples.to_string())]),
+                    GroupState::ExactAgg {
+                        entries: vec![std::rc::Rc::new(BTreeMap::from([(
+                            60_000,
+                            std::sync::Arc::new(state)
+                                as std::sync::Arc<dyn crate::storage_engines::types::AggregateCore>,
+                        )]))],
+                        agg_type: asap_types::AggregationType::Rate,
+                    },
+                )
+            })
+            .collect();
+        let context = dag::RunContext::new(
+            dag::Scope::Query {
+                evaluation_time_ms: 60_000,
+                revision: 0,
+            },
+            dag::Limits::default(),
+        )
+        .unwrap();
+        let output = runtime
+            .execute_node(
+                QueryNodeId(0),
+                &QueryPlanNode::ExactReadout {
+                    input: QueryNodeId(1),
+                    readout: control_plane::query_plan::ExactReadout::Rate,
+                },
+                &[PhysicalQueryOutput::State {
+                    groups,
+                    item_labels: vec![],
+                }],
+                &context,
+            )
+            .unwrap();
+        let PhysicalQueryOutput::Value(rows, _) = output else {
+            panic!("value rows required")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0["instance"], "2");
+    }
+
+    // Empty leading/trailing panes do not invalidate a bounded counter window.
+    #[test]
+    fn sparse_counter_panes_preserve_full_requested_range() {
+        use crate::storage_engines::types::Measurement;
+        let idx = SketchStore::new();
+        let policy = asap_types::PolicyFingerprint(778);
+        idx.register(SummarySeriesMetadata {
+            storage_handle: 7,
+            metric_name: "requests_total".into(),
+            group_by_keys: std::collections::BTreeSet::new(),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: asap_types::AggregationType::Rate,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: policy,
+        });
+        for (start, time, value) in [(20_000, 25_000, 10.), (40_000, 45_000, 20.)] {
+            let state = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
+                Measurement::new(value),
+                time,
+                Measurement::new(value),
+                time,
+            );
+            idx.append_precompute(7, BTreeMap::new(), (start, start + 10_000), Box::new(state));
+        }
+        let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
+            item_labels: vec![],
+            materialization: policy.into(),
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                policy.into(),
+            ),
+            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
+            window_ms: 10_000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: Some(60_000),
+        };
+        let context = QueryExecutionContext {
+            index: &idx,
+            t0_ms: 0,
+            t1_ms: 60_000,
+            is_cumulative: true,
+            allowed_materializations: None,
+        };
+        let groups = context.read_bound_materialization(&binding).unwrap();
+        assert_eq!(groups.len(), 1);
+        let result = groups[0]
+            .1
+            .exact_value_for(
+                control_plane::query_plan::ExactReadout::Rate,
+                &None,
+                0,
+                60_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert!((result - 11. / 24.).abs() < 1e-12);
+        let partial = QueryExecutionContext {
+            t0_ms: 25_000,
+            ..context
+        };
+        assert!(partial.read_bound_materialization(&binding).is_err());
+    }
+
+    // Per-series reads preserve source order so stable ranking retains tied inputs.
+    #[test]
+    fn per_entity_read_preserves_source_order() {
+        let idx = SketchStore::new();
+        let policy = asap_types::PolicyFingerprint(779);
+        for (sid, instance) in [(1, "z"), (2, "a")] {
+            idx.register(SummarySeriesMetadata {
+                storage_handle: sid,
+                metric_name: "m".into(),
+                group_by_keys: std::collections::BTreeSet::new(),
+                capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
+                agg_kind: AggKind::ExactAgg {
+                    agg_type: asap_types::AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: policy,
+            });
+            idx.append_precompute(
+                sid,
+                BTreeMap::from([("instance".into(), instance.into())]),
+                (0, 1_000),
+                Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(1.)),
+            );
+        }
+        let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
+            item_labels: vec![],
+            materialization: policy.into(),
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                policy.into(),
+            ),
+            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
+            window_ms: 1_000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: Some(1_000),
+        };
+        let context = QueryExecutionContext {
+            index: &idx,
+            t0_ms: 0,
+            t1_ms: 1_000,
+            is_cumulative: true,
+            allowed_materializations: None,
+        };
+        let groups = context.read_bound_materialization(&binding).unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(labels, _)| labels["instance"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["z", "a"]
+        );
+    }
 
     // A stored sketch frontier exposes pane coverage without treating it as exact state.
     #[test]
