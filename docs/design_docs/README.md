@@ -1,17 +1,18 @@
 # Design documents
 
 These documents are for architects and developers. The integration proposal and
-SDS model below define the target Planner-to-runtime boundary; their current-code
-notes and migration gates distinguish implemented behavior from proposed changes.
+SDS model below define the target Planner-to-runtime boundary. Acceptance
+requirements and migration gates distinguish target behavior from completed
+integration.
 
 - [Planner/backend glossary](planner-backend-glossary.md) defines the terms used
   by the following three designs.
-- [Planner output to backend physical plans](asapplanner-integration.md) defines
-  how one selected post-ASAP DAG becomes executable PrecomputePlan and QueryPlan
-  subgraphs joined at materialization boundaries.
+- [Binding Planner Physical DAGs to deployment plans](asapplanner-integration.md)
+  defines how backend source/state bindings and operational policy instantiate
+  Planner-provided maintenance and query computation.
 - [Summary definitions table and SDS](summary-catalog-sds-architecture.md) owns definition
-  and instance identity, version-scoped state references, readiness and state
-  lifecycle semantics.
+  and instance identity, version-scoped state references, read eligibility and
+  committed-state metadata.
 - [QueryPlan DAG execution](query-dag-execution.md) explains how the query
   engine evaluates installed query sub-DAGs and reads bound stored summaries.
 - [Architecture migration delivery plan](asapplanner-migration-plan.md) defines
