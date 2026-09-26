@@ -112,13 +112,11 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
         SummaryExpr::SummaryAgg { child, .. } => node_is_archive(child),
         SummaryExpr::ValueOperation { child, .. } => node_is_archive(child),
         SummaryExpr::SummaryEstimate { summary_input, .. } => node_is_archive(summary_input),
-        SummaryExpr::SummaryMerge { children } => children.iter().any(node_is_archive),
+        SummaryExpr::SummaryMerge { children, .. } => children.iter().any(node_is_archive),
         SummaryExpr::SummaryJoin { outer, inner, .. } => {
             node_is_archive(outer) || node_is_archive(inner)
         }
-        SummaryExpr::CandidateTopK {
-            candidates, values, ..
-        } => node_is_archive(candidates) || node_is_archive(values),
+
         SummaryExpr::SummarySubtract { left, right }
         | SummaryExpr::RelationalJoin { left, right, .. }
         | SummaryExpr::BinaryOp {
@@ -332,7 +330,7 @@ fn uncertified_hll_keeps_exact_execution() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
         measures: vec![AggIntent::Cardinality {
-            col: None,
+            cols: vec![],
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
         output_names: Vec::new(),

@@ -70,6 +70,7 @@ fn ddsketch_export(metric: &str, timestamp_ns: u64, values: &[f64]) -> Vec<u8> {
         alpha: sketch.wire_alpha(),
         store_counts: sketch.store_counts,
         store_offset: sketch.store_offset,
+        ..Default::default()
     };
     let point = DdSketchDataPoint {
         attributes: vec![KeyValue {

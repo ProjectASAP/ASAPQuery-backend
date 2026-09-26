@@ -6650,7 +6650,11 @@ mod catalog_install_tests {
             })
             .expect("demo has maintained summaries");
         binding.window_ms += 1;
-        assert!(install(request).unwrap_err().contains("query pane differs"));
+        let error = install(request).unwrap_err();
+        assert!(
+            error.contains("query") && error.contains("pane") && error.contains("differs"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -115,7 +115,7 @@ impl DeltaSketchKind {
                 sketch_cols,
                 layers,
             } => SummaryState::UnivMon(
-                crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator::new(
+                asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator::new(
                     *heap_size as usize,
                     *sketch_rows as usize,
                     *sketch_cols as usize,
@@ -167,7 +167,10 @@ fn decode_full(
             },
             SketchEncoding::MsgpackFull,
         ) => {
-            let state = crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator::from_bytes(bytes)
+            let state =
+                asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator::from_bytes(
+                    bytes,
+                )
                 .map_err(|e| e.to_string())?;
             if state.dimensions()
                 != (
@@ -244,7 +247,7 @@ fn decode_full(
 /// folded across a window (or several) via delta application, or merged
 /// in from another sid's own reconstruction.
 pub enum SummaryState {
-    UnivMon(crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator),
+    UnivMon(asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator),
     Dd(DdSketch),
     Hll(HllSketch),
     Kll(KllSketch),
@@ -321,7 +324,7 @@ impl SummaryState {
                         }
                         // Shape (2): bucket-delta proto → additive apply via the
                         // SAME decoder the ingest delta path uses.
-                        use crate::precompute_engine::operators::dd_sketch_accumulator::DDSketchAccumulator;
+                        use asap_physical_operators::summary_kernels::dd_sketch::DDSketchAccumulator;
                         let mut acc = DDSketchAccumulator {
                             inner: std::mem::replace(sk, DdSketch::new(sk.alpha)),
                             sample_p: 1.0,
@@ -740,21 +743,21 @@ pub fn per_window_summary_states(
 // ---------------------------------------------------------------------------
 
 fn dd_from_proto(buffer: &[u8]) -> Result<DdSketch, String> {
-    use crate::precompute_engine::operators::dd_sketch_accumulator::DDSketchAccumulator;
+    use asap_physical_operators::summary_kernels::dd_sketch::DDSketchAccumulator;
     DDSketchAccumulator::from_sketchlib_proto_bytes(buffer)
         .map(|acc| acc.inner)
         .map_err(|e| e.to_string())
 }
 
 fn kll_from_proto(buffer: &[u8]) -> Result<KllSketch, String> {
-    use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
+    use asap_physical_operators::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
     DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(buffer)
         .map(|acc| acc.inner)
         .map_err(|e| e.to_string())
 }
 
 fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
-    use crate::precompute_engine::operators::hll_sketch_accumulator::HllSketchAccumulator;
+    use asap_physical_operators::summary_kernels::hll_sketch::HllSketchAccumulator;
     HllSketchAccumulator::from_sketchlib_proto_bytes(buffer)
         .map(|acc| acc.inner)
         .map_err(|e| e.to_string())
@@ -788,6 +791,7 @@ mod tests {
             alpha: sk.alpha,
             store_counts: sk.store_counts.clone(),
             store_offset: sk.store_offset,
+            ..Default::default()
         };
         SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
@@ -910,7 +914,7 @@ mod tests {
     fn hll_from_proto_matches_accumulator_decoder() {
         // P2-4: the warm read path and the ingest accumulator must decode
         // the SAME bytes to the SAME sketch (one source of truth).
-        use crate::precompute_engine::operators::hll_sketch_accumulator::HllSketchAccumulator;
+        use asap_physical_operators::summary_kernels::hll_sketch::HllSketchAccumulator;
         let mut sk = HllSketch::new(HllVariant::Regular, 12);
         for i in 0..500u64 {
             sk.update(format!("item-{i}").as_bytes());
@@ -929,7 +933,7 @@ mod tests {
 
     #[test]
     fn dd_from_proto_matches_accumulator_decoder() {
-        use crate::precompute_engine::operators::dd_sketch_accumulator::DDSketchAccumulator;
+        use asap_physical_operators::summary_kernels::dd_sketch::DDSketchAccumulator;
         let mut sk = DdSketch::new(0.01);
         for v in [1.0, 2.0, 5.0, 5.0, 9.0, 42.0] {
             sk.update(v);
@@ -946,7 +950,7 @@ mod tests {
 
     #[test]
     fn kll_from_proto_matches_accumulator_decoder() {
-        use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
+        use asap_physical_operators::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
         let items: Vec<f64> = (0..200).map(|i| i as f64).collect();
         let bytes = encode_kll(256, &items);
         let via_delta = kll_from_proto(&bytes).expect("delta_apply kll decode");

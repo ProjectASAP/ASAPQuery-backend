@@ -38,6 +38,7 @@ fn ddsketch_payload() -> Vec<u8> {
         alpha: sk.alpha,
         store_counts: sk.store_counts.clone(),
         store_offset: sk.store_offset,
+        ..Default::default()
     };
     SketchEnvelope {
         sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),

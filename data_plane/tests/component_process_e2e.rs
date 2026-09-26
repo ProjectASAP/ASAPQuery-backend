@@ -43,6 +43,7 @@ fn ddsketch_export(metric: &str, timestamp_ns: u64, counts: Vec<u64>) -> Vec<u8>
         alpha,
         store_counts: counts,
         store_offset: -1,
+        ..Default::default()
     };
     let point = DdSketchDataPoint {
         attributes: vec![KeyValue {

@@ -484,7 +484,16 @@ impl ClickHouseRelationalAdapter {
                     .rows
                     .sort_by(|left, right| compare_sort_keys(left, right, keys, &schema));
             }
-            ValueOperation::Limit { n, offset } => {
+            ValueOperation::Limit {
+                n,
+                offset,
+                partition_by,
+            } => {
+                if !partition_by.keys().is_empty() || partition_by.is_without() {
+                    return Err(ClickHouseRelationalError::Unsupported(
+                        "partitioned relation Limit is not bound".into(),
+                    ));
+                }
                 input.rows = input.rows.into_iter().skip(*offset).take(*n).collect();
             }
             other => return Err(ClickHouseRelationalError::Unsupported(format!("{other:?}"))),
@@ -1604,7 +1613,11 @@ mod tests {
                 }],
                 partition_by: GroupKeys::none(),
             },
-            ValueOperation::Limit { n: 1, offset: 0 },
+            ValueOperation::Limit {
+                n: 1,
+                offset: 0,
+                partition_by: planner_types::pre_asap::GroupKeys::none(),
+            },
         ] {
             relation = adapter
                 .apply_operation(&operation, &projected_schema, relation)

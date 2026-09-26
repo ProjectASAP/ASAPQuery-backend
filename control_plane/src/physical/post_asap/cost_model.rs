@@ -174,9 +174,20 @@ impl ControlPlaneCostModel {
         &self,
         candidate: &ReplacementSubDAG,
     ) -> Option<CandidateCostEstimate> {
+        if let Replacement::Rewrite(root) = &candidate.replacement {
+            // Price a semantic rewrite through its executable summary candidates,
+            // in the same retained-state units as a direct summary candidate.
+            // Unknown realizations remain uncosted rather than receiving zero.
+            use asap_aware_mapping::{ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG};
+            return SketchAlgorithmStrategy::new(self)
+                .replacements(&TargetSubDAG::new(root))
+                .iter()
+                .filter(|candidate| matches!(candidate.replacement, Replacement::Summary(_)))
+                .filter_map(|candidate| self.candidate_cost_estimate(candidate))
+                .min_by(|a, b| a.value.total_cmp(&b.value));
+        }
         let Replacement::Summary(root) = &candidate.replacement else {
-            // Exact compositions have a separate measured rate model. Raw
-            // rewrites have no retained-state estimate in this model.
+            // Exact compositions have a separate measured rate model.
             return None;
         };
         let dag = planner_types::post_asap::compile_executable_dag(root).ok()?;
@@ -510,6 +521,23 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
 }
 
 impl CostModel for ControlPlaneCostModel {
+    fn summary_support_evidence(
+        &self,
+        summary: &planner_types::post_asap::SummaryNode,
+    ) -> Option<bool> {
+        use planner_types::post_asap::{NonNegativeWeightProof, WeightDomain};
+        let dag =
+            planner_types::post_asap::compile_executable_dag(&std::rc::Rc::new(summary.clone()))
+                .ok()?;
+        // Counter-weighted heaps now consume explicit rate values. The raw
+        // ingestion adapter cannot bind that frontier as counter deltas.
+        let requires_rate_values = dag.nodes.iter().any(|node| matches!(&node.payload,
+            ExecutableOperatorPayload::SummaryAgg { input, family: SummaryFamilyType::Sketch(kind, _), .. }
+                if matches!(kind.algorithm(), SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap)
+                && matches!(input.weight_domain, WeightDomain::NonNegative { proof: NonNegativeWeightProof::ResetAwareCounterDerivative })));
+        requires_rate_values.then_some(false)
+    }
+
     fn candidate_cost(
         &self,
         candidate: &ReplacementSubDAG,
@@ -521,8 +549,8 @@ impl CostModel for ControlPlaneCostModel {
 
     fn value_operation_capabilities(&self) -> ValueOperationCapabilities {
         ValueOperationCapabilities {
-            read_time: true,
-            maintenance_time: false,
+            query_time: true,
+            ingestion_time: false,
         }
     }
 
@@ -869,6 +897,13 @@ impl ForcedFamilyCostModel {
 }
 
 impl CostModel for ForcedFamilyCostModel {
+    fn summary_support_evidence(
+        &self,
+        summary: &planner_types::post_asap::SummaryNode,
+    ) -> Option<bool> {
+        self.inner.summary_support_evidence(summary)
+    }
+
     fn candidate_cost(
         &self,
         candidate: &ReplacementSubDAG,

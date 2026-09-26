@@ -391,13 +391,15 @@ impl QueryPlanEntry {
                     ));
                 }
             }
-            if let QueryPlanNode::CandidateTopK {
-                k, completeness, ..
+            if let QueryPlanNode::RelationalJoin {
+                pruning: Some(completeness),
+                join_kind,
+                ..
             } = node
             {
-                if *k == 0 {
+                if *join_kind != planner_types::pre_asap::JoinKind::Semi {
                     return Err(QueryPlanError::Invalid(
-                        "CandidateTopK requires k > 0".into(),
+                        "pruning evidence requires a semi-join".into(),
                     ));
                 }
                 if matches!(
@@ -409,7 +411,7 @@ impl QueryPlanEntry {
                             || guarantee.failure_probability.evaluate().is_none()
                 ) {
                     return Err(QueryPlanError::Invalid(
-                        "invalid CandidateTopK completeness certificate".into(),
+                        "invalid semi-join pruning certificate".into(),
                     ));
                 }
             }
@@ -571,6 +573,7 @@ pub enum QueryPlanNode {
     RelationalJoin {
         inputs: [QueryNodeId; 2],
         join_kind: planner_types::pre_asap::JoinKind,
+        pruning: Option<CandidateCompleteness>,
         pred: serde_json::Value,
         left_schema: planner_types::post_asap::SummarySchema,
         right_schema: planner_types::post_asap::SummarySchema,
@@ -613,15 +616,6 @@ pub enum QueryPlanNode {
     SummaryMerge {
         inputs: Vec<QueryNodeId>,
     },
-    /// Use an approximate heap only as a membership sidecar, then rerank the
-    /// matching exact counter readouts. `inputs[0]` is candidate membership;
-    /// `inputs[1]` is the authoritative exact value vector.
-    CandidateTopK {
-        inputs: [QueryNodeId; 2],
-        k: u64,
-        grouping: residual::Grouping,
-        completeness: CandidateCompleteness,
-    },
     /// An exact subtree evaluated outside ASAP. Its results enter the query DAG
     /// like any other node output and may depend on summary-produced inputs.
     ExternalExact {
@@ -647,7 +641,6 @@ impl QueryPlanNode {
             Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
-            Self::CandidateTopK { inputs, .. } => inputs,
         }
     }
 }

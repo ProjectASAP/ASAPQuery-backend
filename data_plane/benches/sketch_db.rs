@@ -33,7 +33,7 @@ use asap_sketchlib::DdSketch;
 use asap_sketchlib::{HllSketch, HllVariant};
 use prost::Message;
 
-use data_plane::precompute_engine::operators::SumAccumulator;
+use asap_physical_operators::summary_kernels::SumAccumulator;
 use data_plane::storage_engines::sketch_db::data::{
     AccuracyBound, AggKind, AggregationType, Capability, SketchAlgorithm, SketchConfig,
     SketchEncoding,
@@ -52,6 +52,7 @@ fn encode_ddsketch(values: &[f64], alpha: f64) -> Vec<u8> {
         alpha: sk.alpha,
         store_counts: sk.store_counts.clone(),
         store_offset: sk.store_offset,
+        ..Default::default()
     };
     SketchEnvelope {
         sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),

@@ -346,6 +346,7 @@ fn build_dd_sketch_state(alpha: f64, store_counts: Vec<u64>, store_offset: i32) 
         alpha,
         store_counts,
         store_offset,
+        ..Default::default()
     }
 }
 
@@ -1435,6 +1436,7 @@ fn encode_dd_full_envelope(sk: &asap_sketchlib::DdSketch) -> Vec<u8> {
         alpha: sk.alpha,
         store_counts: sk.store_counts.clone(),
         store_offset: sk.store_offset,
+        ..Default::default()
     };
     SketchEnvelope {
         sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),

@@ -623,42 +623,39 @@ impl PrecomputePlan {
                             .filter(|edge| edge.consumer == id)
                             .collect();
                         use planner_types::post_asap::{
-                            ExecutableOperatorPayload as Payload, ExecutionTiming, ValueOperation,
+                            ExecutableOperatorPayload as Payload, ValueOperation,
                         };
                         if node.output_state
-                            != planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS
+                            != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
                         {
                             return Err(invalid());
                         }
                         match &node.payload {
                             Payload::Value {
                                 operation: ValueOperation::FinalizeExactAccumulator,
-                                timing: ExecutionTiming::MaintenanceTime,
                             } if children.len() == 1
                                 && frontiers.contains_key(&children[0].producer) => {}
-                            Payload::Binary {
-                                operator,
-                                timing: ExecutionTiming::MaintenanceTime,
-                            } if children.len() == 2
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Left
-                                    })
-                                    .count()
-                                    == 1
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Right
-                                    })
-                                    .count()
-                                    == 1
-                                && operator.vector_match.is_none()
-                                && matches!(
-                                    operator.kind,
-                                    planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
-                                ) =>
+                            Payload::Binary { operator }
+                                if children.len() == 2
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Left
+                                        })
+                                        .count()
+                                        == 1
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Right
+                                        })
+                                        .count()
+                                        == 1
+                                    && operator.vector_match.is_none()
+                                    && matches!(
+                                        operator.kind,
+                                        planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+                                    ) =>
                             {
                                 pending.extend(children.iter().map(|edge| edge.producer));
                             }
@@ -1056,7 +1053,7 @@ mod source_window_cohort_tests {
                 reduction: Reduction::by(vec![]),
                 grouping: Default::default(),
             },
-            output_state: ExecutionDataState::MAINTENANCE_SUMMARY,
+            output_state: ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: vec![],
                 time_index: None,

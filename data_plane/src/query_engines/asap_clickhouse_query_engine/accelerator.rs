@@ -361,10 +361,8 @@ mod tests {
         }
     }
 
-    use crate::{
-        precompute_engine::operators::SumAccumulator,
-        storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata},
-    };
+    use crate::storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata};
+    use asap_physical_operators::summary_kernels::SumAccumulator;
     use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
@@ -458,6 +456,7 @@ mod tests {
             QueryPlanNode::RelationalJoin {
                 inputs: [left, external],
                 join_kind: planner_types::pre_asap::JoinKind::Inner,
+                pruning: None,
                 pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
                     left: Rc::new(QueryExpr::Column(0)),
                     op: CompareOpKind::Eq,
@@ -668,7 +667,7 @@ mod tests {
                     root,
                     QueryPlanNode::Relational {
                         input: sort,
-                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0 })
+                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0, partition_by: planner_types::pre_asap::GroupKeys::none() })
                             .unwrap(),
                         input_schema: projected_schema.clone(),
                         output_schema: projected_schema,

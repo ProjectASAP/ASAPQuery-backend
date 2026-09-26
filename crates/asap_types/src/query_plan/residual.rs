@@ -36,11 +36,10 @@ pub enum ResidualQueryOperator {
         operation: Aggregation,
         grouping: Grouping,
     },
-    /// PromQL `topk(k, vector)` selection over values produced by the child.
-    /// This is distinct from a frequency-sketch TopK readout: any exact or
-    /// summary-backed instant-vector child may feed this query-time operator.
-    TopKSelection {
-        k: u64,
+    /// Select an ordered slice independently within each group.
+    Limit {
+        n: u64,
+        offset: u64,
         grouping: Grouping,
     },
     Binary {
@@ -52,6 +51,7 @@ pub enum ResidualQueryOperator {
     },
     Sort {
         descending: bool,
+        grouping: Grouping,
     },
     HistogramQuantile,
     Subquery {

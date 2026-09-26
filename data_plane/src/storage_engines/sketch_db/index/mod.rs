@@ -91,13 +91,13 @@ fn reconstruct_exact_agg(
     type_name: &str,
     bytes: &[u8],
 ) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
-    use crate::precompute_engine::operators::{
+    use crate::storage_engines::types::AggregateCore;
+    use asap_physical_operators::summary_kernels::{
         IncreaseAccumulator, KeyedCounterState, KeyedSumCountAccumulator, MaxAccumulator,
         MinAccumulator, SumAccumulator,
     };
-    use crate::storage_engines::types::AggregateCore;
     match type_name {
-        "PlannerExactAccumulatorV1" => crate::precompute_engine::operators::exact_accumulator::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
+        "PlannerExactAccumulatorV1" => asap_physical_operators::summary_kernels::exact::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
         "SumAccumulator" => SumAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
@@ -1571,12 +1571,12 @@ impl SketchStore {
         // string that had to agree with it.
         let rollup_value = payload
             .as_any()
-            .downcast_ref::<crate::precompute_engine::operators::MinAccumulator>()
+            .downcast_ref::<asap_physical_operators::summary_kernels::MinAccumulator>()
             .map(|acc| (RollupReduction::Min, acc.value))
             .or_else(|| {
                 payload
                     .as_any()
-                    .downcast_ref::<crate::precompute_engine::operators::MaxAccumulator>()
+                    .downcast_ref::<asap_physical_operators::summary_kernels::MaxAccumulator>()
                     .map(|acc| (RollupReduction::Max, acc.value))
             });
         let store = self
@@ -4403,7 +4403,7 @@ mod tests {
 
     #[test]
     fn precompute_payload_round_trips_through_storage() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
 
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
@@ -4444,7 +4444,7 @@ mod tests {
 
     #[test]
     fn query_precomputes_by_agg_returns_data_grouped_by_label_values() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
 
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
@@ -4598,7 +4598,7 @@ mod tests {
         assert!(sketch.as_sketch().is_some());
         assert!(sketch.as_exact_agg().is_none());
 
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
         let exact_agg = AggPayload::ExactAgg(Arc::new(SumAccumulator::with_sum(1.0)));
         assert!(exact_agg.as_sketch().is_none());
         assert!(exact_agg.as_exact_agg().is_some());
@@ -5202,7 +5202,6 @@ mod tests {
                 || !persistence.manifest.live_parts().is_empty(),
                 Duration::from_secs(5)
             ));
-            let old_parts = persistence.manifest.live_parts().len();
             store.remove_instance(old_sid).unwrap();
             assert!(resolver
                 .resolve_with_reactivation("metric", "group", "family", |sid| store
@@ -5227,7 +5226,20 @@ mod tests {
                 );
             }
             assert!(wait_until(
-                || persistence.manifest.live_parts().len() > old_parts,
+                || {
+                    // Old-series epochs may still publish after reactivation. Wait
+                    // for this series, not an unrelated increase in part count.
+                    persistence.manifest.live_parts().iter().any(|part| {
+                        let path =
+                            persistence::part::part_dir_path(&persistence.parts_root, part.part_id);
+                        persistence::part::PartReader::open(&path).is_ok_and(|reader| {
+                            reader
+                                .index_records()
+                                .iter()
+                                .any(|row| row.agg_id == new_sid && row.start_ts < 90_000)
+                        })
+                    })
+                },
                 Duration::from_secs(5)
             ));
             persistence.shutdown();
@@ -5342,7 +5354,7 @@ mod tests {
             850,
             BTreeMap::new(),
             (0, 30_000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::new())
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::new())
         ));
         // A flusher that captured metadata before completion cannot reopen it.
         writer.upsert_all(&[stale_record]).unwrap();
@@ -5767,7 +5779,7 @@ mod tests {
                     lv_zone("z0"),
                     (s, s + 30_000),
                     Box::new(
-                        crate::precompute_engine::operators::SumAccumulator::with_sum(
+                        asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
                             (i + 1) as f64,
                         ),
                     ),
@@ -5986,7 +5998,9 @@ mod tests {
                 lv_zone("z0"),
                 (s, s + 30_000),
                 Box::new(
-                    crate::precompute_engine::operators::SumAccumulator::with_sum((i + 1) as f64),
+                    asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
+                        (i + 1) as f64,
+                    ),
                 ),
             );
         }
@@ -6050,7 +6064,7 @@ mod tests {
                 lv_zone("z0"),
                 (s, s + 30_000),
                 Box::new({
-                    let mut acc = crate::precompute_engine::operators::SumAccumulator::new();
+                    let mut acc = asap_physical_operators::summary_kernels::SumAccumulator::new();
                     acc.update((i + 1) as f64);
                     acc.update(10.0);
                     acc
@@ -6243,8 +6257,8 @@ mod tests {
     // Flush and reopen must preserve Planner family rather than reconstructing Rate as Increase.
     #[test]
     fn planner_exact_families_survive_disk_eviction_and_restart() {
-        use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
         use crate::storage_engines::types::{AggregateCore, AggregationType};
+        use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
         let kinds = [
             AggregationType::Sum,
             AggregationType::Count,

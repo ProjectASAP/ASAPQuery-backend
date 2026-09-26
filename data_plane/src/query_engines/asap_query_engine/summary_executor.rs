@@ -70,9 +70,6 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 
-use crate::precompute_engine::operators::increase_accumulator::IncreaseAccumulator;
-use crate::precompute_engine::operators::max_accumulator::MaxAccumulator;
-use crate::precompute_engine::operators::min_accumulator::MinAccumulator;
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
@@ -81,6 +78,9 @@ use crate::storage_engines::sketch_db::query::delta_apply::{
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
 };
+use asap_physical_operators::summary_kernels::increase::IncreaseAccumulator;
+use asap_physical_operators::summary_kernels::max::MaxAccumulator;
+use asap_physical_operators::summary_kernels::min::MinAccumulator;
 
 /// Per-query, per-call execution context — constructed fresh for each
 /// incoming query (never shared across concurrent queries, never
@@ -251,7 +251,7 @@ impl GroupState {
 
         let planner_state = entries.iter().flat_map(|w| w.values()).any(|a| {
             a.as_any()
-                .is::<crate::precompute_engine::operators::exact_accumulator::ExactAccumulator>()
+                .is::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
         });
         // Temporal exact summaries are the hot path for long-window
         // dashboards. Merge their concrete, fixed-size states in one batch
@@ -1389,7 +1389,7 @@ fn find_metric(node: &SummaryNode) -> Option<String> {
         SummaryExpr::KeepPreAsap(qe) => find_metric_in_query_expr(qe),
         SummaryExpr::SummaryAgg { child, .. } => find_metric(child),
         SummaryExpr::SummaryEstimate { summary_input, .. } => find_metric(summary_input),
-        SummaryExpr::SummaryMerge { children } => children.first().and_then(|c| find_metric(c)),
+        SummaryExpr::SummaryMerge { children, .. } => children.first().and_then(|c| find_metric(c)),
         _ => None,
     }
 }
@@ -1441,7 +1441,7 @@ mod tests {
 
     #[test]
     fn keyed_count_state_follows_planner_family_and_query_readout() {
-        use crate::precompute_engine::operators::KeyedSumCountAccumulator;
+        use asap_physical_operators::summary_kernels::KeyedSumCountAccumulator;
         use asap_types::query_plan::ExactReadout;
 
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
@@ -1958,9 +1958,9 @@ mod tests {
     /// One installed frequency summary merges panes before all four readouts.
     #[test]
     fn bound_univmon_merges_panes_for_four_readouts() {
-        use crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
         use crate::storage_engines::sketch_db::index::SketchEncoding;
         use crate::storage_engines::types::SerializableToSink;
+        use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
         use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
         let index = SketchStore::new();
         let fp = asap_types::PolicyFingerprint(701);
@@ -3190,13 +3190,13 @@ mod tests {
             sid,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(10.0)),
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(10.0)),
         );
         idx.append_precompute(
             sid,
             BTreeMap::new(),
             (T0 + 1000, T0 + 2000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(15.0)),
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(15.0)),
         );
 
         let child = scan_node("bytes_total", None);
@@ -3296,13 +3296,13 @@ mod tests {
             1,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(30.0)),
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(30.0)),
         );
         idx.append_precompute(
             2,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(12.0)),
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(12.0)),
         );
 
         let child = scan_node("bytes_total", None);
@@ -3342,7 +3342,7 @@ mod tests {
             sid,
             BTreeMap::new(),
             (T0, T0 + 1000),
-            Box::new(crate::precompute_engine::operators::MaxAccumulator::new()),
+            Box::new(asap_physical_operators::summary_kernels::MaxAccumulator::new()),
         );
 
         let child = scan_node("latency_max_ms", None);

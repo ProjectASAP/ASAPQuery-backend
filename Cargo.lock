@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cd7e9e0f710816d49190dabd6c789359067a208f#cd7e9e0f710816d49190dabd6c789359067a208f"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=b58f24268270a4dd7b7caaf0076ea3db842f3e9b#b58f24268270a4dd7b7caaf0076ea3db842f3e9b"
 dependencies = [
  "asap-types",
  "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib)",
@@ -376,7 +376,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cd7e9e0f710816d49190dabd6c789359067a208f#cd7e9e0f710816d49190dabd6c789359067a208f"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=b58f24268270a4dd7b7caaf0076ea3db842f3e9b#b58f24268270a4dd7b7caaf0076ea3db842f3e9b"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0 (git+https://github.com/ProjectASAP/promql-parser?rev=9fede7eecca923c9882fe256484d00d37f8706cb)",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cd7e9e0f710816d49190dabd6c789359067a208f#cd7e9e0f710816d49190dabd6c789359067a208f"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=b58f24268270a4dd7b7caaf0076ea3db842f3e9b#b58f24268270a4dd7b7caaf0076ea3db842f3e9b"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -394,14 +394,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "asap-physical-operators"
+version = "0.1.0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=b58f24268270a4dd7b7caaf0076ea3db842f3e9b#b58f24268270a4dd7b7caaf0076ea3db842f3e9b"
+dependencies = [
+ "asap-types",
+ "asap_sketch_codec",
+ "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?rev=5f03ccbd798ed5fec62bdd839bcb331123cab369)",
+ "base64 0.21.7",
+ "bincode",
+ "futures",
+ "prost",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cd7e9e0f710816d49190dabd6c789359067a208f#cd7e9e0f710816d49190dabd6c789359067a208f"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=b58f24268270a4dd7b7caaf0076ea3db842f3e9b#b58f24268270a4dd7b7caaf0076ea3db842f3e9b"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cd7e9e0f710816d49190dabd6c789359067a208f#cd7e9e0f710816d49190dabd6c789359067a208f"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=b58f24268270a4dd7b7caaf0076ea3db842f3e9b#b58f24268270a4dd7b7caaf0076ea3db842f3e9b"
 dependencies = [
  "serde",
  "serde_json",
@@ -422,16 +442,18 @@ dependencies = [
 [[package]]
 name = "asap_sketch_codec"
 version = "0.1.0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=b58f24268270a4dd7b7caaf0076ea3db842f3e9b#b58f24268270a4dd7b7caaf0076ea3db842f3e9b"
 dependencies = [
- "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?branch=main)",
+ "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?rev=5f03ccbd798ed5fec62bdd839bcb331123cab369)",
  "prost",
 ]
 
 [[package]]
 name = "asap_sketchlib"
 version = "0.3.0"
-source = "git+https://github.com/ProjectASAP/asap_sketchlib?branch=main#026cd18c7b8c23ae6c46d4d683151ba562b8cd3a"
+source = "git+https://github.com/ProjectASAP/asap_sketchlib?rev=5f03ccbd798ed5fec62bdd839bcb331123cab369#5f03ccbd798ed5fec62bdd839bcb331123cab369"
 dependencies = [
+ "bincode",
  "bytes",
  "prost",
  "rand 0.9.5",
@@ -467,6 +489,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asap-aware-mapping",
+ "asap-physical-operators",
  "asap-types",
  "base64 0.21.7",
  "clap",
@@ -945,6 +968,7 @@ dependencies = [
  "asap-aware-mapping",
  "asap-frontend-promql",
  "asap-frontend-sql",
+ "asap-physical-operators",
  "asap-types",
  "asap_types",
  "axum",
@@ -1155,10 +1179,11 @@ dependencies = [
  "arrow",
  "asap-aware-mapping",
  "asap-frontend-promql",
+ "asap-physical-operators",
  "asap-types",
  "asap_otel_proto",
  "asap_sketch_codec",
- "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?branch=main)",
+ "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?rev=5f03ccbd798ed5fec62bdd839bcb331123cab369)",
  "asap_types",
  "async-trait",
  "axum",
