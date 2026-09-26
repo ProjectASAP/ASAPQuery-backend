@@ -64,8 +64,9 @@ Collector dependencies, including `asap-precompute-rs` and Collector patches.
 
 ### 3.2 Deployment binding
 
-Adopt the Planner-owned typed computation export and versioned canonicalization
-contract for SDS definitions. Persist the full definition closure before records
+Adopt the Planner-owned semantic-description export and versioned canonicalization
+contract for SDS definitions, independent of internal executable IR serialization.
+Persist only the semantic dependency closure needed to interpret each output before records
 can reference semantic fingerprints. Definitions derived from incomplete legacy
 metadata must be reconstructed from authoritative plans or rejected for rebuild;
 do not infer missing expressions from source and grouping alone.

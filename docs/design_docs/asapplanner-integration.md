@@ -56,6 +56,17 @@ Backend
 | Shared physical library | Operator execution, per-run sharing, backpressure, cancellation and resource contracts |
 | SummaryStore | Committed definitions and stored records, lookup, recovery and reclamation |
 
+The Deployment Plan Compiler binds a realization satisfying Planner requirements;
+it does not repair an unsupported candidate or repeat lifecycle planning. For
+example, Planner may require retention of at least ten minutes, the compiler
+may bind a permitted fifteen-minute retention configuration, and the runtime
+actually retains and reclaims records. If the requirement specifies an exact
+policy rather than a minimum, the binding must preserve that policy.
+
+**Build, merge and readout are reusable operators, not deployment-phase classes.**
+Planner may place a build in a query DAG or a readout before a persisted scalar
+output. Backend execution respects the selected graph boundaries.
+
 Capabilities and scoped cost evidence flow from the backend to Planner selection.
 Missing support makes a candidate unavailable. Deployment compilation validates
 the selected realization; it does not repair an unsupported candidate by changing
@@ -71,7 +82,7 @@ One installed version contains:
 
 | Part | Content |
 | --- | --- |
-| Summary definitions | Persisted canonical Planner computation definitions referenced by stored outputs |
+| Summary definitions | Persisted semantic definitions referenced by stored outputs |
 | PrecomputePlan | Planner-provided maintenance Physical DAGs, input/output bindings, schedules and retention/publication policy |
 | QueryPlan | Planner-provided query Physical DAGs, input bindings, query associations and explicit fallback policy |
 
@@ -126,36 +137,22 @@ The backend adds operational bindings. This YAML illustrates ownership and is
 not a proposed Rust or wire schema:
 
 ```yaml
-plan_version: 42
-summary_definitions:
-  - id: <latency-kll-1m-semantic-fingerprint>
-    planner_ir_version: <supported-version>
-    canonicalization_version: <normalization-version>
-    computation: <canonical-typed-Planner-fragment-for-one-minute-KLL-output>
-    output: <state-root>
-    parameters: <Planner-exported-time-and-input-contract>
+precompute:
+  dag: planner.maintenance_dag
+  inputs: {raw-pane: latency_source}
+  outputs: {kll-state: stored_output.latency-panes}
 
-precompute_plan:
-  physical_dag: planner.maintenance_dag
-  inputs:
-    raw-pane: {source: latency_source, scope: scheduled_complete_pane}
-  outputs:
-    kll-state:
-      reference: {stored_output_id: latency-panes, definition_id: <latency-kll-1m-semantic-fingerprint>}
-      format: {schema: kll-v1, encoding: kll-binary-v1}
-  schedule: {every: 1m, anchor: unix_epoch, require: complete_input}
-  retention: {minimum: selected_lifecycle_requirement}
-
-query_plan:
-  physical_dag: planner.query_dag
-  inputs:
-    compatible-pane:
-      reference: {stored_output_id: latency-panes, definition_id: <latency-kll-1m-semantic-fingerprint>}
-      selection: complete_nonoverlapping_panes_for_requested_range
-      expected_format: {schema: kll-v1, encoding: kll-binary-v1}
+query:
+  dag: planner.query_dag
+  inputs: {compatible-pane: stored_output.latency-panes}
   outputs: {p50: query_p50, p99: query_p99}
-  on_unready: unavailable
 ```
+
+SDS defines semantic identity, format, coverage and version validation. The
+installed bundle also binds the selected maintenance schedule, retention and
+unavailability policy; those fields are omitted here to show the shared-output
+connection clearly. DAG references resolve within the installed bundle, not to
+live Planner objects.
 
 For `(12:00, 12:05]`, the query engine resolves five one-minute records for the
 requested group, validates their format, coverage and revision compatibility,
@@ -179,7 +176,7 @@ Compilation opens no readers and does not establish future state readiness.
 
 For each selected physical candidate, the compiler:
 
-1. Verifies that the backend can supply every input and operate the selected
+1. Verifies that the backend runtime can supply every input and fulfill the selected
    maintenance requirements without changing their semantics.
 2. Binds raw inputs and assigns identities to persisted physical outputs.
 3. Connects stored-state inputs to those outputs, with matching definitions,
@@ -194,7 +191,6 @@ backend supports all of them. An unsupported output is rejected or excluded
 through Planner feasibility selection, never silently replaced with another
 frontier.
 
-Build, merge and readout are reusable operators, not deployment-phase classes.
 A query-only candidate can build state during a query; a precompute candidate
 can finalize values before persisting them. The backend follows the selected
 Physical DAGs rather than enforcing build-only/estimate-only phase rules.
