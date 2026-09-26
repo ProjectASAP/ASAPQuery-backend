@@ -283,6 +283,22 @@ impl ASAPQueryEngine {
             physical.query_plan.plan_id,
             physical.query_plan.plan_version,
         )?;
+        // Native installed DAGs require no remote request preparation. Avoid
+        // constructing evaluation-grid maps for this common deployment path.
+        // Subqueries and raw scans still take the checked preparation path.
+        if entry.nodes.values().all(|node| match node {
+            asap_types::query_plan::QueryPlanNode::ExternalExact { .. } => false,
+            asap_types::query_plan::QueryPlanNode::Logical { operator, .. } => !matches!(
+                operator,
+                asap_types::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
+                    | asap_types::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }
+                    | asap_types::query_plan::residual::ResidualQueryOperator::Subquery { .. }
+                    | asap_types::query_plan::residual::ResidualQueryOperator::Scan { .. }
+            ),
+            _ => true,
+        }) {
+            return Ok(super::logical_dag::PreparedLeaves::new());
+        }
         // Candidate-filtered exact cuts have a data dependency: read the
         // installed membership subtree once, then use that vector to build the
         // Prometheus selector. Keeping the result as a prepared leaf also means
