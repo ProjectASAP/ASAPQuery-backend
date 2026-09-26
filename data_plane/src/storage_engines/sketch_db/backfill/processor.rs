@@ -340,6 +340,7 @@ impl WindowProcessor for BackfillWindowProcessor {
                     for (_handle, output, accumulator) in &batch {
                         let reference = output
                             .stored_output_reference
+                            .clone()
                             .ok_or("backfill has no selected stored output")?;
                         let (plan_id, plan_version) = self
                             .catalog_generation
@@ -349,7 +350,7 @@ impl WindowProcessor for BackfillWindowProcessor {
                         let address = asap_types::sds::StoredSummaryKey {
                             plan_id,
                             plan_version,
-                            output: reference,
+                            stored_output_id: reference.stored_output_id,
                             population: config
                                 .grouping_labels
                                 .iter()

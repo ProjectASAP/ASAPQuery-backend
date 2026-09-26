@@ -635,7 +635,7 @@ mod tests {
                     endpoint_path: "/v1/metrics".into(),
                     timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
                     require_plan_identity: true,
-                    require_summary_definition_identity: true,
+                    require_stored_output_identity: true,
                     require_registered_producer: true,
                 },
                 schemas: Vec::new(),
