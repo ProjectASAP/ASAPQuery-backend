@@ -58,6 +58,15 @@ pub fn artifact_from_materializations(
     // identities and bindings.
     for config in &mut configs {
         config.pane_origin_ms.get_or_insert(0);
+        // These fixtures import synthetic states and replace the producer's
+        // window layout. They do not install the original Planner DAG, so
+        // describe the supplied source/configuration instead of claiming its
+        // persisted-output closure. Derived inputs require the real DAG.
+        assert!(
+            config.derived_input.is_none(),
+            "use the Planner plan for derived inputs"
+        );
+        config.semantic_fragment = None;
     }
     let catalog = control_plane::physical::summary_catalog::SummaryCatalog::from_materializations(
         1, 1, &configs,
