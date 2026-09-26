@@ -82,6 +82,33 @@ where
     Ok(outputs.remove(0))
 }
 
+fn node_syntax(payload: &ExecutableOperatorPayload) -> String {
+    let details = match payload {
+        ExecutableOperatorPayload::Fallback { .. } => String::new(),
+        ExecutableOperatorPayload::Binary { operator } => {
+            format!("operator={operator:?}")
+        }
+        ExecutableOperatorPayload::Value { operation } => {
+            format!("operation={operation:?}")
+        }
+        ExecutableOperatorPayload::RelationalJoin { join_kind, .. } => {
+            format!("join_kind={join_kind:?}")
+        }
+        ExecutableOperatorPayload::SummaryAgg {
+            family,
+            input,
+            reduction,
+            ..
+        } => format!("family={family:?} input={input:?} reduction={reduction:?}"),
+        ExecutableOperatorPayload::SummaryJoin { family, .. } => format!("family={family:?}"),
+        ExecutableOperatorPayload::SummarySubtract => String::new(),
+        ExecutableOperatorPayload::SummaryDelete { .. } => String::new(),
+        ExecutableOperatorPayload::SummaryEstimate { query } => format!("readout={query:?}"),
+        ExecutableOperatorPayload::SummaryMerge => String::new(),
+    };
+    details.chars().take(256).collect()
+}
+
 /// Evaluate all selected stored outputs with one dependency cache. Keys must
 /// describe the same input revision and window; only their output identity may
 /// differ. Validation finishes before executing or committing any output.
@@ -270,10 +297,12 @@ where
                         }
                     };
                     if committed.contains(&node.0) {
+                        tracing::debug!(target: "asap_runtime_debug", sink_node_id = node.0, "precompute DAG reused committed sink");
                         Ok(value)
                     } else {
-                        sink.commit_if_absent(key.clone(), value)
-                            .map_err(ScheduleError::Sink)
+                        let value = sink.commit_if_absent(key.clone(), value).map_err(ScheduleError::Sink)?;
+                        tracing::debug!(target: "asap_runtime_debug", sink_node_id = node.0, "precompute DAG sink commit completed");
+                        Ok(value)
                     }
                 }
             }),
@@ -310,6 +339,7 @@ impl<V, R: PrecomputeOperatorRegistry<V>>
     ) -> Result<execution::OutputStream<'a, Arc<V>>, execution::Error> {
         Ok(futures::stream::once(async move {
             if let Some(source) = &self.source {
+                tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, "precompute node used materialized input");
                 return Ok(Arc::clone(source));
             }
             let inputs =
@@ -323,10 +353,16 @@ impl<V, R: PrecomputeOperatorRegistry<V>>
                 .iter()
                 .map(|value| Arc::clone(value.value()))
                 .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, phase = ?self.node.output_state.timing, syntax = %node_syntax(&self.node.payload), "precompute node started");
             self.registry
                 .execute(self.node, &values, context)
-                .map(Arc::new)
+                .map(|value| {
+                    tracing::debug!(target: "asap_runtime_debug", node_id = self.node.id.0, elapsed_us = started.elapsed().as_micros() as u64, "precompute node completed");
+                    Arc::new(value)
+                })
                 .map_err(|e| {
+                    tracing::warn!(node_id = self.node.id.0, elapsed_us = started.elapsed().as_micros() as u64, "precompute node failed");
                     *self.error.borrow_mut() = Some(e);
                     execution::Error::Operator(format!("ingestion node {} failed", self.node.id.0))
                 })

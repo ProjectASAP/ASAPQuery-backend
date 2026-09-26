@@ -135,6 +135,7 @@ where
         for dependency in &dependencies {
             if let Some(id) = identities.get(dependency) {
                 runtime.borrow_mut().stats.memo_hits += 1;
+                tracing::debug!(target: "asap_runtime_debug", query_id = %entry.query_id, node_id = ?dependency.0, evaluation_ms = dependency.1, "installed query node reused within request");
                 input_ids.push(*id);
             } else {
                 if identities.len() >= 200_000 {
@@ -573,6 +574,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
                 }))
                 .await?;
             let values = values.iter().map(|v| v.value()).collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            tracing::debug!(target: "asap_runtime_debug", node_id = ?self.id, evaluation_ms = self.time, op = self.node.op_label(), syntax = %self.node.log_syntax(), "installed query node started");
             self.runtime
                 .borrow_mut()
                 .execute_node(
@@ -583,7 +586,11 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
                     &self.dependencies,
                     &context,
                 )
+                .inspect(|_| {
+                    tracing::debug!(target: "asap_runtime_debug", node_id = ?self.id, op = self.node.op_label(), elapsed_us = started.elapsed().as_micros() as u64, "installed query node completed");
+                })
                 .map_err(|error| {
+                    tracing::warn!(node_id = ?self.id, op = self.node.op_label(), elapsed_us = started.elapsed().as_micros() as u64, %error, "installed query node failed");
                     *self.error.borrow_mut() = Some(error);
                     physical::Error::Operator(format!(
                         "query node {} at {} failed",

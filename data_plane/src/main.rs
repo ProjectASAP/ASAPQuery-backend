@@ -171,10 +171,6 @@ struct Args {
     #[arg(long, default_value = "/var/log/asap")]
     output_dir: String,
 
-    /// Log level
-    #[arg(long, default_value = "INFO")]
-    log_level: String,
-
     /// Enable profiling (currently unused, kept for compatibility)
     #[arg(long)]
     do_profiling: bool,
@@ -519,7 +515,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging similar to Python's create_loggers function
     // Keep the guard alive for the entire lifetime of the application
-    let _log_guard = setup_logging(&args.output_dir, &args.log_level)?;
+    let _log_guard = setup_logging(&args.output_dir)?;
 
     info!("Starting Query Engine Rust");
     info!("Output directory: {}", args.output_dir);
@@ -1325,16 +1321,10 @@ async fn spawn_memory_diagnostics(
     }
 }
 
-fn setup_logging(
-    output_dir: &str,
-    log_level: &str,
-) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+fn setup_logging(output_dir: &str) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-    // Create env filter that respects RUST_LOG, with fallback to command line arg
-    let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(log_level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Create file appender for logging to file
     let file_appender = tracing_appender::rolling::never(output_dir, "query_engine.log");

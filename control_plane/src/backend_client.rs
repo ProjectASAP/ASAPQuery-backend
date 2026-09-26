@@ -268,12 +268,16 @@ impl BackendClient {
     }
 
     /// Publish one authoritative catalog generation and all plans that reference it.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = publication.transmission_plan.envelope.plan_id,
+            plan_version = publication.transmission_plan.envelope.plan_version))]
     pub async fn post_catalog_plan_typed(
         &self,
         publication: &crate::physical::publication::PhysicalPlanPublication,
         storage_routing: Option<serde_json::Value>,
         adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
+        tracing::debug!(target: "asap_runtime_debug", "backend plan stage request started");
         let body = publication
             .install_request(storage_routing, adaptation_evidence.to_vec())
             .map_err(|error| BackendPostError::Permanent(anyhow::anyhow!(error)))?;
@@ -285,6 +289,8 @@ impl BackendClient {
             .await
             .map_err(classify_reqwest_error)?;
         let status = response.status();
+        tracing::debug!(target: "asap_runtime_debug", http_status = %status,
+            "backend plan stage response received");
         if status.is_success() {
             Ok(())
         } else {
@@ -297,11 +303,18 @@ impl BackendClient {
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        target = "asap_runtime_debug",
+        skip_all,
+        fields(plan_id, plan_version)
+    )]
     pub async fn discard_staged_physical_plan(
         &self,
         plan_id: u64,
         plan_version: u64,
     ) -> std::result::Result<(), BackendPostError> {
+        tracing::debug!(target: "asap_runtime_debug", "staged backend plan cleanup requested");
         let response = self
             .http
             .post(format!(
@@ -324,11 +337,18 @@ impl BackendClient {
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        target = "asap_runtime_debug",
+        skip_all,
+        fields(plan_id, plan_version)
+    )]
     pub async fn activate_physical_plan(
         &self,
         plan_id: u64,
         plan_version: u64,
     ) -> std::result::Result<(), BackendPostError> {
+        tracing::debug!(target: "asap_runtime_debug", "backend plan activation request started");
         let url = format!("{}/activate", derive_physical_plan_url(&self.endpoint));
         let response = self
             .http
@@ -341,6 +361,8 @@ impl BackendClient {
             .await
             .map_err(classify_reqwest_error)?;
         let status = response.status();
+        tracing::debug!(target: "asap_runtime_debug", http_status = %status,
+            "backend plan activation response received");
         if status.is_success() {
             Ok(())
         } else {

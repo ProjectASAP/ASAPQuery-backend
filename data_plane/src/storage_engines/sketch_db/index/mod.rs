@@ -983,11 +983,14 @@ impl SketchStore {
         self.install_catalog_outputs(catalog, outputs)
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(plan_id = catalog.plan_id, plan_version = catalog.plan_version))]
     fn install_catalog_outputs(
         &self,
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
         outputs: BTreeMap<StoredOutputId, StoredOutputReference>,
     ) -> Result<(), String> {
+        tracing::debug!(target: "asap_runtime_debug", "summary store catalog installation started");
         for (definition, output) in &outputs {
             output.validate().map_err(|e| e.to_string())?;
             if output.stored_output_id != *definition
@@ -1082,12 +1085,24 @@ impl SketchStore {
         // producer cannot mutate a new generation before its receipt is rejected.
         let mut inventory = self.admission.write().unwrap();
         if inventory.validate_publication(generation, coordinate, first_revision, revision)? {
+            tracing::debug!(target: "asap_runtime_debug", plan_id = generation.plan_id,
+                plan_version = generation.plan_version,
+                stored_output = coordinate.stored_output_id.as_u64(),
+                window_start_ms = coordinate.time_range.start_ms,
+                window_end_ms = coordinate.time_range.end_ms, revision,
+                "SDS summary publication replay acknowledged");
             return Ok(());
         }
         let series_id =
             persist(&SummaryPublicationWriter(self)).ok_or("summary state publication failed")?;
         inventory.record_series(generation, coordinate, series_id)?;
         inventory.acknowledge(generation, coordinate, revision)?;
+        tracing::debug!(target: "asap_runtime_debug", plan_id = generation.plan_id,
+            plan_version = generation.plan_version, sid = series_id,
+            stored_output = coordinate.stored_output_id.as_u64(),
+            window_start_ms = coordinate.time_range.start_ms,
+            window_end_ms = coordinate.time_range.end_ms, revision,
+            "SDS summary publication acknowledged");
         self.admitted_mutations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let floor = coordinate
@@ -1782,6 +1797,7 @@ impl SketchStore {
         start_unix_ms: u64,
         end_unix_ms: u64,
     ) -> Vec<SketchTimeSeries> {
+        let started = std::time::Instant::now();
         if self
             .incomplete_summary_lineages
             .get(&sid)
@@ -1792,6 +1808,8 @@ impl SketchStore {
                 })
             })
         {
+            tracing::debug!(target: "asap_runtime_debug", sid, start_unix_ms, end_unix_ms,
+                reason = "incomplete_summary_lineage", "SketchStore sketch range read skipped");
             return Vec::new();
         }
         // Result is keyed by the resolved label MAP so the in-memory tier
@@ -1985,14 +2003,18 @@ impl SketchStore {
         // state; the guard is belt-and-suspenders).
         self.union_disk_parts_into(sid, start_unix_ms, end_unix_ms, &mut by_label_map);
 
-        by_label_map
+        let result: Vec<_> = by_label_map
             .into_iter()
             .map(|(label_values, samples)| SketchTimeSeries {
                 sid,
                 series_label_values: label_values,
                 samples,
             })
-            .collect()
+            .collect();
+        tracing::debug!(target: "asap_runtime_debug", sid, start_unix_ms, end_unix_ms,
+            series_count = result.len(), elapsed_us = started.elapsed().as_micros() as u64,
+            "SketchStore sketch range read completed");
+        result
     }
 
     /// Resolve the sorted group-by KEYS for a sid from its instance
@@ -2227,6 +2249,7 @@ impl SketchStore {
         BTreeMap<String, String>,
         BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
     )> {
+        let started = std::time::Instant::now();
         // Key by the resolved label MAP (not `LabelValuesId`) so the
         // in-memory tier and the durable disk tier — which carry
         // independent intern spaces — union by label identity. Mirrors
@@ -2287,7 +2310,11 @@ impl SketchStore {
         // of the range. In-memory wins on a window-end collision.
         self.union_disk_exact_agg_into(sid, start_unix_ms, end_unix_ms, &mut by_label_map);
 
-        by_label_map.into_iter().collect()
+        let result: Vec<_> = by_label_map.into_iter().collect();
+        tracing::debug!(target: "asap_runtime_debug", sid, start_unix_ms, end_unix_ms,
+            series_count = result.len(), elapsed_us = started.elapsed().as_micros() as u64,
+            "SketchStore exact range read completed");
+        result
     }
 
     /// Union the durable disk tier's exact-aggregation entries into
@@ -3413,6 +3440,13 @@ impl SketchStore {
                 accumulator.clone_boxed_core(),
             ),
         };
+        tracing::debug!(target: "asap_runtime_debug", sid,
+            policy_fp = %output.policy_fp,
+            aggregation_type = ?agg_cfg.aggregation_type,
+            window_start_ms = output.start_timestamp,
+            window_end_ms = output.end_timestamp,
+            accepted,
+            "SketchStore precompute window append completed");
         accepted.then_some(sid)
     }
 }

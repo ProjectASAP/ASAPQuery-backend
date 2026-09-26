@@ -5,7 +5,7 @@ use crate::storage_engines::types::hot_reload_config::InstalledPrecomputePlanHan
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{debug_span, warn};
+use tracing::{debug, debug_span, warn};
 
 /// CQ-6 — process-global fallback for the output-sink policy-miss
 /// counter, used when a `SketchStoreSink` was constructed without an
@@ -233,11 +233,15 @@ impl OutputSink for SketchStoreSink {
         if outputs.is_empty() {
             return Ok(());
         }
-        let _span = debug_span!("sketch_index_insert", batch_size = outputs.len()).entered();
+        let _span = debug_span!(target: "asap_runtime_debug", "sketch_index_insert",
+            batch_size = outputs.len())
+        .entered();
         let output_count = outputs.len();
         let failed = consume_in_order(outputs, |(output, accumulator)| {
             self.append_to_index(output, accumulator.as_ref())
         });
+        debug!(target: "asap_runtime_debug", output_count, failed,
+            "precompute output batch stored");
         if failed > 0 {
             return Err(format!(
                 "SketchStore rejected {failed} of {} completed outputs",
