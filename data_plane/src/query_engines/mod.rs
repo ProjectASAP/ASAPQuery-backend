@@ -16,7 +16,6 @@
 
 pub mod asap_clickhouse_query_engine;
 pub mod asap_query_engine;
-pub mod canonical;
 pub mod query_forwarding;
 pub mod query_result;
 pub mod routing;
