@@ -779,11 +779,7 @@ pub fn select_candidates(
 pub fn enumerate_exact_and_materialized_candidates(
     request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
-    let already_selected = super::maintained_population::supported(&request);
     let mut candidates = materialization_candidates(request)?;
-    if already_selected {
-        return Ok(candidates);
-    }
     let roots: Vec<_> = candidates
         .last()
         .expect("exact alternative")
@@ -957,6 +953,36 @@ mod tests {
                 .as_ref()
                 .is_some_and(|reason| reason.contains("external execution is unavailable"))
                 && candidate.total_cost.is_none()));
+    }
+
+    /// Selecting one population must not suppress candidates for other roots.
+    #[test]
+    fn existing_population_does_not_suppress_other_population_candidates() {
+        let mut input = fixture();
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        let template = queries[0].clone();
+        *queries = ["quantile by(job)(0.9,m)", "count by(job)(m)"]
+            .into_iter()
+            .map(|q| {
+                let mut entry = template.clone();
+                entry.query = planner_types::workload::Query(q.into());
+                entry
+            })
+            .collect();
+        let (mut request, _) = input.into_physical_compilation_request().unwrap();
+        let strategy = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+            &request.canonical_roots,
+        );
+        request.queries[0].selected_plan_root =
+            strategy.candidate(&request.canonical_roots[0]).unwrap();
+        request.queries[1].selected_plan_root =
+            crate::planner_selection::keep_pre_asap(&request.canonical_roots[1]).unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.queries.iter().all(|query| {
+                super::super::maintained_population::supported_node(&query.selected_plan_root)
+            })));
     }
 
     /// Instant counts select current membership, never accumulated observations.
