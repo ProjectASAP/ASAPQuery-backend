@@ -14,11 +14,10 @@
 //! projected into a physical-plan artifact with QueryPlan/SummaryCatalog
 //! bindings, then staged and activated before ingest.
 //!
-//! Planner owns the summary choice. These tests declare an accuracy target and
-//! build their payloads from whichever family and parameters it committed to —
-//! `materializations[0].aggregation_type` and `.parameters` — rather than
-//! pinning a family. Family selection itself is covered by the control-plane
-//! compiler tests.
+//! Quantile fixtures use Planner-selected materializations. CMS wire fixtures
+//! explicitly declare the imported payload family; they do not assert that a
+//! total-count query selects CMS. HLL and CountSketch production oracle tests
+//! live in `all_sketches_process_oracle_e2e`.
 //!
 //! Queries are registered with the grouping the producer's attribute set
 //! carries (`sum by (service) (...)`), because the population key the backend
@@ -206,6 +205,19 @@ fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMate
         .compile_promql(request, environment)
         .expect("physical compilation succeeds");
     plan.precompute_plan.materializations
+}
+
+/// Wire fixtures provide CMS bytes directly. Total-count planning can select
+/// an exact accumulator, so it must not be used to infer this payload's format.
+fn imported_cms_materializations(metric: &str) -> Vec<PrecomputeMaterialization> {
+    vec![physical_fixture::materialization(
+        metric,
+        asap_types::AggregationType::CountMinSketch,
+        std::collections::HashMap::from([
+            ("w".into(), serde_json::json!(512)),
+            ("d".into(), serde_json::json!(5)),
+        ]),
+    )]
 }
 
 /// Epsilon-delta accuracy target in the shape `QueryRequirements` expects.
@@ -879,8 +891,6 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
         "sum by (service) (quantile_over_time(0.5, request_size_bytes[1s]))",
         epsilon_delta(0.05, 0.05),
     );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
     post_full_config(&client, &stack, &materializations).await;
 
     let alpha = materializations[0].parameters["alpha"]
@@ -937,42 +947,16 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
     );
 }
 
-// ── Test 5 — full roundtrip with HLL (cardinality) ──────────────────────────
-//
-// HLL backs the cardinality readout. The workload pins HLL via
-// `sketch_type_override: Some(SketchType::HLL)`. The OTLP DP carries
-// a `HllSketchDataPoint` with `HyperLogLogState`. PromQL's
-// `count(metric)` is the spec's distinct-counting idiom — returns
-// the number of distinct label sets in the result vector — which
-// the analyzer routes to `Capability::CardinalityApprox` and the
-// reducer dispatches to the HLL cardinality readout.
-//
-// Closed by a chain of fixes:
-//   * `count(metric)` analyzer fix (PR #255)
-//   * `count` reducer alias (PR #255)
-//   * Vector-vs-Matrix instant-query response shape fix (this PR)
+// An imported CMS state remains readable through its installed count binding.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_query_full_roundtrip_hll() {
+async fn imported_cms_state_serves_count_query() {
     let stack = start_full_stack(19_565, 19_566).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "sum by (service) (count_over_time(unique_users_per_min[1s]))",
-        epsilon_delta(0.05, 0.05),
-    );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
+    let materializations = imported_cms_materializations("unique_users_per_min");
     post_full_config(&client, &stack, &materializations).await;
 
-    // Precision must match what the controller plans for this
-    // workload (`HLLDefaults` in `control_plane::types`). The
-    // accuracy_sla=0.05 above is > the precision_threshold (0.02),
-    // so the planner picks `precision_coarse = 10`. If the OTLP DP
-    // were sent with a different precision, the backend would
-    // register two separate sids for the same metric — one with
-    // policy_fp=UNSET (no matching policy params) — and the query
-    // wouldn't find the policy-tagged one.
     let (w, d) = extract_w_d(&materializations[0]);
     let cells = (w as usize) * (d as usize);
     let mut counts = vec![0i64; cells];
@@ -1032,42 +1016,19 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
     assert_eq!(
         status,
         "success",
-        "HLL cardinality query did not succeed:\n{}",
+        "Imported CMS count query did not succeed:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
 
-// ── Test 6 — wire-format roundtrip with CountSketch (frequency) ─────────────
-//
-// CountSketch backs FREQUENCY estimation — signed-counter matrix
-// producing approximate point-frequency answers. `top_endpoint_qps`
-// is the canonical TopK metric, so the planner pins
-// `with_heap: true` and the controller emits `CountSketchWithHeap`
-// (regardless of override). To match, the wire DP carries a
-// msgpack-encoded heap envelope, but the query
-// uses `count_over_time(...)` instead of `topk(...)` — the
-// reducer's `decode_frequency_total` reads row-0 of the underlying
-// matrix for heap-bearing variants too, so FrequencyEstimate works
-// on a heap-bearing SID.
-//
-// **Strict-success: `count_over_time(top_endpoint_qps[1s])`** binds
-// to `Capability::FrequencyEstimate(Any)`, which
-// `is_satisfied_by` accepts against
-// `FrequencyTopk(CountSketchWithHeap)` (heap is additional info
-// layered over the matrix — the matrix is a fully valid frequency
-// sketch on its own).
+// CMS transport binds the configured dimensions for the endpoint metric.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_query_full_roundtrip_count_sketch() {
+async fn imported_cms_top_endpoint_wire_roundtrip() {
     let stack = start_full_stack(19_567, 19_568).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "topk(3, sum by (service) (count_over_time(top_endpoint_qps[1s])))",
-        epsilon_delta(0.05, 0.05),
-    );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
+    let materializations = imported_cms_materializations("top_endpoint_qps");
     post_full_config(&client, &stack, &materializations).await;
 
     // Use the planner-picked `(w, d)` so the OTLP DP's wire-level
@@ -1159,16 +1120,11 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
 // matrix and returns the per-window total count.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
+async fn imported_cms_frequency_wire_roundtrip() {
     let stack = start_full_stack(19_569, 19_570).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "topk(3, sum by (service) (count_over_time(endpoint_request_freq[1s])))",
-        epsilon_delta(0.05, 0.05),
-    );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
+    let materializations = imported_cms_materializations("endpoint_request_freq");
     post_full_config(&client, &stack, &materializations).await;
 
     // Use planner-picked `(w, d)` so the wire DP's `rows`/`cols`
@@ -1293,14 +1249,11 @@ fn extract_w_d(agg: &PrecomputeMaterialization) -> (u32, u32) {
 // (Prometheus spec for range queries).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_range_query_count_over_time_cms() {
+async fn imported_cms_state_serves_range_query() {
     let stack = start_full_stack(19_575, 19_576).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "topk(3, sum by (service) (count_over_time(endpoint_request_freq[1s])))",
-        epsilon_delta(0.05, 0.05),
-    );
+    let materializations = imported_cms_materializations("endpoint_request_freq");
     post_full_config(&client, &stack, &materializations).await;
 
     let (w, d) = extract_w_d(&materializations[0]);
@@ -1902,34 +1855,15 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
     );
 }
 
-// ── Test — the live serving cutover MERGES the global-merge shape ─────────
-//    correctly, end to end (ASAPController#163/#165)
-//
-// `count(hll_metric)` with NO `by (...)` and MULTIPLE distinct-service HLL
-// sids used to be the ambiguous shape the design doc's "Grouping
-// semantics" section described: `SummaryAgg{by: []}` couldn't tell "no
-// grouping concept" from "reduce everything," so `live_serve.rs`'s
-// `ambiguous_merge_risk` gate DECLINED to serve it from the new path and
-// fell back to the legacy `evaluate_cardinality_global` special case.
-//
-// `Reduction` (ASAPController#165) resolves that: `count(...)` is a
-// genuine aggregation operator, so it lowers to `Reduce([])` and
-// `resolve_group_key` gives both sids the same group key -- the new path
-// merges them itself. The gate is gone; this SHOULD exercise the new
-// path serving the shape directly, not a fallback.
-//
-// The installed cardinality readout merges all bound series and windows.
+// Live serving keeps the two imported CMS series available.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_serve_hll_global_count_merges_across_sids() {
+async fn live_serve_cms_reads_independent_series() {
     let _live = LiveServeEnvGuard::enable();
 
     let stack = start_full_stack(19_595, 19_596).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "sum by (service) (count_over_time(unique_users_per_min[1s]))",
-        epsilon_delta(0.05, 0.05),
-    );
+    let materializations = imported_cms_materializations("unique_users_per_min");
     post_full_config(&client, &stack, &materializations).await;
 
     let (w, d) = extract_w_d(&materializations[0]);
