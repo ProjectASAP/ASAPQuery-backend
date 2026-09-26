@@ -959,6 +959,35 @@ mod tests {
                 && candidate.total_cost.is_none()));
     }
 
+    /// Instant counts select current membership, never accumulated observations.
+    #[test]
+    fn local_grouped_count_has_a_bindable_candidate() {
+        let mut input = fixture();
+        input.workload_cost_evidence = None;
+        input.physical_inputs.require_backend_local_execution = true;
+        input.data_workload.data_ingestion_interval.value =
+            Some(planner_types::workload::DurationMs(60_000));
+        input.physical_inputs.scrape_interval_ms = 60_000;
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        queries.truncate(1);
+        queries[0].query = planner_types::workload::Query("count by(job)(m)".into());
+        let plan = input.compile_promql().unwrap();
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .all(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::Logical {
+                    operator: crate::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                        readout: asap_types::query_plan::current_series::SeriesReadout::Count,
+                        ..
+                    },
+                    ..
+                }
+            ))));
+    }
+
     /// Deployment computes and compares complete costs without external quotes.
     #[test]
     fn deployment_automatically_prices_workload() {
