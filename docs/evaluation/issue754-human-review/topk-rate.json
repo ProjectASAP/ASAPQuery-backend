@@ -1,0 +1,2549 @@
+{
+  "envelope": {
+    "plan_id": 1947004944484088590,
+    "plan_version": 1,
+    "generated_at_unix_ms": 10000,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1",
+    "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+    "capability_snapshot_id": "asapquery-local-v1"
+  },
+  "summary_catalog": {
+    "schema_version": 4,
+    "plan_id": 1947004944484088590,
+    "plan_version": 1,
+    "summary_descriptors": {
+      "summary:v3:{\"fidelity\":{\"full_pane_coverage_required\":true,\"kind\":\"exact_counter\",\"model\":\"prometheus.extrapolated-rate.v1\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"Rate\",\"family\":{\"ExactAggregate\":[\"Rate\",\"Rate\"]},\"kind\":\"configured\",\"parameters\":{\"promql_right_closed\":true}},\"state_schema_version\":2}": {
+        "id": "summary:v3:{\"fidelity\":{\"full_pane_coverage_required\":true,\"kind\":\"exact_counter\",\"model\":\"prometheus.extrapolated-rate.v1\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"Rate\",\"family\":{\"ExactAggregate\":[\"Rate\",\"Rate\"]},\"kind\":\"configured\",\"parameters\":{\"promql_right_closed\":true}},\"state_schema_version\":2}",
+        "operator": {
+          "kind": "configured",
+          "family": {
+            "ExactAggregate": [
+              "Rate",
+              "Rate"
+            ]
+          },
+          "aggregation_type": "Rate",
+          "aggregation_sub_type": "",
+          "parameters": {
+            "promql_right_closed": true
+          }
+        },
+        "fidelity": {
+          "kind": "exact_counter",
+          "model": "prometheus.extrapolated-rate.v1",
+          "full_pane_coverage_required": true
+        },
+        "state_schema_version": 2
+      }
+    },
+    "data_descriptors": {
+      "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:PerEntity|32:asap.timestamped-observations.v2": {
+        "id": "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:PerEntity|32:asap.timestamped-observations.v2",
+        "source": {
+          "time_series": {
+            "metric": "data"
+          }
+        },
+        "value_projection": "sample_value",
+        "population_filter_canonical": "",
+        "group_by_keys": [],
+        "partitioning": "per_entity",
+        "observation_semantics": "asap.timestamped-observations.v2"
+      }
+    },
+    "outputs": {
+      "14425999489689100447": {
+        "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c",
+        "summary_descriptor_id": "summary:v3:{\"fidelity\":{\"full_pane_coverage_required\":true,\"kind\":\"exact_counter\",\"model\":\"prometheus.extrapolated-rate.v1\"},\"operator\":{\"aggregation_sub_type\":\"\",\"aggregation_type\":\"Rate\",\"family\":{\"ExactAggregate\":[\"Rate\",\"Rate\"]},\"kind\":\"configured\",\"parameters\":{\"promql_right_closed\":true}},\"state_schema_version\":2}",
+        "data_descriptor_id": "data:v2|33:{\"time_series\":{\"metric\":\"data\"}}|14:\"sample_value\"|0:|partition:PerEntity|32:asap.timestamped-observations.v2"
+      }
+    },
+    "definitions": {
+      "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c": {
+        "semantic_format_version": 1,
+        "semantics": {
+          "kind": "planner",
+          "fragment": {
+            "format_version": 1,
+            "output": "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d",
+            "nodes": {
+              "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                "operation": {
+                  "expression": {
+                    "Scan": {
+                      "predicates": [],
+                      "schema": {
+                        "closed": false,
+                        "columns": [
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": null
+                          }
+                        ],
+                        "time_index": 0,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "TimeSeries": {
+                          "metric": "data"
+                        }
+                      }
+                    }
+                  },
+                  "kind": "fallback"
+                },
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                },
+                "inputs": [],
+                "record_range": true
+              },
+              "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d": {
+                "operation": {
+                  "family": {
+                    "ExactAggregate": [
+                      "Rate",
+                      "Rate"
+                    ]
+                  },
+                  "grouping": "PerSubpopulationInstance",
+                  "input": {
+                    "item": null,
+                    "weight": {
+                      "Column": "SampleValue"
+                    },
+                    "weight_domain": {
+                      "kind": "unknown_or_signed"
+                    }
+                  },
+                  "kind": "summary_agg",
+                  "reduction": "PerEntity"
+                },
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "ExactAggregate": [
+                          "Rate",
+                          "Rate"
+                        ]
+                      },
+                      "name": "value",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                },
+                "inputs": [
+                  {
+                    "role": "Input",
+                    "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "collector_plans": [],
+  "precompute_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 1947004944484088590,
+      "plan_version": 1,
+      "snapshot_sha256": "3c2e5e458227264136ded8fd8cbaa3556c9c5d48e8bbff2731be198d7992c402"
+    },
+    "envelope": {
+      "plan_id": 1947004944484088590,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "ingest": {
+      "protocol": "prometheus_remote_write_v1",
+      "endpoint_path": "/api/v1/write",
+      "timestamp_unit": "unix_milliseconds",
+      "require_plan_identity": false,
+      "require_stored_output_identity": false,
+      "require_registered_producer": false
+    },
+    "schemas": [
+      {
+        "stored_output_reference": {
+          "stored_output_id": 14425999489689100447,
+          "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c"
+        },
+        "schema_id": "asap-query-backend.v1:summary-state:v1:14425999489689100447",
+        "schema_version": 1,
+        "materialization": 14425999489689100447,
+        "family": {
+          "family": "exact",
+          "kind": "rate"
+        },
+        "source": {
+          "TimeSeries": {
+            "metric": "data"
+          }
+        },
+        "value_projection": "sample_value",
+        "group_by": [],
+        "window": {
+          "kind": "sliding",
+          "size_ms": 60000,
+          "slide_ms": 10000,
+          "pane_origin_ms": 0
+        },
+        "encodings": [
+          "exact_counter_accumulator_v2",
+          "planner_exact_accumulator_v1"
+        ]
+      }
+    ],
+    "producers": [],
+    "materializations": [
+      {
+        "semantic_fragment": {
+          "format_version": 1,
+          "output": "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d",
+          "nodes": {
+            "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+              "operation": {
+                "expression": {
+                  "Scan": {
+                    "predicates": [],
+                    "schema": {
+                      "closed": false,
+                      "columns": [
+                        {
+                          "dtype": "timestamp",
+                          "name": "ts",
+                          "nullable": false,
+                          "table": null
+                        },
+                        {
+                          "dtype": "float64",
+                          "name": "value",
+                          "nullable": false,
+                          "table": null
+                        }
+                      ],
+                      "time_index": 0,
+                      "unique_keys": []
+                    },
+                    "source": {
+                      "TimeSeries": {
+                        "metric": "data"
+                      }
+                    }
+                  }
+                },
+                "kind": "fallback"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              },
+              "inputs": [],
+              "record_range": true
+            },
+            "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d": {
+              "operation": {
+                "family": {
+                  "ExactAggregate": [
+                    "Rate",
+                    "Rate"
+                  ]
+                },
+                "grouping": "PerSubpopulationInstance",
+                "input": {
+                  "item": null,
+                  "weight": {
+                    "Column": "SampleValue"
+                  },
+                  "weight_domain": {
+                    "kind": "unknown_or_signed"
+                  }
+                },
+                "kind": "summary_agg",
+                "reduction": "PerEntity"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "ExactAggregate": [
+                        "Rate",
+                        "Rate"
+                      ]
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              },
+              "inputs": [
+                {
+                  "role": "Input",
+                  "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd"
+                }
+              ]
+            }
+          }
+        },
+        "aggregation_type": "Rate",
+        "aggregation_sub_type": "",
+        "parameters": {
+          "promql_right_closed": true
+        },
+        "grouping_labels": {
+          "labels": []
+        },
+        "partitioning": "per_entity",
+        "aggregated_labels": {
+          "labels": []
+        },
+        "rollup_labels": {
+          "labels": []
+        },
+        "original_yaml": "",
+        "window_size": 60,
+        "slide_interval": 10,
+        "window_type": "sliding",
+        "window_layout": {
+          "kind": "pane",
+          "pane_secs": 10
+        },
+        "pane_origin_ms": 0,
+        "spatial_filter": "",
+        "spatial_filter_normalized": "",
+        "metric": "data",
+        "num_aggregates_to_retain": 7,
+        "table_name": null,
+        "value_projection": null
+      }
+    ],
+    "executable_dags": {
+      "compat-query-0": {
+        "document": {
+          "schema_version": 6,
+          "query_id": "compat-query-0",
+          "nodes": [
+            {
+              "id": 0,
+              "payload": {
+                "expression": {
+                  "TimeRange": {
+                    "child": {
+                      "Scan": {
+                        "predicates": [],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "value",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            }
+                          ],
+                          "time_index": 0,
+                          "unique_keys": []
+                        },
+                        "source": {
+                          "TimeSeries": {
+                            "metric": "data"
+                          }
+                        }
+                      }
+                    },
+                    "range": {
+                      "nanos": 0,
+                      "secs": 60
+                    }
+                  }
+                },
+                "kind": "fallback"
+              },
+              "output_state": {
+                "timing": "ingestion_time",
+                "primitive": "Raw"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  }
+                ],
+                "time_index": 0
+              },
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "KeepPreAsap"
+                  }
+                ]
+              }
+            },
+            {
+              "id": 1,
+              "payload": {
+                "family": {
+                  "ExactAggregate": [
+                    "Rate",
+                    "Rate"
+                  ]
+                },
+                "grouping": "PerSubpopulationInstance",
+                "input": {
+                  "item": null,
+                  "weight": {
+                    "Column": "SampleValue"
+                  },
+                  "weight_domain": {
+                    "kind": "unknown_or_signed"
+                  }
+                },
+                "kind": "summary_agg",
+                "reduction": "PerEntity"
+              },
+              "output_state": {
+                "timing": "ingestion_time",
+                "primitive": "SummaryState"
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "ExactAggregate": [
+                        "Rate",
+                        "Rate"
+                      ]
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  }
+                ],
+                "time_index": 0
+              },
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "ExactAggregate(Rate)"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "counter_rate"
+                    },
+                    "rule": "exact_input"
+                  }
+                ]
+              }
+            }
+          ],
+          "edges": [
+            {
+              "producer": 0,
+              "consumer": 1,
+              "role": "Input",
+              "intermediate_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  }
+                ],
+                "time_index": 0
+              },
+              "data_state": {
+                "timing": "ingestion_time",
+                "primitive": "Raw"
+              },
+              "grouping": "NotApplicable",
+              "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+            }
+          ],
+          "root": 1
+        },
+        "binding": {
+          "nodes": {
+            "0": {
+              "placement": "maintenance_input"
+            },
+            "1": {
+              "placement": "materialization",
+              "stored_output": 14425999489689100447
+            }
+          },
+          "query_sink": 4,
+          "query_plan_sink": 0,
+          "precompute_sinks": [
+            1
+          ]
+        }
+      }
+    }
+  },
+  "transmission_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 1947004944484088590,
+      "plan_version": 1,
+      "snapshot_sha256": "3c2e5e458227264136ded8fd8cbaa3556c9c5d48e8bbff2731be198d7992c402"
+    },
+    "envelope": {
+      "plan_id": 1947004944484088590,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "frame_identity": {
+      "identity_version": 1,
+      "sequence_scope": "materialization_series_producer_epoch",
+      "require_checkpoint_for_full": true,
+      "require_base_checkpoint_for_delta": true
+    },
+    "rules": []
+  },
+  "query_plan": {
+    "plan_id": 1947004944484088590,
+    "plan_version": 1,
+    "selected_dags": {
+      "compat-query-0": {
+        "schema_version": 5,
+        "query_id": "compat-query-0",
+        "nodes": [
+          {
+            "id": 0,
+            "payload": {
+              "expression": {
+                "TimeRange": {
+                  "child": {
+                    "Scan": {
+                      "predicates": [],
+                      "schema": {
+                        "closed": false,
+                        "columns": [
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "utf8",
+                            "name": "label_0",
+                            "nullable": true,
+                            "table": null
+                          }
+                        ],
+                        "time_index": 0,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "TimeSeries": {
+                          "metric": "data"
+                        }
+                      }
+                    }
+                  },
+                  "range": {
+                    "nanos": 0,
+                    "secs": 60
+                  }
+                }
+              },
+              "kind": "fallback"
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "KeepPreAsap"
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "payload": {
+              "family": {
+                "ExactAggregate": [
+                  "Rate",
+                  "Rate"
+                ]
+              },
+              "grouping": "PerSubpopulationInstance",
+              "input": {
+                "item": null,
+                "weight": {
+                  "Column": "SampleValue"
+                },
+                "weight_domain": {
+                  "kind": "unknown_or_signed"
+                }
+              },
+              "kind": "summary_agg",
+              "reduction": "PerEntity"
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "SummaryState"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "ExactAggregate": [
+                      "Rate",
+                      "Rate"
+                    ]
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "ExactAggregate(Rate)"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "zero"
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "absolute_value",
+                    "provenance": [
+                      {
+                        "kind": "exact",
+                        "reason": "KeepPreAsap"
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "counter_rate"
+                  },
+                  "rule": "exact_input"
+                }
+              ]
+            }
+          },
+          {
+            "id": 2,
+            "payload": {
+              "kind": "value",
+              "operation": "FinalizeExactAccumulator"
+            },
+            "output_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "ExactAggregate(Rate)"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "zero"
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "absolute_value",
+                    "provenance": [
+                      {
+                        "kind": "exact",
+                        "reason": "KeepPreAsap"
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "counter_rate"
+                  },
+                  "rule": "exact_input"
+                }
+              ]
+            }
+          },
+          {
+            "id": 3,
+            "payload": {
+              "kind": "value",
+              "operation": {
+                "Sort": {
+                  "keys": [
+                    {
+                      "ascending": false,
+                      "expr": {
+                        "Column": 1
+                      },
+                      "nulls_first": false
+                    }
+                  ],
+                  "partition_by": [
+                    2
+                  ]
+                }
+              }
+            },
+            "output_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "ExactAggregate(Rate)"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "zero"
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "absolute_value",
+                    "provenance": [
+                      {
+                        "kind": "exact",
+                        "reason": "KeepPreAsap"
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "counter_rate"
+                  },
+                  "rule": "exact_input"
+                }
+              ]
+            }
+          },
+          {
+            "id": 4,
+            "payload": {
+              "kind": "value",
+              "operation": {
+                "Limit": {
+                  "n": 3,
+                  "offset": 0,
+                  "partition_by": [
+                    2
+                  ]
+                }
+              }
+            },
+            "output_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "ExactAggregate(Rate)"
+                },
+                {
+                  "guarantee": {
+                    "bound": {
+                      "op": "zero"
+                    },
+                    "failure_probability": {
+                      "op": "zero"
+                    },
+                    "metric": "absolute_value",
+                    "provenance": [
+                      {
+                        "kind": "exact",
+                        "reason": "KeepPreAsap"
+                      }
+                    ]
+                  },
+                  "input_index": 0,
+                  "kind": "child_guarantee"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "counter_rate"
+                  },
+                  "rule": "exact_input"
+                }
+              ]
+            }
+          }
+        ],
+        "edges": [
+          {
+            "producer": 0,
+            "consumer": 1,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+          },
+          {
+            "producer": 1,
+            "consumer": 2,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "ExactAggregate": [
+                      "Rate",
+                      "Rate"
+                    ]
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "SummaryState"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          },
+          {
+            "producer": 2,
+            "consumer": 3,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          },
+          {
+            "producer": 3,
+            "consumer": 4,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          }
+        ],
+        "root": 4
+      }
+    },
+    "entries": {
+      "topk by (label_0) (3, rate(data[1m]))": {
+        "language": "prom_ql",
+        "query_id": "compat-query-0",
+        "canonical_query": "topk by (label_0) (3, rate(data[1m]))",
+        "root": 0,
+        "nodes": {
+          "0": {
+            "op": "logical",
+            "operator": {
+              "kind": "limit",
+              "n": 3,
+              "offset": 0,
+              "grouping": {
+                "labels": [
+                  "label_0"
+                ],
+                "without": false
+              }
+            },
+            "inputs": [
+              1
+            ]
+          },
+          "1": {
+            "op": "logical",
+            "operator": {
+              "kind": "sort",
+              "descending": true,
+              "grouping": {
+                "labels": [
+                  "label_0"
+                ],
+                "without": false
+              }
+            },
+            "inputs": [
+              2
+            ]
+          },
+          "2": {
+            "op": "exact_readout",
+            "input": 3,
+            "readout": "rate"
+          },
+          "3": {
+            "op": "read_materialization",
+            "binding": {
+              "stored_output_reference": {
+                "stored_output_id": 14425999489689100447,
+                "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c"
+              },
+              "materialization": 14425999489689100447,
+              "output_grouping": {
+                "mode": "per_entity"
+              },
+              "window_ms": 10000,
+              "pane_origin_ms": 0,
+              "readout_lookback_ms": 60000
+            }
+          }
+        },
+        "instant": {
+          "lookback_ms": 60000,
+          "full_history": false,
+          "cumulative_readout": true
+        },
+        "fallback": "exact_backend"
+      }
+    }
+  },
+  "storage_routing": {
+    "default_engine": "asap_query",
+    "metrics": [],
+    "tenant": "default"
+  },
+  "lifecycle_estimates": [
+    {
+      "materialization": 14425999489689100447,
+      "consumer_query_ids": [
+        "compat-query-0"
+      ],
+      "window_implementation_id": "backend-tumbling-v1-60s-slide-10s-pane-10s",
+      "horizon_seconds": 300.0,
+      "expected_reads": 30.0,
+      "expected_updates": 30000.0,
+      "lifecycle_cost": 44.3
+    }
+  ],
+  "cost_comparison": {
+    "logical_selection": [
+      {
+        "committed_roots": [
+          {
+            "logical_root_id": "asap-explain-v1:root:81ef074b5004020517dfe3b08372f20d4733d60c94cbdd5d152e8c59d741de49",
+            "query_index": 0
+          }
+        ],
+        "deployment_overrides": [],
+        "group_id_scope": "this_selection",
+        "groups": [
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 0,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:99e8fe24fbbd76ea4bbaa45c6b4bf6214a926befd5151ff132b80b749e2208e0"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 1,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:a50d6d62d7220346106b3da03dc6b932401aeb45b39f324d178c6a0e8fbb557c"
+          },
+          {
+            "candidates": [
+              {
+                "accuracy_status": "known",
+                "candidate_id": "asap-explain-v1:candidate:5d1e04b41b9b08e9d95d45bf9901d5d04f8753370cfd1514952f0c810ac2401e",
+                "cost_estimate": {
+                  "erp_record_ids": [],
+                  "model": "backend_state_footprint_v1",
+                  "source": "analytical",
+                  "unit": "bytes_per_state_partition",
+                  "value": 256.0
+                },
+                "decision_reason": "planner_selected_pending_backend_binding",
+                "estimated_cost": 256.0,
+                "estimated_cost_status": "available",
+                "guarantee": {
+                  "bound": {
+                    "op": "zero"
+                  },
+                  "failure_probability": {
+                    "op": "zero"
+                  },
+                  "metric": "absolute_value",
+                  "provenance": [
+                    {
+                      "kind": "exact",
+                      "reason": "ExactAggregate(Rate)"
+                    },
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "zero"
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "absolute_value",
+                        "provenance": [
+                          {
+                            "kind": "exact",
+                            "reason": "KeepPreAsap"
+                          }
+                        ]
+                      },
+                      "input_index": 0,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "kind": "composition_step",
+                      "operator": {
+                        "op": "counter_rate"
+                      },
+                      "rule": "exact_input"
+                    }
+                  ]
+                },
+                "provenance": "SummaryRealization",
+                "rank": 0,
+                "rationale": "Rate realizes as an exact Rate accumulator — the only realization realizations_for_intent produces for this intent (no approximate candidate applies)",
+                "replacement_kind": "summary",
+                "runtime_support_status": "unknown_pending_backend_binding",
+                "selected": true,
+                "status": "selected",
+                "strategy": "SketchAlgorithmStrategy"
+              }
+            ],
+            "consumer_count": 1,
+            "group_id": 2,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:a3a9acb3549f6001ac4363b3c5ff60902e6b2c7a6b616908bdbbdc664d803871"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 3,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:512c493adcba61b4e2671361d40d5de1504e9764d0460e910e0af51f79687b2c"
+          },
+          {
+            "candidates": [],
+            "consumer_count": 1,
+            "group_id": 4,
+            "rejected": [],
+            "target_id": "asap-explain-v1:target:e783e17c1544b382e37e5f2e9044762b2690f41d6bfbb80f8b2b7db8881ec1fd"
+          }
+        ],
+        "roots": [
+          {
+            "logical_root_id": "asap-explain-v1:root:81ef074b5004020517dfe3b08372f20d4733d60c94cbdd5d152e8c59d741de49",
+            "query_index": 0
+          }
+        ],
+        "schema_version": 1
+      }
+    ],
+    "materialization_search_coverage": null,
+    "data_snapshot_id": "issue-754-level1",
+    "model_version": "deterministic-test-costs",
+    "selected_plan_id": 1947004944484088590,
+    "selected_manifest": {
+      "plan_id": 1947004944484088590,
+      "plan_version": 1,
+      "planner_revision": "c27cd14b8e052ce1f4641c619488ad539ad71f56",
+      "capability_snapshot_id": "asapquery-local-v1",
+      "backend_compat": "asap-query-backend.v1",
+      "horizon_seconds": 300.0,
+      "workload": {
+        "compat-query-0": {
+          "accuracy": {
+            "EpsilonDelta": {
+              "delta": 0.01,
+              "epsilon": 0.01
+            }
+          },
+          "evaluation_interval_ms": 10000,
+          "query": "topk by (label_0) (3, rate(data[1m]))",
+          "source": {
+            "TimeSeries": {
+              "metric": "data"
+            }
+          }
+        }
+      },
+      "components": {
+        "query:compat-query-0:0": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "inputs": [
+                1
+              ],
+              "op": "logical",
+              "operator": {
+                "grouping": {
+                  "labels": [
+                    "label_0"
+                  ],
+                  "without": false
+                },
+                "kind": "limit",
+                "n": 3,
+                "offset": 0
+              }
+            },
+            "query": "topk by (label_0) (3, rate(data[1m]))"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "query:compat-query-0:1": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "inputs": [
+                2
+              ],
+              "op": "logical",
+              "operator": {
+                "descending": true,
+                "grouping": {
+                  "labels": [
+                    "label_0"
+                  ],
+                  "without": false
+                },
+                "kind": "sort"
+              }
+            },
+            "query": "topk by (label_0) (3, rate(data[1m]))"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "query:compat-query-0:2": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "input": 3,
+              "op": "exact_readout",
+              "readout": "rate"
+            },
+            "query": "topk by (label_0) (3, rate(data[1m]))"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "query:compat-query-0:3": {
+          "implementation": {
+            "instant": {
+              "cumulative_readout": true,
+              "full_history": false,
+              "lookback_ms": 60000
+            },
+            "node": {
+              "binding": {
+                "materialization": 14425999489689100447,
+                "output_grouping": {
+                  "mode": "per_entity"
+                },
+                "pane_origin_ms": 0,
+                "readout_lookback_ms": 60000,
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c",
+                  "stored_output_id": 14425999489689100447
+                },
+                "window_ms": 10000
+              },
+              "op": "read_materialization"
+            },
+            "query": "topk by (label_0) (3, rate(data[1m]))"
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "result:compat-query-0": {
+          "implementation": {
+            "query_id": "compat-query-0",
+            "root": 0
+          },
+          "unit": "query_evaluation",
+          "multiplicity": 30.0
+        },
+        "source:{\"ingest\":{\"endpoint_path\":\"/api/v1/write\",\"protocol\":\"prometheus_remote_write_v1\",\"require_plan_identity\":false,\"require_registered_producer\":false,\"require_stored_output_identity\":false,\"timestamp_unit\":\"unix_milliseconds\"},\"location\":\"backend\",\"source\":{\"TimeSeries\":{\"metric\":\"data\"}}}": {
+          "implementation": {
+            "ingest": {
+              "endpoint_path": "/api/v1/write",
+              "protocol": "prometheus_remote_write_v1",
+              "require_plan_identity": false,
+              "require_registered_producer": false,
+              "require_stored_output_identity": false,
+              "timestamp_unit": "unix_milliseconds"
+            },
+            "location": "backend",
+            "source": {
+              "TimeSeries": {
+                "metric": "data"
+              }
+            }
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:14425999489689100447:build": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Rate",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Rate",
+                            "Rate"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Rate",
+                                "Rate"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_counter_accumulator_v2",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "rate"
+                },
+                "group_by": [],
+                "materialization": 14425999489689100447,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:14425999489689100447",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c",
+                  "stored_output_id": 14425999489689100447
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "build"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:14425999489689100447:residency": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Rate",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Rate",
+                            "Rate"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Rate",
+                                "Rate"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_counter_accumulator_v2",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "rate"
+                },
+                "group_by": [],
+                "materialization": 14425999489689100447,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:14425999489689100447",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c",
+                  "stored_output_id": 14425999489689100447
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "residency"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:14425999489689100447:retire": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Rate",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Rate",
+                            "Rate"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Rate",
+                                "Rate"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_counter_accumulator_v2",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "rate"
+                },
+                "group_by": [],
+                "materialization": 14425999489689100447,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:14425999489689100447",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c",
+                  "stored_output_id": 14425999489689100447
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "retire"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        },
+        "state:backend:14425999489689100447:update": {
+          "implementation": {
+            "binding": {
+              "location": "backend",
+              "physical": {
+                "aggregated_labels": {
+                  "labels": []
+                },
+                "aggregation_sub_type": "",
+                "aggregation_type": "Rate",
+                "grouping_labels": {
+                  "labels": []
+                },
+                "metric": "data",
+                "num_aggregates_to_retain": 7,
+                "original_yaml": "",
+                "pane_origin_ms": 0,
+                "parameters": {
+                  "promql_right_closed": true
+                },
+                "partitioning": "per_entity",
+                "rollup_labels": {
+                  "labels": []
+                },
+                "semantic_fragment": {
+                  "format_version": 1,
+                  "nodes": {
+                    "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd": {
+                      "inputs": [],
+                      "operation": {
+                        "expression": {
+                          "Scan": {
+                            "predicates": [],
+                            "schema": {
+                              "closed": false,
+                              "columns": [
+                                {
+                                  "dtype": "timestamp",
+                                  "name": "ts",
+                                  "nullable": false,
+                                  "table": null
+                                },
+                                {
+                                  "dtype": "float64",
+                                  "name": "value",
+                                  "nullable": false,
+                                  "table": null
+                                }
+                              ],
+                              "time_index": 0,
+                              "unique_keys": []
+                            },
+                            "source": {
+                              "TimeSeries": {
+                                "metric": "data"
+                              }
+                            }
+                          }
+                        },
+                        "kind": "fallback"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "Plain": "float64"
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      },
+                      "record_range": true
+                    },
+                    "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d": {
+                      "inputs": [
+                        {
+                          "node": "2c217c08abcc91a7c51e758d2b10849d2c4f8464dae6dd7b1b0c50f64643a4dd",
+                          "role": "Input"
+                        }
+                      ],
+                      "operation": {
+                        "family": {
+                          "ExactAggregate": [
+                            "Rate",
+                            "Rate"
+                          ]
+                        },
+                        "grouping": "PerSubpopulationInstance",
+                        "input": {
+                          "item": null,
+                          "weight": {
+                            "Column": "SampleValue"
+                          },
+                          "weight_domain": {
+                            "kind": "unknown_or_signed"
+                          }
+                        },
+                        "kind": "summary_agg",
+                        "reduction": "PerEntity"
+                      },
+                      "output_schema": {
+                        "fields": [
+                          {
+                            "dtype": {
+                              "Plain": "timestamp"
+                            },
+                            "name": "ts",
+                            "nullable": false
+                          },
+                          {
+                            "dtype": {
+                              "ExactAggregate": [
+                                "Rate",
+                                "Rate"
+                              ]
+                            },
+                            "name": "value",
+                            "nullable": false
+                          }
+                        ],
+                        "time_index": 0
+                      }
+                    }
+                  },
+                  "output": "37611019d35e7390b10bb8cb5d15c910bd13254caf2bd8eb497873f86325f94d"
+                },
+                "slide_interval": 10,
+                "spatial_filter": "",
+                "spatial_filter_normalized": "",
+                "table_name": null,
+                "value_projection": null,
+                "window_layout": {
+                  "kind": "pane",
+                  "pane_secs": 10
+                },
+                "window_size": 60,
+                "window_type": "sliding"
+              },
+              "schema": {
+                "encodings": [
+                  "exact_counter_accumulator_v2",
+                  "planner_exact_accumulator_v1"
+                ],
+                "family": {
+                  "family": "exact",
+                  "kind": "rate"
+                },
+                "group_by": [],
+                "materialization": 14425999489689100447,
+                "schema_id": "asap-query-backend.v1:summary-state:v1:14425999489689100447",
+                "schema_version": 1,
+                "source": {
+                  "TimeSeries": {
+                    "metric": "data"
+                  }
+                },
+                "stored_output_reference": {
+                  "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c",
+                  "stored_output_id": 14425999489689100447
+                },
+                "value_projection": "sample_value",
+                "window": {
+                  "kind": "sliding",
+                  "pane_origin_ms": 0,
+                  "size_ms": 60000,
+                  "slide_ms": 10000
+                }
+              },
+              "window_implementation": "backend-tumbling-v1-60s-slide-10s-pane-10s"
+            },
+            "operation": "update"
+          },
+          "unit": "horizon",
+          "multiplicity": 1.0
+        }
+      }
+    },
+    "component_costs": {
+      "query:compat-query-0:0": 30.0,
+      "query:compat-query-0:1": 30.0,
+      "query:compat-query-0:2": 30.0,
+      "query:compat-query-0:3": 30.0,
+      "result:compat-query-0": 30.0,
+      "source:{\"ingest\":{\"endpoint_path\":\"/api/v1/write\",\"protocol\":\"prometheus_remote_write_v1\",\"require_plan_identity\":false,\"require_registered_producer\":false,\"require_stored_output_identity\":false,\"timestamp_unit\":\"unix_milliseconds\"},\"location\":\"backend\",\"source\":{\"TimeSeries\":{\"metric\":\"data\"}}}": 1.0,
+      "state:backend:14425999489689100447:build": 1.0,
+      "state:backend:14425999489689100447:residency": 1.0,
+      "state:backend:14425999489689100447:retire": 1.0,
+      "state:backend:14425999489689100447:update": 1.0
+    },
+    "candidates": [
+      {
+        "candidate_id": "asap-explain-v1:alternative:7bf31d0ab9316192505912b529653f09524d88a0c7ea36e1082febed672fb8ae",
+        "logical_root_ids": [
+          "asap-explain-v1:root:81ef074b5004020517dfe3b08372f20d4733d60c94cbdd5d152e8c59d741de49"
+        ],
+        "physical_candidate_id": "asap-explain-v1:physical:4a5d7a1c944984c0686fca5b5d0f3d00348e7a458d6adff22b5cf61ba9727362",
+        "identity_unavailable_reason": null,
+        "status": "selected",
+        "plan_id": 1947004944484088590,
+        "total_cost": 155.0,
+        "unavailable_reason": null
+      },
+      {
+        "candidate_id": "asap-explain-v1:alternative:d826e0a1fe67cd1a6225d3455ecfce9ada70d35871cd42b6a6052bab0c060aba",
+        "logical_root_ids": [
+          "asap-explain-v1:root:d53b889d4c5fd077a35df1f50e09a19af63c12366578c9dc11e4d8da261c45c4"
+        ],
+        "physical_candidate_id": "asap-explain-v1:physical:99efedd5c9c62bae3c5a049a228f203e672d3b0bdc8952f82f54da2a5a0df91d",
+        "identity_unavailable_reason": null,
+        "status": "unselected",
+        "plan_id": 15833270860732361489,
+        "total_cost": 61000000000000.0,
+        "unavailable_reason": null
+      }
+    ]
+  },
+  "planner_selection_trace": [
+    {
+      "committed_roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:81ef074b5004020517dfe3b08372f20d4733d60c94cbdd5d152e8c59d741de49",
+          "query_index": 0
+        }
+      ],
+      "deployment_overrides": [],
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 0,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:99e8fe24fbbd76ea4bbaa45c6b4bf6214a926befd5151ff132b80b749e2208e0"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 1,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:a50d6d62d7220346106b3da03dc6b932401aeb45b39f324d178c6a0e8fbb557c"
+        },
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:5d1e04b41b9b08e9d95d45bf9901d5d04f8753370cfd1514952f0c810ac2401e",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 256.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 256.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "ExactAggregate(Rate)"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "counter_rate"
+                    },
+                    "rule": "exact_input"
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "Rate realizes as an exact Rate accumulator — the only realization realizations_for_intent produces for this intent (no approximate candidate applies)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 2,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:a3a9acb3549f6001ac4363b3c5ff60902e6b2c7a6b616908bdbbdc664d803871"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 3,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:512c493adcba61b4e2671361d40d5de1504e9764d0460e910e0af51f79687b2c"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 4,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:e783e17c1544b382e37e5f2e9044762b2690f41d6bfbb80f8b2b7db8881ec1fd"
+        }
+      ],
+      "roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:81ef074b5004020517dfe3b08372f20d4733d60c94cbdd5d152e8c59d741de49",
+          "query_index": 0
+        }
+      ],
+      "schema_version": 1
+    }
+  ]
+}
