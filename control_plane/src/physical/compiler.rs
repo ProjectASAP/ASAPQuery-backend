@@ -2675,9 +2675,49 @@ pub fn select_post_asap(
             delete: false,
         },
     );
+    // These fixtures exercise collector heap transport. Collector fixtures do
+    // not offer backend-only temporal value readouts as a physical capability.
+    struct CollectorFixtureModel(ControlPlaneCostModel);
+    impl asap_aware_mapping::CostModel for CollectorFixtureModel {
+        fn rank_candidates(
+            &self,
+            intent: &planner_types::pre_asap::AggIntent,
+            candidates: &[planner_types::post_asap::SketchAlgorithm],
+        ) -> Vec<planner_types::post_asap::SketchAlgorithm> {
+            self.0.rank_candidates(intent, candidates)
+        }
+        fn size_params(
+            &self,
+            kind: planner_types::post_asap::SketchAlgorithm,
+            intent: &planner_types::pre_asap::AggIntent,
+            eps: f64,
+            delta: f64,
+        ) -> planner_types::post_asap::SketchParams {
+            self.0.size_params(kind, intent, eps, delta)
+        }
+        fn candidate_cost(
+            &self,
+            candidate: &asap_aware_mapping::ReplacementSubDAG,
+            target: &asap_aware_mapping::TargetSubDAG<'_>,
+        ) -> Option<Cost> {
+            self.0.candidate_cost(candidate, target)
+        }
+        fn summary_support_evidence(&self, summary: &SummaryNode) -> Option<bool> {
+            if matches!(
+                summary.expr,
+                SummaryExpr::ValueOperation {
+                    operation: planner_types::post_asap::ValueOperation::Limit { .. },
+                    ..
+                }
+            ) {
+                return Some(false);
+            }
+            self.0.summary_support_evidence(summary)
+        }
+    }
     crate::planner_selection::select_query_with_models(
         expr,
-        &model,
+        &CollectorFixtureModel(model),
         &DefaultAccuracyModel,
         &QueryEvidence {
             topk: evidence,
