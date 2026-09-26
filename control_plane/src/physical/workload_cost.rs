@@ -4,7 +4,9 @@
 //! Planner owns semantic legality. A manifest describes the exact physical
 //! demand to price; provider quotes and candidate evaluations are separate.
 
+mod automatic;
 mod materialization_candidates;
+pub use automatic::{AutomaticCostReport, ComponentResources};
 mod status;
 pub use status::{CandidateEvaluationStatus, CandidateSearchScope};
 
@@ -90,6 +92,8 @@ pub struct CandidatePlanEvaluation {
     pub status: CandidateEvaluationStatus,
     pub plan_id: Option<u64>,
     pub total_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_cost: Option<AutomaticCostReport>,
     pub unavailable_reason: Option<String>,
 }
 
@@ -500,6 +504,7 @@ fn candidate_description(candidate: &PhysicalCompilationRequest) -> CandidatePla
         status: CandidateEvaluationStatus::CompilationFailed,
         plan_id: None,
         total_cost: None,
+        automatic_cost: None,
         unavailable_reason: None,
     }
 }
@@ -612,7 +617,7 @@ pub fn select_lowest_cost_candidate(
     select_candidates(
         candidates,
         env,
-        evidence,
+        Some(evidence),
         super::compiler::QueryFrontend::PromQl,
     )
 }
@@ -625,18 +630,20 @@ pub fn select_lowest_cost_metricsql_candidate(
     select_candidates(
         candidates,
         env,
-        evidence,
+        Some(evidence),
         super::compiler::QueryFrontend::MetricsQl,
     )
 }
 
-fn select_candidates(
+pub fn select_candidates(
     candidates: Vec<PhysicalCompilationRequest>,
     env: PhysicalDeploymentContext,
-    evidence: &WorkloadCostEvidence,
+    evidence: Option<&WorkloadCostEvidence>,
     frontend: super::compiler::QueryFrontend,
 ) -> Result<CompiledPhysicalPlan, CompileError> {
-    evidence.validate(&env)?;
+    if let Some(evidence) = evidence {
+        evidence.validate(&env)?;
+    }
     if candidates.is_empty() || candidates.len() > 64 {
         return Err(invalid(
             "candidate inventory must contain 1..=64 candidates",
@@ -661,15 +668,23 @@ fn select_candidates(
         });
     let planner_selection_trace = candidates[0].planner_selection_trace.clone();
     let mut comparison_workload = None;
+    let mut comparison_inputs = None;
     let mut candidate_evaluations = Vec::new();
-    let mut best_index = 0;
-    let mut best: Option<(
-        Cost,
-        CompiledPhysicalPlan,
-        WorkloadCostManifest,
-        BTreeMap<String, f64>,
-    )> = None;
+    let mut priced_candidates = Vec::new();
     for candidate in candidates {
+        if evidence.is_none() {
+            let inputs = json!({"data":candidate.data_workload,"erp":candidate.erp});
+            if comparison_inputs
+                .as_ref()
+                .is_some_and(|previous| previous != &inputs)
+            {
+                return Err(invalid(
+                    "candidates describe different data/ERP cost inputs",
+                ));
+            }
+            comparison_inputs = Some(inputs);
+        }
+        let cost_request = candidate.clone();
         let (plan, manifest, mut description) =
             match compile_candidate_for_pricing(candidate, env.clone(), frontend) {
                 Ok(bound) => bound,
@@ -686,19 +701,43 @@ fn select_candidates(
             return Err(invalid("candidates describe different workloads/horizons"));
         }
         comparison_workload = Some(scope);
-        match super::realization::RealizationProvider::price(
-            &super::realization::ExistingRealizations,
-            evidence,
-            &manifest,
-        ) {
+        let priced = if let Some(evidence) = evidence {
+            super::realization::RealizationProvider::price(
+                &super::realization::ExistingRealizations,
+                evidence,
+                &manifest,
+            )
+        } else {
+            automatic::estimate(&cost_request, &env, &plan, &manifest)
+                .map(|report| {
+                    let costs = report
+                        .components
+                        .iter()
+                        .map(|(id, r)| (id.clone(), r.weighted_cost()))
+                        .collect::<BTreeMap<_, _>>();
+                    let total = Cost(costs.values().sum());
+                    description.automatic_cost = Some(report);
+                    (total, costs)
+                })
+                .map_err(|error| {
+                    (
+                        CandidateEvaluationStatus::EvidenceMissing,
+                        error.to_string(),
+                    )
+                })
+        };
+        match priced {
             Ok((cost, components)) => {
                 description.status = CandidateEvaluationStatus::Unselected;
                 description.total_cost = Some(cost.0);
                 candidate_evaluations.push(description);
-                if best.as_ref().is_none_or(|(previous, ..)| cost < *previous) {
-                    best_index = candidate_evaluations.len() - 1;
-                    best = Some((cost, plan, manifest, components));
-                }
+                priced_candidates.push(Ok((
+                    cost,
+                    plan,
+                    manifest,
+                    components,
+                    candidate_evaluations.len() - 1,
+                )));
             }
             Err((status, reason)) => {
                 description.status = status;
@@ -707,19 +746,37 @@ fn select_candidates(
             }
         }
     }
-    let (_, mut plan, selected_manifest, component_costs) = best.ok_or_else(|| {
+    let selected = asap_physical_operators::physical_planner::select_candidate(
+        priced_candidates,
+        |(cost, _, manifest, _, _)| {
+            Ok(Some(
+                asap_physical_operators::physical_planner::CandidateCost {
+                    workload_scope: serde_json::to_string(&manifest.workload).map_err(|error| {
+                        asap_physical_operators::Error::Invalid(error.to_string())
+                    })?,
+                    horizon_seconds: manifest.horizon_seconds,
+                    total_cost: cost.0,
+                },
+            ))
+        },
+    )
+    .map_err(|error| {
         CompileError::Candidates(
             json!({"status": "all_infeasible", "logical_selection": planner_selection_trace,
-            "candidates": candidate_evaluations}),
+            "candidates": candidate_evaluations, "selection_error": error.to_string()}),
         )
     })?;
-    // Exactly the winner retained by the existing strict-less-than selector.
+    let (_, mut plan, selected_manifest, component_costs, best_index) = selected.candidate;
     candidate_evaluations[best_index].status = CandidateEvaluationStatus::Selected;
     plan.cost_comparison = Some(CandidatePlanSelectionReport {
         planner_selection_trace,
         materialization_search_coverage,
-        data_snapshot_id: evidence.data_snapshot_id.clone(),
-        model_version: evidence.model_version.clone(),
+        data_snapshot_id: evidence
+            .map(|e| e.data_snapshot_id.clone())
+            .unwrap_or_else(|| "request-scoped-data-workload".into()),
+        model_version: evidence
+            .map(|e| e.model_version.clone())
+            .unwrap_or_else(|| automatic::MODEL_VERSION.into()),
         selected_plan_id: plan.envelope.plan_id,
         selected_manifest,
         component_costs,
@@ -733,11 +790,7 @@ fn select_candidates(
 pub fn enumerate_exact_and_materialized_candidates(
     request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
-    let already_selected = super::maintained_population::supported(&request);
     let mut candidates = materialization_candidates(request)?;
-    if already_selected {
-        return Ok(candidates);
-    }
     let roots: Vec<_> = candidates
         .last()
         .expect("exact alternative")
@@ -867,6 +920,257 @@ fn materialization_candidates(
 mod tests {
     use super::super::compiler::BackendLocalPlanningInput;
     use super::*;
+
+    /// A deployment without external execution rejects native candidates before pricing.
+    #[test]
+    fn local_only_deployment_rejects_external_candidate_before_pricing() {
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["implementation"]["require_backend_local_execution"] = json!(true);
+        let input: BackendLocalPlanningInput = serde_json::from_value(value).unwrap();
+        let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let native = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.queries.iter().all(|query| {
+                    matches!(
+                        query.selected_plan_root.expr,
+                        planner_types::post_asap::SummaryExpr::KeepPreAsap(_)
+                    )
+                })
+            })
+            .expect("native candidate remains inspectable")
+            .clone();
+        let error = DeploymentPlanCompiler
+            .compile_promql(native, environment)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external execution is unavailable"),
+            "{error}"
+        );
+        let selected = input.compile_promql().unwrap();
+        assert!(selected.query_plan.entries.values().all(|entry| entry
+            .nodes
+            .values()
+            .all(|node| !matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. }))));
+        let report = selected.cost_comparison.unwrap();
+        assert!(report
+            .candidate_evaluations
+            .iter()
+            .any(|candidate| candidate
+                .unavailable_reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("external execution is unavailable"))
+                && candidate.total_cost.is_none()));
+    }
+
+    /// Selecting one population must not suppress candidates for other roots.
+    #[test]
+    fn existing_population_does_not_suppress_other_population_candidates() {
+        let mut input = fixture();
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        let template = queries[0].clone();
+        *queries = ["quantile by(job)(0.9,m)", "count by(job)(m)"]
+            .into_iter()
+            .map(|q| {
+                let mut entry = template.clone();
+                entry.query = planner_types::workload::Query(q.into());
+                entry
+            })
+            .collect();
+        let (mut request, _) = input.into_physical_compilation_request().unwrap();
+        let strategy = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+            &request.canonical_roots,
+        );
+        request.queries[0].selected_plan_root =
+            strategy.candidate(&request.canonical_roots[0]).unwrap();
+        request.queries[1].selected_plan_root =
+            crate::planner_selection::keep_pre_asap(&request.canonical_roots[1]).unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.queries.iter().all(|query| {
+                super::super::maintained_population::supported_node(&query.selected_plan_root)
+            })));
+    }
+
+    /// Instant counts select current membership, never accumulated observations.
+    #[test]
+    fn local_grouped_count_has_a_bindable_candidate() {
+        let mut input = fixture();
+        input.workload_cost_evidence = None;
+        input.physical_inputs.require_backend_local_execution = true;
+        input.data_workload.data_ingestion_interval.value =
+            Some(planner_types::workload::DurationMs(60_000));
+        input.physical_inputs.scrape_interval_ms = 60_000;
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        queries.truncate(1);
+        queries[0].query = planner_types::workload::Query("count by(job)(m)".into());
+        let plan = input.compile_promql().unwrap();
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .all(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::Logical {
+                    operator: crate::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                        readout: asap_types::query_plan::current_series::SeriesReadout::Count,
+                        ..
+                    },
+                    ..
+                }
+            ))));
+    }
+
+    /// Deployment computes and compares complete costs without external quotes.
+    #[test]
+    fn deployment_automatically_prices_workload() {
+        let mut input = fixture();
+        input.workload_cost_evidence = None;
+        let plan = input.compile_promql().unwrap();
+        let report = plan.cost_comparison.unwrap();
+        let selected = report
+            .candidate_evaluations
+            .iter()
+            .find(|c| c.status == CandidateEvaluationStatus::Selected)
+            .unwrap();
+        assert_eq!(
+            selected.total_cost.unwrap(),
+            report.component_costs.values().sum::<f64>()
+        );
+        assert!(report
+            .candidate_evaluations
+            .iter()
+            .filter_map(|c| c.total_cost)
+            .all(|cost| cost >= selected.total_cost.unwrap()));
+        assert!(!report.component_costs.is_empty());
+        assert_eq!(
+            report.component_costs.len(),
+            report.selected_manifest.components.len()
+        );
+        assert!(
+            report
+                .candidate_evaluations
+                .iter()
+                .filter(|c| c.total_cost.is_some())
+                .count()
+                > 1
+        );
+    }
+
+    fn automatic_report(
+        request: &PhysicalCompilationRequest,
+        env: &PhysicalDeploymentContext,
+        plan: &CompiledPhysicalPlan,
+    ) -> AutomaticCostReport {
+        automatic::estimate(
+            request,
+            env,
+            plan,
+            &manifest(plan, &request.queries).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Demand changes recurring work, while shared maintenance stays once per location.
+    #[test]
+    fn automatic_cost_scales_demand_data_and_shared_consumers() {
+        let (mut request, env) = fixture().into_physical_compilation_request().unwrap();
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request.clone(), env.clone())
+            .unwrap();
+        let before = automatic_report(&request, &env, &plan);
+        request.queries[0]
+            .summary_lifecycle_inputs
+            .evaluation_interval_ms /= 2;
+        let frequent = automatic_report(&request, &env, &plan);
+        for (id, cost) in &before.components {
+            let factor = if id.starts_with("query:") || id.starts_with("result:") {
+                2.0
+            } else {
+                1.0
+            };
+            assert!(
+                (frequent.components[id].weighted_cost() - factor * cost.weighted_cost()).abs()
+                    < 1e-10,
+                "{id}"
+            );
+        }
+        request
+            .data_workload
+            .as_mut()
+            .unwrap()
+            .ingestion_rate
+            .value
+            .as_mut()
+            .unwrap()
+            .0 *= 2.0;
+        let larger = automatic_report(&request, &env, &plan);
+        assert!(
+            larger
+                .components
+                .iter()
+                .filter(|(id, _)| id.ends_with(":update"))
+                .map(|(_, c)| c.cpu_seconds)
+                .sum::<f64>()
+                > frequent
+                    .components
+                    .iter()
+                    .filter(|(id, _)| id.ends_with(":update"))
+                    .map(|(_, c)| c.cpu_seconds)
+                    .sum::<f64>()
+        );
+        let mut shared = plan.clone();
+        let mut query = request.queries[0].clone();
+        query.query_id = "second-consumer".into();
+        let mut entry = shared.query_plan.entries.values().next().unwrap().clone();
+        entry.query_id = query.query_id.clone();
+        shared
+            .query_plan
+            .entries
+            .insert(query.query_id.clone(), entry);
+        request.queries.push(query);
+        let twice = automatic_report(&request, &env, &shared);
+        for (id, cost) in &larger.components {
+            assert_eq!(&twice.components[id], cost);
+        }
+        assert_eq!(
+            twice
+                .components
+                .keys()
+                .filter(|id| id.starts_with("source:") || id.starts_with("state:"))
+                .count(),
+            larger
+                .components
+                .keys()
+                .filter(|id| id.starts_with("source:") || id.starts_with("state:"))
+                .count()
+        );
+    }
+
+    /// Expired facts and arithmetic overflow cannot silently become a zero quote.
+    #[test]
+    fn automatic_cost_rejects_stale_and_overflowing_data() {
+        let (mut request, env) = fixture().into_physical_compilation_request().unwrap();
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request.clone(), env.clone())
+            .unwrap();
+        let manifest = manifest(&plan, &request.queries).unwrap();
+        let rate = &mut request.data_workload.as_mut().unwrap().ingestion_rate;
+        rate.observed_at_ms = Some(1);
+        rate.valid_for_ms = Some(1);
+        assert!(automatic::estimate(&request, &env, &plan, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("fresh ingestion rate"));
+        let rate = &mut request.data_workload.as_mut().unwrap().ingestion_rate;
+        rate.valid_for_ms = None;
+        rate.value.as_mut().unwrap().0 = f64::MAX;
+        assert!(automatic::estimate(&request, &env, &plan, &manifest).is_err());
+    }
 
     fn fixture() -> BackendLocalPlanningInput {
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
@@ -1383,9 +1687,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_requires_quotes_and_roundtrips_selection() {
+    fn snapshot_supports_automatic_cost_and_roundtrips_quote_override() {
         let mut snapshot = fixture();
-        assert!(snapshot.clone().compile_promql().is_err());
+        assert!(snapshot
+            .clone()
+            .compile_promql()
+            .unwrap()
+            .cost_comparison
+            .is_some());
         let (_, _, evidence) = quoted();
         snapshot.workload_cost_evidence = Some(evidence);
         let snapshot: BackendLocalPlanningInput =

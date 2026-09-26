@@ -1,8 +1,8 @@
-//! Deployment-owned selection at the latest ASAPPlanner boundary.
+//! Supplies deployment capabilities and cost/accuracy evidence to ASAPPlanner.
 //!
-//! ASAPPlanner enumerates a ranked candidate space and deliberately does not
-//! commit to one deployment plan.  The backend owns that decision because it
-//! also owns placement, runtime capabilities, and the physical wire contract.
+//! Planner constructs, evaluates, and selects computation candidates. This
+//! adapter registers the supported strategies and retains selection evidence;
+//! DeploymentPlanCompiler binds the resulting computation and lifecycle.
 
 use std::rc::Rc;
 

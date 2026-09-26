@@ -76,6 +76,13 @@ A maintenance lifecycle is a contract associated with computation, not another
 operator IR. A deployment plan is an operational wrapper around Physical DAGs,
 not another lowering stage.
 
+Cost evidence includes initialization, ingestion updates, retained state,
+transmission, storage, merges, readouts and recurring queries, counting shared
+producer construction once. Candidates use the same data and demand scope;
+missing evidence is not zero cost. Backend `candidate_cost()` supplies applicable
+ERP or analytical estimates to Planner selection. See the
+[workload calculation model](evidence-dependent-candidates.md#backend-owned-workload-calculation).
+
 ## 3. Deployment plan structure
 
 One installed version contains:
