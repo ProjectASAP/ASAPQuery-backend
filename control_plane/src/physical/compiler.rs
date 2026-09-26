@@ -2436,11 +2436,7 @@ pub fn select_post_asap(
         expr,
         &CollectorFixtureModel(model),
         &DefaultAccuracyModel,
-        &QueryEvidence {
-            topk: evidence,
-            scoped: None,
-            now_ms: 0,
-        },
+        &QueryEvidence(evidence),
     )
 }
 
