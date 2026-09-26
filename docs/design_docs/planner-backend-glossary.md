@@ -40,7 +40,7 @@ Migration of existing types and fields is covered in the
 | Term | Meaning |
 | --- | --- |
 | `summary_definitions` | Logical table inside `SummaryStore`: definition ID → `SummaryDefinition`. The compiler supplies a snapshot for validation and registration during installation. |
-| `stored_summaries` | Logical table inside the same store: `(plan_version, stored_output_id, population_key, window)` → `StoredSummary`. |
+| `stored_summaries` | Logical table inside the same store: `(plan_version, stored_output_id, group_key, window)` → `StoredSummary`. |
 | SDS (Self-Describing Summary) | The description and metadata needed to interpret and validate stored summary state. It is not a separate execution engine or payload store. |
 | `SummaryDefinition` | What a summary represents: source/filter, input value, grouping, time semantics, algorithm and parameters. |
 | `stored_output_id` | Compiler-assigned binding ID for a persisted PrecomputePlan DAG output within one plan version. Writers and shared readers use it to name the same output; it is not a memory slot or independent catalog object. |
