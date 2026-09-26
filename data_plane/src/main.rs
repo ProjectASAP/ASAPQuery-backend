@@ -1049,6 +1049,7 @@ async fn run(args: Args) -> Result<()> {
     if active_physical_plan.active_snapshot().plan_id() == 0 {
         let current = active_physical_plan.active_snapshot();
         active_physical_plan.swap(data_plane::storage_engines::types::RuntimePhysicalPlan {
+            readout_programs: Default::default(),
             envelope: current.envelope.clone(),
             summary_catalog: current.summary_catalog.clone(),
             precompute_plan: current.precompute_plan.clone(),
