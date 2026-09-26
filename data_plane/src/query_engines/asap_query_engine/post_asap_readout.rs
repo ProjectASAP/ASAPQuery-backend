@@ -114,6 +114,8 @@ struct PhysicalQueryRuntime<'a> {
     language: control_plane::query_plan::QueryLanguage,
     catalog: Option<std::sync::Arc<asap_types::summary_catalog::SummaryCatalog>>,
     context: QueryExecutionContext<'a>,
+    // All counter groups in a run use the same resolved evaluation range.
+    counter_parameters: std::cell::OnceCell<std::collections::HashMap<String, String>>,
 }
 
 impl PhysicalQueryRuntime<'_> {
@@ -224,21 +226,33 @@ impl PhysicalQueryRuntime<'_> {
                 let [PhysicalQueryOutput::State { groups, .. }] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
+                let no_parameters = std::collections::HashMap::new();
+                let parameters = if matches!(
+                    readout,
+                    control_plane::query_plan::ExactReadout::Rate
+                        | control_plane::query_plan::ExactReadout::Increase
+                ) {
+                    self.counter_parameters.get_or_init(|| {
+                        std::collections::HashMap::from([
+                            ("range_start_ms".into(), self.context.t0_ms.to_string()),
+                            ("range_end_ms".into(), self.context.t1_ms.to_string()),
+                        ])
+                    })
+                } else {
+                    &no_parameters
+                };
                 let mut coverage = None;
                 let values = groups
                     .iter()
                     .filter_map(|(key, state)| {
-                        fold_coverage(&mut coverage, state.exact_coverage());
-                        let value = match state.exact_value_for(
-                            *readout,
-                            &None,
-                            self.context.t0_ms,
-                            self.context.t1_ms,
-                        ) {
-                            Ok(Some(value)) => value,
-                            Ok(None) => return None,
-                            Err(error) => return Some(Err(PhysicalNodeError::Fallback(error))),
-                        };
+                        let state_coverage = state.exact_coverage();
+                        fold_coverage(&mut coverage, state_coverage);
+                        let value =
+                            match state.exact_value_with_parameters(*readout, &None, parameters) {
+                                Ok(Some(value)) => value,
+                                Ok(None) => return None,
+                                Err(error) => return Some(Err(PhysicalNodeError::Fallback(error))),
+                            };
                         Some(Ok({
                             (
                                 {
@@ -257,7 +271,7 @@ impl PhysicalQueryRuntime<'_> {
                                 },
                                 SummaryValue::Points(
                                     vec![(self.context.t1_ms as i64, value)],
-                                    state.exact_coverage(),
+                                    state_coverage,
                                 ),
                             )
                         }))
@@ -662,10 +676,7 @@ impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
                     })?
                 }))
                 .await?;
-            let values = values
-                .iter()
-                .map(|value| value.value())
-                .collect::<Vec<_>>();
+            let values = values.iter().map(|value| value.value()).collect::<Vec<_>>();
             self.runtime
                 .execute_node(self.id, self.node, &values, &context)
                 .map_err(|e| dag::Error::Operator(format!("query node {}: {e}", self.id.0)))
@@ -738,6 +749,7 @@ fn execute_physical_query_payload(
     let revision = index.summary_update_revision();
     let result = (|| {
         let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
             language: entry.language,
             catalog: index.summary_catalog_snapshot(),
             context: QueryExecutionContext {
@@ -856,6 +868,7 @@ pub(crate) fn execute_query_plan_readouts(
     }
     let revision = index.summary_update_revision();
     let runtime = PhysicalQueryRuntime {
+        counter_parameters: Default::default(),
         language: entry.language,
         catalog: index.summary_catalog_snapshot(),
         context: QueryExecutionContext {
@@ -895,6 +908,7 @@ mod tests {
         use crate::storage_engines::types::Measurement;
         let idx = SketchStore::new();
         let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
             language: control_plane::query_plan::QueryLanguage::PromQl,
             catalog: None,
             context: QueryExecutionContext {
@@ -1141,6 +1155,7 @@ mod tests {
         };
         let index = SketchStore::new();
         let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
             language: entry.language,
             catalog: None,
             context: QueryExecutionContext {
@@ -1985,6 +2000,7 @@ mod tests {
         let value = outcome.series[0].1[0].1;
         assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
         let native_runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
             language: control_plane::query_plan::QueryLanguage::MetricsQl,
             catalog: None,
             context: QueryExecutionContext {
