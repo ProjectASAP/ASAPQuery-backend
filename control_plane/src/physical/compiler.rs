@@ -4101,6 +4101,7 @@ pub(crate) mod tests {
             "quantile by (job) (0.99, a)",
             "topk by (job) (1, a)",
             "topk by (job) (5, a)",
+            "count by (job) (a)",
         ];
         snapshot.query_workload.repeating_queries = Some(
             queries
