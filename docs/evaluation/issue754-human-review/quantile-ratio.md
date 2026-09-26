@@ -10,6 +10,20 @@ IDs below are Planner node IDs; QueryPlan adapter IDs are shown separately.
 
 Root: `4`.
 
+```mermaid
+flowchart LR
+  N0["0: Source / time range"]
+  N1["1: SummaryAgg {&quot;Sketch&quot;:[{&quot;algorithm&quot;:&quot;DDSketch&quot;,&quot;category&quot;:&quot;Quantile&quot;,&quot;params&quot;:{&quot;DDSketch&quot;:{&quot;alpha&quot;:0.0049751243781094535}}},&quot;PerSubpopulationInstance&quot;]}"]
+  N2["2: summary_estimate"]
+  N3["3: summary_estimate"]
+  N4["4: binary"]
+  N0 --> N1
+  N1 --> N2
+  N1 --> N3
+  N2 --> N4
+  N3 --> N4
+```
+
 | Node | Dependencies (producer, edge role) | Timing | Operation | Output fields (index: name/type) |
 | --- | --- | --- | --- | --- |
 | 0 | `[]` | `{"timing":"ingestion_time","primitive":"Raw"}` | `{"source":{"TimeSeries":{"metric":"data"}},"predicates":[],"range":{"nanos":0,"secs":60}}` | `["0: ts/timestamp","1: value/float64"]` |
