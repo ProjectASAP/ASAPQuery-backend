@@ -6,7 +6,6 @@
 //! answers are independently computed from those raw fixtures.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,7 +59,6 @@ struct Backend {
     client: reqwest::Client,
     query_base: String,
     otlp_url: String,
-    _config: tempfile::NamedTempFile,
     _output_dir: tempfile::TempDir,
 }
 
@@ -109,22 +107,14 @@ fn envelope(metric: &str, data: Data) -> ExportMetricsServiceRequest {
     }
 }
 
-async fn start_backend(config_yaml: &str) -> Backend {
+async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) -> Backend {
     let query_port = unused_port();
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    config
-        .write_all(config_yaml.as_bytes())
-        .expect("write streaming config");
-    config.flush().expect("flush streaming config");
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
-        &serde_yaml::from_str(config_yaml).unwrap(),
-    )
-    .unwrap();
     let mut physical = tempfile::NamedTempFile::new().unwrap();
-    let mut install = physical_fixture::artifact(&runtime);
+    let mut install =
+        physical_fixture::artifact_from_materializations(vec![materialization.clone()]);
     for rule in &mut install.transmission_plan.rules {
         if matches!(
             install
@@ -147,8 +137,6 @@ async fn start_backend(config_yaml: &str) -> Backend {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command
-        .arg("--streaming-config")
-        .arg(config.path())
         .arg("--physical-plan")
         .arg(physical.path())
         .arg("--http-port")
@@ -188,7 +176,6 @@ async fn start_backend(config_yaml: &str) -> Backend {
                 client,
                 query_base,
                 otlp_url: format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"),
-                _config: config,
                 _output_dir: output_dir,
             };
         }
@@ -294,9 +281,11 @@ fn scalar_values(response: &Value) -> Vec<(HashMap<String, String>, f64)> {
         .collect()
 }
 
-fn config(metric: &str, kind: &str, parameters: &str) -> String {
-    format!(
-        "aggregations:\n  - aggregationType: {kind}\n    aggregationSubType: ''\n    labels:\n      grouping: [service]\n      rollup: []\n      aggregated: []\n    metric: {metric}\n    parameters:\n{parameters}\n    windowSize: 1\n    windowType: tumbling\n    spatialFilter: ''\n"
+fn config(metric: &str, kind: &str, parameters: &str) -> asap_types::PrecomputeMaterialization {
+    physical_fixture::materialization(
+        metric,
+        kind.parse().unwrap(),
+        serde_yaml::from_str(parameters).unwrap(),
     )
 }
 

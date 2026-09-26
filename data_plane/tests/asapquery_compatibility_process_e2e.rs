@@ -399,18 +399,10 @@ async fn certified_kll_state_to_query_oracle() {
     let port = unused_port();
     let otlp_port = unused_port();
     let grpc_port = unused_port();
-    let mut bootstrap_config = tempfile::NamedTempFile::new().unwrap();
-    serde_json::to_writer(
-        &mut bootstrap_config,
-        &serde_json::json!({"aggregations": []}),
-    )
-    .unwrap();
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_data_plane"))
             .args(["--physical-plan"])
             .arg(artifact_file.path())
-            .arg("--streaming-config")
-            .arg(bootstrap_config.path())
             .args(["--http-port", &port.to_string(), "--output-dir"])
             .arg(output.path())
             .args([

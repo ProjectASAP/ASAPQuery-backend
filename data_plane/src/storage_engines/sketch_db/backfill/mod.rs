@@ -491,7 +491,7 @@ impl BackfillRegistry {
     ///   world there is no `SchemaRegistry::get(agg_id)` to look
     ///   it up from, and the caller (typically the HTTP handler
     ///   or control plane) already has the wall-clock snapshot in
-    ///   scope from its `StreamingConfig` reconcile event.
+    ///   scope from its `InstalledPrecomputePlan` reconcile event.
     /// * **Within data retention** (if `data_retention_ms` is
     ///   provided): `time_range.0 >= now - data_retention_ms`.
     ///   Method B from the design discussion — fail fast instead

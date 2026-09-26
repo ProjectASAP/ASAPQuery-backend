@@ -146,7 +146,7 @@ async fn post_full_config(
 }
 
 use control_plane::types::WorkloadCharacteristics;
-use data_plane::storage_engines::types::HotReloadStreamingConfig;
+use data_plane::storage_engines::types::InstalledPrecomputePlanHandle;
 use serde_json::Value as JsonValue;
 
 use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -222,7 +222,7 @@ fn _wc_anchor() -> WorkloadCharacteristics {
 
 /// Full test stack: PrecomputeEngine + SketchStoreSink + OtlpReceiver +
 /// HttpServer, all sharing the same `SketchStore` and
-/// `HotReloadStreamingConfig` so a controller-posted streaming-config
+/// `InstalledPrecomputePlanHandle` so a controller-posted streaming-config
 /// is visible to the engine's accumulator routing, the engine's window
 /// outputs land in `SketchStore`, and the query engine reads from the
 /// same store.
@@ -254,7 +254,7 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     let active = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
         physical_fixture::bootstrap(),
     );
-    let hot_reload = HotReloadStreamingConfig::from_active_physical_plan(active.clone());
+    let hot_reload = InstalledPrecomputePlanHandle::from_active_physical_plan(active.clone());
     let series_resolver = Arc::new(SeriesIdResolver::new());
 
     // SketchStoreSink writes precompute output back into SketchStore so
@@ -712,7 +712,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
 //   * Modified-OTLP `DdSketchDataPoint` wire encoding + the backend's
 //     OTLP HTTP receiver accept the payload (no 4xx/5xx).
 //   * The full stack (PrecomputeEngine + SketchStoreSink + OtlpReceiver
-//     + HttpServer all sharing SketchStore + HotReloadStreamingConfig)
+//     + HttpServer all sharing SketchStore + InstalledPrecomputePlanHandle)
 //     comes up and stays up under POST + query traffic.
 //   * The OTLP-ingested sketch lands in `SketchStore` keyed by the
 //     right `PolicyFingerprint` (or via the `instances_matching`

@@ -757,7 +757,7 @@ mod tests {
         let mut group_by_keys = std::collections::BTreeSet::new();
         group_by_keys.insert("service".to_string());
         idx.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: "unique_users".to_string(),
             group_by_keys,
             capability: Some(Capability::CardinalityApprox),
@@ -799,7 +799,7 @@ mod tests {
             relative_accuracy: 0.01,
         };
         idx.register(SummarySeriesMetadata {
-            sid: 1,
+            storage_handle: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
@@ -1029,7 +1029,7 @@ mod tests {
         let idx = SketchStore::new();
         idx.register(
             crate::storage_engines::sketch_db::index::SummarySeriesMetadata {
-                sid: 1,
+                storage_handle: 1,
                 metric_name: "bytes_total".to_string(),
                 group_by_keys: std::collections::BTreeSet::new(),
                 capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1126,7 +1126,7 @@ mod tests {
                     }
                     let idx = SketchStore::new();
                     idx.register(SummarySeriesMetadata {
-                        sid: 7,
+                        storage_handle: 7,
                         metric_name: "a".into(),
                         group_by_keys: Default::default(),
                         capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1198,7 +1198,7 @@ mod tests {
         let policy = config.policy_fingerprint();
         let idx = SketchStore::new();
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "a".into(),
             group_by_keys: Default::default(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1272,7 +1272,7 @@ mod tests {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1375,7 +1375,7 @@ mod tests {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),

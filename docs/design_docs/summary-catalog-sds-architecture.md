@@ -290,9 +290,10 @@ must still satisfy the reader. V1 needs no additional instance UUID. A
 `StoredOutputReference` identifies the output across its records, not a pointer
 to one payload; reader partition/time selection supplies the rest of the lookup.
 Schema/encoding IDs identify supported formats.
-Human-readable names are diagnostics, not join keys. Reuse across plan versions
-requires an explicit compatibility decision; a matching definition ID is
-insufficient.
+Human-readable names and local numeric row handles are not join keys. V1 reads
+only the installed plan version; a matching definition ID does not authorize
+reading another version’s payload. Cross-version reuse would require an explicit
+reader binding and is outside the V1 storage path.
 
 A `StoredOutputReference` identifies a stored output and definition within the enclosing
 plan version. The reader/writer binding constrains acceptable partition, schema,

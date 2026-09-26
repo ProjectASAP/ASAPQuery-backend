@@ -224,7 +224,7 @@ impl RawDagProgram {
     }
 
     pub fn uses_counter_delta(&self) -> bool {
-        // Planner represents rate computation as an explicit upstream operator.
+        // Counter derivatives are explicit upstream computations in Planner.
         false
     }
 

@@ -1,86 +1,15 @@
-//! Hot-reloadable `StreamingConfig` state.
+//! Generation-consistent physical plan installation and execution views.
 //!
-//! Wraps a shared `StreamingConfig` in `arc_swap::ArcSwap` so an
-//! external control plane can push a new config at runtime via
-//! `POST /api/v1/streaming-config` without restarting the query
-//! engine binary.
-//!
-//! ## How the pieces see the swap
-//!
-//! Runtime bootstrap readers share clones of the same `StreamingConfigHandle`
-//! handle (internally `Arc<ArcSwap<StreamingConfig>>`), so they
-//! observe the swap at the same instant:
-//!
-//! * **Writes** — atomic via `ArcSwap::store`. Lock-free; readers that
-//!   hold a stale snapshot finish their work with the old config and
-//!   drop it when the last reference goes out of scope.
-//! * **IngestState** — re-snapshots per ingest batch
-//!   (`config_snapshot()`). New aggregations start receiving data on
-//!   the next batch.
-//! * **Precompute workers** — read the handle directly in
-//!   `get_or_create_group_state()`. No message passing, no polling;
-//!   new agg_ids are visible the moment a worker tries to create a
-//!   `GroupState` for them.
-//!
-//! Query execution obtains its generation-consistent runtime configuration,
-//! query plan, and catalog from `RuntimePhysicalPlan` instead of this handle.
-//!
-//! ## Config-upgrade contract for the control plane
-//!
-//! The recommended way for a control plane to upgrade a metric's sketch
-//! parameters (or aggregation type) is **monotonic, non-reused
-//! `aggregation_id`s plus time-based retention**:
-//!
-//! 1. Control plane decides to upgrade, e.g. `CMS(width=256)` →
-//!    `CMS(width=1024)` for `test_metric`.
-//! 2. Control plane allocates a **new** `aggregation_id` (never reused),
-//!    e.g. the old id was 1, the new id is 17.
-//! 3. Control plane POSTs a new `StreamingConfig` where the old id is
-//!    **removed** and the new id is **added**:
-//!    - before: `{1: CMS(width=256)}`
-//!    - after:  `{17: CMS(width=1024)}`
-//! 4. What happens on the backend, with zero additional code:
-//!    - `IngestState` stops routing data to agg_id 1 and starts
-//!      routing to agg_id 17 (metric-name match unchanged).
-//!    - Workers evict the now-orphaned `GroupState` entries for
-//!      agg_id 1 after their last windows drain
-//!      (`evict_orphaned_groups`).
-//!    - New `GroupState` entries for agg_id 17 are created on
-//!      demand, with the new `CMS(width=1024)` parameters.
-//!    - Store entries under agg_id 1 are **not deleted** on the
-//!      config swap; they persist until `persistence_delete_older_than_secs`
-//!      retention elapses, at which point the persistence layer's
-//!      time-based TTL sweep drops the corresponding parts.
-//! 5. Query semantics during the transition:
-//!    - Before the swap: `ASAPQueryEngine` matches against agg_id 1.
-//!    - After the swap: `ASAPQueryEngine` matches against agg_id 17.
-//!      Historical data in the store under agg_id 1 is not joined
-//!      into the answer; the new sketch warms up from zero.
-//!    - Callers that need query continuity across parameter changes
-//!      should implement an overlap period at the control plane (keep
-//!      both ids in the config long enough for the new id to accrue
-//!      enough history) — this is a control-plane-side concern, not a
-//!      backend one.
-//!
-//! ## What the contract requires from the control plane
-//!
-//! * Assign `aggregation_id`s from a monotonically-increasing counter.
-//! * Never reuse an `aggregation_id` after it has been removed from
-//!   a `StreamingConfig` push.
-//! * Rely on the backend's `persistence_delete_older_than_secs` for
-//!   store cleanup — do not try to explicitly delete old agg_id data.
-//!
-//! Violating "never reuse" is safe in terms of correctness (the
-//! backend creates a fresh `GroupState` either way), but it can
-//! produce confusing store states where data under the same agg_id
-//! spans multiple parameter generations.
+//! Production consumers obtain the installed precompute program through the
+//! active physical plan. Plan publication installs query and precompute bindings
+//! together; a runtime lookup view cannot independently redefine computation.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::storage_engines::types::StreamingConfig;
+use crate::storage_engines::types::InstalledPrecomputePlan;
 
 /// One immutable, generation-consistent runtime snapshot. Every execution
 /// subsystem must project its view from the same `Arc<RuntimePhysicalPlan>`.
@@ -93,7 +22,7 @@ pub struct RuntimePhysicalPlan {
     pub summary_catalog: Option<Arc<control_plane::physical::summary_catalog::SummaryCatalog>>,
     pub precompute_plan: asap_types::precompute_plan::PrecomputePlan,
     pub transmission_plan: asap_types::producer_plan::TransmissionPlan,
-    pub streaming_config: Arc<StreamingConfig>,
+    pub installed_precompute_plan: Arc<InstalledPrecomputePlan>,
     pub query_plan: Arc<asap_types::query_plan::QueryPlan>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 }
@@ -568,74 +497,69 @@ impl std::fmt::Debug for ActivePhysicalPlanHandle {
     }
 }
 
-/// Streaming materialization view with two compatibility modes. Legacy mode
-/// owns a swappable config; active-plan mode reads the config from the current
-/// immutable runtime plan. In active-plan mode, `swap` only updates the legacy
-/// backing slot and does not publish a new plan. Use plan activation to change
-/// the authoritative configuration.
+/// Precompute projection of the authoritative active physical plan.
 #[derive(Clone)]
-pub struct StreamingConfigHandle {
-    inner: Arc<ArcSwap<StreamingConfig>>,
-    active: Option<ActivePhysicalPlanHandle>,
+pub struct InstalledPrecomputePlanHandle {
+    source: InstalledPrecomputePlanSource,
 }
 
-impl StreamingConfigHandle {
-    /// Construct with an initial `StreamingConfig`. Takes ownership —
-    /// callers who need to keep their own handle should `.clone()` the
-    /// `StreamingConfig` before calling `new`.
-    pub fn new(initial: StreamingConfig) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::new(Arc::new(initial))),
-            active: None,
-        }
+#[derive(Clone)]
+enum InstalledPrecomputePlanSource {
+    Active(ActivePhysicalPlanHandle),
+    #[cfg(test)]
+    Fixture(Arc<ArcSwap<InstalledPrecomputePlan>>),
+}
+
+impl InstalledPrecomputePlanHandle {
+    #[cfg(test)]
+    pub fn new(initial: InstalledPrecomputePlan) -> Self {
+        Self::from_arc(Arc::new(initial))
     }
 
-    /// Construct from a pre-built `Arc<StreamingConfig>` — useful
-    /// when the caller already has the config behind an `Arc` and
-    /// wants to avoid a redundant clone.
-    pub fn from_arc(initial: Arc<StreamingConfig>) -> Self {
+    #[cfg(test)]
+    pub fn from_arc(initial: Arc<InstalledPrecomputePlan>) -> Self {
         Self {
-            inner: Arc::new(ArcSwap::new(initial)),
-            active: None,
+            source: InstalledPrecomputePlanSource::Fixture(Arc::new(ArcSwap::new(initial))),
         }
     }
 
     pub fn from_active_physical_plan(active: ActivePhysicalPlanHandle) -> Self {
-        let initial = active.active_snapshot().streaming_config.clone();
         Self {
-            inner: Arc::new(ArcSwap::new(initial)),
-            active: Some(active),
+            source: InstalledPrecomputePlanSource::Active(active),
         }
     }
 
-    /// Return a cheap, cloneable snapshot of the current config. The
-    /// returned `Arc` is stable for the caller's lifetime — a
-    /// concurrent swap produces a new `Arc` and leaves this one alone.
-    pub fn snapshot(&self) -> Arc<StreamingConfig> {
-        self.active
-            .as_ref()
-            .map(|a| a.active_snapshot().streaming_config.clone())
-            .unwrap_or_else(|| self.inner.load_full())
+    pub fn snapshot(&self) -> Arc<InstalledPrecomputePlan> {
+        match &self.source {
+            InstalledPrecomputePlanSource::Active(active) => {
+                active.active_snapshot().installed_precompute_plan.clone()
+            }
+            #[cfg(test)]
+            InstalledPrecomputePlanSource::Fixture(view) => view.load_full(),
+        }
     }
 
     pub fn active_physical_plan_snapshot(&self) -> Option<Arc<RuntimePhysicalPlan>> {
-        self.active.as_ref().map(|active| active.active_snapshot())
+        match &self.source {
+            InstalledPrecomputePlanSource::Active(active) => Some(active.active_snapshot()),
+            #[cfg(test)]
+            InstalledPrecomputePlanSource::Fixture(_) => None,
+        }
     }
 
-    /// Atomically replace the current config. The previous `Arc` is
-    /// dropped when the last reader holding it goes out of scope.
-    /// Returns the `Arc` that was just replaced, for callers that
-    /// want to diff old vs new (e.g. to log agg_ids that were added
-    /// or removed).
-    pub fn swap(&self, new: StreamingConfig) -> Arc<StreamingConfig> {
-        self.inner.swap(Arc::new(new))
+    #[cfg(test)]
+    pub fn swap(&self, new: InstalledPrecomputePlan) -> Arc<InstalledPrecomputePlan> {
+        match &self.source {
+            InstalledPrecomputePlanSource::Fixture(view) => view.swap(Arc::new(new)),
+            InstalledPrecomputePlanSource::Active(_) => panic!("activate a complete physical plan"),
+        }
     }
 }
 
-impl std::fmt::Debug for StreamingConfigHandle {
+impl std::fmt::Debug for InstalledPrecomputePlanHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snap = self.snapshot();
-        f.debug_struct("StreamingConfigHandle")
+        f.debug_struct("InstalledPrecomputePlanHandle")
             .field(
                 "num_agg_configs",
                 &snap.materializations_by_policy_fingerprint.len(),
@@ -650,10 +574,7 @@ pub use ActivePhysicalPlanHandle as HotReloadActivePhysicalPlan;
 #[deprecated(note = "Use RuntimePhysicalPlan")]
 pub use RuntimePhysicalPlan as ActivePhysicalPlan;
 
-#[deprecated(note = "Use StreamingConfigHandle")]
-pub use StreamingConfigHandle as HotReloadStreamingConfig;
-
-impl StreamingConfigHandle {
+impl InstalledPrecomputePlanHandle {
     #[deprecated(note = "Use from_active_physical_plan")]
     pub fn from_active(active: ActivePhysicalPlanHandle) -> Self {
         Self::from_active_physical_plan(active)
@@ -743,7 +664,7 @@ mod tests {
                 },
                 rules: Vec::new(),
             },
-            streaming_config: Arc::new(StreamingConfig::new(HashMap::new())),
+            installed_precompute_plan: Arc::new(InstalledPrecomputePlan::new(HashMap::new())),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan {
                 plan_id,
                 plan_version,
@@ -775,12 +696,12 @@ mod tests {
         )
     }
 
-    /// Build a StreamingConfig from a list of marker `id`s. After PR 5
+    /// Build a InstalledPrecomputePlan from a list of marker `id`s. After PR 5
     /// the map key IS the policy fingerprint, derived from
     /// `metric_{id}`. We return both the config and the
     /// dummy-id→fingerprint mapping so the assertions below can look
     /// up entries.
-    fn cfg_with_ids(ids: &[u64]) -> (StreamingConfig, std::collections::HashMap<u64, u64>) {
+    fn cfg_with_ids(ids: &[u64]) -> (InstalledPrecomputePlan, std::collections::HashMap<u64, u64>) {
         let mut map = HashMap::new();
         let mut id_to_fp = std::collections::HashMap::new();
         for &id in ids {
@@ -789,13 +710,13 @@ mod tests {
             id_to_fp.insert(id, fp);
             map.insert(fp, cfg);
         }
-        (StreamingConfig::new(map), id_to_fp)
+        (InstalledPrecomputePlan::new(map), id_to_fp)
     }
 
     #[test]
     fn snapshot_reflects_initial_config() {
         let (cfg, id_to_fp) = cfg_with_ids(&[1, 2, 3]);
-        let hr = StreamingConfigHandle::new(cfg);
+        let hr = InstalledPrecomputePlanHandle::new(cfg);
         let snap = hr.snapshot();
         assert_eq!(snap.materializations_by_policy_fingerprint.len(), 3);
         assert!(snap
@@ -807,7 +728,7 @@ mod tests {
     fn swap_replaces_config_atomically() {
         let (cfg1, id_to_fp1) = cfg_with_ids(&[1, 2]);
         let (cfg2, id_to_fp2) = cfg_with_ids(&[3, 4, 5]);
-        let hr = StreamingConfigHandle::new(cfg1);
+        let hr = InstalledPrecomputePlanHandle::new(cfg1);
         let old = hr.swap(cfg2);
         // Old snapshot still reflects pre-swap contents.
         assert_eq!(old.materializations_by_policy_fingerprint.len(), 2);
@@ -829,7 +750,7 @@ mod tests {
     fn clones_share_underlying_swap() {
         let (cfg1, _) = cfg_with_ids(&[1]);
         let (cfg2, id_to_fp2) = cfg_with_ids(&[2, 3]);
-        let hr = StreamingConfigHandle::new(cfg1);
+        let hr = InstalledPrecomputePlanHandle::new(cfg1);
         let hr_clone = hr.clone();
         hr.swap(cfg2);
         // The clone sees the swap because both handles share the
@@ -844,7 +765,7 @@ mod tests {
     #[test]
     fn concurrent_readers_see_consistent_snapshot() {
         let (cfg1, _) = cfg_with_ids(&[1, 2]);
-        let hr = StreamingConfigHandle::new(cfg1);
+        let hr = InstalledPrecomputePlanHandle::new(cfg1);
         let hr_writer = hr.clone();
         let writer = thread::spawn(move || {
             for i in 0..50 {

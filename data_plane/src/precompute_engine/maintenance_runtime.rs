@@ -2,10 +2,13 @@
 
 use super::output_sink::OutputSink;
 use super::subdag_scheduler::{
-    execute_precompute_sink, IdempotentCommitSink, MaterializationCommitKey,
-    PrecomputeOperatorRegistry, ScheduleError,
+    execute_precompute_sink, execute_precompute_sinks, IdempotentCommitSink,
+    MaterializationCommitKey, PrecomputeOperatorRegistry, ScheduleError,
 };
-use crate::storage_engines::types::{AggregateCore, PrecomputedOutput, StreamingConfigHandle};
+use crate::storage_engines::types::{
+    AggregateCore, InstalledPrecomputePlanHandle, PrecomputedOutput,
+};
+use asap_physical_operators::dag::RunContext;
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
 use planner_types::post_asap::{ExecutableDagNode, ExecutableOperatorPayload, PostAsapNodeId};
 use sha2::{Digest, Sha256};
@@ -161,16 +164,45 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
         }
     }
 
+    fn output_bytes(&self, value: &MaintenanceValue) -> usize {
+        fn labels(group: &Population) -> usize {
+            group.iter().map(|(k, v)| k.len() + v.len()).sum()
+        }
+        match value {
+            MaintenanceValue::Summary { state, .. } => state.approx_memory_bytes(),
+            MaintenanceValue::SummaryWindows { states, .. } => states
+                .iter()
+                .map(|(group, windows)| {
+                    labels(group)
+                        + windows
+                            .iter()
+                            .map(|(_, state)| 8 + state.approx_memory_bytes())
+                            .sum::<usize>()
+                })
+                .sum(),
+            MaintenanceValue::Rows { values, name, .. } => {
+                name.len()
+                    + values
+                        .iter()
+                        .map(|(group, rows)| {
+                            labels(group) + rows.len() * std::mem::size_of::<(i64, f64)>()
+                        })
+                        .sum::<usize>()
+            }
+        }
+    }
+
     fn execute(
         &self,
         node: &ExecutableDagNode,
         inputs: &[Arc<MaintenanceValue>],
+        context: RunContext,
     ) -> Result<MaintenanceValue, Self::Error> {
         if node.output_state.timing != planner_types::post_asap::ExecutionTiming::IngestionTime {
             return Err("ingestion executor received a query-time node".into());
         }
         match &node.payload {
-            ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
+            ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs, &context),
             ExecutableOperatorPayload::Binary { operator } => {
                 if !self.inputs.frozen_inputs().is_some()
                     || node.output_state
@@ -178,7 +210,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 {
                     return Err("maintenance binary requires immutable completed row inputs".into());
                 }
-                evaluate_aligned_binary(node, operator, inputs)
+                evaluate_aligned_binary(node, operator, inputs, &context)
             }
 
             ExecutableOperatorPayload::Value {
@@ -190,7 +222,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                             .into(),
                     );
                 }
-                finalize_exact(node, inputs)
+                finalize_exact(node, inputs, &context)
             }
             ExecutableOperatorPayload::SummaryAgg {
                 family,
@@ -255,12 +287,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                         "keyed maintenance updates require explicit row identity routing".into(),
                     );
                 }
-                let mut updater = asap_physical_operators::factory::create_planner_accumulator(
-                    family, input, grouping,
-                )?;
-                if updater.is_keyed() {
-                    return Err("keyed maintenance accumulator requires an item expression".into());
-                }
+                let _ = grouping;
                 let output_groups = values
                     .keys()
                     .map(|group| {
@@ -290,11 +317,39 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                         "maintenance sink requires one explicitly reduced output population".into(),
                     );
                 }
-                for (timestamp_ms, value) in values.values().flatten() {
-                    let weight = evaluate_weight(&input.weight, *value, name)?;
-                    updater.validate_single_input(weight)?;
-                    updater.update_single(weight, *timestamp_ms);
-                }
+                use asap_physical_operators::dag::{operators::Operator, values::Value};
+                let schema = native_schema(vec![
+                    (
+                        "value",
+                        planner_types::post_asap::SummaryFamilyType::Plain(
+                            planner_types::pre_asap::DataType::Float64,
+                        ),
+                    ),
+                    (
+                        "time",
+                        planner_types::post_asap::SummaryFamilyType::Plain(
+                            planner_types::pre_asap::DataType::Timestamp,
+                        ),
+                    ),
+                ]);
+                let rows = values
+                    .values()
+                    .flatten()
+                    .map(|(time, value)| {
+                        Ok(vec![
+                            Value::Float64(evaluate_weight(&input.weight, *value, name)?),
+                            Value::Timestamp(*time),
+                        ])
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let builder =
+                    Operator::summary_build(schema.clone(), family.clone(), 0, Some(1), vec![])
+                        .map_err(|e| e.to_string())?;
+                let mut result = native_rows(schema, rows, vec![builder], &context)?;
+                let Some(Value::Summary { state, .. }) = result.pop().and_then(|mut row| row.pop())
+                else {
+                    return Err("native summary builder did not return state".into());
+                };
                 let timestamp = values
                     .values()
                     .flatten()
@@ -304,7 +359,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 Ok(MaintenanceValue::SummaryWindows {
                     states: BTreeMap::from([(
                         output_groups.into_iter().next().unwrap(),
-                        vec![(timestamp, Arc::from(updater.into_accumulator()))].into(),
+                        vec![(timestamp, state)].into(),
                     )]),
                     family: family.clone(),
                 })
@@ -314,6 +369,92 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
             )),
         }
     }
+}
+
+// These functions translate deployment values into native batches. Window and
+// catalog checks stay here; the library owns all computation on batch values.
+fn native_schema(
+    fields: Vec<(&str, planner_types::post_asap::SummaryFamilyType)>,
+) -> asap_physical_operators::dag::values::Schema {
+    Arc::new(planner_types::post_asap::SummarySchema {
+        fields: fields
+            .into_iter()
+            .map(|(name, dtype)| planner_types::post_asap::SummaryField {
+                name: name.into(),
+                dtype,
+                nullable: false,
+            })
+            .collect(),
+        time_index: None,
+    })
+}
+fn native_rows(
+    schema: asap_physical_operators::dag::values::Schema,
+    rows: Vec<Vec<asap_physical_operators::dag::values::Value>>,
+    operators: Vec<asap_physical_operators::dag::operators::Operator>,
+    context: &RunContext,
+) -> Result<Vec<Vec<asap_physical_operators::dag::values::Value>>, String> {
+    use asap_physical_operators::dag::{batch_execution::evaluate_batch, values::Batch};
+    let input = Batch::try_new(schema, rows).map_err(|e| e.to_string())?;
+    Ok(evaluate_batch(input, operators, context.clone())
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .flat_map(|b| b.rows().to_vec())
+        .collect())
+}
+fn native_arithmetic(
+    op: &planner_types::post_asap::BinaryOperator,
+    inputs: Vec<(i64, f64, f64)>,
+    context: &RunContext,
+) -> Result<Vec<(i64, f64)>, String> {
+    use asap_physical_operators::dag::{
+        operators::{Expression, Operator},
+        values::Value,
+    };
+    use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+    let schema = native_schema(vec![
+        ("time", SummaryFamilyType::Plain(DataType::Timestamp)),
+        ("left", SummaryFamilyType::Plain(DataType::Float64)),
+        ("right", SummaryFamilyType::Plain(DataType::Float64)),
+    ]);
+    let project = Operator::project(
+        schema.clone(),
+        vec![
+            ("time".into(), Expression::Column(0)),
+            (
+                "value".into(),
+                Expression::Binary {
+                    operator: op.clone(),
+                    left: Box::new(Expression::Column(1)),
+                    right: Box::new(Expression::Column(2)),
+                },
+            ),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let rows = native_rows(
+        schema,
+        inputs
+            .into_iter()
+            .map(|(time, left, right)| {
+                vec![
+                    Value::Timestamp(time),
+                    Value::Float64(left),
+                    Value::Float64(right),
+                ]
+            })
+            .collect(),
+        vec![project],
+        context,
+    )?;
+    rows.into_iter()
+        .map(|row| match row.as_slice() {
+            [Value::Timestamp(time), Value::Float64(value)] if value.is_finite() => {
+                Ok((*time, *value))
+            }
+            _ => Err("maintenance binary produced a non-finite update".into()),
+        })
+        .collect()
 }
 
 fn validate_maintenance_grouping(
@@ -408,9 +549,10 @@ fn evaluate_aligned_binary(
     node: &ExecutableDagNode,
     operator: &planner_types::post_asap::BinaryOperator,
     inputs: &[Arc<MaintenanceValue>],
+    context: &RunContext,
 ) -> Result<MaintenanceValue, String> {
     use planner_types::pre_asap::BinaryOpKind;
-    let BinaryOpKind::Arithmetic(arithmetic) = &operator.kind else {
+    let BinaryOpKind::Arithmetic(_) = &operator.kind else {
         return Err("maintenance binary currently requires arithmetic".into());
     };
     if operator.vector_match.is_some() {
@@ -468,14 +610,9 @@ fn evaluate_aligned_binary(
             let right = right_rows
                 .get(&timestamp)
                 .ok_or("maintenance binary requires matching timestamp sets")?;
-            let value = asap_physical_operators::arithmetic::evaluate_float64_arithmetic(
-                arithmetic, left, *right,
-            );
-            if !value.is_finite() {
-                return Err("maintenance binary produced a non-finite update".into());
-            }
-            joined.push((timestamp, value));
+            joined.push((timestamp, left, *right));
         }
+        let joined = native_arithmetic(operator, joined, context)?;
         values.insert(group.clone(), joined);
     }
     Ok(MaintenanceValue::Rows {
@@ -488,6 +625,7 @@ fn evaluate_aligned_binary(
 fn finalize_exact(
     node: &ExecutableDagNode,
     inputs: &[Arc<MaintenanceValue>],
+    context: &RunContext,
 ) -> Result<MaintenanceValue, String> {
     use planner_types::post_asap::{ExactKind, SummaryFamilyType};
     let [input] = inputs else {
@@ -534,12 +672,39 @@ fn finalize_exact(
     let field = maintenance_float64_column(node)?;
     let mut values = PopulationRows::new();
     for (group, states) in groups {
+        use asap_physical_operators::dag::{operators::Operator, values::Value};
+        let schema = native_schema(vec![("state", family.clone())]);
+        let readout = Operator::readout(schema.clone(), 0, statistic, Default::default())
+            .map_err(|e| e.to_string())?;
+        let rows = native_rows(
+            schema,
+            states
+                .iter()
+                .map(|(_, state)| {
+                    vec![Value::Summary {
+                        family: family.clone(),
+                        state: Arc::clone(state),
+                    }]
+                })
+                .collect(),
+            vec![readout],
+            context,
+        )?;
         let rows = states
             .into_iter()
-            .map(|(timestamp, state)| {
-                let value = state
-                    .query_statistic(statistic, &None, &std::collections::HashMap::new())
-                    .map_err(|error| error.to_string())?;
+            .zip(rows)
+            .map(|((timestamp, _), row)| {
+                let value =
+                    match row.first() {
+                        Some(Value::Float64(value)) => *value,
+                        Some(Value::Int64(value)) if value.unsigned_abs() <= (1u64 << 53) => {
+                            *value as f64
+                        }
+                        _ => return Err(
+                            "exact readout cannot be represented by the installed Float64 schema"
+                                .to_string(),
+                        ),
+                    };
                 if !value.is_finite() {
                     return Err("exact maintenance finalization produced a non-finite value".into());
                 }
@@ -556,7 +721,10 @@ fn finalize_exact(
     })
 }
 
-fn merge_inputs(inputs: &[Arc<MaintenanceValue>]) -> Result<MaintenanceValue, String> {
+fn merge_inputs(
+    inputs: &[Arc<MaintenanceValue>],
+    context: &RunContext,
+) -> Result<MaintenanceValue, String> {
     let mut grouped = BTreeMap::<Population, (Vec<&SummaryState>, Option<i64>)>::new();
     let mut expected_groups = None;
     let mut family = None;
@@ -613,19 +781,36 @@ fn merge_inputs(inputs: &[Arc<MaintenanceValue>]) -> Result<MaintenanceValue, St
         let Some((first, rest)) = states.split_first() else {
             return Err("summary maintenance population has no input state".into());
         };
-        let mut merged = first.clone_boxed_core();
-        for state in rest {
-            merged = merged
-                .merge_with(state.as_ref())
-                .map_err(|error| error.to_string())?;
-        }
+        let state_family = family.clone().or_else(|| {
+            first.as_any().downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>().map(|state| state.family().clone())
+        }).or_else(|| first.as_any().is::<asap_physical_operators::summary_kernels::SumAccumulator>().then_some(
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, planner_types::post_asap::ExactParams::Sum)
+        )).ok_or("summary merge requires a registered state family")?;
+        use asap_physical_operators::dag::{operators::Operator, values::Value};
+        let schema = native_schema(vec![("state", state_family.clone())]);
+        let rows = std::iter::once(*first)
+            .chain(rest.iter().copied())
+            .map(|state| {
+                vec![Value::Summary {
+                    family: state_family.clone(),
+                    state: Arc::clone(state),
+                }]
+            })
+            .collect();
+        let merge =
+            Operator::summary_merge(schema.clone(), 0, vec![]).map_err(|e| e.to_string())?;
+        let mut output = native_rows(schema, rows, vec![merge], context)?;
+        let Some(Value::Summary { state: merged, .. }) = output.pop().and_then(|mut row| row.pop())
+        else {
+            return Err("native summary merge did not return state".into());
+        };
         let Some(timestamp) = timestamp else {
             return Ok(MaintenanceValue::Summary {
-                state: Arc::from(merged),
+                state: merged,
                 family,
             });
         };
-        result.insert(group, vec![(timestamp, Arc::from(merged))].into());
+        result.insert(group, vec![(timestamp, merged)].into());
     }
     Ok(MaintenanceValue::SummaryWindows {
         states: result,
@@ -651,31 +836,33 @@ fn frozen_cohort_lineage(
     }
     let mut ordered: Vec<_> = inputs.iter().collect();
     ordered.sort_by(|left, right| {
-        (left.definition, left.sid, &left.group).cmp(&(right.definition, right.sid, &right.group))
+        (left.stored_output_reference, &left.group)
+            .cmp(&(right.stored_output_reference, &right.group))
     });
     if ordered.windows(2).any(|pair| {
-        (pair[0].definition, pair[0].sid, &pair[0].group)
-            == (pair[1].definition, pair[1].sid, &pair[1].group)
+        (pair[0].stored_output_reference, &pair[0].group)
+            == (pair[1].stored_output_reference, &pair[1].group)
     }) {
-        return Err("immutable lineage repeats a physical population".into());
+        return Err("immutable lineage repeats a stored-output population".into());
     }
     let multiple = ordered.len() > 1;
     let mut lineage = Sha256::new();
-    if multiple {
-        lineage.update(b"immutable-maintenance-input-v2");
-        lineage.update((ordered.len() as u64).to_be_bytes());
-    } else {
-        // Preserve the existing durable single-input receipt identity.
-        lineage.update(b"immutable-maintenance-input-v1");
-    }
+    lineage.update(b"immutable-stored-output-input-v3");
+    lineage.update((ordered.len() as u64).to_be_bytes());
     for input in ordered {
         if &input.generation != generation || input.windows.is_empty() {
             return Err("immutable lineage has mixed generations or empty windows".into());
         }
-        lineage.update(input.sid.to_be_bytes());
-        let metadata =
-            serde_json::to_vec(&(&input.definition, &input.generation, &input.group, expected))
-                .map_err(|error| error.to_string())?;
+        if input.stored_output_reference.definition_id != input.definition {
+            return Err("immutable input output differs from its definition".into());
+        }
+        let metadata = serde_json::to_vec(&(
+            &input.stored_output_reference,
+            &input.generation,
+            &input.group,
+            expected,
+        ))
+        .map_err(|error| error.to_string())?;
         if multiple {
             lineage.update((metadata.len() as u64).to_be_bytes());
         }
@@ -1198,19 +1385,8 @@ fn execute_finite_source_cohort(
             config.population_key_encoding,
             &pairs,
         )?;
-        let kind = crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
         let target_sid =
-            resolver.resolve_with_reactivation(&config.metric, &attrs, &kind, |sid| {
-                store.validate_routed_catalog_generation(Some(generation))?;
-                let activation = store.authorize_series_reactivation(sid, *target)?;
-                if activation
-                    .as_deref()
-                    .is_some_and(|actual| actual != generation)
-                {
-                    return Err("finite maintenance generation changed".into());
-                }
-                Ok(activation)
-            })?;
+            store.resolve_output_storage_handle(resolver, *target, &attrs, Some(generation))?;
         if existing
             .get(&target_sid)
             .and_then(|groups| groups.get(&output_group))
@@ -1354,20 +1530,8 @@ fn execute_finite_complete_populations(
             config.population_key_encoding,
             &[],
         )?;
-        let kind = crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-        let target_sid = resolver
-            .resolve_with_reactivation(&config.metric, &attrs, &kind, |sid| {
-                store.validate_routed_catalog_generation(Some(generation))?;
-                let activation = store.authorize_series_reactivation(sid, target)?;
-                if activation
-                    .as_deref()
-                    .is_some_and(|actual| actual != generation.as_ref())
-                {
-                    return Err("complete maintenance generation changed".into());
-                }
-                Ok(activation)
-            })
-            .map_err(|error| error.to_string())?;
+        let target_sid =
+            store.resolve_output_storage_handle(resolver, target, &attrs, Some(generation))?;
         if store
             .completed_maintenance_coordinates(target, generation)?
             .get(&target_sid)
@@ -1509,25 +1673,11 @@ pub(crate) fn execute_finite_maintenance(
                         config.population_key_encoding,
                         &pairs,
                     )?;
-                    let kind =
-                        crate::storage_engines::sketch_db::data::materialization_kind_for_config(
-                            config,
-                        );
-                    let target_sid = resolver.resolve_with_reactivation(
-                        &config.metric,
+                    let target_sid = store.resolve_output_storage_handle(
+                        resolver,
+                        *target,
                         &attrs,
-                        &kind,
-                        |sid| {
-                            store.validate_routed_catalog_generation(Some(generation))?;
-                            let activation = store.authorize_series_reactivation(sid, *target)?;
-                            if activation
-                                .as_deref()
-                                .is_some_and(|actual| actual != generation)
-                            {
-                                return Err("finite maintenance generation changed".into());
-                            }
-                            Ok(activation)
-                        },
+                        Some(generation),
                     )?;
                     for (start, _) in &windows {
                         if (*start as i128 - config.pane_origin_ms.unwrap_or(0) as i128)
@@ -1617,7 +1767,7 @@ struct CommitRegistry(Mutex<CommitRegistryState>);
 impl CommitRegistry {
     fn plan_snapshot(
         &self,
-        plans: &StreamingConfigHandle,
+        plans: &InstalledPrecomputePlanHandle,
     ) -> Result<Option<Arc<crate::storage_engines::types::RuntimePhysicalPlan>>, String> {
         let mut state = self.0.lock().map_err(|_| "commit registry poisoned")?;
         // Read the authoritative generation while holding the registry lock,
@@ -1785,13 +1935,13 @@ impl IdempotentCommitSink<MaintenanceValue> for CommitRegistry {
 /// With no matching DAG, the source output is forwarded unchanged.
 pub struct MaintenanceDagSink {
     inner: Arc<dyn OutputSink>,
-    plans: StreamingConfigHandle,
+    plans: InstalledPrecomputePlanHandle,
     commits: CommitRegistry,
     batch_guard: Mutex<()>,
 }
 
 impl MaintenanceDagSink {
-    pub fn new(inner: Arc<dyn OutputSink>, plans: StreamingConfigHandle) -> Self {
+    pub fn new(inner: Arc<dyn OutputSink>, plans: InstalledPrecomputePlanHandle) -> Self {
         Self {
             inner,
             plans,
@@ -1854,6 +2004,8 @@ impl MaintenanceDagSink {
                 },
                 configs: &plan.precompute_plan.materializations,
             };
+            let mut selected_outputs = Vec::new();
+            let mut horizons = Vec::new();
             for sink_node in &installed.binding.precompute_sinks {
                 // Derived summaries consume complete immutable windows at the
                 // completion barrier, never additive worker fragments.
@@ -1936,18 +2088,24 @@ impl MaintenanceDagSink {
                 if self.commits.is_published(&key)? {
                     continue;
                 }
-                let value = execute_precompute_sink(
-                    &dag,
-                    &installed.binding,
-                    *sink_node,
-                    key.clone(),
-                    &adapter,
-                    &self.commits,
-                )
-                .map_err(schedule_error)?;
+                selected_outputs.push((*sink_node, key));
+                horizons.push(horizon_ms);
+            }
+            let values = execute_precompute_sinks(
+                &dag,
+                &installed.binding,
+                &selected_outputs,
+                &adapter,
+                &self.commits,
+            )
+            .map_err(schedule_error)?;
+            for (((_, key), horizon_ms), value) in
+                selected_outputs.into_iter().zip(horizons).zip(values)
+            {
+                let target = key.summary_definition;
                 let mut target_output = output.clone();
                 target_output.policy_fp = target.into();
-                target_output.series_id = None;
+                target_output.storage_handle = None;
                 derived.push((
                     Some((key, horizon_ms)),
                     target_output,
@@ -2152,6 +2310,19 @@ pub(crate) fn affected_materializations(
 
 #[cfg(test)]
 mod tests {
+    fn test_context() -> asap_physical_operators::dag::RunContext {
+        use asap_physical_operators::dag::{Limits, RunContext, Scope};
+        RunContext::new(
+            Scope::Ingestion {
+                window_start_ms: 0,
+                window_end_ms: 10_000,
+                revision: 1,
+            },
+            Limits::default(),
+        )
+        .unwrap()
+    }
+
     use super::*;
     use asap_physical_operators::summary_kernels::SumAccumulator;
     use planner_types::post_asap::{
@@ -2190,7 +2361,10 @@ mod tests {
             let mut state = asap_physical_operators::summary_kernels::SumAccumulator::new();
             state.update(value);
             FrozenExactWindows {
-                sid,
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                    definition(id),
+                ),
+                storage_handle: sid,
                 definition: definition(id),
                 generation: Arc::new(asap_types::sds::CatalogGeneration {
                     schema_version: 2,
@@ -2209,6 +2383,13 @@ mod tests {
         };
         let baseline =
             frozen_cohort_lineage(&[make(10, 1, 3.0), make(20, 2, 5.0)], &expected).unwrap();
+        let mut relocated = make(20, 2, 5.0);
+        relocated.storage_handle = 999;
+        assert_eq!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), relocated], &expected).unwrap(),
+            "local row relocation must not change stored-output lineage"
+        );
         assert_eq!(
             baseline,
             frozen_cohort_lineage(&[make(20, 2, 5.0), make(10, 1, 3.0)], &expected).unwrap()
@@ -2220,6 +2401,12 @@ mod tests {
         assert_ne!(
             baseline,
             frozen_cohort_lineage(&[make(10, 1, 3.0), make(21, 2, 5.0)], &expected).unwrap()
+        );
+        let mut changed_output = make(20, 2, 5.0);
+        changed_output.stored_output_reference.stored_output_id.0 += 100;
+        assert_ne!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), changed_output], &expected).unwrap()
         );
         let mut changed = make(20, 2, 5.0);
         changed.group.insert("instance".into(), "other".into());
@@ -2243,6 +2430,30 @@ mod tests {
             &expected
         )
         .is_err());
+    }
+
+    // Ingestion adapters must execute native operators in the parent's scope.
+    #[test]
+    fn native_merge_uses_the_parent_budget_and_cancellation() {
+        let input = Arc::new(MaintenanceValue::summary(Arc::new(
+            SumAccumulator::with_sum(3.),
+        )));
+        let context = test_context();
+        let output = merge_inputs(&[Arc::clone(&input)], &context).unwrap();
+        assert_eq!(
+            output
+                .state()
+                .unwrap()
+                .query_statistic(asap_types::Statistic::Sum, &None, &Default::default())
+                .unwrap(),
+            3.
+        );
+        assert!(context.peak_bytes() > 0);
+        context.cancel();
+        assert!(merge_inputs(&[input], &context)
+            .err()
+            .unwrap()
+            .contains("cancelled"));
     }
 
     fn node(id: u32) -> ExecutableDagNode {
@@ -2283,7 +2494,10 @@ mod tests {
     fn frozen_adapter_resolves_each_materialized_frontier_without_aliasing() {
         use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
         let make = |id| crate::storage_engines::sketch_db::index::FrozenExactWindows {
-            sid: id,
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                definition(id),
+            ),
+            storage_handle: id,
             definition: definition(id),
             generation: Arc::new(asap_types::sds::CatalogGeneration {
                 schema_version: 2,
@@ -2337,7 +2551,11 @@ mod tests {
             .unwrap()
             .is_none());
         let merged = adapter
-            .execute(&node(3), &[Arc::new(first), Arc::new(second)])
+            .execute(
+                &node(3),
+                &[Arc::new(first), Arc::new(second)],
+                test_context(),
+            )
             .unwrap();
         assert_eq!(
             merged
@@ -2422,7 +2640,10 @@ mod tests {
         };
         let frozen_inputs = [
             crate::storage_engines::sketch_db::index::FrozenExactWindows {
-                sid: 1,
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                    source_definition,
+                ),
+                storage_handle: 1,
                 definition: source_definition,
                 generation: Arc::new(asap_types::sds::CatalogGeneration {
                     schema_version: 2,
@@ -2456,7 +2677,7 @@ mod tests {
                 ExactParams::Sum,
             )),
         });
-        let row = adapter.execute(&read, &[source]).unwrap();
+        let row = adapter.execute(&read, &[source], test_context()).unwrap();
         let mut aggregate = node(3);
         aggregate.payload = ExecutableOperatorPayload::SummaryAgg {
             family: target_family,
@@ -2468,7 +2689,9 @@ mod tests {
             reduction: Reduction::by(vec![]),
             grouping: GroupingStrategy::default(),
         };
-        let result = adapter.execute(&aggregate, &[Arc::new(row)]).unwrap();
+        let result = adapter
+            .execute(&aggregate, &[Arc::new(row)], test_context())
+            .unwrap();
         let mut kwargs = std::collections::HashMap::new();
         kwargs.insert("quantile".into(), "0.5".into());
         assert_eq!(
@@ -3113,7 +3336,7 @@ mod tests {
                 .load_strict()
                 .unwrap()
                 .iter()
-                .all(|record| record.sid != 1));
+                .all(|record| record.storage_handle != 1));
             persistence.shutdown();
             return;
         }
@@ -3296,7 +3519,7 @@ mod tests {
             .load_strict()
             .unwrap()
             .iter()
-            .all(|record| record.sid != 2));
+            .all(|record| record.storage_handle != 2));
         persistence.shutdown();
     }
 
@@ -3334,9 +3557,13 @@ mod tests {
         let left = rows(vec![(2_000, 7.0), (1_000, 5.0)]);
         let right = rows(vec![(1_000, 2.0), (2_000, 3.0)]);
         // Arrival order cannot exchange windows, and subtraction retains edge order.
-        let MaintenanceValue::Rows { values, .. } =
-            evaluate_aligned_binary(&operation, &operator, &[left.clone(), right.clone()]).unwrap()
-        else {
+        let MaintenanceValue::Rows { values, .. } = evaluate_aligned_binary(
+            &operation,
+            &operator,
+            &[left.clone(), right.clone()],
+            &test_context(),
+        )
+        .unwrap() else {
             panic!("expected rows")
         };
         assert_eq!(values[&BTreeMap::new()], vec![(1_000, 3.0), (2_000, 4.0)]);
@@ -3363,6 +3590,7 @@ mod tests {
             &operation,
             &operator,
             &[grouped_left.clone(), grouped_right],
+            &test_context(),
         )
         .unwrap() else {
             panic!("expected grouped rows")
@@ -3377,7 +3605,8 @@ mod tests {
             &[
                 grouped_left,
                 grouped(BTreeMap::from([(a, vec![(1_000, 2.0)])]))
-            ]
+            ],
+            &test_context()
         )
         .is_err());
         let binding = BackendExecutableBinding {
@@ -3396,7 +3625,7 @@ mod tests {
         };
         operation.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
         assert!(frozen
-            .execute(&operation, &[left.clone(), right.clone()])
+            .execute(&operation, &[left.clone(), right.clone()], test_context())
             .is_ok());
         let live = OperatorAdapter {
             binding: &binding,
@@ -3407,14 +3636,14 @@ mod tests {
             configs: &[],
         };
         assert!(live
-            .execute(&operation, &[left.clone(), right.clone()])
+            .execute(&operation, &[left.clone(), right.clone()], test_context())
             .is_err());
         operation.payload = ExecutableOperatorPayload::Binary {
             operator: operator.clone(),
         };
         operation.output_state = planner_types::post_asap::ExecutionDataState::QUERY_ROWS;
         assert!(frozen
-            .execute(&operation, &[left.clone(), right.clone()])
+            .execute(&operation, &[left.clone(), right.clone()], test_context())
             .is_err());
         operation.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
 
@@ -3431,19 +3660,27 @@ mod tests {
             }),
             Arc::new(MaintenanceValue::summary(sum(2.0))),
         ] {
-            assert!(
-                evaluate_aligned_binary(&operation, &operator, &[left.clone(), invalid]).is_err()
-            );
+            assert!(evaluate_aligned_binary(
+                &operation,
+                &operator,
+                &[left.clone(), invalid],
+                &test_context()
+            )
+            .is_err());
         }
         operator.kind = BinaryOpKind::Arithmetic(ArithmeticOpKind::Div);
         assert!(evaluate_aligned_binary(
             &operation,
             &operator,
-            &[left.clone(), rows(vec![(1_000, 0.0), (2_000, 3.0)])]
+            &[left.clone(), rows(vec![(1_000, 0.0), (2_000, 3.0)])],
+            &test_context()
         )
         .is_err());
         operation.output_schema.fields[1].dtype = SummaryFamilyType::Plain(DataType::Int64);
-        assert!(evaluate_aligned_binary(&operation, &operator, &[left, right]).is_err());
+        assert!(
+            evaluate_aligned_binary(&operation, &operator, &[left, right], &test_context())
+                .is_err()
+        );
     }
 
     #[test]
@@ -3464,7 +3701,7 @@ mod tests {
             )]),
             family,
         });
-        assert!(merge_inputs(&[inputs.clone(), different_group]).is_err());
+        assert!(merge_inputs(&[inputs.clone(), different_group], &test_context()).is_err());
         let mut read = node(2);
         read.output_schema.fields = vec![SummaryField {
             name: "value".into(),
@@ -3472,15 +3709,16 @@ mod tests {
             nullable: false,
         }];
         let MaintenanceValue::Rows { values, .. } =
-            finalize_exact(&read, &[inputs.clone()]).unwrap()
+            finalize_exact(&read, &[inputs.clone()], &test_context()).unwrap()
         else {
             panic!("expected finalized rows")
         };
         assert_eq!(values[&BTreeMap::new()], vec![(1_000, 2.0), (2_000, 7.0)]);
         // Merge is a semantic DAG operation, not an implicit batch optimization.
         // Finalizing after it emits exactly one value instead of two updates.
-        let merged = Arc::new(merge_inputs(&[inputs]).unwrap());
-        let MaintenanceValue::Rows { values, .. } = finalize_exact(&read, &[merged]).unwrap()
+        let merged = Arc::new(merge_inputs(&[inputs], &test_context()).unwrap());
+        let MaintenanceValue::Rows { values, .. } =
+            finalize_exact(&read, &[merged], &test_context()).unwrap()
         else {
             panic!("expected finalized row")
         };
@@ -3495,7 +3733,7 @@ mod tests {
             )),
         });
         assert!(
-            matches!(finalize_exact(&read, &[integer_state]), Err(error) if error.contains("Float64"))
+            matches!(finalize_exact(&read, &[integer_state], &test_context()), Err(error) if error.contains("Float64"))
         );
     }
 
@@ -3522,7 +3760,7 @@ mod tests {
         ];
         read.output_schema.time_index = Some(0);
         let MaintenanceValue::Rows { values, name, .. } =
-            finalize_exact(&read, &[Arc::clone(&input)]).unwrap()
+            finalize_exact(&read, &[Arc::clone(&input)], &test_context()).unwrap()
         else {
             panic!("expected typed rows")
         };
@@ -3550,7 +3788,7 @@ mod tests {
         copy.output_schema.fields[1].name = "ts".into();
         malformed.push(copy);
         for malformed in malformed {
-            assert!(finalize_exact(&malformed, &[Arc::clone(&input)]).is_err());
+            assert!(finalize_exact(&malformed, &[Arc::clone(&input)], &test_context()).is_err());
         }
         let untimed = Arc::new(MaintenanceValue::Summary {
             state: sum(10.0),
@@ -3559,7 +3797,7 @@ mod tests {
                 ExactParams::Sum,
             )),
         });
-        assert!(finalize_exact(&read, &[untimed]).is_err());
+        assert!(finalize_exact(&read, &[untimed], &test_context()).is_err());
     }
 
     #[test]
@@ -3590,7 +3828,11 @@ mod tests {
             reduction: Reduction::by(vec![]),
             grouping: GroupingStrategy::default(),
         };
-        let error = adapter.execute(&aggregate, &[Arc::new(MaintenanceValue::summary(sum(7.0)))]);
+        let error = adapter.execute(
+            &aggregate,
+            &[Arc::new(MaintenanceValue::summary(sum(7.0)))],
+            test_context(),
+        );
         assert!(matches!(error, Err(reason) if reason.contains("typed update evaluator")));
     }
 
@@ -3651,8 +3893,10 @@ mod tests {
             name: "value".into(),
             timestamped: true,
         };
-        assert!(matches!(adapter.execute(&aggregate, &[Arc::new(rows)]),
-            Err(error) if error.contains("one explicitly reduced output population")));
+        assert!(
+            matches!(adapter.execute(&aggregate, &[Arc::new(rows)], test_context()),
+            Err(error) if error.contains("one explicitly reduced output population"))
+        );
     }
 
     #[test]
@@ -3717,8 +3961,10 @@ mod tests {
                 name: "value".into(),
                 timestamped: true,
             };
-            assert!(matches!(adapter.execute(&aggregate, &[Arc::new(rows)]),
-                Err(error) if error.contains("positive representable domain")));
+            assert!(
+                matches!(adapter.execute(&aggregate, &[Arc::new(rows)], test_context()),
+                Err(error) if error.contains("positive representable domain"))
+            );
         }
     }
 
@@ -3822,7 +4068,7 @@ mod tests {
     #[test]
     fn downstream_failure_does_not_acknowledge_maintenance_publication() {
         use crate::storage_engines::types::{
-            ActivePhysicalPlanHandle, RuntimePhysicalPlan, StreamingConfig,
+            ActivePhysicalPlanHandle, InstalledPrecomputePlan, RuntimePhysicalPlan,
         };
         use asap_types::executable_plan::{InstalledPostAsapDag, OwnedPostAsapDag};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3918,7 +4164,7 @@ mod tests {
             summary_catalog: Some(Arc::new(bundle.summary_catalog)),
             precompute_plan: bundle.precompute_plan,
             transmission_plan: bundle.transmission_plan,
-            streaming_config: Arc::new(StreamingConfig::new(Default::default())),
+            installed_precompute_plan: Arc::new(InstalledPrecomputePlan::new(Default::default())),
             query_plan: Arc::new(bundle.query_plan),
             storage_routing: Arc::new(Default::default()),
         };
@@ -3933,9 +4179,9 @@ mod tests {
             });
             let sink = MaintenanceDagSink::new(
                 downstream.clone(),
-                StreamingConfigHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(
-                    active.clone(),
-                )),
+                InstalledPrecomputePlanHandle::from_active_physical_plan(
+                    ActivePhysicalPlanHandle::new(active.clone()),
+                ),
             );
             let batch = || {
                 (0..count)

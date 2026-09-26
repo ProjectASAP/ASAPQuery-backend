@@ -369,7 +369,7 @@ mod tests {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<InstalledPostAsapDag>();
         let wire = serde_json::json!({
-            "schema_version": 1, "query_id": "q", "nodes": [], "edges": [], "root": 0
+            "schema_version": 2, "query_id": "q", "nodes": [], "edges": [], "root": 0
         });
         let document: OwnedPostAsapDag = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(document).unwrap(), wire);

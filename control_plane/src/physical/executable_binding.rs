@@ -2,6 +2,21 @@
 
 pub use asap_types::executable_plan::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperatorExecution {
+    Ingestion,
+    Query,
+}
+
+/// Every physical operator uses its node's placement; payload kind does not
+/// restrict execution phase. Runtime capability is checked separately.
+fn operator_execution(node: &planner_types::post_asap::ExecutableDagNode) -> OperatorExecution {
+    match node.output_state.timing {
+        planner_types::post_asap::ExecutionTiming::IngestionTime => OperatorExecution::Ingestion,
+        planner_types::post_asap::ExecutionTiming::QueryTime => OperatorExecution::Query,
+    }
+}
+
 /// Assign backend phases to a selected semantic DAG without changing its nodes.
 pub fn install_selected_dag(
     query_id: String,
@@ -15,12 +30,21 @@ pub fn install_selected_dag(
     let mut nodes = std::collections::BTreeMap::new();
     let mut precompute_sinks = Vec::new();
     for node in &dag.nodes {
+        if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+            family,
+            input,
+            grouping,
+            ..
+        } = &node.payload
+        {
+            asap_physical_operators::capability::validate_summary_kernel(family, input, grouping)
+                .map_err(|reason| format!("post-ASAP node {:?}: {reason}", node.id))?;
+        }
+        let execution = operator_execution(node);
         let binding = if let Some(summary_definition) = materialization(node.id) {
             precompute_sinks.push(node.id);
             BackendNodeBinding::Materialization { summary_definition }
-        } else if node.output_state.timing
-            == planner_types::post_asap::ExecutionTiming::IngestionTime
-        {
+        } else if execution == OperatorExecution::Ingestion {
             BackendNodeBinding::MaintenanceInput
         } else {
             query_node(node.id).map_or(BackendNodeBinding::QueryInput, |query_node| {

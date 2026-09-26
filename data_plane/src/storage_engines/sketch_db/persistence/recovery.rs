@@ -34,7 +34,7 @@ pub fn recover(disk_path: &Path) -> PersistResult<(Manifest, RecoveryReport)> {
 
     // Validate every live part by reading its meta.bin header.
     let mut to_drop: Vec<PartId> = Vec::new();
-    let pending: HashSet<PartId> = super::metadata::SidMetadataStore::new(disk_path)
+    let pending: HashSet<PartId> = super::metadata::StoredOutputMetadataFile::new(disk_path)
         .load_strict()?
         .into_iter()
         .filter_map(|record| record.pending_immutable.map(|pending| pending.part_id))

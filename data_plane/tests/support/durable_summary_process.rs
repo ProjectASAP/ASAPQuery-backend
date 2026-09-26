@@ -30,18 +30,46 @@ async fn persisted_summary_restarts_without_live_reregistration() {
     };
     let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join("plan.json");
-    let bootstrap = directory.path().join("bootstrap.json");
     let disk = directory.path().join("disk");
     std::fs::create_dir_all(&disk).unwrap();
-    std::fs::write(&artifact, serde_json::to_vec(&install).unwrap()).unwrap();
-    std::fs::write(&bootstrap, b"{\"aggregations\":[]}").unwrap();
+    let mut document = serde_json::to_value(&install).unwrap();
+    let output_ids: std::collections::BTreeMap<u64, u64> = install
+        .precompute_plan
+        .schemas
+        .iter()
+        .enumerate()
+        .map(|(index, schema)| {
+            (
+                schema.stored_output_reference.stored_output_id.0,
+                101 + index as u64,
+            )
+        })
+        .collect();
+    fn assign_output_ids(value: &mut Value, ids: &std::collections::BTreeMap<u64, u64>) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(id) = fields.get_mut("stored_output_id") {
+                    *id = serde_json::json!(ids[&id.as_u64().unwrap()]);
+                }
+                for nested in fields.values_mut() {
+                    assign_output_ids(nested, ids);
+                }
+            }
+            Value::Array(values) => {
+                for nested in values {
+                    assign_output_ids(nested, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    assign_output_ids(&mut document, &output_ids);
+    std::fs::write(&artifact, serde_json::to_vec(&document).unwrap()).unwrap();
     let spawn = |port: u16| {
         ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_data_plane"))
                 .arg("--physical-plan")
                 .arg(&artifact)
-                .arg("--streaming-config")
-                .arg(&bootstrap)
                 .arg("--http-port")
                 .arg(port.to_string())
                 .arg("--output-dir")

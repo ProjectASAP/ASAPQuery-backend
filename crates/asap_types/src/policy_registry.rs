@@ -3,8 +3,8 @@
 //! Derived view over a collection of `PrecomputeMaterialization`s that maps
 //! [`PolicyFingerprint`] → [`PrecomputeMaterialization`]. This is the
 //! merged-sid-identity-chain replacement for the controller-allocated
-//! `aggregation_id`-keyed `HashMap` that `data_plane`'s `StreamingConfig`
-//! carries (see `data_plane::storage_engines::types::streaming_config`'s
+//! `aggregation_id`-keyed `HashMap` that `data_plane`'s `InstalledPrecomputePlan`
+//! carries (see `data_plane::storage_engines::types::installed_precompute_plan`'s
 //! module doc for why that type lives there, not here).
 //!
 //! ## Dual-keyed transition
