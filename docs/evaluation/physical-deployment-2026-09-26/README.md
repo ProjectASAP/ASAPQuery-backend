@@ -1,7 +1,8 @@
 # Shared physical deployment validation — 2026-09-26
 
 The independent Level 1 branch and all seven live Level 2 suites pass. Strict
-Level 3 performance acceptance has not passed. No thresholds or expected
+Level 3 performance acceptance passes the recorded probe-parser run. The final
+Planner-pin measurement failed two p95 comparisons and is retained below. No thresholds or expected
 results have been relaxed.
 
 ## Ownership and dependency order
@@ -20,12 +21,12 @@ its former base during restacking; this did not merge the stack into main.
 
 | Area | Result |
 | --- | --- |
-| Planner physical package | 254 unit tests plus integration/documentation tests; strict all-target Clippy passed |
+| Planner physical package | 255 unit tests plus integration/documentation tests; strict all-target Clippy passed |
 | Planner mapping | 448 unit tests plus integration tests; strict all-target Clippy passed |
 | Backend foundation #774 | 429 control-plane unit tests passed on its own head |
 | Backend data-plane #765 | 891 unit tests and strict all-target Clippy passed |
 | Diagnostics #756 | 429 control-plane unit tests passed on its own head |
-| Runtime controls #766 | 892 data-plane unit tests, strict all-target Clippy and its CI passed |
+| Runtime controls #766 | 893 data-plane unit tests, strict all-target Clippy and its CI passed |
 | Backend scoped costing #761 | 447 control-plane unit tests passed on its own head |
 | Level 1 #728 | Both independent-branch planning tests passed |
 | Level 2 #742 | Seven suites, 161 queries, 759 local responses, zero fallback |
@@ -127,3 +128,59 @@ make benefit REPORT_DIR=/tmp/level3 LOGS_DIR=/tmp/level3-logs
 
 Use separate Cargo targets for branches with different workspace APIs. Both
 live harnesses retain failures and exit nonzero when acceptance fails.
+
+## Passing probe-parser measurement
+
+[CI run 36225215058](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36225215058)
+passes semantic/local-provenance checks and every strict CPU, peak-memory and
+query p95 comparison, with three warmups and 100 measured trials per query.
+The PR head is `1b8bf1d00323918f78728da0c25beb354c44f198`; the tested merge is
+`e5a31f88621b379aa33ad624a2dde228a709c7cc`, with Planner `41fe4fe9`.
+[Complete samples](benefit-ci-probe-fastpath.json) retain all measurements.
+
+| Target | CPU usec | Peak bytes |
+| --- | ---: | ---: |
+| Backend | 267002 | 46448640 |
+| Prometheus | 1239327 | 107585536 |
+| VictoriaMetrics | 621122 | 71811072 |
+| ClickHouse | 14088307 | 459235328 |
+
+HTTP freshness-probe handling now rejects unrelated function tokens before
+constructing the PromQL parser. Query results remain uncached; physical input,
+revision, coverage and readiness checks still occur for every execution.
+
+Final Planner pin `751e5e02c563d1928818971e072f73aea54e7946` additionally fixes
+full re-snapshot population counting. Its regression failed before the fix
+(six samples instead of four). All 255 shared physical unit tests, integrations,
+docs, formatting and strict Clippy pass. With this pin, #774 passes 429 unit
+tests, #728 passes both independent Level 1 tests, #765 passes 891 unit tests
+and 18 process tests plus strict Clippy, #756 passes 891 unit tests plus strict
+Clippy, and #766 passes 893 unit tests. Latest-pin Level 2 passes on independent #742 head `92614f0e`
+([CI](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36225853469));
+[final report card](level2-ci-final.md) and [summary data](level2-ci-final.json)
+record seven suites, 161 queries, 759 local responses and zero fallback.
+Stack-top Level 2 also passes on `de44e3bd`
+([CI](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36225853662)).
+
+[Finalized-pane CI run 36225853665](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36225853665)
+failed strict performance acceptance on PR head `de44e3bd` / tested merge
+`af64df2f579d7a49b4a96bdaa71fcd6973691449`.
+[All samples](benefit-ci-finalized-panes.json) are retained. CPU (269441 µs) and
+peak memory (46018560 bytes) pass all baselines, but temporal-sum p95 is
+1.159219 ms versus VictoriaMetrics 1.114215 ms, and topk-rate p95 is 1.009188 ms
+versus 0.99007 ms. The previous passing run does not make this run pass.
+Further per-run parameter-allocation work is undergoing validation.
+
+## Per-run exact readout parameters
+
+#765 now shares the resolved counter range parameters within each run; sum,
+count, min and max readouts do not create unused range strings. Coverage is
+scanned once per group. Full 891 unit tests, strict all-target Clippy and all
+18 own-branch process tests pass at `ec102f4f`.
+
+The independent [allocation probe](readout-range-allocation-probe.rs) exercises
+the shared readout on reset-sensitive 12-pane states for eight groups. Results
+are equal: Rate allocations fall from 49 to 14 and Sum from 49 to 9. This is
+an allocation measurement, not an end-to-end latency claim. Build the probe
+against the physical library rlib with rustc and its dependency directory.
+The next strict end-to-end run is pending.

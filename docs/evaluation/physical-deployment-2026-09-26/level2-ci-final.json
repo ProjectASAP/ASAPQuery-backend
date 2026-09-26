@@ -1,0 +1,61 @@
+{
+  "cases": [
+    {
+      "asapQuery": 330,
+      "dataset": "aggregations",
+      "passed": true,
+      "prometheusFallback": 0,
+      "queries": 66,
+      "suite": "aggregations"
+    },
+    {
+      "asapQuery": 330,
+      "dataset": "aggregations-dense-cadence",
+      "passed": true,
+      "prometheusFallback": 0,
+      "queries": 66,
+      "suite": "aggregations"
+    },
+    {
+      "asapQuery": 45,
+      "dataset": "aggregations-dense-cadence",
+      "passed": true,
+      "prometheusFallback": 0,
+      "queries": 9,
+      "suite": "issue-702"
+    },
+    {
+      "asapQuery": 16,
+      "dataset": "issue-702-one-second",
+      "passed": true,
+      "prometheusFallback": 0,
+      "queries": 8,
+      "suite": "issue-702-one-second"
+    },
+    {
+      "asapQuery": 30,
+      "dataset": "issue-754",
+      "passed": true,
+      "prometheusFallback": 0,
+      "queries": 10,
+      "suite": "issue-754"
+    },
+    {
+      "asapQuery": 4,
+      "dataset": "single-rate",
+      "passed": true,
+      "prometheusFallback": 0,
+      "queries": 1,
+      "suite": "temporal"
+    },
+    {
+      "asapQuery": 4,
+      "dataset": "sparse-checkout",
+      "passed": true,
+      "prometheusFallback": 0,
+      "queries": 1,
+      "suite": "temporal"
+    }
+  ],
+  "passed": true
+}
