@@ -54,7 +54,7 @@ establish performance at other cardinalities or concurrency.
 A subsequent deployment change reuses immutable readout-boundary plan metadata
 and checks QueryPlan identity to prevent stale bindings. Data, coverage,
 revision and readiness remain per-run checks. Its 891 unit tests, strict
-Clippy and all 18 process tests on #765 pass. Its ten-trial Level 3 CI is pending.
+Clippy and all 18 process tests on #765 pass. Its ten-trial Level 3 CI failed five VictoriaMetrics p95 comparisons.
 Heap process fixtures declare their supported family explicitly; native TopK
 strictly checks original PromQL labels and values. The stack-top process run with this metadata change passed all 19 tests;
 its 12 runner contracts and four HTTP tests also passed.
@@ -72,8 +72,34 @@ nearest-rank formula, ten-trial p95 equals the maximum; 100 trials use the 95th
 sorted observation. All raw samples remain in the report. CPU, peak memory
 and every query p95 must still be strictly lower than every exact baseline.
 The latest runner passes 12 contract tests, four HTTP tests and strict Clippy.
-The new 100-trial performance run is pending; earlier ten-trial artifacts are
-retained as historical evidence, not relabeled as a pass.
+[100-trial CI run 36223795295](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36223795295)
+used backend `746a26e200bde4f800cf82e27c58d633bb8fa0f8` and Planner `41fe4fe9`.
+[Complete 100-trial measurements](benefit-ci-100-trials.json) retain every sample.
+Overall acceptance failed. CPU and peak memory passed against all baselines:
+
+| Target | CPU usec | Peak bytes |
+| --- | ---: | ---: |
+| Backend | 204539 | 45842432 |
+| Prometheus | 664763 | 109088768 |
+| VictoriaMetrics | 328547 | 63328256 |
+| ClickHouse | 7577650 | 437297152 |
+
+Five VictoriaMetrics p95 comparisons failed:
+
+| Query | Backend p95 ms | VictoriaMetrics p95 ms |
+| --- | ---: | ---: |
+| spatial-topk | 0.541 | 0.527 |
+| temporal-quantile | 0.687 | 0.554 |
+| grouped-rate | 0.562 | 0.510 |
+| grouped-temporal-sum | 0.527 | 0.504 |
+| topk-rate | 0.579 | 0.540 |
+
+Earlier ten-trial artifacts remain historical evidence. The scratch-allocation
+probe and increased sampling do not establish end-to-end performance acceptance.
+Level 1 passes on current #728 head `7a59e78c`; Level 2 passes on current #742
+head `85fa2c4a` ([CI](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36223594024)).
+The #766 runtime inspection CI passes on `bc532c54`
+([CI](https://github.com/ProjectASAP/ASAPQuery-backend/actions/runs/36223592865)).
 
 ## Remaining integration scope
 
