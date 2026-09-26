@@ -24,7 +24,7 @@ pub fn install_selected_dag(
     query_plan_sink: QueryNodeId,
     materialization: impl Fn(
         planner_types::post_asap::PostAsapNodeId,
-    ) -> Option<asap_types::sds::SummaryDefinitionId>,
+    ) -> Option<asap_types::sds::StoredOutputId>,
     query_node: impl Fn(planner_types::post_asap::PostAsapNodeId) -> Option<QueryNodeId>,
 ) -> Result<InstalledPostAsapDag, String> {
     let mut nodes = std::collections::BTreeMap::new();
@@ -41,9 +41,9 @@ pub fn install_selected_dag(
                 .map_err(|reason| format!("post-ASAP node {:?}: {reason}", node.id))?;
         }
         let execution = operator_execution(node);
-        let binding = if let Some(summary_definition) = materialization(node.id) {
+        let binding = if let Some(stored_output) = materialization(node.id) {
             precompute_sinks.push(node.id);
-            BackendNodeBinding::Materialization { summary_definition }
+            BackendNodeBinding::Materialization { stored_output }
         } else if execution == OperatorExecution::Ingestion {
             BackendNodeBinding::MaintenanceInput
         } else {

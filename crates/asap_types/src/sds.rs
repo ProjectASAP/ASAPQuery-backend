@@ -30,62 +30,71 @@ macro_rules! descriptor_id {
         }
     };
 }
-/// Semantic materialization reference. Wire-compatible with PolicyFingerprint,
-/// but distinct from descriptor IDs and concrete [`SummaryInstanceId`] identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SummaryDefinitionId(pub crate::PolicyFingerprint);
-impl SummaryDefinitionId {
-    pub fn fingerprint(self) -> crate::PolicyFingerprint {
-        self.0
-    }
-    pub fn as_u64(self) -> u64 {
-        self.0 .0
-    }
-}
-impl From<crate::PolicyFingerprint> for SummaryDefinitionId {
-    fn from(value: crate::PolicyFingerprint) -> Self {
-        Self(value)
-    }
-}
-impl From<SummaryDefinitionId> for crate::PolicyFingerprint {
-    fn from(value: SummaryDefinitionId) -> Self {
-        value.0
-    }
-}
-
-/// Identity of one persisted producer output within an installed plan version.
-/// It is independent of the semantic definition shared by equivalent producers.
+/// Identity of one deployed producer output. Runtime routing uses this identity,
+/// never the semantic definition hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StoredOutputId(pub u64);
+impl StoredOutputId {
+    pub fn fingerprint(self) -> crate::PolicyFingerprint {
+        crate::PolicyFingerprint(self.0)
+    }
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+impl From<crate::PolicyFingerprint> for StoredOutputId {
+    fn from(value: crate::PolicyFingerprint) -> Self {
+        Self(value.0)
+    }
+}
+impl From<StoredOutputId> for crate::PolicyFingerprint {
+    fn from(value: StoredOutputId) -> Self {
+        Self(value.0)
+    }
+}
 
-/// Typed join key carried by both the writer and every bound reader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+descriptor_id!(SummaryDefinitionId);
+impl SummaryDefinitionId {
+    pub(crate) fn from_semantics(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(format!("sds-v1:{:x}", Sha256::digest(bytes)))
+    }
+    pub fn validate(&self) -> Result<(), SdsError> {
+        let hash = self.0.strip_prefix("sds-v1:").unwrap_or("");
+        if hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(())
+        } else {
+            Err(SdsError("invalid semantic definition ID".into()))
+        }
+    }
+}
+
+/// The installed writer/reader binding joins deployment identity and semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredOutputReference {
-    #[serde(alias = "state_slot_id")]
     pub stored_output_id: StoredOutputId,
     pub definition_id: SummaryDefinitionId,
 }
-
 impl StoredOutputReference {
-    /// Default compiler allocation when one output is selected per definition.
-    pub fn for_definition(definition_id: SummaryDefinitionId) -> Self {
+    /// Internal compilation placeholder. Catalog binding must replace its empty
+    /// semantic identity before installation; it cannot authorize a read/write.
+    pub fn for_output(stored_output_id: StoredOutputId) -> Self {
         Self {
-            stored_output_id: StoredOutputId(definition_id.as_u64()),
-            definition_id,
+            stored_output_id,
+            definition_id: SummaryDefinitionId(String::new()),
         }
     }
-
     pub fn validate(&self) -> Result<(), SdsError> {
-        if self.stored_output_id.0 != 0 && !self.definition_id.fingerprint().is_unset() {
-            Ok(())
-        } else {
-            Err(SdsError(
-                "stored output and definition identities must be set".into(),
-            ))
+        if self.stored_output_id.0 == 0 {
+            return Err(SdsError("stored output identity must be set".into()));
         }
+        self.definition_id.validate()
     }
 }
 
@@ -95,14 +104,16 @@ impl StoredOutputReference {
 pub struct StoredSummaryKey {
     pub plan_id: u64,
     pub plan_version: u64,
-    pub output: StoredOutputReference,
+    pub stored_output_id: StoredOutputId,
     pub population: BTreeMap<String, String>,
     pub window: HalfOpenTimeRange,
 }
 
 impl StoredSummaryKey {
     pub fn validate(&self) -> Result<(), SdsError> {
-        self.output.validate()?;
+        if self.stored_output_id.0 == 0 {
+            return Err(SdsError("stored output identity must be set".into()));
+        }
         if self.window.start_ms >= self.window.end_ms {
             return Err(SdsError("stored summary requires a nonempty window".into()));
         }
@@ -174,7 +185,7 @@ pub struct SummarySourcePartition {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstanceCoordinates {
-    pub summary_definition_id: SummaryDefinitionId,
+    pub stored_output_id: StoredOutputId,
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
 }
@@ -185,7 +196,7 @@ impl SummaryInstanceCoordinates {
             serde_json::to_vec(&self.group_values).map_err(|error| SdsError(error.to_string()))?;
         SummaryInstanceId::new(format!(
             "summary-instance:v1:{}:{}:{}:{}",
-            self.summary_definition_id.as_u64(),
+            self.stored_output_id.as_u64(),
             self.time_range.start_ms,
             self.time_range.end_ms,
             xxhash_rust::xxh64::xxh64(&bytes, 0)
@@ -339,7 +350,6 @@ pub struct SummaryInstance {
     pub instance_id: SummaryInstanceId,
     #[serde(alias = "state_slot_id")]
     pub stored_output_id: StoredOutputId,
-    #[serde(alias = "materialization_id")]
     pub summary_definition_id: SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
@@ -360,11 +370,7 @@ pub struct SummaryInstance {
 
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
-        StoredOutputReference {
-            stored_output_id: self.stored_output_id,
-            definition_id: self.summary_definition_id,
-        }
-        .validate()?;
+        self.summary_definition_id.validate()?;
         if self.time_range.start_ms >= self.time_range.end_ms {
             return Err(SdsError(
                 "summary instance time range must be non-empty".into(),
@@ -467,10 +473,11 @@ impl ObservedSummaryInventory {
                 ));
             }
             let definition = catalog
-                .definitions
-                .get(&instance.summary_definition_id)
+                .outputs
+                .get(&instance.stored_output_id)
                 .ok_or_else(|| SdsError("summary instance has no catalog definition".into()))?;
-            if instance.summary_descriptor_id != definition.summary_descriptor_id
+            if instance.summary_definition_id != definition.definition_id
+                || instance.summary_descriptor_id != definition.summary_descriptor_id
                 || instance.data_descriptor_id != definition.data_descriptor_id
                 || instance.state_reference.state_schema_version
                     != catalog.summary_descriptors[&definition.summary_descriptor_id]
@@ -1294,7 +1301,7 @@ mod tests {
             },
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
             coordinates: SummaryInstanceCoordinates {
-                summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
+                stored_output_id: StoredOutputId::from(crate::PolicyFingerprint(7)),
                 time_range: HalfOpenTimeRange {
                     start_ms: 1_000,
                     end_ms: 2_000,
@@ -1360,7 +1367,7 @@ mod tests {
         SummaryInstance {
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
             stored_output_id: StoredOutputId(7),
-            summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
+            summary_definition_id: SummaryDefinitionId::from_semantics(b"fixture"),
             summary_descriptor_id: descriptor(
                 200,
                 FidelityGuarantee::KllRankError {
@@ -1426,10 +1433,7 @@ mod tests {
         let key = StoredSummaryKey {
             plan_id: 1,
             plan_version: 2,
-            output: StoredOutputReference {
-                stored_output_id: StoredOutputId(101),
-                definition_id: crate::PolicyFingerprint(7).into(),
-            },
+            stored_output_id: StoredOutputId(101),
             population: BTreeMap::from([("service".into(), "api".into())]),
             window: HalfOpenTimeRange {
                 start_ms: 0,
@@ -1439,7 +1443,7 @@ mod tests {
         let mut variants = vec![key.clone(); 5];
         variants[0].plan_id += 1;
         variants[1].plan_version += 1;
-        variants[2].output.stored_output_id.0 += 1;
+        variants[2].stored_output_id.0 += 1;
         variants[3].population.insert("service".into(), "db".into());
         variants[4].window.end_ms += 1;
         let canonical = key.storage_key().unwrap();
@@ -1455,11 +1459,11 @@ mod tests {
     // A DAG output has its own identity even when its definition is shared.
     #[test]
     fn stored_output_identity_is_independent_of_definition() {
-        let definition_id = SummaryDefinitionId::from(crate::PolicyFingerprint(7));
+        let definition_id = SummaryDefinitionId::from_semantics(b"fixture");
         for stored_output_id in [StoredOutputId(101), StoredOutputId(102)] {
             StoredOutputReference {
                 stored_output_id,
-                definition_id,
+                definition_id: definition_id.clone(),
             }
             .validate()
             .unwrap();
@@ -1469,28 +1473,34 @@ mod tests {
     #[test]
     fn stored_output_and_payload_version_must_match_instance_definition() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
-        instance.stored_output_id = StoredOutputId(0);
-        assert!(instance.validate().is_err());
+        instance.stored_output_id = StoredOutputId(8);
+        assert!(instance.validate().is_ok());
         instance.stored_output_id = StoredOutputId(7);
         instance.state_reference.generation = 3;
         assert!(instance.validate().is_err());
-        let mut reference = StoredOutputReference::for_definition(instance.summary_definition_id);
-        reference.stored_output_id = StoredOutputId(0);
+        let mut reference = StoredOutputReference::for_output(instance.stored_output_id);
+        reference.stored_output_id = StoredOutputId(8);
         assert!(reference.validate().is_err());
     }
 
+    // Old aliases and numeric semantic IDs must not authorize the new format.
     #[test]
-    fn stored_output_reference_accepts_legacy_state_slot_field() {
-        let reference: StoredOutputReference = serde_json::from_value(json!({
-            "state_slot_id": 7,
-            "definition_id": 7
+    fn stored_output_reference_rejects_legacy_identity() {
+        assert!(serde_json::from_value::<StoredOutputReference>(json!({
+            "state_slot_id": 7, "definition_id": 7
         }))
-        .unwrap();
-        assert_eq!(reference.stored_output_id, StoredOutputId(7));
+        .is_err());
+        let reference = StoredOutputReference {
+            stored_output_id: StoredOutputId(8),
+            definition_id: SummaryDefinitionId::from_semantics(b"fixture"),
+        };
         reference.validate().unwrap();
         assert_eq!(
-            serde_json::to_value(reference).unwrap(),
-            json!({"stored_output_id": 7, "definition_id": 7})
+            serde_json::from_value::<StoredOutputReference>(
+                serde_json::to_value(&reference).unwrap()
+            )
+            .unwrap(),
+            reference
         );
     }
 
@@ -1835,9 +1845,9 @@ mod tests {
         assert_ne!(first.id, second.id);
     }
     #[test]
-    fn summary_definition_id_preserves_legacy_wire_identity() {
+    fn stored_output_id_preserves_legacy_wire_identity() {
         let fingerprint = crate::PolicyFingerprint(42);
-        let id = SummaryDefinitionId::from(fingerprint);
+        let id = StoredOutputId::from(fingerprint);
         assert_eq!(id.fingerprint(), fingerprint);
         assert_eq!(id.as_u64(), 42);
         assert_eq!(crate::PolicyFingerprint::from(id), fingerprint);
@@ -1845,10 +1855,7 @@ mod tests {
             serde_json::to_value(id).unwrap(),
             serde_json::to_value(fingerprint).unwrap()
         );
-        assert_eq!(
-            serde_json::from_str::<SummaryDefinitionId>("42").unwrap(),
-            id
-        );
+        assert_eq!(serde_json::from_str::<StoredOutputId>("42").unwrap(), id);
     }
     /// Every supplied alias must agree with the declared fidelity, including runtime w/d keys.
     #[test]

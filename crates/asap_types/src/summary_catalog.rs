@@ -6,19 +6,20 @@
 use std::collections::BTreeMap;
 
 use crate::sds::{
-    CatalogGeneration, DataDescriptor, DataDescriptorId, DataSourceIdentity, SummaryDefinitionId,
+    CatalogGeneration, DataDescriptor, DataDescriptorId, DataSourceIdentity, StoredOutputId,
     SummaryDescriptor, SummaryDescriptorId,
 };
 use crate::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 3;
+pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 4;
 
 /// Canonical definition binds operator and population descriptors. Writer
 /// layout and concrete state belong to installed plans and runtime instances.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SummaryDefinition {
+pub struct StoredOutputDefinition {
+    pub definition_id: crate::sds::SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
 }
@@ -31,7 +32,9 @@ pub struct SummaryCatalog {
     pub plan_version: u64,
     pub summary_descriptors: BTreeMap<SummaryDescriptorId, SummaryDescriptor>,
     pub data_descriptors: BTreeMap<DataDescriptorId, DataDescriptor>,
-    pub definitions: BTreeMap<SummaryDefinitionId, SummaryDefinition>,
+    pub outputs: BTreeMap<StoredOutputId, StoredOutputDefinition>,
+    pub definitions:
+        BTreeMap<crate::sds::SummaryDefinitionId, crate::summary_semantics::SummaryDefinition>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +70,20 @@ impl CatalogGeneration {
 }
 
 impl SummaryCatalog {
+    pub fn output_reference(
+        &self,
+        id: StoredOutputId,
+    ) -> Result<crate::sds::StoredOutputReference, SummaryCatalogError> {
+        let output = self
+            .outputs
+            .get(&id)
+            .ok_or(SummaryCatalogError::MissingDescriptor(id.as_u64()))?;
+        Ok(crate::sds::StoredOutputReference {
+            stored_output_id: id,
+            definition_id: output.definition_id.clone(),
+        })
+    }
+
     pub fn reference(&self) -> Result<CatalogGeneration, SummaryCatalogError> {
         use sha2::{Digest, Sha256};
         self.validate()?;
@@ -113,7 +130,38 @@ impl SummaryCatalog {
                 Ok((config.policy_fingerprint(), summary, data))
             })
             .collect::<Result<Vec<_>, SummaryCatalogError>>()?;
-        Self::build(plan_id, plan_version, entries)
+        let mut catalog = Self::build(plan_id, plan_version, entries)?;
+        let mut semantic_bindings = BTreeMap::new();
+        for config in materializations {
+            let output = catalog
+                .outputs
+                .get_mut(&StoredOutputId::from(config.policy_fingerprint()))
+                .unwrap();
+            let definition = crate::summary_semantics::SummaryDefinition::from_descriptors(
+                &catalog.summary_descriptors[&output.summary_descriptor_id],
+                &catalog.data_descriptors[&output.data_descriptor_id],
+            )?
+            .with_config(config);
+            let id = definition.id()?;
+            if semantic_bindings
+                .insert(config.policy_fingerprint(), id.clone())
+                .is_some_and(|old| old != id)
+            {
+                return Err(SummaryCatalogError::ConflictingDefinition(
+                    config.policy_fingerprint().0,
+                ));
+            }
+            output.definition_id = id.clone();
+            catalog.definitions.insert(id, definition);
+        }
+        let used: std::collections::BTreeSet<_> = catalog
+            .outputs
+            .values()
+            .map(|o| o.definition_id.clone())
+            .collect();
+        catalog.definitions.retain(|id, _| used.contains(id));
+        catalog.validate()?;
+        Ok(catalog)
     }
 
     pub fn build(
@@ -127,21 +175,27 @@ impl SummaryCatalog {
             plan_version,
             summary_descriptors: BTreeMap::new(),
             data_descriptors: BTreeMap::new(),
+            outputs: BTreeMap::new(),
             definitions: BTreeMap::new(),
         };
         for (fingerprint, summary, data) in entries {
-            let definition = SummaryDefinitionId::from(fingerprint);
+            let definition = StoredOutputId::from(fingerprint);
             summary
                 .validate()
                 .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
             data.validate()
                 .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
-            let binding = SummaryDefinition {
+            let semantics =
+                crate::summary_semantics::SummaryDefinition::from_descriptors(&summary, &data)?;
+            let semantic_id = semantics.id()?;
+            catalog.definitions.insert(semantic_id.clone(), semantics);
+            let binding = StoredOutputDefinition {
+                definition_id: semantic_id,
                 summary_descriptor_id: summary.id().clone(),
                 data_descriptor_id: data.id().clone(),
             };
             if catalog
-                .definitions
+                .outputs
                 .get(&definition)
                 .is_some_and(|old| old != &binding)
             {
@@ -155,7 +209,7 @@ impl SummaryCatalog {
             catalog
                 .data_descriptors
                 .insert(binding.data_descriptor_id.clone(), data);
-            catalog.definitions.insert(definition, binding);
+            catalog.outputs.insert(definition, binding);
         }
         catalog.validate()?;
         Ok(catalog)
@@ -164,6 +218,13 @@ impl SummaryCatalog {
     pub fn validate(&self) -> Result<(), SummaryCatalogError> {
         if self.schema_version != SUMMARY_CATALOG_SCHEMA_VERSION {
             return Err(SummaryCatalogError::SchemaVersion(self.schema_version));
+        }
+        for (id, definition) in &self.definitions {
+            if &definition.id()? != id {
+                return Err(SummaryCatalogError::Descriptor(
+                    "semantic definition content hash mismatch".into(),
+                ));
+            }
         }
         for (key, descriptor) in &self.summary_descriptors {
             descriptor
@@ -185,7 +246,12 @@ impl SummaryCatalog {
                 ));
             }
         }
-        for (id, binding) in &self.definitions {
+        for (id, binding) in &self.outputs {
+            if !self.definitions.contains_key(&binding.definition_id) {
+                return Err(SummaryCatalogError::Descriptor(
+                    "output references absent semantic definition".into(),
+                ));
+            }
             if !self
                 .summary_descriptors
                 .contains_key(&binding.summary_descriptor_id)
@@ -194,6 +260,31 @@ impl SummaryCatalog {
                     .contains_key(&binding.data_descriptor_id)
             {
                 return Err(SummaryCatalogError::MissingDescriptor(id.as_u64()));
+            }
+        }
+        for output in self.outputs.values() {
+            let expected = crate::summary_semantics::SummaryDefinition::from_descriptors(
+                &self.summary_descriptors[&output.summary_descriptor_id],
+                &self.data_descriptors[&output.data_descriptor_id],
+            )?;
+            if let (
+                crate::summary_semantics::SummarySemantics::Configured {
+                    computation: actual,
+                    ..
+                },
+                crate::summary_semantics::SummarySemantics::Configured {
+                    computation: expected,
+                    ..
+                },
+            ) = (
+                &self.definitions[&output.definition_id].semantics,
+                &expected.semantics,
+            ) {
+                if actual != expected {
+                    return Err(SummaryCatalogError::Descriptor(
+                        "output descriptors disagree with semantic definition".into(),
+                    ));
+                }
             }
         }
         if !self
@@ -207,13 +298,13 @@ impl SummaryCatalog {
         let mut pending = std::collections::BTreeMap::new();
         let mut consumers: std::collections::BTreeMap<_, Vec<_>> =
             std::collections::BTreeMap::new();
-        for (id, binding) in &self.definitions {
+        for (id, binding) in &self.outputs {
             let dependencies = match &self.data_descriptors[&binding.data_descriptor_id].source {
                 DataSourceIdentity::Derived { input } => input.inputs.clone(),
                 _ => Default::default(),
             };
             for source in &dependencies {
-                if !self.definitions.contains_key(source) {
+                if !self.outputs.contains_key(source) {
                     return Err(SummaryCatalogError::Descriptor(
                         "derived input references missing summary".into(),
                     ));
@@ -325,7 +416,7 @@ mod tests {
         let catalog =
             SummaryCatalog::from_materializations(1, 1, &[requests, errors, other_time]).unwrap();
         assert_eq!(catalog.data_descriptors.len(), 3);
-        assert_eq!(catalog.definitions.len(), 3);
+        assert_eq!(catalog.outputs.len(), 3);
     }
 
     #[test]
@@ -357,8 +448,52 @@ mod tests {
             SummaryCatalog::from_materializations(7, 2, &[one.clone(), two, one]).unwrap();
         assert_eq!(catalog.summary_descriptors.len(), 1);
         assert_eq!(catalog.data_descriptors.len(), 1);
-        assert_eq!(catalog.definitions.len(), 2);
+        assert_eq!(catalog.outputs.len(), 2);
         assert_eq!((catalog.plan_id, catalog.plan_version), (7, 2));
+    }
+
+    // Stored pane duration identifies a deployment output, not the summary meaning.
+    #[test]
+    fn semantic_definition_is_shared_across_deployed_pane_outputs() {
+        let catalog = SummaryCatalog::from_materializations(
+            1,
+            1,
+            &[config("requests", "", 60), config("requests", "", 120)],
+        )
+        .unwrap();
+        assert_eq!(catalog.definitions.len(), 1);
+        assert_eq!(catalog.outputs.len(), 2);
+    }
+
+    // A hot and rebuild output share meaning but remain independently bound.
+    #[test]
+    fn hot_and_rebuild_have_one_definition_and_two_bound_outputs() {
+        let mut hot = config("latency", "", 60);
+        hot.stored_output_id = Some(StoredOutputId(41));
+        let mut rebuild = hot.clone();
+        rebuild.stored_output_id = Some(StoredOutputId(42));
+        let catalog = SummaryCatalog::from_materializations(7, 42, &[hot, rebuild]).unwrap();
+        assert_eq!(catalog.definitions.len(), 1);
+        let hot = catalog.output_reference(StoredOutputId(41)).unwrap();
+        let rebuild = catalog.output_reference(StoredOutputId(42)).unwrap();
+        assert_eq!(hot.definition_id, rebuild.definition_id);
+        assert_ne!(hot, rebuild);
+        let mut forged = catalog.clone();
+        let crate::summary_semantics::SummarySemantics::Configured { computation, .. } =
+            &mut forged.definitions.values_mut().next().unwrap().semantics
+        else {
+            panic!("fixture")
+        };
+        computation.predicate = "service=other".into();
+        assert!(forged.validate().is_err());
+        let mut unknown = catalog.clone();
+        unknown
+            .definitions
+            .values_mut()
+            .next()
+            .unwrap()
+            .semantic_format_version += 1;
+        assert!(unknown.validate().is_err());
     }
 
     // Source/population changes never alias, while the operator can be reused.
@@ -389,7 +524,7 @@ mod tests {
         let catalog = SummaryCatalog::from_materializations(1, 1, &[a, b]).unwrap();
         assert_eq!(catalog.summary_descriptors.len(), 2);
         assert_eq!(catalog.data_descriptors.len(), 1);
-        assert_eq!(catalog.definitions.len(), 2);
+        assert_eq!(catalog.outputs.len(), 2);
     }
 
     // Construction order cannot affect the published snapshot bytes.
@@ -410,19 +545,18 @@ mod tests {
     fn catalog_definitions_do_not_store_writer_layout() {
         let mut materialization = config("requests", "", 60);
         materialization.pane_origin_ms = Some(7_000);
-        let id = SummaryDefinitionId::from(materialization.policy_fingerprint());
+        let id = StoredOutputId::from(materialization.policy_fingerprint());
         let catalog = SummaryCatalog::from_materializations(7, 2, &[materialization]).unwrap();
-        assert!(catalog.definitions.contains_key(&id));
+        assert!(catalog.outputs.contains_key(&id));
         assert!(
-            !serde_json::to_value(&catalog).unwrap()["definitions"][id.as_u64().to_string()]
+            !serde_json::to_value(&catalog).unwrap()["outputs"][id.as_u64().to_string()]
                 .as_object()
                 .unwrap()
                 .contains_key("pane_origin_ms")
         );
 
         let mut invalid = serde_json::to_value(&catalog).unwrap();
-        invalid["definitions"][id.as_u64().to_string()]["pane_origin_ms"] =
-            serde_json::json!(7_000);
+        invalid["outputs"][id.as_u64().to_string()]["pane_origin_ms"] = serde_json::json!(7_000);
         assert!(serde_json::from_value::<SummaryCatalog>(invalid).is_err());
     }
 
@@ -498,7 +632,7 @@ mod tests {
     #[test]
     fn empty_catalog_is_valid() {
         let catalog = SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
-        assert!(catalog.definitions.is_empty());
+        assert!(catalog.outputs.is_empty());
         catalog.validate().unwrap();
     }
 }
