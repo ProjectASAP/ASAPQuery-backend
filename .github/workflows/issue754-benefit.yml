@@ -1,0 +1,48 @@
+name: Issue 754 level-3 benefit
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benefit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ASAPQuery-backend
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectASAP/ASAPCollector
+          path: ASAPCollector
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectASAP/asap_sketchlib
+          path: asap_sketchlib
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate PR 761 automatic workload costing
+        working-directory: ASAPQuery-backend
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/artifacts/backend-revision.txt"
+          cargo test --locked -p control_plane --lib --bins
+      - name: Validate shared workload and SQL coverage
+        working-directory: ASAPQuery-backend/promql-compliance/runner
+        run: cargo test --locked -p promql-compliance
+      - name: Compare ASAPQuery with exact DB baselines
+        working-directory: ASAPQuery-backend/promql-compliance/runner
+        run: make benefit REPORT_DIR="$GITHUB_WORKSPACE/artifacts/reports" LOGS_DIR="$GITHUB_WORKSPACE/artifacts/logs"
+      - name: Upload benchmark and service logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue754-benefit-evidence
+          path: artifacts
+          if-no-files-found: warn

@@ -156,3 +156,40 @@ fn cli_preserves_planning_failure_without_docker() {
         .unwrap()
         .contains("compile unquoted workload snapshot"));
 }
+
+/// An ingest acknowledgement may precede visibility, but timeout never counts as success.
+#[tokio::test]
+async fn waits_for_query_visibility_and_rejects_timeout() {
+    let expected = json!({"status":"success","data":{"resultType":"vector","result":[{"metric":{"job":"api"},"value":[1,"3"]}]}});
+    let empty = json!({"status":"success","data":{"resultType":"vector","result":[]}});
+    let (url, task) = server(vec![
+        (String::new(), empty.to_string()),
+        (String::new(), expected.to_string()),
+    ])
+    .await;
+    transport::wait_for_visible_query(
+        &transport::client().unwrap(),
+        &url,
+        "m",
+        1000,
+        &expected,
+        &Default::default(),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(task.await.unwrap().len(), 2);
+    let (url, task) = server(vec![(String::new(), empty.to_string())]).await;
+    assert!(transport::wait_for_visible_query(
+        &transport::client().unwrap(),
+        &url,
+        "m",
+        1000,
+        &expected,
+        &Default::default(),
+        std::time::Duration::ZERO
+    )
+    .await
+    .is_err());
+    task.await.unwrap();
+}

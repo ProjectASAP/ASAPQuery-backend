@@ -285,6 +285,12 @@ fn all_ten_sql_baselines_and_latency_assertions() {
     assert!(!runner::benefit_failures(&targets, &suite)
         .unwrap()
         .is_empty());
+    // Missing peak counters retain a failed report instead of losing CPU/latency evidence.
+    targets["backend"]["memoryPeakBytes"] = serde_json::Value::Null;
+    assert!(runner::benefit_failures(&targets, &suite)
+        .unwrap()
+        .iter()
+        .any(|failure| failure.contains("memoryPeakBytes unavailable")));
     assert_eq!(
         promql_compliance::compose::parse_cpu_stat("usage_usec 0\nuser_usec 0").unwrap(),
         0

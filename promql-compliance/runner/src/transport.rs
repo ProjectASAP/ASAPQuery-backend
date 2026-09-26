@@ -160,3 +160,26 @@ pub async fn query(
     }
     Ok(body)
 }
+
+/// Wait for acknowledged Remote Write data to become query-visible before measuring.
+pub async fn wait_for_visible_query(
+    client: &Client,
+    url: &str,
+    expr: &str,
+    at: i64,
+    expected: &Value,
+    policy: &crate::input::Policy,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let actual = query(client, url, expr, at, None, false).await?;
+        match crate::compare::compare(expected, &actual, policy) {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(error).context("acknowledged ingestion did not become query-visible");
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
