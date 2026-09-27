@@ -331,6 +331,44 @@ pub fn select_workload_with_accuracy_model_and_trace(
     Ok((selected, trace))
 }
 
+/// Preserve Planner candidates for deployment admission and pricing. This
+/// does not select a winner or interpret an absent runtime quote as illegality.
+/// Each returned forest has one root; independent roots remain factored rather
+/// than materializing the workload's Cartesian product.
+pub fn enumerate_workload_candidates(
+    roots: Vec<(usize, Rc<QueryExpr>)>,
+    accuracy: AccuracyTarget,
+    cost_model: &ControlPlaneCostModel,
+    evidence: &dyn AccuracyEvidenceProvider,
+    accuracy_model: &dyn AccuracyModel,
+) -> Result<asap_aware_mapping::replacement::CandidateDagInventory<usize>, SelectionError> {
+    let strategies = replacement_strategies(cost_model, evidence, accuracy_model);
+    let space = asap_aware_mapping::search_workload_with_targets(
+        roots
+            .into_iter()
+            .map(|(id, root)| (id, root, Some(accuracy.clone())))
+            .collect(),
+        &strategies,
+        accuracy_model,
+    );
+    let mut inventory = asap_aware_mapping::replacement::CandidateDagInventory {
+        candidates: Vec::new(),
+        rejected_assemblies: Vec::new(),
+    };
+    for (id, _) in &space.roots {
+        let root = space
+            .enumerate_candidate_dags_for_root(id, 65_536)
+            .map_err(|error| SelectionError::Workload(error.to_string()))?;
+        inventory.candidates.extend(root.candidates);
+        inventory.rejected_assemblies.extend(
+            root.rejected_assemblies
+                .into_iter()
+                .map(|reason| format!("query {id}: {reason}")),
+        );
+    }
+    Ok(inventory)
+}
+
 /// The [`ReplacementStrategy`] set this deployment registers, carrying its own
 /// cost and accuracy models. This is deliberately not Planner's
 /// `default_strategies_with`: two of the strategies that list would give us are
