@@ -167,6 +167,8 @@ pub struct ControlPlaneCostModel {
     offline_frequency_comparison: Option<(OfflineComparisonEvidence, OfflineComparisonRequest)>,
     exact_composition_costs: Vec<ExactCompositionCostEvidence>,
     erp: Option<ErpPlanningInput>,
+    erp_costs: Option<ErpPlanningInput>,
+    hll_confidence: Option<super::super::erp::HllConfidenceContract>,
 }
 
 impl ControlPlaneCostModel {
@@ -193,6 +195,8 @@ impl ControlPlaneCostModel {
         let dag = planner_types::post_asap::compile_executable_dag(root).ok()?;
         let mut value = 0.0;
         let mut states = 0;
+        let mut analytical = false;
+        let mut erp_record_ids = Vec::new();
         for node in &dag.nodes {
             let family = match &node.payload {
                 ExecutableOperatorPayload::SummaryAgg { family, .. }
@@ -200,17 +204,38 @@ impl ControlPlaneCostModel {
                 _ => continue,
             };
             states += 1;
-            value += analytical_state_bytes(family)?;
+            let measurement = match family {
+                SummaryFamilyType::Sketch(kind, GroupingStrategy::PerSubpopulationInstance) => self
+                    .erp_costs
+                    .as_ref()
+                    .and_then(|erp| erp.candidate_memory_bytes(kind.algorithm(), kind.params())),
+                _ => None,
+            };
+            if let Some((bytes, ids)) = measurement {
+                value += bytes;
+                erp_record_ids.extend(ids);
+            } else {
+                value += analytical_state_bytes(family)?;
+                analytical = true;
+            }
         }
         if states == 0 || !value.is_finite() {
             return None;
         }
+        erp_record_ids.sort();
+        erp_record_ids.dedup();
         Some(CandidateCostEstimate {
             value,
             unit: "bytes_per_state_partition",
             model: "backend_state_footprint_v1",
-            source: "analytical",
-            erp_record_ids: vec![],
+            source: if erp_record_ids.is_empty() {
+                "analytical"
+            } else if analytical {
+                "mixed"
+            } else {
+                "erp"
+            },
+            erp_record_ids,
         })
     }
 
@@ -224,6 +249,8 @@ impl ControlPlaneCostModel {
             offline_frequency_comparison: None,
             exact_composition_costs: Vec::new(),
             erp: None,
+            erp_costs: None,
+            hll_confidence: None,
         }
     }
 
@@ -235,8 +262,24 @@ impl ControlPlaneCostModel {
         self
     }
 
+    pub fn with_hll_confidence(
+        mut self,
+        contract: super::super::erp::HllConfidenceContract,
+    ) -> Self {
+        self.hll_confidence = Some(contract);
+        self
+    }
+
     pub fn with_erp(mut self, erp: ErpPlanningInput) -> Self {
+        self.erp_costs = Some(erp.clone());
         self.erp = Some(erp);
+        self
+    }
+
+    /// Resource evidence can remain usable when ERP's error observations
+    /// cannot establish the query's requested confidence guarantee.
+    pub fn with_erp_costs(mut self, erp: ErpPlanningInput) -> Self {
+        self.erp_costs = Some(erp);
         self
     }
 
@@ -381,6 +424,44 @@ impl ControlPlaneCostModel {
             return defaults;
         };
         costs.sort_by(|left, right| left.1.total_cmp(&right.1));
+        costs.into_iter().map(|(algorithm, _)| algorithm).collect()
+    }
+
+    fn rank_with_erp_costs(
+        &self,
+        intent: &AggIntent,
+        defaults: Vec<SketchAlgorithm>,
+    ) -> Vec<SketchAlgorithm> {
+        let Some(erp) = &self.erp_costs else {
+            return defaults;
+        };
+        let (eps, delta) =
+            asap_aware_mapping::replacement::accuracy_budget(&intent_accuracy(intent));
+        let mut has_measurement = false;
+        let mut costs = defaults
+            .iter()
+            .map(|algorithm| {
+                let params = self.size_params(algorithm.clone(), intent, eps, delta);
+                let measured = erp.candidate_memory_bytes(algorithm, &params);
+                has_measurement |= measured.is_some();
+                let cost = measured.map(|(bytes, _)| bytes).or_else(|| {
+                    analytical_state_bytes(&SummaryFamilyType::Sketch(
+                        planner_types::post_asap::SketchKind::new(algorithm.clone(), params),
+                        GroupingStrategy::PerSubpopulationInstance,
+                    ))
+                });
+                (algorithm.clone(), cost)
+            })
+            .collect::<Vec<_>>();
+        if !has_measurement {
+            return defaults;
+        }
+        costs.sort_by(|(_, a), (_, b)| match (a, b) {
+            (Some(a), Some(b)) => a.total_cmp(b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
         costs.into_iter().map(|(algorithm, _)| algorithm).collect()
     }
 
@@ -693,7 +774,7 @@ impl CostModel for ControlPlaneCostModel {
             // puts it first (`summary_candidates`), nothing to reorder.
             _ => candidates.to_vec(),
         };
-        self.rank_with_offline_evidence(intent, defaults)
+        self.rank_with_erp_costs(intent, self.rank_with_offline_evidence(intent, defaults))
     }
 
     fn size_params(
@@ -703,6 +784,19 @@ impl CostModel for ControlPlaneCostModel {
         eps: f64,
         delta: f64,
     ) -> SketchParams {
+        if kind == SketchAlgorithm::Hll && matches!(intent, AggIntent::Cardinality { .. }) {
+            if let Some(contract) = &self.hll_confidence {
+                if let Some((eps, delta)) = self.combined_eps_delta(&intent_accuracy(intent)) {
+                    // If no supported precision meets the target, keep the tightest
+                    // candidate for explain; its guarantee still fails selection.
+                    let precision = contract
+                        .confidence(eps)
+                        .and_then(|model| model.precision(delta))
+                        .unwrap_or(18);
+                    return SketchParams::Hll { precision };
+                }
+            }
+        }
         let (max_error, theoretical) = match intent {
             AggIntent::TopK { k, .. } => {
                 let (eps, delta) = self.topk_eps_delta(&intent_accuracy(intent));
@@ -998,12 +1092,159 @@ fn hll_precision_for_eps(eps: f64) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use planner_types::pre_asap::{default_cardinality, default_quantile};
 
     fn eps(e: f64) -> AccuracyTarget {
         AccuracyTarget::Epsilon(e)
+    }
+
+    /// Logical summary selection has an explicit Planner estimate before
+    /// deployment pricing, including when a family is forced.
+    #[test]
+    fn summary_candidates_have_explicit_logical_costs() {
+        use asap_aware_mapping::{ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG};
+        use std::rc::Rc;
+
+        let accuracy = eps(0.1);
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                "quantile_over_time(0.9,m[1m])",
+                accuracy.clone(),
+            )
+            .unwrap(),
+        );
+        let target = TargetSubDAG::new(&root);
+        let model = ControlPlaneCostModel::new(accuracy.clone());
+        let forced = ForcedFamilyCostModel::new(accuracy, SketchAlgorithm::DDSketch);
+        let candidates = SketchAlgorithmStrategy::new(&model).replacements(&target);
+        assert!(!candidates.is_empty());
+        for candidate in &candidates {
+            let estimate = model.candidate_cost_estimate(candidate).unwrap();
+            assert!(estimate.value.is_finite() && estimate.value > 0.0);
+            assert_eq!(estimate.source, "analytical");
+            assert_eq!(estimate.unit, "bytes_per_state_partition");
+            assert_eq!(
+                model.candidate_cost(candidate, &target),
+                Some(Cost(estimate.value))
+            );
+            assert_eq!(
+                forced.candidate_cost(candidate, &target),
+                Some(Cost(estimate.value))
+            );
+        }
+    }
+
+    /// Analytical estimates scale with configured state size; unsupported
+    /// families remain unavailable instead of receiving a made-up zero.
+    #[test]
+    fn analytical_footprint_scales_with_parameters() {
+        use planner_types::post_asap::SketchKind;
+        let kll = |k| {
+            SummaryFamilyType::Sketch(
+                SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k }),
+                GroupingStrategy::PerSubpopulationInstance,
+            )
+        };
+        assert_eq!(analytical_state_bytes(&kll(200)), Some(6400.0));
+        assert_eq!(analytical_state_bytes(&kll(400)), Some(12800.0));
+        let unsupported = SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::Theta, SketchParams::Theta { k: 1024 }),
+            GroupingStrategy::PerSubpopulationInstance,
+        );
+        assert_eq!(analytical_state_bytes(&unsupported), None);
+    }
+
+    pub(crate) fn erp_cost_fixture() -> ErpPlanningInput {
+        serde_json::from_value(serde_json::json!({
+            "artifact": {"schema_version": 1, "producer_version": "synthetic-test-fixture",
+                "records": [{"id": "kll-200", "sketch": "kll-percall", "implementation": "lib",
+                    "parameters": {"k": 200}, "distribution": {"test": "population-a"}, "trials": 20,
+                    "error_metrics": {"max_rank_err": 0.9},
+                    "resources": {"memory_bytes": 7777.0, "update_cpu_seconds": 1e-7,
+                        "merge_cpu_seconds": 1e-5, "query_cpu_seconds": 1e-6}}]},
+            "distribution": {"test": "population-a"}, "implementation": "lib",
+            "error_metric": "max_rank_err", "min_trials": 10,
+            "expected_updates": 1000.0, "expected_queries": 100.0, "expected_merges": 1.0,
+            "retention_seconds": 60.0, "cpu_weight": 1.0, "byte_second_weight": 1e-9,
+            "mode": "hybrid"
+        })).unwrap()
+    }
+
+    /// ERP memory overrides analytical memory for the exact configuration,
+    /// even when it is larger. Mismatched profiles fall back to analytical.
+    #[test]
+    fn erp_cost_precedes_analytical_without_certifying_accuracy() {
+        use asap_aware_mapping::{ReplacementStrategy, SketchAlgorithmStrategy};
+        use std::rc::Rc;
+        let policy = erp_cost_fixture();
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                "quantile_over_time(0.9,m[1m])",
+                eps(0.1),
+            )
+            .unwrap(),
+        );
+        let model = ControlPlaneCostModel::new(eps(0.1));
+        let candidates =
+            SketchAlgorithmStrategy::new(&model).replacements(&TargetSubDAG::new(&root));
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                model
+                    .candidate_cost_estimate(candidate)
+                    .is_some_and(|cost| cost.value == 6400.0)
+            })
+            .expect("KLL candidate");
+        let estimate = |policy: ErpPlanningInput| {
+            ControlPlaneCostModel::new(eps(0.1))
+                .with_erp_costs(policy)
+                .candidate_cost_estimate(candidate)
+                .unwrap()
+        };
+        let matched = estimate(policy.clone());
+        assert_eq!(matched.value, 7777.0);
+        assert_eq!(matched.source, "erp");
+        assert_eq!(matched.erp_record_ids, ["kll-200"]);
+        let mut mismatch = policy.clone();
+        mismatch.distribution = serde_json::json!({"test": "population-b"});
+        assert_eq!(estimate(mismatch).source, "analytical");
+        let mut mismatch = policy.clone();
+        mismatch.implementation = Some("different-runtime".into());
+        assert_eq!(estimate(mismatch).source, "analytical");
+        let mut mismatch = policy.clone();
+        mismatch.artifact.records[0].parameters = serde_json::json!({"k": 400});
+        assert_eq!(estimate(mismatch).source, "analytical");
+        let mut mismatch = policy.clone();
+        mismatch.min_trials = 21;
+        assert_eq!(estimate(mismatch).source, "analytical");
+        let mut mismatch = policy.clone();
+        mismatch.artifact.records[0].resources.memory_bytes = f64::NAN;
+        assert_eq!(estimate(mismatch).source, "analytical");
+        let model = ControlPlaneCostModel::new(eps(0.1)).with_erp_costs(policy);
+        assert_eq!(
+            model.rank_candidates(
+                &default_quantile(0.9),
+                &[SketchAlgorithm::DDSketch, SketchAlgorithm::Kll]
+            )[0],
+            SketchAlgorithm::Kll
+        );
+        let (_, trace) = crate::planner_selection::select_workload_with_accuracy_model_and_trace(
+            vec![(0, root)],
+            eps(0.1),
+            &model,
+            &asap_aware_mapping::NoAccuracyEvidence,
+            &asap_aware_mapping::DefaultAccuracyModel,
+        )
+        .unwrap();
+        assert!(trace["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["candidates"].as_array().unwrap())
+            .any(|candidate| candidate["cost_estimate"]["source"] == "erp"
+                && candidate["cost_estimate"]["unit"] == "bytes_per_state_partition"));
     }
 
     #[test]

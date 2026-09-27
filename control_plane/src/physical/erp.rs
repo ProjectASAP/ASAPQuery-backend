@@ -204,10 +204,44 @@ impl ReadoutEvidence {
     }
 }
 
-/// ERP v1 measures error magnitudes, not tail probabilities. Only an explicit
-/// epsilon-only request may use these observations as its accuracy contract.
+/// Trusted source contract for every HLL readout population of one scoped query.
+/// The upper bound covers the union of all merged panes, not each pane separately.
+/// This is not derived from observed series count or a sampled distinct count.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HllConfidenceContract {
+    /// Identifies classic 64-bit HLL with its linear-counting correction, under
+    /// independent uniform bucket hashing. Other estimators are not certified.
+    pub model: String,
+    pub max_distinct_per_readout: u32,
+}
+
+impl HllConfidenceContract {
+    pub(crate) fn valid(&self) -> bool {
+        self.model == "asap-classic64-uniform-hash-linear-counting-v1"
+            && (1..=4096).contains(&self.max_distinct_per_readout)
+    }
+
+    pub(crate) fn confidence(
+        &self,
+        epsilon: f64,
+    ) -> Option<asap_aware_mapping::hll_confidence::ClassicHllConfidence> {
+        self.valid()
+            .then(|| {
+                asap_aware_mapping::hll_confidence::ClassicHllConfidence::new(
+                    self.max_distinct_per_readout,
+                    epsilon,
+                )
+            })
+            .flatten()
+    }
+}
+
+/// ERP error magnitudes and estimator-specific confidence are separate inputs.
+/// ERP v1 observed maxima do not establish a failure-probability guarantee.
 pub(crate) struct ErpAccuracyModel<'a> {
     pub policy: Option<&'a ErpPlanningInput>,
+    pub hll: Option<&'a HllConfidenceContract>,
     pub max_error: f64,
 }
 
@@ -224,6 +258,20 @@ impl asap_aware_mapping::AccuracyModel for ErpAccuracyModel<'_> {
         query: &planner_types::post_asap::SketchQuery,
     ) -> Option<planner_types::post_asap::ResultGuarantee> {
         use planner_types::post_asap::*;
+        if let (
+            Some(contract),
+            SummaryFamilyType::Sketch(kind, GroupingStrategy::PerSubpopulationInstance),
+            SketchQuery::Cardinality,
+        ) = (self.hll, family, query)
+        {
+            if let (SketchAlgorithm::Hll, SketchParams::Hll { precision }) =
+                (kind.algorithm(), kind.params())
+            {
+                // Resource ERP can still rank this state. Error maxima must not
+                // replace the independent, estimator-specific confidence bound.
+                return contract.confidence(self.max_error)?.guarantee(*precision);
+            }
+        }
         let theoretical = asap_aware_mapping::DefaultAccuracyModel.local_guarantee(family, query);
         let (Some(policy), SummaryFamilyType::Sketch(kind, _)) = (self.policy, family) else {
             return theoretical;
@@ -575,6 +623,91 @@ impl ErpParameterDecision {
 }
 
 impl ErpPlanningInput {
+    /// Match ERP resource measurements for an already-sized candidate. Error
+    /// magnitudes only identify existing records here: no accuracy target is
+    /// certified by this cost lookup. Reuse ERP's implementation, population,
+    /// shape, minimum-trial and runtime checks rather than a second matcher.
+    pub(crate) fn candidate_resources(
+        &self,
+        algorithm: &SketchAlgorithm,
+        params: &SketchParams,
+    ) -> Option<(asap_aware_mapping::erp::ErpResourceProfile, Vec<String>)> {
+        self.artifact.validate().ok()?;
+        let metrics = self
+            .artifact
+            .records
+            .iter()
+            .flat_map(|row| row.error_metrics.keys().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        metrics
+            .into_iter()
+            .filter_map(|metric| {
+                let ErpParameterDecision::Empirical {
+                    record_id,
+                    params: selected,
+                    ..
+                } = self.select_metric(
+                    algorithm.clone(),
+                    &metric,
+                    f64::MAX,
+                    params.clone(),
+                    Some(params),
+                )
+                else {
+                    return None;
+                };
+                if &selected != params {
+                    return None;
+                }
+                let mut ids = if self.artifact.records.iter().any(|row| row.id == record_id) {
+                    vec![record_id]
+                } else {
+                    serde_json::from_str::<Vec<String>>(&record_id).ok()?
+                };
+                if ids.is_empty() {
+                    return None;
+                }
+                // The logical proxy is per partition. For population-specific
+                // profiles use the largest matched partition, not a pooled sketch.
+                let mut resources = asap_aware_mapping::erp::ErpResourceProfile {
+                    memory_bytes: 0.0,
+                    update_cpu_seconds: 0.0,
+                    merge_cpu_seconds: 0.0,
+                    query_cpu_seconds: 0.0,
+                };
+                for id in &ids {
+                    let row = self.artifact.records.iter().find(|row| &row.id == id)?;
+                    resources.memory_bytes = resources.memory_bytes.max(row.resources.memory_bytes);
+                    resources.update_cpu_seconds = resources
+                        .update_cpu_seconds
+                        .max(row.resources.update_cpu_seconds);
+                    resources.merge_cpu_seconds = resources
+                        .merge_cpu_seconds
+                        .max(row.resources.merge_cpu_seconds);
+                    resources.query_cpu_seconds = resources
+                        .query_cpu_seconds
+                        .max(row.resources.query_cpu_seconds);
+                }
+                ids.sort();
+                ids.dedup();
+                Some((resources, ids))
+            })
+            .min_by(|a, b| {
+                a.0.memory_bytes
+                    .total_cmp(&b.0.memory_bytes)
+                    .then_with(|| a.1.cmp(&b.1))
+            })
+    }
+
+    pub(crate) fn candidate_memory_bytes(
+        &self,
+        algorithm: &SketchAlgorithm,
+        params: &SketchParams,
+    ) -> Option<(f64, Vec<String>)> {
+        self.candidate_resources(algorithm, params)
+            .map(|(resources, ids)| (resources.memory_bytes, ids))
+    }
+
     pub fn select(
         &self,
         algorithm: SketchAlgorithm,
@@ -873,7 +1006,10 @@ fn u32_param(parameters: &Value, names: &[&str]) -> Option<u32> {
         .then_some(value as u32)
 }
 
-fn parse_params(algorithm: &SketchAlgorithm, parameters: &Value) -> Option<SketchParams> {
+pub(crate) fn parse_params(
+    algorithm: &SketchAlgorithm,
+    parameters: &Value,
+) -> Option<SketchParams> {
     let width = || u32_param(parameters, &["width", "cols"]);
     let depth = || u32_param(parameters, &["depth", "rows"]);
     Some(match algorithm {
@@ -1080,6 +1216,7 @@ mod tests {
             GroupingStrategy::PerSubpopulationInstance,
         );
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2,
         };
@@ -1093,6 +1230,7 @@ mod tests {
         ));
         policy.artifact.records[1].error_metrics.clear();
         assert!(ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2
         }
@@ -1114,6 +1252,7 @@ mod tests {
             GroupingStrategy::PerSubpopulationInstance,
         );
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.05,
         };
@@ -1160,6 +1299,7 @@ mod tests {
             GroupingStrategy::PerSubpopulationInstance,
         );
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2,
         };
@@ -1191,6 +1331,7 @@ mod tests {
             .error_metrics
             .remove("max_frequency_entropy_absolute_bits_error");
         let model = ErpAccuracyModel {
+            hll: None,
             policy: Some(&policy),
             max_error: 0.2,
         };
@@ -1444,6 +1585,15 @@ mod tests {
         assert!(invalid.populations.is_empty());
         assert!(invalid.invalid_reason.as_deref().unwrap().contains("stale"));
         assert!(policy.observed_shape.is_none());
+        assert!(policy
+            .candidate_memory_bytes(
+                &SketchAlgorithm::Cms,
+                &SketchParams::Cms {
+                    width: 512,
+                    depth: 3
+                }
+            )
+            .is_none());
     }
 
     /// Only the activated catalog may supply a candidate's data contract.
@@ -1604,6 +1754,16 @@ mod tests {
             minimum_confidence: 0.9,
             minimum_confidence_margin: 0.05,
         });
+        assert_eq!(
+            policy.candidate_memory_bytes(
+                &SketchAlgorithm::Cms,
+                &SketchParams::Cms {
+                    width: 512,
+                    depth: 3
+                }
+            ),
+            Some((12_288.0, vec!["cms-512".into()]))
+        );
         assert!(matches!(
             policy.select(
                 SketchAlgorithm::Cms,
@@ -1647,6 +1807,15 @@ mod tests {
             policy.select(SketchAlgorithm::Cms, 0.01, theory.clone()),
             ErpParameterDecision::TheoreticalFallback { params, .. } if params == theory
         ));
+        assert!(policy
+            .candidate_memory_bytes(
+                &SketchAlgorithm::Cms,
+                &SketchParams::Cms {
+                    width: 512,
+                    depth: 3
+                }
+            )
+            .is_none());
     }
 
     #[test]

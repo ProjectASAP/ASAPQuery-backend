@@ -22,7 +22,7 @@ are diagnostics, not semantic IDs or authorization tokens.
 
 | Step | Owner and operation | Diagnostic evidence |
 | --- | --- | --- |
-| 1 | Planner selects the Logical Post-ASAP DAG and maintenance requirements | `planner.select` entry and selection errors. `planner.candidate_inventory`, `planner.candidate_evaluation` and `planner.candidate_selected` distinguish compilation/pricing failures from selection within the bounded inventory. Backend spans bracket Planner calls; they do not instrument every internal Planner optimization. |
+| 1 | Planner selects the Logical Post-ASAP DAG and maintenance requirements | `planner.select` entry and selection errors. `deployment.candidate_inventory`, `deployment.candidate_evaluation` and `deployment.candidate_selected` distinguish compilation/pricing failures from selection within the bounded inventory. Backend spans bracket Planner calls; they do not instrument every internal Planner optimization. |
 | 2 | Planner compiles physical operators, dependencies and typed boundaries | Inspect the selected DAG artifact alongside compilation spans. Do not interpret a backend adapter node as a second Planner physical node. |
 | 3 | Backend Deployment Plan Compiler binds sources, stored outputs and deployment policy | `deployment.bind`, transmission construction and publication spans; plan generation and query counts. The backend does not reselect operators. |
 | 4 | Backend validates, stages and activates one generation | HTTP staging/activation and summary-catalog installation events. Activation does not imply state readiness. |

@@ -157,7 +157,9 @@ pub fn prepare_window_implementations(
         .iter()
         .map(|state| {
             (
-                state.window_secs.unwrap_or(query.query_lookback_seconds),
+                state
+                    .window_secs
+                    .unwrap_or(query.query_lookback_ms.div_ceil(1_000)),
                 cohorts.contains(&(Rc::as_ptr(&state.node) as usize)),
             )
         })

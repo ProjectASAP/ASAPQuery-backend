@@ -302,13 +302,16 @@ dot -Tsvg target/readme-evidence/selected.dot \
   -o target/readme-evidence/selected.svg
 ```
 
-Candidate discovery accepts the checked-in unquoted templates. Deployment and
-selected-plan inspection require `ASAPQUERY_PLANNING_SNAPSHOT` to point to a
-snapshot with complete, valid workload cost evidence. Prepare that input using
-the [cost evidence workflow](docs/examples/workload-cost-evidence.md).
-There is one snapshot compiler: it compares complete executable alternatives,
-including exact fallback. Materialization IDs are definitions, not physical SIDs.
-For `--metricsql`, collect quotes for the MetricsQL frontend.
+Candidate discovery and deployment accept snapshots without external workload
+quotes. The backend combines applicable ERP resources or analytical estimates
+with data size, query frequency and physical-plan structure, then compares
+complete candidate costs, including exact fallback. The selected plan includes
+the resource breakdown and assumptions in `cost_comparison`.
+
+Point `ASAPQUERY_PLANNING_SNAPSHOT` to your workload snapshot with current data
+and capability inputs. Optional calibrated provider quotes can override automatic
+costing through the [cost evidence workflow](docs/examples/workload-cost-evidence.md).
+Materialization IDs are definitions, not physical SIDs.
 
 ## Prometheus runbook
 
