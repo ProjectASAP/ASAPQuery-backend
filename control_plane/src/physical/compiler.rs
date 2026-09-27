@@ -154,6 +154,9 @@ pub struct SummaryLifecyclePlanningInputs {
 
 #[derive(Debug, Clone, Default)]
 pub struct PhysicalCompilationRequest {
+    /// Complete Planner candidates retained until deployment admission/pricing.
+    /// Empty for callers that explicitly supply one already-selected forest.
+    pub planner_candidate_forests: Vec<Vec<QueryCompilationInput>>,
     /// Diagnostic projections of the original Planner search; never consumed by selection.
     pub planner_selection_trace: Vec<serde_json::Value>,
     /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
@@ -167,7 +170,7 @@ pub struct PhysicalCompilationRequest {
     pub query_workload: Option<QueryWorkload>,
     /// Source evidence supplied independently from query demand.
     pub data_workload: Option<DataWorkload>,
-    /// Workload-lowered roots retained across physical alternative enumeration.
+    /// Workload-lowered roots retained across physical candidate enumeration.
     pub canonical_roots: Vec<Rc<QueryExpr>>,
     pub queries: Vec<QueryCompilationInput>,
     pub topk_membership_evidence_by_query_id: HashMap<String, TopKMembershipEvidence>,
@@ -629,7 +632,7 @@ pub struct MaterializationLifecycleEstimate {
 pub enum CompileError {
     #[error("invalid backend-local workload snapshot: {0}")]
     Snapshot(String),
-    #[error("no feasible completely costed alternative: {0}")]
+    #[error("no feasible completely costed candidate: {0}")]
     Candidates(serde_json::Value),
     #[error("planner revision mismatch: request={request}, compiler={compiler}")]
     PlannerRevision {
@@ -936,7 +939,8 @@ impl BackendLocalPlanningInput {
                 exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
             }
         }
-        let planner_selection_trace = select_logical_roots_with_scoped_evidence_and_trace(
+        let mut candidate_roots = Vec::new();
+        let mut planner_selection_trace = logical_roots_and_candidates(
             &mut queries,
             canonical_roots.clone(),
             &topk_evidence_by_id,
@@ -944,6 +948,7 @@ impl BackendLocalPlanningInput {
             &exact_costs_by_id,
             self.physical_inputs.erp.as_ref(),
             self.environment.observed_at_unix_ms,
+            Some(&mut candidate_roots),
         )?;
         for query in &mut queries {
             prepare_window_implementations(
@@ -953,9 +958,36 @@ impl BackendLocalPlanningInput {
                 self.physical_inputs.query_retention_margin_ms,
             )?;
         }
+        let mut planner_candidate_forests = Vec::new();
+        for roots in candidate_roots {
+            let mut forest = queries.clone();
+            for (index, root) in roots {
+                forest[index].selected_plan_root = root;
+            }
+            let preparation = forest.iter_mut().try_for_each(|query| {
+                prepare_window_implementations(
+                    query,
+                    &self.physical_inputs.window_cost_model,
+                    self.environment.target,
+                    self.physical_inputs.query_retention_margin_ms,
+                )
+            });
+            if let Err(error) = preparation {
+                planner_selection_trace.push(serde_json::json!({
+                    "stage": "deployment.window_feasibility",
+                    "status": "rejected",
+                    "logical_root_ids": forest.iter().map(|query| crate::planner_selection::explained_root_id(
+                        &query.selected_plan_root, &query.accuracy_target)).collect::<Vec<_>>(),
+                    "reason": error.to_string(),
+                }));
+                continue;
+            }
+            planner_candidate_forests.push(forest);
+        }
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PhysicalCompilationRequest {
+                planner_candidate_forests,
                 planner_selection_trace,
                 allow_mixed_summary_and_exact_execution: true,
                 require_backend_local_execution: self
@@ -1378,7 +1410,7 @@ impl DeploymentPlanCompiler {
                                 .flatten()
                             });
                             // Masks enumerate counter/max choices only. Other selected
-                            // summaries remain required by this physical alternative.
+                            // summaries remain required by this physical candidate.
                             key.is_none_or(|key| policy.contains(&key))
                         })
                 })
@@ -2473,6 +2505,28 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
     erp: Option<&super::erp::ErpPlanningInput>,
     now_ms: u64,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
+    logical_roots_and_candidates(
+        queries,
+        roots,
+        evidence,
+        scoped_evidence,
+        exact_costs,
+        erp,
+        now_ms,
+        None,
+    )
+}
+
+fn logical_roots_and_candidates(
+    queries: &mut [QueryCompilationInput],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+    scoped_evidence: &HashMap<String, ScopedAccuracyEvidence>,
+    exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
+    erp: Option<&super::erp::ErpPlanningInput>,
+    now_ms: u64,
+    mut candidates_out: Option<&mut Vec<Vec<(usize, Rc<SummaryNode>)>>>,
+) -> Result<Vec<serde_json::Value>, CompileError> {
     tracing::debug!(target: "asap_runtime_debug", stage = "planner.select", "Planner selection entered");
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
@@ -2559,6 +2613,27 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
                 AccuracyTarget::Exact => 0.0,
             },
         };
+        let mut candidate_assembly_rejections = Vec::new();
+        if let Some(output) = candidates_out.as_deref_mut() {
+            let inventory = crate::planner_selection::enumerate_workload_candidates(
+                roots.clone(),
+                accuracy.clone(),
+                &model,
+                &QueryEvidence {
+                    topk: certificate,
+                    scoped: scoped_certificate,
+                    now_ms,
+                },
+                &accuracy_model,
+            )
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+            candidate_assembly_rejections = inventory.rejected_assemblies;
+            let candidates = inventory.candidates;
+            // Retain every root's candidates without multiplying independent
+            // cohorts. Deployment evaluates each root substitution in the
+            // preferred workload context; this is not exhaustive joint search.
+            output.extend(candidates);
+        }
         let (selected, mut trace) =
             crate::planner_selection::select_workload_with_accuracy_model_and_trace(
                 roots,
@@ -2572,6 +2647,14 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
                 &accuracy_model,
             )
             .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        trace["candidate_assembly_rejections"] = serde_json::json!(candidate_assembly_rejections);
+        if candidates_out.is_some() {
+            trace["computation_search_scope"] = serde_json::json!({
+                "inventory": "all_root_candidates",
+                "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+                "joint_workload_search_exhaustive": false,
+            });
+        }
         if let Some(evidence) = scoped_certificate {
             trace["accuracy_evidence_scope"] = serde_json::json!({
                 "query_id": scope,
@@ -2609,7 +2692,7 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
     Ok(traces)
 }
 
-fn requires_exact_erp_fallback(
+pub(super) fn requires_exact_erp_fallback(
     node: &SummaryNode,
     accuracy: &AccuracyTarget,
     erp: &super::erp::ErpPlanningInput,
@@ -3406,12 +3489,12 @@ fn select_lifecycle(
         lifecycle_cost: plan.deployments[0]
             .alternatives
             .iter()
-            .find(|alternative| {
-                alternative.rejection.is_none()
-                    && alternative.summary_maintenance_lifecycle
+            .find(|candidate| {
+                candidate.rejection.is_none()
+                    && candidate.summary_maintenance_lifecycle
                         == guarantee.summary_maintenance_lifecycle
             })
-            .and_then(|alternative| alternative.total_cost)
+            .and_then(|candidate| candidate.total_cost)
             .ok_or_else(|| CompileError::Lifecycle {
                 query_id: query.query_id.clone(),
                 reason: "missing selected lifecycle cost".into(),
@@ -4750,9 +4833,10 @@ pub(crate) mod tests {
         );
     }
 
-    // Capability normalization precedes candidate enumeration, avoiding duplicate exact quotes.
+    // A larger computation inventory must retain both maintained and native
+    // execution; its cardinality is not the correctness contract.
     #[test]
-    fn counter_only_snapshot_has_distinct_local_and_native_cost_alternatives() {
+    fn counter_only_snapshot_has_distinct_local_and_native_cost_candidates() {
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -4760,13 +4844,28 @@ pub(crate) mod tests {
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         entry.query = Query("rate(m[1m])".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
-        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
-        assert_eq!(
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let candidates =
             super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
-                .unwrap()
-                .len(),
-            3
+                .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
+                .count(),
+            1
         );
+        let plans = candidates
+            .into_iter()
+            .map(|candidate| DeploymentPlanCompiler.compile_promql(candidate, environment.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(plans
+            .iter()
+            .any(|plan| !plan.precompute_plan.materializations.is_empty()));
+        assert!(plans
+            .iter()
+            .any(|plan| plan.precompute_plan.materializations.is_empty()));
     }
 
     // Count and value rankings must configure different state update contracts.
@@ -5002,6 +5101,7 @@ pub(crate) mod tests {
             evidence_by_query.insert(query_id.to_string(), evidence);
         }
         Ok(PhysicalCompilationRequest {
+            planner_candidate_forests: Vec::new(),
             planner_selection_trace: Vec::new(),
             canonical_roots: Vec::new(),
             allow_mixed_summary_and_exact_execution: false,
@@ -7010,9 +7110,9 @@ pub(crate) mod tests {
     }
 
     // A tumbling shape pairs only with `Pane` in the validator's
-    // framework/layout table, so there is no alternative to price against it.
+    // framework/layout table, so there is no candidate to price against it.
     #[test]
-    fn tumbling_shapes_have_no_layout_alternative_to_rank() {
+    fn tumbling_shapes_have_no_layout_candidate_to_rank() {
         let cost = planning_snapshot().physical_inputs.window_cost_model.cost;
         let expr = crate::query_parser::parse_query_expr_canonical(
             "quantile_over_time(0.5, data[5m])",
@@ -7447,7 +7547,8 @@ pub(crate) mod tests {
             request =
                 super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
                     .unwrap()
-                    .pop()
+                    .into_iter()
+                    .find(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
                     .unwrap();
             let bundle = DeploymentPlanCompiler
                 .compile_promql(request, environment)
@@ -8056,7 +8157,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn checked_in_per_entity_snapshot_preserves_native_alternative() {
+    fn checked_in_per_entity_snapshot_preserves_native_candidate() {
         let source = include_str!("../../../docs/examples/asapquery-planning-snapshot.json");
         let snapshot: BackendLocalPlanningInput =
             serde_json::from_str(source).expect("strict canonical workload fixture");
@@ -8133,8 +8234,9 @@ pub(crate) mod tests {
         let native =
             crate::physical::workload_cost::enumerate_exact_and_materialized_candidates(request)
                 .unwrap()
-                .pop()
-                .unwrap();
+                .into_iter()
+                .find(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
+                .expect("native candidate retained");
         let plan = DeploymentPlanCompiler
             .compile_promql(native, environment)
             .expect("native demo compiles");

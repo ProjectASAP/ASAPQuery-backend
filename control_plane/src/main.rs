@@ -731,6 +731,7 @@ fn compile_physical_plan_request(
             .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
     }
     let compilation_request = physical::compiler::PhysicalCompilationRequest {
+        planner_candidate_forests: Vec::new(),
         planner_selection_trace,
         query_workload: Some(query_workload),
         data_workload: Some(request.data_workload),
