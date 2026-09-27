@@ -8,23 +8,50 @@ use planner_types::post_asap::{
     maintained_population::*, SummaryExpr, SummaryNode, ValueOperation,
 };
 
-fn selected(node: &SummaryNode) -> Option<(&MaintainedPopulation, &PopulationReadout)> {
-    let SummaryExpr::ValueOperation {
+fn selected(node: &SummaryNode) -> Option<(MaintainedPopulation, PopulationReadout)> {
+    if let SummaryExpr::ValueOperation {
         child,
         operation: ValueOperation::ReadPopulation { readout },
+        ..
+    } = &node.expr
+    {
+        if let SummaryExpr::ValueOperation {
+            operation: ValueOperation::MaintainPopulation { population },
+            ..
+        } = &child.expr
+        {
+            return Some((population.clone(), readout.clone()));
+        }
+    }
+    // The source remains a maintained population when Planner places a heap,
+    // projection and ranking above it. Backend binds that source only.
+    let SummaryExpr::ValueOperation {
+        operation: ValueOperation::Limit { n, offset: 0, .. },
         ..
     } = &node.expr
     else {
         return None;
     };
-    let SummaryExpr::ValueOperation {
-        operation: ValueOperation::MaintainPopulation { population },
-        ..
-    } = &child.expr
-    else {
+    let dag =
+        planner_types::post_asap::compile_executable_dag(&std::rc::Rc::new(node.clone())).ok()?;
+    let populations = dag
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.payload {
+            planner_types::post_asap::ExecutableOperatorPayload::Value {
+                operation: ValueOperation::MaintainPopulation { population },
+            } => Some(population),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [population] = populations.as_slice() else {
         return None;
     };
-    Some((population, readout))
+    asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(
+        &std::rc::Rc::new(node.clone()),
+    )
+    .ok()?;
+    Some(((*population).clone(), PopulationReadout::TopK { k: *n }))
 }
 
 pub(super) fn supported_node(node: &SummaryNode) -> bool {
@@ -55,7 +82,7 @@ pub(super) fn operator(
         .iter()
         .filter_map(|q| {
             selected(&q.selected_plan_root)
-                .map(|(p, _)| serde_json::to_string(p).expect("typed population serializes"))
+                .map(|(p, _)| serde_json::to_string(&p).expect("typed population serializes"))
         })
         .collect();
     let max_bytes = request
@@ -97,7 +124,7 @@ pub(super) fn operator(
             .min(input.lookback_ms),
     };
     population.validate()?;
-    let readout = match readout {
+    let readout = match &readout {
         PopulationReadout::Quantile { q } => SeriesReadout::Quantile { q: *q },
         PopulationReadout::TopK { k } => SeriesReadout::TopK { k: *k as u64 },
         PopulationReadout::Sum => SeriesReadout::Sum,

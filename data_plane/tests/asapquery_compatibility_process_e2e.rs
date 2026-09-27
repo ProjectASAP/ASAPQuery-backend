@@ -1916,3 +1916,6 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
 
 #[path = "support/univmon_erp_process.rs"]
 mod univmon_erp_process;
+
+#[path = "support/spatial_heap_process.rs"]
+mod spatial_heap_process;
