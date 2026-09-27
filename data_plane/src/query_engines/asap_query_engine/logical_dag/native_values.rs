@@ -130,6 +130,8 @@ pub(super) fn semi_join(
     output(values, result)
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(stage = "physical.execute", query_id = %entry.query_id, evaluation_time_ms = at, input_kind = "current_series_snapshot"), err)]
 pub(super) fn execute_population<F>(
     entry: &asap_types::query_plan::QueryPlanEntry,
     at: u64,
@@ -174,9 +176,14 @@ where
         Batch::try_new(input.schema.clone(), rows).map_err(|error| miss(error.to_string()))?;
     let source = Operator::source(input.schema.clone(), vec![batch])
         .map_err(|error| miss(error.to_string()))?;
-    let graph = program
-        .instantiate(BTreeMap::from([(input_id, Box::new(source) as Source<'_>)]))
-        .map_err(|error| miss(error.to_string()))?;
+    let graph = {
+        let _binding = tracing::debug_span!(target: "asap_runtime_debug", "physical_input_binding",
+            stage = "physical.bind_inputs", input_count = 1, input_kind = "current_series_snapshot")
+        .entered();
+        program
+            .instantiate(BTreeMap::from([(input_id, Box::new(source) as Source<'_>)]))
+            .map_err(|error| miss(error.to_string()))?
+    };
     let context = dag::RunContext::new(
         dag::Scope::Query {
             evaluation_time_ms: at_signed,

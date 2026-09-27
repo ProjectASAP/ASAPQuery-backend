@@ -269,6 +269,8 @@ impl QueryPlanEntry {
 
     /// Recover an installed population readout; the source binds the complete
     /// maintained vector, while the physical program owns ranking and limiting.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "physical.recover_validate", query_id = %self.query_id, input_kind = "current_series_snapshot"), err)]
     pub fn recover_population_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
         let invalid = |message: &str| QueryPlanError::Invalid(message.into());
         let population = self

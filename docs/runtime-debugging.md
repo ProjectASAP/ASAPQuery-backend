@@ -95,3 +95,10 @@ publication receipt remains authoritative.
 
 These spans instrument the native storage API, including its recovery E2E. They
 do not imply that all PromQL maintenance candidates use that API yet.
+
+Current-series TopK uses these same stages: installation compiles the Planner
+readout program, recovery validates the persisted program, binding supplies the
+complete eligible population, and native execution performs ranking and limiting.
+These spans use `input_kind=current_series_snapshot`; label sets and sample
+values are not recorded. They describe the exact ranking path, not heap storage
+or request-time physical compilation.

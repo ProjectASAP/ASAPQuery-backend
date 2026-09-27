@@ -112,6 +112,8 @@ pub(super) fn operator(
 
 /// The maintained population is a deployment source; ranking is compiled by
 /// Planner before this candidate is priced or installed.
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(stage = "physical.compile_install", query_id = %entry.query_id, input_kind = "current_series_snapshot"), err)]
 pub(super) fn install_native_topk(
     entry: &mut asap_types::query_plan::QueryPlanEntry,
     selected: &std::rc::Rc<SummaryNode>,
