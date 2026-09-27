@@ -207,7 +207,7 @@ impl PrecomputePlan {
                     schema_id: schema.schema_id.clone(),
                 });
             }
-            if schema.encodings != state_encodings(&family) {
+            if !state_encodings_match(&family, &schema.encodings) {
                 return Err(invalid("encoding does not match state family"));
             }
             if config.num_aggregates_to_retain == Some(0) {
