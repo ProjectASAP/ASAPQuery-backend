@@ -395,7 +395,9 @@ impl QueryPlanEntry {
                 self.query_id, self.root.0
             )));
         }
-        if self.population_snapshot().is_some() {
+        if self.physical_vector_binding().is_some() {
+            self.recover_vector_physical_dag()?;
+        } else if self.population_snapshot().is_some() {
             self.recover_population_physical_dag()?;
         } else if self.relation_output_schema()?.is_some() || self.physical_dag.is_some() {
             self.recover_relational_physical_dag()?;
@@ -603,6 +605,14 @@ pub struct ExternalExactRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    /// Bind deployment-provided vectors to the already compiled physical DAG.
+    /// Input positions correspond to `source_nodes`; operators live only in
+    /// QueryPlanEntry.physical_dag, never in this binding.
+    Physical {
+        inputs: Vec<QueryNodeId>,
+        source_nodes: Vec<u64>,
+        max_bytes: u64,
+    },
     RelationalJoin {
         inputs: [QueryNodeId; 2],
         join_kind: planner_types::pre_asap::JoinKind,
@@ -672,6 +682,7 @@ impl QueryPlanNode {
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs }
+            | Self::Physical { inputs, .. }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
         }

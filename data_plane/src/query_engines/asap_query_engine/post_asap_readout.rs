@@ -321,7 +321,8 @@ impl PhysicalQueryRuntime<'_> {
                         item_labels: merged_item_labels.unwrap_or_default(),
                     })
             }
-            QueryPlanNode::Logical { .. }
+            QueryPlanNode::Physical { .. }
+            | QueryPlanNode::Logical { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
             | QueryPlanNode::RelationalJoin { .. } => Err(PhysicalNodeError::Fallback(

@@ -178,6 +178,7 @@ where
         for (local, mut physical) in nodes {
             match &mut physical {
                 QueryPlanNode::Logical { inputs, .. }
+                | QueryPlanNode::Physical { inputs, .. }
                 | QueryPlanNode::SummaryMerge { inputs }
                 | QueryPlanNode::ExternalExact { inputs, .. } => {
                     for input in inputs {
