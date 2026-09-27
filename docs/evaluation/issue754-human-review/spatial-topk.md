@@ -29,6 +29,27 @@ flowchart LR
 
 No standalone Sort node in this selected DAG; any ranking readout is shown in the operation table.
 
+## Installed native physical program
+
+This program is compiled before candidate pricing and installation. Serving restores its operators and binds its declared inputs.
+
+Roots: `[2]`.
+
+| Node | Dependencies | Operator / input contract | Output fields |
+| --- | --- | --- | --- |
+| 1 | `[]` | `{"Input":{"boundedness":"Bounded","emission":"Unknown"}}` | `["0: ts/timestamp","1: value/float64","2: label_0/utf8","3: $promql_series_identity/utf8"]` |
+| 18446744073709551615 | `[1]` | `{"Sort":{"groups":[2],"keys":[{"column":1,"descending":true,"nulls_first":false}]}}` | `["0: ts/timestamp","1: value/float64","2: label_0/utf8","3: $promql_series_identity/utf8"]` |
+| 2 | `[18446744073709551615]` | `{"Limit":{"groups":[2],"n":3,"offset":0}}` | `["0: ts/timestamp","1: value/float64","2: label_0/utf8","3: $promql_series_identity/utf8"]` |
+
+```mermaid
+flowchart LR
+  P1["1: Bound population snapshot"]
+  P18446744073709551615["18446744073709551615: Sort"]
+  P1 --> P18446744073709551615
+  P2["2: Limit"]
+  P18446744073709551615 --> P2
+```
+
 ## Candidate admission and costing
 
 Costs below come from the controlled Level 1 fixture, not production measurements.
@@ -68,6 +89,232 @@ This is the emitted adapter representation, including dependencies, pane size, r
 
 ```json
 {
+  "physical_dag": {
+    "nodes": {
+      "1": {
+        "Input": {
+          "properties": {
+            "boundedness": "Bounded",
+            "emission": "Unknown"
+          },
+          "schema": {
+            "fields": [
+              {
+                "dtype": {
+                  "Plain": "timestamp"
+                },
+                "name": "ts",
+                "nullable": false
+              },
+              {
+                "dtype": {
+                  "Plain": "float64"
+                },
+                "name": "value",
+                "nullable": false
+              },
+              {
+                "dtype": {
+                  "Plain": "utf8"
+                },
+                "name": "label_0",
+                "nullable": true
+              },
+              {
+                "dtype": {
+                  "Plain": "utf8"
+                },
+                "name": "$promql_series_identity",
+                "nullable": false
+              }
+            ],
+            "time_index": 0
+          }
+        }
+      },
+      "18446744073709551615": {
+        "Operator": {
+          "inputs": [
+            1
+          ],
+          "operator": {
+            "inputs": [
+              {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "$promql_series_identity",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              }
+            ],
+            "kind": {
+              "Sort": {
+                "groups": [
+                  2
+                ],
+                "keys": [
+                  {
+                    "column": 1,
+                    "descending": true,
+                    "nulls_first": false
+                  }
+                ]
+              }
+            },
+            "output": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "$promql_series_identity",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            }
+          }
+        }
+      },
+      "2": {
+        "Operator": {
+          "inputs": [
+            18446744073709551615
+          ],
+          "operator": {
+            "inputs": [
+              {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "$promql_series_identity",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              }
+            ],
+            "kind": {
+              "Limit": {
+                "groups": [
+                  2
+                ],
+                "n": 3,
+                "offset": 0
+              }
+            },
+            "output": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "$promql_series_identity",
+                  "nullable": false
+                }
+              ],
+              "time_index": 0
+            }
+          }
+        }
+      }
+    },
+    "roots": [
+      2
+    ],
+    "version": 1
+  },
   "language": "prom_ql",
   "query_id": "compat-query-0",
   "canonical_query": "topk by (label_0) (3, data)",
@@ -95,8 +342,7 @@ This is the emitted adapter representation, including dependencies, pane size, r
           "quantiles": false
         },
         "readout": {
-          "kind": "top_k",
-          "k": 3
+          "kind": "snapshot"
         }
       },
       "inputs": []

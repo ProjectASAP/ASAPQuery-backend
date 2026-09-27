@@ -79,6 +79,33 @@ for path in sorted(BASE.glob('*.json')):
                     lines += [f"Its input is node `{producer['id']}`: {cell(producer['payload'])}. Column indices refer to that producer's output schema above.", '']
         if not found:
             lines += ['No standalone Sort node in this selected DAG; any ranking readout is shown in the operation table.', '']
+    physical = entry.get('physical_dag')
+    if physical:
+        lines += ['## Installed native physical program', '',
+                  'This program is compiled before candidate pricing and installation. Serving restores its operators and binds its declared inputs.', '',
+                  f"Roots: {cell(physical['roots'])}.", '',
+                  '| Node | Dependencies | Operator / input contract | Output fields |',
+                  '| --- | --- | --- | --- |']
+        diagram = ['```mermaid', 'flowchart LR']
+        for node_id, node in physical['nodes'].items():
+            if 'Input' in node:
+                dependencies = []
+                payload = {'Input': node['Input']['properties']}
+                fields = node['Input']['schema']['fields']
+                name = 'Bound population snapshot'
+            else:
+                operator = node['Operator']
+                dependencies = operator['inputs']
+                payload = operator['operator']['kind']
+                fields = operator['operator']['output']['fields']
+                name = next(iter(payload)) if isinstance(payload, dict) else payload
+            names = [f"{i}: {field['name']}/{dtype(field['dtype'])}" for i, field in enumerate(fields)]
+            lines.append(f"| {node_id} | {cell(dependencies)} | {cell(payload)} | {cell(names)} |")
+            diagram.append(f'  P{node_id}["{node_id}: {name}"]')
+            for parent in dependencies:
+                diagram.append(f'  P{parent} --> P{node_id}')
+        diagram += ['```', '']
+        lines += ['', *diagram]
     report = plan.get('cost_comparison') or {}
     lines += ['## Candidate admission and costing', '',
               'Costs below come from the controlled Level 1 fixture, not production measurements.', '']
@@ -126,9 +153,11 @@ Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
 
 These exports describe the current Backend implementation. They do **not** prove
 completion of the Planner physical-candidate installation/execution handoff.
-The displayed computation is logical provenance; the installed Backend adapter
-and stored-output bindings are shown separately. Deployment Rate → heap storage
-E2E and latest-value spatial TopK remain outstanding.
+Logical provenance and installed native physical programs are shown separately.
+Spatial TopK binds a complete current-series snapshot and runs a persisted native
+Sort → Limit program. This is the exact ranking candidate; spatial CMS/CountSketch
+heap deployment and Rate → heap storage E2E remain outstanding. Other PromQL
+paths still use the documented Backend adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
 currently evaluates single-root substitutions in a preferred workload context;

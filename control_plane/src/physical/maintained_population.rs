@@ -109,3 +109,52 @@ pub(super) fn operator(
         readout,
     }))
 }
+
+/// The maintained population is a deployment source; ranking is compiled by
+/// Planner before this candidate is priced or installed.
+pub(super) fn install_native_topk(
+    entry: &mut asap_types::query_plan::QueryPlanEntry,
+    selected: &std::rc::Rc<SummaryNode>,
+) -> Result<(), CompileError> {
+    use asap_types::query_plan::QueryPlanNode;
+    let Some(QueryPlanNode::Logical {
+        operator:
+            ResidualQueryOperator::CurrentSeries {
+                population,
+                readout: SeriesReadout::TopK { .. },
+            },
+        ..
+    }) = entry.nodes.get(&entry.root)
+    else {
+        return Ok(());
+    };
+    if population.grouping.without {
+        return Ok(());
+    }
+    let compiled =
+        asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(
+            selected,
+        )
+        .map_err(|error| CompileError::Query {
+            query_id: entry.query_id.clone(),
+            reason: error.to_string(),
+        })?;
+    let encoded = compiled.encode().map_err(|error| CompileError::Query {
+        query_id: entry.query_id.clone(),
+        reason: error.to_string(),
+    })?;
+    entry.physical_dag = Some(
+        serde_json::from_slice(&encoded)
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?,
+    );
+    let Some(QueryPlanNode::Logical {
+        operator: ResidualQueryOperator::CurrentSeries { readout, .. },
+        ..
+    }) = entry.nodes.get_mut(&entry.root)
+    else {
+        unreachable!()
+    };
+    *readout = SeriesReadout::Snapshot;
+    entry.recover_population_physical_dag()?;
+    Ok(())
+}
