@@ -51,11 +51,11 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 - quantile(q=0.9) realizes as a Kll sketch: composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }
 - quantile(q=0.5) realizes as a Kll sketch: composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }
 
-| Candidate | Status | Fixture cost | Rejection / unavailable reason |
-| --- | --- | --- | --- |
-| 0 | `"selected"` | `155.0` | `null` |
-| 1 | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `"unselected"` | `61000000000000.0` | `null` |
+| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- | --- |
+| 0 | `["asap-explain-v1:root:3940fdbb710d2157fa1442d60a27e84ed9ea6ac3468bf9b4632b5a86bffec77b"]` | `"selected"` | `155.0` | `null` |
+| 1 | `["asap-explain-v1:root:23c3df7787dc24dff3251071956d7d703b06c8e7291d420679fdbc7045aa4b8e"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:ddd37e37de447338654e5b71ea256bbf69beda84ae8734a7f9650d801eade1f6"]` | `"unselected"` | `61000000000000.0` | `null` |
 
 Successfully compiled candidate plans: [quantile-ratio-0](candidates/quantile-ratio-0.json), [quantile-ratio-1](candidates/quantile-ratio-1.json), [quantile-ratio-2](candidates/quantile-ratio-2.json)
 
@@ -92,8 +92,8 @@ Stored output `2776719732314936823` → semantic definition `sds-v1:f20a6a984012
     "aggregation_type": "DDSketch",
     "aggregation_sub_type": "",
     "parameters": {
-      "promql_right_closed": true,
-      "alpha": 0.0049751243781094535
+      "alpha": 0.0049751243781094535,
+      "promql_right_closed": true
     },
     "grouping_labels": {
       "labels": []
