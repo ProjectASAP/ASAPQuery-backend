@@ -505,7 +505,16 @@ pub(super) fn estimate(
                     ..
                 } => {
                     output_rows = cardinality;
-                    cardinality * CPU_PER_ITEM
+                    if entry.population_snapshot().is_some() {
+                        detail = json!({"input_rows": cardinality,
+                            "physical_program": entry.physical_dag,
+                            "workspace_bytes_bound": cardinality * SERIES_BYTES * 3.0,
+                            "formula": "rows * (log2(max(rows, 2)) + 2) * cpu_seconds_per_item",
+                            "cpu_seconds_per_item": CPU_PER_ITEM});
+                        cardinality * (cardinality.max(2.0).log2() + 2.0) * CPU_PER_ITEM
+                    } else {
+                        cardinality * CPU_PER_ITEM
+                    }
                 }
                 Node::RelationalJoin {
                     inputs,
@@ -572,13 +581,18 @@ pub(super) fn estimate(
             } else {
                 BTreeSet::new()
             };
+            let workspace_byte_seconds = if entry.population_snapshot().is_some() {
+                cardinality * SERIES_BYTES * 3.0 * cpu * evaluations
+            } else {
+                0.0
+            };
             detail["evaluations"] = json!(evaluations);
             detail["output_rows_bound"] = json!(output_rows);
             insert(
                 id,
                 resources(
                     cpu * evaluations,
-                    0.0,
+                    workspace_byte_seconds,
                     network * evaluations,
                     ids.into_iter().collect(),
                     detail,

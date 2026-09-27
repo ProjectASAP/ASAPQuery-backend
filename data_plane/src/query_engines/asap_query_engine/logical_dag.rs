@@ -96,6 +96,14 @@ pub(crate) fn execute_installed<F>(
 where
     F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
 {
+    if entry.population_snapshot().is_some() {
+        if !leaves.is_empty() {
+            return Err(miss(
+                "population physical input must use its installed source binding",
+            ));
+        }
+        return native_values::execute_population(entry, at, callback);
+    }
     execute_values(entry, leaves, at, callback)
 }
 

@@ -395,7 +395,9 @@ impl QueryPlanEntry {
                 self.query_id, self.root.0
             )));
         }
-        if self.relation_output_schema()?.is_some() || self.physical_dag.is_some() {
+        if self.population_snapshot().is_some() {
+            self.recover_population_physical_dag()?;
+        } else if self.relation_output_schema()?.is_some() || self.physical_dag.is_some() {
             self.recover_relational_physical_dag()?;
         }
         for (id, node) in &self.nodes {
