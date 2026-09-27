@@ -1,0 +1,23 @@
+digraph compiled_physical_plan {
+  rankdir=LR;
+  node [shape=box, fontname=Helvetica];
+  subgraph cluster_precompute {
+    label="PrecomputePlan";
+    materialization_a6120bc1de539146 [label="materialization\npolicy_fp:a6120bc1de539146\nmetric=data\nwindow_type=sliding\nwindow=60s / 10s\nlayout=Pane { pane_secs: 10 }", shape=component];
+    subgraph cluster_precompute_dag_0 {
+      label="compat-query-0";
+    precompute_0_0 [label="fallback #0\nMaintenanceInput"];
+    precompute_0_1 [label="summary_agg #1\nMaterialization { stored_output: StoredOutputId(11966640087163441478) }"];
+      precompute_0_0 -> precompute_0_1 [label="Input"];
+    }
+  }
+  subgraph cluster_query_0 {
+    label="QueryPlan: sum by (label_0) (rate(data[1m]))";
+    query_0_0 [label="Logical\nAggregate", shape=doubleoctagon];
+    query_0_1 [label="ExactReadout\nRate"];
+    query_0_2 [label="ReadMaterialization\npolicy_fp:a6120bc1de539146\nwindow=10000ms\nlookback=Some(60000)"];
+    materialization_a6120bc1de539146 -> query_0_2 [style=dashed, color=gray40, label="reads"];
+    query_0_1 -> query_0_0;
+    query_0_2 -> query_0_1;
+  }
+}

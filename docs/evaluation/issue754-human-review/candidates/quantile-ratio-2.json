@@ -1,0 +1,556 @@
+{
+  "envelope": {
+    "plan_id": 12971657221408630864,
+    "plan_version": 1,
+    "generated_at_unix_ms": 10000,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1",
+    "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+    "capability_snapshot_id": "asapquery-local-v1"
+  },
+  "summary_catalog": {
+    "schema_version": 4,
+    "plan_id": 12971657221408630864,
+    "plan_version": 1,
+    "summary_descriptors": {},
+    "data_descriptors": {},
+    "outputs": {},
+    "definitions": {}
+  },
+  "collector_plans": [],
+  "precompute_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 12971657221408630864,
+      "plan_version": 1,
+      "snapshot_sha256": "59bd2d2fcdc457e2f0b6fd69b34d69c94d12cb251016be429c8d54a23c82046b"
+    },
+    "envelope": {
+      "plan_id": 12971657221408630864,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "ingest": {
+      "protocol": "prometheus_remote_write_v1",
+      "endpoint_path": "/api/v1/write",
+      "timestamp_unit": "unix_milliseconds",
+      "require_plan_identity": false,
+      "require_stored_output_identity": false,
+      "require_registered_producer": false
+    },
+    "schemas": [],
+    "producers": [],
+    "materializations": []
+  },
+  "transmission_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 12971657221408630864,
+      "plan_version": 1,
+      "snapshot_sha256": "59bd2d2fcdc457e2f0b6fd69b34d69c94d12cb251016be429c8d54a23c82046b"
+    },
+    "envelope": {
+      "plan_id": 12971657221408630864,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "frame_identity": {
+      "identity_version": 1,
+      "sequence_scope": "materialization_series_producer_epoch",
+      "require_checkpoint_for_full": true,
+      "require_base_checkpoint_for_delta": true
+    },
+    "rules": []
+  },
+  "query_plan": {
+    "plan_id": 12971657221408630864,
+    "plan_version": 1,
+    "entries": {
+      "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])": {
+        "language": "prom_ql",
+        "query_id": "compat-query-0",
+        "canonical_query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])",
+        "root": 0,
+        "nodes": {
+          "0": {
+            "op": "exact_fallback",
+            "reason": "post-ASAP node requires exact execution"
+          }
+        },
+        "instant": {
+          "lookback_ms": 60000,
+          "full_history": false,
+          "cumulative_readout": true
+        },
+        "fallback": "exact_backend"
+      }
+    }
+  },
+  "storage_routing": {
+    "default_engine": "asap_query",
+    "metrics": [],
+    "tenant": "default"
+  },
+  "lifecycle_estimates": [],
+  "cost_comparison": null,
+  "planner_selection_trace": [
+    {
+      "accuracy_evidence_scope": {
+        "data_snapshot_id": "issue-754-level1",
+        "hll": null,
+        "observed_at_unix_ms": 9500,
+        "query_id": "compat-query-0",
+        "source": "issue-754-finite-generator"
+      },
+      "candidate_assembly_rejections": [],
+      "committed_roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:7f04ff126184a28d95318262a8eec07763c65f4e04cc683e17fa14531cd8d010",
+          "query_index": 0
+        }
+      ],
+      "computation_search_scope": {
+        "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+        "inventory": "all_root_candidates",
+        "joint_workload_search_exhaustive": false
+      },
+      "deployment_overrides": [],
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:5fa26921b1d39f2fc96ba81e0afd092c67a8a2ca3c5625f5d2b9512dce9d33a5",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 131072.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 131072.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "constant",
+                  "value": 0.010000000000000002
+                },
+                "failure_probability": {
+                  "op": "union_bound",
+                  "terms": [
+                    {
+                      "op": "zero"
+                    },
+                    {
+                      "op": "zero"
+                    }
+                  ]
+                },
+                "metric": "relative_value",
+                "provenance": [
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "constant",
+                        "value": 0.0049751243781094535
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "relative_value",
+                      "provenance": [
+                        {
+                          "algorithm": "DDSketch",
+                          "contract": "ddsketch_relative_error_alpha_v1",
+                          "kind": "sketch_readout",
+                          "params": {
+                            "DDSketch": {
+                              "alpha": 0.0049751243781094535
+                            }
+                          },
+                          "query": "Quantile { q: 0.9 }"
+                        },
+                        {
+                          "guarantee": {
+                            "bound": {
+                              "op": "zero"
+                            },
+                            "failure_probability": {
+                              "op": "zero"
+                            },
+                            "metric": "absolute_value",
+                            "provenance": [
+                              {
+                                "kind": "exact",
+                                "reason": "KeepPreAsap"
+                              }
+                            ]
+                          },
+                          "input_index": 0,
+                          "kind": "child_guarantee"
+                        },
+                        {
+                          "kind": "composition_step",
+                          "operator": {
+                            "op": "approximate_aggregate"
+                          },
+                          "rule": "exact_input"
+                        },
+                        {
+                          "kind": "accuracy_target",
+                          "target": {
+                            "EpsilonDelta": {
+                              "delta": 0.01,
+                              "epsilon": 0.0049751243781094535
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "constant",
+                        "value": 0.0049751243781094535
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "relative_value",
+                      "provenance": [
+                        {
+                          "algorithm": "DDSketch",
+                          "contract": "ddsketch_relative_error_alpha_v1",
+                          "kind": "sketch_readout",
+                          "params": {
+                            "DDSketch": {
+                              "alpha": 0.0049751243781094535
+                            }
+                          },
+                          "query": "Quantile { q: 0.5 }"
+                        },
+                        {
+                          "guarantee": {
+                            "bound": {
+                              "op": "zero"
+                            },
+                            "failure_probability": {
+                              "op": "zero"
+                            },
+                            "metric": "absolute_value",
+                            "provenance": [
+                              {
+                                "kind": "exact",
+                                "reason": "KeepPreAsap"
+                              }
+                            ]
+                          },
+                          "input_index": 0,
+                          "kind": "child_guarantee"
+                        },
+                        {
+                          "kind": "composition_step",
+                          "operator": {
+                            "op": "approximate_aggregate"
+                          },
+                          "rule": "exact_input"
+                        },
+                        {
+                          "kind": "accuracy_target",
+                          "target": {
+                            "EpsilonDelta": {
+                              "delta": 0.01,
+                              "epsilon": 0.0049751243781094535
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "input_index": 1,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "contract": "complete finite issue-754 generator population",
+                    "input_index": 0,
+                    "kind": "input_value_domain",
+                    "lower": 10.0,
+                    "max_samples": 14408,
+                    "upper": 1600.0
+                  },
+                  {
+                    "contract": "complete finite issue-754 generator population",
+                    "input_index": 1,
+                    "kind": "input_value_domain",
+                    "lower": 10.0,
+                    "max_samples": 14408,
+                    "upper": 1600.0
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "exact_division"
+                    },
+                    "rule": "relative_division"
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "preserve exact PromQL arithmetic over independently realized summary operands",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 0,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:b894853c06b25627bb8bad93789d2ce76ba7fa1750b29670a45b804e65196132"
+        },
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:88e75ab45a0a1658bb344e5394e5e1b3b988e3d1e62fcc348ed879166869ba43",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 65536.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 65536.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "constant",
+                  "value": 0.01
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "relative_value",
+                "provenance": [
+                  {
+                    "algorithm": "DDSketch",
+                    "contract": "ddsketch_relative_error_alpha_v1",
+                    "kind": "sketch_readout",
+                    "params": {
+                      "DDSketch": {
+                        "alpha": 0.01
+                      }
+                    },
+                    "query": "Quantile { q: 0.9 }"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "approximate_aggregate"
+                    },
+                    "rule": "exact_input"
+                  },
+                  {
+                    "kind": "accuracy_target",
+                    "target": {
+                      "EpsilonDelta": {
+                        "delta": 0.01,
+                        "epsilon": 0.01
+                      }
+                    }
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 1,
+          "rejected": [
+            {
+              "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
+              "status": "rejected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "target_id": "asap-explain-v1:target:ba80c7c5e379ef5aef72bbf7653e5f57abc8ac7a202da4d779ba567e2abaef29"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 2,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:f2d8a6e172e9b59050865be57d09b4bdbd7d4730674c1a70db575de443b5799e"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 3,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:fea78612f2fa8f89f78a2ec53ead01790d4b0011ebcd091841070f18944b6933"
+        },
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:383fd4a4f6ffc9d8040e84b7a77be3f0b6430e33cfb7dc12e852176e01e0a69b",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 65536.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 65536.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "constant",
+                  "value": 0.01
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "relative_value",
+                "provenance": [
+                  {
+                    "algorithm": "DDSketch",
+                    "contract": "ddsketch_relative_error_alpha_v1",
+                    "kind": "sketch_readout",
+                    "params": {
+                      "DDSketch": {
+                        "alpha": 0.01
+                      }
+                    },
+                    "query": "Quantile { q: 0.5 }"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "approximate_aggregate"
+                    },
+                    "rule": "exact_input"
+                  },
+                  {
+                    "kind": "accuracy_target",
+                    "target": {
+                      "EpsilonDelta": {
+                        "delta": 0.01,
+                        "epsilon": 0.01
+                      }
+                    }
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "quantile(q=0.5) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 4,
+          "rejected": [
+            {
+              "description": "quantile(q=0.5) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
+              "status": "rejected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "target_id": "asap-explain-v1:target:9f6e77500866a2d6a470f2d7749294e8289c8c53b5e671978a9da2add5fb0095"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 5,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:f2d8a6e172e9b59050865be57d09b4bdbd7d4730674c1a70db575de443b5799e"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 6,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:fea78612f2fa8f89f78a2ec53ead01790d4b0011ebcd091841070f18944b6933"
+        }
+      ],
+      "roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:7f04ff126184a28d95318262a8eec07763c65f4e04cc683e17fa14531cd8d010",
+          "query_index": 0
+        }
+      ],
+      "schema_version": 1
+    }
+  ]
+}
