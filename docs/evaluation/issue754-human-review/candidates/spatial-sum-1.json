@@ -1,0 +1,219 @@
+{
+  "envelope": {
+    "plan_id": 17875413431231421451,
+    "plan_version": 1,
+    "generated_at_unix_ms": 10000,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1",
+    "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+    "capability_snapshot_id": "asapquery-local-v1"
+  },
+  "summary_catalog": {
+    "schema_version": 4,
+    "plan_id": 17875413431231421451,
+    "plan_version": 1,
+    "summary_descriptors": {},
+    "data_descriptors": {},
+    "outputs": {},
+    "definitions": {}
+  },
+  "collector_plans": [],
+  "precompute_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 17875413431231421451,
+      "plan_version": 1,
+      "snapshot_sha256": "30281263668785b9e14aa808c84a05be99b49dbb9694ec42c58e75a96e08ad1f"
+    },
+    "envelope": {
+      "plan_id": 17875413431231421451,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "ingest": {
+      "protocol": "prometheus_remote_write_v1",
+      "endpoint_path": "/api/v1/write",
+      "timestamp_unit": "unix_milliseconds",
+      "require_plan_identity": false,
+      "require_stored_output_identity": false,
+      "require_registered_producer": false
+    },
+    "schemas": [],
+    "producers": [],
+    "materializations": []
+  },
+  "transmission_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 17875413431231421451,
+      "plan_version": 1,
+      "snapshot_sha256": "30281263668785b9e14aa808c84a05be99b49dbb9694ec42c58e75a96e08ad1f"
+    },
+    "envelope": {
+      "plan_id": 17875413431231421451,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "frame_identity": {
+      "identity_version": 1,
+      "sequence_scope": "materialization_series_producer_epoch",
+      "require_checkpoint_for_full": true,
+      "require_base_checkpoint_for_delta": true
+    },
+    "rules": []
+  },
+  "query_plan": {
+    "plan_id": 17875413431231421451,
+    "plan_version": 1,
+    "entries": {
+      "sum by (label_0) (data)": {
+        "language": "prom_ql",
+        "query_id": "compat-query-0",
+        "canonical_query": "sum by (label_0) (data)",
+        "root": 0,
+        "nodes": {
+          "0": {
+            "op": "exact_fallback",
+            "reason": "post-ASAP node requires exact execution"
+          }
+        },
+        "instant": {
+          "lookback_ms": 5000,
+          "full_history": false,
+          "cumulative_readout": true
+        },
+        "fallback": "exact_backend"
+      }
+    }
+  },
+  "storage_routing": {
+    "default_engine": "asap_query",
+    "metrics": [],
+    "tenant": "default"
+  },
+  "lifecycle_estimates": [],
+  "cost_comparison": null,
+  "planner_selection_trace": [
+    {
+      "candidate_assembly_rejections": [],
+      "committed_roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:a777bfc3162b4886824f150c5c09c0f0ca2be0e19a627fa04f84e7eae87f0bb6",
+          "query_index": 0
+        }
+      ],
+      "computation_search_scope": {
+        "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+        "inventory": "all_root_candidates",
+        "joint_workload_search_exhaustive": false
+      },
+      "deployment_overrides": [],
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:ee22ac54b67473dd8a283e16855f7921873b2180b838feac7d55d1374b1b20fd",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 256.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 256.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "zero"
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "absolute_value",
+                "provenance": [
+                  {
+                    "kind": "exact",
+                    "reason": "ExactAggregate(Sum)"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "exact_sum"
+                    },
+                    "rule": "exact_input"
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "Sum { col: None } realizes as an exact Sum accumulator — the only realization realizations_for_intent produces for this intent (no approximate candidate applies)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 0,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:236375e815435f67245689ac4612b1cc56d8aad2c1234a5b00efccde71a1bcfb"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 1,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:895df194bc0a6bd010cf6387dc67324d437eed29d154e49eb9c2c82774fdc797"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 2,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:488bb6ba5af7d7fb5fe373487cd181ea65416a8dfb251ec38ba769be612ae312"
+        }
+      ],
+      "roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:a777bfc3162b4886824f150c5c09c0f0ca2be0e19a627fa04f84e7eae87f0bb6",
+          "query_index": 0
+        }
+      ],
+      "schema_version": 1
+    }
+  ]
+}

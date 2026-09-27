@@ -1,40 +1,38 @@
 # Issue #754 plans for human review
 
-These are the ten **actual selected plans** exported by #728's existing Level 1
-fixture, not hand-written expected plans. This artifact does not record human
-approval. No plan behavior or test assertion was changed for this export.
+These are actual plans exported by the Level 1 fixture. No human approval is
+recorded. Selected plans and successfully compiled candidate plans are retained
+as JSON/DOT; each page shows accuracy rejections and deployment cost decisions.
 
-Backend source revision is in [source-commit.txt](source-commit.txt); Planner is
-pinned to `c27cd14b8e052ce1f4641c619488ad539ad71f56`. The source revision differs
-from the export execution revision only by inherited documentation merges.
+Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
+`2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986`.
 
-Each page contains the full Planner operation payloads, dependency edges, output
-column indices/types, timing, sort expressions, persisted boundaries, maintenance
-windows and the installed query adapter. Raw JSON and DOT are retained beside it.
-`fallback` in a Planner source payload is an IR tag: it does not by itself prove
-that execution forwards to an exact backend. Inspect the bound QueryPlan and
-Level 2 provenance to determine execution behavior.
+## Current implementation boundary
+
+These exports describe the current Backend implementation. They do **not** prove
+completion of the Planner physical-candidate installation/execution handoff.
+The displayed computation is logical provenance; the installed Backend adapter
+and stored-output bindings are shown separately. Deployment Rate → heap storage
+E2E and latest-value spatial TopK remain outstanding.
+
+Candidate discovery preserves each root's admitted computations. Deployment
+currently evaluates single-root substitutions in a preferred workload context;
+it does not exhaustively enumerate joint workload combinations. Fixture costs
+are not evidence of production-optimal placement.
 
 ## Review order
 
-1. Follow source → transformation → grouping/window → readout for each query.
-2. Check persisted producer nodes against read bindings and pane coverage.
-3. For topk-rate, inspect the Sort input and column index, not just descending.
-4. Check guarantees and admission evidence in raw JSON for approximate queries.
+1. Check source, value transformations, grouping, windows and readouts.
+2. Compare candidate rejection reasons with the query's accuracy requirement.
+3. Check persisted boundaries, definition IDs and requested pane coverage.
+4. For topk-rate, check the actual rate-value sort expression and partition keys.
+5. Compare costs and rejected candidates before reviewing the selected adapter.
 
-The topk-rate export explicitly sorts `Column(1)` descending, partitioned by
-column 2 (`label_0`). Its producer is `FinalizeExactAccumulator` over per-series
-Rate state, with column 1 named `value`. The QueryPlan adapter has an implicit
-value sort and does not itself serialize an explicit sort-key expression.
-This exposes the relevant mapping for review; it is not an additional assertion.
-
-The grouped-temporal-sum cost-reversal test covers only that query. The other
-selected plans use fixture costs; these exports do not prove production-optimal
-placement or an exhaustive search over maintenance/query-time alternatives.
-
-Legacy `residual` module/type names still exist in code. They are not presented
-here as a new architectural layer; renaming or removing that adapter is separate
-from the bound-query SDS migration.
+The strict spatial-quantile fixture rejects the default KLL guarantee. A separate
+assertion with relaxed accuracy verifies that both KLL and DDSketch reach costing
+when admitted. The grouped-temporal-sum test checks cost-dependent placement;
+it does not establish this for every query. Sort-key mutation tests reject ranking
+by timestamp or label instead of the finalized rate value.
 
 | Query | PromQL |
 | --- | --- |

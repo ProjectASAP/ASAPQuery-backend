@@ -41,12 +41,14 @@ def block(value):
     return '```json\n' + json.dumps(value, indent=2) + '\n```\n'
 
 rows = []
+planner_revisions = set()
 for path in sorted(BASE.glob('*.json')):
     plan = json.loads(path.read_text())
+    planner_revisions.add(plan['envelope']['planner_revision'])
     entry = next(iter(plan['query_plan']['entries'].values()))
     lines = ['# ' + path.stem, '', '`' + entry['canonical_query'] + '`', '',
              f'[Raw selected plan]({path.name}) · [DAG DOT]({path.stem}.dot)', '',
-             '## Planner-selected computation', '',
+             '## Selected computation: logical provenance', '',
              'IDs below are Planner node IDs; QueryPlan adapter IDs are shown separately.', '']
     for dag in plan['query_plan']['selected_dags'].values():
         lines += [f"Root: `{dag['root']}`.", '', '| Node | Dependencies (producer, edge role) | Timing | Operation | Output fields (index: name/type) |', '| --- | --- | --- | --- | --- |']
@@ -77,6 +79,25 @@ for path in sorted(BASE.glob('*.json')):
                     lines += [f"Its input is node `{producer['id']}`: {cell(producer['payload'])}. Column indices refer to that producer's output schema above.", '']
         if not found:
             lines += ['No standalone Sort node in this selected DAG; any ranking readout is shown in the operation table.', '']
+    report = plan.get('cost_comparison') or {}
+    lines += ['## Candidate admission and costing', '',
+              'Costs below come from the controlled Level 1 fixture, not production measurements.', '']
+    traces = report.get('logical_selection', [])
+    for trace in traces:
+        if trace.get('computation_search_scope'):
+            lines += [block(trace['computation_search_scope'])]
+        for group in trace.get('groups', []):
+            for rejected in group.get('rejected', []):
+                description = rejected.get('description', '').split(' — ', 1)[0]
+                lines += [f"- {description}: {rejected.get('reason', '')}"]
+    lines += ['', '| Candidate | Status | Fixture cost | Rejection / unavailable reason |',
+              '| --- | --- | --- | --- |']
+    for index, candidate in enumerate(report.get('candidates', [])):
+        lines.append(f"| {index} | {cell(candidate.get('status'))} | {cell(candidate.get('total_cost'))} | {cell(candidate.get('unavailable_reason'))} |")
+    exported = sorted((BASE / 'candidates').glob(path.stem + '-*.json'))
+    if exported:
+        lines += ['', 'Successfully compiled candidate plans: ' + ', '.join(
+            f'[{candidate.stem}](candidates/{candidate.name})' for candidate in exported), '']
     lines += ['## Persisted boundaries', '']
     if not plan['precompute_plan'].get('executable_dags', {}):
         lines += ['No precompute executable DAG is installed for this selected candidate.', '']
@@ -92,47 +113,46 @@ for path in sorted(BASE.glob('*.json')):
     (BASE / (path.stem + '.md')).write_text('\n'.join(lines))
     rows.append(f"| [{path.stem}]({path.stem}.md) | `{entry['canonical_query']}` |")
 
-intro = '''# Issue #754 plans for human review
+intro = """# Issue #754 plans for human review
 
-These are the ten **actual selected plans** exported by #728's existing Level 1
-fixture, not hand-written expected plans. This artifact does not record human
-approval. No plan behavior or test assertion was changed for this export.
+These are actual plans exported by the Level 1 fixture. No human approval is
+recorded. Selected plans and successfully compiled candidate plans are retained
+as JSON/DOT; each page shows accuracy rejections and deployment cost decisions.
 
-Backend source revision is in [source-commit.txt](source-commit.txt); Planner is
-pinned to `c27cd14b8e052ce1f4641c619488ad539ad71f56`. The source revision differs
-from the export execution revision only by inherited documentation merges.
+Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
+<PLANNER_REVISION>.
 
-Each page contains the full Planner operation payloads, dependency edges, output
-column indices/types, timing, sort expressions, persisted boundaries, maintenance
-windows and the installed query adapter. Raw JSON and DOT are retained beside it.
-`fallback` in a Planner source payload is an IR tag: it does not by itself prove
-that execution forwards to an exact backend. Inspect the bound QueryPlan and
-Level 2 provenance to determine execution behavior.
+## Current implementation boundary
+
+These exports describe the current Backend implementation. They do **not** prove
+completion of the Planner physical-candidate installation/execution handoff.
+The displayed computation is logical provenance; the installed Backend adapter
+and stored-output bindings are shown separately. Deployment Rate → heap storage
+E2E and latest-value spatial TopK remain outstanding.
+
+Candidate discovery preserves each root's admitted computations. Deployment
+currently evaluates single-root substitutions in a preferred workload context;
+it does not exhaustively enumerate joint workload combinations. Fixture costs
+are not evidence of production-optimal placement.
 
 ## Review order
 
-1. Follow source → transformation → grouping/window → readout for each query.
-2. Check persisted producer nodes against read bindings and pane coverage.
-3. For topk-rate, inspect the Sort input and column index, not just descending.
-4. Check guarantees and admission evidence in raw JSON for approximate queries.
+1. Check source, value transformations, grouping, windows and readouts.
+2. Compare candidate rejection reasons with the query's accuracy requirement.
+3. Check persisted boundaries, definition IDs and requested pane coverage.
+4. For topk-rate, check the actual rate-value sort expression and partition keys.
+5. Compare costs and rejected candidates before reviewing the selected adapter.
 
-The topk-rate export explicitly sorts `Column(1)` descending, partitioned by
-column 2 (`label_0`). Its producer is `FinalizeExactAccumulator` over per-series
-Rate state, with column 1 named `value`. The QueryPlan adapter has an implicit
-value sort and does not itself serialize an explicit sort-key expression.
-This exposes the relevant mapping for review; it is not an additional assertion.
-
-The grouped-temporal-sum cost-reversal test covers only that query. The other
-selected plans use fixture costs; these exports do not prove production-optimal
-placement or an exhaustive search over maintenance/query-time alternatives.
-
-Legacy `residual` module/type names still exist in code. They are not presented
-here as a new architectural layer; renaming or removing that adapter is separate
-from the bound-query SDS migration.
+The strict spatial-quantile fixture rejects the default KLL guarantee. A separate
+assertion with relaxed accuracy verifies that both KLL and DDSketch reach costing
+when admitted. The grouped-temporal-sum test checks cost-dependent placement;
+it does not establish this for every query. Sort-key mutation tests reject ranking
+by timestamp or label instead of the finalized rate value.
 
 | Query | PromQL |
 | --- | --- |
-'''
+"""
+intro = intro.replace('<PLANNER_REVISION>', ', '.join(f'`{revision}`' for revision in sorted(planner_revisions)))
 ending = '''
 
 ## Reproduce

@@ -4,7 +4,7 @@
 
 [Raw selected plan](temporal-sum.json) · [DAG DOT](temporal-sum.dot)
 
-## Planner-selected computation
+## Selected computation: logical provenance
 
 IDs below are Planner node IDs; QueryPlan adapter IDs are shown separately.
 
@@ -25,6 +25,27 @@ flowchart LR
 ### Sort expressions
 
 No standalone Sort node in this selected DAG; any ranking readout is shown in the operation table.
+
+## Candidate admission and costing
+
+Costs below come from the controlled Level 1 fixture, not production measurements.
+
+```json
+{
+  "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+  "inventory": "all_root_candidates",
+  "joint_workload_search_exhaustive": false
+}
+```
+
+
+| Candidate | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- |
+| 0 | `"selected"` | `95.0` | `null` |
+| 1 | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `"unselected"` | `122.0` | `null` |
+
+Successfully compiled candidate plans: [temporal-sum-0](candidates/temporal-sum-0.json), [temporal-sum-1](candidates/temporal-sum-1.json), [temporal-sum-2](candidates/temporal-sum-2.json)
 
 ## Persisted boundaries
 

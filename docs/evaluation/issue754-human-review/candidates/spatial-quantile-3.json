@@ -1,0 +1,243 @@
+{
+  "envelope": {
+    "plan_id": 7667691247138405742,
+    "plan_version": 1,
+    "generated_at_unix_ms": 10000,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1",
+    "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+    "capability_snapshot_id": "asapquery-local-v1"
+  },
+  "summary_catalog": {
+    "schema_version": 4,
+    "plan_id": 7667691247138405742,
+    "plan_version": 1,
+    "summary_descriptors": {},
+    "data_descriptors": {},
+    "outputs": {},
+    "definitions": {}
+  },
+  "collector_plans": [],
+  "precompute_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 7667691247138405742,
+      "plan_version": 1,
+      "snapshot_sha256": "0753a8d648c301f37202296a41f8a62dc12431d7b1ffe0783be9fcfc490a0fe0"
+    },
+    "envelope": {
+      "plan_id": 7667691247138405742,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "ingest": {
+      "protocol": "prometheus_remote_write_v1",
+      "endpoint_path": "/api/v1/write",
+      "timestamp_unit": "unix_milliseconds",
+      "require_plan_identity": false,
+      "require_stored_output_identity": false,
+      "require_registered_producer": false
+    },
+    "schemas": [],
+    "producers": [],
+    "materializations": []
+  },
+  "transmission_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 7667691247138405742,
+      "plan_version": 1,
+      "snapshot_sha256": "0753a8d648c301f37202296a41f8a62dc12431d7b1ffe0783be9fcfc490a0fe0"
+    },
+    "envelope": {
+      "plan_id": 7667691247138405742,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "frame_identity": {
+      "identity_version": 1,
+      "sequence_scope": "materialization_series_producer_epoch",
+      "require_checkpoint_for_full": true,
+      "require_base_checkpoint_for_delta": true
+    },
+    "rules": []
+  },
+  "query_plan": {
+    "plan_id": 7667691247138405742,
+    "plan_version": 1,
+    "entries": {
+      "quantile by (label_0) (0.9, data)": {
+        "language": "prom_ql",
+        "query_id": "compat-query-0",
+        "canonical_query": "quantile by (label_0) (0.9, data)",
+        "root": 0,
+        "nodes": {
+          "0": {
+            "op": "exact_fallback",
+            "reason": "post-ASAP node requires exact execution"
+          }
+        },
+        "instant": {
+          "lookback_ms": 5000,
+          "full_history": false,
+          "cumulative_readout": true
+        },
+        "fallback": "exact_backend"
+      }
+    }
+  },
+  "storage_routing": {
+    "default_engine": "asap_query",
+    "metrics": [],
+    "tenant": "default"
+  },
+  "lifecycle_estimates": [],
+  "cost_comparison": null,
+  "planner_selection_trace": [
+    {
+      "candidate_assembly_rejections": [],
+      "committed_roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:4204be2f7d656137893f480397fdd6ebef194f01c4ee065798ed1be687baec69",
+          "query_index": 0
+        }
+      ],
+      "computation_search_scope": {
+        "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+        "inventory": "all_root_candidates",
+        "joint_workload_search_exhaustive": false
+      },
+      "deployment_overrides": [],
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [
+            {
+              "accuracy_status": "known",
+              "candidate_id": "asap-explain-v1:candidate:ec636c415f0e8a731403c5949cf5d7da7cda1532a43565ce8d31a909034d422c",
+              "cost_estimate": {
+                "erp_record_ids": [],
+                "model": "backend_state_footprint_v1",
+                "source": "analytical",
+                "unit": "bytes_per_state_partition",
+                "value": 65536.0
+              },
+              "decision_reason": "planner_selected_pending_backend_binding",
+              "estimated_cost": 65536.0,
+              "estimated_cost_status": "available",
+              "guarantee": {
+                "bound": {
+                  "op": "constant",
+                  "value": 0.01
+                },
+                "failure_probability": {
+                  "op": "zero"
+                },
+                "metric": "relative_value",
+                "provenance": [
+                  {
+                    "algorithm": "DDSketch",
+                    "contract": "ddsketch_relative_error_alpha_v1",
+                    "kind": "sketch_readout",
+                    "params": {
+                      "DDSketch": {
+                        "alpha": 0.01
+                      }
+                    },
+                    "query": "Quantile { q: 0.9 }"
+                  },
+                  {
+                    "guarantee": {
+                      "bound": {
+                        "op": "zero"
+                      },
+                      "failure_probability": {
+                        "op": "zero"
+                      },
+                      "metric": "absolute_value",
+                      "provenance": [
+                        {
+                          "kind": "exact",
+                          "reason": "KeepPreAsap"
+                        }
+                      ]
+                    },
+                    "input_index": 0,
+                    "kind": "child_guarantee"
+                  },
+                  {
+                    "kind": "composition_step",
+                    "operator": {
+                      "op": "approximate_aggregate"
+                    },
+                    "rule": "exact_input"
+                  },
+                  {
+                    "kind": "accuracy_target",
+                    "target": {
+                      "EpsilonDelta": {
+                        "delta": 0.01,
+                        "epsilon": 0.01
+                      }
+                    }
+                  }
+                ]
+              },
+              "provenance": "SummaryRealization",
+              "rank": 0,
+              "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "replacement_kind": "summary",
+              "runtime_support_status": "unknown_pending_backend_binding",
+              "selected": true,
+              "status": "selected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 0,
+          "rejected": [
+            {
+              "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
+              "status": "rejected",
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "target_id": "asap-explain-v1:target:99731cbe9663c9b9c3d9fc4e2e3220d1b8ccd62b077a163242f6978c73fe7136"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 1,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:895df194bc0a6bd010cf6387dc67324d437eed29d154e49eb9c2c82774fdc797"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 2,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:488bb6ba5af7d7fb5fe373487cd181ea65416a8dfb251ec38ba769be612ae312"
+        }
+      ],
+      "roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:4204be2f7d656137893f480397fdd6ebef194f01c4ee065798ed1be687baec69",
+          "query_index": 0
+        }
+      ],
+      "schema_version": 1
+    }
+  ]
+}
