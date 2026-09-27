@@ -309,7 +309,7 @@ pub fn manifest(
         for node_id in entry.topological_order()? {
             add(
                 format!("query:{}:{}", entry.query_id, node_id.0),
-                json!({"node": entry.nodes[&node_id], "query": entry.canonical_query, "instant": entry.instant}),
+                json!({"node": entry.nodes[&node_id], "query": entry.canonical_query, "instant": entry.instant, "physical_dag": entry.physical_dag}),
                 "query_evaluation",
                 evaluations,
             );
@@ -572,6 +572,12 @@ fn compile_candidate_for_pricing(
         })
         .collect::<Vec<_>>();
     placement.sort();
+    let native_programs = plan
+        .query_plan
+        .entries
+        .values()
+        .map(|entry| (&entry.query_id, &entry.physical_dag))
+        .collect::<std::collections::BTreeMap<_, _>>();
     description.physical_candidate_id =
         description
             .candidate_id
@@ -584,6 +590,7 @@ fn compile_candidate_for_pricing(
                         bindings,
                         placement,
                         &plan.precompute_plan.ingest,
+                        native_programs,
                     ),
                 )
             });

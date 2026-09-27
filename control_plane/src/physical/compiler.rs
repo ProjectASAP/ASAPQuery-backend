@@ -2138,6 +2138,10 @@ impl DeploymentPlanCompiler {
             if frontend == QueryFrontend::MetricsQl {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
+            super::maintained_population::install_native_topk(
+                &mut entry,
+                &query.selected_plan_root,
+            )?;
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
                 return Err(CompileError::Query {
