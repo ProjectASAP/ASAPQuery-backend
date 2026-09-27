@@ -5,7 +5,7 @@ recorded. Selected plans and successfully compiled candidate plans are retained
 as JSON/DOT; each page shows accuracy rejections and deployment cost decisions.
 
 Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
-`3ebe195260fa6e16e226183ee50938078bb8359f`.
+`c899084019580eac55e6502eb641d42e748c6ff2`.
 
 ## Current implementation boundary
 
@@ -19,9 +19,14 @@ bound or score-separation proof, so its heap candidate is explicitly rejected
 before pricing. The inherited `native_snapshot_topk` tests cover certified heap
 admission, cost-dependent selection and analytical workspace costing; a separate
 real-process test covers Remote Write and heap HTTP results. Signed samples do
-not authorize CMS. Rate → heap storage E2E and the complete physical-candidate
-handoff remain outstanding. Other PromQL paths still use the documented Backend
-adapter representation.
+not authorize CMS. Rate TopK also exposes native exact ranking, CMS and
+CountSketch heaps above its bound per-series Rate readout. This fixture lacks
+heap proof and records the rejection. Separate controlled tests select each
+program through Backend costs; process E2E tests verify both heap families over
+durable counter SDS, including reset, window changes and process restart.
+Those paths build the heap at query time. Stored-heap precompute and the complete
+physical-candidate handoff remain outstanding; other PromQL paths retain the
+documented Backend adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
 currently evaluates single-root substitutions in a preferred workload context;

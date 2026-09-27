@@ -42,13 +42,33 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 ```
 
 - quantile(q=0.9) realizes as a Kll sketch: composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }
+### Planner physical candidate
+
+Logical root: `null`.
+
+
+
+Guarantee: `null`
+
+invalid DAG: ranking requires one exact per-series Rate frontier
+
+### Planner physical candidate
+
+Logical root: `null`.
+
+
+
+Guarantee: `null`
+
+invalid DAG: ranking requires one exact per-series Rate frontier
+
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:d55703b72c0c4bb9bc209232c1d9d0afcc595b8b60f978dbc7392a2f6439c4b0"]` | `"selected"` | `95.0` | `null` |
-| 1 | `["asap-explain-v1:root:9377634ea064bea3a66d6598cf85ef8648d59bc0473debae77b5958390104be7"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:198743eeb4cf6ad3369e04e5e07dfd7570c71dadf47a32aef1ca714a46d0dcd5"]` | `"unselected"` | `130.0` | `null` |
-| 3 | `["asap-explain-v1:root:6d5fa81380e4588417d6d892ec1f786499d644abbc6ea906446dac9db4a4fd26"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 0 | `["asap-explain-v1:root:d7005162ca16c23b9aee36776c1afc21e981ef6a7056c1af6435bc08de843b73"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:77eedd0c83f98c91c83589e77f3cd1f7d40f8090794d32ff94518e0da2a03af8"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:66a2f16251a90e29b698bc4e5deaa442ad61437f1e43abed64041848f8956f43"]` | `"unselected"` | `130.0` | `null` |
+| 3 | `["asap-explain-v1:root:421adad5f16b00e894bfca2d892952c678e36489cd1f4c25d8836c84a1e8fa36"]` | `"unselected"` | `61000000000000.0` | `null` |
 
 Successfully compiled candidate plans: [spatial-quantile-0](candidates/spatial-quantile-0.json), [spatial-quantile-1](candidates/spatial-quantile-1.json), [spatial-quantile-2](candidates/spatial-quantile-2.json), [spatial-quantile-3](candidates/spatial-quantile-3.json)
 
@@ -85,8 +105,8 @@ Stored output `1584935399223751265` → semantic definition `sds-v1:1fd0b827ec01
     "aggregation_type": "DDSketch",
     "aggregation_sub_type": "",
     "parameters": {
-      "promql_right_closed": true,
-      "alpha": 0.01
+      "alpha": 0.01,
+      "promql_right_closed": true
     },
     "grouping_labels": {
       "labels": [
