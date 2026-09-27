@@ -28,3 +28,34 @@ The HTTP lifecycle is exposed through `/api/v1/physical-plan`,
 The current V1 storage path reads only the installed plan version. Matching
 definition identity does not authorize cross-version payload reuse; that would
 require an explicit reader binding and separate compatibility support.
+
+## Persisted physical computation and outputs
+
+Installed SQL entries include a serialized native physical DAG. Installation
+compiles it once; activation and requests validate its version, roots and input
+schemas, then bind concrete batches. Missing physical programs require plan
+recompilation. Serving does not lower relational expressions again.
+
+Native summary snapshots use `native_batch_v1`, with an explicit storage tag
+separate from legacy sketch frames. The payload preserves the physical schema,
+Float64 values, typed heap identities and the summary codec. Legacy sketch
+readers reject this tag. Existing installed schemas may keep a nonempty, unique
+subset of supported encodings when new decoders are added.
+
+`SketchStore::publish_native_summary_output` publishes one summary row for one
+group/window through the existing immutable commit path. It requires the complete
+durable raw input cohort and validates the installed family and group. Repeated
+publication of the same lineage reuses the existing commit.
+
+`read_native_summary_output` resolves the installed output/group through the
+persistent series resolver without allocating an identity. It validates the
+plan version, definition, exact window, completeness, encoding, physical schema,
+group values and read budget before returning a batch to the physical executor.
+The supported path reads a complete immutable window; pane composition remains
+an explicitly planned physical operation.
+
+The storage integration test covers durable per-series sums, native quantile
+state construction, publication, bound readout and restart of both the store and
+resolver. Automatic PromQL physical-candidate installation, Rate-to-heap storage
+execution and spatial latest-value heap execution remain pending. This test does
+not establish those paths.
