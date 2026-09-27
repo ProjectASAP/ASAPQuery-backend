@@ -140,6 +140,7 @@ mod forwarding_policy_tests {
         let query = "sum(rate(m[5m]))";
         let canonical = asap_types::query_plan::canonical_promql(query).unwrap();
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::PromQl,
             query_id: canonical.clone(),
             canonical_query: canonical,
@@ -2865,6 +2866,7 @@ mod range_stitch_tests {
         plan.query_plan.entries.insert(
             asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
             QueryPlanEntry {
+                physical_dag: None,
                 language: QueryLanguage::MetricsQl,
                 query_id: "vm-scalar".into(),
                 canonical_query: identity.clone(),

@@ -1384,6 +1384,7 @@ mod topk_tests {
                 TemporalOperation::Rate,
             ] {
                 let entry = QueryPlanEntry {
+                    physical_dag: None,
                     language,
                     query_id: "labels".into(),
                     canonical_query: "test".into(),
@@ -1461,6 +1462,7 @@ mod topk_tests {
         let summary = QueryNodeId(0);
         let root = QueryNodeId(1);
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "summary-rate-topk".into(),
             canonical_query: "topk(2, rate(requests_total[5m]))".into(),
@@ -1612,6 +1614,7 @@ mod topk_tests {
         let filter = QueryNodeId(2);
         let root = QueryNodeId(3);
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "candidate-topk".into(),
             canonical_query: "topk(1, rate(requests_total[5m]))".into(),
@@ -1778,6 +1781,7 @@ mod shared_runtime_tests {
 
     fn entry() -> QueryPlanEntry {
         QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::PromQl,
             query_id: "shared-grid".into(),
             canonical_query: "shared-grid".into(),

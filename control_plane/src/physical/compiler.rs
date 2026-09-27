@@ -2054,6 +2054,7 @@ impl DeploymentPlanCompiler {
                     .expect("compiled Planner DAG");
                 query_node_bindings.insert((query_index, compiled.dag.root), root);
                 Ok(crate::query_plan::QueryPlanEntry {
+                    physical_dag: None,
                     language: crate::query_plan::QueryLanguage::PromQl,
                     query_id: query.query_id.clone(),
                     canonical_query: canonical.clone(),
@@ -2085,6 +2086,7 @@ impl DeploymentPlanCompiler {
                 // Keep native semantics instead of lowering an unbound summary.
                 let root = crate::query_plan::QueryNodeId(0);
                 Ok(crate::query_plan::QueryPlanEntry {
+                    physical_dag: None,
                     language: crate::query_plan::QueryLanguage::PromQl,
                     query_id: query.query_id.clone(),
                     canonical_query: canonical.clone(),

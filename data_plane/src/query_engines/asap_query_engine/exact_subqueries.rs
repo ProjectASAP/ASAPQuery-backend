@@ -454,6 +454,7 @@ mod tests {
     use asap_types::query_plan::{FallbackPolicy, InstantExecution};
     fn entry(nodes: BTreeMap<QueryNodeId, QueryPlanNode>) -> QueryPlanEntry {
         QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "remote-cut".into(),
             canonical_query: "a / b".into(),

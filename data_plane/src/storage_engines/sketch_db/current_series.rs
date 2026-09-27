@@ -586,6 +586,7 @@ mod tests {
         plan.entries.insert(
             "test".into(),
             QueryPlanEntry {
+                physical_dag: None,
                 language: QueryLanguage::PromQl,
                 query_id: "test".into(),
                 canonical_query: "quantile by (job) (0.5, a)".into(),
