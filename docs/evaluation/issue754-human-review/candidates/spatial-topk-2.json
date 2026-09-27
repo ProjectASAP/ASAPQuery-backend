@@ -6,7 +6,7 @@
     "activation_unix_ms": 10000,
     "expiry_unix_ms": null,
     "backend_compat": "asap-query-backend.v1",
-    "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+    "planner_revision": "a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab",
     "capability_snapshot_id": "asapquery-local-v1"
   },
   "summary_catalog": {
@@ -33,7 +33,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "planner_revision": "a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "ingest": {
@@ -62,7 +62,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "planner_revision": "a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "frame_identity": {
@@ -387,6 +387,232 @@
     },
     "entries": {
       "topk by (label_0) (3, data)": {
+        "physical_dag": {
+          "nodes": {
+            "1": {
+              "Input": {
+                "properties": {
+                  "boundedness": "Bounded",
+                  "emission": "Unknown"
+                },
+                "schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            },
+            "18446744073709551615": {
+              "Operator": {
+                "inputs": [
+                  1
+                ],
+                "operator": {
+                  "inputs": [
+                    {
+                      "fields": [
+                        {
+                          "dtype": {
+                            "Plain": "timestamp"
+                          },
+                          "name": "ts",
+                          "nullable": false
+                        },
+                        {
+                          "dtype": {
+                            "Plain": "float64"
+                          },
+                          "name": "value",
+                          "nullable": false
+                        },
+                        {
+                          "dtype": {
+                            "Plain": "utf8"
+                          },
+                          "name": "label_0",
+                          "nullable": true
+                        },
+                        {
+                          "dtype": {
+                            "Plain": "utf8"
+                          },
+                          "name": "$promql_series_identity",
+                          "nullable": false
+                        }
+                      ],
+                      "time_index": 0
+                    }
+                  ],
+                  "kind": {
+                    "Sort": {
+                      "groups": [
+                        2
+                      ],
+                      "keys": [
+                        {
+                          "column": 1,
+                          "descending": true,
+                          "nulls_first": false
+                        }
+                      ]
+                    }
+                  },
+                  "output": {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                }
+              }
+            },
+            "2": {
+              "Operator": {
+                "inputs": [
+                  18446744073709551615
+                ],
+                "operator": {
+                  "inputs": [
+                    {
+                      "fields": [
+                        {
+                          "dtype": {
+                            "Plain": "timestamp"
+                          },
+                          "name": "ts",
+                          "nullable": false
+                        },
+                        {
+                          "dtype": {
+                            "Plain": "float64"
+                          },
+                          "name": "value",
+                          "nullable": false
+                        },
+                        {
+                          "dtype": {
+                            "Plain": "utf8"
+                          },
+                          "name": "label_0",
+                          "nullable": true
+                        },
+                        {
+                          "dtype": {
+                            "Plain": "utf8"
+                          },
+                          "name": "$promql_series_identity",
+                          "nullable": false
+                        }
+                      ],
+                      "time_index": 0
+                    }
+                  ],
+                  "kind": {
+                    "Limit": {
+                      "groups": [
+                        2
+                      ],
+                      "n": 3,
+                      "offset": 0
+                    }
+                  },
+                  "output": {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                }
+              }
+            }
+          },
+          "roots": [
+            2
+          ],
+          "version": 1
+        },
         "language": "prom_ql",
         "query_id": "compat-query-0",
         "canonical_query": "topk by (label_0) (3, data)",
@@ -414,8 +640,7 @@
                 "quantiles": false
               },
               "readout": {
-                "kind": "top_k",
-                "k": 3
+                "kind": "snapshot"
               }
             },
             "inputs": []
@@ -442,7 +667,7 @@
       "candidate_assembly_rejections": [],
       "committed_roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:b380eb945b2640c6d136a7f15ee66c930b1f748d302b99ae33614ba5b9e68e08",
+          "logical_root_id": "asap-explain-v1:root:8b6b65e3ba94853ad8f5c681cfba1a0d755386474d3c4713179eaf94a2cdd0a4",
           "query_index": 0
         }
       ],
@@ -459,33 +684,33 @@
           "consumer_count": 1,
           "group_id": 0,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:01946213927c1a55fd8a33b377da423dbdf9a68c4f799e9c69ef2d351969ab03"
+          "target_id": "asap-explain-v1:target:d1fb6ce69319906d0ecba39fa10c91521b2578e755241f1fc2df449571b44eb9"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 1,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:a8d89afe8dcb0b4891987e7c7779ea577d8e30480752d29554cfa2c68c6b8daf"
+          "target_id": "asap-explain-v1:target:56c511761421b4738cc8e4889124c0e82ffb4e62403d6f2d68c1e1117f7a7722"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 2,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:895df194bc0a6bd010cf6387dc67324d437eed29d154e49eb9c2c82774fdc797"
+          "target_id": "asap-explain-v1:target:fefd4546492e8b576aa41c6054095794989712b3f4b9a9cebe1bf7c52efadbb0"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 3,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:488bb6ba5af7d7fb5fe373487cd181ea65416a8dfb251ec38ba769be612ae312"
+          "target_id": "asap-explain-v1:target:2ecb546eb3c47bd97637e1d6babf17b12b1f85a2bbe0fc331dc0119d27dfcea9"
         }
       ],
       "roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:b380eb945b2640c6d136a7f15ee66c930b1f748d302b99ae33614ba5b9e68e08",
+          "logical_root_id": "asap-explain-v1:root:8b6b65e3ba94853ad8f5c681cfba1a0d755386474d3c4713179eaf94a2cdd0a4",
           "query_index": 0
         }
       ],
