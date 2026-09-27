@@ -890,18 +890,26 @@ fn enumerate_frontier_candidates(
         // workload roots. Preserve each priced temporal candidate and mask.
         let maintained: Vec<_> = candidates
             .iter()
-            .map(|candidate| {
+            .filter_map(|candidate| {
                 let mut candidate = candidate.clone();
+                let mut changed = false;
                 for (query, selected) in candidate.queries.iter_mut().zip(&maintained_roots) {
                     if let Some(selected) = selected {
-                        query.selected_plan_root = std::rc::Rc::clone(selected);
+                        if !super::maintained_population::supported_node(&query.selected_plan_root)
+                        {
+                            query.selected_plan_root = std::rc::Rc::clone(selected);
+                            changed = true;
+                        }
                     }
+                }
+                if !changed {
+                    return None;
                 }
                 if maintained_roots.iter().all(Option::is_some) {
                     candidate.allow_mixed_summary_and_exact_execution = false;
                     candidate.enabled_materialization_keys = None;
                 }
-                candidate
+                Some(candidate)
             })
             .collect();
         for candidate in maintained {

@@ -1062,7 +1062,7 @@ mod api_tests {
             .cost_comparison
             .as_ref()
             .expect("HTTP must compare automatically priced candidates");
-        assert_eq!(report.model_version, "backend-workload-resources-v1");
+        assert_eq!(report.model_version, "backend-workload-resources-v2");
         assert!(report
             .candidate_evaluations
             .iter()

@@ -237,6 +237,10 @@ pub struct ScopedAccuracyEvidence {
     pub hydra_shared_grid_collision_bound: Option<f64>,
     #[serde(default)]
     pub hydra_shared_grid_failure_probability: Option<f64>,
+    /// Enforced upper bound across all partition/item identities for this query
+    /// snapshot. An observed cardinality estimate is not this contract.
+    #[serde(default)]
+    pub topk_max_distinct_items: Option<u64>,
     #[serde(default)]
     pub topk_selected_lower_bound: Option<f64>,
     #[serde(default)]
@@ -279,6 +283,9 @@ impl ScopedAccuracyEvidence {
             _ => false,
         };
         let valid_stats = valid_topk
+            && self
+                .topk_max_distinct_items
+                .is_none_or(|n| n > 0 && n <= (1_u64 << 53))
             && self
                 .hll
                 .as_ref()
@@ -658,6 +665,10 @@ struct QueryEvidence<'a> {
 }
 
 impl AccuracyEvidenceProvider for QueryEvidence<'_> {
+    fn topk_max_distinct_items(&self, _: &QueryExpr) -> Option<u64> {
+        self.scoped
+            .and_then(|evidence| evidence.topk_max_distinct_items)
+    }
     fn quantile_input_domain(
         &self,
         operand: &QueryExpr,
@@ -950,6 +961,56 @@ impl BackendLocalPlanningInput {
             self.environment.observed_at_unix_ms,
             Some(&mut candidate_roots),
         )?;
+        // Resolve physical row identity before asking Planner for snapshot heap
+        // candidates. Keep canonical query semantics and exact candidates intact.
+        for (index, (query, root)) in queries.iter().zip(&canonical_roots).enumerate() {
+            let Ok(typed) =
+                asap_physical_operators::physical_planner::promql_rows::with_series_identity(root)
+            else {
+                continue;
+            };
+            let evidence = QueryEvidence {
+                topk: topk_evidence_by_id.get(&query.query_id),
+                scoped: scoped_evidence_by_id.get(&query.query_id),
+                now_ms: self.environment.observed_at_unix_ms,
+            };
+            let strategy =
+                asap_aware_mapping::SketchAlgorithmStrategy::new_with_planning_inputs_and_evidence(
+                    &asap_aware_mapping::cost_model::DefaultCostModel,
+                    &asap_aware_mapping::accuracy::DefaultAccuracyModel,
+                    &asap_aware_mapping::accuracy::EqualSplitAllocator,
+                    &evidence,
+                );
+            let proposed =
+                strategy.current_series_topk_candidates(&Rc::new(typed), &query.accuracy_target);
+            for candidate in proposed.candidates {
+                let asap_aware_mapping::Replacement::Summary(root) = candidate.replacement else {
+                    continue;
+                };
+                let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root);
+                match compiled {
+                    Ok(program) => {
+                        planner_selection_trace.push(serde_json::json!({
+                            "stage": "planner.physical_candidate", "query_id": query.query_id,
+                            "logical_root_id": crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
+                            "rationale": candidate.rationale, "physical_dag": serde_json::from_slice::<Value>(&program.encode().map_err(|error| CompileError::Snapshot(error.to_string()))?).map_err(|error| CompileError::Snapshot(error.to_string()))?,
+                            "guarantee": root.guarantee,
+                        }));
+                        candidate_roots.push(vec![(index, root)]);
+                    }
+                    Err(error) => planner_selection_trace.push(serde_json::json!({
+                        "stage": "planner.physical_candidate", "query_id": query.query_id,
+                        "status": "unsupported", "reason": error.to_string(),
+                    })),
+                }
+            }
+            for rejected in proposed.rejected {
+                planner_selection_trace.push(serde_json::json!({
+                    "stage": "planner.physical_candidate", "query_id": query.query_id,
+                    "status": "rejected", "reason": rejected.error.to_string(),
+                }));
+            }
+        }
         for query in &mut queries {
             prepare_window_implementations(
                 query,
@@ -1352,14 +1413,18 @@ impl DeploymentPlanCompiler {
             }
             let node = query.selected_plan_root.clone();
             reject_uncertified_readouts(&query.query_id, &node, environment.target)?;
-            let selected = collect_selected_materializations(
-                &node,
-                request.allow_mixed_summary_and_exact_execution,
-            )
-            .map_err(|reason| CompileError::Query {
-                query_id: query.query_id.clone(),
-                reason,
-            })?;
+            let selected = if super::maintained_population::supported_node(&node) {
+                Vec::new()
+            } else {
+                collect_selected_materializations(
+                    &node,
+                    request.allow_mixed_summary_and_exact_execution,
+                )
+                .map_err(|reason| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                })?
+            };
             if !selected.is_empty() {
                 reject_uncertified_readouts(&query.query_id, &node, environment.target)?;
             }
@@ -5484,6 +5549,7 @@ pub(crate) mod tests {
             input_row_count: Some(10),
             hydra_shared_grid_collision_bound: None,
             hydra_shared_grid_failure_probability: None,
+            topk_max_distinct_items: None,
             topk_selected_lower_bound: None,
             topk_excluded_upper_bound: None,
             topk_interval_failure_probability: None,
@@ -5574,6 +5640,7 @@ pub(crate) mod tests {
             input_row_count: None,
             hydra_shared_grid_collision_bound: None,
             hydra_shared_grid_failure_probability: None,
+            topk_max_distinct_items: None,
             topk_selected_lower_bound: None,
             topk_excluded_upper_bound: None,
             topk_interval_failure_probability: None,

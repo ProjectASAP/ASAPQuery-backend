@@ -56,9 +56,8 @@ an explicitly planned physical operation.
 
 The storage integration test covers durable per-series sums, native quantile
 state construction, publication, bound readout and restart of both the store and
-resolver. Automatic PromQL physical-candidate installation, Rate-to-heap storage
-execution and spatial latest-value heap execution remain pending. This test does
-not establish those paths.
+resolver. The full PromQL physical-candidate handoff and Rate-to-heap storage
+execution remain pending. This storage test does not establish those paths.
 
 Bound frozen reads resolve the stored-output/group prefix through the persistent
 series resolver. Each cached part builds a sorted output/window index once on
@@ -72,7 +71,16 @@ all eligible members through a snapshot binding. Planner compiles the ranking
 above that boundary; the QueryPlan persists that physical program before
 candidate pricing and activation. Serving recovers its operators and supplies
 full-label native rows without parsing or lowering the query. Automatic cost
-estimates include sorting CPU and temporary workspace; provider quote manifests
-include the physical program itself. Other population readouts retain their
-existing paths. This path does not imply that spatial heap candidates or buffered
-Rate-to-heap persistence are deployed yet.
+estimates include native operator CPU and temporary workspace; provider quote
+manifests include the physical program itself. Other population readouts retain
+their existing paths.
+
+Planner also exposes a CountSketch-with-heap candidate over that same snapshot.
+Backend requires scoped membership/score evidence, including the enforced
+`topk_max_distinct_items` bound, before installation. Source cardinality estimates
+do not supply that accuracy bound. Signed sample values cannot authorize CMS.
+Backend compares the complete physical programs; it does not replace the selected
+heap with Sort/Limit. The heap is rebuilt for each evaluation, so decreases,
+staleness and expiry do not accumulate historical weights. Automated real-process
+Remote Write/HTTP coverage verifies these changes with no exact-backend fallback.
+This is a query-time heap candidate; buffered Rate-to-heap persistence is separate.
