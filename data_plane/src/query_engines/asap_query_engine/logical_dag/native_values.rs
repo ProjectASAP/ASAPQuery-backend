@@ -131,8 +131,9 @@ pub(super) fn semi_join(
 }
 
 #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
-    fields(stage = "physical.execute", query_id = %entry.query_id, evaluation_time_ms = at, input_kind = "current_series_snapshot"), err)]
-pub(super) fn execute_population<F>(
+    fields(stage = "physical.execute", query_id = %entry.query_id, evaluation_time_ms = at,
+        input_kind = "bound_promql_vector", bound_counter_state = entry.physical_vector_binding().is_some()), err)]
+pub(super) fn execute_vectors<F>(
     entry: &asap_types::query_plan::QueryPlanEntry,
     at: u64,
     mut callback: F,
@@ -159,30 +160,59 @@ where
     };
     use futures::{executor::block_on, StreamExt};
     use std::collections::BTreeMap;
-    let program = entry
-        .recover_population_physical_dag()
-        .map_err(|error| miss(error.to_string()))?;
-    let (input_id, input) = program.input_contracts().next().unwrap();
+    let (program, bindings, max_bytes) =
+        if let Some((inputs, source_nodes, budget)) = entry.physical_vector_binding() {
+            (
+                entry
+                    .recover_vector_physical_dag()
+                    .map_err(|e| miss(e.to_string()))?,
+                source_nodes
+                    .iter()
+                    .copied()
+                    .zip(inputs.iter().copied())
+                    .collect::<BTreeMap<_, _>>(),
+                budget,
+            )
+        } else {
+            let program = entry
+                .recover_population_physical_dag()
+                .map_err(|e| miss(e.to_string()))?;
+            let source = program.input_contracts().next().unwrap().0;
+            (
+                program,
+                BTreeMap::from([(source, entry.root)]),
+                entry.population_snapshot().unwrap().max_bytes,
+            )
+        };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
-    let values = super::vector(super::from_result(callback(entry.root, at)?)?)?;
-    let rows = values
-        .into_iter()
-        .map(|(labels, value)| {
-            series_row(&input.schema, &labels, at_signed, value)
-                .map_err(|error| miss(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let batch =
-        Batch::try_new(input.schema.clone(), rows).map_err(|error| miss(error.to_string()))?;
-    let source = Operator::source(input.schema.clone(), vec![batch])
-        .map_err(|error| miss(error.to_string()))?;
+    let mut sources = BTreeMap::new();
+    let mut input_bytes = 0usize;
+    for (input_id, input) in program.input_contracts() {
+        let values = super::vector(super::from_result(callback(bindings[&input_id], at)?)?)?;
+        let rows = values
+            .into_iter()
+            .map(|(labels, value)| {
+                series_row(&input.schema, &labels, at_signed, value)
+                    .map_err(|e| miss(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch = Batch::try_new(input.schema.clone(), rows).map_err(|e| miss(e.to_string()))?;
+        input_bytes = input_bytes
+            .checked_add(batch.bytes())
+            .ok_or_else(|| miss("physical input size overflow"))?;
+        if input_bytes > max_bytes as usize {
+            return Err(miss("physical input exceeds run budget"));
+        }
+        let source =
+            Operator::source(input.schema.clone(), vec![batch]).map_err(|e| miss(e.to_string()))?;
+        sources.insert(input_id, Box::new(source) as Source<'_>);
+    }
     let graph = {
         let _binding = tracing::debug_span!(target: "asap_runtime_debug", "physical_input_binding",
-            stage = "physical.bind_inputs", input_count = 1, input_kind = "current_series_snapshot")
-        .entered();
+            stage = "physical.bind_inputs", input_count = sources.len(), input_bytes, input_kind = "bound_promql_vector").entered();
         program
-            .instantiate(BTreeMap::from([(input_id, Box::new(source) as Source<'_>)]))
-            .map_err(|error| miss(error.to_string()))?
+            .instantiate(sources)
+            .map_err(|e| miss(e.to_string()))?
     };
     let context = dag::RunContext::new(
         dag::Scope::Query {
@@ -190,7 +220,7 @@ where
             revision: 0,
         },
         dag::Limits {
-            max_bytes: entry.population_snapshot().unwrap().max_bytes as usize,
+            max_bytes: max_bytes as usize,
             ..dag::Limits::default()
         },
     )
@@ -236,7 +266,7 @@ where
     Ok((
         QueryResult::vector(values, at),
         super::ExecutionStats {
-            summary_readout_evaluations: 1,
+            summary_readout_evaluations: bindings.len(),
             ..Default::default()
         },
     ))

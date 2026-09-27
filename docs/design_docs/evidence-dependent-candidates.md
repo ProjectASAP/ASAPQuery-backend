@@ -325,3 +325,10 @@ workload cardinality is insufficient. Missing evidence leaves the candidate
 visible but ineligible for installation. Cost model v2 prices the installed
 native operators and transient heap workspace. A complete provider quote can
 choose either candidate; neither is forced by operator name.
+
+Rate TopK follows the same admission and pricing boundary. Nonnegative finalized
+counter rates admit CMS as well as CountSketch when the scoped accuracy evidence
+is sufficient. Exact ranking remains available. The installed physical program
+consumes the complete per-series Rate vector from bound counter SDS; Backend
+quotes can select any of the three programs, and automatic costs charge the
+actual native workspace. Operator support alone does not supply accuracy proof.

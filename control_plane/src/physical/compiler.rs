@@ -981,16 +981,24 @@ impl BackendLocalPlanningInput {
                     &asap_aware_mapping::accuracy::EqualSplitAllocator,
                     &evidence,
                 );
-            let proposed =
-                strategy.current_series_topk_candidates(&Rc::new(typed), &query.accuracy_target);
+            let typed = Rc::new(typed);
+            let mut proposed =
+                strategy.current_series_topk_candidates(&typed, &query.accuracy_target);
+            let direct = asap_aware_mapping::ReplacementStrategy::propose(
+                &strategy,
+                &asap_aware_mapping::TargetSubDAG::new(&typed),
+            );
+            proposed.candidates.extend(direct.candidates);
+            proposed.rejected.extend(direct.rejected);
             for candidate in proposed.candidates {
                 let asap_aware_mapping::Replacement::Summary(root) = candidate.replacement else {
                     continue;
                 };
                 let _physical = tracing::debug_span!(target: "asap_runtime_debug", "physical_candidate_compile",
                     stage = "planner.physical_candidate", query_id = %query.query_id,
-                    input_kind = "current_series_snapshot").entered();
-                let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root);
+                    input_kind = "bound_promql_vector").entered();
+                let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
+                    .or_else(|_| asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(&root).map(|(_, program)| program));
                 match compiled {
                     Ok(program) => {
                         planner_selection_trace.push(serde_json::json!({
@@ -2113,8 +2121,65 @@ impl DeploymentPlanCompiler {
                 } else {
                     false
                 };
-            let mut entry = if let Some(operator) =
-                super::maintained_population::operator(&request, query)?
+            let native_rate =
+                asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(
+                    &query.selected_plan_root,
+                )
+                .ok();
+            let mut entry = if let Some((source, program)) = native_rate {
+                let mut entry = crate::query_plan::compile_bound_composable_mapped(
+                    query.query_id.clone(),
+                    canonical.clone(),
+                    &source,
+                    instant,
+                    FallbackPolicy::ExactBackend,
+                    binding,
+                    |node, query_node| {
+                        if let Some(id) = executable_dags[query_index]
+                            .as_ref()
+                            .and_then(|compiled| compiled.node_ids.node_id(node))
+                        {
+                            query_node_bindings.insert((query_index, id), query_node);
+                        }
+                    },
+                )?;
+                let root = crate::query_plan::QueryNodeId(
+                    entry.nodes.keys().map(|id| id.0).max().unwrap_or(0) + 1,
+                );
+                let sources = program
+                    .input_contracts()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>();
+                if sources.len() != 1 {
+                    return Err(CompileError::Snapshot(
+                        "Rate physical candidate requires one source binding".into(),
+                    ));
+                }
+                entry.nodes.insert(
+                    root,
+                    crate::query_plan::QueryPlanNode::Physical {
+                        inputs: vec![entry.root],
+                        source_nodes: sources,
+                        max_bytes: request
+                            .retained_summary_memory_budget_bytes
+                            .unwrap_or(64 * 1024 * 1024),
+                    },
+                );
+                entry.root = root;
+                entry.physical_dag = Some(
+                    serde_json::from_slice(
+                        &program
+                            .encode()
+                            .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                    )
+                    .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                );
+                entry.recover_vector_physical_dag()?;
+                if let Some(compiled) = &executable_dags[query_index] {
+                    query_node_bindings.insert((query_index, compiled.dag.root), root);
+                }
+                Ok(entry)
+            } else if let Some(operator) = super::maintained_population::operator(&request, query)?
             {
                 let root = crate::query_plan::QueryNodeId(0);
                 let compiled = executable_dags[query_index]
@@ -4229,7 +4294,17 @@ fn collect_selected_materializations(
     }
 
     let mut selected = Vec::new();
-    walk(node, None, composable, None, &mut selected)?;
+    let physical_source =
+        asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(node)
+            .ok()
+            .map(|(source, _)| source);
+    walk(
+        physical_source.as_ref().unwrap_or(node),
+        None,
+        composable,
+        None,
+        &mut selected,
+    )?;
     if composable {
         selected
             .retain(|state| !has_unsafe_raw_entity_leaf(node, &[Rc::clone(&state.node)], false));
