@@ -71,6 +71,8 @@ impl RelationDagExecutor<'_> {
     #[cfg(not(test))]
     fn record_evaluation(&mut self, _id: QueryNodeId) {}
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "physical.execute", query_id = %self.entry.query_id, root = root.0), err)]
     fn execute_graph(
         &mut self,
         root: QueryNodeId,
@@ -156,9 +158,15 @@ impl RelationDagExecutor<'_> {
                 ) as asap_physical_operators::physical_planner::Source<'_>,
             );
         }
-        let graph = compiled
-            .instantiate(resolved_inputs)
-            .map_err(|e| e.to_string())?;
+        let graph = {
+            let _binding =
+                tracing::debug_span!(target: "asap_runtime_debug", "physical_input_binding",
+                stage = "physical.bind_inputs", input_count = resolved_inputs.len())
+                .entered();
+            compiled
+                .instantiate(resolved_inputs)
+                .map_err(|e| e.to_string())?
+        };
         let mut output = graph
             .execute(&[root.0], context)
             .map_err(|e| e.to_string())?

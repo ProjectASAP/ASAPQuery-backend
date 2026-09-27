@@ -69,3 +69,17 @@ query-time Sum and an exact fallback; it does not export a precomputed grouped
 Rate-result candidate. The selected plan therefore cannot establish that query-time
 Sum beats that absent alternative. Search coverage is scoped to the declared
 inventory, never a claim of exhaustive physical optimization.
+
+### Installed SQL physical DAG stages
+
+SQL plans compile native operators before installation (`physical.compile_install`).
+Activation and serving validate the persisted program (`physical.recover_validate`);
+this stage decodes physical operators and does not lower logical expressions.
+`physical.bind_inputs` attaches the resolved external/SDS batches, and
+`physical.execute` covers the request's physical execution path. These debug spans
+include the query identity, root or input count, and errors without logging batches
+or sketch payloads. They use the existing `asap_runtime_debug` target.
+
+These stages describe the installed SQL path. They do not establish that the
+remaining PromQL candidate-selection and maintenance paths have migrated to the
+same physical handoff.
