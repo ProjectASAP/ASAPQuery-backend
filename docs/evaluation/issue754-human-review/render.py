@@ -111,16 +111,30 @@ for path in sorted(BASE.glob('*.json')):
               'Costs below come from the controlled Level 1 fixture, not production measurements.', '']
     traces = report.get('logical_selection', [])
     for trace in traces:
+        if trace.get('stage') == 'planner.physical_candidate':
+            lines += ['### Planner physical candidate', '',
+                      f"Logical root: {cell(trace.get('logical_root_id'))}.", '',
+                      trace.get('rationale', '').replace('alternatives', 'candidates'), '',
+                      'Guarantee: ' + cell(trace.get('guarantee')), '']
+            program = trace.get('physical_dag')
+            if program:
+                lines += ['| Node | Dependencies | Native operator / input |', '| --- | --- | --- |']
+                for node_id, node in program['nodes'].items():
+                    op = node.get('Operator')
+                    lines.append(f"| {node_id} | {cell(op['inputs'] if op else [])} | {cell(op['operator']['kind'] if op else {'Input': node['Input']})} |")
+                lines += ['', f"Roots: {cell(program['roots'])}.", '']
+            if trace.get('reason'):
+                lines += [trace['reason'], '']
         if trace.get('computation_search_scope'):
             lines += [block(trace['computation_search_scope'])]
         for group in trace.get('groups', []):
             for rejected in group.get('rejected', []):
                 description = rejected.get('description', '').split(' — ', 1)[0]
                 lines += [f"- {description}: {rejected.get('reason', '')}"]
-    lines += ['', '| Candidate | Status | Fixture cost | Rejection / unavailable reason |',
-              '| --- | --- | --- | --- |']
+    lines += ['', '| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |',
+              '| --- | --- | --- | --- | --- |']
     for index, candidate in enumerate(report.get('candidates', [])):
-        lines.append(f"| {index} | {cell(candidate.get('status'))} | {cell(candidate.get('total_cost'))} | {cell(candidate.get('unavailable_reason'))} |")
+        lines.append(f"| {index} | {cell(candidate.get('logical_root_ids'))} | {cell(candidate.get('status'))} | {cell(candidate.get('total_cost'))} | {cell(candidate.get('unavailable_reason'))} |")
     exported = sorted((BASE / 'candidates').glob(path.stem + '-*.json'))
     if exported:
         lines += ['', 'Successfully compiled candidate plans: ' + ', '.join(
@@ -155,9 +169,15 @@ These exports describe the current Backend implementation. They do **not** prove
 completion of the Planner physical-candidate installation/execution handoff.
 Logical provenance and installed native physical programs are shown separately.
 Spatial TopK binds a complete current-series snapshot and runs a persisted native
-Sort → Limit program. This is the exact ranking candidate; spatial CMS/CountSketch
-heap deployment and Rate → heap storage E2E remain outstanding. Other PromQL
-paths still use the documented Backend adapter representation.
+Sort → Limit program. Planner also exposes a CountSketch-with-heap physical
+candidate over the same snapshot. This fixture has no enforced distinct-item
+bound or score-separation proof, so its heap candidate is explicitly rejected
+before pricing. The inherited `native_snapshot_topk` tests cover certified heap
+admission, cost-dependent selection and analytical workspace costing; a separate
+real-process test covers Remote Write and heap HTTP results. Signed samples do
+not authorize CMS. Rate → heap storage E2E and the complete physical-candidate
+handoff remain outstanding. Other PromQL paths still use the documented Backend
+adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
 currently evaluates single-root substitutions in a preferred workload context;
