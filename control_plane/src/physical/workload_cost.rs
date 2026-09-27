@@ -489,7 +489,7 @@ fn candidate_description(candidate: &PhysicalCompilationRequest) -> CandidatePla
     CandidatePlanEvaluation {
         candidate_id: complete.then(|| {
             crate::planner_selection::explain_identity(
-                "alternative",
+                "candidate",
                 &(
                     &logical_root_ids,
                     candidate.allow_mixed_summary_and_exact_execution,
@@ -522,6 +522,19 @@ fn compile_candidate_for_pricing(
     Box<CandidatePlanEvaluation>,
 > {
     let mut description = candidate_description(&candidate);
+    if let Some(policy) = &candidate.erp {
+        if candidate.queries.iter().any(|query| {
+            super::compiler::requires_exact_erp_fallback(
+                &query.selected_plan_root,
+                &query.accuracy_target,
+                policy,
+            )
+        }) {
+            description.unavailable_reason =
+                Some("candidate does not satisfy ERP accuracy admission".into());
+            return Err(Box::new(description));
+        }
+    }
     let queries = candidate.queries.clone();
     let compiled = super::realization::RealizationProvider::compile(
         &super::realization::ExistingRealizations,
@@ -644,9 +657,9 @@ pub fn select_candidates(
     if let Some(evidence) = evidence {
         evidence.validate(&env)?;
     }
-    if candidates.is_empty() || candidates.len() > 64 {
+    if candidates.is_empty() || candidates.len() > 4096 {
         return Err(invalid(
-            "candidate inventory must contain 1..=64 candidates",
+            "candidate inventory must contain 1..=4096 candidates",
         ));
     }
     let candidate_key_sets: BTreeSet<_> = candidates
@@ -788,17 +801,55 @@ pub fn select_candidates(
 /// The current executor exposes continuously maintained state and the native
 /// exact backend. Additional Planner-produced forests can use `select_lowest_cost_candidate` directly.
 pub fn enumerate_exact_and_materialized_candidates(
-    request: PhysicalCompilationRequest,
+    mut request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
+    let forests = std::mem::take(&mut request.planner_candidate_forests);
+    if forests.is_empty() {
+        return enumerate_frontier_candidates(request);
+    }
+    // Keep the existing deterministic ordering for equal-cost candidates;
+    // every discovered forest still reaches deployment admission and pricing.
+    let mut candidates: Vec<PhysicalCompilationRequest> = Vec::new();
+    for forest in std::iter::once(request.queries.clone()).chain(forests) {
+        let mut candidate = request.clone();
+        candidate.queries = forest;
+        for candidate in enumerate_frontier_candidates(candidate)? {
+            if !candidates.iter().any(|existing| {
+                existing.allow_mixed_summary_and_exact_execution
+                    == candidate.allow_mixed_summary_and_exact_execution
+                    && existing.enabled_materialization_keys
+                        == candidate.enabled_materialization_keys
+                    && existing
+                        .queries
+                        .iter()
+                        .zip(&candidate.queries)
+                        .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
+            }) {
+                candidates.push(candidate);
+            }
+            if candidates.len() > 4096 {
+                return Err(invalid(
+                    "deployment candidate inventory exceeds budget; no partial inventory selected",
+                ));
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn enumerate_frontier_candidates(
+    mut request: PhysicalCompilationRequest,
+) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
+    request.planner_candidate_forests.clear();
     let mut candidates = materialization_candidates(request)?;
     let roots: Vec<_> = candidates
         .last()
-        .expect("exact alternative")
+        .expect("exact candidate")
         .queries
         .iter()
         .map(|q| match &q.selected_plan_root.expr {
             planner_types::post_asap::SummaryExpr::KeepPreAsap(root) => std::rc::Rc::clone(root),
-            _ => unreachable!("native alternative retains canonical roots"),
+            _ => unreachable!("native candidate retains canonical roots"),
         })
         .collect();
     let strategy =
@@ -813,11 +864,11 @@ pub fn enumerate_exact_and_materialized_candidates(
         .collect();
     if maintained_roots.iter().any(Option::is_some) {
         // Current-series rules are compatible with window summaries in other
-        // workload roots. Preserve each priced temporal alternative and mask.
+        // workload roots. Preserve each priced temporal candidate and mask.
         let maintained: Vec<_> = candidates
             .iter()
-            .map(|alternative| {
-                let mut candidate = alternative.clone();
+            .map(|candidate| {
+                let mut candidate = candidate.clone();
                 for (query, selected) in candidate.queries.iter_mut().zip(&maintained_roots) {
                     if let Some(selected) = selected {
                         query.selected_plan_root = std::rc::Rc::clone(selected);
@@ -889,7 +940,7 @@ fn materialization_candidates(
                 &query.selected_plan_root,
             ) {
                 Ok(found) => keys.extend(found),
-                // A failed local projection must not make the native alternative
+                // A failed local projection must not make the native candidate
                 // disappear. Compile/select_lowest_cost_candidate retains its concrete unavailability.
                 Err(_) => return Ok(vec![request, exact]),
             }
@@ -920,6 +971,34 @@ fn materialization_candidates(
 mod tests {
     use super::super::compiler::BackendLocalPlanningInput;
     use super::*;
+
+    /// Deployment pricing must see candidate sketch families, not only an
+    /// upstream winner chosen before runtime resource evidence is applied.
+    #[test]
+    fn planner_quantile_inventory_reaches_backend_before_family_selection() {
+        let mut input = fixture();
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        queries.truncate(1);
+        queries[0].query = planner_types::workload::Query("quantile_over_time(0.9,m[1m])".into());
+        queries[0].requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
+            crate::types::AccuracyTarget::Epsilon(0.05),
+        );
+        let (request, _) = input.into_physical_compilation_request().unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let roots = candidates
+            .iter()
+            .flat_map(|c| &c.queries)
+            .map(|q| format!("{:?}", q.selected_plan_root))
+            .collect::<Vec<_>>();
+        assert!(
+            roots.iter().any(|r| r.contains("Kll")),
+            "KLL disappeared before backend pricing"
+        );
+        assert!(
+            roots.iter().any(|r| r.contains("DDSketch")),
+            "DDSketch disappeared before backend pricing"
+        );
+    }
 
     /// A deployment without external execution rejects native candidates before pricing.
     #[test]
@@ -1256,7 +1335,7 @@ mod tests {
         let (mut request, env) = fixture().into_physical_compilation_request().unwrap();
         request.allow_mixed_summary_and_exact_execution = false;
         request.queries[0].window_realization_candidates.clear();
-        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let candidates = enumerate_frontier_candidates(request).unwrap();
         let (manifests, explanations) = compile_candidates_for_pricing(
             candidates,
             env,
@@ -1382,7 +1461,7 @@ mod tests {
             crate::types::AccuracyTarget::Exact,
         );
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let candidates = enumerate_frontier_candidates(request).unwrap();
         assert_eq!(
             candidates.len(),
             5,
@@ -1446,7 +1525,7 @@ mod tests {
         WorkloadCostEvidence,
     ) {
         let (request, env) = fixture().into_physical_compilation_request().unwrap();
-        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let candidates = enumerate_frontier_candidates(request).unwrap();
         let quotes = candidates
             .iter()
             .map(|candidate| {
@@ -1480,7 +1559,7 @@ mod tests {
 
     // Retained local input is priced once per metric, separate from the native service.
     #[test]
-    fn counter_materialization_manifest_prices_owned_state_and_distinct_native_alternative() {
+    fn counter_materialization_manifest_prices_owned_state_and_distinct_native_candidate() {
         use planner_types::workload::{AccuracyRequirement, Query};
         let mut snapshot = fixture();
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
@@ -1535,19 +1614,14 @@ mod tests {
             ),
             ("sum_over_time(m[1m]) + count_over_time(m[1m])", vec!["m"]),
         ] {
-            let (mut request, env) = fixture().into_physical_compilation_request().unwrap();
-            request.queries[0].query_string = query.into();
-            request
-                .query_workload
-                .as_mut()
-                .unwrap()
-                .repeating_queries
-                .as_mut()
-                .unwrap()[0]
-                .query = planner_types::workload::Query(query.into());
+            let mut input = fixture();
+            input.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+                planner_types::workload::Query(query.into());
+            let (request, env) = input.into_physical_compilation_request().unwrap();
             let exact = enumerate_exact_and_materialized_candidates(request)
                 .unwrap()
-                .pop()
+                .into_iter()
+                .find(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
                 .unwrap();
             let plan = DeploymentPlanCompiler
                 .compile_promql(exact.clone(), env.clone())
@@ -1663,7 +1737,9 @@ mod tests {
         assert!(plan.cost_comparison.unwrap().candidate_evaluations[0]
             .unavailable_reason
             .is_some());
-        evidence.quotes[1].executable = false;
+        for quote in &mut evidence.quotes[1..] {
+            quote.executable = false;
+        }
         assert!(select_lowest_cost_candidate(candidates.clone(), env.clone(), &evidence).is_err());
         let (_, _, mut evidence) = quoted();
         evidence
@@ -1764,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_alternative_does_not_require_unused_state_implementation_evidence() {
+    fn exact_candidate_does_not_require_unused_state_implementation_evidence() {
         let (candidates, env, evidence) = quoted();
         let mut exact = candidates[1].clone();
         assert_eq!(
