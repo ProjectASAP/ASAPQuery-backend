@@ -53,9 +53,9 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:3940fdbb710d2157fa1442d60a27e84ed9ea6ac3468bf9b4632b5a86bffec77b"]` | `"selected"` | `155.0` | `null` |
-| 1 | `["asap-explain-v1:root:23c3df7787dc24dff3251071956d7d703b06c8e7291d420679fdbc7045aa4b8e"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:ddd37e37de447338654e5b71ea256bbf69beda84ae8734a7f9650d801eade1f6"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 0 | `["asap-explain-v1:root:c97a9ef7b7b6351ef7fa1fe69a02f0763f34cd401324455c7dc2fa56ac4b56ab"]` | `"selected"` | `155.0` | `null` |
+| 1 | `["asap-explain-v1:root:f122297d88d6220bee67ca1f56a1f559ce1c2149a3e304ac8b3f86b4c9e54efb"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:4d0e6951ae09283c4de99b5818cd2c54e4924dd51371863645c52b82e1fca0ce"]` | `"unselected"` | `61000000000000.0` | `null` |
 
 Successfully compiled candidate plans: [quantile-ratio-0](candidates/quantile-ratio-0.json), [quantile-ratio-1](candidates/quantile-ratio-1.json), [quantile-ratio-2](candidates/quantile-ratio-2.json)
 

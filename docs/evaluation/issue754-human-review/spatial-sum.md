@@ -38,13 +38,23 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 }
 ```
 
+### Planner physical candidate
+
+Logical root: `null`.
+
+
+
+Guarantee: `null`
+
+invalid DAG: ranking requires one exact per-series Rate frontier
+
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:ccbffb2261b46356131f600b3f9c77e7458b8f7948eb57d7f8b342b7c2e55313"]` | `"selected"` | `95.0` | `null` |
-| 1 | `["asap-explain-v1:root:2935fd3a75baedb0549fea7dbe3d3933f76142da47a4a293caf2558aab6f4a62"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:dcda374abb5ab2069d67f417b0d637df071f8df1a82813b3be18a768cef1e16f"]` | `"unselected"` | `130.0` | `null` |
-| 3 | `["asap-explain-v1:root:e482255fa6fa4b7a0fa48d597024c21bf0cf8e1978d5b27ff868cec7c501b9fe"]` | `"unselected"` | `122.0` | `null` |
+| 0 | `["asap-explain-v1:root:54edb93d464e00fe2e30abffd525ee0d4e0da1d2944aca77eec0b23a8d78f7f4"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:859b668e3bad84483effc1c9f32cafbd0074f48e50342f4e67fceed1e056a697"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:adc370740d34eba03a9c193b88fd4e29d5a3d8104091cce1117c6b6da2548a9f"]` | `"unselected"` | `130.0` | `null` |
+| 3 | `["asap-explain-v1:root:db97ab23dd9487d0687eeab40856861788fe2feb9601644dbe5feee0520b5c6c"]` | `"unselected"` | `122.0` | `null` |
 
 Successfully compiled candidate plans: [spatial-sum-0](candidates/spatial-sum-0.json), [spatial-sum-1](candidates/spatial-sum-1.json), [spatial-sum-2](candidates/spatial-sum-2.json), [spatial-sum-3](candidates/spatial-sum-3.json)
 

@@ -6,7 +6,7 @@
     "activation_unix_ms": 10000,
     "expiry_unix_ms": null,
     "backend_compat": "asap-query-backend.v1",
-    "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
+    "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
     "capability_snapshot_id": "asapquery-local-v1"
   },
   "summary_catalog": {
@@ -33,7 +33,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
+      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "ingest": {
@@ -62,7 +62,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
+      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "frame_identity": {
@@ -667,7 +667,7 @@
       "candidate_assembly_rejections": [],
       "committed_roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:27192fc14e82a405f0e491940c71fd77abd52d45f84229c51f61fd7bc58c92b7",
+          "logical_root_id": "asap-explain-v1:root:54d39c0b1ca8f4666729a2ee4bd473828d883206bc76edc27b57daf451be36e9",
           "query_index": 0
         }
       ],
@@ -684,33 +684,33 @@
           "consumer_count": 1,
           "group_id": 0,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:e96817ed3871f552485654a7536072e33469cded139f3eb315e1fc810a2a32a5"
+          "target_id": "asap-explain-v1:target:c98cc10556fd3a38a69cf29d4f0772b4bb01a34877b424944001303d5472c88c"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 1,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:e31b1e546f1cc1df9f5b174d6d5b4603ff6a014a718a188cfeec0e522ec48fa0"
+          "target_id": "asap-explain-v1:target:9364f80f868bc0d57b2ff28b75d0dd8faefad031e8c0aa4edf4de7dcc3be3e81"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 2,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:0952698ef2cd28778e80ac197b051a4042a8ea6f1a85205a36168c71ae7925dd"
+          "target_id": "asap-explain-v1:target:76fb60732b238d7aeef0db007ca42d1b0da0d168fbed33e21c862df28e6e8743"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 3,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:b4bb9f59761cfee4a65d231ca69c105189a9272accda0075e480cc45b1ad77b5"
+          "target_id": "asap-explain-v1:target:65d5f761dcf95671dffb45e7742a12eef3531e6f3d03e4e0d8c07a7612f09525"
         }
       ],
       "roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:27192fc14e82a405f0e491940c71fd77abd52d45f84229c51f61fd7bc58c92b7",
+          "logical_root_id": "asap-explain-v1:root:54d39c0b1ca8f4666729a2ee4bd473828d883206bc76edc27b57daf451be36e9",
           "query_index": 0
         }
       ],
@@ -813,7 +813,7 @@
           }
         ]
       },
-      "logical_root_id": "asap-explain-v1:root:05416c5491e4dda45929f873ae0664ba6c10b4bb9ab4da4924162a758bd29b43",
+      "logical_root_id": "asap-explain-v1:root:4787547f619c2df86e3374054965b3ad497d25e53cb42dad069dd51fce5fafea",
       "physical_dag": {
         "nodes": {
           "1": {

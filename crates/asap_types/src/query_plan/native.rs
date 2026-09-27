@@ -326,6 +326,117 @@ impl QueryPlanEntry {
     }
 }
 
+impl QueryPlanEntry {
+    pub fn physical_vector_binding(&self) -> Option<(&[QueryNodeId], &[u64], u64)> {
+        match self.nodes.get(&self.root) {
+            Some(QueryPlanNode::Physical {
+                inputs,
+                source_nodes,
+                max_bytes,
+            }) => Some((inputs, source_nodes, *max_bytes)),
+            _ => None,
+        }
+    }
+
+    /// The initial stored-vector adapter binds exact per-series counter reads.
+    /// Recovery validates source identities and schemas without logical lowering.
+    pub fn recover_vector_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
+        let invalid = |message: &str| QueryPlanError::Invalid(message.into());
+        let (inputs, source_nodes, max_bytes) = self
+            .physical_vector_binding()
+            .ok_or_else(|| invalid("missing physical vector binding"))?;
+        if max_bytes == 0
+            || usize::try_from(max_bytes).is_err()
+            || inputs.is_empty()
+            || inputs.len() != source_nodes.len()
+            || source_nodes.iter().copied().collect::<BTreeSet<_>>().len() != source_nodes.len()
+        {
+            return Err(invalid("invalid physical vector source mapping or budget"));
+        }
+        for input in inputs {
+            let Some(QueryPlanNode::ExactReadout {
+                input: state,
+                readout: ExactReadout::Rate,
+            }) = self.nodes.get(input)
+            else {
+                return Err(invalid(
+                    "physical vector requires an exact per-series Rate readout",
+                ));
+            };
+            let Some(QueryPlanNode::ReadMaterialization { binding }) = self.nodes.get(state) else {
+                return Err(invalid(
+                    "physical Rate input requires its installed stored output",
+                ));
+            };
+            if binding
+                .readout_lookback_ms
+                .is_none_or(|window| window == 0 || window != self.instant.lookback_ms)
+                || !matches!(&binding.output_grouping, PhysicalGrouping::PerEntity)
+            {
+                return Err(invalid(
+                    "physical Rate input must preserve every series and its window",
+                ));
+            }
+        }
+        let value = self
+            .physical_dag
+            .as_ref()
+            .ok_or_else(|| invalid("missing installed vector physical DAG"))?;
+        let dag = CompiledPhysicalDag::decode(
+            &serde_json::to_vec(value).map_err(|e| QueryPlanError::Invalid(e.to_string()))?,
+        )
+        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+        if dag
+            .input_contracts()
+            .map(|(id, _)| id)
+            .collect::<BTreeSet<_>>()
+            != source_nodes.iter().copied().collect()
+            || dag.roots().len() != 1
+        {
+            return Err(invalid(
+                "physical vector program differs from installed source mapping",
+            ));
+        }
+        use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+        let vector_schema = |schema: &SummarySchema| {
+            [
+                (
+                    asap_physical_operators::physical_planner::promql_rows::SERIES_IDENTITY_COLUMN,
+                    DataType::Utf8,
+                ),
+                ("value", DataType::Float64),
+            ]
+            .into_iter()
+            .all(|(name, dtype)| {
+                schema.fields.iter().any(|f| {
+                    f.name == name
+                        && f.dtype == SummaryFamilyType::Plain(dtype.clone())
+                        && !f.nullable
+                })
+            }) && schema.time_index.is_some_and(|i| {
+                schema
+                    .fields
+                    .get(i)
+                    .is_some_and(|f| f.dtype == SummaryFamilyType::Plain(DataType::Timestamp))
+            })
+        };
+        if dag
+            .input_contracts()
+            .any(|(_, input)| !vector_schema(&input.schema))
+            || !vector_schema(
+                &dag.output_contract(dag.roots()[0])
+                    .map_err(|e| QueryPlanError::Invalid(e.to_string()))?
+                    .schema,
+            )
+        {
+            return Err(invalid(
+                "physical vector program loses complete identity, timestamp or value",
+            ));
+        }
+        Ok(dag)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
