@@ -67,7 +67,7 @@ A missing candidate is not evidence that its placement costs more. For example,
 the retained #728 grouped-rate fixture exports per-series Rate state plus
 query-time Sum and an exact fallback; it does not export a precomputed grouped
 Rate-result candidate. The selected plan therefore cannot establish that query-time
-Sum beats that absent alternative. Search coverage is scoped to the declared
+Sum beats that absent candidate. Search coverage is scoped to the declared
 inventory, never a claim of exhaustive physical optimization.
 
 ### Installed SQL physical DAG stages
@@ -83,3 +83,15 @@ or sketch payloads. They use the existing `asap_runtime_debug` target.
 These stages describe the installed SQL path. They do not establish that the
 remaining PromQL candidate-selection and maintenance paths have migrated to the
 same physical handoff.
+
+### Native SDS publication and recovery
+
+`sds.publish_native` covers complete-cohort validation and immutable publication;
+`sds.read_native` covers the installed output lookup and native decoding. Their
+fields include the requested window and byte budget; read spans also include the
+plan version. Group labels and summary payloads are not logged. Successful return
+from an idempotent publication can mean the output was already committed; the
+publication receipt remains authoritative.
+
+These spans instrument the native storage API, including its recovery E2E. They
+do not imply that all PromQL maintenance candidates use that API yet.
