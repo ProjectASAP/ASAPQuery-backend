@@ -970,7 +970,7 @@ impl DeploymentPlanCompiler {
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
-        tracing::debug!(target: "asap_runtime_debug", "physical plan compiler entered");
+        tracing::debug!(target: "asap_runtime_debug", stage = "deployment.bind", "backend deployment compiler entered");
         if let Some(data) = &request.data_workload {
             data.validate()
                 .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -2205,7 +2205,7 @@ pub fn select_logical_roots_with_trace(
     exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
     erp: Option<&super::erp::ErpPlanningInput>,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
-    tracing::debug!(target: "asap_runtime_debug", "logical root selection started");
+    tracing::debug!(target: "asap_runtime_debug", stage = "planner.select", "Planner selection entered");
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(

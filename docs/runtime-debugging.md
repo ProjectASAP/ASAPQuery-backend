@@ -1,9 +1,71 @@
-# Runtime debugging logs
+# Runtime diagnostics along the execution path
 
-Set `RUST_LOG=info,asap_runtime_debug=debug` before starting both controller and backend to enable workflow debug events while keeping other targets at `info`. Set `RUST_LOG=info` to hide debug events. Both processes use `RUST_LOG` and default to `info` when it is unset or invalid. Their console streams use the same `tracing_subscriber` text layout with timestamp, level, target, source file and line, span context, and event fields. The controller writes to stdout. The backend writes to stdout and `<output_dir>/query_engine.log`; the file layer disables terminal colors.
+Audience: developers tracing an installed plan from selection to a result.
+The [architecture](design_docs/asapplanner-integration.md) and
+[SDS contract](design_docs/summary-catalog-sds-architecture.md) define ownership;
+diagnostics observe these decisions and never select replacement computations.
 
-Filter both streams by `plan_id` and `plan_version`. A `call_id` distinguishes concurrent plan requests or query calls within one process; it is local to that process and is not shared between controller and backend. The controller reports compilation, collector preflight and publication, backend staging, and activation. The backend reports staging validation, activation, and summary catalog installation. At `debug`, the query engine reports call start and completion or failure with elapsed time, the selected installed query DAG, and each evaluated node with its `node_id`, operator label `op` (for example `logical/aggregate/sum` or `exact_readout/count`), and inclusive duration. Node start events also include `inputs` and `syntax`: bounded operator arguments such as `operation=Sum grouping=by(service)`, `operation=Div return_bool=false`, or window parameters. The syntax field omits complete query strings, matchers, and samples. Prepared leaves and memo hits have separate events with the node type in `op`. When input preparation fails, the backend logs the node that failed catalog validation or the exact leaf that could not be prepared, with its `node_id` and `op`; a failing DAG logs the first failing node rather than repeating its error at every ancestor. Instant-query completion also includes remote evaluation and RPC counts. Failed query calls that the ASAP tier cannot serve are logged at `debug`; backend failures and failed plan operations are logged at `warn` or `error`. Error messages can contain query text, so protect access to these logs accordingly.
+## Enable and correlate
 
-Events share a rendered layout, but their fields depend on the operation. Plan events use `plan_id` and `plan_version`; query events add `query_id`, `call_id`, and elapsed time when available; node events add `node_id` and `op`. Inner spans cover compiler selection and transmission construction, backend publication and validation, worker processing, summary catalog installation, and installed query preparation and execution. They carry identifiers and counts without dumping request bodies or samples. Existing messages elsewhere in the system still include free-form text. These logs are text output, not a JSON schema or a distributed trace ID.
+Set `RUST_LOG=info,asap_runtime_debug=debug` on controller and backend. Use
+`RUST_LOG=info` to hide these events. Logs contain timestamps, target, file/line,
+span context and event fields. Controller output goes to stdout; backend output
+also goes to `<output_dir>/query_engine.log` without terminal colors.
 
-For deeper precompute and storage work, use `RUST_LOG=info,asap_runtime_debug=debug,data_plane::precompute_engine=debug,data_plane::storage_engines=debug` on the backend. The precompute DAG span carries plan ID, version, sink node, summary definition, and window bounds. Node events add the operator type, bounded syntax arguments, input node IDs, and duration; a reused materialization or committed sink has a separate event. Worker processing logs the aggregation type and window layout. SketchStore logs accepted or rejected window appends and range read counts. SDS logs descriptor bindings by a short hash of each canonical descriptor ID, and admitted publication receipts with their catalog generation and summary definition. The new event fields omit raw samples and full fallback expressions; existing worker spans may include group label values. An error before backend staging points to plan compilation or publication; an error after activation with a matching plan identifier points to runtime query or storage behavior.
+Correlate by `plan_id` and `plan_version`, then `query_id` and the process-local
+`call_id`. A call ID is not a distributed trace ID. For state reads and writes,
+use `stored_output_id` for the deployed producer and `definition_id` for its
+meaning. A `sid`/storage handle is only a local row locator. Descriptor hashes
+are diagnostics, not semantic IDs or authorization tokens.
+
+## Follow the architecture in order
+
+| Step | Owner and operation | Diagnostic evidence |
+| --- | --- | --- |
+| 1 | Planner selects the Logical Post-ASAP DAG and maintenance requirements | `planner.select` entry and selection errors. `planner.candidate_inventory`, `planner.candidate_evaluation` and `planner.candidate_selected` distinguish compilation/pricing failures from selection within the bounded inventory. Backend spans bracket Planner calls; they do not instrument every internal Planner optimization. |
+| 2 | Planner compiles physical operators, dependencies and typed boundaries | Inspect the selected DAG artifact alongside compilation spans. Do not interpret a backend adapter node as a second Planner physical node. |
+| 3 | Backend Deployment Plan Compiler binds sources, stored outputs and deployment policy | `deployment.bind`, transmission construction and publication spans; plan generation and query counts. The backend does not reselect operators. |
+| 4 | Backend validates, stages and activates one generation | HTTP staging/activation and summary-catalog installation events. Activation does not imply state readiness. |
+| 5 | Precompute engine resolves inputs and invokes the shared executor | Worker and precompute DAG spans: node/dependency IDs, execution timing, window, sink and inclusive node duration. Reused inputs and already-committed sinks have separate events. |
+| 6 | SummaryStore admits and publishes state | `sds.bind_storage_handle` includes both bound identities; `sds.publish` includes output, plan generation, window and revision. Replay acknowledgment is distinguished from a new publication. |
+| 7 | Query engine selects the installed QueryPlan | Query call/preparation events and the selected query DAG. A bound query does not search for semantically similar outputs. |
+| 8 | Bound read validates identity, locates records and validates eligibility | `sds.bound_read` carries output ID, definition ID and requested range. `sds.validate_binding` checks the installed reference; `sds.locate_records` reports candidate storage handles; `sds.validate_records` follows format, applicable coverage and stable-revision checks. Failures terminate the read span. |
+| 9 | Shared operators compute the result; backend serves or applies installed fallback | Node start/completion/failure, memo hits, query completion and remote/RPC counts. Match fallback evidence to the request rather than assuming a successful response ran locally. |
+| 10 | SummaryStore recovers persisted state on restart | `sds.recover` brackets metadata replay and reports eligible restored handles. Existing warnings distinguish provenance mismatch, missing identity and unsupported state. A successful disk read alone does not establish semantic eligibility. |
+
+Step 8 follows the actual implementation: it validates the installed reference
+before lookup, then validates concrete state. Lookup is scoped to the selected
+output; equal definition IDs never authorize switching to another deployed
+output. Coverage rules depend on the selected state family: additive panes need
+contiguous coverage, while supported counter state carries sample endpoints.
+No diagnostic introduces a universal no-gap rule for every operator.
+
+## Timing and node identity
+
+Node durations are inclusive. Parent and child intervals can overlap and shared
+producers can serve multiple consumers, so do not sum them as CPU time. These
+logs do not provide exclusive kernel, allocation or lock timing. Pair them with
+#766's profiling workflow for overhead attribution.
+
+Backend QueryPlan adapter IDs and Planner DAG IDs occupy different namespaces.
+The installed bindings connect their sinks; retain the plan artifact when
+following an edge across that boundary. Build, merge and readout are operators,
+not fixed precompute/query phases. Interpret placement from the selected DAG.
+
+## Detail and limitations
+
+For storage and worker details, add
+`data_plane::precompute_engine=debug,data_plane::storage_engines=debug`.
+The diagnostic target omits samples, complete query text and full fallback
+expressions from its new structured fields. Existing errors or worker fields can
+still contain query text or group labels. Logs are text events, not a versioned
+JSON API. Missing a completion event can indicate an interrupted process; it
+is not proof that work committed. Publication receipts and recovered state remain
+the source of truth.
+
+A missing candidate is not evidence that its placement costs more. For example,
+the retained #728 grouped-rate fixture exports per-series Rate state plus
+query-time Sum and an exact fallback; it does not export a precomputed grouped
+Rate-result candidate. The selected plan therefore cannot establish that query-time
+Sum beats that absent alternative. Search coverage is scoped to the declared
+inventory, never a claim of exhaustive physical optimization.

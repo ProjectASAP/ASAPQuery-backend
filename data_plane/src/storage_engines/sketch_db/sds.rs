@@ -320,6 +320,9 @@ impl SummaryDescriptorRegistry {
             .as_ref()
             .map(|(_, generation, _)| generation.clone());
         tracing::debug!(target: "asap_runtime_debug", sid = metadata.storage_handle,
+            stage = "sds.bind_storage_handle",
+            stored_output_id = stored_output_reference.as_ref().map(|r| r.stored_output_id.as_u64()),
+            definition_id = ?stored_output_reference.as_ref().map(|r| &r.definition_id),
             policy_fp = %metadata.policy_fp,
             summary_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(summary_descriptor.id().canonical().as_bytes(), 0)),
             data_descriptor_hash = format_args!("{:016x}", xxhash_rust::xxh64::xxh64(data_id.canonical().as_bytes(), 0)),

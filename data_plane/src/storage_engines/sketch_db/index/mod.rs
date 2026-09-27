@@ -1087,7 +1087,7 @@ impl SketchStore {
         if inventory.validate_publication(generation, coordinate, first_revision, revision)? {
             tracing::debug!(target: "asap_runtime_debug", plan_id = generation.plan_id,
                 plan_version = generation.plan_version,
-                stored_output = coordinate.stored_output_id.as_u64(),
+                stage = "sds.publish", stored_output_id = coordinate.stored_output_id.as_u64(),
                 window_start_ms = coordinate.time_range.start_ms,
                 window_end_ms = coordinate.time_range.end_ms, revision,
                 "SDS summary publication replay acknowledged");
@@ -1099,7 +1099,7 @@ impl SketchStore {
         inventory.acknowledge(generation, coordinate, revision)?;
         tracing::debug!(target: "asap_runtime_debug", plan_id = generation.plan_id,
             plan_version = generation.plan_version, sid = series_id,
-            stored_output = coordinate.stored_output_id.as_u64(),
+            stage = "sds.publish", stored_output_id = coordinate.stored_output_id.as_u64(),
             window_start_ms = coordinate.time_range.start_ms,
             window_end_ms = coordinate.time_range.end_ms, revision,
             "SDS summary publication acknowledged");
@@ -3599,6 +3599,12 @@ impl SketchStore {
     /// missing only for parts written before this feature landed (or a
     /// fresh dir) — those sids stay invisible until a live DataPoint
     /// re-registers them, the same as pre-fix behavior.
+    #[tracing::instrument(
+        level = "debug",
+        target = "asap_runtime_debug",
+        skip_all,
+        fields(stage = "sds.recover")
+    )]
     pub fn register_recovered_disk_series(&self, disk_path: &std::path::Path) -> usize {
         use crate::storage_engines::sketch_db::index::persistence::metadata::StoredOutputMetadataFile;
 
@@ -3681,6 +3687,8 @@ impl SketchStore {
                 registered += 1;
             }
         }
+        tracing::debug!(target: "asap_runtime_debug", registered,
+            "durable identities validated and eligible storage handles restored");
         registered
     }
 
