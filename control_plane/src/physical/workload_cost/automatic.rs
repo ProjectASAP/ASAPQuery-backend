@@ -9,7 +9,7 @@ use asap_types::{
 };
 use planner_types::post_asap::SketchAlgorithm;
 
-pub const MODEL_VERSION: &str = "backend-workload-resources-v1";
+pub const MODEL_VERSION: &str = "backend-workload-resources-v2";
 const CPU_PER_ITEM: f64 = 1e-7;
 const CPU_PER_BYTE: f64 = 1e-9;
 const SAMPLE_BYTES: f64 = 24.0;
@@ -72,6 +72,74 @@ fn resources(
         calculation,
     }
 }
+// Price the installed program, including transient heap state. Group count is
+// conservatively bounded by input cardinality until scoped group statistics exist.
+fn snapshot_work(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    rows: f64,
+) -> Result<(f64, f64), CompileError> {
+    use planner_types::post_asap::{SketchParams, SummaryFamilyType};
+    let program = entry
+        .physical_dag
+        .as_ref()
+        .ok_or_else(|| invalid("missing snapshot physical program"))?;
+    let nodes = program["nodes"]
+        .as_object()
+        .ok_or_else(|| invalid("invalid snapshot program"))?;
+    let mut items = rows; // Bind complete input rows.
+    let mut bytes = rows * SERIES_BYTES * 3.0;
+    for node in nodes.values().filter_map(|node| node.get("Operator")) {
+        let kind = node["operator"]["kind"]
+            .as_object()
+            .ok_or_else(|| invalid("invalid native operator"))?;
+        let Some((name, parameters)) = kind.iter().next() else {
+            return Err(invalid("missing native operator kind"));
+        };
+        match name.as_str() {
+            "Sort" => items += rows * rows.max(2.0).log2(),
+            "Limit" | "Project" | "CompiledProject" => items += rows,
+            "KeyedSummaryBuild" => {
+                let family: SummaryFamilyType =
+                    serde_json::from_value(parameters["family"].clone())
+                        .map_err(|error| invalid(error.to_string()))?;
+                let SummaryFamilyType::Sketch(kind, _) = family else {
+                    return Err(invalid("no snapshot cost model for non-sketch keyed build"));
+                };
+                let (width, depth, capacity) = match kind.params() {
+                    SketchParams::CmsWithHeap {
+                        width,
+                        depth,
+                        heap_size,
+                    }
+                    | SketchParams::CountSketchWithHeap {
+                        width,
+                        depth,
+                        heap_size,
+                    } => (*width as f64, *depth as f64, *heap_size as f64),
+                    _ => return Err(invalid("no snapshot heap cost model for this algorithm")),
+                };
+                let groups = if parameters["groups"]
+                    .as_array()
+                    .is_some_and(|groups| groups.is_empty())
+                {
+                    rows.min(1.0)
+                } else {
+                    rows
+                };
+                items += rows * (depth + capacity.max(2.0).log2());
+                bytes += groups * (width * depth * 8.0 + capacity * (SERIES_BYTES + 24.0));
+            }
+            "KeyedReadout" => items += rows * rows.max(2.0).log2(),
+            _ => {
+                return Err(invalid(format!(
+                    "no automatic snapshot cost model for {name}"
+                )))
+            }
+        }
+    }
+    Ok((items * CPU_PER_ITEM, bytes))
+}
+
 fn state(
     m: &PrecomputeMaterialization,
     request: &PhysicalCompilationRequest,
@@ -506,12 +574,13 @@ pub(super) fn estimate(
                 } => {
                     output_rows = cardinality;
                     if entry.population_snapshot().is_some() {
+                        let (cpu, workspace) = snapshot_work(entry, cardinality)?;
                         detail = json!({"input_rows": cardinality,
                             "physical_program": entry.physical_dag,
-                            "workspace_bytes_bound": cardinality * SERIES_BYTES * 3.0,
-                            "formula": "rows * (log2(max(rows, 2)) + 2) * cpu_seconds_per_item",
+                            "workspace_bytes_bound": workspace,
+                            "formula": "sum of installed operator work; grouped heap count bounded by input rows",
                             "cpu_seconds_per_item": CPU_PER_ITEM});
-                        cardinality * (cardinality.max(2.0).log2() + 2.0) * CPU_PER_ITEM
+                        cpu
                     } else {
                         cardinality * CPU_PER_ITEM
                     }
@@ -582,7 +651,7 @@ pub(super) fn estimate(
                 BTreeSet::new()
             };
             let workspace_byte_seconds = if entry.population_snapshot().is_some() {
-                cardinality * SERIES_BYTES * 3.0 * cpu * evaluations
+                snapshot_work(entry, cardinality)?.1 * cpu * evaluations
             } else {
                 0.0
             };
