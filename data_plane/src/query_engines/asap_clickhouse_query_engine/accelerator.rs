@@ -496,6 +496,7 @@ mod tests {
             },
         );
         entry.root = project;
+        entry.compile_relational_physical_dag().unwrap();
         entry
     }
 
@@ -574,6 +575,7 @@ mod tests {
         let sort = QueryNodeId(4);
         let root = QueryNodeId(5);
         let executable = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::ClickHouseSql,
             query_id: "SELECT value FROM samples".into(),
             canonical_query: "SELECT value FROM samples".into(),
@@ -707,7 +709,8 @@ mod tests {
         } else {
             BTreeMap::new()
         };
-        let entry = QueryPlanEntry {
+        let mut entry = QueryPlanEntry {
+            physical_dag: None,
             query_id: sql.clone(),
             canonical_query: canonical_sql.clone(),
             language: QueryLanguage::ClickHouseSql,
@@ -721,6 +724,7 @@ mod tests {
             instant: executable.instant,
             fallback: executable.fallback,
         };
+        entry.compile_relational_physical_dag().unwrap();
         let query_plan = QueryPlan {
             plan_id: 41,
             plan_version: 1,
