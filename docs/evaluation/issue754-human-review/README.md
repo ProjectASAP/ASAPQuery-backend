@@ -5,15 +5,17 @@ recorded. Selected plans and successfully compiled candidate plans are retained
 as JSON/DOT; each page shows accuracy rejections and deployment cost decisions.
 
 Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
-`2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986`.
+`a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab`.
 
 ## Current implementation boundary
 
 These exports describe the current Backend implementation. They do **not** prove
 completion of the Planner physical-candidate installation/execution handoff.
-The displayed computation is logical provenance; the installed Backend adapter
-and stored-output bindings are shown separately. Deployment Rate → heap storage
-E2E and latest-value spatial TopK remain outstanding.
+Logical provenance and installed native physical programs are shown separately.
+Spatial TopK binds a complete current-series snapshot and runs a persisted native
+Sort → Limit program. This is the exact ranking candidate; spatial CMS/CountSketch
+heap deployment and Rate → heap storage E2E remain outstanding. Other PromQL
+paths still use the documented Backend adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
 currently evaluates single-root substitutions in a preferred workload context;

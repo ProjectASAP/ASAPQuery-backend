@@ -244,7 +244,69 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
             json!({"labels":["label_0"],"without":false})
         );
         assert_eq!(node["operator"]["population"]["max_k"], 3);
-        assert_eq!(node["operator"]["readout"], json!({"kind":"top_k","k":3}));
+        assert_eq!(node["operator"]["readout"], json!({"kind":"snapshot"}));
+        let installed = plan.query_plan.entries.values().next().unwrap();
+        let physical = installed.recover_population_physical_dag().unwrap();
+        let inputs = physical.input_contracts().collect::<Vec<_>>();
+        assert_eq!(
+            inputs.len(),
+            1,
+            "spatial ranking binds one complete population"
+        );
+        let input = &inputs[0].1.schema;
+        assert!(input
+            .fields
+            .iter()
+            .any(|field| field.name == "$promql_series_identity"));
+        let value_column = input
+            .fields
+            .iter()
+            .position(|field| field.name == "value")
+            .unwrap();
+        let group_column = input
+            .fields
+            .iter()
+            .position(|field| field.name == "label_0")
+            .unwrap();
+        let program: Value = serde_json::from_slice(&physical.encode().unwrap()).unwrap();
+        let operations: Vec<_> = program["nodes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|node| node.get("Operator"))
+            .collect();
+        assert_eq!(operations.len(), 2);
+        let sort = operations
+            .iter()
+            .find(|node| node["operator"]["kind"].get("Sort").is_some())
+            .unwrap();
+        assert_eq!(
+            sort["operator"]["kind"]["Sort"]["keys"],
+            json!([{"column":value_column,"descending":true,"nulls_first":false}])
+        );
+        assert_eq!(
+            sort["operator"]["kind"]["Sort"]["groups"],
+            json!([group_column])
+        );
+        let limit = operations
+            .iter()
+            .find(|node| node["operator"]["kind"].get("Limit").is_some())
+            .unwrap();
+        assert_eq!(
+            limit["operator"]["kind"]["Limit"],
+            json!({"n":3,"offset":0,"groups":[group_column]})
+        );
+        assert_eq!(sort["inputs"], json!([inputs[0].0]));
+        let sort_id: u64 = program["nodes"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, node)| node.get("Operator") == Some(*sort))
+            .unwrap()
+            .0
+            .parse()
+            .unwrap();
+        assert_eq!(limit["inputs"], json!([sort_id]));
         assert!(
             materializations.is_empty(),
             "{name}: current-series readout has no summary producer"
