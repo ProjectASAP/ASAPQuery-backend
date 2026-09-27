@@ -471,6 +471,73 @@ fn issue754_queries_have_valid_physical_plans() {
         }
         let mut input: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
         let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+        if case.name == "spatial-quantile" {
+            // The fixture's admissible sketch families must reach deployment
+            // costing; the initially preferred family is not the inventory.
+            let mut families = std::collections::BTreeSet::new();
+            for forest in &request.planner_candidate_forests {
+                for query in forest {
+                    let dag =
+                        planner_types::post_asap::compile_executable_dag(&query.selected_plan_root)
+                            .unwrap();
+                    for node in dag.nodes {
+                        if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                            family: SummaryFamilyType::Sketch(kind, _),
+                            ..
+                        } = node.payload
+                        {
+                            families.insert(format!("{:?}", kind.algorithm()));
+                        }
+                    }
+                }
+            }
+            assert!(
+                families.contains("Kll")
+                    || request
+                        .planner_selection_trace
+                        .iter()
+                        .flat_map(|trace| trace["groups"].as_array().into_iter().flatten())
+                        .flat_map(|group| group["rejected"].as_array().into_iter().flatten())
+                        .any(|rejection| rejection["description"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("Kll"))
+                            && rejection["reason"]
+                                .as_str()
+                                .is_some_and(|s| s.contains("does not satisfy"))),
+                "a missing KLL candidate needs an explicit accuracy rejection"
+            );
+            let mut relaxed = input.clone();
+            relaxed.query_workload.repeating_queries.as_mut().unwrap()[0]
+                .requirements
+                .accuracy = planner_types::workload::AccuracyRequirement::Explicit(
+                planner_types::types::AccuracyTarget::Epsilon(0.05),
+            );
+            let (relaxed, _) = relaxed.into_physical_compilation_request().unwrap();
+            let roots = relaxed
+                .planner_candidate_forests
+                .iter()
+                .flatten()
+                .map(|query| format!("{:?}", query.selected_plan_root))
+                .collect::<Vec<_>>();
+            assert!(
+                roots.iter().any(|root| root.contains("Kll")),
+                "admissible KLL disappeared before deployment costing"
+            );
+            assert!(
+                roots.iter().any(|root| root.contains("DDSketch")),
+                "admissible DDSketch disappeared before deployment costing"
+            );
+            assert!(
+                families.contains("DDSketch"),
+                "DDSketch disappeared before deployment costing"
+            );
+            assert!(
+                request.planner_selection_trace.iter().any(|trace| trace
+                    ["computation_search_scope"]["joint_workload_search_exhaustive"]
+                    == false),
+                "root substitutions must not be reported as exhaustive joint search"
+            );
+        }
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let mut valid_plans = Vec::new();
         let mut quotes = Vec::new();
