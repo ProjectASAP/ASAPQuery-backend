@@ -59,3 +59,10 @@ state construction, publication, bound readout and restart of both the store and
 resolver. Automatic PromQL physical-candidate installation, Rate-to-heap storage
 execution and spatial latest-value heap execution remain pending. This test does
 not establish those paths.
+
+Bound frozen reads resolve the stored-output/group prefix through the persistent
+series resolver. Each cached part builds a sorted output/window index once on
+open, including older parts written in flush order. Range reads inspect only the
+matching prefix and start-time range, then validate end times and exact coverage.
+Duplicate windows remain visible and are rejected as ambiguous. The index memory
+counts toward the part-cache budget; the on-disk part format is unchanged.

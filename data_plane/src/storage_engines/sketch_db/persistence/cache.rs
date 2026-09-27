@@ -34,9 +34,9 @@ impl PartCache {
             Some(
                 Cache::builder()
                     .weigher(|_k: &PartId, v: &LoadedPart| -> u32 {
-                        // Weight = sum of mmap'd bytes. Moka's weigher
+                        // Include mmap bytes and the in-memory window index. The weigher
                         // returns u32, so clamp large parts.
-                        let len = v.meta.data_len + v.meta.index_len;
+                        let len = v.resident_bytes();
                         len.min(u32::MAX as u64) as u32
                     })
                     .max_capacity(byte_budget)
