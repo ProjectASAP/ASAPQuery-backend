@@ -129,3 +129,108 @@ pub(super) fn semi_join(
     .map_err(|e| miss(e.to_string()))?;
     output(values, result)
 }
+
+pub(super) fn execute_population<F>(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    at: u64,
+    mut callback: F,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+>
+where
+    F: FnMut(
+        asap_types::query_plan::QueryNodeId,
+        u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, EngineError>,
+{
+    use crate::{
+        query_engines::query_result::{InstantVectorElement, QueryResult},
+        storage_engines::types::KeyByLabelValues,
+    };
+    use asap_physical_operators::physical_planner::{
+        promql_rows::{decode_series_identity, series_row, SERIES_IDENTITY_COLUMN},
+        Source,
+    };
+    use futures::{executor::block_on, StreamExt};
+    use std::collections::BTreeMap;
+    let program = entry
+        .recover_population_physical_dag()
+        .map_err(|error| miss(error.to_string()))?;
+    let (input_id, input) = program.input_contracts().next().unwrap();
+    let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
+    let values = super::vector(super::from_result(callback(entry.root, at)?)?)?;
+    let rows = values
+        .into_iter()
+        .map(|(labels, value)| {
+            series_row(&input.schema, &labels, at_signed, value)
+                .map_err(|error| miss(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch =
+        Batch::try_new(input.schema.clone(), rows).map_err(|error| miss(error.to_string()))?;
+    let source = Operator::source(input.schema.clone(), vec![batch])
+        .map_err(|error| miss(error.to_string()))?;
+    let graph = program
+        .instantiate(BTreeMap::from([(input_id, Box::new(source) as Source<'_>)]))
+        .map_err(|error| miss(error.to_string()))?;
+    let context = dag::RunContext::new(
+        dag::Scope::Query {
+            evaluation_time_ms: at_signed,
+            revision: 0,
+        },
+        dag::Limits {
+            max_bytes: entry.population_snapshot().unwrap().max_bytes as usize,
+            ..dag::Limits::default()
+        },
+    )
+    .map_err(|error| miss(error.to_string()))?;
+    let mut stream = graph
+        .execute(program.roots(), context)
+        .map_err(|error| miss(error.to_string()))?
+        .remove(0);
+    let values = block_on(async {
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|error| miss(error.to_string()))?;
+            let identity = batch
+                .schema()
+                .fields
+                .iter()
+                .position(|field| field.name == SERIES_IDENTITY_COLUMN)
+                .ok_or_else(|| miss("physical output loses series identity"))?;
+            let value = batch
+                .schema()
+                .fields
+                .iter()
+                .position(|field| field.name == "value")
+                .ok_or_else(|| miss("physical output loses sample value"))?;
+            for row in batch.rows() {
+                let (Value::Utf8(encoded), Value::Float64(sample)) = (&row[identity], &row[value])
+                else {
+                    return Err(miss("invalid population physical output"));
+                };
+                let labels =
+                    decode_series_identity(encoded).map_err(|error| miss(error.to_string()))?;
+                values.push(
+                    InstantVectorElement::new(
+                        KeyByLabelValues::new_with_labels(labels.values().cloned().collect()),
+                        *sample,
+                    )
+                    .with_label_keys_override(labels.into_keys().collect()),
+                );
+            }
+        }
+        Ok(values)
+    })?;
+    Ok((
+        QueryResult::vector(values, at),
+        super::ExecutionStats {
+            summary_readout_evaluations: 1,
+            ..Default::default()
+        },
+    ))
+}

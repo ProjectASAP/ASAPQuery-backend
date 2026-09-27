@@ -245,6 +245,87 @@ impl QueryPlanEntry {
     }
 }
 
+impl QueryPlanEntry {
+    pub fn population_snapshot(&self) -> Option<&current_series::SeriesPopulation> {
+        if self.nodes.len() != 1 {
+            return None;
+        }
+        match self.nodes.get(&self.root) {
+            Some(QueryPlanNode::Logical {
+                operator:
+                    residual::ResidualQueryOperator::CurrentSeries {
+                        population,
+                        readout: current_series::SeriesReadout::Snapshot,
+                    },
+                inputs,
+            }) if inputs.is_empty() => Some(population),
+            _ => None,
+        }
+    }
+
+    /// Recover an installed population readout; the source binds the complete
+    /// maintained vector, while the physical program owns ranking and limiting.
+    pub fn recover_population_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
+        let invalid = |message: &str| QueryPlanError::Invalid(message.into());
+        let population = self
+            .population_snapshot()
+            .ok_or_else(|| invalid("missing population source binding"))?;
+        population.validate()?;
+        let value = self
+            .physical_dag
+            .as_ref()
+            .ok_or_else(|| invalid("missing installed population physical DAG"))?;
+        let dag = CompiledPhysicalDag::decode(
+            &serde_json::to_vec(value)
+                .map_err(|error| QueryPlanError::Invalid(error.to_string()))?,
+        )
+        .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
+        let inputs = dag.input_contracts().collect::<Vec<_>>();
+        let [(_, input)] = inputs.as_slice() else {
+            return Err(invalid("population physical DAG requires one source"));
+        };
+        let [root] = dag.roots() else {
+            return Err(invalid("population physical DAG requires one root"));
+        };
+        let output = dag
+            .output_contract(*root)
+            .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
+        if input.schema != output.schema {
+            return Err(invalid(
+                "population ranking must preserve complete source rows",
+            ));
+        }
+        use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+        let fields = &input.schema.fields;
+        let column = |name: &str, dtype: DataType| {
+            fields.iter().any(|field| {
+                field.name == name
+                    && field.dtype == SummaryFamilyType::Plain(dtype.clone())
+                    && !field.nullable
+            })
+        };
+        if !column(
+            asap_physical_operators::physical_planner::promql_rows::SERIES_IDENTITY_COLUMN,
+            DataType::Utf8,
+        ) || !column("value", DataType::Float64)
+            || input.schema.time_index.is_none_or(|index| {
+                fields[index].dtype != SummaryFamilyType::Plain(DataType::Timestamp)
+            })
+            || population.grouping.without
+            || population.grouping.labels.iter().any(|label| {
+                !fields.iter().any(|field| {
+                    &field.name == label && field.dtype == SummaryFamilyType::Plain(DataType::Utf8)
+                })
+            })
+        {
+            return Err(invalid(
+                "population physical source loses identity, value, timestamp or grouping",
+            ));
+        }
+        Ok(dag)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

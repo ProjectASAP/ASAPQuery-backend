@@ -103,6 +103,28 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
     });
     let planned = snapshot.clone().compile_promql().unwrap();
     for entry in planned.query_plan.entries.values() {
+        if entry.canonical_query.starts_with("topk") {
+            assert!(
+                entry.population_snapshot().is_some(),
+                "TopK must bind a complete population source"
+            );
+            let restored: asap_types::query_plan::QueryPlanEntry =
+                serde_json::from_slice(&serde_json::to_vec(entry).unwrap()).unwrap();
+            let physical = restored.recover_population_physical_dag().unwrap();
+            let encoded = String::from_utf8(physical.encode().unwrap()).unwrap();
+            assert!(encoded.contains("Sort") && encoded.contains("Limit"));
+            assert!(encoded.contains("$promql_series_identity"));
+            assert!(
+                !encoded.contains("CurrentSeries"),
+                "the stored population boundary must not be recomputed"
+            );
+            let mut missing = restored.clone();
+            missing.physical_dag = None;
+            assert!(missing.recover_population_physical_dag().is_err());
+            let mut version = restored;
+            version.physical_dag.as_mut().unwrap()["version"] = 999.into();
+            assert!(version.recover_population_physical_dag().is_err());
+        }
         for node in entry.nodes.values() {
             if let asap_types::query_plan::QueryPlanNode::Logical {
                 operator:

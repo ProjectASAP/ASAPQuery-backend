@@ -66,3 +66,13 @@ open, including older parts written in flush order. Range reads inspect only the
 matching prefix and start-time range, then validate end times and exact coverage.
 Duplicate windows remain visible and are rejected as ambiguous. The index memory
 counts toward the part-cache budget; the on-disk part format is unchanged.
+
+For selected explicit-`by` current-series TopK, the population store now supplies
+all eligible members through a snapshot binding. Planner compiles the ranking
+above that boundary; the QueryPlan persists that physical program before
+candidate pricing and activation. Serving recovers its operators and supplies
+full-label native rows without parsing or lowering the query. Automatic cost
+estimates include sorting CPU and temporary workspace; provider quote manifests
+include the physical program itself. Other population readouts retain their
+existing paths. This path does not imply that spatial heap candidates or buffered
+Rate-to-heap persistence are deployed yet.
