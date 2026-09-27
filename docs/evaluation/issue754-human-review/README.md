@@ -5,7 +5,7 @@ recorded. Selected plans and successfully compiled candidate plans are retained
 as JSON/DOT; each page shows accuracy rejections and deployment cost decisions.
 
 Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
-`a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab`.
+`3ebe195260fa6e16e226183ee50938078bb8359f`.
 
 ## Current implementation boundary
 
@@ -13,9 +13,15 @@ These exports describe the current Backend implementation. They do **not** prove
 completion of the Planner physical-candidate installation/execution handoff.
 Logical provenance and installed native physical programs are shown separately.
 Spatial TopK binds a complete current-series snapshot and runs a persisted native
-Sort → Limit program. This is the exact ranking candidate; spatial CMS/CountSketch
-heap deployment and Rate → heap storage E2E remain outstanding. Other PromQL
-paths still use the documented Backend adapter representation.
+Sort → Limit program. Planner also exposes a CountSketch-with-heap physical
+candidate over the same snapshot. This fixture has no enforced distinct-item
+bound or score-separation proof, so its heap candidate is explicitly rejected
+before pricing. The inherited `native_snapshot_topk` tests cover certified heap
+admission, cost-dependent selection and analytical workspace costing; a separate
+real-process test covers Remote Write and heap HTTP results. Signed samples do
+not authorize CMS. Rate → heap storage E2E and the complete physical-candidate
+handoff remain outstanding. Other PromQL paths still use the documented Backend
+adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
 currently evaluates single-root substitutions in a preferred workload context;

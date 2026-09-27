@@ -39,12 +39,12 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 ```
 
 
-| Candidate | Status | Fixture cost | Rejection / unavailable reason |
-| --- | --- | --- | --- |
-| 0 | `"selected"` | `95.0` | `null` |
-| 1 | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
-| 3 | `"unselected"` | `125.0` | `null` |
+| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- | --- |
+| 0 | `["asap-explain-v1:root:6c8189cd0edd95b27e17aea6db55caf7e65a74df9fdab82440e45423cfff8f7b"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:ec68700333a360fe95b44ffe857bff4ddb5edd7a68e5c6e6739fd46598318ffd"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:677c17ebaa3903cdf54856f869cf13e5d3b347f6793c243f5537ce6474b80741"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| 3 | `["asap-explain-v1:root:b7c61d6400b48010b50be44a67267fba78022d774c798351e28de3af7fed5319"]` | `"unselected"` | `125.0` | `null` |
 
 Successfully compiled candidate plans: [grouped-temporal-sum-0](candidates/grouped-temporal-sum-0.json), [grouped-temporal-sum-1](candidates/grouped-temporal-sum-1.json), [grouped-temporal-sum-3](candidates/grouped-temporal-sum-3.json)
 

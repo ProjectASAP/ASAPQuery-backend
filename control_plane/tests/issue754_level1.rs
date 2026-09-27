@@ -600,6 +600,35 @@ fn issue754_queries_have_valid_physical_plans() {
                 "root substitutions must not be reported as exhaustive joint search"
             );
         }
+        let snapshot_heap_root = if case.name == "spatial-topk" {
+            let trace = request
+                .planner_selection_trace
+                .iter()
+                .find(|trace| {
+                    trace["stage"] == "planner.physical_candidate"
+                        && trace["physical_dag"]
+                            .to_string()
+                            .contains("CountSketchWithHeap")
+                })
+                .expect("Planner must expose a physical signed snapshot heap candidate");
+            let program = asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(
+                &serde_json::to_vec(&trace["physical_dag"]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(program.input_contracts().count(), 1);
+            let encoded = trace["physical_dag"].to_string();
+            assert!(encoded.contains("KeyedSummaryBuild") && encoded.contains("KeyedReadout"));
+            assert!(encoded.contains("$promql_series_identity"));
+            assert!(
+                !encoded.contains("CurrentSeries"),
+                "the source already supplies an eligible snapshot"
+            );
+            assert!(trace["guarantee"].to_string().contains("topk_max_distinct_items"),
+                "this fixture has no enforced distinct-item bound; do not invent one from estimated cardinality");
+            Some(trace["logical_root_id"].as_str().unwrap().to_owned())
+        } else {
+            None
+        };
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let mut valid_plans = Vec::new();
         let mut quotes = Vec::new();
@@ -715,6 +744,26 @@ fn issue754_queries_have_valid_physical_plans() {
         let selected = input
             .compile_promql()
             .unwrap_or_else(|error| panic!("{} selected plan failed: {error}", case.name));
+        if let Some(root_id) = snapshot_heap_root {
+            let report = selected.cost_comparison.as_ref().unwrap();
+            let heap = report
+                .candidate_evaluations
+                .iter()
+                .filter(|candidate| candidate.logical_root_ids.contains(&root_id))
+                .collect::<Vec<_>>();
+            assert!(
+                !heap.is_empty(),
+                "physical heap candidate disappeared before admission"
+            );
+            assert!(
+                heap.iter().all(|candidate| candidate.total_cost.is_none()
+                    && candidate
+                        .unavailable_reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.contains("accuracy guarantee"))),
+                "missing proof must be an explicit admission failure: {heap:?}"
+            );
+        }
         let selected_entry = selected.query_plan.lookup(&case.expr).unwrap();
         assert!(selected_entry.nodes.contains_key(&selected_entry.root));
         if let Some(error) = assert_selected_plan(&case.name, &selected) {

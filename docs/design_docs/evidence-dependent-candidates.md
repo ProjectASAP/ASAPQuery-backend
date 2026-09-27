@@ -211,7 +211,7 @@ flowchart LR
     Compare --> Select[Lowest-cost feasible physical candidate]
 ```
 
-`backend-workload-resources-v1` is an explicit analytical reference model, not a
+`backend-workload-resources-v2` is an explicit analytical reference model, not a
 calibrated prediction or a monetary quote. It computes a resource vector before
 weighting it: `cost = CPU_seconds + 1e-9 * memory_byte_seconds + 1e-8 * network_bytes`.
 These fixed versioned weights express a default tradeoff; a deployment can still
@@ -317,3 +317,11 @@ bound must not change the query's read interval. A temporal producer that cannot
 implement a fractional range remains unsupported for that binding, while exact
 execution preserves the original range. Level-3 acceptance uses the actual
 replay cadence and still requires a local executable plan.
+
+Spatial TopK admission keeps the exact population ranking and the Planner's
+CountSketch-with-heap physical candidate separate. The heap requires scoped
+score separation and an enforced `topk_max_distinct_items` bound; an estimated
+workload cardinality is insufficient. Missing evidence leaves the candidate
+visible but ineligible for installation. Cost model v2 prices the installed
+native operators and transient heap workspace. A complete provider quote can
+choose either candidate; neither is forced by operator name.

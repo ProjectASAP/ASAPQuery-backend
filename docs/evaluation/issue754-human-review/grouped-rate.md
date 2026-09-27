@@ -45,11 +45,11 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 ```
 
 
-| Candidate | Status | Fixture cost | Rejection / unavailable reason |
-| --- | --- | --- | --- |
-| 0 | `"selected"` | `125.0` | `null` |
-| 1 | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- | --- |
+| 0 | `["asap-explain-v1:root:f64d455c779dbeffa3b3791fa9f36aa53ff23ca87cbedcec85cd8f15514c79d1"]` | `"selected"` | `125.0` | `null` |
+| 1 | `["asap-explain-v1:root:4f1a460e06820b58ecb3eba688270ec13eb5a8490e30d797b6e6792e02b0eb7b"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:72da058ea30881ecb59998b94e12f7eec58af16de26d7d41ee8aa00bf93584e3"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
 
 Successfully compiled candidate plans: [grouped-rate-0](candidates/grouped-rate-0.json), [grouped-rate-1](candidates/grouped-rate-1.json)
 

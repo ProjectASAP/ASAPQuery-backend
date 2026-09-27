@@ -50,11 +50,11 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 ```
 
 
-| Candidate | Status | Fixture cost | Rejection / unavailable reason |
-| --- | --- | --- | --- |
-| 0 | `"selected"` | `155.0` | `null` |
-| 1 | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `"unselected"` | `242.0` | `null` |
+| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- | --- |
+| 0 | `["asap-explain-v1:root:0a36a2bb43a5c67a3c0cdab44d6d7fa5a769bc85af3fb7fa2c41b396da68ef3d"]` | `"selected"` | `155.0` | `null` |
+| 1 | `["asap-explain-v1:root:85695f3e2398a8f92061778b3a0f9ad6470c7fd2fff67e1c223b1d09ced9b08e"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:e28a371ca7f0bf312bb0f9e26cd45ffc61f072e4c8441e7309f4a9e3830661fb"]` | `"unselected"` | `242.0` | `null` |
 
 Successfully compiled candidate plans: [topk-rate-0](candidates/topk-rate-0.json), [topk-rate-1](candidates/topk-rate-1.json), [topk-rate-2](candidates/topk-rate-2.json)
 

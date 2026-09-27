@@ -43,12 +43,12 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 - quantile(q=0.9) realizes as a Kll sketch: composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }
 
-| Candidate | Status | Fixture cost | Rejection / unavailable reason |
-| --- | --- | --- | --- |
-| 0 | `"selected"` | `95.0` | `null` |
-| 1 | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `"unselected"` | `130.0` | `null` |
-| 3 | `"unselected"` | `61000000000000.0` | `null` |
+| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- | --- |
+| 0 | `["asap-explain-v1:root:d55703b72c0c4bb9bc209232c1d9d0afcc595b8b60f978dbc7392a2f6439c4b0"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:9377634ea064bea3a66d6598cf85ef8648d59bc0473debae77b5958390104be7"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:198743eeb4cf6ad3369e04e5e07dfd7570c71dadf47a32aef1ca714a46d0dcd5"]` | `"unselected"` | `130.0` | `null` |
+| 3 | `["asap-explain-v1:root:6d5fa81380e4588417d6d892ec1f786499d644abbc6ea906446dac9db4a4fd26"]` | `"unselected"` | `61000000000000.0` | `null` |
 
 Successfully compiled candidate plans: [spatial-quantile-0](candidates/spatial-quantile-0.json), [spatial-quantile-1](candidates/spatial-quantile-1.json), [spatial-quantile-2](candidates/spatial-quantile-2.json), [spatial-quantile-3](candidates/spatial-quantile-3.json)
 
