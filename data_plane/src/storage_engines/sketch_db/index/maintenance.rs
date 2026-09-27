@@ -386,10 +386,7 @@ impl SketchStore {
                 .part_cache
                 .get_or_load(part.part_id)
                 .map_err(|e| e.to_string())?;
-            for record in reader.index_records() {
-                if record.agg_id != sid || record.start_ts < start_ms || record.end_ts > end_ms {
-                    continue;
-                }
+            for record in reader.window_records(sid, start_ms, end_ms) {
                 let entry = reader.load_entry(&record).map_err(|e| e.to_string())?;
                 if entry.label.as_ref().map_or(0, |label| label.labels.len()) != keys.len() {
                     return Err("immutable input label arity differs from its descriptor".into());
