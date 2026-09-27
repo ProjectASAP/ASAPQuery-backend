@@ -105,6 +105,7 @@ pub mod encoding_tag {
     pub const PROTO_DELTA: u8 = 2;
     pub const MSGPACK_FULL: u8 = 3;
     pub const MSGPACK_DELTA: u8 = 4;
+    pub const NATIVE_BATCH_V1: u8 = 5;
 }
 
 /// One entry inside a decoded part. The `start_ts`/`end_ts`/`label`

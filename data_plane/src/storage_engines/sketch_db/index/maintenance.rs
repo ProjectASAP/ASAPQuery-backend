@@ -276,6 +276,28 @@ impl SketchStore {
         expected_windows: &BTreeSet<(u64, u64)>,
         group: &BTreeMap<String, String>,
     ) -> Result<FrozenExactWindows, String> {
+        self.read_frozen_windows_with(
+            sid,
+            definition,
+            generation,
+            expected_windows,
+            group,
+            |name, _, bytes| {
+                reconstruct_exact_agg(name, bytes)
+                    .ok_or_else(|| "immutable input accumulator cannot be decoded".to_string())
+            },
+        )
+    }
+
+    pub(super) fn read_frozen_windows_with(
+        &self,
+        sid: u64,
+        definition: StoredOutputId,
+        generation: &Arc<CatalogGeneration>,
+        expected_windows: &BTreeSet<(u64, u64)>,
+        group: &BTreeMap<String, String>,
+        mut decode: impl FnMut(&str, u8, &[u8]) -> Result<Box<dyn AggregateCore>, String>,
+    ) -> Result<FrozenExactWindows, String> {
         let start_ms = expected_windows
             .iter()
             .map(|window| window.0)
@@ -377,8 +399,11 @@ impl SketchStore {
                 if population != *group {
                     continue;
                 }
-                let state = reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
-                    .ok_or("immutable input accumulator cannot be decoded")?;
+                let state = decode(
+                    &entry.sketch_type_name,
+                    entry.encoding_tag,
+                    &entry.sketch_bytes,
+                )?;
                 if windows
                     .insert((record.start_ts, record.end_ts), Arc::from(state))
                     .is_some()
@@ -720,9 +745,13 @@ impl SketchStore {
                     labels: labels.into_values().collect(),
                 }),
                 sketch_type_name: state.type_name().to_string(),
-                encoding_tag: match binding.metadata.agg_kind {
-                    AggKind::Sketch { .. } => encoding_to_tag(SketchEncoding::MsgpackFull),
-                    AggKind::ExactAgg { .. } => 0,
+                encoding_tag: if state.type_name() == "NativePhysicalOutputV1" {
+                    encoding_to_tag(SketchEncoding::NativeBatchV1)
+                } else {
+                    match binding.metadata.agg_kind {
+                        AggKind::Sketch { .. } => encoding_to_tag(SketchEncoding::MsgpackFull),
+                        AggKind::ExactAgg { .. } => 0,
+                    }
                 },
                 sketch_bytes: bytes,
             }],
