@@ -1,0 +1,21 @@
+digraph compiled_physical_plan {
+  rankdir=LR;
+  node [shape=box, fontname=Helvetica];
+  subgraph cluster_precompute {
+    label="PrecomputePlan";
+    materialization_3412bab1910610ee [label="materialization\npolicy_fp:3412bab1910610ee\nmetric=data\nwindow_type=sliding\nwindow=60s / 10s\nlayout=Pane { pane_secs: 10 }", shape=component];
+    subgraph cluster_precompute_dag_0 {
+      label="compat-query-0";
+    precompute_0_0 [label="fallback #0\nMaintenanceInput"];
+    precompute_0_1 [label="summary_agg #1\nMaterialization { stored_output: StoredOutputId(3752266711358116078) }"];
+      precompute_0_0 -> precompute_0_1 [label="Input"];
+    }
+  }
+  subgraph cluster_query_0 {
+    label="QueryPlan: quantile_over_time(0.9, data[1m])";
+    query_0_0 [label="SummaryEstimate\nQuantile { q: 0.9 }", shape=doubleoctagon];
+    query_0_1 [label="ReadMaterialization\npolicy_fp:3412bab1910610ee\nwindow=10000ms\nlookback=Some(60000)"];
+    materialization_3412bab1910610ee -> query_0_1 [style=dashed, color=gray40, label="reads"];
+    query_0_1 -> query_0_0;
+  }
+}

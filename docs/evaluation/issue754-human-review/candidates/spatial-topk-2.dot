@@ -1,0 +1,11 @@
+digraph compiled_physical_plan {
+  rankdir=LR;
+  node [shape=box, fontname=Helvetica];
+  subgraph cluster_precompute {
+    label="PrecomputePlan";
+  }
+  subgraph cluster_query_0 {
+    label="QueryPlan: topk by (label_0) (3, data)";
+    query_0_0 [label="Logical\nCurrentSeries", shape=doubleoctagon];
+  }
+}

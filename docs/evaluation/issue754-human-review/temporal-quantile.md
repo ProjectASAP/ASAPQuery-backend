@@ -4,7 +4,7 @@
 
 [Raw selected plan](temporal-quantile.json) · [DAG DOT](temporal-quantile.dot)
 
-## Planner-selected computation
+## Selected computation: logical provenance
 
 IDs below are Planner node IDs; QueryPlan adapter IDs are shown separately.
 
@@ -28,6 +28,28 @@ flowchart LR
 ### Sort expressions
 
 No standalone Sort node in this selected DAG; any ranking readout is shown in the operation table.
+
+## Candidate admission and costing
+
+Costs below come from the controlled Level 1 fixture, not production measurements.
+
+```json
+{
+  "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+  "inventory": "all_root_candidates",
+  "joint_workload_search_exhaustive": false
+}
+```
+
+- quantile(q=0.9) realizes as a Kll sketch: composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }
+
+| Candidate | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- |
+| 0 | `"selected"` | `95.0` | `null` |
+| 1 | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `"unselected"` | `61000000000000.0` | `null` |
+
+Successfully compiled candidate plans: [temporal-quantile-0](candidates/temporal-quantile-0.json), [temporal-quantile-1](candidates/temporal-quantile-1.json), [temporal-quantile-2](candidates/temporal-quantile-2.json)
 
 ## Persisted boundaries
 
@@ -62,8 +84,8 @@ Stored output `3752266711358116078` → semantic definition `sds-v1:2fde0175b6e4
     "aggregation_type": "DDSketch",
     "aggregation_sub_type": "",
     "parameters": {
-      "alpha": 0.01,
-      "promql_right_closed": true
+      "promql_right_closed": true,
+      "alpha": 0.01
     },
     "grouping_labels": {
       "labels": []

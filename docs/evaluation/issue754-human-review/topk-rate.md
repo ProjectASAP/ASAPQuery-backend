@@ -4,7 +4,7 @@
 
 [Raw selected plan](topk-rate.json) · [DAG DOT](topk-rate.dot)
 
-## Planner-selected computation
+## Selected computation: logical provenance
 
 IDs below are Planner node IDs; QueryPlan adapter IDs are shown separately.
 
@@ -37,6 +37,27 @@ Node `3`: `{"keys":[{"ascending":false,"expr":{"Column":1},"nulls_first":false}]
 
 Its input is node `2`: `{"kind":"value","operation":"FinalizeExactAccumulator"}`. Column indices refer to that producer's output schema above.
 
+## Candidate admission and costing
+
+Costs below come from the controlled Level 1 fixture, not production measurements.
+
+```json
+{
+  "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+  "inventory": "all_root_candidates",
+  "joint_workload_search_exhaustive": false
+}
+```
+
+
+| Candidate | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- |
+| 0 | `"selected"` | `155.0` | `null` |
+| 1 | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `"unselected"` | `242.0` | `null` |
+
+Successfully compiled candidate plans: [topk-rate-0](candidates/topk-rate-0.json), [topk-rate-1](candidates/topk-rate-1.json), [topk-rate-2](candidates/topk-rate-2.json)
+
 ## Persisted boundaries
 
 Binding for `compat-query-0`:
@@ -49,7 +70,7 @@ Binding for `compat-query-0`:
     },
     "1": {
       "placement": "materialization",
-      "stored_output": 14425999489689100447
+      "stored_output": 11966640087163441478
     }
   },
   "query_sink": 4,
@@ -60,7 +81,7 @@ Binding for `compat-query-0`:
 }
 ```
 
-Stored output `14425999489689100447` → semantic definition `sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c`.
+Stored output `11966640087163441478` → semantic definition `sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c`.
 
 ### Maintenance configuration
 
@@ -73,7 +94,9 @@ Stored output `14425999489689100447` → semantic definition `sds-v1:528d2a7adb5
       "promql_right_closed": true
     },
     "grouping_labels": {
-      "labels": []
+      "labels": [
+        "label_0"
+      ]
     },
     "partitioning": "per_entity",
     "aggregated_labels": {
@@ -153,10 +176,10 @@ This is the emitted adapter representation, including dependencies, pane size, r
       "op": "read_materialization",
       "binding": {
         "stored_output_reference": {
-          "stored_output_id": 14425999489689100447,
+          "stored_output_id": 11966640087163441478,
           "definition_id": "sds-v1:528d2a7adb528822d205d1e239daf9904249ae30c5c50c6f7288f286b451ea6c"
         },
-        "materialization": 14425999489689100447,
+        "materialization": 11966640087163441478,
         "output_grouping": {
           "mode": "per_entity"
         },

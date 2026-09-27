@@ -88,7 +88,7 @@ for path in sorted(BASE.glob('*.json')):
             lines += [block(trace['computation_search_scope'])]
         for group in trace.get('groups', []):
             for rejected in group.get('rejected', []):
-                description = rejected.get('description', '').replace('alternatives', 'candidates')
+                description = rejected.get('description', '').split(' — ', 1)[0]
                 lines += [f"- {description}: {rejected.get('reason', '')}"]
     lines += ['', '| Candidate | Status | Fixture cost | Rejection / unavailable reason |',
               '| --- | --- | --- | --- |']

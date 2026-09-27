@@ -1,0 +1,495 @@
+{
+  "envelope": {
+    "plan_id": 2697027346875258477,
+    "plan_version": 1,
+    "generated_at_unix_ms": 10000,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1",
+    "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+    "capability_snapshot_id": "asapquery-local-v1"
+  },
+  "summary_catalog": {
+    "schema_version": 4,
+    "plan_id": 2697027346875258477,
+    "plan_version": 1,
+    "summary_descriptors": {},
+    "data_descriptors": {},
+    "outputs": {},
+    "definitions": {}
+  },
+  "collector_plans": [],
+  "precompute_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 2697027346875258477,
+      "plan_version": 1,
+      "snapshot_sha256": "c39264742060bb3770b355054f4ae836778892df8f7839eb4acb8e7c2f6c8132"
+    },
+    "envelope": {
+      "plan_id": 2697027346875258477,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "ingest": {
+      "protocol": "prometheus_remote_write_v1",
+      "endpoint_path": "/api/v1/write",
+      "timestamp_unit": "unix_milliseconds",
+      "require_plan_identity": false,
+      "require_stored_output_identity": false,
+      "require_registered_producer": false
+    },
+    "schemas": [],
+    "producers": [],
+    "materializations": []
+  },
+  "transmission_plan": {
+    "summary_catalog": {
+      "schema_version": 4,
+      "plan_id": 2697027346875258477,
+      "plan_version": 1,
+      "snapshot_sha256": "c39264742060bb3770b355054f4ae836778892df8f7839eb4acb8e7c2f6c8132"
+    },
+    "envelope": {
+      "plan_id": 2697027346875258477,
+      "plan_version": 1,
+      "generated_at_unix_ms": 10000,
+      "activation_unix_ms": 10000,
+      "expiry_unix_ms": null,
+      "backend_compat": "asap-query-backend.v1",
+      "planner_revision": "2bdf1d2e8eca0ce5aabdc998ca0755b21da7f986",
+      "capability_snapshot_id": "asapquery-local-v1"
+    },
+    "frame_identity": {
+      "identity_version": 1,
+      "sequence_scope": "materialization_series_producer_epoch",
+      "require_checkpoint_for_full": true,
+      "require_base_checkpoint_for_delta": true
+    },
+    "rules": []
+  },
+  "query_plan": {
+    "plan_id": 2697027346875258477,
+    "plan_version": 1,
+    "selected_dags": {
+      "compat-query-0": {
+        "schema_version": 5,
+        "query_id": "compat-query-0",
+        "nodes": [
+          {
+            "id": 0,
+            "payload": {
+              "expression": {
+                "TimeRange": {
+                  "child": {
+                    "Scan": {
+                      "predicates": [],
+                      "schema": {
+                        "closed": false,
+                        "columns": [
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": null
+                          },
+                          {
+                            "dtype": "utf8",
+                            "name": "label_0",
+                            "nullable": true,
+                            "table": null
+                          }
+                        ],
+                        "time_index": 0,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "TimeSeries": {
+                          "metric": "data"
+                        }
+                      }
+                    }
+                  },
+                  "range": {
+                    "nanos": 0,
+                    "secs": 5
+                  }
+                }
+              },
+              "kind": "fallback"
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "source samples"
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "payload": {
+              "kind": "value",
+              "operation": {
+                "MaintainPopulation": {
+                  "population": {
+                    "input": {
+                      "CurrentSeries": {
+                        "grouping": [
+                          "label_0"
+                        ],
+                        "lookback_ms": 5000,
+                        "matchers": [],
+                        "metric": "data",
+                        "without": false
+                      }
+                    },
+                    "max_k": 3,
+                    "quantiles": false
+                  }
+                }
+              }
+            },
+            "output_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "exact members under the declared population semantics"
+                }
+              ]
+            }
+          },
+          {
+            "id": 2,
+            "payload": {
+              "kind": "value",
+              "operation": {
+                "ReadPopulation": {
+                  "readout": {
+                    "TopK": {
+                      "k": 3
+                    }
+                  }
+                }
+              }
+            },
+            "output_state": {
+              "timing": "query_time",
+              "primitive": "Raw"
+            },
+            "output_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "exact current-population readout"
+                }
+              ]
+            }
+          }
+        ],
+        "edges": [
+          {
+            "producer": 0,
+            "consumer": 1,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+          },
+          {
+            "producer": 1,
+            "consumer": 2,
+            "role": "Input",
+            "intermediate_schema": {
+              "fields": [
+                {
+                  "dtype": {
+                    "Plain": "timestamp"
+                  },
+                  "name": "ts",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "float64"
+                  },
+                  "name": "value",
+                  "nullable": false
+                },
+                {
+                  "dtype": {
+                    "Plain": "utf8"
+                  },
+                  "name": "label_0",
+                  "nullable": true
+                }
+              ],
+              "time_index": 0
+            },
+            "data_state": {
+              "timing": "ingestion_time",
+              "primitive": "Raw"
+            },
+            "grouping": "NotApplicable",
+            "window": "NotApplicable"
+          }
+        ],
+        "root": 2
+      }
+    },
+    "entries": {
+      "topk by (label_0) (3, data)": {
+        "language": "prom_ql",
+        "query_id": "compat-query-0",
+        "canonical_query": "topk by (label_0) (3, data)",
+        "root": 0,
+        "nodes": {
+          "0": {
+            "op": "logical",
+            "operator": {
+              "kind": "current_series",
+              "population": {
+                "metric": "data",
+                "matchers": [],
+                "grouping": {
+                  "labels": [
+                    "label_0"
+                  ],
+                  "without": false
+                },
+                "lookback_ms": 5000,
+                "max_input_lag_ms": 5000,
+                "history_retention_ms": 0,
+                "max_series": 100000,
+                "max_bytes": 1073741824,
+                "max_k": 3,
+                "quantiles": false
+              },
+              "readout": {
+                "kind": "top_k",
+                "k": 3
+              }
+            },
+            "inputs": []
+          }
+        },
+        "instant": {
+          "lookback_ms": 5000,
+          "full_history": false,
+          "cumulative_readout": true
+        },
+        "fallback": "exact_backend"
+      }
+    }
+  },
+  "storage_routing": {
+    "default_engine": "asap_query",
+    "metrics": [],
+    "tenant": "default"
+  },
+  "lifecycle_estimates": [],
+  "cost_comparison": null,
+  "planner_selection_trace": [
+    {
+      "candidate_assembly_rejections": [],
+      "committed_roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:b380eb945b2640c6d136a7f15ee66c930b1f748d302b99ae33614ba5b9e68e08",
+          "query_index": 0
+        }
+      ],
+      "computation_search_scope": {
+        "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+        "inventory": "all_root_candidates",
+        "joint_workload_search_exhaustive": false
+      },
+      "deployment_overrides": [],
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 0,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:01946213927c1a55fd8a33b377da423dbdf9a68c4f799e9c69ef2d351969ab03"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 1,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:a8d89afe8dcb0b4891987e7c7779ea577d8e30480752d29554cfa2c68c6b8daf"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 2,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:895df194bc0a6bd010cf6387dc67324d437eed29d154e49eb9c2c82774fdc797"
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 3,
+          "rejected": [],
+          "target_id": "asap-explain-v1:target:488bb6ba5af7d7fb5fe373487cd181ea65416a8dfb251ec38ba769be612ae312"
+        }
+      ],
+      "roots": [
+        {
+          "logical_root_id": "asap-explain-v1:root:b380eb945b2640c6d136a7f15ee66c930b1f748d302b99ae33614ba5b9e68e08",
+          "query_index": 0
+        }
+      ],
+      "schema_version": 1
+    }
+  ]
+}
