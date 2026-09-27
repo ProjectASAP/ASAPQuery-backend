@@ -38,13 +38,33 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 }
 ```
 
+### Planner physical candidate
+
+Logical root: `null`.
+
+
+
+Guarantee: `null`
+
+invalid DAG: ranking requires one exact per-series Rate frontier
+
+### Planner physical candidate
+
+Logical root: `null`.
+
+
+
+Guarantee: `null`
+
+invalid DAG: ranking requires one exact per-series Rate frontier
+
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:6c8189cd0edd95b27e17aea6db55caf7e65a74df9fdab82440e45423cfff8f7b"]` | `"selected"` | `95.0` | `null` |
-| 1 | `["asap-explain-v1:root:ec68700333a360fe95b44ffe857bff4ddb5edd7a68e5c6e6739fd46598318ffd"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:677c17ebaa3903cdf54856f869cf13e5d3b347f6793c243f5537ce6474b80741"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
-| 3 | `["asap-explain-v1:root:b7c61d6400b48010b50be44a67267fba78022d774c798351e28de3af7fed5319"]` | `"unselected"` | `125.0` | `null` |
+| 0 | `["asap-explain-v1:root:5efffd4a80a801d5afec54dd73b388d1bf3fd8552c8c5bf7a5e6266c7914289c"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:bb5e147f97964e9682b5a4f4cbc408bff8def6352684f3d8a409a93bcb43af41"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:d4790d6fa34e8c3a9f8880f785ad17b1b33bb6b11fb3cac6b491e7e88407c1ab"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| 3 | `["asap-explain-v1:root:1e5ddc1f0dbddbf7c2e03528cc8d8651f5373f981dfbf13a38df07e54a91ad7a"]` | `"unselected"` | `125.0` | `null` |
 
 Successfully compiled candidate plans: [grouped-temporal-sum-0](candidates/grouped-temporal-sum-0.json), [grouped-temporal-sum-1](candidates/grouped-temporal-sum-1.json), [grouped-temporal-sum-3](candidates/grouped-temporal-sum-3.json)
 

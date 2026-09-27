@@ -1919,3 +1919,6 @@ mod univmon_erp_process;
 
 #[path = "support/spatial_heap_process.rs"]
 mod spatial_heap_process;
+
+#[path = "support/rate_heap_process.rs"]
+mod rate_heap_process;

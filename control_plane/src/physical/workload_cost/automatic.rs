@@ -499,6 +499,11 @@ pub(super) fn estimate(
             let mut detail = json!({"input_rows":input_rows});
             let mut network = 0.0;
             let cpu = match node {
+                Node::Physical { .. } => {
+                    let (cpu, workspace) = snapshot_work(entry, input_rows)?;
+                    detail = json!({"input_rows":input_rows,"physical_program":entry.physical_dag,"workspace_bytes_bound":workspace});
+                    cpu
+                }
                 Node::ReadMaterialization { binding } => {
                     let s = states
                         .get(&binding.materialization.fingerprint())
@@ -650,7 +655,9 @@ pub(super) fn estimate(
             } else {
                 BTreeSet::new()
             };
-            let workspace_byte_seconds = if entry.population_snapshot().is_some() {
+            let workspace_byte_seconds = if matches!(node, Node::Physical { .. }) {
+                snapshot_work(entry, input_rows)?.1 * cpu * evaluations
+            } else if entry.population_snapshot().is_some() {
                 snapshot_work(entry, cardinality)?.1 * cpu * evaluations
             } else {
                 0.0

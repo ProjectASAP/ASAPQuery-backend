@@ -6,7 +6,7 @@
     "activation_unix_ms": 10000,
     "expiry_unix_ms": null,
     "backend_compat": "asap-query-backend.v1",
-    "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
+    "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
     "capability_snapshot_id": "asapquery-local-v1"
   },
   "summary_catalog": {
@@ -197,7 +197,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
+      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "ingest": {
@@ -663,7 +663,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
+      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "frame_identity": {
@@ -1382,7 +1382,7 @@
       "candidate_assembly_rejections": [],
       "committed_roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:0a36a2bb43a5c67a3c0cdab44d6d7fa5a769bc85af3fb7fa2c41b396da68ef3d",
+          "logical_root_id": "asap-explain-v1:root:1f040959f6bd310c8f43ccf79eb37d38a12469a6e08588a848bb41449d3778f4",
           "query_index": 0
         }
       ],
@@ -1398,7 +1398,7 @@
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:a57a9a5af2eb437c2c385614cc70f207d5356a352eb0c5b9ca612e18611ee0a9",
+              "candidate_id": "asap-explain-v1:candidate:d3f3c43a0e2f06589c622545e13b5cb4d0b0dc643d8eb75e216493eb7b41753c",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -1463,13 +1463,13 @@
           "consumer_count": 1,
           "group_id": 0,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:6bafe9c54cda3e799b6b40c2be9654161e388bb423519a554d9996ac868fedc5"
+          "target_id": "asap-explain-v1:target:ede641258d6c6c57789db368ce0412c1c0da06e74165e700912daab8f272ea4c"
         },
         {
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:d72e273e0a55a12a715ae312623ba8aacff4af16af0c164cfb813ff934aecb7a",
+              "candidate_id": "asap-explain-v1:candidate:a6925dc98136d616dcea4a0336a2cb8a27916e4ce81cff47330b17d299c2e984",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -1534,30 +1534,1829 @@
           "consumer_count": 1,
           "group_id": 1,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:b9cac0f4239c7186cb73aaaf9444df7fc60a00189f6d8cd75879f3926ff7e274"
+          "target_id": "asap-explain-v1:target:b8b8189857cb686ee6417f8a5f4983dcc56989b208cc012b38d99528e9aad496"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 2,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:74c012275701cb78be91b3415f605a53802b2a710020b4c96125946d4495771a"
+          "target_id": "asap-explain-v1:target:3b9064ebf966ec0eaec1af0985a979564b15eb5ec7f8cbcd8f4bfe14c6a476fe"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 3,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:b4bb9f59761cfee4a65d231ca69c105189a9272accda0075e480cc45b1ad77b5"
+          "target_id": "asap-explain-v1:target:65d5f761dcf95671dffb45e7742a12eef3531e6f3d03e4e0d8c07a7612f09525"
         }
       ],
       "roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:0a36a2bb43a5c67a3c0cdab44d6d7fa5a769bc85af3fb7fa2c41b396da68ef3d",
+          "logical_root_id": "asap-explain-v1:root:1f040959f6bd310c8f43ccf79eb37d38a12469a6e08588a848bb41449d3778f4",
           "query_index": 0
         }
       ],
       "schema_version": 1
+    },
+    {
+      "guarantee": {
+        "bound": {
+          "op": "zero"
+        },
+        "failure_probability": {
+          "op": "zero"
+        },
+        "metric": "absolute_value",
+        "provenance": [
+          {
+            "kind": "exact",
+            "reason": "ExactAggregate(Rate)"
+          },
+          {
+            "guarantee": {
+              "bound": {
+                "op": "zero"
+              },
+              "failure_probability": {
+                "op": "zero"
+              },
+              "metric": "absolute_value",
+              "provenance": [
+                {
+                  "kind": "exact",
+                  "reason": "KeepPreAsap"
+                }
+              ]
+            },
+            "input_index": 0,
+            "kind": "child_guarantee"
+          },
+          {
+            "kind": "composition_step",
+            "operator": {
+              "op": "counter_rate"
+            },
+            "rule": "exact_input"
+          }
+        ]
+      },
+      "logical_root_id": "asap-explain-v1:root:908757ed9c20f3cd5c92d8329e3880c6c876a7b154c4551a78f5d641634ed6f2",
+      "physical_dag": {
+        "nodes": {
+          "2": {
+            "Input": {
+              "properties": {
+                "boundedness": "Bounded",
+                "emission": "Unknown"
+              },
+              "schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "$promql_series_identity",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              }
+            }
+          },
+          "3": {
+            "Operator": {
+              "inputs": [
+                2
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "Sort": {
+                    "groups": [
+                      2
+                    ],
+                    "keys": [
+                      {
+                        "column": 1,
+                        "descending": true,
+                        "nulls_first": false
+                      }
+                    ]
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          },
+          "4": {
+            "Operator": {
+              "inputs": [
+                3
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "Limit": {
+                    "groups": [
+                      2
+                    ],
+                    "n": 3,
+                    "offset": 0
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          }
+        },
+        "roots": [
+          4
+        ],
+        "version": 1
+      },
+      "query_id": "compat-query-0",
+      "rationale": "select exact Top-K from independently maintained temporal values",
+      "stage": "planner.physical_candidate"
+    },
+    {
+      "guarantee": {
+        "bound": {
+          "op": "unknown",
+          "statistic": "topk_membership_margin"
+        },
+        "failure_probability": {
+          "op": "union_bound",
+          "terms": [
+            {
+              "op": "unknown",
+              "statistic": "topk_interval_failure_probability"
+            },
+            {
+              "count": {
+                "op": "unknown",
+                "statistic": "topk_max_distinct_items"
+              },
+              "inner": {
+                "op": "constant",
+                "value": 0.006737946999085467
+              },
+              "op": "scaled"
+            }
+          ]
+        },
+        "metric": "top_k_membership",
+        "provenance": [
+          {
+            "guarantee": {
+              "bound": {
+                "op": "constant",
+                "value": 0.009993683192864136
+              },
+              "failure_probability": {
+                "count": {
+                  "op": "unknown",
+                  "statistic": "topk_max_distinct_items"
+                },
+                "inner": {
+                  "op": "constant",
+                  "value": 0.006737946999085467
+                },
+                "op": "scaled"
+              },
+              "metric": "frequency",
+              "provenance": [
+                {
+                  "algorithm": "CmsWithHeap",
+                  "contract": "count_min_l1_markov_v1",
+                  "kind": "sketch_readout",
+                  "params": {
+                    "CmsWithHeap": {
+                      "depth": 5,
+                      "heap_size": 100,
+                      "width": 272
+                    }
+                  },
+                  "query": "TopK { k: 100 }"
+                },
+                {
+                  "kind": "unavailable_statistic",
+                  "statistic": "topk_max_distinct_items"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "approximate_aggregate"
+                  },
+                  "rule": "simultaneous_score_bounds_over_distinct_partition_item_identities"
+                }
+              ]
+            },
+            "input_index": 0,
+            "kind": "child_guarantee"
+          },
+          {
+            "kind": "unavailable_statistic",
+            "statistic": "topk_selected_lower_bound"
+          },
+          {
+            "kind": "unavailable_statistic",
+            "statistic": "topk_excluded_upper_bound"
+          },
+          {
+            "kind": "unavailable_statistic",
+            "statistic": "topk_interval_failure_probability"
+          },
+          {
+            "kind": "composition_step",
+            "operator": {
+              "op": "top_k_selection"
+            },
+            "rule": "topk_membership_margin_certificate"
+          }
+        ]
+      },
+      "logical_root_id": "asap-explain-v1:root:9c781a6f8ee6ff1521a78043c04c2b6b9781949e93de89a494c70a6dd2a0b50d",
+      "physical_dag": {
+        "nodes": {
+          "2": {
+            "Input": {
+              "properties": {
+                "boundedness": "Bounded",
+                "emission": "Unknown"
+              },
+              "schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "$promql_series_identity",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              }
+            }
+          },
+          "3": {
+            "Operator": {
+              "inputs": [
+                2
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "KeyedSummaryBuild": {
+                    "family": {
+                      "Sketch": [
+                        {
+                          "algorithm": "CmsWithHeap",
+                          "category": "TopK",
+                          "params": {
+                            "CmsWithHeap": {
+                              "depth": 5,
+                              "heap_size": 100,
+                              "width": 272
+                            }
+                          }
+                        },
+                        "PerSubpopulationInstance"
+                      ]
+                    },
+                    "groups": [
+                      2
+                    ],
+                    "items": [
+                      0,
+                      3
+                    ],
+                    "value": 1
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Sketch": [
+                          {
+                            "algorithm": "CmsWithHeap",
+                            "category": "TopK",
+                            "params": {
+                              "CmsWithHeap": {
+                                "depth": 5,
+                                "heap_size": 100,
+                                "width": 272
+                              }
+                            }
+                          },
+                          "PerSubpopulationInstance"
+                        ]
+                      },
+                      "name": "topk_3",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                }
+              }
+            }
+          },
+          "4": {
+            "Operator": {
+              "inputs": [
+                3
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Sketch": [
+                            {
+                              "algorithm": "CmsWithHeap",
+                              "category": "TopK",
+                              "params": {
+                                "CmsWithHeap": {
+                                  "depth": 5,
+                                  "heap_size": 100,
+                                  "width": 272
+                                }
+                              }
+                            },
+                            "PerSubpopulationInstance"
+                          ]
+                        },
+                        "name": "topk_3",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": null
+                  }
+                ],
+                "kind": {
+                  "KeyedReadout": {
+                    "k": 100,
+                    "state": 1
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "__asap_estimate",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                }
+              }
+            }
+          },
+          "5": {
+            "Operator": {
+              "inputs": [
+                4
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "__asap_estimate",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": null
+                  }
+                ],
+                "kind": {
+                  "Project": [
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 1
+                        },
+                        "output": [
+                          "timestamp",
+                          false
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    },
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 3
+                        },
+                        "output": [
+                          "float64",
+                          false
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    },
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 0
+                        },
+                        "output": [
+                          "utf8",
+                          true
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    },
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 2
+                        },
+                        "output": [
+                          "utf8",
+                          false
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    }
+                  ]
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          },
+          "6": {
+            "Operator": {
+              "inputs": [
+                5
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "Sort": {
+                    "groups": [
+                      2
+                    ],
+                    "keys": [
+                      {
+                        "column": 1,
+                        "descending": true,
+                        "nulls_first": false
+                      }
+                    ]
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          },
+          "7": {
+            "Operator": {
+              "inputs": [
+                6
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "Limit": {
+                    "groups": [
+                      2
+                    ],
+                    "n": 3,
+                    "offset": 0
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          }
+        },
+        "roots": [
+          7
+        ],
+        "version": 1
+      },
+      "query_id": "compat-query-0",
+      "rationale": "top-3 heavy-hitters realizes as a CmsWithHeap sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+      "stage": "planner.physical_candidate"
+    },
+    {
+      "guarantee": {
+        "bound": {
+          "op": "unknown",
+          "statistic": "topk_membership_margin"
+        },
+        "failure_probability": {
+          "op": "union_bound",
+          "terms": [
+            {
+              "op": "unknown",
+              "statistic": "topk_interval_failure_probability"
+            },
+            {
+              "count": {
+                "op": "unknown",
+                "statistic": "topk_max_distinct_items"
+              },
+              "inner": {
+                "op": "constant",
+                "value": 0.009940766872773949
+              },
+              "op": "scaled"
+            }
+          ]
+        },
+        "metric": "top_k_membership",
+        "provenance": [
+          {
+            "guarantee": {
+              "bound": {
+                "op": "constant",
+                "value": 0.01
+              },
+              "failure_probability": {
+                "count": {
+                  "op": "unknown",
+                  "statistic": "topk_max_distinct_items"
+                },
+                "inner": {
+                  "op": "constant",
+                  "value": 0.009940766872773949
+                },
+                "op": "scaled"
+              },
+              "metric": "l2_frequency",
+              "provenance": [
+                {
+                  "algorithm": "CountSketchWithHeap",
+                  "contract": "count_sketch_l2_median_hoeffding_v1",
+                  "kind": "sketch_readout",
+                  "params": {
+                    "CountSketchWithHeap": {
+                      "depth": 83,
+                      "heap_size": 100,
+                      "width": 30000
+                    }
+                  },
+                  "query": "TopK { k: 100 }"
+                },
+                {
+                  "kind": "unavailable_statistic",
+                  "statistic": "topk_max_distinct_items"
+                },
+                {
+                  "kind": "composition_step",
+                  "operator": {
+                    "op": "approximate_aggregate"
+                  },
+                  "rule": "simultaneous_score_bounds_over_distinct_partition_item_identities"
+                }
+              ]
+            },
+            "input_index": 0,
+            "kind": "child_guarantee"
+          },
+          {
+            "kind": "unavailable_statistic",
+            "statistic": "topk_selected_lower_bound"
+          },
+          {
+            "kind": "unavailable_statistic",
+            "statistic": "topk_excluded_upper_bound"
+          },
+          {
+            "kind": "unavailable_statistic",
+            "statistic": "topk_interval_failure_probability"
+          },
+          {
+            "kind": "composition_step",
+            "operator": {
+              "op": "top_k_selection"
+            },
+            "rule": "topk_membership_margin_certificate"
+          }
+        ]
+      },
+      "logical_root_id": "asap-explain-v1:root:4a670de6282d46c41df7fa3295bf3e5b6e058fd05d6222234784f260dc4e3d64",
+      "physical_dag": {
+        "nodes": {
+          "2": {
+            "Input": {
+              "properties": {
+                "boundedness": "Bounded",
+                "emission": "Unknown"
+              },
+              "schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "timestamp"
+                    },
+                    "name": "ts",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "label_0",
+                    "nullable": true
+                  },
+                  {
+                    "dtype": {
+                      "Plain": "utf8"
+                    },
+                    "name": "$promql_series_identity",
+                    "nullable": false
+                  }
+                ],
+                "time_index": 0
+              }
+            }
+          },
+          "3": {
+            "Operator": {
+              "inputs": [
+                2
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "KeyedSummaryBuild": {
+                    "family": {
+                      "Sketch": [
+                        {
+                          "algorithm": "CountSketchWithHeap",
+                          "category": "TopK",
+                          "params": {
+                            "CountSketchWithHeap": {
+                              "depth": 83,
+                              "heap_size": 100,
+                              "width": 30000
+                            }
+                          }
+                        },
+                        "PerSubpopulationInstance"
+                      ]
+                    },
+                    "groups": [
+                      2
+                    ],
+                    "items": [
+                      0,
+                      3
+                    ],
+                    "value": 1
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Sketch": [
+                          {
+                            "algorithm": "CountSketchWithHeap",
+                            "category": "TopK",
+                            "params": {
+                              "CountSketchWithHeap": {
+                                "depth": 83,
+                                "heap_size": 100,
+                                "width": 30000
+                              }
+                            }
+                          },
+                          "PerSubpopulationInstance"
+                        ]
+                      },
+                      "name": "topk_3",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                }
+              }
+            }
+          },
+          "4": {
+            "Operator": {
+              "inputs": [
+                3
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Sketch": [
+                            {
+                              "algorithm": "CountSketchWithHeap",
+                              "category": "TopK",
+                              "params": {
+                                "CountSketchWithHeap": {
+                                  "depth": 83,
+                                  "heap_size": 100,
+                                  "width": 30000
+                                }
+                              }
+                            },
+                            "PerSubpopulationInstance"
+                          ]
+                        },
+                        "name": "topk_3",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": null
+                  }
+                ],
+                "kind": {
+                  "KeyedReadout": {
+                    "k": 100,
+                    "state": 1
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "__asap_estimate",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                }
+              }
+            }
+          },
+          "5": {
+            "Operator": {
+              "inputs": [
+                4
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "__asap_estimate",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": null
+                  }
+                ],
+                "kind": {
+                  "Project": [
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 1
+                        },
+                        "output": [
+                          "timestamp",
+                          false
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    },
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 3
+                        },
+                        "output": [
+                          "float64",
+                          false
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    },
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 0
+                        },
+                        "output": [
+                          "utf8",
+                          true
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    },
+                    {
+                      "Planner": {
+                        "expression": {
+                          "Column": 2
+                        },
+                        "output": [
+                          "utf8",
+                          false
+                        ],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "utf8",
+                              "name": "label_0",
+                              "nullable": true,
+                              "table": null
+                            },
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "utf8",
+                              "name": "$promql_series_identity",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "__asap_estimate",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": null,
+                          "unique_keys": []
+                        }
+                      }
+                    }
+                  ]
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          },
+          "6": {
+            "Operator": {
+              "inputs": [
+                5
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "Sort": {
+                    "groups": [
+                      2
+                    ],
+                    "keys": [
+                      {
+                        "column": 1,
+                        "descending": true,
+                        "nulls_first": false
+                      }
+                    ]
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          },
+          "7": {
+            "Operator": {
+              "inputs": [
+                6
+              ],
+              "operator": {
+                "inputs": [
+                  {
+                    "fields": [
+                      {
+                        "dtype": {
+                          "Plain": "timestamp"
+                        },
+                        "name": "ts",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "float64"
+                        },
+                        "name": "value",
+                        "nullable": false
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "label_0",
+                        "nullable": true
+                      },
+                      {
+                        "dtype": {
+                          "Plain": "utf8"
+                        },
+                        "name": "$promql_series_identity",
+                        "nullable": false
+                      }
+                    ],
+                    "time_index": 0
+                  }
+                ],
+                "kind": {
+                  "Limit": {
+                    "groups": [
+                      2
+                    ],
+                    "n": 3,
+                    "offset": 0
+                  }
+                },
+                "output": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "label_0",
+                      "nullable": true
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "$promql_series_identity",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 0
+                }
+              }
+            }
+          }
+        },
+        "roots": [
+          7
+        ],
+        "version": 1
+      },
+      "query_id": "compat-query-0",
+      "rationale": "top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+      "stage": "planner.physical_candidate"
     }
   ]
 }

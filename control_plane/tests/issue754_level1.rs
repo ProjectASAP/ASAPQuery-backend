@@ -183,6 +183,74 @@ fn topk_rate_sort_contract_rejects_wrong_value_expression() {
     }
 }
 
+fn assert_native_ranking(installed: &asap_types::query_plan::QueryPlanEntry) {
+    let physical = if installed.physical_vector_binding().is_some() {
+        installed.recover_vector_physical_dag().unwrap()
+    } else {
+        installed.recover_population_physical_dag().unwrap()
+    };
+    let inputs = physical.input_contracts().collect::<Vec<_>>();
+    assert_eq!(
+        inputs.len(),
+        1,
+        "spatial ranking binds one complete population"
+    );
+    let input = &inputs[0].1.schema;
+    assert!(input
+        .fields
+        .iter()
+        .any(|field| field.name == "$promql_series_identity"));
+    let value_column = input
+        .fields
+        .iter()
+        .position(|field| field.name == "value")
+        .unwrap();
+    let group_column = input
+        .fields
+        .iter()
+        .position(|field| field.name == "label_0")
+        .unwrap();
+    let program: Value = serde_json::from_slice(&physical.encode().unwrap()).unwrap();
+    let operations: Vec<_> = program["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|node| node.get("Operator"))
+        .collect();
+    assert_eq!(operations.len(), 2);
+    let sort = operations
+        .iter()
+        .find(|node| node["operator"]["kind"].get("Sort").is_some())
+        .unwrap();
+    assert_eq!(
+        sort["operator"]["kind"]["Sort"]["keys"],
+        json!([{"column":value_column,"descending":true,"nulls_first":false}])
+    );
+    assert_eq!(
+        sort["operator"]["kind"]["Sort"]["groups"],
+        json!([group_column])
+    );
+    let limit = operations
+        .iter()
+        .find(|node| node["operator"]["kind"].get("Limit").is_some())
+        .unwrap();
+    assert_eq!(
+        limit["operator"]["kind"]["Limit"],
+        json!({"n":3,"offset":0,"groups":[group_column]})
+    );
+    assert_eq!(sort["inputs"], json!([inputs[0].0]));
+    let sort_id: u64 = program["nodes"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, node)| node.get("Operator") == Some(*sort))
+        .unwrap()
+        .0
+        .parse()
+        .unwrap();
+    assert_eq!(limit["inputs"], json!([sort_id]));
+}
+
 fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<String> {
     if name == "topk-rate" {
         for dag in plan.query_plan.selected_dags.values() {
@@ -246,67 +314,7 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
         assert_eq!(node["operator"]["population"]["max_k"], 3);
         assert_eq!(node["operator"]["readout"], json!({"kind":"snapshot"}));
         let installed = plan.query_plan.entries.values().next().unwrap();
-        let physical = installed.recover_population_physical_dag().unwrap();
-        let inputs = physical.input_contracts().collect::<Vec<_>>();
-        assert_eq!(
-            inputs.len(),
-            1,
-            "spatial ranking binds one complete population"
-        );
-        let input = &inputs[0].1.schema;
-        assert!(input
-            .fields
-            .iter()
-            .any(|field| field.name == "$promql_series_identity"));
-        let value_column = input
-            .fields
-            .iter()
-            .position(|field| field.name == "value")
-            .unwrap();
-        let group_column = input
-            .fields
-            .iter()
-            .position(|field| field.name == "label_0")
-            .unwrap();
-        let program: Value = serde_json::from_slice(&physical.encode().unwrap()).unwrap();
-        let operations: Vec<_> = program["nodes"]
-            .as_object()
-            .unwrap()
-            .values()
-            .filter_map(|node| node.get("Operator"))
-            .collect();
-        assert_eq!(operations.len(), 2);
-        let sort = operations
-            .iter()
-            .find(|node| node["operator"]["kind"].get("Sort").is_some())
-            .unwrap();
-        assert_eq!(
-            sort["operator"]["kind"]["Sort"]["keys"],
-            json!([{"column":value_column,"descending":true,"nulls_first":false}])
-        );
-        assert_eq!(
-            sort["operator"]["kind"]["Sort"]["groups"],
-            json!([group_column])
-        );
-        let limit = operations
-            .iter()
-            .find(|node| node["operator"]["kind"].get("Limit").is_some())
-            .unwrap();
-        assert_eq!(
-            limit["operator"]["kind"]["Limit"],
-            json!({"n":3,"offset":0,"groups":[group_column]})
-        );
-        assert_eq!(sort["inputs"], json!([inputs[0].0]));
-        let sort_id: u64 = program["nodes"]
-            .as_object()
-            .unwrap()
-            .iter()
-            .find(|(_, node)| node.get("Operator") == Some(*sort))
-            .unwrap()
-            .0
-            .parse()
-            .unwrap();
-        assert_eq!(limit["inputs"], json!([sort_id]));
+        assert_native_ranking(installed);
         assert!(
             materializations.is_empty(),
             "{name}: current-series readout has no summary producer"
@@ -349,6 +357,15 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
         }));
         return None;
     }
+    let native_rate = name == "topk-rate" && node["op"] == "physical";
+    if native_rate {
+        let installed = plan.query_plan.entries.values().next().unwrap();
+        assert_native_ranking(installed);
+        let inputs = node["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1);
+        node = &nodes[&inputs[0].to_string()];
+        expected.root_operation = None;
+    }
     let Some(family) = expected.family.as_ref() else {
         panic!("{name}: no physical plan contract");
     };
@@ -387,7 +404,9 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
     }
     assert_eq!(
         nodes.len(),
-        if expected.root_operation == Some("limit") {
+        if native_rate {
+            3
+        } else if expected.root_operation == Some("limit") {
             4
         } else if expected.root_operation.is_some() {
             3
@@ -600,35 +619,45 @@ fn issue754_queries_have_valid_physical_plans() {
                 "root substitutions must not be reported as exhaustive joint search"
             );
         }
-        let snapshot_heap_root = if case.name == "spatial-topk" {
-            let trace = request
-                .planner_selection_trace
-                .iter()
-                .find(|trace| {
-                    trace["stage"] == "planner.physical_candidate"
-                        && trace["physical_dag"]
-                            .to_string()
-                            .contains("CountSketchWithHeap")
-                })
-                .expect("Planner must expose a physical signed snapshot heap candidate");
-            let program = asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(
-                &serde_json::to_vec(&trace["physical_dag"]).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(program.input_contracts().count(), 1);
-            let encoded = trace["physical_dag"].to_string();
-            assert!(encoded.contains("KeyedSummaryBuild") && encoded.contains("KeyedReadout"));
-            assert!(encoded.contains("$promql_series_identity"));
-            assert!(
-                !encoded.contains("CurrentSeries"),
-                "the source already supplies an eligible snapshot"
-            );
-            assert!(trace["guarantee"].to_string().contains("topk_max_distinct_items"),
-                "this fixture has no enforced distinct-item bound; do not invent one from estimated cardinality");
-            Some(trace["logical_root_id"].as_str().unwrap().to_owned())
-        } else {
-            None
+        let heap_families: &[&str] = match case.name.as_str() {
+            "spatial-topk" => &["CountSketchWithHeap"],
+            "topk-rate" => &["CmsWithHeap", "CountSketchWithHeap"],
+            _ => &[],
         };
+        let heap_roots =
+            heap_families
+                .iter()
+                .map(|family| {
+                    let trace = request
+                        .planner_selection_trace
+                        .iter()
+                        .find(|trace| {
+                            trace["stage"] == "planner.physical_candidate"
+                                && trace["physical_dag"].to_string().contains(family)
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("{}: Planner must expose native {family}", case.name)
+                        });
+                    let program =
+                        asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(
+                            &serde_json::to_vec(&trace["physical_dag"]).unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(program.input_contracts().count(), 1);
+                    let encoded = trace["physical_dag"].to_string();
+                    assert!(
+                        encoded.contains("KeyedSummaryBuild") && encoded.contains("KeyedReadout")
+                    );
+                    assert!(encoded.contains("$promql_series_identity"));
+                    assert!(
+                        !encoded.contains("CurrentSeries"),
+                        "the bound source supplies this evaluation's vector"
+                    );
+                    assert!(trace["guarantee"].to_string().contains("topk_max_distinct_items"),
+                "fixture lacks an enforced bound; cardinality estimates cannot certify a heap");
+                    trace["logical_root_id"].as_str().unwrap().to_owned()
+                })
+                .collect::<Vec<_>>();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let mut valid_plans = Vec::new();
         let mut quotes = Vec::new();
@@ -744,7 +773,7 @@ fn issue754_queries_have_valid_physical_plans() {
         let selected = input
             .compile_promql()
             .unwrap_or_else(|error| panic!("{} selected plan failed: {error}", case.name));
-        if let Some(root_id) = snapshot_heap_root {
+        for root_id in heap_roots {
             let report = selected.cost_comparison.as_ref().unwrap();
             let heap = report
                 .candidate_evaluations

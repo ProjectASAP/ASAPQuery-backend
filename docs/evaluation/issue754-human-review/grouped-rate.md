@@ -44,12 +44,28 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 }
 ```
 
+### Planner physical candidate
+
+Logical root: `"asap-explain-v1:root:0e5bd63bf2b058035044a1c50ec5912afbfbd59dd75611d27ff23b9420d09851"`.
+
+Sum { col: None } realizes as an exact Sum accumulator — the only realization realizations_for_intent produces for this intent (no approximate candidate applies)
+
+Guarantee: `{"bound":{"op":"zero"},"failure_probability":{"op":"zero"},"metric":"absolute_value","provenance":[{"kind":"exact","reason":"ExactAggregate(Sum)"},{"guarantee":{"bound":{"op":"zero"},"failure_probability":{"op":"zero"},"metric":"absolute_value","provenance":[{"kind":"exact","reason":"ExactAggregate(Rate)"},{"guarantee":{"bound":{"op":"zero"},"failure_probability":{"op":"zero"},"metric":"absolute_value","provenance":[{"kind":"exact","reason":"KeepPreAsap"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"composition_step","operator":{"op":"counter_rate"},"rule":"exact_input"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"composition_step","operator":{"op":"exact_sum"},"rule":"exact_input"}]}`
+
+| Node | Dependencies | Native operator / input |
+| --- | --- | --- |
+| 2 | `[]` | `{"Input":{"properties":{"boundedness":"Bounded","emission":"Unknown"},"schema":{"fields":[{"dtype":{"Plain":"timestamp"},"name":"ts","nullable":false},{"dtype":{"Plain":"float64"},"name":"value","nullable":false},{"dtype":{"Plain":"utf8"},"name":"label_0","nullable":true},{"dtype":{"Plain":"utf8"},"name":"$promql_series_identity","nullable":false}],"time_index":0}}}` |
+| 3 | `[2]` | `{"SummaryBuild":{"family":{"ExactAggregate":["Sum","Sum"]},"groups":[2],"time":0,"value":1}}` |
+
+Roots: `[3]`.
+
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:f64d455c779dbeffa3b3791fa9f36aa53ff23ca87cbedcec85cd8f15514c79d1"]` | `"selected"` | `125.0` | `null` |
-| 1 | `["asap-explain-v1:root:4f1a460e06820b58ecb3eba688270ec13eb5a8490e30d797b6e6792e02b0eb7b"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:72da058ea30881ecb59998b94e12f7eec58af16de26d7d41ee8aa00bf93584e3"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| 0 | `["asap-explain-v1:root:0e31a8d3445c715a2134c5af0a5ea3f922da28603611abeb514a6bd3a11c083e"]` | `"selected"` | `125.0` | `null` |
+| 1 | `["asap-explain-v1:root:643999c2c793eda9409a53042cc0ff84502915e9de4dc74029bf589e91917ff7"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:81569c887cc72d5c00aafe4f5a9840b55e15409c4224e7e879ce7d698bb0a4d1"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| 3 | `["asap-explain-v1:root:0e5bd63bf2b058035044a1c50ec5912afbfbd59dd75611d27ff23b9420d09851"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: physical vector program loses complete identity, timestamp or value"` |
 
 Successfully compiled candidate plans: [grouped-rate-0](candidates/grouped-rate-0.json), [grouped-rate-1](candidates/grouped-rate-1.json)
 

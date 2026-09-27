@@ -139,6 +139,9 @@ fn escape(value: &str) -> String {
 
 fn query_node_label(node: &QueryPlanNode) -> String {
     match node {
+        QueryPlanNode::Physical { source_nodes, .. } => {
+            format!("Planner Physical DAG\nbound sources {source_nodes:?}")
+        }
         QueryPlanNode::RelationalJoin { .. } => "RelationalJoin".into(),
         QueryPlanNode::Relational { .. } => "Relational".into(),
         QueryPlanNode::Logical { operator, .. } => format!("Logical\n{}", residual_label(operator)),

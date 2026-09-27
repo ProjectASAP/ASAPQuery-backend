@@ -43,7 +43,7 @@ Roots: `[2]`.
 
 ```mermaid
 flowchart LR
-  P1["1: Bound population snapshot"]
+  P1["1: Bound physical input"]
   P18446744073709551615["18446744073709551615: Sort"]
   P1 --> P18446744073709551615
   P2["2: Limit"]
@@ -64,7 +64,7 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:05416c5491e4dda45929f873ae0664ba6c10b4bb9ab4da4924162a758bd29b43"`.
+Logical root: `"asap-explain-v1:root:4787547f619c2df86e3374054965b3ad497d25e53cb42dad069dd51fce5fafea"`.
 
 top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)
 
@@ -84,10 +84,10 @@ Roots: `[6]`.
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:27192fc14e82a405f0e491940c71fd77abd52d45f84229c51f61fd7bc58c92b7"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
-| 1 | `["asap-explain-v1:root:6bcde9e7369ab7cd9b27c33a64182d767fe88c2af0d632733de19108b377f375"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:1090e332041c96a28fe239565dad1a116f856886c584b1ba49d0aaf3dc02d3f0"]` | `"selected"` | `130.0` | `null` |
-| 3 | `["asap-explain-v1:root:05416c5491e4dda45929f873ae0664ba6c10b4bb9ab4da4924162a758bd29b43"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 0 | `["asap-explain-v1:root:54d39c0b1ca8f4666729a2ee4bd473828d883206bc76edc27b57daf451be36e9"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| 1 | `["asap-explain-v1:root:abf768f94bef2e820457146939248d0df406fef3a70da171cbf2c6e34f4269b6"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:7edfeb167e264152810f299c5f3e6e96ed5db3c7f284488e52dc4c316c692cf0"]` | `"selected"` | `130.0` | `null` |
+| 3 | `["asap-explain-v1:root:4787547f619c2df86e3374054965b3ad497d25e53cb42dad069dd51fce5fafea"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
 
 Successfully compiled candidate plans: [spatial-topk-1](candidates/spatial-topk-1.json), [spatial-topk-2](candidates/spatial-topk-2.json)
 
