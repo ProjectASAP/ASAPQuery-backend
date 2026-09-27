@@ -5,6 +5,40 @@ readout and direct exact computation over the same raw observations. No standalo
 sketch server is involved. This experiment does not measure planner quality or
 replace the workload benefit gates in #759.
 
+## Architectural scope and evidence
+
+Follow the [deployment architecture](../../design_docs/asapplanner-integration.md):
+Planner selects and compiles Physical DAGs; the backend binds deployment plans;
+engines resolve inputs and call shared execution; SummaryStore persists and
+validates state. Runtime controls change scheduling capacity, never computation,
+materialization boundaries, semantic IDs or eligibility rules.
+
+| Architectural step | What this inspection measures |
+| --- | --- |
+| Logical selection and Planner physical compilation | Excluded. This is an imported-state fixture, not a Planner-quality experiment. Use #728's selected-plan artifacts to review placement. |
+| Backend deployment compilation | Excluded. The fixture constructs explicit bindings; it does not price or select a deployment candidate. |
+| Catalog installation and plan validation/activation | Separately recorded setup wall time, outside request latency. |
+| Precompute DAG execution and durable recovery | Excluded. The fixture builds a DDSketch directly and publishes one in-memory pane; this is not a measurement of the precompute engine. |
+| Bound output lookup and semantic validation | Included in `backend` and `http`. The installed reference has independent output and definition IDs. |
+| Record format, revision and coverage checks; shared summary execution | Included in `backend` and `http`, using the production bound-query path. |
+| HTTP parsing, routing and response encoding/decoding | Included only in `http`, including the loopback client. |
+
+Every matrix cell writes `installed-plan.json` containing the exact catalog,
+output references and query bindings. Its `report.json` contains an `architecture`
+section listing the timed path, excluded steps and setup durations. Setup labels
+prefixed `fixture.` describe synthetic preparation, not Planner compilation or
+shared DAG execution. The request-path stages are **included, not individually
+timed**; do not invent per-stage costs by subtracting unrelated layer medians.
+
+For a production workload, first retain its selected/installed plan, runtime
+configuration, input size, groups, pane count and concurrency. Use #756 events
+to locate work along selection → binding → activation → precompute → publication
+→ bound read → shared execution → response, and use CPU/lock/allocation profiling
+for attribution. #756 and #766 are independent PRs: the diagnostic events are
+available only when #756 is also integrated. This fixture does not establish
+mixed ingestion/query performance or recovery cost; those require a workload
+that actually runs those paths. #759 retains the end-to-end benefit gate.
+
 ## Runtime model and controls
 
 The backend has one multithreaded Tokio runtime. HTTP query handlers, ingestion,
@@ -34,7 +68,7 @@ OS counters are null. Visible cgroup ancestors are recorded because their limits
 outside a container namespace remain unknown; record the deployment's CPU quota
 and pinning alongside these artifacts.
 
-## Reproducible three-layer experiment
+## Reproducible four-layer experiment
 
 Build once; do not include compilation in timing:
 

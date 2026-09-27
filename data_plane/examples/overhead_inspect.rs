@@ -1,4 +1,4 @@
-//! Three-layer overhead inspection; each matrix cell runs in a fresh process.
+//! Four-layer overhead inspection; each matrix cell runs in a fresh process.
 #[path = "overhead/fixture.rs"]
 mod fixture;
 use anyhow::{ensure, Context, Result};
@@ -243,6 +243,10 @@ fn cell(args: &Args) -> Result<()> {
     let _guard = args.logging.init(&args.output)?;
     let runtime = args.runtime.build()?;
     let fixture = Arc::new(fixture::Fixture::new(args.samples)?);
+    std::fs::write(
+        args.output.join("installed-plan.json"),
+        serde_json::to_vec_pretty(&fixture.installed_plan)?,
+    )?;
     let port = runtime
         .block_on(fixture.server.start_test_server())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -302,7 +306,21 @@ fn cell(args: &Args) -> Result<()> {
         let driver_cpu=cpu(libc::CLOCK_THREAD_CPUTIME_ID)-start_driver_cpu;
         latencies.sort_by(f64::total_cmp);service_latencies.sort_by(f64::total_cmp);
         let completed=latencies.len();
-        Ok::<_,anyhow::Error>(json!({"layer":layer,"warmup_requests":args.warmup,"sketch_alpha":0.01,"quantile":0.5,"series":1,"workers":runtime.metrics().num_workers(),"max_blocking_threads":args.runtime.runtime_max_blocking_threads,
+        Ok::<_,anyhow::Error>(json!({"layer":layer,
+            "architecture": {
+                "fixture_kind": "imported_state_bound_query",
+                "installed_plan_artifact": "installed-plan.json",
+                "setup_seconds": fixture.setup_seconds,
+                "timed_path": match layer.as_str() {
+                    "sketch" => vec!["direct_sketch_readout"],
+                    "raw_exact" => vec!["raw_copy", "exact_selection"],
+                    "backend" => vec!["installed_query_lookup", "bound_output_validation", "store_range_lookup", "record_eligibility", "shared_summary_execution", "result_construction"],
+                    _ => vec!["http_parse_and_route", "installed_query_lookup", "bound_output_validation", "store_range_lookup", "record_eligibility", "shared_summary_execution", "response_encode_and_decode"]
+                },
+                "excluded": ["planner_selection", "planner_physical_compilation", "backend_deployment_compilation", "precompute_dag_execution", "durable_recovery"],
+                "stage_timing_contract": "setup durations are separate; timed_path stages are included but not individually timed"
+            },
+            "warmup_requests":args.warmup,"sketch_alpha":0.01,"quantile":0.5,"series":1,"workers":runtime.metrics().num_workers(),"max_blocking_threads":args.runtime.runtime_max_blocking_threads,
             "concurrency":concurrency,"samples":args.samples,"offered_requests":args.requests,"completed":completed,"dropped":dropped,"admitted":args.requests-dropped,
             "errors":errors,"error_rate":errors.len() as f64/args.requests as f64,"offered_rate":args.rate,
             "actual_offered_per_second":args.requests as f64/elapsed,"actual_admitted_per_second":(args.requests-dropped) as f64/elapsed,"completed_per_second":completed as f64/elapsed,

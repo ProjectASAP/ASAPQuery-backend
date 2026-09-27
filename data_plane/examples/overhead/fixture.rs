@@ -14,6 +14,7 @@ use data_plane::{ASAPQueryEngine, HttpServer, HttpServerConfig};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
+    time::Instant,
 };
 
 #[path = "../../tests/support/physical_fixture.rs"]
@@ -29,6 +30,8 @@ pub struct Fixture {
     pub exact_expected: f64,
     pub engine: Arc<ASAPQueryEngine>,
     pub server: HttpServer,
+    pub setup_seconds: BTreeMap<&'static str, f64>,
+    pub installed_plan: serde_json::Value,
 }
 pub fn exact(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
@@ -50,15 +53,23 @@ pub fn exact(values: &[f64]) -> f64 {
 impl Fixture {
     pub fn new(samples: usize) -> Result<Self> {
         ensure!(samples > 0, "samples must be positive");
+        let mut setup_seconds = BTreeMap::new();
+        let started = Instant::now();
         // Deliberately unsorted, reproducible input; exact includes scratch allocation
         // and selection, while prebuilt sketch construction is outside measurement.
         let raw: Vec<_> = (0..samples)
             .map(|i| 1.0 + ((i * 7919) % 10007) as f64)
             .collect();
+        setup_seconds.insert("fixture.raw_input", started.elapsed().as_secs_f64());
+        let started = Instant::now();
         let mut sketch = DdSketch::new(0.01);
         for value in &raw {
             sketch.update(*value);
         }
+        setup_seconds.insert(
+            "fixture.direct_sketch_build",
+            started.elapsed().as_secs_f64(),
+        );
         let expected = sketch.quantile(0.5).unwrap();
         let exact_expected = exact(&raw);
         ensure!(
@@ -75,7 +86,11 @@ impl Fixture {
                 "spatial_filter":"","spatial_filter_normalized":"","original_yaml":""
             }),
         )?;
+        let started = Instant::now();
         let plan = physical_fixture::artifact_from_materializations(vec![config.clone()]);
+        setup_seconds.insert("fixture.bound_plan", started.elapsed().as_secs_f64());
+        let installed_plan = serde_json::to_value(&plan)?;
+        let started = Instant::now();
         let store = Arc::new(SketchStore::new());
         store
             .install_precompute_plan(
@@ -83,6 +98,8 @@ impl Fixture {
                 &plan.precompute_plan,
             )
             .map_err(anyhow::Error::msg)?;
+        setup_seconds.insert("sds.install_catalog", started.elapsed().as_secs_f64());
+        let started = Instant::now();
         let skconfig = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
@@ -114,9 +131,15 @@ impl Fixture {
             ),
             "sample admission failed"
         );
+        setup_seconds.insert("sds.register_and_publish", started.elapsed().as_secs_f64());
+        let started = Instant::now();
         let active = ActivePhysicalPlanHandle::new(
             validate_and_build_runtime_plan(plan, Arc::new(BackendStorageRouting::empty()))
                 .map_err(anyhow::Error::msg)?,
+        );
+        setup_seconds.insert(
+            "deployment.validate_and_activate",
+            started.elapsed().as_secs_f64(),
         );
         let engine = Arc::new(
             ASAPQueryEngine::new(1000)
@@ -141,6 +164,8 @@ impl Fixture {
             exact_expected,
             engine,
             server,
+            setup_seconds,
+            installed_plan,
         })
     }
     pub async fn backend(&self) -> Result<f64> {
