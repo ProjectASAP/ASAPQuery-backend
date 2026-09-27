@@ -987,6 +987,9 @@ impl BackendLocalPlanningInput {
                 let asap_aware_mapping::Replacement::Summary(root) = candidate.replacement else {
                     continue;
                 };
+                let _physical = tracing::debug_span!(target: "asap_runtime_debug", "physical_candidate_compile",
+                    stage = "planner.physical_candidate", query_id = %query.query_id,
+                    input_kind = "current_series_snapshot").entered();
                 let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root);
                 match compiled {
                     Ok(program) => {

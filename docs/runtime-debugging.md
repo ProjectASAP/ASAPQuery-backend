@@ -102,3 +102,9 @@ complete eligible population, and native execution performs ranking and limiting
 These spans use `input_kind=current_series_snapshot`; label sets and sample
 values are not recorded. They describe the exact ranking path, not heap storage
 or request-time physical compilation.
+
+Snapshot heap discovery records `planner.physical_candidate` while Planner
+compiles the candidate above its population boundary. Deployment admission and
+pricing follow separately; an emitted physical graph does not imply that its
+accuracy evidence was admitted. The same recovery, binding and execution spans
+cover the installed CountSketch heap and exact ranking programs.
