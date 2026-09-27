@@ -56,8 +56,8 @@ an explicitly planned physical operation.
 
 The storage integration test covers durable per-series sums, native quantile
 state construction, publication, bound readout and restart of both the store and
-resolver. The full PromQL physical-candidate handoff and Rate-to-heap storage
-execution remain pending. This storage test does not establish those paths.
+resolver. That test does not establish the full PromQL physical-candidate handoff or
+precomputed heap publication.
 
 Bound frozen reads resolve the stored-output/group prefix through the persistent
 series resolver. Each cached part builds a sorted output/window index once on
@@ -84,3 +84,17 @@ heap with Sort/Limit. The heap is rebuilt for each evaluation, so decreases,
 staleness and expiry do not accumulate historical weights. Automated real-process
 Remote Write/HTTP coverage verifies these changes with no exact-backend fallback.
 This is a query-time heap candidate; buffered Rate-to-heap persistence is separate.
+
+For `topk by (...) (..., rate(metric[1m]))`, Planner also compiles exact ranking,
+CMS heap and CountSketch heap above the exact per-series Rate boundary. Backend
+binds that input to the installed counter SDS. `QueryPlanNode::Physical` maps
+source node IDs to deployment readouts and supplies the run budget; it contains
+no second operator representation. Recovery requires the persisted physical
+program, matching source IDs, complete identity and the same readout window.
+
+The process E2E tests ingest raw counters, publish durable counter windows, run
+native ranking, restart the process and repeat both window queries. Both heap
+families preserve hidden series labels, account for counter resets and rebuild
+ranking independently for each window. Missing windows cannot serve a warm
+result. This path stores counter state and builds the heap at query time;
+publishing the heap itself during precompute requires a separate placement.
