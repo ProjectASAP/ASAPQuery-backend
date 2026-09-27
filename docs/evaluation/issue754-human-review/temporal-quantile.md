@@ -43,11 +43,11 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 - quantile(q=0.9) realizes as a Kll sketch: composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }
 
-| Candidate | Status | Fixture cost | Rejection / unavailable reason |
-| --- | --- | --- | --- |
-| 0 | `"selected"` | `95.0` | `null` |
-| 1 | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `"unselected"` | `61000000000000.0` | `null` |
+| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- | --- |
+| 0 | `["asap-explain-v1:root:b923f5545572b9c7df01f0bf06504b22a85b6cfcf2bb8cd49cc4996e5763a6b7"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:3d81ba5ec5c336a1c18e69c62e0ee52e108ce328016ef3ae3ff1ed3a550fc3bd"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:6255bfbde517cfeb768cd858f05893bd0c849864f281889972454405b3902ddf"]` | `"unselected"` | `61000000000000.0` | `null` |
 
 Successfully compiled candidate plans: [temporal-quantile-0](candidates/temporal-quantile-0.json), [temporal-quantile-1](candidates/temporal-quantile-1.json), [temporal-quantile-2](candidates/temporal-quantile-2.json)
 
@@ -84,8 +84,8 @@ Stored output `3752266711358116078` → semantic definition `sds-v1:2fde0175b6e4
     "aggregation_type": "DDSketch",
     "aggregation_sub_type": "",
     "parameters": {
-      "promql_right_closed": true,
-      "alpha": 0.01
+      "alpha": 0.01,
+      "promql_right_closed": true
     },
     "grouping_labels": {
       "labels": []

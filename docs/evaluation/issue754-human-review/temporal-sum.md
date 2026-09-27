@@ -39,11 +39,11 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 ```
 
 
-| Candidate | Status | Fixture cost | Rejection / unavailable reason |
-| --- | --- | --- | --- |
-| 0 | `"selected"` | `95.0` | `null` |
-| 1 | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `"unselected"` | `122.0` | `null` |
+| Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
+| --- | --- | --- | --- | --- |
+| 0 | `["asap-explain-v1:root:4c9b21a678ae6be64cc8d6d6311fdd9e261ee1c5239ad0654a4f7fa64333c373"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:6f807235b84232925ad508c8c585c2e8c2be1f75ce9f1aca20c86b11cf100f6e"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:f0eae8f84fc9d14b63bbcece67194b5db2edc5f149fe7c52f557df238240a137"]` | `"unselected"` | `122.0` | `null` |
 
 Successfully compiled candidate plans: [temporal-sum-0](candidates/temporal-sum-0.json), [temporal-sum-1](candidates/temporal-sum-1.json), [temporal-sum-2](candidates/temporal-sum-2.json)
 

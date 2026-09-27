@@ -6,7 +6,7 @@
     "activation_unix_ms": 10000,
     "expiry_unix_ms": null,
     "backend_compat": "asap-query-backend.v1",
-    "planner_revision": "a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab",
+    "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
     "capability_snapshot_id": "asapquery-local-v1"
   },
   "summary_catalog": {
@@ -33,7 +33,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab",
+      "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "ingest": {
@@ -62,7 +62,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "a2bf21fd7c8e9eda344ff2fed7f9d8c66dd9b5ab",
+      "planner_revision": "3ebe195260fa6e16e226183ee50938078bb8359f",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "frame_identity": {
@@ -109,7 +109,7 @@
       "candidate_assembly_rejections": [],
       "committed_roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:3cd135211aa0afd01c9717580bec3fe158b5cb953cdb4051485175b51f8864f0",
+          "logical_root_id": "asap-explain-v1:root:0a36a2bb43a5c67a3c0cdab44d6d7fa5a769bc85af3fb7fa2c41b396da68ef3d",
           "query_index": 0
         }
       ],
@@ -125,7 +125,7 @@
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:58325459c0b5c3afd7a457c537051c8ebe6dd2a918443a2472913b26e2e2007f",
+              "candidate_id": "asap-explain-v1:candidate:a57a9a5af2eb437c2c385614cc70f207d5356a352eb0c5b9ca612e18611ee0a9",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -190,13 +190,13 @@
           "consumer_count": 1,
           "group_id": 0,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:10e5eeed5cc7b2b4ef844875ec7126eb009903ed07c1963c3ca66c11073644f9"
+          "target_id": "asap-explain-v1:target:6bafe9c54cda3e799b6b40c2be9654161e388bb423519a554d9996ac868fedc5"
         },
         {
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:c1bd00a24b97ff3ae03c1c94b838378381e1670fa65e2d321aaa78c9f12bc9d6",
+              "candidate_id": "asap-explain-v1:candidate:d72e273e0a55a12a715ae312623ba8aacff4af16af0c164cfb813ff934aecb7a",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -261,26 +261,26 @@
           "consumer_count": 1,
           "group_id": 1,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:466902b13e9749257667814533798cc9d7d8cb7be985bc3e417ab14559379b18"
+          "target_id": "asap-explain-v1:target:b9cac0f4239c7186cb73aaaf9444df7fc60a00189f6d8cd75879f3926ff7e274"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 2,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:693b5ee47c5522fafaf694030611b6c41549550d84b21dcf83d044d1fa6f6a8b"
+          "target_id": "asap-explain-v1:target:74c012275701cb78be91b3415f605a53802b2a710020b4c96125946d4495771a"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 3,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:2ecb546eb3c47bd97637e1d6babf17b12b1f85a2bbe0fc331dc0119d27dfcea9"
+          "target_id": "asap-explain-v1:target:b4bb9f59761cfee4a65d231ca69c105189a9272accda0075e480cc45b1ad77b5"
         }
       ],
       "roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:3cd135211aa0afd01c9717580bec3fe158b5cb953cdb4051485175b51f8864f0",
+          "logical_root_id": "asap-explain-v1:root:0a36a2bb43a5c67a3c0cdab44d6d7fa5a769bc85af3fb7fa2c41b396da68ef3d",
           "query_index": 0
         }
       ],
