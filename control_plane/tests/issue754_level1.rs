@@ -119,7 +119,76 @@ fn family_matches(expected: &ExpectedFamily, actual: &SummaryFamilyType) -> bool
     }
 }
 
+// Inspect the Planner expression, since the adapter only stores sort direction.
+fn assert_rate_sort_expression(dag: &asap_types::executable_plan::OwnedPostAsapDag) {
+    for sort in &dag.nodes {
+        let Some(spec) = sort.payload["operation"].get("Sort") else {
+            continue;
+        };
+        let inputs: Vec<_> = dag
+            .edges
+            .iter()
+            .filter(|edge| edge.consumer == sort.id)
+            .collect();
+        assert_eq!(inputs.len(), 1, "rate ranking requires one producer");
+        let producer = dag
+            .nodes
+            .iter()
+            .find(|node| node.id == inputs[0].producer)
+            .unwrap();
+        assert_eq!(
+            producer.payload["operation"], "FinalizeExactAccumulator",
+            "ranking must consume finalized per-series rates"
+        );
+        let fields = producer.output_schema["fields"].as_array().unwrap();
+        let value = fields
+            .iter()
+            .position(|field| field["name"] == "value")
+            .unwrap();
+        assert_eq!(
+            spec["keys"],
+            json!([{
+                "ascending": false, "expr": {"Column": value}, "nulls_first": false
+            }]),
+            "TopK must rank rate values, not timestamps or labels"
+        );
+        let partition = fields
+            .iter()
+            .position(|field| field["name"] == "label_0")
+            .unwrap();
+        assert_eq!(spec["partition_by"], json!([partition]));
+    }
+}
+
+// A descending sort over a timestamp or label must fail the Level 1 contract.
+#[test]
+fn topk_rate_sort_contract_rejects_wrong_value_expression() {
+    let artifact: Value = serde_json::from_str(include_str!(
+        "../../docs/evaluation/issue754-human-review/topk-rate.json"
+    ))
+    .unwrap();
+    let dag: asap_types::executable_plan::OwnedPostAsapDag =
+        serde_json::from_value(artifact["query_plan"]["selected_dags"]["compat-query-0"].clone())
+            .unwrap();
+    assert_rate_sort_expression(&dag);
+    for column in [0, 2] {
+        let mut wrong = dag.clone();
+        let sort = wrong
+            .nodes
+            .iter_mut()
+            .find(|node| node.payload["operation"].get("Sort").is_some())
+            .unwrap();
+        sort.payload["operation"]["Sort"]["keys"][0]["expr"] = json!({"Column": column});
+        assert!(std::panic::catch_unwind(|| assert_rate_sort_expression(&wrong)).is_err());
+    }
+}
+
 fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<String> {
+    if name == "topk-rate" {
+        for dag in plan.query_plan.selected_dags.values() {
+            assert_rate_sort_expression(dag);
+        }
+    }
     for materialization in &plan.precompute_plan.materializations {
         let definition = plan
             .summary_catalog
