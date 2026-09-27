@@ -147,6 +147,7 @@ pub fn artifact_from_materializations(
             query_plan.entries.insert(
                 canonical.clone(),
                 QueryPlanEntry {
+                    physical_dag: None,
                     language: asap_types::query_plan::QueryLanguage::PromQl,
                     query_id: canonical.clone(),
                     canonical_query: canonical,

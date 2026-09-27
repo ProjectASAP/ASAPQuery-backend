@@ -6,6 +6,7 @@
 //! searching for compatible materializations.
 
 pub mod current_series;
+mod native;
 pub mod residual;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,6 +296,9 @@ pub use crate::executable_plan::QueryNodeId;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct QueryPlanEntry {
+    /// Planner-selected native computation, persisted before activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_dag: Option<serde_json::Value>,
     #[serde(default)]
     pub language: QueryLanguage,
     pub query_id: String,
@@ -391,8 +395,10 @@ impl QueryPlanEntry {
                 self.query_id, self.root.0
             )));
         }
+        if self.relation_output_schema()?.is_some() || self.physical_dag.is_some() {
+            self.recover_relational_physical_dag()?;
+        }
         for (id, node) in &self.nodes {
-            validate_native_relation(*id, node)?;
             if let QueryPlanNode::Logical { operator, inputs } = node {
                 operator.validate(inputs.len())?;
             }
@@ -773,6 +779,7 @@ mod contract_tests {
 }
 
 /// Bind portable relation semantics before an installed plan can access its sources.
+#[cfg(test)]
 fn validate_native_relation(id: QueryNodeId, node: &QueryPlanNode) -> Result<(), QueryPlanError> {
     use planner_types::post_asap::{
         ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState, PostAsapNodeId,

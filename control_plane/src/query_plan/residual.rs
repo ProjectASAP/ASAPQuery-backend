@@ -298,6 +298,7 @@ pub fn compile_logical(
     };
     let root = lower.lower(&expr)?;
     let entry = QueryPlanEntry {
+        physical_dag: None,
         language: super::QueryLanguage::PromQl,
         query_id,
         canonical_query,

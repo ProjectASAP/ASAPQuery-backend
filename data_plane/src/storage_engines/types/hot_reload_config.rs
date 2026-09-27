@@ -763,6 +763,7 @@ mod tests {
     fn readout_programs_follow_replaced_query_plan_bindings() {
         use asap_types::query_plan::*;
         let entry = |id: u64| QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::QueryLanguage::PromQl,
             query_id: "sum_over_time(m[1m])".into(),
             canonical_query: "sum_over_time(m[1m])".into(),

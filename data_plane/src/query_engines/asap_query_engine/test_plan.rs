@@ -44,6 +44,7 @@ pub(super) fn entry(
 ) -> QueryPlanEntry {
     let canonical = canonical_promql(query).unwrap();
     QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::PromQl,
         query_id: canonical.clone(),
         canonical_query: canonical,
