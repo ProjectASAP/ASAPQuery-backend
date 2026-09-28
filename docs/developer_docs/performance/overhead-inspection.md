@@ -39,6 +39,16 @@ available only when #756 is also integrated. This fixture does not establish
 mixed ingestion/query performance or recovery cost; those require a workload
 that actually runs those paths. #759 retains the end-to-end benefit gate.
 
+For Rate aggregation, retain whether the installed candidate performs grouped
+Sum or CMS/CountSketch heap construction during maintenance or query execution.
+A precomputed candidate executes one complete counter window per evaluation,
+publishes an atomic grouped SDS batch, then binds that batch at query time.
+A query-time candidate binds per-series Rate values and runs its aggregation in
+the query DAG. A 60-second lookback with five-second recurrence produces overlapping
+complete windows; record both width and stride when comparing CPU and retained
+bytes. These paths inherit the runtime controls below, but the DDSketch experiment
+does not measure their ingestion, publication, or recovery overhead.
+
 ## Runtime model and controls
 
 The backend has one multithreaded Tokio runtime. HTTP query handlers, ingestion,
