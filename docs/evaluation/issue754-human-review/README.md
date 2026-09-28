@@ -22,12 +22,10 @@ explaining; its `admission/` directory drops straight onto this one.
 
 ## Identities are pinned, and they move
 
-Candidate, physical-candidate and logical-root ids are content-addressed over
-the Planner build. They are **not** stable across a Planner bump: changing the
-pin rewrites every id here while leaving every status, reason and `plan_id`
-untouched. Always regenerate before citing an id; an id from an older revision
-does not resolve. The historical synthetic-price exports were removed for this
-reason — they named candidates that no longer exist.
+Candidate, physical-candidate and logical-root IDs identify the generated
+computations and plans. A Planner or binding change can change those identities,
+the candidate inventory, or admission results. Regenerate before citing an ID;
+use the pinned source revision to reproduce the report.
 
 Backend source revision is in [source-commit.txt](source-commit.txt). The
 Planner revision is whatever `planner-types` pins in the workspace `Cargo.toml`;
