@@ -5,36 +5,36 @@
   "scope": "finite fixture differential execution, not production selection or real ERP calibration",
   "reports": [
     {
-      "file": "aggregations.json",
-      "sha256": "9ea33fedbfedf43c6effcfb1646e2c640db3083caf79fd26002776e9a24d048d"
+      "file": "aggregations.json.gz",
+      "sha256": "4b6e17db0387897782f8c7eead2e760860aa40b2fbbf191bc599acf600d1969c"
     },
     {
       "file": "summary.json",
       "sha256": "3f7bad5dda4fdb08b235afaca9adacaf825262598fa8d3cd752437b1565bcac3"
     },
     {
-      "file": "issue-702.json",
-      "sha256": "eb1efcce0bcfe654c6e5e6bb26786a39338c7c8b30e386b2f06bc18d574a249f"
+      "file": "issue-702.json.gz",
+      "sha256": "e18a3200c5f6e12b81d36c9918d16dbcb80ea3e6094def09a225bfde8073ad46"
     },
     {
-      "file": "sparse-checkout-temporal.json",
-      "sha256": "fd45b6c6c836f2bed5895acfd54f6f1084f0957b5a6e54fc666f832ced09c19d"
+      "file": "sparse-checkout-temporal.json.gz",
+      "sha256": "4161ef56c266e5a1a34f9ec443e6efda6dca267b22874bc3d629a8bd8d46e457"
     },
     {
-      "file": "issue-702-one-second.json",
-      "sha256": "9b7531a809fed6cc378dfd6d29b3ff0f77a2d60410b72e231da6761a9bee0a6f"
+      "file": "issue-702-one-second.json.gz",
+      "sha256": "f752f9891568bf28ae39b68fef6ba7bcdb132d6f896b4a578411614adf6de4da"
     },
     {
-      "file": "single-rate-temporal.json",
-      "sha256": "323ddb3d1cbda1cb3c6eb069eebd51bf70b17a8cc5d846dc62336b560a3fac89"
+      "file": "single-rate-temporal.json.gz",
+      "sha256": "5f81a5cee9f9fc3594b71b5408c9ff3e1fdf93e3a5c177d57daa8d1224c13bd1"
     },
     {
-      "file": "aggregations-dense-cadence.json",
-      "sha256": "f4b4ebd20d968bac6bf7135d0aecb5ef2824d3b248f2aebe324325badac9b1af"
+      "file": "aggregations-dense-cadence.json.gz",
+      "sha256": "005a1d0f24d472590ef8d341adc74910b8af85cf979cf1302e1bc6cadc86f249"
     },
     {
-      "file": "issue-754.json",
-      "sha256": "2b12542b677f8ac1412c209354f5f59b603fd811f5508feac386ff0e8e19755a"
+      "file": "issue-754.json.gz",
+      "sha256": "ae6975f0bc7b97cf36ed41c0d701e68266ce61ac1c2601a5c1437546ab39b773"
     }
   ]
 }
