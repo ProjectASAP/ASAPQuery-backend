@@ -102,6 +102,11 @@ async fn execute(args: &Args, benefit: bool) -> Result<Value> {
     let base = args.base_time_ms.unwrap_or(now as i64 - 1_800_000);
     let snapshot = planning::snapshot(&suite, &data, now, base, benefit)
         .context("compile unquoted workload snapshot")?;
+    let snapshot = if benefit {
+        snapshot
+    } else {
+        planning::with_fixture_costs(snapshot)?
+    };
     let snapshot_path = args.output.with_extension("snapshot.json");
     write_json(&snapshot_path, &snapshot)?;
     // Compile before starting services. Preserve real planning failures without
@@ -111,7 +116,11 @@ async fn execute(args: &Args, benefit: bool) -> Result<Value> {
         .context("compile unquoted workload snapshot")?;
     let plan_path = args.output.with_extension("plan.json");
     write_json(&plan_path, &plan)?;
-    planning::validate_cost(&plan).context("automatic workload cost gate")?;
+    if benefit {
+        planning::validate_cost(&plan).context("historical automatic cost gate")?;
+    } else {
+        planning::validate_fixture_cost(&plan).context("synthetic workload cost gate")?;
+    }
     planning::validate_local(&plan).context("ASAP-local plan gate")?;
     let installation_path = args.output.with_extension("install.json");
     write_json(&installation_path, &planning::installation(plan))?;

@@ -1,3 +1,11 @@
+# Current execution scope
+
+The current milestone is workload → Planner physical candidates → Backend selection
+with synthetic costs → typed installation → data-plane execution. The original
+Q&A below records earlier decisions. Online ERP collection, query-time statistics
+feedback and runtime replanning are deferred. Synthetic prices never weaken the
+accuracy, local-execution or bound-SDS contracts.
+
 # PromQL compliance design Q&A
 
 > **Question:** should v1 be a strict differential suite for a deliberately supported, locally answered subset of PromQL—with unsupported queries required to fail—or should it allow Prometheus fallback?

@@ -1,50 +1,50 @@
-# Planning validation: separate contracts and evidence
+# Current planning and execution validation
 
-Audience: implementers and reviewers. Each PR proves one contract; a downstream
-pass cannot substitute for a missing upstream check.
+Audience: implementers and reviewers.
 
-| Layer | Input | Assertion |
+The current scope is a complete deterministic path from a workload to correct
+execution. Backend uses explicit synthetic prices for candidate selection. Online
+ERP collection, feedback-driven replanning and deployment switching are deferred.
+
+| PR | Input | Assertion |
 | --- | --- | --- |
-| Level 1 (#728) | workload and declared capabilities/accuracy requirements | Every exposed supported candidate has a valid physical DAG or an explicit binding rejection; no prices or winner assertions |
-| Level 2 (#742) | same candidates plus synthetic complete quotes | Ranking, cost reversal, infeasible/missing quote exclusion; no claim about real costs |
-| Workload statistics | ingestion observations, query history and series observations | Scope, units, observation windows, freshness and missingness survive into demand |
-| Accuracy evidence | sketch error evidence and query requirements | Only applicable evidence admits a candidate; observed mean error is not a formal guarantee |
-| Resource measurements | measured operator CPU, memory and storage | Correct units and work multiplicities, shared work counted once, provenance retained |
-| Execution correctness | installed physical plan and input data | Results, stored state, recovery and coverage; independent of selection quality |
-| Level 3 (#759) | real workload, applicable accuracy evidence and measured resource costs | Accurate results and measured selection quality under a declared objective |
+| #728: structure | workload and declared execution/accuracy contracts | Every supported candidate has a valid physical DAG or an explicit binding rejection; no prices or winner assertions |
+| #742: ranking | same candidates plus synthetic complete quotes | Selection follows costs, reverses with costs, and excludes unavailable candidates |
+| #775: execution | workload, synthetic quotes, finite fixture data | Select, install and execute the exact physical plan; validate results and execution provenance |
 
-ERP means Error–Resource Profile. Workload statistics describe how much work is
-requested. Accuracy evidence constrains which candidates are legal. Resource
-measurements price feasible candidates. Synthetic prices test the selector only.
+```text
+workload → Planner physical candidates
+         → Backend selection with synthetic costs
+         → Deployment Plan → data plane → checked results
+```
 
-## Evidence required for Level 3
+Planner owns computation semantics and physical candidate construction. Backend
+owns deployment selection and binding. Serving loads the selected typed plan;
+it must not silently re-plan it at startup. The executor's existing operator,
+shared-producer, window, bound-SDS and recovery tests remain part of the baseline.
+Synthetic pricing does not relax query accuracy admission or SDS identity checks.
 
-Record the workload identity, observation interval, query frequency, accepted
-sample count, distinct-series scope, implementation revision, machine, sketch
-parameters and evidence timestamps. Preserve missing/unsupported dimensions;
-do not replace them with zero or relabel analytical coefficients as measured.
+## Synthetic cost scope
 
-Freeze planning inputs before the evaluation interval. Measure each feasible
-candidate under the same workload, horizon and resource objective, using repeated
-runs. Compare predicted costs and selected-plan measurements with the measured
-best candidate, reporting uncertainty and selection regret. Validate results
-against exact execution and the query's accuracy contract. Evidence from the
-same samples used to tune the model is not independent selection validation.
+Prices are deterministic test inputs, not resource measurements. The execution
+fixture quotes every component of each compilable candidate. A candidate requiring
+external execution is marked infeasible for the local-execution fixture. Backend
+selects from that inventory using its production quote selection path. Retain the
+quoted snapshot, selected plan and installed plan for inspection. Contract tests
+must reject missing prices, a changed cost-model identity or a different installed
+generation. Human plan approval remains a separate review.
 
-Historical differential runs establish execution correctness. Historical benefit
-runs against another engine establish only their stated performance comparison.
-Neither establishes Level 3 selection quality. A real-evidence run with missing
-inputs must be reported as incomplete, never as a synthetic pass.
+## Deferred work
 
-## Agreed Level 3 experiment
+ERP means Error–Resource Profile. In future, offline benchmark evidence or online
+measurements may inform candidate costs. Query-time merged sketch statistics can
+supply merge/readout resource observations, but do not alone establish accuracy.
+An online loop would additionally require valid observation scope, update policy,
+replanning triggers and safe deployment replacement. None is required now.
 
-Use a real historical trace replay, preserving input/query timing. First validate
-individual queries; then evaluate the full concurrent workload including sharing
-and contention. With accuracy, p95 latency and memory limits fixed in advance,
-compare measured total CPU over a common horizon. Keep predicted costs alongside
-measured results and report selection regret; do not claim production optimality
-from synthetic prices or a single selected-plan run.
-
-The executable audit and artifact contract are in
-[`tools/planning-validation`](../../tools/planning-validation/README.md). No real
-measurement pass is implied by its synthetic unit-test success.
+#776 (statistics), #777 (accuracy evidence), #778 (resource measurements) and #759
+(real-evidence selection audit) are follow-up PRs, not prerequisites for the
+current #728 → #742 → #775 path. Their contract tests are not live telemetry or
+production validation. Independent measurement correctness fixes may be reviewed
+separately. The broader real-trace experiment remains deferred; its prior CPU
+objective is not a gate for the current fixture execution milestone.

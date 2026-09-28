@@ -17,14 +17,16 @@ could prove valid or deploys one whose guarantee has never been established.
 | --- | --- | --- |
 | Construct semantic candidates | Planner | Preserve unknown guarantees; reject known-invalid evidence and impossible shapes |
 | Supply external facts | Backend | Bind evidence to the query, data population, snapshot and validity period |
-| Derive accuracy and select logical roots | Planner, under backend models and policy | Respect the root accuracy target; missing proof is not certification |
+| Derive accuracy and expose supported candidates | Planner, under supplied facts and policy | Respect the root accuracy target; missing proof is not certification |
 | Bind and admit a deployment | Backend | Verify concrete execution support and compute complete workload resource cost |
 
-The backend still invokes Planner's workload search and global selection. It
-does not introduce a second semantic optimizer. Physical binding preserves the
-selected DAG's operators, grouping, windows and dependencies; a semantic change
-requires a new selection. Single-query and workload selection use the same
-costed Planner search; the first-candidate helper has been removed.
+Planner supplies the supported computation/physical candidate inventory. Backend
+binds and prices candidates, then selects a deployment. Physical binding preserves
+operators, grouping, windows and dependencies; it does not introduce another
+semantic optimizer. The current validation milestone uses synthetic complete
+quotes followed by execution of the selected typed plan. Online ERP observations,
+feedback-driven replanning and deployment replacement are deferred. Optional
+existing ERP adapters described below are not prerequisites for this milestone.
 
 ## Decision flow
 
@@ -34,7 +36,7 @@ flowchart TD
     Validate -->|Invalid supplied evidence| Error[Reject request with reason]
     Validate -->|Valid or absent evidence| Search[Planner search retains constructible candidates]
     Search --> Inspect[Explain known and unknown candidate properties]
-    Search --> Select[Planner global selection under backend policy]
+    Search --> Select[Backend candidate binding and cost selection]
     Select --> Exact[Explicit exact fallback when no certified summary is selected]
     Select --> Bind[Bind selected logical DAG to concrete execution]
     Bind --> Admit[Check guarantees, runtime support and computed workload cost]
