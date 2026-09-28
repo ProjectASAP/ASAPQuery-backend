@@ -184,17 +184,21 @@ where
         .execute(&[0], context)
         .map_err(EngineError::from)?
         .remove(0);
-    // These adapters have synchronous callbacks and prepared I/O leaves. A
-    // single poll avoids nesting a blocking futures executor inside a readout.
-    let evaluated = match output.next().now_or_never().flatten() {
-        Some(Ok(value)) => value.value().clone(),
-        Some(Err(failure)) => {
-            return Err(error
-                .borrow_mut()
-                .take()
-                .unwrap_or_else(|| EngineError::Physical(failure)))
+    // I/O is prepared before this synchronous adapter; Pending is a cooperative yield.
+    let evaluated = loop {
+        match output.next().now_or_never() {
+            Some(Some(Ok(value))) => break value.value().clone(),
+            Some(Some(Err(failure))) => {
+                return Err(error
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(|| EngineError::Physical(failure)));
+            }
+            Some(None) => {
+                return Err(physical::Error::Operator("query DAG produced no result".into()).into())
+            }
+            None => continue,
         }
-        None => return Err(miss("synchronous query adapter did not produce a result")),
     };
     drop(output);
     drop(graph);
