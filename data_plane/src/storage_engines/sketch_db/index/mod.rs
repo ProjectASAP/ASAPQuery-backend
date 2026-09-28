@@ -5308,7 +5308,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_definition_does_not_rebind_previous_generation_payload() {
+    fn new_generation_requires_fresh_state_for_unchanged_definition() {
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
             serde_json::from_str(include_str!(
                 "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
@@ -5339,7 +5339,28 @@ mod tests {
         let mut next = plan.summary_catalog;
         next.plan_version += 1;
         store.install_summary_catalog(Arc::new(next)).unwrap();
-        assert!(store.series_ids_for_policy(fingerprint).is_empty());
+        assert!(
+            store.series_ids_for_policy(fingerprint).is_empty(),
+            "new version must start cold"
+        );
+        let output =
+            asap_types::sds::StoredOutputReference::for_output(fingerprint.into()).stored_output_id;
+        let inventory = store
+            .observed_summary_inventory(
+                "backend-a",
+                "store-a",
+                &BTreeMap::from([(
+                    StoredOutputId::from(fingerprint),
+                    (output, "producer-a".into()),
+                )]),
+                1,
+                100,
+            )
+            .unwrap();
+        assert!(inventory.instances.is_empty());
+        store.register(meta_for_config(510, &state_config));
+        store.append_sample(510, BTreeMap::new(), (0, 10_000), sample(2));
+        assert_eq!(store.series_ids_for_policy(fingerprint), vec![510]);
         let incompatible = asap_types::summary_catalog::SummaryCatalog::from_materializations(
             plan.precompute_plan.envelope.plan_id,
             plan.precompute_plan.envelope.plan_version + 2,
