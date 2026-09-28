@@ -330,7 +330,7 @@ fn assert_native_grouped_rate(plan: &CompiledPhysicalPlan) -> bool {
     stored
 }
 
-fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<String> {
+fn assert_candidate_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<String> {
     if name == "topk-rate" {
         for dag in plan.query_plan.selected_dags.values() {
             assert_rate_sort_expression(dag);
@@ -394,6 +394,28 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
     let materializations = artifact["precompute_plan"]["materializations"]
         .as_array()
         .unwrap();
+    if node["operator"]["kind"] == "current_series"
+        && matches!(name, "spatial-sum" | "spatial-quantile")
+    {
+        assert_eq!(nodes.len(), 1);
+        assert!(materializations.is_empty());
+        let population = &node["operator"]["population"];
+        assert_eq!(population["metric"], "data");
+        assert_eq!(
+            population["grouping"],
+            json!({"labels":["label_0"],"without":false})
+        );
+        assert_eq!(population["lookback_ms"], 5000);
+        assert_eq!(
+            node["operator"]["readout"],
+            if name == "spatial-sum" {
+                json!({"kind":"sum"})
+            } else {
+                json!({"kind":"quantile","q":0.9})
+            }
+        );
+        return None;
+    }
     if name == "spatial-topk" {
         assert_eq!(nodes.len(), 1, "{name}: unexpected query nodes");
         assert_eq!(node["op"], "logical", "{name}: expected a local readout");
@@ -779,14 +801,17 @@ fn issue754_queries_have_valid_physical_plans() {
                             "summary plan must retain its Planner DAG"
                         );
                     }
-                    if matches!(case.name.as_str(), "grouped-rate" | "grouped-temporal-sum") {
+                    {
                         let local = entry.nodes.values().all(|node| !matches!(node,
                             QueryPlanNode::ExactFallback { .. } | QueryPlanNode::Logical {
                                 operator: control_plane::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
                                     | control_plane::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }, .. }));
                         if local {
-                            assert_eq!(assert_selected_plan(&case.name, &plan), None,
-                                "every admitted local candidate must preserve grouped/window semantics");
+                            assert_eq!(
+                                assert_candidate_plan(&case.name, &plan),
+                                None,
+                                "every admitted local candidate must preserve query semantics"
+                            );
                         }
                     }
                     if case.name == "grouped-rate" && entry.physical_vector_binding().is_some() {
