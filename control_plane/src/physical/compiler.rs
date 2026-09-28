@@ -7822,7 +7822,9 @@ pub(crate) mod tests {
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         env.target_collector_ids.clear();
-        let bundle = DeploymentPlanCompiler.compile_promql(workload, env).unwrap();
+        let bundle = DeploymentPlanCompiler
+            .compile_promql(workload, env)
+            .unwrap();
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
     }
 
