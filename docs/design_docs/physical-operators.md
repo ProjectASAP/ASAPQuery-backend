@@ -89,7 +89,7 @@ frontier. Result-row publication, revision/coverage and retention bindings must
 be admitted explicitly; the deployment compiler must reject unsupported
 frontiers instead of moving operators.
 
-Selected Sort, Limit and semi-join fragments are compiled by Planner and persisted
+Selected Filter, Sort, Limit and semi-join fragments are compiled by Planner and persisted
 with typed input contracts. Runtime binds protocol vectors to these contracts;
 renamed or multiple join keys retain their original types and positions. External
 Prometheus bindings fetch the selected authoritative subquery without rewriting
