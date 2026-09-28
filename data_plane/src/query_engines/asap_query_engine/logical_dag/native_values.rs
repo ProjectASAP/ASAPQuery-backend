@@ -208,6 +208,13 @@ pub(super) fn physical(
                             SummaryFamilyType::Plain(DataType::Float64) => {
                                 Ok(Value::Float64(*sample))
                             }
+                            SummaryFamilyType::Plain(DataType::Int64) => {
+                                if sample.is_finite() && sample.fract() == 0. && sample.abs() <= (1_u64 << 53) as f64 {
+                                    Ok(Value::Int64(*sample as i64))
+                                } else {
+                                    Err(asap_physical_operators::Error::Invalid("protocol sample cannot represent the required Int64 input exactly".into()).into())
+                                }
+                            }
                             SummaryFamilyType::Plain(DataType::Utf8) => {
                                 Ok(labels.get(&field.name).map_or_else(
                                     || {
