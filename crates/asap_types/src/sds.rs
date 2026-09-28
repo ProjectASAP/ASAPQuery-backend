@@ -356,7 +356,7 @@ pub struct SummaryInstance {
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
     pub catalog_generation: CatalogGeneration,
-    /// Reserved wire field. Initial rollout rejects cross-version adoption.
+    /// Reserved wire field. Cross-version state adoption is not supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from_generation: Option<CatalogGeneration>,
     pub placement: SummaryPlacement,
@@ -389,14 +389,13 @@ impl SummaryInstance {
         }
         if self.reused_from_generation.is_some() {
             return Err(SdsError(
-                "cross-version stored state adoption is unsupported".into(),
+                "cross-version state adoption is not supported".into(),
             ));
         }
-        let payload_generation = self.catalog_generation.plan_version;
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
-            || self.state_reference.generation != payload_generation
+            || self.state_reference.generation != self.catalog_generation.plan_version
         {
             return Err(SdsError(
                 "summary instance has invalid state reference".into(),
@@ -1497,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_version_payload_adoption_is_rejected() {
+    fn new_generation_rejects_cross_version_payload_adoption() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
         let mut source = instance.catalog_generation.clone();
         source.plan_version -= 1;
@@ -1505,7 +1504,7 @@ mod tests {
         instance.state_reference.generation = source.plan_version;
         assert!(
             instance.validate().is_err(),
-            "new plan must not adopt old-version payload"
+            "cross-version adoption must be rejected"
         );
         instance.reused_from_generation.as_mut().unwrap().plan_id += 1;
         assert!(instance.validate().is_err());
