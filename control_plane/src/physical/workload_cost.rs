@@ -1102,7 +1102,7 @@ mod tests {
                         node,
                         crate::query_plan::QueryPlanNode::Logical {
                             operator:
-                                asap_types::query_plan::logical::ResidualQueryOperator::Scan { .. },
+                                crate::query_plan::residual::ResidualQueryOperator::Scan { .. },
                             ..
                         }
                     ))
