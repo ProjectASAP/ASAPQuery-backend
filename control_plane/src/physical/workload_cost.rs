@@ -445,6 +445,17 @@ impl WorkloadCostEvidence {
         {
             return Err(invalid("missing, future or stale evidence generation"));
         }
+        // One generation prices one dataset; a foreign quote taints all of it.
+        if let Some(quote) = self
+            .quotes
+            .iter()
+            .find(|quote| quote.manifest.dataset_identity != env.dataset_identity)
+        {
+            return Err(CompileError::CostEvidenceDataset {
+                expected: env.dataset_identity.clone(),
+                found: quote.manifest.dataset_identity.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -1804,6 +1815,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cost evidence compiler mismatch"), "{error}");
+    }
+
+    #[test]
+    fn evidence_quoting_another_dataset_is_rejected_whole() {
+        let (candidates, env, evidence) = quoted();
+        assert!(select_lowest_cost_candidate(candidates.clone(), env.clone(), &evidence).is_ok());
+        let last = evidence.quotes.len() - 1;
+        for alter in [
+            |id: &mut planner_types::post_asap::LogicalDatasetIdentity| {
+                id.namespace.push_str("-other")
+            },
+            |id: &mut planner_types::post_asap::LogicalDatasetIdentity| {
+                id.dataset.push_str("-other")
+            },
+        ] {
+            let mut foreign = evidence.clone();
+            alter(&mut foreign.quotes[last].manifest.dataset_identity);
+            let found = foreign.quotes[last].manifest.dataset_identity.clone();
+            for error in [
+                select_lowest_cost_candidate(candidates.clone(), env.clone(), &foreign),
+                select_lowest_cost_metricsql_candidate(candidates.clone(), env.clone(), &foreign),
+            ]
+            .map(Result::unwrap_err)
+            {
+                assert!(
+                    matches!(
+                        &error,
+                        CompileError::CostEvidenceDataset { expected, found: f }
+                            if expected == &env.dataset_identity && f == &found
+                    ),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]

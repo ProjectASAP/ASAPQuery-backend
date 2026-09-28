@@ -29,7 +29,10 @@ Synthetic pricing does not relax query accuracy admission or SDS identity checks
 Each layer tests the ten individual queries plus three workload ensembles:
 shared-rate (temporal-rate, grouped-rate, topk-rate), shared-quantiles
 (temporal-quantile, quantile-ratio), and all ten queries together. Structure checks
-preserve every query and validate shared output identities. Ranking checks change
+preserve every query, validate shared output identities, and apply the same
+rejection discipline as the single-query path, with its own recorded defect
+counts. Sharing one deployed output between queries that need different
+semantics from it is refused as a matter of policy, not recorded as a defect. Ranking checks change
 prices for whole workload candidates. Execution installs each selected workload
 once, ingests its fixture once, and checks every query in that workload.
 
