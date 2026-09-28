@@ -355,7 +355,10 @@ mod tests {
     fn planner_filter_compiles_and_executes_bound_labels() {
         use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryPlanNode};
         use planner_types::{
-            post_asap::{lift_plain, ExecutionTiming, SummaryExpr, SummaryNode, ValueOperation},
+            post_asap::{
+                execution_data_state::lift_plain, ExecutionTiming, SummaryExpr, SummaryNode,
+                ValueOperation,
+            },
             pre_asap::QueryExpr,
         };
         let query = "m{instance=\"pod\"}";
