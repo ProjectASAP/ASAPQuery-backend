@@ -1,4 +1,4 @@
-name: Issue 754 level-3 benefit
+name: Cross-engine benefit (fixture workload)
 
 on:
   pull_request:

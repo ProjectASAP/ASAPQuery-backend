@@ -35,3 +35,16 @@ Historical differential runs establish execution correctness. Historical benefit
 runs against another engine establish only their stated performance comparison.
 Neither establishes Level 3 selection quality. A real-evidence run with missing
 inputs must be reported as incomplete, never as a synthetic pass.
+
+## Agreed Level 3 experiment
+
+Use a real historical trace replay, preserving input/query timing. First validate
+individual queries; then evaluate the full concurrent workload including sharing
+and contention. With accuracy, p95 latency and memory limits fixed in advance,
+compare measured total CPU over a common horizon. Keep predicted costs alongside
+measured results and report selection regret; do not claim production optimality
+from synthetic prices or a single selected-plan run.
+
+The executable audit and artifact contract are in
+[`tools/planning-validation`](../../tools/planning-validation/README.md). No real
+measurement pass is implied by its synthetic unit-test success.

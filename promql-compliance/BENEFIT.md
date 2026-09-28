@@ -1,3 +1,7 @@
+> Historical cross-engine benefit evaluation. This is not the current Level 3
+> real-evidence candidate-selection gate. See
+> [measured selection validation](../tools/planning-validation/README.md).
+
 # Issue 754 level-3 benefit test
 
 The Rust workspace binary `benefit-runner`, invoked by `make benefit` in `promql-compliance/runner` reuses the level-1 and level-2
