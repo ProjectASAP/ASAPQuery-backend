@@ -96,6 +96,13 @@ A physical graph may be embedded or referenced within the bundle; either way,
 its operator vocabulary and computation remain Planner-owned. The backend does
 not copy it into a second set of Build/Merge/Estimate node variants.
 
+Two concrete decisions govern these bindings:
+
+| Design question | Decision and example |
+| --- | --- |
+| What identifies the source dataset? | Tenant A's and tenant B's `KLL(latency)` have different definitions. Moving tenant A's dataset to another endpoint preserves its definition. See [source identity examples](summary-catalog-sds-architecture.md#source-identity). |
+| Can a new plan version reuse old state immediately? | Version 43 populates its own state even if version 42 has the same definition. Same-version restart can recover eligible records. See [recovery examples](summary-catalog-sds-architecture.md#recovery-and-plan-version-changes). |
+
 Bindings attach only to declared physical boundaries:
 
 ```text

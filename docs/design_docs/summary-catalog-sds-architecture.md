@@ -116,18 +116,42 @@ must not force state migration. Unknown semantic versions fail validation.
 
 ### Source identity
 
-Source semantics include a stable logical dataset identity, supplied by Backend
-to Planner before semantic definitions are exported. It distinguishes datasets
-and includes their semantic namespace where needed, such as tenant scope.
-`KLL(latency)` over tenant A's dataset and tenant B's dataset therefore has different
-definition IDs, even when field names and types match. An endpoint, replica or
-storage location is a deployment binding and does not change dataset identity.
+**Design question 1: What identifies the source data in a SummaryDefinition?**
 
-The authority resolving a source must preserve that identity across relocation
-and assign a different identity when the logical dataset changes. Installation
-validates that the concrete binding realizes the identity in the definition.
-Definition equality never grants cross-tenant or cross-deployment authorization.
-Future discovery must match source identity as well as expression semantics.
+Two deployments both compute `KLL(latency)`. One reads tenant A's dataset and
+one reads tenant B's. Should they have the same definition ID?
+
+**Decision:** no. Backend supplies a stable logical dataset identity to Planner
+before semantic definitions are exported. Dataset identity is part of semantics;
+endpoint, replica and storage location are deployment bindings.
+
+```text
+Same expression, different datasets:
+
+  tenant-A/requests → KLL(latency) → definition D_A
+  tenant-B/requests → KLL(latency) → definition D_B
+
+  D_A ≠ D_B
+
+Same dataset, different endpoints:
+
+  tenant-A/requests ── bound to endpoint east ── definition D_A
+  tenant-A/requests ── bound to endpoint west ── definition D_A
+
+  Relocation preserves D_A when the logical dataset is unchanged.
+```
+
+| Change | Definition identity | Binding requirement |
+| --- | --- | --- |
+| Tenant A's dataset → tenant B's dataset | Changes | Bind the newly identified dataset |
+| Endpoint east → endpoint west for the same dataset | Unchanged | Verify the endpoint realizes the same dataset |
+| `latency` → `log(latency)` in the same dataset | Changes | Preserve the new input expression |
+
+The authority resolving a source preserves dataset identity across relocation and
+assigns a different identity when the logical dataset changes. Installation checks
+that the concrete source realizes the identity in the definition. Equal definitions
+do not grant cross-tenant or cross-deployment authorization. Future discovery must
+match dataset identity as well as expression semantics.
 
 ### Definition boundary
 
@@ -328,19 +352,47 @@ completeness and source event-time completeness.
 
 ### Recovery and plan-version changes
 
-The initial rollout recovers records only under the same authoritative installed
-plan version and compatible bindings. Persisting definitions and payloads does
-not itself make admission metadata durable or establish exactly-once processing
-across crashes. Recovery must re-establish required eligibility; missing proof
-cannot be treated as complete input.
+**Design question 2: Must the initial rollout reuse stored state across plan versions?**
 
-A new plan version populates its own output namespace. Even a scheduling-only
-change with equal definition IDs does not automatically adopt the old version's
-records. Queries use the new version's installed fallback or unavailability policy
-until its state is ready. This entails rebuild work and a warm-up interval.
-In-flight runs retain their installed version, and cleanup respects active readers.
-Explicit cross-version state adoption is deferred to a separate compatibility and
-authorization design; it is not part of initial recovery or binary rollback.
+Version 42 already stores `KLL(latency)`. Version 43 changes only the scheduling
+policy and keeps the same semantic definition. Can version 43 read version 42's
+records immediately?
+
+**Decision:** no. Initial recovery supports the same installed plan version.
+Each new version populates its own output namespace. Cross-version state adoption
+is deferred, even when definitions match.
+
+```text
+Existing deployment:
+  version 42 → output latency-kll → definition D → ready records
+
+Restart version 42:
+  recover version-42 records
+      → validate bindings and required completeness proof
+      → serve eligible state
+
+Install version 43 (same definition D, changed schedule):
+  version 43 → output latency-kll → definition D → no ready records yet
+      → populate version-43 state
+      → fallback or unavailable while warming up
+      → serve version-43 state when eligible
+
+  Equal D does not authorize reading version-42 records from version 43.
+```
+
+| Event | Initial-rollout behavior |
+| --- | --- |
+| Restart the same installed version | Recover compatible records and revalidate eligibility |
+| Install a new version with equal definitions | Populate new-version state; no automatic adoption |
+| Query before new-version state is ready | Apply the installed fallback or unavailability policy |
+| Old-version query already in flight | Keep its installed version; cleanup respects active readers |
+
+This choice incurs rebuild work and a warm-up interval. Persisting definitions
+and payloads does not itself make admission metadata durable or establish
+exactly-once processing across crashes. Missing completeness proof cannot be
+interpreted as complete input after restart. Cross-version adoption requires a
+separate compatibility and authorization design; binary rollback does not itself
+authorize it.
 
 ## 7. Future: discovering SDS for an unregistered query
 
