@@ -55,6 +55,10 @@ jobs:
           python3 -m unittest discover -s scripts/ci -p 'test_*.py'
           node scripts/ci/test_planner_merge.js
 
+      - name: Test resource measurement normalization
+        working-directory: ASAPQuery-backend
+        run: python3 -m unittest discover -s tools/empirical-bench -p 'test_*.py'
+
       - name: Check workspace formatting
         working-directory: ASAPQuery-backend
         # `--all` also follows this workspace's sibling path dependencies.
