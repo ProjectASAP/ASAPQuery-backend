@@ -807,12 +807,13 @@ fn finish_readout(
     result: Result<PostAsapReadoutOutcome, LoweringSkip>,
     revision_unchanged: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let outcome = result?;
     if !revision_unchanged {
         return Err(LoweringSkip::ExecuteFailed(
             "summary input changed during query DAG evaluation".into(),
         ));
     }
-    result
+    Ok(outcome)
 }
 
 /// `SummaryValue::Points`/`TopK` -> `ASAPTierResult.series`'s row shape.
