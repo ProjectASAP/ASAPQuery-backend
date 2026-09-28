@@ -384,7 +384,7 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
-            if let QueryPlanNode::Physical {
+            if let QueryPlanNode::PhysicalFragment {
                 inputs,
                 dag,
                 row_input,
@@ -669,7 +669,7 @@ pub struct PruningInputContract {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
     /// Planner-compiled computation. Input order follows the physical input contracts.
-    Physical {
+    PhysicalFragment {
         inputs: Vec<QueryNodeId>,
         dag: Vec<u8>,
         row_input: usize,
@@ -744,7 +744,7 @@ impl QueryPlanNode {
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
-            Self::Physical { inputs, .. }
+            Self::PhysicalFragment { inputs, .. }
             | Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
