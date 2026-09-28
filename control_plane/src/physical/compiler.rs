@@ -648,6 +648,14 @@ pub enum CompileError {
     Query { query_id: String, reason: String },
     #[error("query {query_id}: TopK evidence is stale or invalid: {reason}")]
     InvalidEvidence { query_id: String, reason: String },
+    #[error(
+        "cost evidence for dataset {}/{} cannot price deployment for {}/{}",
+        found.namespace, found.dataset, expected.namespace, expected.dataset
+    )]
+    CostEvidenceDataset {
+        expected: planner_types::post_asap::LogicalDatasetIdentity,
+        found: planner_types::post_asap::LogicalDatasetIdentity,
+    },
     #[error("query {query_id}: lifecycle planning failed: {reason}")]
     Lifecycle { query_id: String, reason: String },
     #[error("failed to construct a physical materialization: {0}")]
