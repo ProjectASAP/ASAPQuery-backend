@@ -1,6 +1,6 @@
 //! Emit pricing requirements; never fabricate quotes or publish a plan.
 use control_plane::physical::{
-    compiler::BackendLocalPlanningInput, compiler::PhysicalPlanCompiler, workload_cost,
+    compiler::BackendLocalPlanningInput, compiler::DeploymentPlanCompiler, workload_cost,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .filter_map(|candidate| {
             let queries = candidate.queries.clone();
-            PhysicalPlanCompiler
+            DeploymentPlanCompiler
                 .compile_promql(candidate, environment.clone())
                 .and_then(|plan| workload_cost::manifest(&plan, &queries))
                 .ok()

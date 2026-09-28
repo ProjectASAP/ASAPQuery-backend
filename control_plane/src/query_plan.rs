@@ -9,8 +9,6 @@ pub use asap_types::query_plan::*;
 use asap_types::PolicyFingerprint;
 use planner_types::post_asap::{SummaryExpr, SummaryFamilyType, SummaryNode};
 use planner_types::pre_asap::Reduction;
-#[deprecated(note = "Use query_plan::residual")]
-pub use residual as logical;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -1031,9 +1029,10 @@ mod catalog_binding_tests {
                         full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: config.policy_fingerprint().into(),
-                        state_reference: asap_types::sds::StateReference::for_definition(
-                            config.policy_fingerprint().into(),
-                        ),
+                        stored_output_reference:
+                            asap_types::sds::StoredOutputReference::for_definition(
+                                config.policy_fingerprint().into(),
+                            ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 10_000,
                         pane_origin_ms: Some(0),
@@ -1163,8 +1162,10 @@ mod catalog_binding_tests {
             SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
         let (mut counter_plan, _) = fixture();
         binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
-        binding(&mut counter_plan).state_reference =
-            asap_types::sds::StateReference::for_definition(counter.policy_fingerprint().into());
+        binding(&mut counter_plan).stored_output_reference =
+            asap_types::sds::StoredOutputReference::for_definition(
+                counter.policy_fingerprint().into(),
+            );
         as_rate_plan(counter_plan)
             .validate_against_catalog(&counter_catalog)
             .unwrap();
@@ -1184,7 +1185,7 @@ mod tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let root = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let root = crate::planner_selection::plan_test_query(&canonical).unwrap();
         let SummaryExpr::BinaryOp { operator, .. } = &root.expr else {
             panic!("expected the Planner's average rewrite");
         };
@@ -1207,9 +1208,10 @@ mod tests {
                     Ok(MaterializationBinding {
                         full_window_slide_ms: None,
                         materialization: PolicyFingerprint(7).into(),
-                        state_reference: asap_types::sds::StateReference::for_definition(
-                            PolicyFingerprint(7).into(),
-                        ),
+                        stored_output_reference:
+                            asap_types::sds::StoredOutputReference::for_definition(
+                                PolicyFingerprint(7).into(),
+                            ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
                         pane_origin_ms: Some(0),

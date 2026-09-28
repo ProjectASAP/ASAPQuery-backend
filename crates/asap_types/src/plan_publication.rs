@@ -81,10 +81,10 @@ pub fn validate_maintenance_query_bindings(
     Ok(())
 }
 
-/// Every query read must target the installed writer's exact state slot and
+/// Every query read must target the installed writer's exact stored output and
 /// physical window contract. The catalog describes semantics; these choices
 /// belong to the executable plans.
-pub fn validate_state_references(
+pub fn validate_stored_output_references(
     precompute: &PrecomputePlan,
     query: &QueryPlan,
 ) -> Result<(), String> {
@@ -100,15 +100,23 @@ pub fn validate_state_references(
         .collect::<std::collections::BTreeMap<crate::sds::SummaryDefinitionId, _>>();
     for entry in query.entries.values() {
         for binding in entry.materialization_bindings() {
-            let writer = writers
-                .get(&binding.materialization)
-                .ok_or("query binding has no precompute state writer")?;
-            if binding.state_reference != writer.state_reference {
-                return Err("query read and precompute writer have different state slots".into());
+            let writer = writers.get(&binding.materialization).ok_or_else(|| {
+                format!(
+                    "query binding for definition {} has no precompute stored-summary writer",
+                    binding.materialization.as_u64()
+                )
+            })?;
+            if binding.stored_output_reference != writer.stored_output_reference {
+                return Err(
+                    "query read and precompute writer have different stored outputs".into(),
+                );
             }
-            let config = configs
-                .get(&binding.materialization)
-                .ok_or("query binding has no precompute definition")?;
+            let config = configs.get(&binding.materialization).ok_or_else(|| {
+                format!(
+                    "query binding for definition {} has no precompute configuration",
+                    binding.materialization.as_u64()
+                )
+            })?;
             let full_slide = matches!(
                 config.window_layout,
                 crate::WindowMaterializationLayout::FullWindow
@@ -145,7 +153,7 @@ impl PhysicalPlanPublication {
             .validate_against_catalog(catalog)
             .map_err(|e| e.to_string())?;
         validate_maintenance_query_bindings(&self.precompute_plan, &self.query_plan)?;
-        validate_state_references(&self.precompute_plan, &self.query_plan)?;
+        validate_stored_output_references(&self.precompute_plan, &self.query_plan)?;
         let mut collectors = std::collections::BTreeSet::new();
         for collector in &self.collector_plans {
             if collector.envelope != self.precompute_plan.envelope

@@ -521,10 +521,15 @@ pub(crate) fn selected_residual_nodes(
             ) else {
                 continue;
             };
-            let Ok(witness) = crate::planner_selection::select_summary_default(&canonical) else {
-                continue;
+            // Match provenance against all exact candidates. Do not make a
+            // second selection or assume the first enumerated candidate won.
+            use asap_aware_mapping::{
+                Replacement, ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
             };
-            if witness.as_ref() == selected {
+            let root = std::rc::Rc::new(canonical);
+            let candidates = SketchAlgorithmStrategy::new(&asap_aware_mapping::DefaultCostModel)
+                .replacements(&TargetSubDAG::new(&root));
+            if candidates.iter().any(|candidate| matches!(&candidate.replacement, Replacement::Summary(node) if node.as_ref() == selected)) {
                 let mut lower = Lower {
                     nodes: BTreeMap::new(),
                     seen: BTreeMap::new(),
@@ -579,46 +584,47 @@ mod hybrid_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
-        let entry =
-            crate::query_plan::compile_bound_composable_mapped(
-                "hybrid".into(),
-                query.into(),
-                &selected,
-                InstantExecution {
-                    lookback_ms: 300_000,
-                    full_history: false,
-                    cumulative_readout: false,
-                },
-                FallbackPolicy::Reject,
-                |node, _| {
-                    let (_, _, spatial_filter) =
-                        crate::physical::compiler::raw_materialization_input_contract(node)
-                            .map_err(QueryPlanError::Invalid)?;
-                    Ok(MaterializationBinding {
-                        full_window_slide_ms: None,
-                        item_labels: Vec::new(),
-                        materialization: asap_types::PolicyFingerprint(
-                            if spatial_filter.is_empty() { 7 } else { 8 },
-                        )
-                        .into(),
-                        state_reference: asap_types::sds::StateReference::for_definition(
-                            asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
-                                7
-                            } else {
-                                8
-                            })
-                            .into(),
-                        ),
-                        output_grouping: PhysicalGrouping::PerEntity,
-                        window_ms: 300_000,
-                        pane_origin_ms: Some(0),
-                        readout_lookback_ms: Some(300_000),
+        let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
+        let entry = crate::query_plan::compile_bound_composable_mapped(
+            "hybrid".into(),
+            query.into(),
+            &selected,
+            InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            FallbackPolicy::Reject,
+            |node, _| {
+                let (_, _, spatial_filter) =
+                    crate::physical::compiler::raw_materialization_input_contract(node)
+                        .map_err(QueryPlanError::Invalid)?;
+                Ok(MaterializationBinding {
+                    full_window_slide_ms: None,
+                    item_labels: Vec::new(),
+                    materialization: asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
+                        7
+                    } else {
+                        8
                     })
-                },
-                |_, _| {},
-            )
-            .unwrap();
+                    .into(),
+                    stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                        asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
+                            7
+                        } else {
+                            8
+                        })
+                        .into(),
+                    ),
+                    output_grouping: PhysicalGrouping::PerEntity,
+                    window_ms: 300_000,
+                    pane_origin_ms: Some(0),
+                    readout_lookback_ms: Some(300_000),
+                })
+            },
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(entry.materialization_bindings().len(), 2);
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
@@ -661,7 +667,7 @@ mod hybrid_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
         assert!(
             selected_residual_nodes("sum_over_time(m{job=\"worker\"}[5m])", &selected).is_err()
         );
@@ -671,7 +677,7 @@ mod hybrid_tests {
 #[cfg(test)]
 mod planner_workload_tests {
     use super::*;
-    use crate::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use crate::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
 
     fn compile_one(query: &str) -> crate::physical::compiler::CompiledPhysicalPlan {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -686,7 +692,7 @@ mod planner_workload_tests {
         let (request, environment) = snapshot
             .into_physical_compilation_request()
             .unwrap_or_else(|error| panic!("{query}: {error}"));
-        PhysicalPlanCompiler
+        DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap_or_else(|error| panic!("{query}: {error}"))
     }
@@ -772,7 +778,7 @@ mod planner_workload_tests {
         let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         assert!(request.allow_mixed_summary_and_exact_execution);
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         assert_eq!(plan.query_plan.entries.len(), 24);
@@ -791,8 +797,19 @@ mod planner_workload_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
-        let operator = selected_aggregate_operator(query, &selected).unwrap();
+        use asap_aware_mapping::{
+            Replacement, ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
+        };
+        let root = std::rc::Rc::new(canonical);
+        let candidates = SketchAlgorithmStrategy::new(&asap_aware_mapping::DefaultCostModel)
+            .replacements(&TargetSubDAG::new(&root));
+        let [candidate] = candidates.as_slice() else {
+            panic!("expected one exact aggregate candidate")
+        };
+        let Replacement::Summary(selected) = &candidate.replacement else {
+            panic!("expected exact summary fixture")
+        };
+        let operator = selected_aggregate_operator(query, selected).unwrap();
         assert!(matches!(
             operator,
             ResidualQueryOperator::Aggregate {
@@ -810,13 +827,13 @@ mod planner_workload_tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
+        let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
         let maximum = crate::query_parser::parse_query_expr_canonical(
             "max(m)",
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let maximum = crate::planner_selection::select_summary_default(&maximum).unwrap();
+        let maximum = crate::planner_selection::plan_test_query(&maximum).unwrap();
         let result = selected_residual_nodes("min(m) + max(m)", &selected);
         if selected == maximum {
             assert!(result.is_err());
@@ -918,7 +935,7 @@ mod range_max_materialization_tests {
                 planner_types::types::AccuracyTarget::Exact,
             )
             .unwrap();
-            let selected = crate::planner_selection::select_summary_default(&original).unwrap();
+            let selected = crate::planner_selection::plan_test_query(&original).unwrap();
             let key = selected_range_max_materialization(query, &selected)
                 .unwrap()
                 .unwrap();
@@ -938,7 +955,7 @@ mod range_max_materialization_tests {
                 planner_types::types::AccuracyTarget::Exact,
             )
             .unwrap();
-            let selected = crate::planner_selection::select_summary_default(&original).unwrap();
+            let selected = crate::planner_selection::plan_test_query(&original).unwrap();
             assert!(
                 selected_range_max_materialization(query, &selected)
                     .unwrap()
@@ -949,7 +966,7 @@ mod range_max_materialization_tests {
     }
 }
 
-/// Stable contract identity used by priced physical alternatives, independent of node IDs.
+/// Stable contract identity used by priced physical candidates, independent of node IDs.
 fn materialization_candidate_key(
     candidate: MaterializationCandidateIdentity,
 ) -> Result<String, QueryPlanError> {
@@ -1331,7 +1348,7 @@ mod remote_boundary_regressions {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let selected = crate::planner_selection::select_summary_default(&parsed).unwrap();
+        let selected = crate::planner_selection::plan_test_query(&parsed).unwrap();
         assert_eq!(
             eligible_materialization_keys(query, &selected)
                 .unwrap()
@@ -1340,9 +1357,6 @@ mod remote_boundary_regressions {
         );
     }
 }
-
-#[deprecated(note = "Use eligible_materialization_keys")]
-pub use eligible_materialization_keys as materialization_candidate_keys;
 
 #[cfg(test)]
 mod tests {

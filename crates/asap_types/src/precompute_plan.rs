@@ -218,7 +218,8 @@ impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StateSchemaContract {
-    pub state_reference: crate::sds::StateReference,
+    #[serde(alias = "state_reference")]
+    pub stored_output_reference: crate::sds::StoredOutputReference,
     pub schema_id: String,
     pub schema_version: u32,
     pub materialization: crate::sds::SummaryDefinitionId,
@@ -333,7 +334,9 @@ impl PrecomputePlan {
                 );
                 let value_projection = materialization.effective_value_projection().clone();
                 Ok(StateSchemaContract {
-                    state_reference: crate::sds::StateReference::for_definition(fingerprint.into()),
+                    stored_output_reference: crate::sds::StoredOutputReference::for_definition(
+                        fingerprint.into(),
+                    ),
                     schema_id: state_schema_id(fingerprint),
                     schema_version: 1,
                     materialization: fingerprint.into(),
@@ -788,15 +791,15 @@ impl PrecomputePlan {
             }
         }
         let mut schema_ids = BTreeSet::new();
-        let mut state_slots = BTreeSet::new();
+        let mut stored_outputs = BTreeSet::new();
         for schema in &self.schemas {
             if schema.schema_id.trim().is_empty()
                 || !schema_ids.insert(schema.schema_id.as_str())
-                || !state_slots.insert(schema.state_reference.state_slot_id)
+                || !stored_outputs.insert(schema.stored_output_reference.stored_output_id)
                 || schema.schema_version == 0
                 || schema.encodings.is_empty()
-                || schema.state_reference.validate().is_err()
-                || schema.state_reference.definition_id != schema.materialization
+                || schema.stored_output_reference.validate().is_err()
+                || schema.stored_output_reference.definition_id != schema.materialization
             {
                 return Err(PrecomputePlanError::InvalidSchema {
                     schema_id: schema.schema_id.clone(),

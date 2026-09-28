@@ -1,5 +1,6 @@
-//! Shared SDS metadata contracts. Summary payload bytes remain storage-engine
-//! owned; catalogs and inventories contain identities and state references only.
+//! Shared contracts for summary definitions, stored-summary metadata, and plan
+//! output bindings. Payload bytes remain storage-engine owned and logically
+//! belong to the stored summary identified by this metadata.
 pub const TIMESTAMPED_OBSERVATION_SEMANTICS: &str = "asap.timestamped-observations.v2";
 
 use crate::{AggregationType, PrecomputeMaterialization};
@@ -53,35 +54,38 @@ impl From<SummaryDefinitionId> for crate::PolicyFingerprint {
     }
 }
 
-/// Identity of one producer output within an installed plan version. The
-/// enclosing plan version scopes this value; shared readers use the same slot.
+/// Identity of one persisted producer output within an installed plan version.
+/// V1 derives it from the definition ID because the runtime index is keyed by
+/// definition; a future schema may allocate independent output IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct StateSlotId(pub u64);
+pub struct StoredOutputId(pub u64);
 
 /// Typed join key carried by both the writer and every bound reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StateReference {
-    pub state_slot_id: StateSlotId,
+pub struct StoredOutputReference {
+    #[serde(alias = "state_slot_id")]
+    pub stored_output_id: StoredOutputId,
     pub definition_id: SummaryDefinitionId,
 }
 
-impl StateReference {
-    /// Deterministic slot allocation for a shared producer keyed by its
-    /// definition. Validation also permits other compiler-assigned slots.
+impl StoredOutputReference {
+    /// V1 binding for the single stored output of a definition.
     pub fn for_definition(definition_id: SummaryDefinitionId) -> Self {
         Self {
-            state_slot_id: StateSlotId(definition_id.as_u64()),
+            stored_output_id: StoredOutputId(definition_id.as_u64()),
             definition_id,
         }
     }
 
     pub fn validate(&self) -> Result<(), SdsError> {
-        if self.state_slot_id.0 != 0 {
+        if *self == Self::for_definition(self.definition_id) {
             Ok(())
         } else {
-            Err(SdsError("state slot must be nonzero".into()))
+            Err(SdsError(
+                "stored output differs from its V1 definition binding".into(),
+            ))
         }
     }
 }
@@ -308,7 +312,8 @@ pub enum InstanceLifecycle {
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstance {
     pub instance_id: SummaryInstanceId,
-    pub state_slot_id: StateSlotId,
+    #[serde(alias = "state_slot_id")]
+    pub stored_output_id: StoredOutputId,
     #[serde(alias = "materialization_id")]
     pub summary_definition_id: SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
@@ -316,8 +321,8 @@ pub struct SummaryInstance {
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
     pub catalog_generation: CatalogGeneration,
-    /// Original storage generation when an identical state contract is
-    /// explicitly reused by the active plan.
+    /// Source generation selected by an explicit compatibility decision when
+    /// an unchanged definition reuses a committed payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from_generation: Option<CatalogGeneration>,
     pub placement: SummaryPlacement,
@@ -330,9 +335,11 @@ pub struct SummaryInstance {
 
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
-        if self.state_slot_id.0 == 0 {
+        if self.stored_output_id
+            != StoredOutputReference::for_definition(self.summary_definition_id).stored_output_id
+        {
             return Err(SdsError(
-                "summary instance has an invalid state slot".into(),
+                "summary instance has an invalid stored output".into(),
             ));
         }
         if self.time_range.start_ms >= self.time_range.end_ms {
@@ -352,13 +359,13 @@ impl SummaryInstance {
                 "summary instance placement must be resolved".into(),
             ));
         }
-        let state_generation = if let Some(source) = &self.reused_from_generation {
+        let payload_generation = if let Some(source) = &self.reused_from_generation {
             validate_catalog_generation(source)?;
             if source.plan_id != self.catalog_generation.plan_id
                 || source.plan_version >= self.catalog_generation.plan_version
             {
                 return Err(SdsError(
-                    "summary instance has invalid reuse provenance".into(),
+                    "stored summary has invalid reuse provenance".into(),
                 ));
             }
             source.plan_version
@@ -368,7 +375,7 @@ impl SummaryInstance {
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
-            || self.state_reference.generation != state_generation
+            || self.state_reference.generation != payload_generation
         {
             return Err(SdsError(
                 "summary instance has invalid state reference".into(),
@@ -1290,7 +1297,7 @@ mod tests {
     fn observed_instance(lifecycle: InstanceLifecycle) -> SummaryInstance {
         SummaryInstance {
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
-            state_slot_id: StateSlotId(7),
+            stored_output_id: StoredOutputId(7),
             summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
             summary_descriptor_id: descriptor(
                 200,
@@ -1352,25 +1359,35 @@ mod tests {
     }
 
     #[test]
-    fn state_slot_is_plan_scoped_and_payload_version_must_match_instance() {
+    fn stored_output_and_payload_version_must_match_instance_definition() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
-        instance.state_slot_id = StateSlotId(0);
+        instance.stored_output_id = StoredOutputId(8);
         assert!(instance.validate().is_err());
-        instance.state_slot_id = StateSlotId(7);
-        instance.state_slot_id = StateSlotId(8);
-        instance.validate().unwrap();
-        instance.state_slot_id = StateSlotId(7);
+        instance.stored_output_id = StoredOutputId(7);
         instance.state_reference.generation = 3;
         assert!(instance.validate().is_err());
-        let mut reference = StateReference::for_definition(instance.summary_definition_id);
-        reference.state_slot_id = StateSlotId(0);
+        let mut reference = StoredOutputReference::for_definition(instance.summary_definition_id);
+        reference.stored_output_id = StoredOutputId(8);
         assert!(reference.validate().is_err());
-        reference.state_slot_id = StateSlotId(8);
-        reference.validate().unwrap();
     }
 
     #[test]
-    fn reused_instance_requires_explicit_matching_source_generation() {
+    fn stored_output_reference_accepts_legacy_state_slot_field() {
+        let reference: StoredOutputReference = serde_json::from_value(json!({
+            "state_slot_id": 7,
+            "definition_id": 7
+        }))
+        .unwrap();
+        assert_eq!(reference.stored_output_id, StoredOutputId(7));
+        reference.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(reference).unwrap(),
+            json!({"stored_output_id": 7, "definition_id": 7})
+        );
+    }
+
+    #[test]
+    fn reused_payload_requires_an_older_compatible_plan_generation() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
         let mut source = instance.catalog_generation.clone();
         source.plan_version -= 1;

@@ -8,9 +8,6 @@
 pub mod current_series;
 pub mod residual;
 
-#[deprecated(note = "Use query_plan::residual")]
-pub use residual as logical;
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use planner_types::post_asap::SketchQuery;
@@ -174,6 +171,34 @@ impl QueryPlan {
             return Err(QueryPlanError::Invalid(
                 "non-bootstrap QueryPlan has zero plan_version".into(),
             ));
+        }
+        for (query_id, selected) in &self.selected_dags {
+            if query_id != &selected.query_id {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG map key `{query_id}` differs from document query ID `{}`",
+                    selected.query_id
+                )));
+            }
+            if selected.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+            {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` has unsupported schema version {}",
+                    selected.schema_version
+                )));
+            }
+            selected.decode().map_err(|error| {
+                QueryPlanError::Invalid(format!("selected DAG `{query_id}` is invalid: {error}"))
+            })?;
+            let matching_entries = self
+                .entries
+                .values()
+                .filter(|entry| entry.query_id == *query_id)
+                .count();
+            if matching_entries != 1 {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` must correspond to exactly one query entry; found {matching_entries}"
+                )));
+            }
         }
         if let Some(context) = &self.clickhouse_context {
             for (template, identities) in &context.window_templates {
@@ -397,11 +422,11 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
-                if binding.state_reference.validate().is_err()
-                    || binding.state_reference.definition_id != binding.materialization
+                if binding.stored_output_reference.validate().is_err()
+                    || binding.stored_output_reference.definition_id != binding.materialization
                 {
                     return Err(QueryPlanError::Invalid(
-                        "read binding has invalid state slot or definition".into(),
+                        "read binding has invalid stored output or definition".into(),
                     ));
                 }
                 if binding.readout_lookback_ms == Some(0) {
@@ -440,7 +465,8 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
-    pub state_reference: crate::sds::StateReference,
+    #[serde(alias = "state_reference")]
+    pub stored_output_reference: crate::sds::StoredOutputReference,
     /// Complete-window storage advances independently of its stored extent.
     /// None denotes disjoint pane storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]

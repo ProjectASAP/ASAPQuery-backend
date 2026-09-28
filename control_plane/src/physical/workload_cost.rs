@@ -9,7 +9,7 @@ mod status;
 pub use status::{CandidateEvaluationStatus, CandidateSearchScope};
 
 #[cfg(test)]
-use super::compiler::PhysicalPlanCompiler;
+use super::compiler::DeploymentPlanCompiler;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,9 +29,9 @@ pub struct CostComponentDemand {
     pub implementation: Value,
     /// `horizon` includes all work in the manifest's source/time scope;
     /// `query_evaluation` is one execution of this bound query operator.
-    #[serde(rename = "unit", alias = "pricing_basis")]
+    #[serde(rename = "unit")]
     pub pricing_basis: String,
-    #[serde(rename = "multiplicity", alias = "occurrences_per_horizon")]
+    #[serde(rename = "multiplicity")]
     pub occurrences_per_horizon: f64,
 }
 
@@ -44,7 +44,7 @@ pub struct WorkloadCostManifest {
     pub capability_snapshot_id: String,
     pub backend_compat: String,
     pub horizon_seconds: f64,
-    /// Canonical roots, requirements and demand must match across alternatives.
+    /// Canonical roots, requirements and demand must match across candidates.
     pub workload: BTreeMap<String, Value>,
     pub components: BTreeMap<String, CostComponentDemand>,
 }
@@ -79,11 +79,11 @@ pub struct WorkloadCostEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 /// A candidate diagnostic can precede pricing or record compilation failure.
 pub struct CandidatePlanEvaluation {
-    #[serde(rename = "alternative_id", alias = "candidate_id")]
+    #[serde(rename = "candidate_id")]
     pub candidate_id: Option<String>,
     #[serde(default)]
     pub logical_root_ids: Vec<String>,
-    #[serde(rename = "physical_alternative_id", alias = "physical_candidate_id")]
+    #[serde(rename = "physical_candidate_id")]
     pub physical_candidate_id: Option<String>,
     pub identity_unavailable_reason: Option<String>,
     #[serde(default)]
@@ -95,31 +95,28 @@ pub struct CandidatePlanEvaluation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MaterializationSearchCoverage {
-    #[serde(rename = "eligible_leaves", alias = "eligible_materialization_count")]
+    #[serde(rename = "eligible_leaves")]
     pub eligible_materialization_count: usize,
-    #[serde(
-        rename = "enumerated_local_masks",
-        alias = "enumerated_candidate_key_sets"
-    )]
+    #[serde(rename = "enumerated_local_masks")]
     pub enumerated_candidate_key_sets: usize,
     pub exhaustive: bool,
-    #[serde(rename = "scope", alias = "search_scope")]
+    #[serde(rename = "scope")]
     pub search_scope: CandidateSearchScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CandidatePlanSelectionReport {
     #[serde(default)]
-    #[serde(rename = "logical_selection", alias = "planner_selection_trace")]
+    #[serde(rename = "logical_selection")]
     pub planner_selection_trace: Vec<Value>,
-    #[serde(default, alias = "index_search_coverage")]
+    #[serde(default)]
     pub materialization_search_coverage: Option<MaterializationSearchCoverage>,
     pub data_snapshot_id: String,
     pub model_version: String,
     pub selected_plan_id: u64,
     pub selected_manifest: WorkloadCostManifest,
     pub component_costs: BTreeMap<String, f64>,
-    #[serde(rename = "alternatives", alias = "candidate_evaluations")]
+    #[serde(rename = "candidates")]
     pub candidate_evaluations: Vec<CandidatePlanEvaluation>,
 }
 
@@ -470,7 +467,7 @@ impl WorkloadCostEvidence {
     }
 }
 
-fn alternative_description(candidate: &PhysicalCompilationRequest) -> CandidatePlanEvaluation {
+fn candidate_description(candidate: &PhysicalCompilationRequest) -> CandidatePlanEvaluation {
     let root_ids = candidate
         .queries
         .iter()
@@ -519,7 +516,7 @@ fn compile_candidate_for_pricing(
     ),
     Box<CandidatePlanEvaluation>,
 > {
-    let mut description = alternative_description(&candidate);
+    let mut description = candidate_description(&candidate);
     let queries = candidate.queries.clone();
     let compiled = super::realization::RealizationProvider::compile(
         &super::realization::ExistingRealizations,
@@ -606,7 +603,7 @@ pub fn compile_candidates_for_pricing(
 }
 
 /// Compare complete Planner-authorized forests after binding. Infeasible or
-/// uncosted alternatives are retained as unavailable, never assigned zero.
+/// uncosted candidates are retained as unavailable, never assigned zero.
 pub fn select_lowest_cost_candidate(
     candidates: Vec<PhysicalCompilationRequest>,
     env: PhysicalDeploymentContext,
@@ -684,9 +681,7 @@ fn select_candidates(
             .as_ref()
             .is_some_and(|previous| previous != &scope)
         {
-            return Err(invalid(
-                "alternatives describe different workloads/horizons",
-            ));
+            return Err(invalid("candidates describe different workloads/horizons"));
         }
         comparison_workload = Some(scope);
         match super::realization::RealizationProvider::price(
@@ -711,9 +706,9 @@ fn select_candidates(
         }
     }
     let (_, mut plan, selected_manifest, component_costs) = best.ok_or_else(|| {
-        CompileError::Alternatives(
+        CompileError::Candidates(
             json!({"status": "all_infeasible", "logical_selection": planner_selection_trace,
-            "alternatives": candidate_evaluations}),
+            "candidates": candidate_evaluations}),
         )
     })?;
     // Exactly the winner retained by the existing strict-less-than selector.
@@ -737,11 +732,11 @@ pub fn enumerate_exact_and_materialized_candidates(
     request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
     let already_selected = super::maintained_population::supported(&request);
-    let mut alternatives = materialization_alternatives(request)?;
+    let mut candidates = materialization_candidates(request)?;
     if already_selected {
-        return Ok(alternatives);
+        return Ok(candidates);
     }
-    let roots: Vec<_> = alternatives
+    let roots: Vec<_> = candidates
         .last()
         .expect("exact alternative")
         .queries
@@ -753,7 +748,7 @@ pub fn enumerate_exact_and_materialized_candidates(
         .collect();
     let strategy =
         asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(&roots);
-    let candidates: Vec<_> = roots
+    let maintained_roots: Vec<_> = roots
         .iter()
         .map(|root| {
             strategy
@@ -761,19 +756,19 @@ pub fn enumerate_exact_and_materialized_candidates(
                 .filter(|node| super::maintained_population::supported_node(node))
         })
         .collect();
-    if candidates.iter().any(Option::is_some) {
+    if maintained_roots.iter().any(Option::is_some) {
         // Current-series rules are compatible with window summaries in other
         // workload roots. Preserve each priced temporal alternative and mask.
-        let maintained: Vec<_> = alternatives
+        let maintained: Vec<_> = candidates
             .iter()
             .map(|alternative| {
                 let mut candidate = alternative.clone();
-                for (query, selected) in candidate.queries.iter_mut().zip(&candidates) {
+                for (query, selected) in candidate.queries.iter_mut().zip(&maintained_roots) {
                     if let Some(selected) = selected {
                         query.selected_plan_root = std::rc::Rc::clone(selected);
                     }
                 }
-                if candidates.iter().all(Option::is_some) {
+                if maintained_roots.iter().all(Option::is_some) {
                     candidate.allow_mixed_summary_and_exact_execution = false;
                     candidate.enabled_materialization_keys = None;
                 }
@@ -781,7 +776,7 @@ pub fn enumerate_exact_and_materialized_candidates(
             })
             .collect();
         for candidate in maintained {
-            if !alternatives.iter().any(|existing| {
+            if !candidates.iter().any(|existing| {
                 existing.allow_mixed_summary_and_exact_execution
                     == candidate.allow_mixed_summary_and_exact_execution
                     && existing.enabled_materialization_keys
@@ -792,14 +787,14 @@ pub fn enumerate_exact_and_materialized_candidates(
                         .zip(&candidate.queries)
                         .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
             }) {
-                alternatives.push(candidate);
+                candidates.push(candidate);
             }
         }
     }
-    Ok(alternatives)
+    Ok(candidates)
 }
 
-fn materialization_alternatives(
+fn materialization_candidates(
     request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
     let mut exact = request.clone();
@@ -866,37 +861,6 @@ fn materialization_alternatives(
     }
 }
 
-// Compatibility imports; new callers use the domain names above.
-#[deprecated(note = "Use CandidatePlanEvaluation")]
-pub use CandidatePlanEvaluation as AlternativeCost;
-#[deprecated(note = "Use CandidatePlanSelectionReport")]
-pub use CandidatePlanSelectionReport as WorkloadCostComparison;
-#[deprecated(note = "Use CostComponentDemand")]
-pub use CostComponentDemand as CostDemand;
-
-#[deprecated(note = "Use enumerate_exact_and_materialized_candidates")]
-pub use enumerate_exact_and_materialized_candidates as with_exact_alternative;
-#[deprecated(note = "Use select_lowest_cost_candidate")]
-pub use select_lowest_cost_candidate as select;
-#[deprecated(note = "Use select_lowest_cost_metricsql_candidate")]
-pub use select_lowest_cost_metricsql_candidate as select_metricsql;
-#[deprecated(note = "Use compile_candidates_for_pricing with QueryFrontend")]
-pub fn prepare_manifests(
-    candidates: Vec<PhysicalCompilationRequest>,
-    env: PhysicalDeploymentContext,
-    metricsql: bool,
-) -> (Vec<WorkloadCostManifest>, Vec<CandidatePlanEvaluation>) {
-    compile_candidates_for_pricing(
-        candidates,
-        env,
-        if metricsql {
-            super::compiler::QueryFrontend::MetricsQl
-        } else {
-            super::compiler::QueryFrontend::PromQl
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::compiler::BackendLocalPlanningInput;
@@ -912,72 +876,33 @@ mod tests {
         snapshot
     }
 
-    // New input aliases must produce the same candidate identities and manifests
-    // while serialization continues to serve existing evidence producers.
+    /// Input uses one wire contract; removed aliases are not silently accepted.
     #[test]
-    fn renamed_inputs_preserve_candidate_manifests_and_wire_names() {
-        let legacy = serde_json::to_value(fixture()).unwrap();
-        assert!(legacy.get("snapshot_version").is_some());
-        assert!(legacy.get("physical_inputs").is_none());
-        let mut renamed = legacy.clone();
-        let root = renamed.as_object_mut().unwrap();
-        let version = root.remove("snapshot_version").unwrap();
-        root.insert("schema_version".into(), version);
-        let inputs = root.remove("implementation").unwrap();
-        // Upstream window planning now consumes a cost model; removed default
-        // window fields are no longer part of the naming compatibility contract.
-        assert!(inputs.get("window_cost_model").is_some());
-        assert!(inputs.get("window_implementation_id").is_none());
-        assert!(inputs.get("implementation_cost").is_none());
-        root.insert("physical_inputs".into(), inputs);
-        let environment = root
-            .get_mut("environment")
-            .unwrap()
-            .as_object_mut()
-            .unwrap();
-        let collectors = environment.remove("collector_ids").unwrap();
-        environment.insert("target_collector_ids".into(), collectors);
-
-        let old: BackendLocalPlanningInput = serde_json::from_value(legacy.clone()).unwrap();
-        let new: BackendLocalPlanningInput = serde_json::from_value(renamed).unwrap();
-        assert_eq!(old, new);
-        assert_eq!(serde_json::to_value(&new).unwrap(), legacy);
-        // Shared publication fields already had domain names: renaming the
-        // streaming accessor must not change their wire keys or catalog hash.
-        let (request, environment) = new.clone().into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler
-            .compile_promql(request, environment)
-            .unwrap();
-        let catalog = serde_json::to_value(&plan.summary_catalog).unwrap();
-        assert!(catalog.get("definitions").is_some());
-        let precompute = serde_json::to_value(&plan.precompute_plan).unwrap();
-        assert!(precompute.get("materializations").is_some());
-        assert!(precompute.get("get_all_aggregation_configs").is_none());
-        let compile = |input: BackendLocalPlanningInput| {
-            let (request, environment) = input.into_physical_compilation_request().unwrap();
-            compile_candidates_for_pricing(
-                enumerate_exact_and_materialized_candidates(request).unwrap(),
-                environment,
-                super::super::compiler::QueryFrontend::PromQl,
-            )
-        };
-        let old_candidates = compile(old);
-        let new_candidates = compile(new);
-        assert!(!old_candidates.0.is_empty());
-        assert_eq!(old_candidates, new_candidates);
+    fn snapshot_rejects_removed_input_aliases() {
+        let value = serde_json::to_value(fixture()).unwrap();
+        let decoded: BackendLocalPlanningInput = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        for (canonical, removed) in [
+            ("snapshot_version", "schema_version"),
+            ("implementation", "physical_inputs"),
+        ] {
+            let mut invalid = value.clone();
+            let field = invalid.as_object_mut().unwrap().remove(canonical).unwrap();
+            invalid[removed] = field;
+            assert!(serde_json::from_value::<BackendLocalPlanningInput>(invalid).is_err());
+        }
     }
 
-    // A renamed demand remains readable by old quote providers, including
-    // fractional recurrence; missing and future statuses keep round-tripping.
+    // Fractional demand and unavailable candidate costs preserve the current contract.
     #[test]
-    fn demand_and_evaluation_keep_legacy_wire_contracts() {
+    fn demand_and_evaluation_use_candidate_wire_contracts() {
         let old = json!({"implementation": {"op": "read"}, "unit": "query_evaluation", "multiplicity": 2.5});
         let demand: CostComponentDemand = serde_json::from_value(old.clone()).unwrap();
         assert_eq!(demand.pricing_basis, "query_evaluation");
         assert_eq!(demand.occurrences_per_horizon, 2.5);
         assert_eq!(serde_json::to_value(demand).unwrap(), old);
         let row = json!({
-            "alternative_id": null, "physical_alternative_id": null,
+            "candidate_id": null, "physical_candidate_id": null,
             "identity_unavailable_reason": null, "plan_id": null,
             "total_cost": null, "unavailable_reason": null
         });
@@ -985,11 +910,11 @@ mod tests {
         assert_eq!(evaluation.status, CandidateEvaluationStatus::Unspecified);
         let encoded = serde_json::to_value(evaluation).unwrap();
         assert_eq!(encoded["status"], "");
-        assert!(encoded.get("alternative_id").is_some());
-        assert!(encoded.get("candidate_id").is_none());
+        assert!(encoded.get("candidate_id").is_some());
+        assert!(encoded.get("alternative_id").is_none());
     }
 
-    // IDs describe semantics; activation/version changes do not create new alternatives.
+    // IDs describe semantics; activation/version changes do not create new candidates.
     #[test]
     fn explain_identity_is_stable_across_activations_and_distinguishes_native() {
         let (request, mut env) = fixture().into_physical_compilation_request().unwrap();
@@ -1046,15 +971,15 @@ mod tests {
         let (candidates, env, mut evidence) = quoted();
         let count = candidates.len();
         evidence.quotes.clear();
-        let CompileError::Alternatives(report) =
+        let CompileError::Candidates(report) =
             select_lowest_cost_candidate(candidates, env, &evidence).unwrap_err()
         else {
             panic!("expected structured all-infeasible report")
         };
         assert_eq!(report["status"], "all_infeasible");
-        let alternatives = report["alternatives"].as_array().unwrap();
-        assert_eq!(alternatives.len(), count);
-        assert!(alternatives
+        let candidates = report["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), count);
+        assert!(candidates
             .iter()
             .all(|item| item["status"] == "evidence_missing"));
         assert!(!report["logical_selection"].as_array().unwrap().is_empty());
@@ -1107,7 +1032,7 @@ mod tests {
         );
         entries.push(second);
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request.clone(), env)
             .unwrap();
         let costs = manifest(&plan, &request.queries).unwrap();
@@ -1164,7 +1089,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .len();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(candidate.clone(), environment.clone())
                 .unwrap();
             assert!(identities.insert(plan.envelope.plan_id));
@@ -1234,7 +1159,7 @@ mod tests {
         let quotes = candidates
             .iter()
             .map(|candidate| {
-                let plan = PhysicalPlanCompiler
+                let plan = DeploymentPlanCompiler
                     .compile_promql(candidate.clone(), env.clone())
                     .unwrap();
                 let manifest = manifest(&plan, &candidate.queries).unwrap();
@@ -1274,10 +1199,10 @@ mod tests {
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         assert!(candidates.len() >= 2);
-        let local = PhysicalPlanCompiler
+        let local = DeploymentPlanCompiler
             .compile_promql(candidates[0].clone(), environment.clone())
             .unwrap();
-        let native = PhysicalPlanCompiler
+        let native = DeploymentPlanCompiler
             .compile_promql(candidates.last().unwrap().clone(), environment)
             .unwrap();
         assert_ne!(local.envelope.plan_id, native.envelope.plan_id);
@@ -1333,7 +1258,7 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(exact.clone(), env.clone())
                 .unwrap();
             let manifest = manifest(&plan, &exact.queries).unwrap();
@@ -1504,7 +1429,7 @@ mod tests {
     fn second_consumer_adds_reads_not_another_shared_state() {
         let (request, env) = fixture().into_physical_compilation_request().unwrap();
         let first = manifest(
-            &PhysicalPlanCompiler
+            &DeploymentPlanCompiler
                 .compile_promql(request.clone(), env.clone())
                 .unwrap(),
             &request.queries,
@@ -1545,7 +1470,7 @@ mod tests {
             &shared.exact_composition_costs,
         )
         .unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(shared.clone(), env)
             .unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);

@@ -1,6 +1,6 @@
 //! Export every bindable candidate for isolated measurement, without selecting a winner.
 use control_plane::physical::{
-    compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler},
+    compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler},
     workload_cost,
 };
 use planner_types::post_asap::{SummaryExpr, SummaryNode};
@@ -138,9 +138,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let enabled_materialization_keys = candidate.enabled_materialization_keys.clone();
         let planner_selected_queries = planner_forest(&queries);
         let compiled = if metricsql {
-            PhysicalPlanCompiler.compile_metricsql(candidate, environment.clone())
+            DeploymentPlanCompiler.compile_metricsql(candidate, environment.clone())
         } else {
-            PhysicalPlanCompiler.compile_promql(candidate, environment.clone())
+            DeploymentPlanCompiler.compile_promql(candidate, environment.clone())
         };
         let plan = match compiled {
             Ok(plan) => plan,

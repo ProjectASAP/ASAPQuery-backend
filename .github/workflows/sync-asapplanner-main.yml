@@ -1,0 +1,45 @@
+name: Sync ASAPPlanner main
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-asapplanner-main
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+
+      - name: Configure private Cargo dependencies
+        env:
+          ASAP_CI_REPO_TOKEN: ${{ secrets.ASAP_CI_REPO_TOKEN }}
+        run: git config --global url."https://x-access-token:${ASAP_CI_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Update Planner revision and lockfile
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: ./scripts/sync-asapplanner-main.sh
+
+      - name: Create or update synchronization PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.ASAP_CI_REPO_TOKEN }}
+          branch: automation/sync-asapplanner-main
+          delete-branch: true
+          commit-message: "chore: sync ASAPPlanner main"
+          title: "chore: sync ASAPPlanner main"
+          body: |
+            Updates all ASAPPlanner workspace dependencies to the current `main` commit and regenerates `Cargo.lock`.
+
+            MVP CI validates formatting, compilation, linting and tests. A semantic Planner change stays visible as a failing synchronization PR until the backend adaptation is added.

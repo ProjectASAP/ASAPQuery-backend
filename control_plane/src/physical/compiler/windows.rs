@@ -310,14 +310,27 @@ mod tests {
             base_pane_secs: 10,
             levels_secs: vec![30],
         };
+        assert!(quote
+            .layout
+            .validate(quote.window_secs, quote.slide_secs)
+            .is_ok());
+        assert!(!supported(
+            &quote,
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite
+        ));
         model.quotes = vec![quote];
-        assert!(prepare_window_implementations(
+        let error = prepare_window_implementations(
             &mut query,
             &model,
             PhysicalDeploymentTarget::BackendLocalRemoteWrite,
-            0
+            0,
         )
-        .is_err());
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CompileError::Lifecycle { reason, .. }
+                if reason.contains("does not match an executable state layout")
+        ));
     }
 
     // Conflicting identities and repeated shape evidence must fail rather than silently lose an offer.
