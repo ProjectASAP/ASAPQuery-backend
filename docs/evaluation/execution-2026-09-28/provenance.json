@@ -5,36 +5,8 @@
   "scope": "finite fixture differential execution, not production selection or real ERP calibration",
   "reports": [
     {
-      "file": "aggregations.json.gz",
-      "sha256": "4b6e17db0387897782f8c7eead2e760860aa40b2fbbf191bc599acf600d1969c"
-    },
-    {
       "file": "summary.json",
       "sha256": "3f7bad5dda4fdb08b235afaca9adacaf825262598fa8d3cd752437b1565bcac3"
-    },
-    {
-      "file": "issue-702.json.gz",
-      "sha256": "e18a3200c5f6e12b81d36c9918d16dbcb80ea3e6094def09a225bfde8073ad46"
-    },
-    {
-      "file": "sparse-checkout-temporal.json.gz",
-      "sha256": "4161ef56c266e5a1a34f9ec443e6efda6dca267b22874bc3d629a8bd8d46e457"
-    },
-    {
-      "file": "issue-702-one-second.json.gz",
-      "sha256": "f752f9891568bf28ae39b68fef6ba7bcdb132d6f896b4a578411614adf6de4da"
-    },
-    {
-      "file": "single-rate-temporal.json.gz",
-      "sha256": "5f81a5cee9f9fc3594b71b5408c9ff3e1fdf93e3a5c177d57daa8d1224c13bd1"
-    },
-    {
-      "file": "aggregations-dense-cadence.json.gz",
-      "sha256": "005a1d0f24d472590ef8d341adc74910b8af85cf979cf1302e1bc6cadc86f249"
-    },
-    {
-      "file": "issue-754.json.gz",
-      "sha256": "ae6975f0bc7b97cf36ed41c0d701e68266ce61ac1c2601a5c1437546ab39b773"
     }
   ]
 }

@@ -24,8 +24,8 @@ Total: 20 candidate runs; 52 query comparisons.
 
 For each target, only synthetic prices change. Production selection must return
 its exact manifest. An ensemble is installed once and ingested once per candidate;
-all member queries run against that installation. Rejected candidates remain in
-`results.json.gz`. Coverage is the exposed, admitted fixture inventory, not an
+all member queries run against that installation. Generated admission reports
+include rejected candidates. Coverage is the exposed, admitted fixture inventory, not an
 exhaustive Cartesian product of theoretical physical plans.
 
 Validation also passed: three Level 1 tests, the complete Level 2 ranking test,
@@ -49,7 +49,5 @@ complete durable rerun pass; no candidate was skipped or tolerance relaxed.
 - Data-plane SHA256: `32a89c8f2091633a629e7fd1a49dc264447069bb95cfd123554f1db9ad8311e8`.
 - Runner SHA256: `3bb04c99d9e382d54945efbefb316edce9305b7ea8c2bed1643da0ee80e6d5f0`.
 
-Files retain quoted snapshots, selected plans, typed installations, responses and
-service logs. Decompress with `gzip -dc <file>`. Paths inside raw reports refer
-to the original run directory; the same relative paths are preserved here.
-`SHA256SUMS` covers the retained compressed artifacts.
+Generated snapshots, selected plans, installations, responses and service logs
+are kept outside version control. Reproduce them with the command above.
