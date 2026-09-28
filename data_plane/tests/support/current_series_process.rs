@@ -27,7 +27,6 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         "../../../docs/examples/asapquery-planning-snapshot.json"
     ))
     .unwrap();
-    snapshot.schema_version = 2;
     // Exercise a short declared horizon; native differential mode keeps its five-minute contract.
     let horizon_ms: i64 = if native.is_some() { 300_000 } else { 5_000 };
     let scrape_ms = horizon_ms / 5;
