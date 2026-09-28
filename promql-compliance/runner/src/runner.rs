@@ -113,11 +113,13 @@ async fn execute(args: &Args, benefit: bool) -> Result<Value> {
     write_json(&plan_path, &plan)?;
     planning::validate_cost(&plan).context("automatic workload cost gate")?;
     planning::validate_local(&plan).context("ASAP-local plan gate")?;
-    let snapshot_path = std::fs::canonicalize(snapshot_path)?;
+    let installation_path = args.output.with_extension("install.json");
+    write_json(&installation_path, &planning::installation(plan))?;
+    let installation_path = std::fs::canonicalize(installation_path)?;
     let mut compose = Compose::new(
         args.compose_file.clone(),
         args.compose_project.clone(),
-        snapshot_path,
+        installation_path,
         args.logs_dir.clone(),
         args.keep_services,
     );
@@ -474,9 +476,14 @@ pub fn report_card(directory: &Path) -> Result<()> {
         let filename = path.file_name().unwrap().to_string_lossy();
         if path.extension().is_none_or(|s| s != "json")
             || filename == "summary.json"
-            || [".snapshot.json", ".plan.json", ".semantic.json"]
-                .iter()
-                .any(|suffix| filename.ends_with(suffix))
+            || [
+                ".snapshot.json",
+                ".plan.json",
+                ".install.json",
+                ".semantic.json",
+            ]
+            .iter()
+            .any(|suffix| filename.ends_with(suffix))
         {
             continue;
         }

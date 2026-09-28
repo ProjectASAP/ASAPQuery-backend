@@ -4,7 +4,7 @@ use std::{path::PathBuf, process::Command};
 pub struct Compose {
     pub files: Vec<PathBuf>,
     pub project: String,
-    pub snapshot: PathBuf,
+    pub installation: PathBuf,
     pub logs: PathBuf,
     pub keep: bool,
     started: bool,
@@ -13,14 +13,14 @@ impl Compose {
     pub fn new(
         files: Vec<PathBuf>,
         project: String,
-        snapshot: PathBuf,
+        installation: PathBuf,
         logs: PathBuf,
         keep: bool,
     ) -> Self {
         Self {
             files,
             project,
-            snapshot,
+            installation,
             logs,
             keep,
             started: false,
@@ -32,7 +32,7 @@ impl Compose {
         for file in &self.files {
             c.arg("--file").arg(file);
         }
-        c.env("ASAP_PLANNING_SNAPSHOT", &self.snapshot);
+        c.env("ASAP_PHYSICAL_PLAN", &self.installation);
         c
     }
     fn run(&self, args: &[&str]) -> Result<String> {
