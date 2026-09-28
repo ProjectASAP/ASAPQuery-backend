@@ -956,6 +956,7 @@ mod tests {
             },
         };
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::PromQl,
             query_id: "resource-test".into(),
             canonical_query: "1".into(),

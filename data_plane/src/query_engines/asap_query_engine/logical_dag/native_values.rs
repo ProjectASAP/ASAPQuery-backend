@@ -545,7 +545,7 @@ where
                     .map_err(|e| miss(e.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Batch::try_new(schema.clone(), rows).map_err(|e| miss(e.to_string()))
+            Batch::try_new(schema.clone(), rows).map_err(EngineError::from)
         },
     )
 }
@@ -634,17 +634,15 @@ fn execute_batches(
         let batch = input_batch(input_id, &input.schema)?;
         input_bytes = input_bytes
             .checked_add(batch.bytes())
-            .ok_or_else(|| miss("physical input size overflow"))?;
+            .ok_or(asap_physical_operators::Error::MemoryLimit)?;
         if input_bytes > max_bytes as usize {
-            return Err(miss("physical input exceeds run budget"));
+            return Err(asap_physical_operators::Error::MemoryLimit.into());
         }
         let source =
-            Operator::source(input.schema.clone(), vec![batch]).map_err(|e| miss(e.to_string()))?;
+            Operator::source(input.schema.clone(), vec![batch]).map_err(EngineError::from)?;
         sources.insert(input_id, Box::new(source) as Source<'_>);
     }
-    let graph = program
-        .instantiate(sources)
-        .map_err(|e| miss(e.to_string()))?;
+    let graph = program.instantiate(sources).map_err(EngineError::from)?;
     let context = dag::RunContext::new(
         dag::Scope::Query {
             evaluation_time_ms: at_signed,
@@ -655,15 +653,15 @@ fn execute_batches(
             ..dag::Limits::default()
         },
     )
-    .map_err(|error| miss(error.to_string()))?;
+    .map_err(EngineError::from)?;
     let mut stream = graph
         .execute(program.roots(), context)
-        .map_err(|error| miss(error.to_string()))?
+        .map_err(EngineError::from)?
         .remove(0);
     let values = block_on(async {
         let mut values = Vec::new();
         while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|error| miss(error.to_string()))?;
+            let batch = batch.map_err(EngineError::from)?;
             let identity = batch
                 .schema()
                 .fields
@@ -683,7 +681,7 @@ fn execute_batches(
                     let Value::Utf8(encoded) = &row[identity] else {
                         return Err(miss("invalid physical series identity"));
                     };
-                    decode_series_identity(encoded).map_err(|error| miss(error.to_string()))?
+                    decode_series_identity(encoded).map_err(EngineError::from)?
                 } else {
                     batch
                         .schema()

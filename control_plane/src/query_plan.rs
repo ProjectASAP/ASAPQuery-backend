@@ -1379,6 +1379,7 @@ mod tests {
             )
             .unwrap();
             let entry = QueryPlanEntry {
+                physical_dag: None,
                 language: QueryLanguage::PromQl,
                 query_id: "q".into(),
                 canonical_query: "topk(1, m)".into(),
