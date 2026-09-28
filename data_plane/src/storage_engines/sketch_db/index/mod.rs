@@ -3307,7 +3307,7 @@ impl SketchStore {
         // early-returns on the missing `sid_group_by_keys` → "No result"
         // cluster-wide even though the data is durable on disk. Idempotent:
         // sids already registered (e.g. by an in-flight DataPoint) are kept.
-        let recovered = self.register_recovered_disk_series(&cfg.disk_path);
+        let recovered = self.register_recovered_disk_series(&cfg.disk_path)?;
         if recovered > 0 {
             tracing::info!(
                 recovered_sids = recovered,
@@ -3356,22 +3356,14 @@ impl SketchStore {
     /// metadata is authoritative, so we don't clobber it). Returns the
     /// number of sids freshly registered from disk.
     ///
-    /// `capability` / `accuracy` are re-derived from the persisted
-    /// `agg_kind` exactly as the ingest path derives them. The sidecar is
-    /// missing only for parts written before this feature landed (or a
-    /// fresh dir) — those sids stay invisible until a live DataPoint
-    /// re-registers them, the same as pre-fix behavior.
-    pub fn register_recovered_disk_series(&self, disk_path: &std::path::Path) -> usize {
+    /// Persisted metadata errors propagate to startup. Only an absent file is
+    /// treated as a fresh store.
+    pub fn register_recovered_disk_series(
+        &self,
+        disk_path: &std::path::Path,
+    ) -> persistence::PersistResult<usize> {
         use crate::storage_engines::sketch_db::index::persistence::metadata::SidMetadataStore;
-
-        let store = SidMetadataStore::new(disk_path);
-        let records = match store.load() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load sid metadata sidecar on recovery");
-                return 0;
-            }
-        };
+        let records = SidMetadataStore::new(disk_path).load()?;
 
         let mut registered = 0usize;
         for rec in records {
@@ -3454,7 +3446,7 @@ impl SketchStore {
                 registered += 1;
             }
         }
-        registered
+        Ok(registered)
     }
 
     /// Switch the store into durable-tier mode: install the read handle
@@ -3777,6 +3769,26 @@ mod tests {
         let before = store.summary_update_revision();
         store.append_sample(1, BTreeMap::new(), (0, 1000), sample(1));
         assert!(!before.matches(store.summary_update_revision()));
+    }
+
+    #[test]
+    fn recovery_rejects_unsupported_or_corrupt_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SketchStore::new();
+        let sidecar = persistence::metadata::SidMetadataStore::new(directory.path());
+        assert_eq!(
+            store
+                .register_recovered_disk_series(directory.path())
+                .unwrap(),
+            0
+        );
+        for bytes in [b"{not json".as_slice(), b"{\"schema_version\":1}", b"{}"] {
+            std::fs::write(sidecar.path(), bytes).unwrap();
+            assert!(store
+                .register_recovered_disk_series(directory.path())
+                .is_err());
+            assert!(store.snapshot_instances().is_empty());
+        }
     }
 
     #[test]
@@ -5104,7 +5116,7 @@ mod tests {
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
-        assert_eq!(store.register_recovered_disk_series(tmp.path()), 0);
+        assert_eq!(store.register_recovered_disk_series(tmp.path()).unwrap(), 0);
         assert!(store.instance(507).is_none());
         let mut foreign = record;
         foreign.stored_output_id = Some(fingerprint.into());
@@ -5116,7 +5128,7 @@ mod tests {
             snapshot_sha256: reference.snapshot_sha256,
         }));
         sidecar.upsert_all(&[foreign]).unwrap();
-        assert_eq!(store.register_recovered_disk_series(tmp.path()), 0);
+        assert_eq!(store.register_recovered_disk_series(tmp.path()).unwrap(), 0);
         assert!(store.series_ids_for_policy(fingerprint).is_empty());
     }
 
@@ -5419,7 +5431,9 @@ mod tests {
         restored
             .install_summary_catalog(Arc::new(plan.summary_catalog))
             .unwrap();
-        restored.register_recovered_disk_series(directory.path());
+        restored
+            .register_recovered_disk_series(directory.path())
+            .unwrap();
         assert!(!restored.append_sample(850, BTreeMap::new(), (0, 30_000), sample(3)));
         assert!(restored.append_sample(850, BTreeMap::new(), (30_000, 60_000), sample(4)));
     }
