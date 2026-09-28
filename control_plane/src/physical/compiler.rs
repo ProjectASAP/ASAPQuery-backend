@@ -222,12 +222,23 @@ pub enum PhysicalDeploymentTarget {
 
 /// Startup and candidate-discovery input for backend-local planning.
 /// Version 3 requires an explicit logical dataset identity; it is the sole supported schema; deployment always requires quotes.
+/// The one workload-snapshot schema this backend accepts.
+///
+/// Every producer of a snapshot has to agree with this number, and they are
+/// written in different languages, so the number cannot live in each of them.
+/// It lives here, and `snapshot_version_is_declared_once` fails if a shipped
+/// example or a tool in `tools/` disagrees. Bumping the schema is then a single
+/// edit plus whatever that test reports, instead of a literal that some
+/// producers follow and others quietly do not.
+pub const WORKLOAD_SNAPSHOT_VERSION: u32 = 3;
+
 /// Query/data semantics use ASAPPlanner's canonical workload types directly;
 /// this wrapper adds only backend-owned implementation evidence and lifecycle
 /// identity required to choose a concrete physical realization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPlanningInput {
+    /// Must equal [`WORKLOAD_SNAPSHOT_VERSION`].
     #[serde(rename = "snapshot_version")]
     pub schema_version: u32,
     /// May be absent during candidate discovery, never during deployment.
@@ -571,10 +582,10 @@ impl BackendLocalPlanningInput {
     pub fn into_physical_compilation_request(
         self,
     ) -> Result<(PhysicalCompilationRequest, PhysicalDeploymentContext), CompileError> {
-        if self.schema_version != 3 {
+        if self.schema_version != WORKLOAD_SNAPSHOT_VERSION {
             return Err(CompileError::Snapshot(format!(
-                "unsupported workload snapshot version {}; only version 3 is supported",
-                self.schema_version
+                "unsupported workload snapshot version {}; only version {} is supported",
+                self.schema_version, WORKLOAD_SNAPSHOT_VERSION
             )));
         }
         if self.environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite {

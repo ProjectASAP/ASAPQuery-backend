@@ -12,6 +12,7 @@ name = "control_plane"
 path = "src/main.rs"
 
 [dependencies]
+asap-physical-operators.workspace = true
 tokio       = { version = "1",    features = ["full"] }
 axum        = { version = "0.7",  features = ["ws"] }
 futures-util = "0.3"
