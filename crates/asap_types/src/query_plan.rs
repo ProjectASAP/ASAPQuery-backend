@@ -392,6 +392,82 @@ impl QueryPlanEntry {
         }
         for (id, node) in &self.nodes {
             validate_native_relation(*id, node)?;
+            if let QueryPlanNode::Physical {
+                inputs,
+                dag,
+                row_input,
+                pruning,
+            } = node
+            {
+                let compiled =
+                    asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                for (_, contract) in compiled.input_contracts() {
+                    let mut samples = 0;
+                    for (index, field) in contract.schema.fields.iter().enumerate() {
+                        use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+                        match &field.dtype {
+                            SummaryFamilyType::Plain(DataType::Float64) => samples += 1,
+                            SummaryFamilyType::Plain(DataType::Utf8) => {}
+                            SummaryFamilyType::Plain(DataType::Timestamp)
+                                if contract.schema.time_index == Some(index) => {}
+                            _ => {
+                                return Err(QueryPlanError::Invalid(format!(
+                                    "PromQL input binding cannot supply field {}",
+                                    field.name
+                                )))
+                            }
+                        }
+                    }
+                    if samples > 1 {
+                        return Err(QueryPlanError::Invalid(
+                            "PromQL vector input has only one numeric sample per row".into(),
+                        ));
+                    }
+                }
+                let source = compiled.input_contracts().nth(*row_input).map(|(id, _)| id);
+                if compiled.roots().len() != 1
+                    || source.is_none()
+                    || compiled.row_source(compiled.roots()[0]) != source
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "physical vector output must preserve its bound input rows".into(),
+                    ));
+                }
+                if let Some(pruning) = pruning {
+                    if matches!(&pruning.completeness, CandidateCompleteness::Certified { guarantee }
+                        if guarantee.metric != planner_types::post_asap::ErrorMetric::TopKMembership || guarantee.bound.evaluate().is_none() || guarantee.failure_probability.evaluate().is_none())
+                    {
+                        return Err(QueryPlanError::Invalid(
+                            "invalid physical pruning certificate".into(),
+                        ));
+                    }
+                    let contracts = compiled.input_contracts().collect::<Vec<_>>();
+                    let left = contracts
+                        .get(*row_input)
+                        .ok_or_else(|| QueryPlanError::Invalid("invalid row input".into()))?
+                        .1;
+                    let right = contracts
+                        .get(pruning.candidate_input)
+                        .ok_or_else(|| QueryPlanError::Invalid("invalid candidate input".into()))?
+                        .1;
+                    asap_physical_operators::operators::Operator::semi_join(
+                        left.schema.clone(),
+                        right.schema.clone(),
+                        pruning.keys.clone(),
+                    )
+                    .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                }
+                if compiled.input_contracts().count() != inputs.len()
+                    || compiled.roots().len() != 1
+                    || *row_input >= inputs.len()
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "physical input/root binding mismatch".into(),
+                    ));
+                }
+            }
+
             if let QueryPlanNode::Logical { operator, inputs } = node {
                 operator.validate(inputs.len())?;
             }
@@ -586,9 +662,26 @@ pub struct ExternalExactRequest {
     pub input_contracts: Vec<ExternalExactInput>,
 }
 
+/// Required candidate rows must have authoritative values at the bound source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PruningInputContract {
+    pub candidate_input: usize,
+    pub keys: Vec<(usize, usize)>,
+    pub completeness: CandidateCompleteness,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    /// Planner-compiled computation. Input order follows the physical input contracts.
+    Physical {
+        inputs: Vec<QueryNodeId>,
+        dag: Vec<u8>,
+        row_input: usize,
+        pruning: Option<PruningInputContract>,
+    },
+
     RelationalJoin {
         inputs: [QueryNodeId; 2],
         join_kind: planner_types::pre_asap::JoinKind,
@@ -657,7 +750,8 @@ impl QueryPlanNode {
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
-            Self::SummaryMerge { inputs }
+            Self::Physical { inputs, .. }
+            | Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
         }

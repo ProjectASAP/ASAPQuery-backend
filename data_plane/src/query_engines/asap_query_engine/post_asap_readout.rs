@@ -16,7 +16,31 @@ pub enum LoweringSkip {
     InvalidQueryPlan(String),
     MaterializationNotReady(String),
     ExecuteFailed(String),
+    Execution(dag::Error),
 }
+impl From<LoweringSkip> for crate::query_engines::EngineError {
+    fn from(error: LoweringSkip) -> Self {
+        match error {
+            LoweringSkip::Execution(error) => Self::Physical(error),
+            other => Self::capability_miss("installed_query_dag", format!("{other:?}")),
+        }
+    }
+}
+fn execution_failure(error: dag::Error) -> LoweringSkip {
+    fn resource(error: &dag::Error) -> bool {
+        match error {
+            dag::Error::MemoryLimit | dag::Error::Cancelled => true,
+            dag::Error::AtNode { source, .. } => resource(source),
+            _ => false,
+        }
+    }
+    if resource(&error) {
+        LoweringSkip::Execution(error)
+    } else {
+        LoweringSkip::ExecuteFailed(error.to_string())
+    }
+}
+
 use crate::query_engines::asap_query_engine::summary_executor::{
     GroupState, QueryExecutionContext, SummaryExecutorError, SummaryValue,
 };
@@ -102,6 +126,8 @@ enum PhysicalQueryOutput {
 
 #[derive(Debug, thiserror::Error)]
 enum PhysicalNodeError {
+    #[error(transparent)]
+    Physical(#[from] dag::Error),
     #[error("materialization/store operation failed: {0:?}")]
     Store(SummaryExecutorError),
     #[error("node expected summary state input")]
@@ -324,6 +350,7 @@ impl PhysicalQueryRuntime<'_> {
             QueryPlanNode::Logical { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
+            | QueryPlanNode::Physical { .. }
             | QueryPlanNode::RelationalJoin { .. } => Err(PhysicalNodeError::Fallback(
                 "logical node requires installed logical runtime".into(),
             )),
@@ -569,7 +596,7 @@ fn reduce_sum_values_in_context(
                 .map(move |value| vec![Value::Int64(index as i64), Value::Float64(*value)])
         })
         .collect();
-    let error = |error: dag::Error| PhysicalNodeError::Fallback(error.to_string());
+    let error = PhysicalNodeError::Physical;
     let batch = Batch::try_new(schema.clone(), rows).map_err(error)?;
     let operator = Operator::aggregate(schema, vec![0], vec![("value".into(), Reduction::Sum(1))])
         .map_err(error)?;
@@ -679,7 +706,10 @@ impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
             let values = values.iter().map(|value| value.value()).collect::<Vec<_>>();
             self.runtime
                 .execute_node(self.id, self.node, &values, &context)
-                .map_err(|e| dag::Error::Operator(format!("query node {}: {e}", self.id.0)))
+                .map_err(|error| match error {
+                    PhysicalNodeError::Physical(error) => error,
+                    other => dag::Error::Operator(format!("query node {}: {other}", self.id.0)),
+                })
         })
         .boxed_local())
     }
@@ -761,9 +791,7 @@ fn execute_physical_query_payload(
             },
         };
         let output = execute_bound_query(entry, root, &runtime, revision.mutation_sequence())
-            .map_err(|error| {
-                LoweringSkip::ExecuteFailed(format!("query {}: {error}", entry.query_id))
-            })?;
+            .map_err(execution_failure)?;
         readout_outcome(output, t1_ms)
     })();
     if !revision.matches(index.summary_update_revision()) {
@@ -879,8 +907,8 @@ pub(crate) fn execute_query_plan_readouts(
             allowed_materializations: None,
         },
     };
-    let output = execute_bound_queries(entry, roots, &runtime, context)
-        .map_err(|e| LoweringSkip::ExecuteFailed(e.to_string()))?;
+    let output =
+        execute_bound_queries(entry, roots, &runtime, context).map_err(execution_failure)?;
     let result = roots
         .iter()
         .copied()
