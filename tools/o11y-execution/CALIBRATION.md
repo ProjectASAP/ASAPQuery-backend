@@ -13,7 +13,7 @@ compares its complete quotes and installs the selected artifact.
    Duplicate corpus occurrences increase their registered query frequency, so
    the manifest accounts for all 28 occurrences, not merely 24 unique strings. Provenance preserves input hashes and source counts.
    This discovery snapshot contains an **uncalibrated unit enumeration seed**,
-   not cost evidence; version 2 with no quotes cannot deploy it.
+   not cost evidence; version 3 with no quotes cannot deploy it.
 2. Run `calibration_candidates DISCOVERY`. It calls the control plane and Planner,
    and exports every bindable candidate with its manifest and install request.
    Errors remain in the output. These artifacts are solely for calibration.
