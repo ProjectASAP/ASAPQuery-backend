@@ -782,7 +782,15 @@ mod workload_tests {
             } => child,
             _ => lhs,
         };
-        assert!(Rc::ptr_eq(&roots[0].1, shared));
+        let SummaryExpr::ValueOperation {
+            child: standalone,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            ..
+        } = &roots[0].1.expr
+        else {
+            panic!("standalone query must finalize its shared state")
+        };
+        assert!(Rc::ptr_eq(standalone, shared));
     }
 
     // The registered set is exactly the four strategies this deployment
@@ -939,6 +947,12 @@ mod workload_tests {
                         SummaryExpr::SummaryEstimate { summary_input, .. } => {
                             is_summary(summary_input)
                         }
+                        SummaryExpr::ValueOperation {
+                            child,
+                            operation:
+                                planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                            ..
+                        } => is_summary(child),
                         _ => false,
                     }
                 }
