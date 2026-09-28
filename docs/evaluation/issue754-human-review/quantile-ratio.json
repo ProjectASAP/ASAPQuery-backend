@@ -6,7 +6,7 @@
     "activation_unix_ms": 10000,
     "expiry_unix_ms": null,
     "backend_compat": "asap-query-backend.v1",
-    "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
+    "planner_revision": "574bef34c3792c9ebc76773eeff159ffd14194fd",
     "capability_snapshot_id": "asapquery-local-v1"
   },
   "summary_catalog": {
@@ -219,7 +219,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
+      "planner_revision": "574bef34c3792c9ebc76773eeff159ffd14194fd",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "ingest": {
@@ -652,7 +652,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
+      "planner_revision": "574bef34c3792c9ebc76773eeff159ffd14194fd",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "frame_identity": {
@@ -1490,7 +1490,7 @@
         "candidate_assembly_rejections": [],
         "committed_roots": [
           {
-            "logical_root_id": "asap-explain-v1:root:c97a9ef7b7b6351ef7fa1fe69a02f0763f34cd401324455c7dc2fa56ac4b56ab",
+            "logical_root_id": "asap-explain-v1:root:a38e7fc6350398ff19099337079a171761a5aaf24eaac1195dea8bda054fcde2",
             "query_index": 0
           }
         ],
@@ -1506,7 +1506,7 @@
             "candidates": [
               {
                 "accuracy_status": "known",
-                "candidate_id": "asap-explain-v1:candidate:d93917ae5ebc313289c950837de0e1be069d0ea5e6584af601f96baa73f52c6c",
+                "candidate_id": "asap-explain-v1:candidate:1b8d70af3c9ec690017e081999b8853bed8f5d2f39e7f1b3ae8e88e4f49f42c6",
                 "cost_estimate": {
                   "erp_record_ids": [],
                   "model": "backend_state_footprint_v1",
@@ -1697,13 +1697,13 @@
             "consumer_count": 1,
             "group_id": 0,
             "rejected": [],
-            "target_id": "asap-explain-v1:target:591c59c94f3cd7d40929739a51f9f92add66fcda87ee45d5b46874aeaf257348"
+            "target_id": "asap-explain-v1:target:bee64680ca4a1d0fc3d31388d0bad65e7ed61280abca50952252fcc9f0358fa8"
           },
           {
             "candidates": [
               {
                 "accuracy_status": "known",
-                "candidate_id": "asap-explain-v1:candidate:1654b24018726516f9e515061f7344b20e04f910be3bcb43f5db87354cc412c5",
+                "candidate_id": "asap-explain-v1:candidate:21cc40b59e2e661844d9b564d64cddb59c2812c299abe245f15dba1146c9f073",
                 "cost_estimate": {
                   "erp_record_ids": [],
                   "model": "backend_state_footprint_v1",
@@ -1774,7 +1774,7 @@
                 },
                 "provenance": "SummaryRealization",
                 "rank": 0,
-                "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
                 "replacement_kind": "summary",
                 "runtime_support_status": "unknown_pending_backend_binding",
                 "selected": true,
@@ -1786,33 +1786,33 @@
             "group_id": 1,
             "rejected": [
               {
-                "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
                 "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
                 "status": "rejected",
                 "strategy": "SketchAlgorithmStrategy"
               }
             ],
-            "target_id": "asap-explain-v1:target:3b4c70576dd530e10894a93970a18eefab40b84e486ccf850b9f316561439c36"
+            "target_id": "asap-explain-v1:target:7e4a5bcda33002793b251b1f206d59257783e9716a94bcf420c22fbb13c2fdc8"
           },
           {
             "candidates": [],
             "consumer_count": 1,
             "group_id": 2,
             "rejected": [],
-            "target_id": "asap-explain-v1:target:b217617ead9baaf2a804ba32eb8203ad81572b4de269021c0a978a46e56cd641"
+            "target_id": "asap-explain-v1:target:d1e4c432ccc1ceaaccec4e05838b43789a659ff7f1ec8b5439b2fec816d7eaa0"
           },
           {
             "candidates": [],
             "consumer_count": 1,
             "group_id": 3,
             "rejected": [],
-            "target_id": "asap-explain-v1:target:2ad0b64316322fd126233280fcc8694fabbe47c6bec0a9525e92f5b3ffcf9381"
+            "target_id": "asap-explain-v1:target:970cfdd60f7a1294f5851e3dcee628c3fccd81c5631ea54a178d2dea5cc63341"
           },
           {
             "candidates": [
               {
                 "accuracy_status": "known",
-                "candidate_id": "asap-explain-v1:candidate:e991fd55da5a242782b7177e115c99a5735d754359e8b07514a365140ec301cb",
+                "candidate_id": "asap-explain-v1:candidate:de75050142e5e75240a8808c33c2b80b7d1bddc0884069f280332e46008c5409",
                 "cost_estimate": {
                   "erp_record_ids": [],
                   "model": "backend_state_footprint_v1",
@@ -1883,7 +1883,7 @@
                 },
                 "provenance": "SummaryRealization",
                 "rank": 0,
-                "rationale": "quantile(q=0.5) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "rationale": "quantile(q=0.5) realizes as a DDSketch sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
                 "replacement_kind": "summary",
                 "runtime_support_status": "unknown_pending_backend_binding",
                 "selected": true,
@@ -1895,32 +1895,32 @@
             "group_id": 4,
             "rejected": [
               {
-                "description": "quantile(q=0.5) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+                "description": "quantile(q=0.5) realizes as a Kll sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
                 "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
                 "status": "rejected",
                 "strategy": "SketchAlgorithmStrategy"
               }
             ],
-            "target_id": "asap-explain-v1:target:7097d4b2aedaf57dcff6d266e4fe40f300ac9ea6a9cb26b53f0c661a1829bf84"
+            "target_id": "asap-explain-v1:target:f71a98d81456d511db8d34c8385e1708878d3b1339206bc9f19f5e1295c89513"
           },
           {
             "candidates": [],
             "consumer_count": 1,
             "group_id": 5,
             "rejected": [],
-            "target_id": "asap-explain-v1:target:b217617ead9baaf2a804ba32eb8203ad81572b4de269021c0a978a46e56cd641"
+            "target_id": "asap-explain-v1:target:d1e4c432ccc1ceaaccec4e05838b43789a659ff7f1ec8b5439b2fec816d7eaa0"
           },
           {
             "candidates": [],
             "consumer_count": 1,
             "group_id": 6,
             "rejected": [],
-            "target_id": "asap-explain-v1:target:2ad0b64316322fd126233280fcc8694fabbe47c6bec0a9525e92f5b3ffcf9381"
+            "target_id": "asap-explain-v1:target:970cfdd60f7a1294f5851e3dcee628c3fccd81c5631ea54a178d2dea5cc63341"
           }
         ],
         "roots": [
           {
-            "logical_root_id": "asap-explain-v1:root:c97a9ef7b7b6351ef7fa1fe69a02f0763f34cd401324455c7dc2fa56ac4b56ab",
+            "logical_root_id": "asap-explain-v1:root:a38e7fc6350398ff19099337079a171761a5aaf24eaac1195dea8bda054fcde2",
             "query_index": 0
           }
         ],
@@ -1934,7 +1934,7 @@
     "selected_manifest": {
       "plan_id": 14871479243635342203,
       "plan_version": 1,
-      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
+      "planner_revision": "574bef34c3792c9ebc76773eeff159ffd14194fd",
       "capability_snapshot_id": "asapquery-local-v1",
       "backend_compat": "asap-query-backend.v1",
       "horizon_seconds": 300.0,
@@ -2920,11 +2920,11 @@
     },
     "candidates": [
       {
-        "candidate_id": "asap-explain-v1:candidate:b2508b20d07bf2406e5e186377ff55fdf39460c69f40b5819f42dd87e65b3dbd",
+        "candidate_id": "asap-explain-v1:candidate:eab0bd8e22438c18d1280d1d460d8e8c5471f15139f3224c6a997c9a6dab546f",
         "logical_root_ids": [
-          "asap-explain-v1:root:c97a9ef7b7b6351ef7fa1fe69a02f0763f34cd401324455c7dc2fa56ac4b56ab"
+          "asap-explain-v1:root:a38e7fc6350398ff19099337079a171761a5aaf24eaac1195dea8bda054fcde2"
         ],
-        "physical_candidate_id": "asap-explain-v1:physical:4f6afdcaa21c824ea853887b087599b285582ecfd5e75c2b3779eead71667ae5",
+        "physical_candidate_id": "asap-explain-v1:physical:9803bb28dc85804436828690973880e21982e88b657b775d6577447b33ba2b8a",
         "identity_unavailable_reason": null,
         "status": "selected",
         "plan_id": 14871479243635342203,
@@ -2932,11 +2932,11 @@
         "unavailable_reason": null
       },
       {
-        "candidate_id": "asap-explain-v1:candidate:29e8f1781d89b958a960072e765e1db2c3b1889cfa4c178a5057e7c75527d9b2",
+        "candidate_id": "asap-explain-v1:candidate:0c4460c5d392b04e0b401219ca0008b40e345aab93e42f2859719c271ea522f1",
         "logical_root_ids": [
-          "asap-explain-v1:root:f122297d88d6220bee67ca1f56a1f559ce1c2149a3e304ac8b3f86b4c9e54efb"
+          "asap-explain-v1:root:f449b879c1309ad29867d455b6e488c0616fa126fc4f24b6c620ce33946d6a7f"
         ],
-        "physical_candidate_id": "asap-explain-v1:physical:319ec2bd9419c6036c67a98a552b6a62802d81d009bb2312881a5d2d6e834381",
+        "physical_candidate_id": "asap-explain-v1:physical:ed9fbdf49266e9fc8a75e2d87fce09976c96c59d3ad1a94b743956e7ccf02b21",
         "identity_unavailable_reason": null,
         "status": "unselected",
         "plan_id": 5752356276213301876,
@@ -2944,11 +2944,11 @@
         "unavailable_reason": null
       },
       {
-        "candidate_id": "asap-explain-v1:candidate:bf15c64e9362f4491837e0a8a04edb8bf4fbb8791c03ebd6664f1c89641c35bb",
+        "candidate_id": "asap-explain-v1:candidate:f175d7852c18ff5fc1fdf05c824a42313866ae4702c221ec1212303acf59a9ee",
         "logical_root_ids": [
-          "asap-explain-v1:root:4d0e6951ae09283c4de99b5818cd2c54e4924dd51371863645c52b82e1fca0ce"
+          "asap-explain-v1:root:4a3c1395d360b821426b27218cd5d53be87544d0fb93060fb25f548a56ea3fd0"
         ],
-        "physical_candidate_id": "asap-explain-v1:physical:24e1dae5e4c8cf6d534ae819af2bc604fbb7f60cff8ff6240474adb08585be57",
+        "physical_candidate_id": "asap-explain-v1:physical:3f5a99c36308c22d7ddf69fee8058b6d7bffcc0cc3f5a51e447f4e9e271fe19a",
         "identity_unavailable_reason": null,
         "status": "unselected",
         "plan_id": 12971657221408630864,
@@ -2969,7 +2969,7 @@
       "candidate_assembly_rejections": [],
       "committed_roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:c97a9ef7b7b6351ef7fa1fe69a02f0763f34cd401324455c7dc2fa56ac4b56ab",
+          "logical_root_id": "asap-explain-v1:root:a38e7fc6350398ff19099337079a171761a5aaf24eaac1195dea8bda054fcde2",
           "query_index": 0
         }
       ],
@@ -2985,7 +2985,7 @@
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:d93917ae5ebc313289c950837de0e1be069d0ea5e6584af601f96baa73f52c6c",
+              "candidate_id": "asap-explain-v1:candidate:1b8d70af3c9ec690017e081999b8853bed8f5d2f39e7f1b3ae8e88e4f49f42c6",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -3176,13 +3176,13 @@
           "consumer_count": 1,
           "group_id": 0,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:591c59c94f3cd7d40929739a51f9f92add66fcda87ee45d5b46874aeaf257348"
+          "target_id": "asap-explain-v1:target:bee64680ca4a1d0fc3d31388d0bad65e7ed61280abca50952252fcc9f0358fa8"
         },
         {
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:1654b24018726516f9e515061f7344b20e04f910be3bcb43f5db87354cc412c5",
+              "candidate_id": "asap-explain-v1:candidate:21cc40b59e2e661844d9b564d64cddb59c2812c299abe245f15dba1146c9f073",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -3253,7 +3253,7 @@
               },
               "provenance": "SummaryRealization",
               "rank": 0,
-              "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "rationale": "quantile(q=0.9) realizes as a DDSketch sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
               "replacement_kind": "summary",
               "runtime_support_status": "unknown_pending_backend_binding",
               "selected": true,
@@ -3265,33 +3265,33 @@
           "group_id": 1,
           "rejected": [
             {
-              "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "description": "quantile(q=0.9) realizes as a Kll sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
               "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
               "status": "rejected",
               "strategy": "SketchAlgorithmStrategy"
             }
           ],
-          "target_id": "asap-explain-v1:target:3b4c70576dd530e10894a93970a18eefab40b84e486ccf850b9f316561439c36"
+          "target_id": "asap-explain-v1:target:7e4a5bcda33002793b251b1f206d59257783e9716a94bcf420c22fbb13c2fdc8"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 2,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:b217617ead9baaf2a804ba32eb8203ad81572b4de269021c0a978a46e56cd641"
+          "target_id": "asap-explain-v1:target:d1e4c432ccc1ceaaccec4e05838b43789a659ff7f1ec8b5439b2fec816d7eaa0"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 3,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:2ad0b64316322fd126233280fcc8694fabbe47c6bec0a9525e92f5b3ffcf9381"
+          "target_id": "asap-explain-v1:target:970cfdd60f7a1294f5851e3dcee628c3fccd81c5631ea54a178d2dea5cc63341"
         },
         {
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:e991fd55da5a242782b7177e115c99a5735d754359e8b07514a365140ec301cb",
+              "candidate_id": "asap-explain-v1:candidate:de75050142e5e75240a8808c33c2b80b7d1bddc0884069f280332e46008c5409",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -3362,7 +3362,7 @@
               },
               "provenance": "SummaryRealization",
               "rank": 0,
-              "rationale": "quantile(q=0.5) realizes as a DDSketch sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "rationale": "quantile(q=0.5) realizes as a DDSketch sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
               "replacement_kind": "summary",
               "runtime_support_status": "unknown_pending_backend_binding",
               "selected": true,
@@ -3374,32 +3374,32 @@
           "group_id": 4,
           "rejected": [
             {
-              "description": "quantile(q=0.5) realizes as a Kll sketch — one of summary_candidates' alternatives for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
+              "description": "quantile(q=0.5) realizes as a Kll sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)",
               "reason": "composed guarantee (Rank, bound Some(0.013294757464848584), failure probability Some(0.01)) does not satisfy EpsilonDelta { epsilon: 0.01, delta: 0.01 }",
               "status": "rejected",
               "strategy": "SketchAlgorithmStrategy"
             }
           ],
-          "target_id": "asap-explain-v1:target:7097d4b2aedaf57dcff6d266e4fe40f300ac9ea6a9cb26b53f0c661a1829bf84"
+          "target_id": "asap-explain-v1:target:f71a98d81456d511db8d34c8385e1708878d3b1339206bc9f19f5e1295c89513"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 5,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:b217617ead9baaf2a804ba32eb8203ad81572b4de269021c0a978a46e56cd641"
+          "target_id": "asap-explain-v1:target:d1e4c432ccc1ceaaccec4e05838b43789a659ff7f1ec8b5439b2fec816d7eaa0"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 6,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:2ad0b64316322fd126233280fcc8694fabbe47c6bec0a9525e92f5b3ffcf9381"
+          "target_id": "asap-explain-v1:target:970cfdd60f7a1294f5851e3dcee628c3fccd81c5631ea54a178d2dea5cc63341"
         }
       ],
       "roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:c97a9ef7b7b6351ef7fa1fe69a02f0763f34cd401324455c7dc2fa56ac4b56ab",
+          "logical_root_id": "asap-explain-v1:root:a38e7fc6350398ff19099337079a171761a5aaf24eaac1195dea8bda054fcde2",
           "query_index": 0
         }
       ],

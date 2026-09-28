@@ -7,5 +7,13 @@ digraph compiled_physical_plan {
   subgraph cluster_query_0 {
     label="QueryPlan: topk by (label_0) (3, data)";
     query_0_0 [label="Logical\nCurrentSeries", shape=doubleoctagon];
+    subgraph cluster_native_query_0 {
+      label="Planner query operators";
+    native_query_0_1 [label="#1\nBound physical input"];
+    native_query_0_18446744073709551615 [label="#18446744073709551615\n{\"Sort\":{\"groups\":[2],\"keys\":[{\"column\":1,\"descending\":true,\"nulls_first\":false}]}}"];
+      native_query_0_1 -> native_query_0_18446744073709551615;
+    native_query_0_2 [label="#2\n{\"Limit\":{\"groups\":[2],\"n\":3,\"offset\":0}}"];
+      native_query_0_18446744073709551615 -> native_query_0_2;
+    }
   }
 }
