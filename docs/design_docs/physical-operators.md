@@ -23,8 +23,10 @@ pruning step; sorting exact scores does not prove completeness. There is no
 
 ## Acceptance
 
-Binding must reject an unsupported operation, expression, family, parameter or
-schema before execution. An implicit external fallback is not an implementation.
+Planner validates operation, expression, family and parameter support when it
+compiles the physical DAG. Backend validates deployment input and storage
+contracts before execution. It must not reject a supported computation because
+its adapter discarded a type, predicate or join key. An implicit external fallback is not an implementation.
 Planner tests cover shared producers, phase assignment, typed batches and
 composed candidate pruning. Backend tests cover source binding, installed plan
 validation, storage compatibility and query responses.
@@ -36,11 +38,12 @@ the backend can execute arbitrary raw-only installed plans.
 ## Stack integration
 
 Planner PR #462 owns the library and depends on Planner #461, including its
-composed candidate-pruning API. Backend #770 consumes the pinned library;
+composed candidate-pruning API. Backend #774 consumes the pinned library;
 #763 integrates ingestion DAG execution and #765 integrates query DAG execution.
-The remaining backend stack builds on those integrations. #759 carries the
-full-workload acceptance suite; its performance results must be reported
-separately from library and process correctness tests.
+The remaining backend stack builds on those integrations. #728 checks candidate
+structure, #742 checks selection with synthetic costs, and #775 checks installed
+plans against data-plane results. Production evidence and performance validation
+remain separate from these correctness tests.
 
 The library also owns stored-summary decoding, delta reconstruction and
 family-specific readout kernels. Deployment adapters select compatible panes
@@ -85,3 +88,15 @@ Planner capability does not prove that the backend can persist every value-outpu
 frontier. Result-row publication, revision/coverage and retention bindings must
 be admitted explicitly; the deployment compiler must reject unsupported
 frontiers instead of moving operators.
+
+Selected Sort, Limit and semi-join fragments are compiled by Planner and persisted
+with typed input contracts. Runtime binds protocol vectors to these contracts;
+renamed or multiple join keys retain their original types and positions. External
+Prometheus bindings fetch the selected authoritative subquery without rewriting
+its labels from the candidate side. The native join performs the comparison.
+
+Physical execution errors retain their original cause. Memory exhaustion and
+cancellation terminate both instant and range requests; routing does not try a
+second engine or exact fallback. Physical fragments in one query evaluation share
+one run context. This does not yet account for every protocol-buffer allocation
+or provide an HTTP-disconnect cancellation mechanism.

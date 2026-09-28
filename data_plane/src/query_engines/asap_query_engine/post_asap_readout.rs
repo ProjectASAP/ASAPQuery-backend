@@ -16,7 +16,31 @@ pub enum LoweringSkip {
     InvalidQueryPlan(String),
     MaterializationNotReady(String),
     ExecuteFailed(String),
+    Execution(dag::Error),
 }
+impl From<LoweringSkip> for crate::query_engines::EngineError {
+    fn from(error: LoweringSkip) -> Self {
+        match error {
+            LoweringSkip::Execution(error) => Self::Physical(error),
+            other => Self::capability_miss("installed_query_dag", format!("{other:?}")),
+        }
+    }
+}
+fn execution_failure(error: dag::Error) -> LoweringSkip {
+    fn resource(error: &dag::Error) -> bool {
+        match error {
+            dag::Error::MemoryLimit | dag::Error::Cancelled => true,
+            dag::Error::AtNode { source, .. } => resource(source),
+            _ => false,
+        }
+    }
+    if resource(&error) {
+        LoweringSkip::Execution(error)
+    } else {
+        LoweringSkip::ExecuteFailed(error.to_string())
+    }
+}
+
 use crate::query_engines::asap_query_engine::summary_executor::{
     GroupState, QueryExecutionContext, SummaryExecutorError, SummaryValue,
 };
@@ -102,6 +126,8 @@ enum PhysicalQueryOutput {
 
 #[derive(Debug, thiserror::Error)]
 enum PhysicalNodeError {
+    #[error(transparent)]
+    Physical(#[from] dag::Error),
     #[error("materialization/store operation failed: {0:?}")]
     Store(SummaryExecutorError),
     #[error("node expected summary state input")]
@@ -129,7 +155,12 @@ impl PhysicalQueryRuntime<'_> {
         match node {
             QueryPlanNode::Scalar { value } => super::logical_dag::native_scalar(*value, context)
                 .map(PhysicalQueryOutput::Scalar)
-                .map_err(|error| PhysicalNodeError::Fallback(error.to_string())),
+                .map_err(|error| match error {
+                    crate::query_engines::EngineError::Physical(error) => {
+                        PhysicalNodeError::Physical(error)
+                    }
+                    other => PhysicalNodeError::Fallback(other.to_string()),
+                }),
             QueryPlanNode::Binary { operator, .. } => {
                 let [lhs, rhs] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
@@ -321,7 +352,8 @@ impl PhysicalQueryRuntime<'_> {
                         item_labels: merged_item_labels.unwrap_or_default(),
                     })
             }
-            QueryPlanNode::Physical { .. }
+            QueryPlanNode::PhysicalFragment { .. }
+            | QueryPlanNode::Physical { .. }
             | QueryPlanNode::Logical { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
@@ -570,7 +602,7 @@ fn reduce_sum_values_in_context(
                 .map(move |value| vec![Value::Int64(index as i64), Value::Float64(*value)])
         })
         .collect();
-    let error = |error: dag::Error| PhysicalNodeError::Fallback(error.to_string());
+    let error = PhysicalNodeError::Physical;
     let batch = Batch::try_new(schema.clone(), rows).map_err(error)?;
     let operator = Operator::aggregate(schema, vec![0], vec![("value".into(), Reduction::Sum(1))])
         .map_err(error)?;
@@ -680,7 +712,10 @@ impl PhysicalOperator<PhysicalQueryOutput, ()> for BoundQueryOperator<'_, '_> {
             let values = values.iter().map(|value| value.value()).collect::<Vec<_>>();
             self.runtime
                 .execute_node(self.id, self.node, &values, &context)
-                .map_err(|e| dag::Error::Operator(format!("query node {}: {e}", self.id.0)))
+                .map_err(|error| match error {
+                    PhysicalNodeError::Physical(error) => error,
+                    other => dag::Error::Operator(format!("query node {}: {other}", self.id.0)),
+                })
         })
         .boxed_local())
     }
@@ -762,9 +797,7 @@ fn execute_physical_query_payload(
             },
         };
         let output = execute_bound_query(entry, root, &runtime, revision.mutation_sequence())
-            .map_err(|error| {
-                LoweringSkip::ExecuteFailed(format!("query {}: {error}", entry.query_id))
-            })?;
+            .map_err(execution_failure)?;
         readout_outcome(output, t1_ms)
     })();
     if !revision.matches(index.summary_update_revision()) {
@@ -880,8 +913,8 @@ pub(crate) fn execute_query_plan_readouts(
             allowed_materializations: None,
         },
     };
-    let output = execute_bound_queries(entry, roots, &runtime, context)
-        .map_err(|e| LoweringSkip::ExecuteFailed(e.to_string()))?;
+    let output =
+        execute_bound_queries(entry, roots, &runtime, context).map_err(execution_failure)?;
     let result = roots
         .iter()
         .copied()
@@ -902,6 +935,69 @@ mod tests {
     use crate::query_engines::asap_query_engine::test_plan;
     use asap_types::query_plan::{ExactReadout, PhysicalGrouping, QueryReadout};
     use planner_types::pre_asap::ArithmeticOpKind;
+
+    // Real DAG resource failures survive both summary-readout and engine error adapters.
+    #[test]
+    fn summary_dag_resource_failures_never_become_capability_misses() {
+        use asap_types::query_plan::{
+            FallbackPolicy, InstantExecution, QueryLanguage, QueryPlanEntry,
+        };
+        let store = SketchStore::new();
+        let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
+            language: QueryLanguage::PromQl,
+            catalog: None,
+            context: QueryExecutionContext {
+                index: &store,
+                t0_ms: 0,
+                t1_ms: 42,
+                is_cumulative: false,
+                allowed_materializations: None,
+            },
+        };
+        let entry = QueryPlanEntry {
+            physical_dag: None,
+            language: QueryLanguage::PromQl,
+            query_id: "resource-test".into(),
+            canonical_query: "1".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: [(QueryNodeId(0), QueryPlanNode::Scalar { value: 1. })].into(),
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        for cancelled in [false, true] {
+            let context = dag::RunContext::new(
+                dag::Scope::Query {
+                    evaluation_time_ms: 42,
+                    revision: 1,
+                },
+                dag::Limits {
+                    max_bytes: if cancelled { 4096 } else { 1 },
+                    ..dag::Limits::default()
+                },
+            )
+            .unwrap();
+            if cancelled {
+                context.cancel();
+            }
+            let error =
+                match execute_bound_queries(&entry, &[entry.root], &runtime, context.clone()) {
+                    Err(error) => error,
+                    Ok(_) => panic!("resource-limited execution succeeded"),
+                };
+            let engine: crate::query_engines::EngineError = execution_failure(error).into();
+            assert!(
+                matches!(engine, crate::query_engines::EngineError::Physical(_)),
+                "{engine:?}"
+            );
+            assert_eq!(context.retained_bytes(), 0);
+        }
+    }
 
     // A sparse counter is omitted without dropping other series in the vector.
     #[test]
