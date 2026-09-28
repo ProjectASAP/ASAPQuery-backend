@@ -1,5 +1,8 @@
 # Issue #754 plans for human review
 
+The [ensemble exports](ensembles/README.md) cover shared-rate, shared-quantile and
+full-workload candidates without prices or a selected winner.
+
 The `candidates/` directory contains physical plans for structural review. No
 human approval is recorded. Level 1 now exports candidate JSON/DOT and per-query
 `*.admission.json` reports before pricing, including `bind_failed` reasons. It
