@@ -2503,6 +2503,7 @@ mod tests {
                     summary_catalog: Some(generation.clone()),
                     envelope: envelope.clone(),
                     ingest: IngestContract {
+                        dataset_identity: None,
                         protocol: IngestProtocol::PrometheusRemoteWriteV1,
                         endpoint_path: "/api/v1/write".into(),
                         timestamp_unit: TimestampUnit::UnixMilliseconds,
