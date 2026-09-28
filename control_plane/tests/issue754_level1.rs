@@ -637,10 +637,22 @@ fn assert_candidate_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Stri
         }));
         return None;
     }
-    let native_rate = name == "topk-rate" && node["op"] == "physical";
+    let native_rate = matches!(name, "topk-rate" | "temporal-rate") && node["op"] == "physical";
     if native_rate {
         let installed = plan.query_plan.entries.values().next().unwrap();
-        assert_native_ranking(installed);
+        if name == "topk-rate" {
+            assert_native_ranking(installed);
+        } else {
+            // A complete Rate frontier can itself be the selected physical output.
+            let physical = installed.recover_vector_physical_dag().unwrap();
+            let sources = physical
+                .input_contracts()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            assert_eq!(sources.len(), 1);
+            assert_eq!(physical.roots(), sources.as_slice());
+            assert_eq!(physical.operator_name(sources[0]), Some("Input"));
+        }
         let inputs = node["inputs"].as_array().unwrap();
         assert_eq!(inputs.len(), 1);
         node = &nodes[&inputs[0].to_string()];
@@ -702,7 +714,7 @@ fn assert_candidate_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Stri
         } else {
             2
         },
-        "{name}: unexpected DAG nodes"
+        "{name}: unexpected DAG nodes: {nodes:?}"
     );
     if expected.readout == "quantile" {
         assert_eq!(

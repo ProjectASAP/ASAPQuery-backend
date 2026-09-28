@@ -90,7 +90,9 @@ be admitted explicitly; the deployment compiler must reject unsupported
 frontiers instead of moving operators.
 
 Selected Filter, Sort, Limit and semi-join fragments are compiled by Planner and persisted
-with typed input contracts. Runtime binds protocol vectors to these contracts;
+with typed input contracts. Complete query candidates include Planner readouts
+that turn accumulator state into values; internal shared and stored edges retain
+their state types. Runtime binds protocol vectors to these contracts;
 renamed or multiple join keys retain their original types and positions. External
 Prometheus bindings fetch the selected authoritative subquery without rewriting
 its labels from the candidate side. The native join performs the comparison.
