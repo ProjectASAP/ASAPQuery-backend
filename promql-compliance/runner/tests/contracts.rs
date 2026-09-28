@@ -436,3 +436,33 @@ fn synthetic_selection_installs_the_exact_selected_generation() {
         assert!(planning::validate_fixture_cost(&invalid).is_err());
     }
 }
+
+/// Mutating prices must select each admitted manifest, and a missing target
+/// quote must fail coverage rather than silently reduce the execution matrix.
+#[test]
+fn candidate_sweep_selects_every_admitted_target() {
+    let input = planning::with_fixture_costs(
+        planning::snapshot(&suite(), &dataset(), 10000, 0, false).unwrap(),
+    )
+    .unwrap();
+    let baseline = input.clone().compile_promql().unwrap();
+    let report = baseline.cost_comparison.unwrap();
+    let targets = planning::executable_fixture_targets(&input, &report).unwrap();
+    assert!(targets.len() > 1);
+    for target in &targets {
+        let selected = planning::prefer_fixture_candidate(input.clone(), target)
+            .unwrap()
+            .compile_promql()
+            .unwrap();
+        planning::validate_fixture_cost(&selected).unwrap();
+        assert_eq!(&selected.cost_comparison.unwrap().selected_manifest, target);
+    }
+    let mut missing = input;
+    missing
+        .workload_cost_evidence
+        .as_mut()
+        .unwrap()
+        .quotes
+        .retain(|q| q.manifest != targets[0]);
+    assert!(planning::executable_fixture_targets(&missing, &report).is_err());
+}

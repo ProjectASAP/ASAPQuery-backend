@@ -1,4 +1,4 @@
-.PHONY: test run run-all
+.PHONY: test run run-all candidates
 
 DATASET ?= ../datasets/single-rate.yaml
 SUITE ?= ../suites/temporal.yaml
@@ -41,3 +41,6 @@ benefit:
 		--compose-file ../docker-compose.benefit.yml \
 		--output "$(REPORT_DIR)/issue-754-benefit.json" \
 		--logs-dir "$(LOGS_DIR)/issue-754-benefit"
+# Select, install and execute every admitted candidate for singles and ensembles.
+candidates:
+	cargo run --locked -p promql-compliance --bin differential-runner -- --all-candidates --dataset ../datasets/issue-754.yaml --suite ../suites/issue-754.yaml --reference-url $(REFERENCE_URL) --test-url $(BACKEND_URL) --compose-file $(COMPOSE_FILE) --logs-dir "$(LOGS_DIR)/candidates" --output "$(REPORT_DIR)/candidates.json"

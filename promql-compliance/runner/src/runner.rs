@@ -14,7 +14,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct Args {
     #[arg(long)]
     pub dataset: PathBuf,
@@ -54,6 +54,9 @@ pub struct Args {
     // to measure the tail percentile while retaining every observation.
     #[arg(long, default_value_t = 100)]
     pub trials: usize,
+    /// Mutate fixture quotes and execute every admitted candidate for each query and the full ensemble.
+    #[arg(long)]
+    pub all_candidates: bool,
 }
 pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -63,7 +66,15 @@ pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 pub async fn run(args: Args, benefit: bool) -> Result<()> {
-    let result = execute(&args, benefit).await;
+    let result = if args.all_candidates {
+        ensure!(
+            !benefit && !args.keep_services && !args.compose_file.is_empty(),
+            "candidate sweep requires isolated Compose execution without benefit/keep-services"
+        );
+        execute_candidates(&args).await
+    } else {
+        execute(&args, benefit).await
+    };
     match result {
         Ok(report) => {
             write_json(&args.output, &report)?;
@@ -122,6 +133,18 @@ async fn execute(args: &Args, benefit: bool) -> Result<Value> {
         planning::validate_fixture_cost(&plan).context("synthetic workload cost gate")?;
     }
     planning::validate_local(&plan).context("ASAP-local plan gate")?;
+    execute_installed(args, benefit, &suite, &data, base, plan).await
+}
+
+async fn execute_installed(
+    args: &Args,
+    benefit: bool,
+    suite: &Suite,
+    data: &Dataset,
+    base: i64,
+    plan: control_plane::physical::compiler::CompiledPhysicalPlan,
+) -> Result<Value> {
+    let plan_path = args.output.with_extension("plan.json");
     let installation_path = args.output.with_extension("install.json");
     write_json(&installation_path, &planning::installation(plan))?;
     let installation_path = std::fs::canonicalize(installation_path)?;
@@ -140,7 +163,7 @@ async fn execute(args: &Args, benefit: bool) -> Result<Value> {
     ] {
         transport::wait(&client, &url).await?;
     }
-    let body = transport::encode(&data, base)?;
+    let body = transport::encode(data, base)?;
     let mut targets = vec![args.reference.as_str(), args.backend.as_str()];
     if benefit {
         transport::wait(&client, &format!("{}/health", args.victoria_url)).await?;
@@ -153,7 +176,7 @@ async fn execute(args: &Args, benefit: bool) -> Result<Value> {
         &client,
         &args.reference,
         &args.backend,
-        &suite,
+        suite,
         &data.name,
         base,
     )
@@ -167,9 +190,9 @@ async fn execute(args: &Args, benefit: bool) -> Result<Value> {
         semantic["passed"] == true,
         "semantic gate failed; inspect semantic report"
     );
-    sql::seed(&client, &args.clickhouse_url, &data, base).await?;
-    verify_baselines(&client, args, &suite, &data, base).await?;
-    let report = measure(&client, args, &suite, &data, &compose, base, &plan_path).await?;
+    sql::seed(&client, &args.clickhouse_url, data, base).await?;
+    verify_baselines(&client, args, suite, data, base).await?;
+    let report = measure(&client, args, suite, data, &compose, base, &plan_path).await?;
     compose.finish()?;
     Ok(report)
 }
@@ -545,4 +568,133 @@ pub fn report_card(directory: &Path) -> Result<()> {
     )?;
     std::fs::write(directory.join("summary.md"), markdown)?;
     Ok(())
+}
+
+/// Exercise each admitted physical workload by changing quotes, never by
+/// replacing the selected DAG after the production selector has run.
+async fn execute_candidates(args: &Args) -> Result<Value> {
+    let data = Dataset::load(&args.dataset)?;
+    let suite = Suite::load(&args.suite)?;
+    let mut scopes: Vec<(String, Suite)> = suite
+        .queries
+        .iter()
+        .map(|query| {
+            (
+                format!("query:{}", query.name),
+                Suite {
+                    queries: vec![query.clone()],
+                    ..suite.clone()
+                },
+            )
+        })
+        .collect();
+    for (name, names) in [
+        (
+            "shared-rate",
+            vec!["temporal-rate", "grouped-rate", "topk-rate"],
+        ),
+        (
+            "shared-quantiles",
+            vec!["temporal-quantile", "quantile-ratio"],
+        ),
+    ] {
+        let queries: Vec<_> = suite
+            .queries
+            .iter()
+            .filter(|q| names.contains(&q.name.as_str()))
+            .cloned()
+            .collect();
+        if queries.len() == names.len() {
+            scopes.push((
+                name.into(),
+                Suite {
+                    queries,
+                    ..suite.clone()
+                },
+            ));
+        }
+    }
+    if suite.queries.len() > 1 {
+        scopes.push(("full-ensemble".into(), suite));
+    }
+    let mut runs = Vec::new();
+    let mut inventories = Vec::new();
+    let mut results = Vec::new();
+    let mut passed = true;
+    for (scope_index, (name, suite)) in scopes.into_iter().enumerate() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+        let base = args.base_time_ms.unwrap_or(now as i64 - 1_800_000);
+        let input =
+            planning::with_fixture_costs(planning::snapshot(&suite, &data, now, base, false)?)?;
+        let baseline = input.clone().compile_promql()?;
+        planning::validate_fixture_cost(&baseline)?;
+        let report = baseline.cost_comparison.context("missing inventory")?;
+        let targets = planning::executable_fixture_targets(&input, &report)?;
+        inventories.push(json!({"scope":name,"queries":suite.queries.iter().map(|q| &q.expr).collect::<Vec<_>>(),
+            "candidateEvaluations": report.candidate_evaluations,"executableCandidates":targets.len(),
+            "searchScope": report.materialization_search_coverage}));
+        for (candidate_index, target) in targets.into_iter().enumerate() {
+            let mut trial = args.clone();
+            let directory = args
+                .output
+                .with_extension("")
+                .join(format!("scope-{scope_index}"));
+            trial.output = directory.join(format!("candidate-{candidate_index}.json"));
+            trial.logs_dir = args
+                .logs_dir
+                .join(format!("scope-{scope_index}-candidate-{candidate_index}"));
+            trial.compose_project =
+                format!("{}-s{scope_index}-c{candidate_index}", args.compose_project);
+            eprintln!(
+                "Executing {name} candidate {candidate_index}: plan {}",
+                target.plan_id
+            );
+            let trial_result: Result<Value> = async {
+                let priced = planning::prefer_fixture_candidate(input.clone(), &target)?;
+                write_json(&trial.output.with_extension("snapshot.json"), &priced)?;
+                let selected = priced.compile_promql()?;
+                planning::validate_fixture_cost(&selected)?;
+                planning::validate_local(&selected)?;
+                ensure!(
+                    selected
+                        .cost_comparison
+                        .as_ref()
+                        .context("missing selected report")?
+                        .selected_manifest
+                        == target,
+                    "synthetic prices did not select the intended candidate"
+                );
+                write_json(&trial.output.with_extension("plan.json"), &selected)?;
+                execute_installed(&trial, false, &suite, &data, base, selected).await
+            }
+            .await;
+            let result = match trial_result {
+                Ok(result) => result,
+                Err(error) => json!({"passed":false,"error":format!("{error:#}")}),
+            };
+            passed &= result["passed"] == true;
+            write_json(&trial.output, &result)?;
+            if let Some(queries) = result["queries"].as_array() {
+                results.extend(queries.iter().cloned().map(|mut query| {
+                    query["candidatePlanId"] = json!(target.plan_id);
+                    query["scope"] = json!(name);
+                    query
+                }));
+            }
+            runs.push(
+                json!({"scope":name,"candidatePlanId":target.plan_id,"passed":result["passed"],
+                "report":trial.output,"error":result.get("error")}),
+            );
+            // Persist partial coverage so an interrupted run never looks complete.
+            write_json(
+                &args.output,
+                &json!({"passed":false,"complete":false,"inventories":inventories,"candidateRuns":runs}),
+            )?;
+        }
+    }
+    ensure!(!runs.is_empty(), "no executable candidate trials");
+    Ok(
+        json!({"passed":passed,"complete":true,"dataset":data.name,"inventories":inventories,
+        "candidateRuns":runs,"queries":results,"costModel":planning::FIXTURE_COST_MODEL}),
+    )
 }

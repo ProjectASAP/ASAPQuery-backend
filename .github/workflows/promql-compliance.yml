@@ -33,6 +33,9 @@ jobs:
       - name: Run every differential corpus
         working-directory: ASAPQuery-backend/promql-compliance/runner
         run: make run-all REPORT_DIR="$GITHUB_WORKSPACE/artifacts/reports" LOGS_DIR="$GITHUB_WORKSPACE/artifacts/logs"
+      - name: Execute every admitted individual and ensemble candidate
+        working-directory: ASAPQuery-backend/promql-compliance/runner
+        run: make candidates REPORT_DIR="$GITHUB_WORKSPACE/artifacts/reports" LOGS_DIR="$GITHUB_WORKSPACE/artifacts/logs"
       - name: Upload reports and service logs
         if: always()
         uses: actions/upload-artifact@v4

@@ -395,3 +395,69 @@ pub fn validate_fixture_cost(plan: &CompiledPhysicalPlan) -> Result<()> {
     );
     Ok(())
 }
+
+/// One target per distinct admitted deployment manifest. Binding/accuracy
+/// failures remain in the inventory report and are never silently executable.
+pub fn executable_fixture_targets(
+    input: &BackendLocalPlanningInput,
+    report: &control_plane::physical::workload_cost::CandidatePlanSelectionReport,
+) -> Result<Vec<control_plane::physical::workload_cost::WorkloadCostManifest>> {
+    let evidence = input
+        .workload_cost_evidence
+        .as_ref()
+        .context("missing fixture quotes")?;
+    let admitted: std::collections::BTreeSet<_> = report
+        .candidate_evaluations
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.status,
+                CandidateEvaluationStatus::Selected | CandidateEvaluationStatus::Unselected
+            )
+        })
+        .map(|c| c.plan_id.context("admitted candidate lacks identity"))
+        .collect::<Result<_>>()?;
+    let targets: Vec<_> = evidence
+        .quotes
+        .iter()
+        .filter(|q| q.executable && admitted.contains(&q.manifest.plan_id))
+        .map(|q| q.manifest.clone())
+        .collect();
+    ensure!(!targets.is_empty(), "no executable fixture candidates");
+    ensure!(
+        targets
+            .iter()
+            .map(|m| m.plan_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            == admitted,
+        "admitted candidate lacks an executable quote"
+    );
+    Ok(targets)
+}
+
+pub fn prefer_fixture_candidate(
+    mut input: BackendLocalPlanningInput,
+    target: &control_plane::physical::workload_cost::WorkloadCostManifest,
+) -> Result<BackendLocalPlanningInput> {
+    let evidence = input
+        .workload_cost_evidence
+        .as_mut()
+        .context("missing fixture quotes")?;
+    ensure!(
+        evidence.model_version == FIXTURE_COST_MODEL,
+        "not fixture costs"
+    );
+    let mut matches = 0;
+    for quote in &mut evidence.quotes {
+        let preferred = &quote.manifest == target;
+        if preferred {
+            ensure!(quote.executable, "target is infeasible");
+            matches += 1;
+        }
+        for value in quote.unit_costs.values_mut() {
+            *value = if preferred { 1.0 } else { 1e12 };
+        }
+    }
+    ensure!(matches == 1, "target must identify exactly one quote");
+    Ok(input)
+}
