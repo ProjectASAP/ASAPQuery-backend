@@ -48,7 +48,7 @@ def prepare(data, manifest, query_id, snapshot, end_ms, repetitions):
     registered = snapshot["query_workload"]
     if registered.get("query_batch") or {q["query"] for q in registered["repeating_queries"]} != {query["promql"]}:
         raise ValueError("costed snapshot must register exactly the selected query")
-    if snapshot.get("snapshot_version") != 2 or not snapshot.get("workload_cost_evidence", {}).get("quotes"):
+    if snapshot.get("snapshot_version") != 3 or not snapshot.get("workload_cost_evidence", {}).get("quotes"):
         raise ValueError("measured complete-workload cost evidence is required; discovery/demo costs are not deployment quotes")
     return query, {"upstream_revision": "shared-workload:" + hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest(),
                    "queries": [{"id": query_id, "query": query["promql"], "eval_timestamp_ms": end}]}
