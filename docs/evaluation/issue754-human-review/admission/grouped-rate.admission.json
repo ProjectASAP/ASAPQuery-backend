@@ -28,12 +28,12 @@
     "logical_root_ids": [
       "asap-explain-v1:root:6daba5f3c9b44ad12632739d6780f55e616a9653fbd1525b02168d0e453a4845"
     ],
-    "physical_candidate_id": null,
+    "physical_candidate_id": "asap-explain-v1:physical:6f31f22b23159cfb14664439fe5e367d047968ad47d2d96d0ebfbd89e951442d",
     "identity_unavailable_reason": null,
-    "status": "bind_failed",
-    "plan_id": null,
+    "status": "bound",
+    "plan_id": 6192272502608540012,
     "total_cost": null,
-    "unavailable_reason": "failed to construct QueryPlan: invalid QueryPlan: Planner logical fragment does not match any original query subtree"
+    "unavailable_reason": null
   },
   {
     "candidate_id": "asap-explain-v1:candidate:f1d848dd9b94a31003252e3e67de1fc831e8cd65e6816ac62bf5f0e1153924a6",
@@ -58,17 +58,5 @@
     "plan_id": 3349874915222028658,
     "total_cost": null,
     "unavailable_reason": null
-  },
-  {
-    "candidate_id": "asap-explain-v1:candidate:6be4fb9f425339017648a016bdcf3d4191d067ea32bea01c7464bbe04e7dcde0",
-    "logical_root_ids": [
-      "asap-explain-v1:root:27d5ae8f88ae3d24c8195cfb77f8ced66c8b982380181dac51c499a264c5ac55"
-    ],
-    "physical_candidate_id": null,
-    "identity_unavailable_reason": null,
-    "status": "bind_failed",
-    "plan_id": null,
-    "total_cost": null,
-    "unavailable_reason": "failed to construct QueryPlan: invalid QueryPlan: physical program has incompatible input or result schema"
   }
 ]
