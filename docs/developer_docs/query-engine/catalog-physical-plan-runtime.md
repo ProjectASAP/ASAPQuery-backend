@@ -98,3 +98,26 @@ families preserve hidden series labels, account for counter resets and rebuild
 ranking independently for each window. Missing windows cannot serve a warm
 result. This path stores counter state and builds the heap at query time;
 publishing the heap itself during precompute requires a separate placement.
+
+Fixed-window Rate ranking has a second placement: Planner finalizes the complete
+per-series counter window and builds the heap during maintenance. The deployment
+binds the resulting heap to SDS; the query graph contains readout and ranking
+projection only. Counter states are the bounded input buffer, including timestamps
+and resets. Rates from different windows are never added as heap updates.
+
+This placement runs after the finite input cohort is closed and durable. It does
+not infer population completeness from a timer or a missing series. Continuous
+maintenance needs an explicit population/window completion contract before it can
+use this path. Binding requires matching nonoverlapping complete source windows.
+
+Each native heap output is one atomic batch record per window. Logical groups
+and series identities remain in the typed batch; its outer storage address uses
+an empty group. Publishing groups independently would permit recovery to expose
+an incomplete group set. The canonical SummaryDefinition still describes the
+logical grouping and expressions. This storage granularity does not erase them.
+
+Installed maintenance programs retain Planner operator definitions and typed
+input/output node identities. Recovery validates those boundaries against the
+installed semantic document and stored-output bindings. The query resolves its
+exact deployed output through the store index, checks the definition, generation,
+window, encoding and batch schema, then executes the retained query graph.

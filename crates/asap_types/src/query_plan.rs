@@ -605,7 +605,7 @@ pub struct ExternalExactRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
-    /// Bind deployment-provided vectors to the already compiled physical DAG.
+    /// Bind deployment-provided vectors or stored batches to the compiled physical DAG.
     /// Input positions correspond to `source_nodes`; operators live only in
     /// QueryPlanEntry.physical_dag, never in this binding.
     Physical {

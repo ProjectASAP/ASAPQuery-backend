@@ -8,6 +8,7 @@ pub mod ingest_handler;
 pub mod maintenance_runtime;
 pub(crate) mod metrics;
 pub mod multisource_coordinator;
+mod native_maintenance;
 pub mod output_sink;
 pub mod raw_dag;
 pub mod series_buffer;
