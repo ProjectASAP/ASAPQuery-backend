@@ -1,0 +1,15 @@
+services:
+  data-plane:
+    # The benchmark issues one query at a time; use one runtime worker
+    # for this sequential request stream.
+    environment:
+      TOKIO_WORKER_THREADS: "1"
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports: ["${CLICKHOUSE_PORT:-18123}:8123"]
+  victoria:
+    image: victoriametrics/victoria-metrics:v1.126.0
+    command: ["-retentionPeriod=1d", "-search.maxStalenessInterval=5m"]
+    ports: ["${VICTORIA_PORT:-18428}:8428"]

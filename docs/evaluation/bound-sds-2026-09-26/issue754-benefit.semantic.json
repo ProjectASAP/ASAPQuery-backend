@@ -1,0 +1,5107 @@
+{
+  "baseTimeMs": 1790442355571,
+  "dataset": "issue-754",
+  "passed": true,
+  "queries": [
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "sum by (label_0) (data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "300"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1740"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "300"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1740"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "900"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "3300"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "900"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "3300"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "spatial-sum",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "300"
+                  ],
+                  [
+                    1790442535.571,
+                    "900"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1740"
+                  ],
+                  [
+                    1790442535.571,
+                    "3300"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "300"
+                  ],
+                  [
+                    1790442535.571,
+                    "900"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1740"
+                  ],
+                  [
+                    1790442535.571,
+                    "3300"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "topk by (label_0) (3, data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "160"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "90"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "40"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "640"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "490"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "360"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "160"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "90"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "40"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "640"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "490"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "360"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "400"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "270"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "160"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1120"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "910"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "720"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "400"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "270"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "160"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1120"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "910"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "__name__": "data",
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "720"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "spatial-topk",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "40"
+                  ],
+                  [
+                    1790442535.571,
+                    "160"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "90"
+                  ],
+                  [
+                    1790442535.571,
+                    "270"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "160"
+                  ],
+                  [
+                    1790442535.571,
+                    "400"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "360"
+                  ],
+                  [
+                    1790442535.571,
+                    "720"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "490"
+                  ],
+                  [
+                    1790442535.571,
+                    "910"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "640"
+                  ],
+                  [
+                    1790442535.571,
+                    "1120"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "40"
+                  ],
+                  [
+                    1790442535.571,
+                    "160"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "90"
+                  ],
+                  [
+                    1790442535.571,
+                    "270"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "160"
+                  ],
+                  [
+                    1790442535.571,
+                    "400"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "360"
+                  ],
+                  [
+                    1790442535.571,
+                    "720"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "490"
+                  ],
+                  [
+                    1790442535.571,
+                    "910"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "__name__": "data",
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "640"
+                  ],
+                  [
+                    1790442535.571,
+                    "1120"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "quantile by (label_0) (0.9, data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "139"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "595"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "139"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "595"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "361"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1057"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "361"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1057"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "spatial-quantile",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "139"
+                  ],
+                  [
+                    1790442535.571,
+                    "361"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "595"
+                  ],
+                  [
+                    1790442535.571,
+                    "1057"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "139"
+                  ],
+                  [
+                    1790442535.571,
+                    "361"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "595"
+                  ],
+                  [
+                    1790442535.571,
+                    "1057"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "sum_over_time(data[1m])",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "59910"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "131820"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "215730.00000000003"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "311640"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "419550"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "539460"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "671370"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "815280"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "59910"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "131820"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "215730"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "311640"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "419550"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "539460"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "671370"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "815280"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "24030"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "60060"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "108090"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "168120"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "240150"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "324180"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "420210"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "528240"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "24030.000000000004"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "60060.00000000001"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "108090.00000000001"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "168120.00000000003"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "240150.00000000003"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "324180"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "420210.00000000006"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "528240"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "temporal-sum",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "59910"
+                  ],
+                  [
+                    1790442535.571,
+                    "24030"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "131820"
+                  ],
+                  [
+                    1790442535.571,
+                    "60060"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "215730.00000000003"
+                  ],
+                  [
+                    1790442535.571,
+                    "108090"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "311640"
+                  ],
+                  [
+                    1790442535.571,
+                    "168120"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "419550"
+                  ],
+                  [
+                    1790442535.571,
+                    "240150"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "539460"
+                  ],
+                  [
+                    1790442535.571,
+                    "324180"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "671370"
+                  ],
+                  [
+                    1790442535.571,
+                    "420210"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "815280"
+                  ],
+                  [
+                    1790442535.571,
+                    "528240"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "59910"
+                  ],
+                  [
+                    1790442535.571,
+                    "24030.000000000004"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "131820"
+                  ],
+                  [
+                    1790442535.571,
+                    "60060.00000000001"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "215730"
+                  ],
+                  [
+                    1790442535.571,
+                    "108090.00000000001"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "311640"
+                  ],
+                  [
+                    1790442535.571,
+                    "168120.00000000003"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "419550"
+                  ],
+                  [
+                    1790442535.571,
+                    "240150.00000000003"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "539460"
+                  ],
+                  [
+                    1790442535.571,
+                    "324180"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "671370"
+                  ],
+                  [
+                    1790442535.571,
+                    "420210.00000000006"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "815280"
+                  ],
+                  [
+                    1790442535.571,
+                    "528240"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "quantile_over_time(0.9, data[1m])",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "122.99313054806508"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "267.77212581584365"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "432.7466024574666"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "620.2758780658382"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "820.7131665561263"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1043.3392628236145"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1300.0903120454363"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1556.5000347398156"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "123.91000000000001"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "267.82000000000005"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "431.7300000000001"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "615.64"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "819.55"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1043.46"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1287.37"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1551.28"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "63.56776506694714"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "146.95351919323392"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "252.17778678947934"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "376.2100669308296"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "518.0948550403809"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "685.5131467993269"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "871.4649775130587"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1064.4168236887378"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "64.01"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "148.02"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "252.03000000000003"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "376.04"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "520.0500000000001"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "684.0600000000001"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "868.07"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1072.08"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "temporal-quantile",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "122.99313054806508"
+                  ],
+                  [
+                    1790442535.571,
+                    "63.56776506694714"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "267.77212581584365"
+                  ],
+                  [
+                    1790442535.571,
+                    "146.95351919323392"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "432.7466024574666"
+                  ],
+                  [
+                    1790442535.571,
+                    "252.17778678947934"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "620.2758780658382"
+                  ],
+                  [
+                    1790442535.571,
+                    "376.2100669308296"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "820.7131665561263"
+                  ],
+                  [
+                    1790442535.571,
+                    "518.0948550403809"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1043.3392628236145"
+                  ],
+                  [
+                    1790442535.571,
+                    "685.5131467993269"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1300.0903120454363"
+                  ],
+                  [
+                    1790442535.571,
+                    "871.4649775130587"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1556.5000347398156"
+                  ],
+                  [
+                    1790442535.571,
+                    "1064.4168236887378"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "123.91000000000001"
+                  ],
+                  [
+                    1790442535.571,
+                    "64.01"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "267.82000000000005"
+                  ],
+                  [
+                    1790442535.571,
+                    "148.02"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "431.7300000000001"
+                  ],
+                  [
+                    1790442535.571,
+                    "252.03000000000003"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "615.64"
+                  ],
+                  [
+                    1790442535.571,
+                    "376.04"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "819.55"
+                  ],
+                  [
+                    1790442535.571,
+                    "520.0500000000001"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1043.46"
+                  ],
+                  [
+                    1790442535.571,
+                    "684.0600000000001"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1287.37"
+                  ],
+                  [
+                    1790442535.571,
+                    "868.07"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1551.28"
+                  ],
+                  [
+                    1790442535.571,
+                    "1072.08"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "rate(data[1m])",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1652754590984977"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "2.6644407345575964"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "4.497495826377297"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "6.664440734557596"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "9.165275459098497"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "12.000000000000002"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "15.168614357262102"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "18.671118530884808"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1652754590984977"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "2.6644407345575964"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "4.497495826377297"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "6.664440734557596"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "9.165275459098497"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "12.000000000000002"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "15.168614357262102"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "18.671118530884808"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:6)"
+              ],
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "0.9999999999999998"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "2.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "3.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "4.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "5.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "6.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "7.999999999999998"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "0.9999999999999998"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "2.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "3.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "4.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "5.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "6.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "7.999999999999998"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:6)"
+              ],
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "temporal-rate",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1652754590984977"
+                  ],
+                  [
+                    1790442535.571,
+                    "0.9999999999999998"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "2.6644407345575964"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "4.497495826377297"
+                  ],
+                  [
+                    1790442535.571,
+                    "2.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "6.664440734557596"
+                  ],
+                  [
+                    1790442535.571,
+                    "3.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "9.165275459098497"
+                  ],
+                  [
+                    1790442535.571,
+                    "4.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "12.000000000000002"
+                  ],
+                  [
+                    1790442535.571,
+                    "5.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "15.168614357262102"
+                  ],
+                  [
+                    1790442535.571,
+                    "6.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "18.671118530884808"
+                  ],
+                  [
+                    1790442535.571,
+                    "7.999999999999998"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1652754590984977"
+                  ],
+                  [
+                    1790442535.571,
+                    "0.9999999999999998"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "2.6644407345575964"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "4.497495826377297"
+                  ],
+                  [
+                    1790442535.571,
+                    "2.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "6.664440734557596"
+                  ],
+                  [
+                    1790442535.571,
+                    "3.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "9.165275459098497"
+                  ],
+                  [
+                    1790442535.571,
+                    "4.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "12.000000000000002"
+                  ],
+                  [
+                    1790442535.571,
+                    "5.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "15.168614357262102"
+                  ],
+                  [
+                    1790442535.571,
+                    "6.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "18.671118530884808"
+                  ],
+                  [
+                    1790442535.571,
+                    "7.999999999999998"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:6)"
+          ],
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "sum by (label_0) (rate(data[1m]))",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "14.991652754590987"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "55.00500834724541"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "14.991652754590987"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "55.00500834724541"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:24)"
+              ],
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "9.999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "25.999999999999993"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "9.999999999999998"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "25.999999999999996"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:24)"
+              ],
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "grouped-rate",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "14.991652754590987"
+                  ],
+                  [
+                    1790442535.571,
+                    "9.999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "55.00500834724541"
+                  ],
+                  [
+                    1790442535.571,
+                    "25.999999999999993"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "14.991652754590987"
+                  ],
+                  [
+                    1790442535.571,
+                    "9.999999999999998"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "55.00500834724541"
+                  ],
+                  [
+                    1790442535.571,
+                    "25.999999999999996"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:24)"
+          ],
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "sum by (label_0) (sum_over_time(data[1m]))",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "719100"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "2445660"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "719100"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "2445660"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "360300"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1512780"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "360300.00000000006"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1512780"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "grouped-temporal-sum",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "719100"
+                  ],
+                  [
+                    1790442535.571,
+                    "360300"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "2445660"
+                  ],
+                  [
+                    1790442535.571,
+                    "1512780"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "719100"
+                  ],
+                  [
+                    1790442535.571,
+                    "360300.00000000006"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "2445660"
+                  ],
+                  [
+                    1790442535.571,
+                    "1512780"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "topk by (label_0) (3, rate(data[1m]))",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "6.664440734557596"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "4.497495826377297"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "2.6644407345575964"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "18.671118530884808"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "15.168614357262102"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "12.000000000000002"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "6.664440734557596"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "4.497495826377297"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "2.6644407345575964"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "18.671118530884808"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "15.168614357262102"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "12.000000000000002"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:28)"
+              ],
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "3.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "2.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "7.999999999999998"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "6.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "5.999999999999999"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "3.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "2.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.9999999999999996"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "7.999999999999998"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "6.999999999999999"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "5.999999999999999"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:28)"
+              ],
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "topk-rate",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "2.6644407345575964"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "4.497495826377297"
+                  ],
+                  [
+                    1790442535.571,
+                    "2.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "6.664440734557596"
+                  ],
+                  [
+                    1790442535.571,
+                    "3.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "12.000000000000002"
+                  ],
+                  [
+                    1790442535.571,
+                    "5.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "15.168614357262102"
+                  ],
+                  [
+                    1790442535.571,
+                    "6.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "18.671118530884808"
+                  ],
+                  [
+                    1790442535.571,
+                    "7.999999999999998"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "2.6644407345575964"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "4.497495826377297"
+                  ],
+                  [
+                    1790442535.571,
+                    "2.9999999999999996"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "6.664440734557596"
+                  ],
+                  [
+                    1790442535.571,
+                    "3.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "12.000000000000002"
+                  ],
+                  [
+                    1790442535.571,
+                    "5.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "15.168614357262102"
+                  ],
+                  [
+                    1790442535.571,
+                    "6.999999999999999"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "18.671118530884808"
+                  ],
+                  [
+                    1790442535.571,
+                    "7.999999999999998"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: \"data\" (1:28)"
+          ],
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "expr": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.2447158597509214"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.2141194427342956"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.196147475686665"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1843044313729358"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1725786449236988"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1609689553699984"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1494742132376226"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1380932804332897"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.239719859929965"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.217917235106867"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1997498957899126"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1843786071565987"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1712040014290817"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1597865955318438"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1497968115035946"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442475.571,
+                      "1.1409826419535158"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.5978597066932154"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.4814564513315633"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.3955989912135047"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.3358383804438014"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2952563149674061"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2697346485319148"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2336243322877944"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2201900399479668"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "instance": "a1",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.598252184769039"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a2",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.478721278721279"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a3",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.3990008326394674"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "a4",
+                      "label_0": "a"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.3420413990007138"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b1",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2993129294191132"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b2",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2660744031093838"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b3",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2394802598700652"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "instance": "b4",
+                      "label_0": "b"
+                    },
+                    "value": [
+                      1790442535.571,
+                      "1.2177192185370285"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442535571
+        }
+      ],
+      "name": "quantile-ratio",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.2447158597509214"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.5978597066932154"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.2141194427342956"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.4814564513315633"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.196147475686665"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.3955989912135047"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1843044313729358"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.3358383804438014"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1725786449236988"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2952563149674061"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1609689553699984"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2697346485319148"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1494742132376226"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2336243322877944"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1380932804332897"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2201900399479668"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "instance": "a1",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.239719859929965"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.598252184769039"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a2",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.217917235106867"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.478721278721279"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a3",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1997498957899126"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.3990008326394674"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "a4",
+                  "label_0": "a"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1843786071565987"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.3420413990007138"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b1",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1712040014290817"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2993129294191132"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b2",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1597865955318438"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2660744031093838"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b3",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1497968115035946"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2394802598700652"
+                  ]
+                ]
+              },
+              {
+                "metric": {
+                  "instance": "b4",
+                  "label_0": "b"
+                },
+                "values": [
+                  [
+                    1790442475.571,
+                    "1.1409826419535158"
+                  ],
+                  [
+                    1790442535.571,
+                    "1.2177192185370285"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 120.0,
+          "timeMs": 1790442475571
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 180.0,
+          "timeMs": 1790442535571
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    }
+  ],
+  "suite": "issue-754"
+}

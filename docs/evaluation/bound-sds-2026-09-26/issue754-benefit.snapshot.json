@@ -1,0 +1,567 @@
+{
+  "snapshot_version": 2,
+  "query_workload": {
+    "language": "promql",
+    "query_batch": null,
+    "repeating_queries": [
+      {
+        "query": "sum by (label_0) (data)",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "topk by (label_0) (3, data)",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "quantile by (label_0) (0.9, data)",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "sum_over_time(data[1m])",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "quantile_over_time(0.9, data[1m])",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "rate(data[1m])",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "sum by (label_0) (rate(data[1m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "sum by (label_0) (sum_over_time(data[1m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "topk by (label_0) (3, rate(data[1m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      },
+      {
+        "query": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 55571
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": null,
+          "as_of": null
+        }
+      }
+    ]
+  },
+  "data_workload": {
+    "arrival": "continuously_ingesting",
+    "data_ingestion_interval": {
+      "value": 100,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "ingestion_volume": {
+      "value": 14408,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "ingestion_rate": {
+      "value": 80.0,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "input_cardinality": {
+      "value": 8,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "distribution": {
+      "value": null,
+      "source": "unknown",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    }
+  },
+  "implementation": {
+    "require_backend_local_execution": true,
+    "lifecycle_costs": {
+      "build": 10.0,
+      "maintenance_per_update": 0.001,
+      "read": 0.1,
+      "retention_per_second": 0.001,
+      "retirement": 1.0
+    },
+    "evidence_observed_at_unix_ms": 1790444155571,
+    "evidence_valid_for_ms": 600000,
+    "horizon_seconds": 300.0,
+    "window_cost_model": {
+      "implementation_id": "backend-tumbling-v1",
+      "cost": {
+        "model_version": "compat-cost-v1",
+        "workload_fingerprint": "replaced-with-canonical-promql",
+        "observed_at_unix_ms": 1790444155571,
+        "valid_for_ms": 600000,
+        "horizon_seconds": 300.0,
+        "cpu_cost": 1.0,
+        "peak_memory_bytes": 1024,
+        "network_bytes": 0,
+        "storage_bytes": 512,
+        "source_scan_bytes": 0,
+        "weighted_cost": 1.0
+      }
+    },
+    "scrape_interval_ms": 100,
+    "query_staleness_margin_ms": 60000,
+    "data_snapshot_id": "finite-replay-issue-754-1790444155571",
+    "accuracy_evidence": {
+      "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])": {
+        "query_string": "quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])",
+        "data_snapshot_id": "finite-replay-issue-754-1790444155571",
+        "data_workload": {
+          "arrival": "continuously_ingesting",
+          "data_ingestion_interval": {
+            "value": 100,
+            "source": "declared",
+            "observed_at_ms": null,
+            "valid_for_ms": null
+          },
+          "ingestion_volume": {
+            "value": 14408,
+            "source": "declared",
+            "observed_at_ms": null,
+            "valid_for_ms": null
+          },
+          "ingestion_rate": {
+            "value": 80.0,
+            "source": "declared",
+            "observed_at_ms": null,
+            "valid_for_ms": null
+          },
+          "input_cardinality": {
+            "value": 8,
+            "source": "declared",
+            "observed_at_ms": null,
+            "valid_for_ms": null
+          },
+          "distribution": {
+            "value": null,
+            "source": "unknown",
+            "observed_at_ms": null,
+            "valid_for_ms": null
+          }
+        },
+        "source": "complete-finite-replay",
+        "observed_at_unix_ms": 1790444155571,
+        "valid_for_ms": 600000,
+        "quantile_operand_domains": [
+          {
+            "operand": {
+              "Aggregate": {
+                "child": {
+                  "TimeRange": {
+                    "child": {
+                      "Scan": {
+                        "predicates": [],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "value",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": 0,
+                          "unique_keys": []
+                        },
+                        "source": {
+                          "TimeSeries": {
+                            "metric": "data"
+                          }
+                        }
+                      }
+                    },
+                    "range": {
+                      "nanos": 0,
+                      "secs": 60
+                    }
+                  }
+                },
+                "having": null,
+                "measures": [
+                  {
+                    "accuracy": {
+                      "EpsilonDelta": {
+                        "delta": 0.01,
+                        "epsilon": 0.01
+                      }
+                    },
+                    "col": null,
+                    "kind": "quantile",
+                    "q": 0.9
+                  }
+                ],
+                "output_names": [
+                  ""
+                ],
+                "reduction": "PerEntity"
+              }
+            },
+            "lower": 10.0,
+            "upper": 1599.2,
+            "max_samples": 14408,
+            "contract": "complete finite fixture replay; no other writers"
+          },
+          {
+            "operand": {
+              "Aggregate": {
+                "child": {
+                  "TimeRange": {
+                    "child": {
+                      "Scan": {
+                        "predicates": [],
+                        "schema": {
+                          "closed": false,
+                          "columns": [
+                            {
+                              "dtype": "timestamp",
+                              "name": "ts",
+                              "nullable": false,
+                              "table": null
+                            },
+                            {
+                              "dtype": "float64",
+                              "name": "value",
+                              "nullable": false,
+                              "table": null
+                            }
+                          ],
+                          "time_index": 0,
+                          "unique_keys": []
+                        },
+                        "source": {
+                          "TimeSeries": {
+                            "metric": "data"
+                          }
+                        }
+                      }
+                    },
+                    "range": {
+                      "nanos": 0,
+                      "secs": 60
+                    }
+                  }
+                },
+                "having": null,
+                "measures": [
+                  {
+                    "accuracy": {
+                      "EpsilonDelta": {
+                        "delta": 0.01,
+                        "epsilon": 0.01
+                      }
+                    },
+                    "col": null,
+                    "kind": "quantile",
+                    "q": 0.5
+                  }
+                ],
+                "output_names": [
+                  ""
+                ],
+                "reduction": "PerEntity"
+              }
+            },
+            "lower": 10.0,
+            "upper": 1599.2,
+            "max_samples": 14408,
+            "contract": "complete finite fixture replay; no other writers"
+          }
+        ],
+        "hll": null,
+        "values_non_negative": null,
+        "input_row_count": null,
+        "hydra_shared_grid_collision_bound": null,
+        "hydra_shared_grid_failure_probability": null,
+        "topk_selected_lower_bound": null,
+        "topk_excluded_upper_bound": null,
+        "topk_interval_failure_probability": null
+      }
+    }
+  },
+  "environment": {
+    "target": "backend_local_remote_write",
+    "collector_ids": [],
+    "capability_snapshot_id": "promql-compliance",
+    "observed_at_unix_ms": 1790444155571,
+    "max_evidence_age_ms": 600000,
+    "plan_version": 1,
+    "activation_unix_ms": 1790444155571,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1"
+  }
+}

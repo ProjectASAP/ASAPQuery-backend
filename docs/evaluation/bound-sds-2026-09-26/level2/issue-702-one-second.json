@@ -1,0 +1,1160 @@
+{
+  "baseTimeMs": 1790443164162,
+  "dataset": "issue-702-one-second",
+  "passed": true,
+  "queries": [
+    {
+      "backendParity": [],
+      "expr": "quantile by (job) (0.9, issue701_data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 901.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "5.7"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "5.7"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444065162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 961.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "1.9"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "1.9"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444125162
+        }
+      ],
+      "name": "quantile-by-job-0.9",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [],
+      "expr": "sum by (job) (issue701_data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 901.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444065162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 961.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444125162
+        }
+      ],
+      "name": "sum-by-job",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [],
+      "expr": "sum(issue701_data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 901.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444065.162,
+                      "18"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444065.162,
+                      "18"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444065162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 961.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444125.162,
+                      "6"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444125.162,
+                      "6"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444125162
+        }
+      ],
+      "name": "sum",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [],
+      "expr": "avg_over_time(issue701_data[5m])",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 900.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "a"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "16.283333333333335"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "b"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "32.56666666666667"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db",
+                      "pod": "c"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "48.85"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "a"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "16.283333333333335"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "b"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "32.56666666666667"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db",
+                      "pod": "c"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "48.85"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444064162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 960.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "a"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "16.35"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "b"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "32.7"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db",
+                      "pod": "c"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "49.05"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "a"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "16.35"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "api",
+                      "pod": "b"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "32.7"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db",
+                      "pod": "c"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "49.05"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444124162
+        }
+      ],
+      "name": "avg-over-time",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [],
+      "expr": "count by (job) (issue701_data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 901.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "2"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "2"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444065162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 961.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "2"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "2"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444125162
+        }
+      ],
+      "name": "count-by-job",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [],
+      "expr": "count(issue701_data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 901.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444065.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444065.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444065162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 961.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {},
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444125162
+        }
+      ],
+      "name": "count",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [],
+      "expr": "avg by (job) (issue701_data)",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 901.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "4.5"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "4.5"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444065.162,
+                      "9"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444065162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 961.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "1.5"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "1.5"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444125.162,
+                      "3"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444125162
+        }
+      ],
+      "name": "avg-by-job",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    },
+    {
+      "backendParity": [],
+      "expr": "sum by (job) (sum_over_time(issue701_data[5m]))",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 900.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "14655"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "14655"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "14655"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444064.162,
+                      "14655"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444064162
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 960.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "14715"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "14715"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "job": "api"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "14715"
+                    ]
+                  },
+                  {
+                    "metric": {
+                      "job": "db"
+                    },
+                    "value": [
+                      1790444124.162,
+                      "14715"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790444124162
+        }
+      ],
+      "name": "sum-by-job-sum-over-time",
+      "passed": true,
+      "referenceParity": [],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.01
+        }
+      }
+    }
+  ],
+  "suite": "issue-702-one-second"
+}

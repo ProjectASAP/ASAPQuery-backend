@@ -1,0 +1,14 @@
+name: Selection audit contract (synthetic tests)
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify real-evidence rejection and measured comparison logic
+        run: python3 -m unittest discover -s tools/planning-validation -p 'test_*.py'

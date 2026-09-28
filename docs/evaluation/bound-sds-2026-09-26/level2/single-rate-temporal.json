@@ -1,0 +1,383 @@
+{
+  "baseTimeMs": 1790442685427,
+  "dataset": "single-rate",
+  "passed": true,
+  "queries": [
+    {
+      "backendParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 300.0,
+          "timeMs": 1790442985427
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 600.0,
+          "timeMs": 1790443285427
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 1200.0,
+          "timeMs": 1790443885427
+        }
+      ],
+      "expr": "rate(http_requests_total[5m])",
+      "instant": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 300.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790442985.427,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790442985.427,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790442985427
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 600.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443285.427,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443285.427,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790443285427
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 1200.0,
+          "responses": {
+            "backend": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443885.427,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "infos": [
+                "execution: asap",
+                "data_source: asap_query"
+              ],
+              "servedBy": "asap_query",
+              "status": "success",
+              "warnings": []
+            },
+            "reference": {
+              "data": {
+                "result": [
+                  {
+                    "metric": {
+                      "host": "a"
+                    },
+                    "value": [
+                      1790443885.427,
+                      "1"
+                    ]
+                  }
+                ],
+                "resultType": "vector"
+              },
+              "status": "success"
+            }
+          },
+          "timeMs": 1790443885427
+        }
+      ],
+      "name": "request-rate",
+      "passed": true,
+      "range": {
+        "passed": true
+      },
+      "rangeResponses": {
+        "backend": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "host": "a"
+                },
+                "values": [
+                  [
+                    1790442985.427,
+                    "1"
+                  ],
+                  [
+                    1790443045.427,
+                    "1"
+                  ],
+                  [
+                    1790443105.427,
+                    "1"
+                  ],
+                  [
+                    1790443165.427,
+                    "1"
+                  ],
+                  [
+                    1790443225.427,
+                    "1"
+                  ],
+                  [
+                    1790443285.427,
+                    "1"
+                  ],
+                  [
+                    1790443345.427,
+                    "1"
+                  ],
+                  [
+                    1790443405.427,
+                    "1"
+                  ],
+                  [
+                    1790443465.427,
+                    "1"
+                  ],
+                  [
+                    1790443525.427,
+                    "1"
+                  ],
+                  [
+                    1790443585.427,
+                    "1"
+                  ],
+                  [
+                    1790443645.427,
+                    "1"
+                  ],
+                  [
+                    1790443705.427,
+                    "1"
+                  ],
+                  [
+                    1790443765.427,
+                    "1"
+                  ],
+                  [
+                    1790443825.427,
+                    "1"
+                  ],
+                  [
+                    1790443885.427,
+                    "1"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "infos": [
+            "execution: asap",
+            "data_source: asap_query"
+          ],
+          "servedBy": "asap_query",
+          "status": "success",
+          "warnings": []
+        },
+        "reference": {
+          "data": {
+            "result": [
+              {
+                "metric": {
+                  "host": "a"
+                },
+                "values": [
+                  [
+                    1790442985.427,
+                    "1"
+                  ],
+                  [
+                    1790443045.427,
+                    "1"
+                  ],
+                  [
+                    1790443105.427,
+                    "1"
+                  ],
+                  [
+                    1790443165.427,
+                    "1"
+                  ],
+                  [
+                    1790443225.427,
+                    "1"
+                  ],
+                  [
+                    1790443285.427,
+                    "1"
+                  ],
+                  [
+                    1790443345.427,
+                    "1"
+                  ],
+                  [
+                    1790443405.427,
+                    "1"
+                  ],
+                  [
+                    1790443465.427,
+                    "1"
+                  ],
+                  [
+                    1790443525.427,
+                    "1"
+                  ],
+                  [
+                    1790443585.427,
+                    "1"
+                  ],
+                  [
+                    1790443645.427,
+                    "1"
+                  ],
+                  [
+                    1790443705.427,
+                    "1"
+                  ],
+                  [
+                    1790443765.427,
+                    "1"
+                  ],
+                  [
+                    1790443825.427,
+                    "1"
+                  ],
+                  [
+                    1790443885.427,
+                    "1"
+                  ]
+                ]
+              }
+            ],
+            "resultType": "matrix"
+          },
+          "status": "success"
+        }
+      },
+      "referenceParity": [
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 300.0,
+          "timeMs": 1790442985427
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 600.0,
+          "timeMs": 1790443285427
+        },
+        {
+          "comparison": {
+            "passed": true
+          },
+          "offsetSeconds": 1200.0,
+          "timeMs": 1790443885427
+        }
+      ],
+      "tolerance": {
+        "value_tolerance": {
+          "absolute": 1e-6,
+          "relative": 0.0
+        }
+      }
+    }
+  ],
+  "suite": "temporal"
+}
