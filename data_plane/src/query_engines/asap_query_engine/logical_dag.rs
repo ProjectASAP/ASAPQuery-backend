@@ -147,11 +147,17 @@ where
                 input_ids.push(*id);
             } else {
                 if identities.len() >= 200_000 {
-                    return Err(miss("installed DAG evaluation budget exceeded"));
+                    return Err(physical::Error::Operator(
+                        "installed DAG evaluation budget exceeded".into(),
+                    )
+                    .into());
                 }
                 let depth = depths[&(id, time)] + 1;
                 if depth > 128 {
-                    return Err(miss("installed DAG exceeds execution depth of 128"));
+                    return Err(physical::Error::Operator(
+                        "installed DAG exceeds execution depth of 128".into(),
+                    )
+                    .into());
                 }
                 depths.insert(*dependency, depth);
                 let id = identities.len() as u64;
@@ -173,7 +179,7 @@ where
                     error: &error,
                 },
             )
-            .map_err(|error| miss(error.to_string()))?;
+            .map_err(EngineError::from)?;
     }
     let context = physical::RunContext::new(
         physical::Scope::Query {
@@ -182,22 +188,26 @@ where
         },
         physical::Limits::default(),
     )
-    .map_err(|error| miss(error.to_string()))?;
+    .map_err(EngineError::from)?;
     let mut output = graph
         .execute(&[0], context)
-        .map_err(|error| miss(error.to_string()))?
+        .map_err(EngineError::from)?
         .remove(0);
-    // These adapters have synchronous callbacks and prepared I/O leaves. A
-    // single poll avoids nesting a blocking futures executor inside a readout.
-    let evaluated = match output.next().now_or_never().flatten() {
-        Some(Ok(value)) => value.value().clone(),
-        Some(Err(failure)) => {
-            return Err(error
-                .borrow_mut()
-                .take()
-                .unwrap_or_else(|| miss(failure.to_string())))
+    // I/O is prepared before this synchronous adapter; Pending is a cooperative yield.
+    let evaluated = loop {
+        match output.next().now_or_never() {
+            Some(Some(Ok(value))) => break value.value().clone(),
+            Some(Some(Err(failure))) => {
+                return Err(error
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(|| EngineError::Physical(failure)));
+            }
+            Some(None) => {
+                return Err(physical::Error::Operator("query DAG produced no result".into()).into())
+            }
+            None => continue,
         }
-        None => return Err(miss("synchronous query adapter did not produce a result")),
     };
     drop(output);
     drop(graph);
@@ -281,39 +291,62 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                 }
                 self.logical(operator, inputs, dependencies, at, context)?
             }
+            QueryPlanNode::PhysicalFragment {
+                dag,
+                row_input,
+                pruning,
+                ..
+            } => {
+                let values = inputs
+                    .iter()
+                    .map(|value| vector((**value).clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(contract) = &pruning {
+                    native_values::validate_pruning(
+                        &dag,
+                        &values,
+                        row_input,
+                        contract,
+                        at,
+                        context.clone(),
+                    )?;
+                    if let Some(warning) = pruning_warning(Some(&contract.completeness)) {
+                        self.warnings.push(warning);
+                    }
+                }
+                Value::Vector(native_values::physical(
+                    &dag,
+                    values,
+                    row_input,
+                    at,
+                    context.clone(),
+                )?)
+            }
             QueryPlanNode::RelationalJoin {
-                inputs: _,
                 join_kind: planner_types::pre_asap::JoinKind::Semi,
                 pred,
                 pruning,
                 left_schema,
                 right_schema,
+                output_schema,
                 ..
             } => {
                 let [values, candidates] = inputs else {
                     return Err(miss("semi-join requires two inputs"));
                 };
-                let values = vector((**values).clone())?;
-                let candidates = vector((**candidates).clone())?;
-                let predicate = serde_json::from_value(pred)
-                    .map_err(|_| miss("invalid semi-join predicate"))?;
-                let keys = asap_physical_operators::dag::planner::equijoin_keys(
-                    &predicate,
-                    &left_schema,
-                    &right_schema,
-                )
-                .map_err(|error| miss(error.to_string()))?
-                .into_iter()
-                .map(|(left, right)| {
-                    (
-                        left_schema.fields[left].name.clone(),
-                        right_schema.fields[right].name.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-                let (selected, warning) =
-                    semi_join(candidates, values, &keys, pruning.as_ref(), context)?;
-                if let Some(warning) = warning {
+                let selected = native_values::relation(
+                    vector((**values).clone())?,
+                    vector((**candidates).clone())?,
+                    serde_json::from_value(pred)
+                        .map_err(|error| physical::Error::Invalid(error.to_string()))?,
+                    std::sync::Arc::new(left_schema),
+                    std::sync::Arc::new(right_schema),
+                    std::sync::Arc::new(output_schema),
+                    pruning.clone(),
+                    at,
+                    context.clone(),
+                )?;
+                if let Some(warning) = pruning_warning(pruning.as_ref()) {
                     self.warnings.push(warning);
                 }
                 Value::Vector(selected)
@@ -371,7 +404,11 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             } => {
                 let values = vector(input(0)?)?;
                 Ok(Value::Vector(native_values::limit(
-                    values, &grouping, n, offset, context,
+                    values,
+                    &grouping,
+                    n,
+                    offset,
+                    context.clone(),
                 )?))
             }
             ResidualQueryOperator::Binary {
@@ -416,7 +453,10 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             } => {
                 let values = vector(input(0)?)?;
                 Ok(Value::Vector(native_values::sort(
-                    values, &grouping, descending, context,
+                    values,
+                    &grouping,
+                    descending,
+                    context.clone(),
                 )?))
             }
             ResidualQueryOperator::HistogramQuantile => {
@@ -530,7 +570,9 @@ fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i6
             operator: ResidualQueryOperator::CurrentSeries { .. },
             ..
         } => Ok(vec![]),
-        QueryPlanNode::Logical { inputs, .. } => Ok(inputs.iter().map(|&id| (id, at)).collect()),
+        QueryPlanNode::PhysicalFragment { inputs, .. } | QueryPlanNode::Logical { inputs, .. } => {
+            Ok(inputs.iter().map(|&id| (id, at)).collect())
+        }
         QueryPlanNode::RelationalJoin { inputs, .. } => {
             Ok(inputs.iter().map(|&id| (id, at)).collect())
         }
@@ -610,38 +652,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
     }
 }
 
-fn semi_join(
-    candidates: Vector,
-    values: Vector,
-    keys: &[(String, String)],
-    completeness: Option<&CandidateCompleteness>,
-    context: &physical::RunContext,
-) -> Result<(Vector, Option<String>), EngineError> {
-    let left_key = |labels: &Labels| {
-        keys.iter()
-            .map(|(left, _)| labels.get(left).cloned().unwrap_or_default())
-            .collect::<Vec<_>>()
-    };
-    let right_key = |labels: &Labels| {
-        keys.iter()
-            .map(|(_, right)| labels.get(right).cloned().unwrap_or_default())
-            .collect::<Vec<_>>()
-    };
-    let available = values
-        .iter()
-        .map(|(labels, _)| left_key(labels))
-        .collect::<std::collections::BTreeSet<_>>();
-    let missing = candidates
-        .iter()
-        .map(|(labels, _)| right_key(labels))
-        .filter(|key| !available.contains(key))
-        .collect::<Vec<_>>();
-    let selected = native_values::semi_join(values, &candidates, &left_key, &right_key, context)?;
-    if !missing.is_empty() && matches!(completeness, Some(CandidateCompleteness::Certified { .. }))
-    {
-        return Err(miss("certified pruning key has no authoritative value"));
-    }
-    let warning = match completeness {
+fn pruning_warning(completeness: Option<&CandidateCompleteness>) -> Option<String> {
+    match completeness {
         None | Some(CandidateCompleteness::Certified { .. }) => None,
         Some(CandidateCompleteness::BestEffort { guarantee }) => Some(match guarantee {
             Some(guarantee) => format!(
@@ -650,8 +662,65 @@ fn semi_join(
             ),
             None => "ASAP membership pruning is approximate and uncertified".into(),
         }),
+    }
+}
+
+#[cfg(test)]
+fn semi_join(
+    candidates: Vector,
+    values: Vector,
+    keys: &[(String, String)],
+    completeness: Option<&CandidateCompleteness>,
+    context: &physical::RunContext,
+) -> Result<(Vector, Option<String>), EngineError> {
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::{CompareOpKind, DataType, Predicate, QueryExpr},
     };
-    Ok((selected, warning))
+    use std::{rc::Rc, sync::Arc};
+    let schema = |right: bool| {
+        Arc::new(SummarySchema {
+            fields: keys
+                .iter()
+                .map(|(l, r)| {
+                    let name = if right { r } else { l };
+                    SummaryField {
+                        name: name.clone(),
+                        dtype: SummaryFamilyType::Plain(if name == "value" {
+                            DataType::Float64
+                        } else {
+                            DataType::Utf8
+                        }),
+                        nullable: false,
+                    }
+                })
+                .collect(),
+            time_index: None,
+        })
+    };
+    let left = schema(false);
+    let right = schema(true);
+    let predicate = Predicate(Rc::new(QueryExpr::BoolAnd(
+        (0..keys.len())
+            .map(|i| QueryExpr::Compare {
+                left: Rc::new(QueryExpr::Column(i)),
+                op: CompareOpKind::Eq,
+                right: Rc::new(QueryExpr::Column(keys.len() + i)),
+            })
+            .collect(),
+    )));
+    let rows = native_values::relation(
+        values,
+        candidates,
+        predicate,
+        left.clone(),
+        right,
+        left,
+        completeness.cloned(),
+        0,
+        context.clone(),
+    )?;
+    Ok((rows, pruning_warning(completeness)))
 }
 
 pub(super) fn native_scalar(
@@ -663,8 +732,8 @@ pub(super) fn native_scalar(
         Cell::Float64(value),
         planner_types::pre_asap::DataType::Float64,
     )
-    .map_err(|e| miss(e.to_string()))?;
-    let batches = evaluate_source(source, context.clone()).map_err(|e| miss(e.to_string()))?;
+    .map_err(EngineError::from)?;
+    let batches = evaluate_source(source, context.clone()).map_err(EngineError::from)?;
     match batches
         .first()
         .and_then(|b| b.rows().first())
@@ -728,7 +797,7 @@ fn native_vector_batch(
             ]
         })
         .collect();
-    Batch::try_new(schema, rows).map_err(|e| miss(e.to_string()))
+    Batch::try_new(schema, rows).map_err(EngineError::from)
 }
 fn native_batch_rows(
     batch: physical::values::Batch,
@@ -742,7 +811,7 @@ fn native_batch_rows(
                 .flat_map(|batch| batch.rows().to_vec())
                 .collect()
         })
-        .map_err(|e| miss(e.to_string()))
+        .map_err(EngineError::from)
 }
 fn native_vector_output(
     rows: Vec<Vec<physical::values::Value>>,
@@ -795,7 +864,7 @@ fn aggregate(
         vec![1],
         vec![("value".into(), reduction)],
     )
-    .map_err(|e| miss(e.to_string()))?;
+    .map_err(EngineError::from)?;
     native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
 }
 
@@ -824,7 +893,7 @@ fn negate(value: Value, context: &physical::RunContext) -> Result<Value, EngineE
             ),
         ],
     )
-    .map_err(|e| miss(e.to_string()))?;
+    .map_err(EngineError::from)?;
     let result = native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)?;
     Ok(if scalar {
         Value::Scalar(result[0].1)
@@ -842,7 +911,7 @@ fn vector_to_scalar(values: Vector, context: &physical::RunContext) -> Result<Va
         },
     )?;
     let operator =
-        Operator::vector_to_scalar(batch.schema().clone(), 2).map_err(|e| miss(e.to_string()))?;
+        Operator::vector_to_scalar(batch.schema().clone(), 2).map_err(EngineError::from)?;
     let rows = native_batch_rows(batch, vec![operator], context)?;
     match rows.first().and_then(|row| row.first()) {
         Some(Cell::Float64(value)) => Ok(Value::Scalar(*value)),
@@ -885,8 +954,8 @@ fn topk_selection(
         }],
         vec![1],
     )
-    .map_err(|e| miss(e.to_string()))?;
-    let limit = Operator::limit(sort.schema(), k, 0, vec![1]).map_err(|e| miss(e.to_string()))?;
+    .map_err(EngineError::from)?;
+    let limit = Operator::limit(sort.schema(), k, 0, vec![1]).map_err(EngineError::from)?;
     let mut output =
         native_vector_output(native_batch_rows(batch, vec![sort, limit], context)?, 0, 2)?;
     // The HTTP adapter preserves canonical label-group presentation; native Sort
@@ -1002,7 +1071,7 @@ fn binary_in_context(
             .map(|(_, a, b)| vec![Cell::Float64(*a), Cell::Float64(*b)])
             .collect(),
     )
-    .map_err(|e| miss(e.to_string()))?;
+    .map_err(EngineError::from)?;
     let operator = Operator::project(
         schema,
         vec![(
@@ -1019,7 +1088,7 @@ fn binary_in_context(
             },
         )],
     )
-    .map_err(|e| miss(e.to_string()))?;
+    .map_err(EngineError::from)?;
     let rows = native_batch_rows(batch, vec![operator], context)?;
     let mut output = Vec::new();
     for ((labels, a, b), row) in pairs.into_iter().zip(rows) {
@@ -1135,9 +1204,9 @@ fn native_window(
         time_index: None,
     });
     let batch =
-        physical::values::Batch::try_new(schema.clone(), rows).map_err(|e| miss(e.to_string()))?;
+        physical::values::Batch::try_new(schema.clone(), rows).map_err(EngineError::from)?;
     let operator = physical::operators::Operator::window(schema, intent, 1, 2, vec![0], window)
-        .map_err(|e| miss(e.to_string()))?;
+        .map_err(EngineError::from)?;
     native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
 }
 
@@ -1571,6 +1640,55 @@ mod topk_tests {
             bound: BoundExpr::Zero,
             failure_probability: ProbabilityExpr::Constant { value: 0.01 },
             provenance: vec![],
+        }
+    }
+
+    // Numeric boundary fields must reach Planner as numbers, never absent labels.
+    #[test]
+    fn semi_join_does_not_match_unequal_numeric_samples() {
+        let (rows, _) = semi_join(
+            vec![(Labels::new(), 2.0)],
+            vec![(Labels::new(), 1.0)],
+            &[("value".into(), "value".into())],
+            None,
+            &test_native_context(),
+        )
+        .unwrap();
+        assert!(rows.is_empty(), "unequal numeric samples matched: {rows:?}");
+    }
+
+    #[test]
+    fn native_join_preserves_renamed_and_multiple_typed_keys() {
+        let left = vec![
+            (
+                labels(&[("instance", "a"), ("zone", "east"), ("extra", "kept")]),
+                1.,
+            ),
+            (labels(&[("instance", "a"), ("zone", "west")]), 2.),
+        ];
+        let right = vec![(labels(&[("pod", "a"), ("region", "east")]), 99.)];
+        let (selected, _) = semi_join(
+            right,
+            left.clone(),
+            &[
+                ("instance".into(), "pod".into()),
+                ("zone".into(), "region".into()),
+            ],
+            None,
+            &test_native_context(),
+        )
+        .unwrap();
+        assert_eq!(selected, vec![left[0].clone()]);
+        for (a, b, matched) in [(f64::NAN, f64::NAN, false), (-0., 0., true), (1., 1., true)] {
+            let (rows, _) = semi_join(
+                vec![(Labels::new(), b)],
+                vec![(Labels::new(), a)],
+                &[("value".into(), "value".into())],
+                None,
+                &test_native_context(),
+            )
+            .unwrap();
+            assert_eq!(!rows.is_empty(), matched);
         }
     }
 

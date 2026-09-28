@@ -87,6 +87,10 @@ fn leaves(
             },
             // A join is a typed composition node rather than a Logical
             // wrapper, but its value input can still be a Prometheus leaf.
+            QueryPlanNode::PhysicalFragment { inputs, .. }
+            | QueryPlanNode::Physical { inputs, .. } => {
+                pending.extend(inputs.iter().map(|input| (*input, at)));
+            }
             QueryPlanNode::RelationalJoin { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }

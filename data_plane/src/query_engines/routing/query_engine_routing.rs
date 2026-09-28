@@ -250,6 +250,9 @@ impl EngineRouter {
                     );
                     return Ok((result, id));
                 }
+                Err(e @ EngineError::Physical(_)) => {
+                    return Err(EngineRouterError::AllFailed { last: e });
+                }
                 Err(e) => {
                     warn!(
                         backend = ?backend,
@@ -342,6 +345,9 @@ impl EngineRouter {
                         "router: range dispatch succeeded",
                     );
                     return Ok((result, id));
+                }
+                Err(e @ EngineError::Physical(_)) => {
+                    return Err(EngineRouterError::AllFailed { last: e });
                 }
                 Err(e) => {
                     warn!(
