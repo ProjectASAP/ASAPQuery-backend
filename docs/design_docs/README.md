@@ -20,9 +20,8 @@ integration.
   the backend's bounded admission, publication and recovery behavior.
 
 Existing [Collector system contracts](https://github.com/ProjectASAP/ASAPCollector/tree/main/docs/design_docs)
-remain the cross-component compatibility baseline until coordinated migrations
-land. These proposals do not silently change those interfaces. Current backend
-implementation guides live under [developer docs](../developer_docs/README.md).
+remain the cross-component baseline. Current backend implementation guides live
+under [developer docs](../developer_docs/README.md).
 
 Other designs and profiles:
 
