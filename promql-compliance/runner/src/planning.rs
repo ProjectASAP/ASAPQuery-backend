@@ -278,3 +278,120 @@ pub fn installation(
         adaptation_evidence: Vec::new(),
     }
 }
+
+pub const FIXTURE_COST_MODEL: &str = "synthetic-execution-fixture-v1";
+
+/// Price the exposed inventory with explicit test numbers, never online ERP.
+/// Local execution is a fixture feasibility constraint, not a semantic rewrite.
+pub fn with_fixture_costs(
+    mut input: BackendLocalPlanningInput,
+) -> Result<BackendLocalPlanningInput> {
+    use control_plane::physical::{
+        compiler::{DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION},
+        workload_cost::{
+            enumerate_exact_and_materialized_candidates, manifest, WorkloadCostEvidence,
+            WorkloadQuote,
+        },
+    };
+    ensure!(
+        input.physical_inputs.erp.is_none(),
+        "execution fixture must not consume ERP"
+    );
+    let (request, env) = input.clone().into_physical_compilation_request()?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut quotes = Vec::new();
+    for candidate in enumerate_exact_and_materialized_candidates(request)? {
+        let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate.clone(), env.clone()) else {
+            continue; // Production selection retains the binding rejection.
+        };
+        let manifest = manifest(&plan, &candidate.queries)?;
+        if !seen.insert(serde_json::to_string(&manifest)?) {
+            continue;
+        }
+        quotes.push(WorkloadQuote {
+            executable: validate_local(&plan).is_ok(),
+            unit_costs: manifest
+                .components
+                .keys()
+                .map(|key| (key.clone(), 1.0))
+                .collect(),
+            manifest,
+        });
+    }
+    ensure!(!quotes.is_empty(), "fixture has no priceable candidates");
+    input.workload_cost_evidence = Some(WorkloadCostEvidence {
+        backend_revision: BACKEND_REVISION.into(),
+        planner_revision: PLANNER_REVISION.into(),
+        data_snapshot_id: input
+            .physical_inputs
+            .data_snapshot_id
+            .clone()
+            .context("fixture data snapshot identity missing")?,
+        model_version: FIXTURE_COST_MODEL.into(),
+        observed_at_unix_ms: env.observed_at_unix_ms,
+        valid_for_ms: env.max_evidence_age_ms,
+        quotes,
+    });
+    Ok(input)
+}
+
+pub fn validate_fixture_cost(plan: &CompiledPhysicalPlan) -> Result<()> {
+    let report = plan
+        .cost_comparison
+        .as_ref()
+        .context("missing fixture cost comparison")?;
+    ensure!(
+        report.model_version == FIXTURE_COST_MODEL,
+        "fixture costs were bypassed"
+    );
+    ensure!(
+        report.selected_plan_id == plan.envelope.plan_id
+            && report.selected_manifest.plan_id == plan.envelope.plan_id,
+        "selected identity mismatch"
+    );
+    ensure!(
+        !report.component_costs.is_empty()
+            && report
+                .component_costs
+                .keys()
+                .eq(report.selected_manifest.components.keys()),
+        "incomplete fixture cost coverage"
+    );
+    ensure!(
+        report
+            .component_costs
+            .values()
+            .all(|v| v.is_finite() && *v >= 0.),
+        "invalid fixture price"
+    );
+    let mut winner = None;
+    let mut minimum = f64::INFINITY;
+    for candidate in &report.candidate_evaluations {
+        ensure!(
+            candidate.automatic_cost.is_none(),
+            "fixture acquired measured/analytical resource claims"
+        );
+        if let Some(total) = candidate.total_cost {
+            ensure!(total.is_finite() && total >= 0., "invalid candidate price");
+            minimum = minimum.min(total);
+            if candidate.status == CandidateEvaluationStatus::Selected {
+                ensure!(
+                    winner.is_none() && candidate.plan_id == Some(plan.envelope.plan_id),
+                    "invalid winner identity"
+                );
+                winner = Some(total);
+            }
+        } else {
+            ensure!(
+                candidate.status != CandidateEvaluationStatus::Selected,
+                "selected unpriced candidate"
+            );
+        }
+    }
+    let sum: f64 = report.component_costs.values().sum();
+    ensure!(
+        winner.is_some_and(|cost| equal(cost, sum) && equal(cost, minimum)),
+        "inconsistent fixture selection"
+    );
+    Ok(())
+}
