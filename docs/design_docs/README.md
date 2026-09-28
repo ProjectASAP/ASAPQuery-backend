@@ -10,6 +10,9 @@ internals and are subordinate to the shared system contracts.
 
 Proposals for shared-contract review:
 
+- [Offline ERP planning: physical selection to deployment](offline-erp-plan-selection.md)
+  proposes one-shot planning from offline profiles and workload inputs, with
+  global physical selection and existing deployment artifacts, without replanning.
 - [ASAPPlanner integration architecture](asapplanner-integration.md) proposes
   the Planner/backend responsibility boundary, shared semantic DAG workflow,
   and high-level consolidation milestones.
