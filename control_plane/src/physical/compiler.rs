@@ -1007,6 +1007,8 @@ impl BackendLocalPlanningInput {
                 let _physical = tracing::debug_span!(target: "asap_runtime_debug", "physical_candidate_compile",
                     stage = "planner.physical_candidate", query_id = %query.query_id,
                     input_kind = "bound_promql_vector").entered();
+                let root = asap_aware_mapping::replacement::finalize_query_candidate(root, &typed)
+                    .map_err(|error| CompileError::Snapshot(error.to_string()))?;
                 let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
                     .or_else(|_| asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(&root).map(|(_, program)| program));
                 if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&root) {
