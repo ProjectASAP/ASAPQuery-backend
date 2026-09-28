@@ -330,13 +330,17 @@ impl SeriesRouter {
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
-        for sender in &self.senders {
-            sender
-                .send(WorkerMessage::Shutdown)
-                .await
-                .map_err(|error| error.to_string())?;
+        let mut errors = Vec::new();
+        for (worker, sender) in self.senders.iter().enumerate() {
+            if let Err(error) = sender.send(WorkerMessage::Shutdown).await {
+                errors.push(format!("worker {worker}: {error}"));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub async fn complete_dag(
@@ -380,6 +384,17 @@ pub enum TryRouteError {
 
 #[cfg(test)]
 mod tests {
+    // One failed worker must not prevent shutdown of the other workers.
+    #[tokio::test]
+    async fn shutdown_reaches_healthy_workers_after_an_earlier_worker_failed() {
+        let (failed, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let (healthy, mut receiver) = tokio::sync::mpsc::channel(1);
+        let router = SeriesRouter::new(vec![failed, healthy]);
+        assert!(router.shutdown().await.is_err());
+        assert!(matches!(receiver.try_recv(), Ok(WorkerMessage::Shutdown)));
+    }
+
     use super::*;
 
     // Shared DAG consumers must share partition ownership regardless of locator IDs.

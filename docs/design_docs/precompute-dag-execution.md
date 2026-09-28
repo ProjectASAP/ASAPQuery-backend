@@ -230,8 +230,8 @@ Within one evaluation, the worker follows this workflow:
 
 ### Shared physical operator execution
 
-The shared library lives in ASAPPlanner alongside post-ASAP IR. Backend #770
-pins that library and IR to the same revision; this PR integrates ingestion.
+The shared library lives in ASAPPlanner alongside post-ASAP IR. Backend pins
+that library and IR to the same revision.
 Installed precompute DAGs execute through its `PhysicalDag` runtime. The backend supplies
 storage frontiers, declared edge order, window completeness and durable commit
 keys. It does not own a second dependency walker.
@@ -241,7 +241,13 @@ SummaryMerge uses the native state merge, finalization uses native typed readout
 and Binary lowers aligned rows to native Project using the Planner binary contract, including checked division. Batch conversion
 preserves the installed population and timestamp bindings. Native calls receive
 the surrounding execution context, so they share its memory budget and
-cancellation. Query execution uses the same library's operations.
+cancellation. The scheduler accepts the caller's run context rather than creating
+an independent budget. Physical cancellation and memory errors retain their
+error types through maintenance execution. A failed worker stops processing
+input and publishing outputs, and closes admission; the failing drain reports
+the original failure and shutdown
+does not flush more state. Recovery requires restarting the failed execution.
+Query execution uses the same library's operations.
 
 Raw ingestion retains per-window accumulator state through shared-library
 updaters; worker routing and window completion remain backend responsibilities.
@@ -280,10 +286,34 @@ checks their coverage before executing downstream operators. That read is a
 frontier: the worker does not repeat the source records' upstream computation.
 Derived work follows the same partition ownership and worker execution model.
 
-Nodes within a worker execute sequentially. Parallelism comes from independent
-workers, including when they construct derived summaries. Store commit
-coordination protects publication without requiring unrelated workers to hold
-one global lock while evaluating their DAGs.
+For the initial deployment, derived graphs use one owning worker and execute
+serially. Cross-worker shuffle and parallel grouped maintenance are outside this
+scope. Independent raw-input partitions may still execute on separate workers.
+
+### Continuous local input: revision snapshots (target)
+
+The first continuous-input deployment receives Remote Write directly in Backend.
+A window may be revised under the Planner-selected maintenance contract. Each
+evaluation consumes a fixed input revision; its dependent outputs must describe
+compatible snapshots. Later input can produce a new revision of the same stored
+output without installing a new plan version.
+
+```text
+Window W, input revision r1: values [2, 3]     -> Sum(W, r1) = 5
+Late input creates revision r2: values [2, 3, 4] -> Sum(W, r2) = 9
+```
+
+Publishing r1 does not assert that no more events for W can arrive. A downstream
+recomputation must replace or version the previous result according to the
+selected contract; adding the complete r2 result to r1 would count old input
+twice. Queries cannot combine dependent outputs from incompatible revisions.
+An external producer/partition completion protocol is not required for this
+initial local-input design.
+
+The production implementation currently establishes finite-input closure only.
+Continuous revision snapshots still require durable input capture, publication
+and recovery rules. Selection of an older consistent revision under freshness
+requirements, and the permitted correction horizon, remain design decisions.
 
 ## 6. Publish the selected DAG outputs
 
@@ -314,7 +344,7 @@ version. The writer supplies a `StoredSummaryKey` and the reader supplies the
 same selected `StoredOutputReference` within its installed plan version.
 Durable metadata retains this binding so recovery validates it before exposing
 payloads. V1 does not implicitly reuse records from another plan version.
-The durable binding format is version 4; earlier SID metadata is rejected rather
+The durable binding format is version 5; earlier SID metadata is rejected rather
 than inferred to refer to a selected output.
 
 Before publication, validate that the output matches its bound definition,
@@ -324,6 +354,11 @@ uncommitted payload. Repeating the publication of the same completed result must
 not add that result twice; conflicting writes must not silently overwrite a
 record under the same key. Any permitted replacement follows the selected
 update policy and preserves coherent reads.
+
+Sibling outputs may commit independently. A query needing several outputs must
+wait for the required set at compatible revisions; it cannot read a partially
+published evaluation during a quiet interval between commits. Publication
+receipts and the query-wide revision fence must cover all dependent branches.
 
 QueryPlan and derived precompute readers perform indexed lookup using the
 installed reference and requested population/window. They check definition,
