@@ -7068,40 +7068,26 @@ pub(crate) mod tests {
             interval: RepetitionInterval(45_000),
             evaluation_phase: planner_types::workload::TimestampMs(0),
         };
-        let mut right = snapshot.clone();
-        right.query_workload.repeating_queries.as_mut().unwrap()[0].query =
-            Query("sum_over_time(n[1m])".into());
-        let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let (right, _) = right.into_physical_compilation_request().unwrap();
-        // These are independent query outputs. Adding an approximate quantile
-        // to an exact sum would require a separate composed accuracy proof.
-        let mut raw_query = right.queries[0].clone();
-        raw_query.query_id = "raw-query".into();
-        request.queries.push(raw_query);
-        request
+        // Keep both outputs independent: composing a quantile with a sum would
+        // require an additional accuracy proof unrelated to cadence selection.
+        let mut raw_entry = entry.clone();
+        raw_entry.query = Query("sum_over_time(n[1m])".into());
+        snapshot
             .query_workload
-            .as_mut()
-            .unwrap()
             .repeating_queries
             .as_mut()
             .unwrap()
-            .push(
-                right
-                    .query_workload
-                    .unwrap()
-                    .repeating_queries
-                    .unwrap()
-                    .remove(0),
-            );
-        prepare_window_implementations(&mut request.queries[0], &model, env.target, 0).unwrap();
-        request.queries[0]
-            .window_realization_candidates
-            .retain(|candidate| {
+            .push(raw_entry);
+        let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+        for query in &mut request.queries {
+            prepare_window_implementations(query, &model, env.target, 0).unwrap();
+            query.window_realization_candidates.retain(|candidate| {
                 matches!(
                     candidate.layout,
                     asap_types::WindowMaterializationLayout::Pane { .. }
                 )
             });
+        }
         let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert!(plan
             .precompute_plan
