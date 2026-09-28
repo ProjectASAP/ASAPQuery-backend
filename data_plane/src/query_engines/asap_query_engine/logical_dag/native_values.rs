@@ -350,6 +350,73 @@ mod tests {
         Error,
     };
 
+    // An available label is bound by Backend; Planner evaluates its predicate.
+    #[test]
+    fn planner_filter_compiles_and_executes_bound_labels() {
+        use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryPlanNode};
+        use planner_types::{
+            post_asap::{lift_plain, ExecutionTiming, SummaryExpr, SummaryNode, ValueOperation},
+            pre_asap::QueryExpr,
+        };
+        let query = "m{instance=\"pod\"}";
+        let logical = control_plane::query_parser::parse_query_expr_canonical(
+            query,
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let QueryExpr::Filter { child, pred } = logical else {
+            panic!("expected selector filter: {logical:?}")
+        };
+        let input = std::rc::Rc::new(SummaryNode {
+            schema: lift_plain(&child.output_schema().unwrap()),
+            guarantee: None,
+            expr: SummaryExpr::KeepPreAsap(child),
+        });
+        let root = std::rc::Rc::new(SummaryNode {
+            schema: input.schema.clone(),
+            guarantee: None,
+            expr: SummaryExpr::ValueOperation {
+                child: input,
+                operation: ValueOperation::Filter { pred },
+                timing: ExecutionTiming::QueryTime,
+            },
+        });
+        let entry = control_plane::query_plan::compile_bound_mapped(
+            "filter".into(),
+            query.into(),
+            &root,
+            InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            FallbackPolicy::Reject,
+            |_, _| panic!("filter requires no materialization"),
+            |_, _| {},
+        )
+        .unwrap();
+        let QueryPlanNode::PhysicalFragment { dag, row_input, .. } = &entry.nodes[&entry.root]
+        else {
+            panic!("filter was rejected: {:?}", entry.nodes)
+        };
+        let values = vec![
+            (
+                [
+                    ("instance".into(), "pod".into()),
+                    ("extra".into(), "kept".into()),
+                ]
+                .into(),
+                7.,
+            ),
+            ([("instance".into(), "other".into())].into(), 9.),
+        ];
+        let expected = values[0].clone();
+        assert_eq!(
+            physical(dag, vec![values], *row_input, 42, context(1 << 20)).unwrap(),
+            vec![expected]
+        );
+    }
+
     fn sorted() -> Vec<u8> {
         let input = schema(&[("value", DataType::Float64)]);
         CompiledPhysicalDag::from_operators(
