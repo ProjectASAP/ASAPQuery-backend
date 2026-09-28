@@ -16,6 +16,131 @@ use serde_json::{json, Value};
 mod workload;
 use workload::Suite;
 
+/// Level 1 asserts *membership*: which shapes the candidate inventory must
+/// expose, and which it must refuse and why. It never names a winner, because
+/// ranking is #742's contract and this layer prices nothing.
+///
+/// A required shape declares how it must resolve. `MustBind` shapes have to
+/// reach `AwaitingQuote`; `MustReject` shapes have to appear in the inventory
+/// and then fail admission for the stated policy reason. The same shape can be
+/// `MustReject` under the strict fixture and `MustBind` under the certified
+/// one, so the fixture, not a second test path, carries the difference.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resolution {
+    // No fixture constructs this yet: the issue-754 generator cannot certify a
+    // heap (see `required_summary_shapes`), so every required shape here is a
+    // rejection. The variant is the half of the contract a certified fixture
+    // fills in, and deleting it would delete that contract.
+    #[allow(dead_code)]
+    MustBind,
+    MustReject(PolicyReason),
+}
+
+/// Reasons a fixture may legitimately refuse an otherwise well-formed
+/// candidate. Anything outside this set is a defect, not a policy decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PolicyReason {
+    /// The fixture supplies no evidence that certifies the summary readout.
+    NoCertifiedGuarantee,
+    /// The realized family cannot meet the query's declared accuracy target.
+    AccuracyTargetUnmet,
+}
+
+impl PolicyReason {
+    fn matches(self, reason: &str) -> bool {
+        match self {
+            Self::NoCertifiedGuarantee => reason.contains("accuracy guarantee"),
+            Self::AccuracyTargetUnmet => reason.contains("does not satisfy"),
+        }
+    }
+
+    const ALL: &'static [Self] = &[Self::NoCertifiedGuarantee, Self::AccuracyTargetUnmet];
+}
+
+/// Sketch/heap families each query must expose, with how this fixture resolves
+/// them. The strict issue-754 fixture certifies no heap, so every heap family
+/// is required to be present *and* rejected; that is a positive assertion about
+/// the inventory, not silence about it.
+///
+/// A certified companion fixture cannot be derived from this generator. Scoped
+/// evidence needs `topk_selected_lower_bound > topk_excluded_upper_bound`, and
+/// under the generator's own per-series domain (`multiplier * base` to
+/// `multiplier * (base + modulo)`, as `issue754_workload` reads it for the
+/// quantile operands) the third- and fourth-ranked series overlap in both
+/// groups: group `a` selects down to 40 while excluding a series reaching 130,
+/// and group `b` selects down to 360 while excluding one reaching 850. The
+/// pointwise ordering never actually changes, but the queries evaluate in
+/// `real_time` scope, so the contract must hold across the whole validity
+/// window, not at one instant. Certifying a heap needs a generator with
+/// non-overlapping per-series domains.
+fn required_summary_shapes(name: &str) -> &'static [(&'static str, Resolution)] {
+    match name {
+        "spatial-topk" => &[(
+            "CountSketchWithHeap",
+            Resolution::MustReject(PolicyReason::NoCertifiedGuarantee),
+        )],
+        "topk-rate" => &[
+            (
+                "CmsWithHeap",
+                Resolution::MustReject(PolicyReason::NoCertifiedGuarantee),
+            ),
+            (
+                "CountSketchWithHeap",
+                Resolution::MustReject(PolicyReason::NoCertifiedGuarantee),
+            ),
+        ],
+        _ => &[],
+    }
+}
+
+/// Binding defects this fixture reaches today. Level 1 records them rather than
+/// tolerating them silently: each entry must still occur exactly `count` times,
+/// so a new instance fails the test and a fixed one forces its line to be
+/// deleted. `main` is green on these paths, so every entry is a regression
+/// introduced inside the #737 → #728 stack, and all of them must be gone before
+/// #775 installs and executes these candidates.
+const KNOWN_BINDING_DEFECTS: &[(&str, &str, usize)] = &[
+    (
+        "grouped-rate",
+        "Planner logical fragment does not match any original query subtree",
+        1,
+    ),
+    (
+        "grouped-rate",
+        "physical program has incompatible input or result schema",
+        1,
+    ),
+    (
+        "grouped-temporal-sum",
+        "Planner logical fragment does not match any original query subtree",
+        1,
+    ),
+    (
+        "spatial-topk",
+        "Planner logical fragment does not match any original query subtree",
+        1,
+    ),
+];
+
+/// Classify one admission rejection. A reason that is neither a declared policy
+/// refusal nor a recorded defect fails the query outright.
+fn assert_rejection_is_accounted_for(name: &str, reason: &str) {
+    if PolicyReason::ALL
+        .iter()
+        .any(|policy| policy.matches(reason))
+    {
+        return;
+    }
+    assert!(
+        KNOWN_BINDING_DEFECTS
+            .iter()
+            .any(|(query, defect, _)| *query == name && reason.contains(defect)),
+        "{name}: unaccounted binding rejection: {reason}\n\
+         Add a policy reason if this is a deliberate refusal, or fix the \
+         defect. Level 1 does not accept unexplained bind failures."
+    );
+}
+
 struct ExpectedPlan {
     family: Option<ExpectedFamily>,
     partitioning: &'static str,
@@ -152,15 +277,43 @@ fn assert_rate_sort_expression(dag: &asap_types::executable_plan::OwnedPostAsapD
 }
 
 // A descending sort over a timestamp or label must fail the Level 1 contract.
+/// Compile the topk-rate query and return every ranking DAG the inventory
+/// exposes. Reading a committed export instead would pin the contract to plans
+/// generated by an older Planner revision; candidate identities do not survive
+/// a Planner bump, so the fixture has to be produced by the build under test.
+fn compiled_topk_rate_sort_dags() -> Vec<asap_types::executable_plan::OwnedPostAsapDag> {
+    let case = workload::suite()
+        .queries
+        .into_iter()
+        .find(|case| case.name == "topk-rate")
+        .expect("topk-rate left the issue-754 suite");
+    let (request, environment) = workload::input(&case)
+        .into_physical_compilation_request()
+        .unwrap();
+    let mut dags = Vec::new();
+    for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
+        let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) else {
+            continue;
+        };
+        dags.extend(
+            plan.query_plan
+                .selected_dags
+                .values()
+                .filter(|dag| {
+                    dag.nodes
+                        .iter()
+                        .any(|node| node.payload["operation"].get("Sort").is_some())
+                })
+                .cloned(),
+        );
+    }
+    assert!(!dags.is_empty(), "topk-rate exposes no ranking DAG");
+    dags
+}
+
 #[test]
 fn topk_rate_sort_contract_rejects_wrong_value_expression() {
-    let artifact: Value = serde_json::from_str(include_str!(
-        "../../docs/evaluation/issue754-human-review/topk-rate.json"
-    ))
-    .unwrap();
-    let dag: asap_types::executable_plan::OwnedPostAsapDag =
-        serde_json::from_value(artifact["query_plan"]["selected_dags"]["compat-query-0"].clone())
-            .unwrap();
+    let dag = compiled_topk_rate_sort_dags().remove(0);
     assert_rate_sort_expression(&dag);
     for column in [0, 2] {
         let mut wrong = dag.clone();
@@ -694,15 +847,11 @@ fn issue754_queries_have_valid_physical_plans() {
                 "root substitutions must not be reported as exhaustive joint search"
             );
         }
-        let heap_families: &[&str] = match case.name.as_str() {
-            "spatial-topk" => &["CountSketchWithHeap"],
-            "topk-rate" => &["CmsWithHeap", "CountSketchWithHeap"],
-            _ => &[],
-        };
+        let heap_families = required_summary_shapes(&case.name);
         let mut heap_roots =
             heap_families
                 .iter()
-                .map(|family| {
+                .map(|(family, resolution)| {
                     let trace = request
                         .planner_selection_trace
                         .iter()
@@ -730,11 +879,14 @@ fn issue754_queries_have_valid_physical_plans() {
                     );
                     assert!(trace["guarantee"].to_string().contains("topk_max_distinct_items"),
                 "fixture lacks an enforced bound; cardinality estimates cannot certify a heap");
-                    trace["logical_root_id"].as_str().unwrap().to_owned()
+                    (
+                        trace["logical_root_id"].as_str().unwrap().to_owned(),
+                        *resolution,
+                    )
                 })
                 .collect::<Vec<_>>();
         if case.name == "topk-rate" {
-            for family in heap_families {
+            for (family, resolution) in heap_families {
                 let trace = request
                     .planner_selection_trace
                     .iter()
@@ -758,7 +910,10 @@ fn issue754_queries_have_valid_physical_plans() {
                     .query
                     .input_contracts()
                     .all(|(id, _)| split.materialized_outputs.contains_key(&id)));
-                heap_roots.push(trace["logical_root_id"].as_str().unwrap().to_owned());
+                heap_roots.push((
+                    trace["logical_root_id"].as_str().unwrap().to_owned(),
+                    *resolution,
+                ));
             }
         }
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
@@ -777,17 +932,47 @@ fn issue754_queries_have_valid_physical_plans() {
             );
             match result.status {
                 CandidateEvaluationStatus::AwaitingQuote => assert!(result.plan_id.is_some()),
-                CandidateEvaluationStatus::CompilationFailed => assert!(result
-                    .unavailable_reason
-                    .as_ref()
-                    .is_some_and(|reason| !reason.is_empty())),
+                CandidateEvaluationStatus::CompilationFailed => {
+                    let reason = result.unavailable_reason.as_deref().unwrap_or_default();
+                    assert!(
+                        !reason.is_empty(),
+                        "{}: bind failure without a reason",
+                        case.name
+                    );
+                    assert_rejection_is_accounted_for(&case.name, reason);
+                }
                 ref status => panic!("unexpected pre-pricing status: {status:?}"),
             }
         }
+        // Each recorded defect must still occur exactly as often as declared:
+        // a new occurrence and a silently fixed one both fail here.
+        for (query, defect, count) in KNOWN_BINDING_DEFECTS {
+            if *query != case.name {
+                continue;
+            }
+            let observed = admission
+                .iter()
+                .filter(|result| {
+                    result
+                        .unavailable_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains(defect))
+                })
+                .count();
+            assert_eq!(
+                observed, *count,
+                "{}: recorded defect count changed for {defect:?}; \
+                 update KNOWN_BINDING_DEFECTS (delete the entry once fixed)",
+                case.name
+            );
+        }
         if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
-            std::fs::create_dir_all(&directory).unwrap();
+            // Mirror the committed layout: `admission/` is the contract, so a
+            // downloaded CI artifact drops straight onto the repository copy.
+            let admission_dir = std::path::Path::new(&directory).join("admission");
+            std::fs::create_dir_all(&admission_dir).unwrap();
             std::fs::write(
-                std::path::Path::new(&directory).join(format!("{}.admission.json", case.name)),
+                admission_dir.join(format!("{}.admission.json", case.name)),
                 serde_json::to_vec_pretty(&admission).unwrap(),
             )
             .unwrap();
@@ -880,7 +1065,7 @@ fn issue754_queries_have_valid_physical_plans() {
                 case.name
             );
         }
-        for root_id in heap_roots {
+        for (root_id, resolution) in heap_roots {
             let heap = admission
                 .iter()
                 .filter(|candidate| candidate.logical_root_ids.contains(&root_id))
@@ -889,16 +1074,25 @@ fn issue754_queries_have_valid_physical_plans() {
                 !heap.is_empty(),
                 "physical heap candidate disappeared before admission"
             );
-            assert!(
-                heap.iter().all(|candidate| candidate.status
-                    == CandidateEvaluationStatus::CompilationFailed
-                    && candidate.total_cost.is_none()
-                    && candidate
-                        .unavailable_reason
-                        .as_ref()
-                        .is_some_and(|reason| reason.contains("accuracy guarantee"))),
-                "missing proof must be an explicit admission failure: {heap:?}"
-            );
+            match resolution {
+                Resolution::MustBind => assert!(
+                    heap.iter().all(|candidate| candidate.status
+                        == CandidateEvaluationStatus::AwaitingQuote
+                        && candidate.plan_id.is_some()
+                        && candidate.total_cost.is_none()),
+                    "certified shape must reach pricing unpriced: {heap:?}"
+                ),
+                Resolution::MustReject(policy) => assert!(
+                    heap.iter().all(|candidate| candidate.status
+                        == CandidateEvaluationStatus::CompilationFailed
+                        && candidate.total_cost.is_none()
+                        && candidate
+                            .unavailable_reason
+                            .as_deref()
+                            .is_some_and(|reason| policy.matches(reason))),
+                    "missing proof must be an explicit {policy:?} admission failure: {heap:?}"
+                ),
+            }
         }
     }
 }
