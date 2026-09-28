@@ -56,13 +56,12 @@ inventory, not every theoretical plan, production cost optimality, or human revi
 - Focused binding, snapshot-version, adoption, recovery, query-fence and installation tests passed.
 - Strict all-target Clippy passed for control_plane, data_plane and promql-compliance.
 - Deferred test stack passed an all-target compile check; its production-cost acceptance was not rerun.
-- Cross-version metadata regression failed before the fix; both logs are retained.
+- Cross-version metadata regression failed before the fix; generated logs are kept outside version control.
 - Existing runtime generation filtering was already strict; the fix rejects the obsolete metadata marker.
 
 - `data_plane` SHA256: `b3d4d37f6520670955d2b3f9fd2afa208ccb001ec108370a542f47727e5d5206`.
 - `differential-runner` SHA256: `0b8a87d439b6943e178672f01a544adf90ea2644f3065dc2bb9bad1e7941b6e2`.
 
 Run `make candidates` in `promql-compliance/runner` to reproduce the sweep.
-The retained Compose file used the built binaries and durable state. Logs and
-JSON are gzip-compressed; `SHA256SUMS` covers all retained artifacts. Absolute
-paths in raw reports refer to the original run; relative directory structure is preserved.
+The run used built binaries and durable state. Generated logs, Compose captures
+and detailed result artifacts are kept outside version control.
