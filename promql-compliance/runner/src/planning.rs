@@ -143,7 +143,7 @@ pub fn validate_cost(plan: &CompiledPhysicalPlan) -> Result<()> {
         .as_ref()
         .context("missing cost comparison")?;
     ensure!(
-        report.model_version == "backend-workload-resources-v1",
+        report.model_version == "backend-workload-resources-v2",
         "automatic cost path was bypassed"
     );
     ensure!(
