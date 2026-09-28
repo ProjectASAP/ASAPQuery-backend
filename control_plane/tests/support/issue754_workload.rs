@@ -85,6 +85,7 @@ pub fn input(case: &Case) -> BackendLocalPlanningInput {
 /// item count is the series count. The assertion at the end is what makes this
 /// a contract rather than a guess -- if the dataset stops separating, the
 /// fixture fails instead of certifying something false.
+#[allow(dead_code)] // Shared fixture module: only the admission suite needs certification.
 pub fn certified_topk_input(case: &Case) -> BackendLocalPlanningInput {
     const K: usize = 3;
     let mut snapshot: Value = serde_json::from_str(include_str!(
