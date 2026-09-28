@@ -1682,24 +1682,14 @@ mod tests {
 
     #[test]
     fn counter_delta_scale_preserves_sub_unit_membership_weights() {
-        use planner_types::post_asap::{
-            EntityIdentity, NonNegativeWeightProof, SummaryInputExpr, SummaryUpdate, WeightDomain,
-        };
-        let config = topk_config(AggregationType::CountMinSketchWithHeap, None);
-        let family = config.accumulator_spec().unwrap().family;
-        let input = SummaryUpdate {
-            item: Some(SummaryInputExpr::Column(
-                planner_types::pre_asap::ColumnRef::Named("host".into()),
-            )),
-            weight: SummaryInputExpr::ResetAwareCounterDelta {
-                value: planner_types::pre_asap::ColumnRef::SampleValue,
-                series: EntityIdentity::PromqlLabelSet { excluding: vec![] },
-            },
-            weight_domain: WeightDomain::NonNegative {
-                proof: NonNegativeWeightProof::ResetAwareCounterDerivative,
-            },
-        };
-        let mut updater = create_planner_accumulator(&family, &input, &Default::default()).unwrap();
+        let mut config = topk_config(
+            AggregationType::CountMinSketchWithHeap,
+            Some("counter_delta"),
+        );
+        config
+            .parameters
+            .insert("weight_scale".into(), serde_json::json!(1_000_000));
+        let mut updater = create_fixture_accumulator(&config);
         updater.update_keyed(&host_key("payment"), 0.004, 1_000);
         updater.update_keyed(&host_key("order"), 0.002, 1_000);
         let ranked = ranked_topk(&*updater.take_accumulator());
@@ -1842,16 +1832,7 @@ pub fn create_planner_accumulator(
     if family_grouping != grouping {
         return Err("Planner family and operator grouping disagree".into());
     }
-    // Heap counters use fixed-point storage for fractional counter deltas.
-    // This encodes the selected update; it does not choose another family.
-    let weight_scale = if matches!(
-        input.weight,
-        planner_types::post_asap::SummaryInputExpr::ResetAwareCounterDelta { .. }
-    ) {
-        1_000_000.0
-    } else {
-        1.0
-    };
+    let weight_scale = 1.0;
     let updater: Box<dyn AccumulatorUpdater> = match (kind.algorithm(), kind.params()) {
         (SketchAlgorithm::Kll, SketchParams::Kll { k }) => Box::new(KllAccumulatorUpdater::new(
             u16::try_from(*k).map_err(|_| "KLL k exceeds runtime bound")?,

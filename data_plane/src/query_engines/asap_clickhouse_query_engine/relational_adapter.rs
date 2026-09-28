@@ -484,9 +484,15 @@ impl ClickHouseRelationalAdapter {
                     .rows
                     .sort_by(|left, right| compare_sort_keys(left, right, keys, &schema));
             }
-            ValueOperation::Limit { n, offset, partition_by } => {
+            ValueOperation::Limit {
+                n,
+                offset,
+                partition_by,
+            } => {
                 if !partition_by.keys().is_empty() || partition_by.is_without() {
-                    return Err(ClickHouseRelationalError::Unsupported("partitioned Limit".into()));
+                    return Err(ClickHouseRelationalError::Unsupported(
+                        "partitioned Limit".into(),
+                    ));
                 }
                 input.rows = input.rows.into_iter().skip(*offset).take(*n).collect();
             }
@@ -1607,7 +1613,11 @@ mod tests {
                 }],
                 partition_by: GroupKeys::none(),
             },
-            ValueOperation::Limit { n: 1, offset: 0, partition_by: planner_types::pre_asap::GroupKeys::by(vec![]) },
+            ValueOperation::Limit {
+                n: 1,
+                offset: 0,
+                partition_by: planner_types::pre_asap::GroupKeys::by(vec![]),
+            },
         ] {
             relation = adapter
                 .apply_operation(&operation, &projected_schema, relation)

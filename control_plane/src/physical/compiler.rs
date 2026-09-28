@@ -2416,9 +2416,49 @@ pub fn select_post_asap(
             delete: false,
         },
     );
+    // These fixtures exercise collector heap transport. Collector fixtures do
+    // not offer backend-only temporal value readouts as a physical capability.
+    struct CollectorFixtureModel(ControlPlaneCostModel);
+    impl asap_aware_mapping::CostModel for CollectorFixtureModel {
+        fn rank_candidates(
+            &self,
+            intent: &planner_types::pre_asap::AggIntent,
+            candidates: &[planner_types::post_asap::SketchAlgorithm],
+        ) -> Vec<planner_types::post_asap::SketchAlgorithm> {
+            self.0.rank_candidates(intent, candidates)
+        }
+        fn size_params(
+            &self,
+            kind: planner_types::post_asap::SketchAlgorithm,
+            intent: &planner_types::pre_asap::AggIntent,
+            eps: f64,
+            delta: f64,
+        ) -> planner_types::post_asap::SketchParams {
+            self.0.size_params(kind, intent, eps, delta)
+        }
+        fn candidate_cost(
+            &self,
+            candidate: &asap_aware_mapping::ReplacementSubDAG,
+            target: &asap_aware_mapping::TargetSubDAG<'_>,
+        ) -> Option<Cost> {
+            self.0.candidate_cost(candidate, target)
+        }
+        fn summary_support_evidence(&self, summary: &SummaryNode) -> Option<bool> {
+            if matches!(
+                summary.expr,
+                SummaryExpr::ValueOperation {
+                    operation: planner_types::post_asap::ValueOperation::Limit { .. },
+                    ..
+                }
+            ) {
+                return Some(false);
+            }
+            self.0.summary_support_evidence(summary)
+        }
+    }
     crate::planner_selection::select_query_with_models(
         expr,
-        &model,
+        &CollectorFixtureModel(model),
         &DefaultAccuracyModel,
         &QueryEvidence(evidence),
     )
@@ -3561,9 +3601,11 @@ fn collect_selected_materializations(
         }
         match &node.expr {
             SummaryExpr::RelationalJoin {
-                right: candidates, left: values,
+                right: candidates,
+                left: values,
                 kind: planner_types::pre_asap::JoinKind::Semi,
-                pruning: Some(_), ..
+                pruning: Some(_),
+                ..
             } => {
                 walk(candidates, readout, composable, grouping.clone(), selected)?;
                 // In a hybrid TopK, the sketch is only a candidate-membership
@@ -3660,12 +3702,6 @@ fn collect_selected_materializations(
                             _ => return Err("unsupported TopK SummaryUpdate weight".into()),
                         };
                         parameters["weight_mode"] = mode.into();
-                        if mode == "counter_delta" {
-                            // CMS/CountSketch heap implementations quantize
-                            // weights to integer counters. Preserve sub-unit
-                            // counter increments used by CPU metrics.
-                            parameters["weight_scale"] = 1_000_000.into();
-                        }
                     }
                     let (metric, window_secs, spatial_filter) = match selected_input_contract(node)
                     {
@@ -3821,7 +3857,7 @@ pub(crate) mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap();
-        snapshot.schema_version = 2;
+        snapshot.schema_version = 3;
         snapshot.data_workload.data_ingestion_interval.value = Some(DurationMs(1_000));
         let template = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0].clone();
         let queries = [
@@ -4444,7 +4480,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn weighted_counter_topk_keeps_heap_membership_separate_from_exact_values() {
+    fn unsupported_rate_heap_uses_explicit_exact_route() {
         let query = "topk(2, sum by (job) (rate(m[1m])))";
         let evidence = TopKMembershipEvidence {
             selected_lower_bound: 101.0,
@@ -4457,89 +4493,21 @@ pub(crate) mod tests {
         let plan = DeploymentPlanCompiler
             .compile_promql(request, environment(10_000))
             .unwrap();
-        let entry = plan.query_plan.entries.values().next().unwrap();
-        let crate::query_plan::QueryPlanNode::Logical {
-            operator: asap_types::query_plan::residual::ResidualQueryOperator::TopKSelection { .. },
-            inputs,
-        } = &entry.nodes[&entry.root]
-        else {
-            panic!("expected ordinary TopK root")
-        };
-        let crate::query_plan::QueryPlanNode::MembershipFilter { inputs, .. } =
-            &entry.nodes[&inputs[0]]
-        else {
-            panic!("Planner weighted TopK must lower to MembershipFilter: {entry:#?}");
-        };
+        let entry = plan.query_plan.lookup(query).unwrap();
         assert!(matches!(
-            entry.nodes[&inputs[0]],
-            crate::query_plan::QueryPlanNode::SummaryEstimate {
-                query: crate::query_plan::QueryReadout::TopK { .. },
-                ..
-            }
+            &entry.nodes[&entry.root],
+            crate::query_plan::QueryPlanNode::ExactFallback { .. }
         ));
-        let candidate_read = match &entry.nodes[&inputs[0]] {
-            crate::query_plan::QueryPlanNode::SummaryEstimate { input, .. } => *input,
-            _ => unreachable!(),
-        };
-        assert!(matches!(
-            entry.nodes[&candidate_read],
-            crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
-        ));
-        assert!(!entry
-            .nodes
-            .values()
-            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. })));
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            crate::query_plan::QueryPlanNode::ExactReadout {
-                readout: crate::query_plan::ExactReadout::Rate,
-                ..
-            }
-        )));
-        let heaps = plan
-            .precompute_plan
-            .materializations
-            .iter()
-            .filter(|materialization| {
-                materialization.aggregation_type
-                    == asap_types::AggregationType::CountMinSketchWithHeap
-                    && materialization.parameters["weight_mode"] == "counter_delta"
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(heaps.len(), 1, "unpartitioned TopK owns one global CMS");
-        assert!(heaps[0].grouping_labels.names().is_empty());
-        assert_eq!(heaps[0].aggregated_labels.labels, vec!["job"]);
-        assert_eq!(heaps[0].parameters["weight_scale"], 1_000_000);
-        assert_eq!(retained_partition_count(heaps[0], Some(5)), 1);
-        let crate::query_plan::QueryPlanNode::ReadMaterialization { binding } =
-            &entry.nodes[&candidate_read]
-        else {
-            unreachable!()
-        };
-        assert!(matches!(
-            binding.output_grouping,
-            crate::query_plan::PhysicalGrouping::Reduce(ref labels) if labels.is_empty()
-        ));
-        assert_eq!(binding.item_labels, vec!["job"]);
-        let counter = plan
-            .precompute_plan
-            .materializations
-            .iter()
-            .find(|materialization| {
-                matches!(
-                    materialization.aggregation_type,
-                    asap_types::AggregationType::Rate
-                )
-            })
-            .expect("reset-aware exact counter");
-        assert_eq!(retained_partition_count(counter, Some(5)), 5);
+        assert_eq!(
+            entry.fallback,
+            crate::query_plan::FallbackPolicy::ExactBackend
+        );
+        assert_eq!(entry.canonical_query, query);
+        assert!(plan.precompute_plan.materializations.is_empty());
     }
 
     #[test]
-    fn hybrid_weighted_topk_installs_only_candidates_and_delegates_filtered_exact_values() {
-        use crate::query_plan::{
-            residual::ResidualQueryOperator, ExternalExactInput, ExternalExactOutput, QueryPlanNode,
-        };
+    fn hybrid_rate_topk_preserves_the_original_exact_subquery() {
         let query = "topk(2, sum by (job) (rate(m[1m])))";
         let evidence = TopKMembershipEvidence {
             selected_lower_bound: 101.0,
@@ -4557,82 +4525,31 @@ pub(crate) mod tests {
         let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
-
-        assert_eq!(plan.precompute_plan.materializations.len(), 1);
-        assert_eq!(
-            plan.precompute_plan.materializations[0].aggregation_type,
-            asap_types::AggregationType::CountMinSketchWithHeap
-        );
         let entry = plan.query_plan.lookup(query).unwrap();
-        let QueryPlanNode::Logical {
-            operator: ResidualQueryOperator::TopKSelection { .. },
-            inputs,
-        } = &entry.nodes[&entry.root]
-        else {
-            panic!("expected ordinary TopK root")
-        };
-        let QueryPlanNode::MembershipFilter { inputs, .. } = &entry.nodes[&inputs[0]] else {
-            panic!("expected candidate TopK: {entry:#?}");
-        };
+        use crate::query_plan::{residual::ResidualQueryOperator, QueryPlanNode};
         assert!(matches!(
-            &entry.nodes[&inputs[1]],
-            QueryPlanNode::ExternalExact {
-                request,
-                inputs: exact_inputs,
-            } if request.language == crate::query_plan::QueryLanguage::PromQl
-                && request.expression == "sum by (job) (rate(m[1m]))"
-                && request.output == ExternalExactOutput::InstantVector
-                && request.input_contracts == vec![ExternalExactInput::CandidateMembership {
-                    item_label: "job".into(),
-                }]
-                && exact_inputs == &vec![inputs[0]]
+            &entry.nodes[&entry.root],
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::TopKSelection { k: 2, .. },
+                ..
+            }
         ));
-        assert!(entry.nodes.values().all(|node| !matches!(
-            node,
-            QueryPlanNode::ExactReadout { .. }
-                | QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Scan { .. },
-                    ..
-                }
-        )));
-        let installed = plan
-            .precompute_plan
-            .executable_dags
-            .get(&entry.query_id)
-            .expect("compiled query retains its maintenance projection");
-        installed
-            .validate()
-            .expect("typed maintenance DAG document");
         assert_eq!(
-            installed.document.schema_version,
-            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION
+            entry
+                .nodes
+                .values()
+                .filter(|node| matches!(node, QueryPlanNode::Logical {
+            operator: ResidualQueryOperator::ExactSubquery { query }, ..
+        } if query == "sum by (job) (rate(m[1m]))"))
+                .count(),
+            1
         );
-        assert!(installed
-            .document
-            .nodes
-            .iter()
-            .all(|node| node.output_state.timing
-                == planner_types::post_asap::ExecutionTiming::IngestionTime));
-        assert_eq!(installed.binding.query_plan_sink, entry.root);
-        let mut mismatched = plan.to_publication_artifact().unwrap();
-        let projected = mismatched
-            .precompute_plan
-            .executable_dags
-            .get_mut(&entry.query_id)
-            .unwrap();
-        projected.binding.query_plan_sink = asap_types::executable_plan::QueryNodeId(u64::MAX);
-        assert!(mismatched.validate().is_err());
-        assert!(installed.binding.nodes.values().any(|placement| matches!(
-            placement,
-            crate::physical::executable_binding::BackendNodeBinding::Materialization { .. }
-        )));
-        let encoded = serde_json::to_value(installed).unwrap();
-        let decoded: crate::physical::executable_binding::InstalledPostAsapDag =
-            serde_json::from_value(encoded).unwrap();
-        assert_eq!(&decoded, installed);
-        decoded
-            .validate()
-            .expect("round-tripped typed DAG document");
+        assert!(entry.materialization_bindings().is_empty());
+        assert!(plan.precompute_plan.materializations.is_empty());
+        let artifact = plan.to_publication_artifact().unwrap();
+        artifact.validate().unwrap();
+        let encoded = serde_json::to_value(&artifact).unwrap();
+        assert!(!encoded.to_string().contains("counter_delta"));
     }
 
     #[test]
@@ -4648,7 +4565,7 @@ pub(crate) mod tests {
             .compile_promql(
                 request_with_evidence(
                     "topk-rate",
-                    "topk(2, sum by (job) (rate(m[1m])))",
+                    "topk(2, count_over_time(m[1m]))",
                     Some(evidence),
                 )
                 .unwrap(),

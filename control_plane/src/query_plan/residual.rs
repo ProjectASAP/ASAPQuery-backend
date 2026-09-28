@@ -361,11 +361,32 @@ pub(super) fn residual_nodes(
     horizons(residual, &mut intervals);
     intervals.sort_unstable();
     intervals.dedup();
+    // Accuracy annotations select a candidate, but exact execution still
+    // implements that candidate's computation. Reconstruct the same typed IR
+    // before comparing it; do not erase operators or source predicates.
+    let accuracy = match residual {
+        planner_types::pre_asap::QueryExpr::Aggregate { measures, .. } => measures
+            .iter()
+            .find_map(|intent| {
+                use planner_types::pre_asap::AggIntent;
+                match intent {
+                    AggIntent::Quantile { accuracy, .. }
+                    | AggIntent::Cardinality { accuracy, .. }
+                    | AggIntent::Count { accuracy }
+                    | AggIntent::TopK { accuracy, .. }
+                    | AggIntent::FrequencyL2 { accuracy, .. }
+                    | AggIntent::FrequencyEntropy { accuracy, .. } => Some(accuracy.clone()),
+                    _ => None,
+                }
+            })
+            .unwrap_or(planner_types::types::AccuracyTarget::Exact),
+        _ => planner_types::types::AccuracyTarget::Exact,
+    };
     for expression in expressions {
         for interval in &intervals {
             if let Ok(candidate) = crate::query_parser::parse_query_expr_with_interval(
                 &expression.to_string(),
-                planner_types::types::AccuracyTarget::Exact,
+                accuracy.clone(),
                 *interval,
             ) {
                 if &candidate == residual {

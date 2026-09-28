@@ -31,7 +31,7 @@ impl RawDagProgram {
             installed.validate()?;
             let dag = installed.document.decode()?;
             for node in &dag.nodes {
-                if !matches!(installed.binding.node(node.id), Some(BackendNodeBinding::Materialization { summary_definition }) if summary_definition.fingerprint() == config.policy_fingerprint())
+                if !matches!(installed.binding.node(node.id), Some(BackendNodeBinding::Materialization { stored_output }) if stored_output.fingerprint() == config.policy_fingerprint())
                 {
                     continue;
                 }
@@ -150,10 +150,6 @@ impl RawDagProgram {
                     (SummaryInputExpr::Constant(value), asap_types::SampleUpdateRule::Count) => {
                         *value == 1.0
                     }
-                    (
-                        SummaryInputExpr::ResetAwareCounterDelta { .. },
-                        asap_types::SampleUpdateRule::CounterDelta { scale },
-                    ) => scale == 1_000_000.0,
                     _ => {
                         asap_types::accumulator_spec::is_unit_sample_frequency(input)
                             || (matches!(
@@ -209,10 +205,6 @@ impl RawDagProgram {
             SummaryInputExpr::Column(
                 ColumnRef::Named(name) | ColumnRef::Qualified { name, .. },
             ) if self.projected_column.as_ref() == Some(name) => {}
-            SummaryInputExpr::ResetAwareCounterDelta {
-                value: ColumnRef::SampleValue,
-                series: planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
-            } if excluding.is_empty() => {}
             _ => return Err("raw DAG weight expression is unsupported".into()),
         }
         fn item(expr: &SummaryInputExpr) -> bool {
@@ -232,10 +224,7 @@ impl RawDagProgram {
     }
 
     pub fn uses_counter_delta(&self) -> bool {
-        matches!(
-            self.input.weight,
-            SummaryInputExpr::ResetAwareCounterDelta { .. }
-        )
+        false
     }
 
     pub fn apply(
@@ -248,7 +237,7 @@ impl RawDagProgram {
         let weight = match &self.input.weight {
             SummaryInputExpr::Constant(c) => *c,
             // The worker retains one previous value per series across pane rotation.
-            SummaryInputExpr::Column(_) | SummaryInputExpr::ResetAwareCounterDelta { .. } => value,
+            SummaryInputExpr::Column(_) => value,
             _ => return Err("unsupported raw weight expression".into()),
         };
         let scalar_frequency = asap_types::accumulator_spec::is_unit_sample_frequency(&self.input)

@@ -170,11 +170,8 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
             return Err("maintenance runtime requires ingestion-time nodes".into());
         }
         match &node.payload {
-            ExecutableOperatorPayload::SummaryMerge {
-            } => merge_inputs(inputs),
-            ExecutableOperatorPayload::Binary {
-                operator,
-            } => {
+            ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
+            ExecutableOperatorPayload::Binary { operator } => {
                 if !self.inputs.frozen_inputs().is_some()
                     || node.output_state
                         != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
@@ -2246,8 +2243,7 @@ mod tests {
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
             id: PostAsapNodeId(id),
-            payload: ExecutableOperatorPayload::SummaryMerge {
-            },
+            payload: ExecutableOperatorPayload::SummaryMerge,
             output_state: planner_types::post_asap::ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: vec![],
@@ -2904,8 +2900,7 @@ mod tests {
         second_node.id = PostAsapNodeId(5);
         let mut merge = second_node.clone();
         merge.id = PostAsapNodeId(6);
-        merge.payload = ExecutableOperatorPayload::SummaryMerge {
-        };
+        merge.payload = ExecutableOperatorPayload::SummaryMerge;
         dag.nodes.extend([second_node, merge]);
         let original = dag
             .edges

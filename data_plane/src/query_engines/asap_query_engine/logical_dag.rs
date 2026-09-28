@@ -430,10 +430,16 @@ fn membership_filter(
         labels.remove("__name__");
         labels
     };
-    let candidate_ids: BTreeSet<_> = candidates.iter().map(|(labels, _)| identity(labels)).collect();
+    let candidate_ids: BTreeSet<_> = candidates
+        .iter()
+        .map(|(labels, _)| identity(labels))
+        .collect();
     let value_ids: BTreeSet<_> = values.iter().map(|(labels, _)| identity(labels)).collect();
     let missing: BTreeSet<_> = candidate_ids.difference(&value_ids).collect();
-    let selected = values.into_iter().filter(|(labels, _)| candidate_ids.contains(&identity(labels))).collect();
+    let selected = values
+        .into_iter()
+        .filter(|(labels, _)| candidate_ids.contains(&identity(labels)))
+        .collect();
     if !missing.is_empty() && matches!(completeness, CandidateCompleteness::Certified { .. }) {
         return Err(miss("certified membership key has no authoritative value"));
     }

@@ -660,28 +660,27 @@ impl PrecomputePlan {
                                 operation: ValueOperation::FinalizeExactAccumulator,
                             } if children.len() == 1
                                 && frontiers.contains_key(&children[0].producer) => {}
-                            Payload::Binary {
-                                operator,
-                            } if children.len() == 2
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Left
-                                    })
-                                    .count()
-                                    == 1
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Right
-                                    })
-                                    .count()
-                                    == 1
-                                && operator.vector_match.is_none()
-                                && matches!(
-                                    operator.kind,
-                                    planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
-                                ) =>
+                            Payload::Binary { operator }
+                                if children.len() == 2
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Left
+                                        })
+                                        .count()
+                                        == 1
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Right
+                                        })
+                                        .count()
+                                        == 1
+                                    && operator.vector_match.is_none()
+                                    && matches!(
+                                        operator.kind,
+                                        planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+                                    ) =>
                             {
                                 pending.extend(children.iter().map(|edge| edge.producer));
                             }
@@ -1099,8 +1098,7 @@ mod source_window_cohort_tests {
         assert!(validate_maintenance_reduction(&config, &node).is_err());
         config.partitioning = None;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
-        node.payload = ExecutableOperatorPayload::SummaryMerge {
-        };
+        node.payload = ExecutableOperatorPayload::SummaryMerge;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
     }
 

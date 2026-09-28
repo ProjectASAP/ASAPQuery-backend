@@ -274,10 +274,25 @@ fn sketch(node: &SummaryNode) -> (&SketchAlgorithm, &SketchParams) {
     }
 }
 
-/// The actual control-plane parser/binder selects the lower measured update
-/// cost while preserving the selected algorithm's normal parameter sizing.
+fn assert_exact_count(node: &SummaryNode) {
+    match &node.expr {
+        SummaryExpr::SummaryEstimate { summary_input, .. } => assert_exact_count(summary_input),
+        SummaryExpr::SummaryAgg {
+            family:
+                SummaryFamilyType::ExactAggregate(
+                    planner_types::post_asap::ExactKind::Count,
+                    planner_types::post_asap::ExactParams::Count,
+                ),
+            ..
+        } => {}
+        other => panic!("expected exact total-count state, got {other:?}"),
+    }
+}
+
+/// Update evidence ranks frequency sketches but does not replace an exact
+/// total-count accumulator with a point-frequency sketch.
 #[test]
-fn offline_update_evidence_changes_typed_binding() {
+fn offline_update_evidence_preserves_exact_count_binding() {
     let default = model();
     let (artifact, context) = fixture(&default, &intent());
     let empirical =
@@ -292,12 +307,8 @@ fn offline_update_evidence_changes_typed_binding() {
     );
     let default_bound = bound(&default);
     let measured_bound = bound(&empirical);
-    assert_eq!(sketch(&default_bound).0, &SketchAlgorithm::Cms);
-    assert_eq!(sketch(&measured_bound).0, &SketchAlgorithm::CountSketch);
-    assert_eq!(
-        sketch(&measured_bound).1,
-        &default.size_params(SketchAlgorithm::CountSketch, &intent(), 0.01, 0.01)
-    );
+    assert_exact_count(&default_bound);
+    assert_exact_count(&measured_bound);
     assert!(default_bound.guarantee.is_some());
     assert!(measured_bound.guarantee.is_some());
     // Observed zero point-frequency error has no effect on formal sizing.
@@ -334,11 +345,7 @@ fn incompatible_evidence_preserves_deployment_behavior() {
             candidates(),
             "{scenario}"
         );
-        assert_eq!(
-            sketch(&bound(&empirical)).0,
-            &SketchAlgorithm::Cms,
-            "{scenario}"
-        );
+        assert_exact_count(&bound(&empirical));
     }
 }
 

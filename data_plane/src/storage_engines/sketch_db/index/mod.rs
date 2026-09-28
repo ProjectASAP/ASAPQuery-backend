@@ -5162,8 +5162,8 @@ mod tests {
                 .is_some(),
             "live version change must allocate a fresh physical series"
         );
-        let output = asap_types::sds::StoredOutputReference::for_output(fingerprint.into())
-            .stored_output_id;
+        let output =
+            asap_types::sds::StoredOutputReference::for_output(fingerprint.into()).stored_output_id;
         let inventory = store
             .observed_summary_inventory(
                 "backend-a",
@@ -5245,7 +5245,6 @@ mod tests {
                 || !persistence.manifest.live_parts().is_empty(),
                 Duration::from_secs(5)
             ));
-            let old_parts = persistence.manifest.live_parts().len();
             store.remove_instance(old_sid).unwrap();
             assert!(resolver
                 .resolve_with_reactivation("metric", "group", "family", |sid| store
@@ -5270,7 +5269,20 @@ mod tests {
                 );
             }
             assert!(wait_until(
-                || persistence.manifest.live_parts().len() > old_parts,
+                || {
+                    // Old-series epochs may still publish after reactivation. Wait
+                    // for this series, not an unrelated increase in part count.
+                    persistence.manifest.live_parts().iter().any(|part| {
+                        let path =
+                            persistence::part::part_dir_path(&persistence.parts_root, part.part_id);
+                        persistence::part::PartReader::open(&path).is_ok_and(|reader| {
+                            reader
+                                .index_records()
+                                .iter()
+                                .any(|row| row.agg_id == new_sid && row.start_ts < 90_000)
+                        })
+                    })
+                },
                 Duration::from_secs(5)
             ));
             persistence.shutdown();

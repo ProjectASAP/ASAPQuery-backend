@@ -715,7 +715,7 @@ impl SidMetadataStore {
         };
         if matches!(
             value.get("schema_version").and_then(|v| v.as_u64()),
-            Some(2 | 3 | 4)
+            Some(2..=4)
         ) {
             let sidecar: SdsSidecar = match serde_json::from_value(value) {
                 Ok(sidecar) => sidecar,
@@ -807,7 +807,7 @@ impl SidMetadataStore {
         let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| PersistError::Format(format!("invalid SID metadata: {error}")))?;
         if let Some(version) = value.get("schema_version") {
-            if !matches!(version.as_u64(), Some(2 | 3 | 4)) {
+            if !matches!(version.as_u64(), Some(2..=4)) {
                 return Err(PersistError::Format(
                     "unsupported SID metadata version".into(),
                 ));

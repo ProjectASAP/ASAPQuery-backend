@@ -72,7 +72,8 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 left,
                 right,
                 kind,
-                pred, pruning,
+                pred,
+                pruning,
             } => (
                 "RelationalJoin",
                 vec![left, right],
