@@ -61,9 +61,14 @@ pub(super) fn entry(
                         .then_some(config.slide_interval * 1000),
                         materialization: config.policy_fingerprint().into(),
                         stored_output_reference:
-                            asap_types::sds::StoredOutputReference::for_definition(
-                                config.policy_fingerprint().into(),
-                            ),
+                            asap_types::summary_catalog::SummaryCatalog::from_materializations(
+                                1,
+                                1,
+                                &[config.clone()],
+                            )
+                            .unwrap()
+                            .output_reference(config.policy_fingerprint().into())
+                            .unwrap(),
                         output_grouping: grouping,
                         item_labels: config.aggregated_labels.labels.clone(),
                         window_ms: config.stored_window_ms(),
@@ -104,7 +109,7 @@ pub(super) fn install(
             .unwrap();
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), materializations, &["fixture".into()]).unwrap();
-    precompute.summary_catalog = Some(catalog.reference().unwrap());
+    precompute.bind_catalog(&catalog).unwrap();
     let mut transmission = control_plane::physical::compiler::build_transmission_plan(
         envelope,
         &precompute,
@@ -157,4 +162,32 @@ pub(super) fn engine(
     ASAPQueryEngine::new(15_000)
         .with_sketch_index(index)
         .with_active_physical_plan(active)
+}
+
+/// Low-level operator fixtures install the descriptors of their explicit states.
+/// Process tests use compiled publications instead of this fixture adapter.
+pub(super) fn bound_reference(
+    index: &SketchStore,
+    output: asap_types::sds::StoredOutputId,
+) -> asap_types::sds::StoredOutputReference {
+    if let Some(catalog) = index.summary_catalog_snapshot() {
+        return catalog.output_reference(output).unwrap();
+    }
+    let metadata = index.snapshot_instances();
+    let entries = metadata
+        .iter()
+        .filter(|m| !m.policy_fp.is_unset())
+        .map(|m| {
+            let (summary, data) = index.descriptors_for_series_id(m.sid).unwrap();
+            (m.policy_fp, (*summary).clone(), (*data).clone())
+        })
+        .collect::<Vec<_>>();
+    let catalog = asap_types::summary_catalog::SummaryCatalog::build(1, 1, entries).unwrap();
+    index
+        .install_summary_catalog(Arc::new(catalog.clone()))
+        .unwrap();
+    for metadata in metadata {
+        index.register((*metadata).clone());
+    }
+    catalog.output_reference(output).unwrap()
 }

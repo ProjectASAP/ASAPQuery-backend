@@ -746,11 +746,12 @@ async fn main() -> Result<()> {
             capability_snapshot_id: "bootstrap".into(),
         },
         ingest: asap_types::precompute_plan::IngestContract {
+            dataset_identity: None,
             protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
             endpoint_path: "/v1/metrics".into(),
             timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
             require_plan_identity: false,
-            require_summary_definition_identity: false,
+            require_stored_output_identity: false,
             require_registered_producer: false,
         },
         schemas: Vec::new(),

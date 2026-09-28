@@ -20,7 +20,7 @@ use xxhash_rust::xxh64::xxh64;
 /// hashing or pane lookup. `group_key` and `policy_fp` still travel
 /// alongside the sid: `group_key` is consumed at emit-time to render the
 /// output label vector; `policy_fp` is the handle the worker uses to fetch
-/// the source `AggregationConfig` from the hot-reload snapshot (window
+/// the source `PrecomputeMaterialization` from the hot-reload snapshot (window
 /// shape, late-data policy, etc.). Together they let the worker key state
 /// by sid without losing the data the legacy `(agg_id, group_key)` shape
 /// carried.
@@ -50,8 +50,8 @@ pub enum WorkerMessage {
         /// `(metric, attrs_fingerprint, agg_kind_canonical)` — see
         /// `SeriesIdResolver::resolve`. Worker keys `group_states` on this.
         sid: u64,
-        /// Source `AggregationConfig` fingerprint. Worker looks up its
-        /// `AggregationConfig` (window size, sketch kind/config, late
+        /// Source `PrecomputeMaterialization` fingerprint. Worker looks up its
+        /// `PrecomputeMaterialization` (window size, sketch kind/config, late
         /// data policy, etc.) via `snap.get_aggregation_config(policy_fp.as_u64())`.
         policy_fp: PolicyFingerprint,
         /// Grouping label values joined by semicolons (e.g. "constant").
@@ -78,7 +78,7 @@ pub enum WorkerMessage {
     AccumulatorInput {
         /// Registry-allocated bucket identity; see `GroupSamples::sid`.
         sid: u64,
-        /// Source `AggregationConfig` fingerprint; see
+        /// Source `PrecomputeMaterialization` fingerprint; see
         /// `GroupSamples::policy_fp`.
         policy_fp: PolicyFingerprint,
         /// Grouping label values joined by semicolons, matching the

@@ -154,7 +154,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                         .catalog
                         .as_ref()
                         .and_then(|catalog| {
-                            let definition = catalog.definitions.get(&binding.materialization)?;
+                            let definition = catalog.outputs.get(&binding.materialization)?;
                             catalog
                                 .data_descriptors
                                 .get(&definition.data_descriptor_id)?
@@ -305,7 +305,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     })
             }
             QueryPlanNode::Logical { .. }
-            | QueryPlanNode::CandidateTopK { .. }
+            | QueryPlanNode::MembershipFilter { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
             | QueryPlanNode::RelationalJoin { .. } => Err(PhysicalNodeError::Fallback(
@@ -882,10 +882,10 @@ mod tests {
                         binding: MaterializationBinding {
                             full_window_slide_ms: None,
                             materialization: config.policy_fingerprint().into(),
-                            stored_output_reference:
-                                asap_types::sds::StoredOutputReference::for_definition(
-                                    config.policy_fingerprint().into(),
-                                ),
+                            stored_output_reference: super::super::test_plan::bound_reference(
+                                &idx,
+                                config.policy_fingerprint().into(),
+                            ),
                             output_grouping: PhysicalGrouping::PerEntity,
                             item_labels: vec![],
                             window_ms: 1000,
@@ -1126,16 +1126,16 @@ mod tests {
                         }
                     }
                     let idx = SketchStore::new();
+                    idx.install_summary_catalog(std::sync::Arc::new(plan.summary_catalog.clone()))
+                        .unwrap();
                     idx.register(SummarySeriesMetadata {
                         sid: 7,
                         metric_name: "a".into(),
                         group_by_keys: Default::default(),
                         capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
-                        agg_kind: AggKind::ExactAgg {
-                            agg_type: asap_types::AggregationType::Sum,
-                            parameters_canonical: String::new(),
-                            spatial_filter_canonical: String::new(),
-                        },
+                        agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_config(
+                            config,
+                        ),
                         accuracy: None,
                         first_seen_unix_ms: 0,
                         retired_at_ms: None,
@@ -1196,16 +1196,14 @@ mod tests {
         let config = &plan.precompute_plan.materializations[0];
         let policy = config.policy_fingerprint();
         let idx = SketchStore::new();
+        idx.install_summary_catalog(std::sync::Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
         idx.register(SummarySeriesMetadata {
             sid: 7,
             metric_name: "a".into(),
             group_by_keys: Default::default(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
-            agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::AggregationType::Sum,
-                parameters_canonical: String::new(),
-                spatial_filter_canonical: String::new(),
-            },
+            agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_config(config),
             accuracy: None,
             first_seen_unix_ms: 0,
             retired_at_ms: None,
@@ -1321,10 +1319,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
-                            stored_output_reference:
-                                asap_types::sds::StoredOutputReference::for_definition(
-                                    policy.into(),
-                                ),
+                            stored_output_reference: super::super::test_plan::bound_reference(
+                                &idx,
+                                policy.into(),
+                            ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
                             pane_origin_ms: Some(0),
@@ -1377,9 +1375,9 @@ mod tests {
             sid: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
-            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Increase)),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),
             agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::AggregationType::Increase,
+                agg_type: asap_types::AggregationType::Rate,
                 parameters_canonical: String::new(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1422,10 +1420,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
-                            stored_output_reference:
-                                asap_types::sds::StoredOutputReference::for_definition(
-                                    policy.into(),
-                                ),
+                            stored_output_reference: super::super::test_plan::bound_reference(
+                                &idx,
+                                policy.into(),
+                            ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
                             pane_origin_ms: Some(0),

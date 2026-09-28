@@ -377,7 +377,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_types::{sds::HalfOpenTimeRange, sds::SummaryDefinitionId, PolicyFingerprint};
+    use asap_types::{sds::HalfOpenTimeRange, sds::StoredOutputId, PolicyFingerprint};
     use std::collections::BTreeMap;
 
     fn generation() -> CatalogGeneration {
@@ -399,7 +399,7 @@ mod tests {
 
     fn coordinates() -> SummaryInstanceCoordinates {
         SummaryInstanceCoordinates {
-            summary_definition_id: SummaryDefinitionId(PolicyFingerprint(7)),
+            stored_output_id: StoredOutputId::from(PolicyFingerprint(7)),
             time_range: HalfOpenTimeRange {
                 start_ms: 0,
                 end_ms: 10,

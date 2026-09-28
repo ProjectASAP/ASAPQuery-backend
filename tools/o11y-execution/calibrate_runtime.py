@@ -212,7 +212,7 @@ def measure(args, artifact, corpus, snapshot, folder):
             query_phase = phase(folder, "query-" + qid, before, after, time.perf_counter_ns() - start)
             raw = folder / f"queries-{qid}.json"
             runner.write_json(raw, records)
-            validate_candidate_topk_execution(artifact, records)
+            validate_membership_filter_execution(artifact, records)
             routes = {record["execution"] for record in records}
             correct = all(record["comparison"]["equal"] and record["exact"]["http_status"] == 200 for record in records)
             row["queries"][qid] = {"cpu_ns": query_phase["cpu_ns"], "evaluations": len(records),
@@ -267,20 +267,20 @@ def measure(args, artifact, corpus, snapshot, folder):
 
 
 
-def _candidate_topk_inputs(nodes, root):
+def _membership_filter_inputs(nodes, root):
     bindings, visiting, visited = set(), set(), set()
     def visit(node_id):
         node_id = str(node_id)
         if node_id in visiting:
-            raise ValueError("CandidateTopK input DAG contains a cycle")
+            raise ValueError("MembershipFilter input DAG contains a cycle")
         if node_id in visited:
             return
         if node_id not in nodes:
-            raise ValueError(f"CandidateTopK input DAG references missing node {node_id}")
+            raise ValueError(f"MembershipFilter input DAG references missing node {node_id}")
         visiting.add(node_id)
         node = nodes[node_id]
         if node.get("op") == "exact_fallback":
-            raise ValueError("CandidateTopK input contains ExactFallback")
+            raise ValueError("MembershipFilter input contains ExactFallback")
         if node.get("op") == "read_materialization":
             bindings.add(str(node["binding"]["materialization"]))
         children = [str(value) for value in node.get("inputs", [])]
@@ -294,21 +294,21 @@ def _candidate_topk_inputs(nodes, root):
     return bindings
 
 
-def validate_candidate_topk_artifact(artifact):
-    """Reject CandidateTopK plans whose membership sidecar is not locally installed."""
+def validate_membership_filter_artifact(artifact):
+    """Reject MembershipFilter plans whose membership sidecar is not locally installed."""
     request = artifact.get("install_request", {})
     schemas = {str(row["materialization"]): row for row in request.get("precompute_plan", {}).get("schemas", [])}
     modes = set()
     for entry in request.get("query_plan", {}).get("entries", {}).values():
         nodes = entry.get("nodes", {})
         for node in nodes.values():
-            if node.get("op") != "candidate_top_k":
+            if node.get("op") != "membership_filter":
                 continue
             inputs = node.get("inputs", [])
             if len(inputs) != 2:
-                raise ValueError("CandidateTopK requires membership and exact-value inputs")
-            membership_bindings = _candidate_topk_inputs(nodes, inputs[0])
-            value_bindings = _candidate_topk_inputs(nodes, inputs[1])
+                raise ValueError("MembershipFilter requires membership and exact-value inputs")
+            membership_bindings = _membership_filter_inputs(nodes, inputs[0])
+            value_bindings = _membership_filter_inputs(nodes, inputs[1])
             heap_bindings = []
             for materialization in membership_bindings:
                 schema = schemas.get(materialization)
@@ -316,7 +316,7 @@ def validate_candidate_topk_artifact(artifact):
                 if "CmsWithHeap" in family or "CountSketchWithHeap" in family:
                     heap_bindings.append(materialization)
             if not heap_bindings:
-                raise ValueError("CandidateTopK membership input has no installed heap materialization")
+                raise ValueError("MembershipFilter membership input has no installed heap materialization")
             value_node = nodes.get(str(inputs[1]), {})
             operator = value_node.get("operator", {}) if value_node.get("op") == "logical" else {}
             if operator.get("kind") == "candidate_exact_subquery":
@@ -339,21 +339,21 @@ def validate_candidate_topk_artifact(artifact):
                            and any(kind in json.dumps((schemas.get(mid) or {}).get("family", {})).lower()
                                    for kind in ("counter", "rate", "increase"))
                            for mid in value_bindings):
-                    raise ValueError("CandidateTopK value input has no installed ExactCounter materialization")
+                    raise ValueError("MembershipFilter value input has no installed ExactCounter materialization")
     return modes
 
 
-def validate_candidate_topk_execution(artifact, records):
-    modes = validate_candidate_topk_artifact(artifact)
+def validate_membership_filter_execution(artifact, records):
+    modes = validate_membership_filter_artifact(artifact)
     if not modes:
         return
     if len(modes) != 1:
-        raise ValueError("mixed CandidateTopK execution contracts are not calibratable together")
+        raise ValueError("mixed MembershipFilter execution contracts are not calibratable together")
     mode = next(iter(modes))
     for record in records:
         provenance = record.get("execution_provenance", {})
         if provenance.get("raw_scan_evaluations", 0) not in (0, None):
-            raise ValueError("CandidateTopK execution used a forbidden local raw scan")
+            raise ValueError("MembershipFilter execution used a forbidden local raw scan")
         if mode == "candidate_filtered_exact":
             if record.get("execution") != "hybrid" or provenance.get("detail") != "hybrid":
                 raise ValueError("candidate-filtered TopK did not report hybrid execution")
@@ -364,12 +364,12 @@ def validate_candidate_topk_execution(artifact, records):
                     raise ValueError(f"candidate-filtered TopK has invalid provenance: {key}")
         else:
             if record.get("execution") != "warm" or provenance.get("detail") not in (None, "asap"):
-                raise ValueError("local CandidateTopK execution was not warm")
+                raise ValueError("local MembershipFilter execution was not warm")
             for key in ("exact_subquery_rpcs", "exact_subquery_evaluations", "exact_branch_evaluations"):
                 if provenance.get(key, 0) != 0:
-                    raise ValueError(f"CandidateTopK execution used exact path: {key}")
+                    raise ValueError(f"MembershipFilter execution used exact path: {key}")
             if provenance.get("summary_readout_evaluations", 0) < 2:
-                raise ValueError("CandidateTopK execution did not read both summary branches")
+                raise ValueError("MembershipFilter execution did not read both summary branches")
 
 
 def main():
@@ -413,7 +413,7 @@ def main():
     candidates = candidate_document["candidates"]
     for candidate in candidates:
         if "manifest" in candidate and "install_request" in candidate:
-            validate_candidate_topk_artifact(candidate)
+            validate_membership_filter_artifact(candidate)
     for index, candidate in enumerate(candidates):
         if "manifest" not in candidate or "install_request" not in candidate:
             continue

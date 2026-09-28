@@ -75,12 +75,55 @@ fn legacy_summary(kind: &AggKind) -> SummaryDescriptor {
     })
 }
 
+// A valid deployment reference does not authorize bytes in another state format.
+fn operator_matches(summary: &SummaryDescriptor, actual: &AggKind) -> bool {
+    match &summary.operator {
+        SummaryOperator::Configured {
+            aggregation_type,
+            aggregation_sub_type,
+            parameters,
+            ..
+        } => {
+            let config = asap_types::PrecomputeMaterialization::new(
+                *aggregation_type,
+                aggregation_sub_type.clone(),
+                parameters.clone().into_iter().collect(),
+                asap_types::KeyByLabelNames::empty(),
+                asap_types::KeyByLabelNames::empty(),
+                asap_types::KeyByLabelNames::empty(),
+                String::new(),
+                1,
+                1,
+                asap_types::WindowKind::Tumbling,
+                String::new(),
+                String::new(),
+                None,
+                None,
+                None,
+            );
+            super::data::agg_kind_for_config(&config).operator_canonical_string()
+                == actual.operator_canonical_string()
+        }
+        SummaryOperator::ExactAgg {
+            agg_type,
+            parameters_canonical,
+        } => matches!(actual,
+            AggKind::ExactAgg { agg_type: actual, parameters_canonical: parameters, .. } if actual == agg_type && parameters == parameters_canonical),
+        SummaryOperator::LegacyPartial { operator_canonical } => {
+            actual.operator_canonical_string() == *operator_canonical
+        }
+        // Bound runtime plans carry the complete Configured state contract.
+        SummaryOperator::Sketch { .. } => false,
+    }
+}
+
 /// Runtime foreign-key binding from one SeriesId to shared descriptors. Every pane
 /// row stored under the SeriesId is a Summary Instance: `(binding, interval,
 /// group-values, state)`. Descriptor references are normalized here instead of
 /// copied into every pane row.
 #[derive(Debug, Clone)]
 pub struct SdsBinding {
+    pub stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
     pub metadata: Arc<SummarySeriesMetadata>,
     pub summary_descriptor: Arc<SummaryDescriptor>,
     pub data_descriptor: Arc<DataDescriptor>,
@@ -156,15 +199,19 @@ impl SummaryDescriptorRegistry {
                     "materialization identity is required by the installed SummaryCatalog".into(),
                 );
             }
-            let materialization = asap_types::sds::SummaryDefinitionId::from(metadata.policy_fp);
-            let identity = catalog.definitions.get(&materialization).ok_or_else(|| {
+            let materialization = asap_types::sds::StoredOutputId::from(metadata.policy_fp);
+            let identity = catalog.outputs.get(&materialization).ok_or_else(|| {
                 format!(
                     "materialization {} is absent from the installed SummaryCatalog",
                     materialization.as_u64()
                 )
             })?;
+            let summary = &catalog.summary_descriptors[&identity.summary_descriptor_id];
+            if !operator_matches(summary, &metadata.agg_kind) {
+                return Err("stored output state format differs from installed definition".into());
+            }
             Some((
-                catalog.summary_descriptors[&identity.summary_descriptor_id].clone(),
+                summary.clone(),
                 catalog.data_descriptors[&identity.data_descriptor_id].clone(),
             ))
         } else {
@@ -205,7 +252,16 @@ impl SummaryDescriptorRegistry {
             }
         };
 
+        let stored_output_reference = authoritative
+            .as_ref()
+            .map(|(catalog, _)| {
+                catalog
+                    .output_reference(metadata.policy_fp.into())
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
         Ok(SdsBinding {
+            stored_output_reference,
             metadata: Arc::new(metadata),
             summary_descriptor,
             data_descriptor,
@@ -382,7 +438,7 @@ mod tests {
         let summary = SummaryDescriptor::new(
             SummaryOperator::ExactAgg {
                 agg_type: AggregationType::Sum,
-                parameters_canonical: "authoritative=true".into(),
+                parameters_canonical: "pane=5000;".into(),
             },
             FidelityGuarantee::Exact,
             1,
@@ -402,8 +458,14 @@ mod tests {
         let registry = SummaryDescriptorRegistry::default();
         registry.install_catalog(Arc::new(catalog)).unwrap();
 
+        assert!(
+            registry
+                .bind(metadata(1, "wrong-local-copy", "", AggregationType::Max, 7))
+                .is_err(),
+            "an output ID must not authorize a different state family"
+        );
         let binding = registry
-            .bind(metadata(1, "wrong-local-copy", "", AggregationType::Max, 7))
+            .bind(metadata(1, "cpu", "", AggregationType::Sum, 7))
             .unwrap();
         assert_eq!(binding.summary_descriptor.as_ref(), &summary);
         assert_eq!(binding.data_descriptor.as_ref(), &data);

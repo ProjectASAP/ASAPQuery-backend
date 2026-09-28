@@ -6,31 +6,22 @@ use std::fs::File;
 use std::io::BufReader;
 use std::ops::Index;
 
-use asap_types::enums::QueryLanguage;
-use asap_types::{AggregationConfig, MonitorSpec, PolicyRegistry};
+use asap_types::{MonitorSpec, PolicyRegistry, PrecomputeMaterialization};
 
 use super::storage_backend::StorageBackend;
 
-/// The backend's active streaming policy config: every `AggregationConfig`
-/// currently pushed by the controller, plus the storage-backend pin and CDM
-/// monitor specs.
-///
-/// Formerly `asap_types::streaming_config::StreamingConfig` — moved here
-/// (see `scratchpad/artifacts/enum-unification-plan.md`) because
-/// `control_plane` never actually depended on this type: its own
-/// `StreamingConfigEmitter` hand-builds wire-compatible JSON independently,
-/// and `PolicyRegistry::from_streaming_config` (the only thing that made
-/// `asap_types::PolicyRegistry` -- genuinely shared -- look coupled to this
-/// type) had exactly one real caller, this struct's own `policy_registry()`
-/// method below. `asap_types` keeps the lower-level `PolicyRegistry::
-/// from_configs` primitive this method now calls directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// DAG installation plus a derived in-memory routing index. The flat index is
+/// never serialized as executable configuration. Raw programs are validated
+/// and shared once per installed producer across all of its population states.
+#[derive(Debug, Clone, Serialize)]
 pub struct StreamingConfig {
-    #[serde(
-        rename = "aggregation_configs",
-        alias = "materializations_by_policy_fingerprint"
-    )]
-    pub materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig>,
+    #[serde(skip)]
+    pub(crate) raw_programs:
+        HashMap<u64, std::sync::Arc<crate::precompute_engine::raw_dag::RawDagProgram>>,
+    /// Authoritative execution configuration: Planner DAGs and physical bindings.
+    pub precompute_plan: Option<asap_types::precompute_plan::PrecomputePlan>,
+    #[serde(skip)]
+    pub materializations_by_policy_fingerprint: HashMap<u64, PrecomputeMaterialization>,
     /// Phase-5 capability-routing axis: which storage tier serves this
     /// per-metric runtime config. The controller pushes this when planning
     /// (see `docs/design-gorilla-s3-cold-engine.md` §8); pre-Phase-5
@@ -45,13 +36,58 @@ pub struct StreamingConfig {
     pub monitors: Vec<MonitorSpec>,
 }
 
+// Flat aggregation lists are deliberately not an accepted execution document.
+impl<'de> Deserialize<'de> for StreamingConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Document {
+            precompute_plan: asap_types::precompute_plan::PrecomputePlan,
+            #[serde(default)]
+            storage_backend: StorageBackend,
+            #[serde(default)]
+            monitors: Vec<MonitorSpec>,
+        }
+        let doc = Document::deserialize(deserializer)?;
+        let mut config =
+            Self::from_precompute_plan(doc.precompute_plan).map_err(serde::de::Error::custom)?;
+        config.storage_backend = doc.storage_backend;
+        config.monitors = doc.monitors;
+        Ok(config)
+    }
+}
+
 impl StreamingConfig {
-    pub fn new(materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig>) -> Self {
+    pub fn new(
+        materializations_by_policy_fingerprint: HashMap<u64, PrecomputeMaterialization>,
+    ) -> Self {
         Self {
+            raw_programs: HashMap::new(),
+            precompute_plan: None,
             materializations_by_policy_fingerprint,
             storage_backend: StorageBackend::default(),
             monitors: Vec::new(),
         }
+    }
+
+    /// Build the routing projection only after validating the DAG installation.
+    pub fn from_precompute_plan(plan: asap_types::precompute_plan::PrecomputePlan) -> Result<Self> {
+        let materializations = plan.runtime_materializations()?;
+        let mut programs = HashMap::new();
+        for config in materializations.values().filter(|c| {
+            c.derived_input.is_none()
+                && plan.ingest.protocol
+                    == asap_types::precompute_plan::IngestProtocol::PrometheusRemoteWriteV1
+        }) {
+            let program =
+                crate::precompute_engine::raw_dag::RawDagProgram::from_plan(&plan, config)
+                    .map_err(anyhow::Error::msg)?;
+            programs.insert(config.policy_fp_u64(), std::sync::Arc::new(program));
+        }
+        let mut view = Self::new(materializations);
+        view.precompute_plan = Some(plan);
+        view.raw_programs = programs;
+        Ok(view)
     }
 
     /// CDM monitor specs the data-plane coordinator should serve (may be empty).
@@ -63,10 +99,12 @@ impl StreamingConfig {
     /// Used by the controller-driven plan-push path; tests typically
     /// stay on `Self::new(...)` and let the default land.
     pub fn with_storage_backend(
-        materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig>,
+        materializations_by_policy_fingerprint: HashMap<u64, PrecomputeMaterialization>,
         storage_backend: StorageBackend,
     ) -> Self {
         Self {
+            raw_programs: HashMap::new(),
+            precompute_plan: None,
             materializations_by_policy_fingerprint,
             storage_backend,
             monitors: Vec::new(),
@@ -80,12 +118,15 @@ impl StreamingConfig {
         self.storage_backend
     }
 
-    pub fn get_aggregation_config(&self, aggregation_id: u64) -> Option<&AggregationConfig> {
+    pub fn get_aggregation_config(
+        &self,
+        aggregation_id: u64,
+    ) -> Option<&PrecomputeMaterialization> {
         self.materializations_by_policy_fingerprint
             .get(&aggregation_id)
     }
 
-    pub fn materializations(&self) -> &HashMap<u64, AggregationConfig> {
+    pub fn materializations(&self) -> &HashMap<u64, PrecomputeMaterialization> {
         &self.materializations_by_policy_fingerprint
     }
 
@@ -126,56 +167,12 @@ impl StreamingConfig {
     /// (operator-authored query→agg_ids YAML feeding a retention_map)
     /// is gone — the controller drives capability matching dynamically.
     pub fn from_yaml_data(data: &Value) -> Result<Self> {
-        let mut materializations_by_policy_fingerprint: HashMap<u64, AggregationConfig> =
-            HashMap::new();
-
-        if let Some(aggregations) = data.get("aggregations").and_then(|v| v.as_sequence()) {
-            for aggregation_data in aggregations {
-                // Retention comes from each aggregation entry; identity is derived from
-                // its configuration content.
-                let num_aggregates_to_retain = aggregation_data
-                    .get("numAggregatesToRetain")
-                    .and_then(|v| v.as_u64());
-                let config = AggregationConfig::from_yaml_data(
-                    aggregation_data,
-                    num_aggregates_to_retain,
-                    QueryLanguage::PromQl,
-                )?;
-                if !config.population_key_encoding.is_legacy() {
-                    anyhow::bail!(
-                        "legacy streaming input does not support this population key encoding"
-                    );
-                }
-                if config.derived_input.is_some() {
-                    anyhow::bail!(
-                        "legacy streaming input cannot execute a derived summary program"
-                    );
-                }
-                // PR 5: the map key IS the policy-fingerprint u64.
-                // `AggregationConfig::policy_fp_u64()` is the canonical
-                // accessor for this value.
-                materializations_by_policy_fingerprint.insert(config.policy_fp_u64(), config);
-            }
-        }
-
-        let mut config = Self::new(materializations_by_policy_fingerprint);
-        // Continuous-monitoring (CDM) specs: a top-level `monitors:` array, each
-        // entry deserializing into a MonitorSpec. Absent → empty (the common
-        // case). The data-plane monitor coordinator reads these.
-        if let Some(monitors) = data.get("monitors").and_then(|v| v.as_sequence()) {
-            for m in monitors {
-                let spec: MonitorSpec = serde_yaml::from_value(m.clone()).map_err(|e| {
-                    anyhow::anyhow!("invalid monitor spec in streaming-config: {e}")
-                })?;
-                config.monitors.push(spec);
-            }
-        }
-        Ok(config)
+        serde_yaml::from_value(data.clone()).map_err(Into::into)
     }
 }
 
 impl Index<u64> for StreamingConfig {
-    type Output = AggregationConfig;
+    type Output = PrecomputeMaterialization;
 
     fn index(&self, aggregation_id: u64) -> &Self::Output {
         &self.materializations_by_policy_fingerprint[&aggregation_id]
@@ -190,7 +187,7 @@ impl Default for StreamingConfig {
 
 impl StreamingConfig {
     #[deprecated(note = "Use materializations")]
-    pub fn get_all_aggregation_configs(&self) -> &HashMap<u64, AggregationConfig> {
+    pub fn get_all_aggregation_configs(&self) -> &HashMap<u64, PrecomputeMaterialization> {
         self.materializations()
     }
 }
@@ -199,153 +196,16 @@ impl StreamingConfig {
 mod tests {
     use super::*;
 
-    /// Pre-Phase-5 deploys serialize `StreamingConfig` without the
-    /// `storage_backend` field; deserialize must default to `SketchStore`
-    /// so the router keeps dispatching to `ASAPQueryEngine` unchanged.
+    // Old flat lists cannot become execution authority through JSON or YAML.
     #[test]
-    fn deserialize_legacy_yaml_defaults_to_asap_tier() {
-        let yaml = "{\"aggregation_configs\":{}}";
-        let cfg: StreamingConfig = serde_json::from_str(yaml).expect("legacy decode");
-        assert_eq!(cfg.storage_backend(), StorageBackend::SketchStore);
-    }
-
-    #[test]
-    fn deserialize_with_explicit_double_write_pin() {
-        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"double_write\"}";
-        let cfg: StreamingConfig = serde_json::from_str(yaml).expect("Phase-5 decode");
-        assert_eq!(cfg.storage_backend(), StorageBackend::DoubleWrite);
-    }
-
-    /// #746 deleted the archive tier; its storage-axis spelling is no longer
-    /// a known variant, so a stale config naming it fails to decode rather
-    /// than silently pinning some other tier.
-    #[test]
-    fn deserialize_rejects_the_removed_archive_axis() {
-        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_object_store\"}";
-        assert!(serde_json::from_str::<StreamingConfig>(yaml).is_err());
-    }
-
-    #[test]
-    fn legacy_yaml_rejects_derived_summary_input() {
-        let data = serde_yaml::from_str::<Value>(&format!(
-            "aggregations:\n- aggregationType: Sum\n  aggregationSubType: ''\n  metric: outer\n  labels: {{grouping: [], rollup: [], aggregated: []}}\n  parameters: {{}}\n  windowSize: 10\n  windowType: tumbling\n  spatialFilter: ''\n  derived_input:\n    inputs: [1]\n    program_sha256: '{}'\n", "a".repeat(64)
-        )).unwrap();
-        let error = StreamingConfig::from_yaml_data(&data).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("legacy streaming input cannot execute"));
-    }
-
-    #[test]
-    fn legacy_yaml_rejects_canonical_population_key_encoding() {
-        let data: Value = serde_yaml::from_str(
-            r#"
-aggregations:
-- aggregationType: Sum
-  aggregationSubType: ''
-  metric: m
-  population_key_encoding: canonical_labels_v1
-  labels:
-    grouping: [host]
-    rollup: []
-    aggregated: []
-  parameters: {}
-  windowSize: 60
-  windowType: tumbling
-  spatialFilter: ''
-"#,
-        )
-        .unwrap();
-        let error = StreamingConfig::from_yaml_data(&data).unwrap_err();
-        assert!(
-            error.to_string().contains("population key encoding"),
-            "{error}"
-        );
-    }
-
-    /// PR 5: a streaming-config YAML that omits `aggregationId`
-    /// parses correctly — the backend derives identity from content
-    /// via `PolicyFingerprint::from_config`. The map key is the
-    /// fingerprint's u64 form.
-    #[test]
-    fn from_yaml_data_accepts_entry_without_aggregation_id() {
-        let yaml = "\
-aggregations:\n\
-- aggregationType: DDSketch\n  aggregationSubType: ''\n  metric: cpu_seconds\n  labels:\n    grouping: [host]\n    rollup: []\n    aggregated: []\n  parameters:\n    relative_accuracy: 0.01\n  windowSize: 30\n  windowType: tumbling\n  spatialFilter: ''\n";
-        let data: Value = serde_yaml::from_str(yaml).expect("yaml ok");
-        let cfg = StreamingConfig::from_yaml_data(&data).expect("decode without id");
-        assert_eq!(cfg.materializations_by_policy_fingerprint.len(), 1);
-        let (k, v) = cfg
-            .materializations_by_policy_fingerprint
-            .iter()
-            .next()
-            .unwrap();
-        assert_ne!(*k, 0, "derived id is not the 0 sentinel");
-        assert_eq!(*k, v.policy_fp_u64(), "map key equals fingerprint u64");
-        assert_eq!(v.metric, "cpu_seconds");
-    }
-
-    /// PR 5: a streaming-config YAML that still spells out
-    /// `aggregationId: N` parses the SAME as one without — the field
-    /// is silently dropped.
-    #[test]
-    fn from_yaml_data_ignores_explicit_aggregation_id() {
-        let with = "\
-aggregations:\n\
-- aggregationId: 42\n  aggregationType: DDSketch\n  aggregationSubType: ''\n  metric: cpu_seconds\n  labels:\n    grouping: [host]\n    rollup: []\n    aggregated: []\n  parameters:\n    relative_accuracy: 0.01\n  windowSize: 30\n  windowType: tumbling\n  spatialFilter: ''\n";
-        let without = "\
-aggregations:\n\
-- aggregationType: DDSketch\n  aggregationSubType: ''\n  metric: cpu_seconds\n  labels:\n    grouping: [host]\n    rollup: []\n    aggregated: []\n  parameters:\n    relative_accuracy: 0.01\n  windowSize: 30\n  windowType: tumbling\n  spatialFilter: ''\n";
-        let w: Value = serde_yaml::from_str(with).expect("with yaml ok");
-        let wo: Value = serde_yaml::from_str(without).expect("without yaml ok");
-        let cw = StreamingConfig::from_yaml_data(&w).expect("with");
-        let cwo = StreamingConfig::from_yaml_data(&wo).expect("without");
-        let (kw, _) = cw
-            .materializations_by_policy_fingerprint
-            .iter()
-            .next()
-            .unwrap();
-        let (kwo, _) = cwo
-            .materializations_by_policy_fingerprint
-            .iter()
-            .next()
-            .unwrap();
-        assert_eq!(
-            kw, kwo,
-            "explicit aggregationId in YAML must not change identity"
-        );
-        assert_ne!(
-            *kw, 42,
-            "the explicit value must NOT leak through as the map key"
-        );
-    }
-
-    #[test]
-    fn from_yaml_data_parses_monitors_section() {
-        // CDM monitor specs: a top-level `monitors:` array must populate
-        // StreamingConfig.monitors (the data-plane coordinator reads these).
-        let yaml = "\
-aggregations: []\n\
-monitors:\n\
-- agg_id: 16346598078036168951\n  key: \"\"\n  tau: 5000.0\n  epsilon: 0.05\n  window_ms: 10000\n";
-        let data: Value = serde_yaml::from_str(yaml).expect("yaml ok");
-        let cfg = StreamingConfig::from_yaml_data(&data).expect("decode monitors");
-        assert_eq!(cfg.monitors().len(), 1, "monitors: section must be parsed");
-        let m = &cfg.monitors()[0];
-        assert_eq!(m.agg_id, 16346598078036168951);
-        assert_eq!(m.tau, 5000.0);
-        assert_eq!(m.window_ms, 10000);
-        assert_eq!(m.epsilon, 0.05);
-    }
-
-    #[test]
-    fn from_yaml_data_absent_monitors_is_empty() {
-        let yaml = "aggregations: []\n";
-        let data: Value = serde_yaml::from_str(yaml).expect("yaml ok");
-        let cfg = StreamingConfig::from_yaml_data(&data).expect("decode");
-        assert!(
-            cfg.monitors().is_empty(),
-            "no monitors: → empty (byte-compat)"
-        );
+    fn rejects_flat_aggregation_documents() {
+        for text in [
+            r#"{"aggregation_configs":{}}"#,
+            "aggregations: []",
+            "aggregations: [{aggregationType: Sum, metric: m}]",
+        ] {
+            let yaml = serde_yaml::from_str(text).unwrap();
+            assert!(StreamingConfig::from_yaml_data(&yaml).is_err());
+        }
     }
 }

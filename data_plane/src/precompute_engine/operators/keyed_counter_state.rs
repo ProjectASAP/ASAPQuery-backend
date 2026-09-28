@@ -12,11 +12,11 @@ use asap_types::Statistic;
 /// Accumulator that maintains separate increase accumulators for multiple keys
 /// Allows tracking rate/increase for different label combinations
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MultipleIncreaseAccumulator {
+pub struct KeyedCounterState {
     pub increases: HashMap<KeyByLabelValues, IncreaseAccumulator>,
 }
 
-impl MultipleIncreaseAccumulator {
+impl KeyedCounterState {
     pub fn new() -> Self {
         Self {
             increases: HashMap::new(),
@@ -91,13 +91,13 @@ impl MultipleIncreaseAccumulator {
     }
 }
 
-impl Default for MultipleIncreaseAccumulator {
+impl Default for KeyedCounterState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SerializableToSink for MultipleIncreaseAccumulator {
+impl SerializableToSink for KeyedCounterState {
     fn serialize_to_json(&self) -> Value {
         let entries: Vec<Value> = self
             .increases
@@ -135,13 +135,13 @@ impl SerializableToSink for MultipleIncreaseAccumulator {
     }
 }
 
-impl AggregateCore for MultipleIncreaseAccumulator {
+impl AggregateCore for KeyedCounterState {
     fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
         Box::new(self.clone())
     }
 
     fn type_name(&self) -> &'static str {
-        "MultipleIncreaseAccumulator"
+        "KeyedCounterState"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -156,20 +156,20 @@ impl AggregateCore for MultipleIncreaseAccumulator {
         &self,
         other: &dyn AggregateCore,
     ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error + Send + Sync>> {
-        // Check if other is also a MultipleIncreaseAccumulator
+        // Check if other is also a KeyedCounterState
         if other.get_accumulator_type() != self.get_accumulator_type() {
             return Err(format!(
-                "Cannot merge MultipleIncreaseAccumulator with {}",
+                "Cannot merge KeyedCounterState with {}",
                 other.get_accumulator_type()
             )
             .into());
         }
 
-        // Downcast to MultipleIncreaseAccumulator
+        // Downcast to KeyedCounterState
         let other_multiple_increase = other
             .as_any()
-            .downcast_ref::<MultipleIncreaseAccumulator>()
-            .ok_or("Failed to downcast to MultipleIncreaseAccumulator")?;
+            .downcast_ref::<KeyedCounterState>()
+            .ok_or("Failed to downcast to KeyedCounterState")?;
 
         // Clone self once, then merge each matching counter with the same
         // reset-aware, boundary-aware implementation used by the unkeyed path.
@@ -189,7 +189,7 @@ impl AggregateCore for MultipleIncreaseAccumulator {
     }
 
     fn get_accumulator_type(&self) -> AggregationType {
-        AggregationType::MultipleIncrease
+        AggregationType::Increase
     }
 
     fn approx_memory_bytes(&self) -> usize {
@@ -210,14 +210,12 @@ impl AggregateCore for MultipleIncreaseAccumulator {
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         use crate::storage_engines::types::MultipleSubpopulationAggregate;
-        let key_val = key
-            .as_ref()
-            .ok_or("Key required for MultipleIncreaseAccumulator")?;
+        let key_val = key.as_ref().ok_or("Key required for KeyedCounterState")?;
         self.query(statistic, key_val, Some(query_kwargs))
     }
 }
 
-impl MultipleSubpopulationAggregate for MultipleIncreaseAccumulator {
+impl MultipleSubpopulationAggregate for KeyedCounterState {
     fn query(
         &self,
         statistic: Statistic,
@@ -227,7 +225,7 @@ impl MultipleSubpopulationAggregate for MultipleIncreaseAccumulator {
         let data = self
             .increases
             .get(key)
-            .ok_or_else(|| format!("Key {key} not found in MultipleIncreaseAccumulator"))?;
+            .ok_or_else(|| format!("Key {key} not found in KeyedCounterState"))?;
 
         data.query(statistic, query_kwargs)
     }
@@ -237,15 +235,15 @@ impl MultipleSubpopulationAggregate for MultipleIncreaseAccumulator {
     }
 }
 
-impl MergeableAccumulator<MultipleIncreaseAccumulator> for MultipleIncreaseAccumulator {
+impl MergeableAccumulator<KeyedCounterState> for KeyedCounterState {
     fn merge_accumulators(
-        accumulators: Vec<MultipleIncreaseAccumulator>,
-    ) -> Result<MultipleIncreaseAccumulator, Box<dyn std::error::Error + Send + Sync>> {
+        accumulators: Vec<KeyedCounterState>,
+    ) -> Result<KeyedCounterState, Box<dyn std::error::Error + Send + Sync>> {
         if accumulators.is_empty() {
             return Err("No accumulators to merge".into());
         }
 
-        let mut result = MultipleIncreaseAccumulator::new();
+        let mut result = KeyedCounterState::new();
 
         for accumulator in accumulators {
             for (key, data) in accumulator.increases {
@@ -291,14 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_increase_accumulator_creation() {
-        let acc = MultipleIncreaseAccumulator::new();
+    fn test_keyed_counter_state_creation() {
+        let acc = KeyedCounterState::new();
         assert!(acc.increases.is_empty());
     }
 
     #[test]
-    fn test_multiple_increase_accumulator_update() {
-        let mut acc = MultipleIncreaseAccumulator::new();
+    fn test_keyed_counter_state_update() {
+        let mut acc = KeyedCounterState::new();
 
         let key1 = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
 
@@ -316,8 +314,8 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_increase_accumulator_query() {
-        let mut acc = MultipleIncreaseAccumulator::new();
+    fn test_keyed_counter_state_query() {
+        let mut acc = KeyedCounterState::new();
 
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
 
@@ -344,14 +342,14 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_increase_accumulator_sum_per_key() {
-        // `sum by (zone) (counter)` reaches MultipleIncreaseAccumulator
+    fn test_keyed_counter_state_sum_per_key() {
+        // `sum by (zone) (counter)` reaches KeyedCounterState
         // only when the ASAP-tier ingest groups multiple series under
         // a single accumulator (the `Multiple*` variant). In that case
         // each per-key Sum should be the series' latest cumulative
         // value; the engine's outer `by` aggregation does the cross-key
         // grouping. (Issue ProjectASAP/ASAPCollector#46.)
-        let mut acc = MultipleIncreaseAccumulator::new();
+        let mut acc = KeyedCounterState::new();
         let east = KeyByLabelValues::new_with_labels(vec!["us-east-1".to_string()]);
         let west = KeyByLabelValues::new_with_labels(vec!["us-west-2".to_string()]);
 
@@ -369,9 +367,9 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_increase_accumulator_merge() {
-        let mut acc1 = MultipleIncreaseAccumulator::new();
-        let mut acc2 = MultipleIncreaseAccumulator::new();
+    fn test_keyed_counter_state_merge() {
+        let mut acc1 = KeyedCounterState::new();
+        let mut acc2 = KeyedCounterState::new();
 
         let key1 = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
 
@@ -387,7 +385,7 @@ mod tests {
             create_test_increase_accumulator_with_time(15.0, 2000, 30.0, 3000),
         ); // Later time range
 
-        let merged = MultipleIncreaseAccumulator::merge_accumulators(vec![acc1, acc2]).unwrap();
+        let merged = KeyedCounterState::merge_accumulators(vec![acc1, acc2]).unwrap();
 
         assert_eq!(merged.increases.len(), 2);
         assert!(merged.increases.contains_key(&key1));
@@ -400,8 +398,8 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_increase_accumulator_serialization() {
-        let mut acc = MultipleIncreaseAccumulator::new();
+    fn test_keyed_counter_state_serialization() {
+        let mut acc = KeyedCounterState::new();
 
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
         let second_key = KeyByLabelValues::new_with_labels(vec!["api".to_string()]);
@@ -415,7 +413,7 @@ mod tests {
 
         // Test JSON serialization
         let json_value = acc.serialize_to_json();
-        let deserialized = MultipleIncreaseAccumulator::deserialize_from_json(&json_value).unwrap();
+        let deserialized = KeyedCounterState::deserialize_from_json(&json_value).unwrap();
 
         assert_eq!(deserialized.increases.len(), 2);
         let deserialized_acc = deserialized.increases.get(&key).unwrap();
@@ -425,8 +423,7 @@ mod tests {
 
         // Test binary serialization
         let bytes = acc.serialize_to_bytes();
-        let deserialized_bytes =
-            MultipleIncreaseAccumulator::deserialize_from_bytes(&bytes).unwrap();
+        let deserialized_bytes = KeyedCounterState::deserialize_from_bytes(&bytes).unwrap();
 
         assert_eq!(deserialized_bytes.increases.len(), 2);
         let deserialized_acc_bytes = deserialized_bytes.increases.get(&key).unwrap();
@@ -445,8 +442,8 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_increase_accumulator_get_keys() {
-        let mut acc = MultipleIncreaseAccumulator::new();
+    fn test_keyed_counter_state_get_keys() {
+        let mut acc = KeyedCounterState::new();
 
         let key1 = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
         let key2 = KeyByLabelValues::new_with_labels(vec!["api".to_string()]);
@@ -462,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_trait_object() {
-        let mut acc = MultipleIncreaseAccumulator::new();
+        let mut acc = KeyedCounterState::new();
         let key = KeyByLabelValues::new();
         acc.update(key.clone(), create_test_increase_accumulator(10.0, 25.0));
 
@@ -477,7 +474,7 @@ mod tests {
     }
 
     // #[test]
-    // fn test_multiple_increase_accumulator_arroyo_deserialization() {
+    // fn test_keyed_counter_state_arroyo_deserialization() {
     //     // Create test data in Arroyo MessagePack format
     //     // Format: {key: [starting_value, starting_timestamp, last_seen_value, last_seen_timestamp]}
     //     let mut test_data = std::collections::HashMap::new();
@@ -489,7 +486,7 @@ mod tests {
 
     //     // Test Arroyo deserialization
     //     let deserialized_acc =
-    //         MultipleIncreaseAccumulator::deserialize_from_bytes_arroyo(&arroyo_buffer).unwrap();
+    //         KeyedCounterState::deserialize_from_bytes_arroyo(&arroyo_buffer).unwrap();
 
     //     // Verify the deserialized accumulator has the correct data
     //     assert_eq!(deserialized_acc.increases.len(), 2);

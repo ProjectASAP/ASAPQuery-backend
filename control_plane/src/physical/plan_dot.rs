@@ -154,7 +154,7 @@ fn query_node_label(node: &QueryPlanNode) -> String {
         QueryPlanNode::SummaryEstimate { query, .. } => format!("SummaryEstimate\n{query:?}"),
         QueryPlanNode::ExactReadout { readout, .. } => format!("ExactReadout\n{readout:?}"),
         QueryPlanNode::SummaryMerge { .. } => "SummaryMerge".into(),
-        QueryPlanNode::CandidateTopK { k, .. } => format!("CandidateTopK\nk={k}"),
+        QueryPlanNode::MembershipFilter { .. } => "MembershipFilter".into(),
         QueryPlanNode::ExternalExact { .. } => "ExternalExact".into(),
         QueryPlanNode::ExactFallback { reason } => format!("ExactFallback\n{reason}"),
     }

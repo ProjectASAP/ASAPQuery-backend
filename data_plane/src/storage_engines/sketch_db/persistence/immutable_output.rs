@@ -34,6 +34,7 @@ fn validate_identity(current: &SidMetaRecord, record: &SidMetaRecord) -> Persist
         || current.removed
         || current.retired_at_ms.is_some()
         || current.expires_at_ms.is_some()
+        || current.stored_output_id != record.stored_output_id
         || current.summary_definition_id != record.summary_definition_id
         || current.catalog_generation != record.catalog_generation
         || current.metric_name != record.metric_name

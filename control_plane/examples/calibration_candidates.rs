@@ -37,17 +37,6 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 vec![lhs, rhs],
                 json!({"operator_debug":format!("{operator:?}"),"timing_debug":format!("{timing:?}")}),
             ),
-            SummaryExpr::CandidateTopK {
-                candidates,
-                values,
-                k,
-                grouping,
-                completeness,
-            } => (
-                "CandidateTopK",
-                vec![candidates, values],
-                json!({"k":k,"grouping_debug":format!("{grouping:?}"),"completeness_debug":format!("{completeness:?}")}),
-            ),
             SummaryExpr::ValueOperation {
                 child,
                 operation,
@@ -84,10 +73,11 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 right,
                 kind,
                 pred,
+                pruning,
             } => (
                 "RelationalJoin",
                 vec![left, right],
-                json!({"kind_debug":format!("{kind:?}"),"predicate_debug":format!("{pred:?}")}),
+                json!({"kind_debug":format!("{kind:?}"),"predicate_debug":format!("{pred:?}"), "pruning_debug":format!("{pruning:?}")}),
             ),
             SummaryExpr::SummarySubtract { left, right } => {
                 ("SummarySubtract", vec![left, right], json!({}))
@@ -105,7 +95,7 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 vec![summary_input],
                 json!({"query_debug":format!("{query:?}")}),
             ),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 ("SummaryMerge", children.iter().collect(), json!({}))
             }
         };

@@ -101,11 +101,10 @@ pub struct PlanEnvelope {
     pub capability_snapshot_id: String,
 }
 
-/// Backend-side materialization projection consumed by the streaming
-/// precompute engine. This is deliberately config-driven: it contains no
-/// PromQL string or ad-hoc scheduler job. The aggregation definitions are
-/// emitted to `/api/v1/streaming-config`, where the runtime matches incoming
-/// series, maintains windows, and writes content-addressed materializations.
+/// DAG-format precompute installation. Planner node payloads and dependency
+/// edges define execution; materializations attach storage/window placement.
+/// Raw source-to-SummaryAgg paths lower to streaming kernels. Derived paths
+/// execute through the maintenance DAG scheduler at stored-state frontiers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,12 +138,14 @@ pub enum TimestampUnit {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IngestContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_identity: Option<planner_types::post_asap::LogicalDatasetIdentity>,
     pub protocol: IngestProtocol,
     pub endpoint_path: String,
     pub timestamp_unit: TimestampUnit,
     pub require_plan_identity: bool,
     #[serde(alias = "require_materialization_identity")]
-    pub require_summary_definition_identity: bool,
+    pub require_stored_output_identity: bool,
     pub require_registered_producer: bool,
 }
 
@@ -154,6 +155,8 @@ pub enum StateEncoding {
     SketchlibProtobufV1,
     SketchCoreMsgpackV1,
     ExactAccumulatorV1,
+    /// Persisted backend state with explicit Planner family and population layout.
+    PlannerExactAccumulatorV1,
     ExactCounterAccumulatorV2,
 }
 
@@ -222,7 +225,7 @@ pub struct StateSchemaContract {
     pub stored_output_reference: crate::sds::StoredOutputReference,
     pub schema_id: String,
     pub schema_version: u32,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub family: StateFamilyContract,
     pub source: Source,
     #[serde(
@@ -256,7 +259,7 @@ pub struct StateWindowContract {
 pub struct ProducerContract {
     pub producer_id: String,
     pub collector_id: String,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub schema_id: String,
     /// Authoritative partitions for completion barriers. Empty legacy contracts
     /// authorize state ingestion only, never completion claims.
@@ -334,7 +337,7 @@ impl PrecomputePlan {
                 );
                 let value_projection = materialization.effective_value_projection().clone();
                 Ok(StateSchemaContract {
-                    stored_output_reference: crate::sds::StoredOutputReference::for_definition(
+                    stored_output_reference: crate::sds::StoredOutputReference::for_output(
                         fingerprint.into(),
                     ),
                     schema_id: state_schema_id(fingerprint),
@@ -372,25 +375,31 @@ impl PrecomputePlan {
                 })
             })
             .collect();
+        let dataset_identity = materializations
+            .iter()
+            .filter_map(|m| m.semantic_fragment.as_ref()?.dataset_identity.clone())
+            .next();
         let plan = Self {
             summary_catalog: None,
             envelope,
             ingest: if backend_local {
                 IngestContract {
+                    dataset_identity: dataset_identity.clone(),
                     protocol: IngestProtocol::PrometheusRemoteWriteV1,
                     endpoint_path: "/api/v1/write".into(),
                     timestamp_unit: TimestampUnit::UnixMilliseconds,
                     require_plan_identity: false,
-                    require_summary_definition_identity: false,
+                    require_stored_output_identity: false,
                     require_registered_producer: false,
                 }
             } else {
                 IngestContract {
+                    dataset_identity: dataset_identity.clone(),
                     protocol: IngestProtocol::ModifiedOtlpMetricsV1,
                     endpoint_path: "/v1/metrics".into(),
                     timestamp_unit: TimestampUnit::UnixNanoseconds,
                     require_plan_identity: true,
-                    require_summary_definition_identity: true,
+                    require_stored_output_identity: true,
                     require_registered_producer: true,
                 }
             },
@@ -438,7 +447,7 @@ impl PrecomputePlan {
     /// monotonic progress. The runtime must enforce those before accepting it.
     pub fn validate_watermark_scope(
         &self,
-        materialization: crate::sds::SummaryDefinitionId,
+        materialization: crate::sds::StoredOutputId,
         barrier: &crate::sds::SummaryWatermarkBarrier,
     ) -> Result<(), PrecomputePlanError> {
         self.validate()?;
@@ -468,19 +477,36 @@ impl PrecomputePlan {
     }
 
     pub fn validate(&self) -> Result<(), PrecomputePlanError> {
+        if let Some(dataset) = &self.ingest.dataset_identity {
+            dataset
+                .validate()
+                .map_err(PrecomputePlanError::CatalogContract)?;
+        }
+        for materialization in &self.materializations {
+            if let Some(fragment) = &materialization.semantic_fragment {
+                fragment
+                    .validate()
+                    .map_err(PrecomputePlanError::CatalogContract)?;
+                if fragment.dataset_identity != self.ingest.dataset_identity {
+                    return Err(PrecomputePlanError::CatalogContract(
+                        "semantic dataset differs from installed input binding".into(),
+                    ));
+                }
+            }
+        }
         let valid_ingest = match self.ingest.protocol {
             IngestProtocol::ModifiedOtlpMetricsV1 => {
                 self.ingest.endpoint_path == "/v1/metrics"
                     && self.ingest.timestamp_unit == TimestampUnit::UnixNanoseconds
                     && self.ingest.require_plan_identity
-                    && self.ingest.require_summary_definition_identity
+                    && self.ingest.require_stored_output_identity
                     && self.ingest.require_registered_producer
             }
             IngestProtocol::PrometheusRemoteWriteV1 => {
                 self.ingest.endpoint_path == "/api/v1/write"
                     && self.ingest.timestamp_unit == TimestampUnit::UnixMilliseconds
                     && !self.ingest.require_plan_identity
-                    && !self.ingest.require_summary_definition_identity
+                    && !self.ingest.require_stored_output_identity
                     && !self.ingest.require_registered_producer
             }
         };
@@ -563,8 +589,8 @@ impl PrecomputePlan {
                     .map_err(PrecomputePlanError::CatalogContract)?;
                 for sink in &installed.binding.precompute_sinks {
                     if !matches!(installed.binding.node(*sink),
-                        Some(crate::executable_plan::BackendNodeBinding::Materialization { summary_definition })
-                        if summary_definition.fingerprint() == config.policy_fingerprint())
+                        Some(crate::executable_plan::BackendNodeBinding::Materialization { stored_output })
+                        if stored_output.fingerprint() == config.policy_fingerprint())
                     {
                         continue;
                     }
@@ -589,9 +615,9 @@ impl PrecomputePlan {
                         .iter()
                         .filter_map(|(node, binding)| match binding {
                             crate::executable_plan::BackendNodeBinding::Materialization {
-                                summary_definition,
-                            } if derived.inputs.contains(summary_definition) => {
-                                Some((*node, *summary_definition))
+                                stored_output,
+                            } if derived.inputs.contains(stored_output) => {
+                                Some((*node, *stored_output))
                             }
                             _ => None,
                         })
@@ -622,42 +648,39 @@ impl PrecomputePlan {
                             .filter(|edge| edge.consumer == id)
                             .collect();
                         use planner_types::post_asap::{
-                            ExecutableOperatorPayload as Payload, ExecutionTiming, ValueOperation,
+                            ExecutableOperatorPayload as Payload, ValueOperation,
                         };
                         if node.output_state
-                            != planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS
+                            != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
                         {
                             return Err(invalid());
                         }
                         match &node.payload {
                             Payload::Value {
                                 operation: ValueOperation::FinalizeExactAccumulator,
-                                timing: ExecutionTiming::MaintenanceTime,
                             } if children.len() == 1
                                 && frontiers.contains_key(&children[0].producer) => {}
-                            Payload::Binary {
-                                operator,
-                                timing: ExecutionTiming::MaintenanceTime,
-                            } if children.len() == 2
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Left
-                                    })
-                                    .count()
-                                    == 1
-                                && children
-                                    .iter()
-                                    .filter(|edge| {
-                                        edge.role == planner_types::post_asap::EdgeRole::Right
-                                    })
-                                    .count()
-                                    == 1
-                                && operator.vector_match.is_none()
-                                && matches!(
-                                    operator.kind,
-                                    planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
-                                ) =>
+                            Payload::Binary { operator }
+                                if children.len() == 2
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Left
+                                        })
+                                        .count()
+                                        == 1
+                                    && children
+                                        .iter()
+                                        .filter(|edge| {
+                                            edge.role == planner_types::post_asap::EdgeRole::Right
+                                        })
+                                        .count()
+                                        == 1
+                                    && operator.vector_match.is_none()
+                                    && matches!(
+                                        operator.kind,
+                                        planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+                                    ) =>
                             {
                                 pending.extend(children.iter().map(|edge| edge.producer));
                             }
@@ -686,7 +709,7 @@ impl PrecomputePlan {
                 .map_err(PrecomputePlanError::CatalogContract)?;
             for node in &dag.nodes {
                 let Some(crate::executable_plan::BackendNodeBinding::Materialization {
-                    summary_definition,
+                    stored_output,
                 }) = installed.binding.node(node.id)
                 else {
                     continue;
@@ -694,7 +717,7 @@ impl PrecomputePlan {
                 let Some(config) = self
                     .materializations
                     .iter()
-                    .find(|config| config.policy_fingerprint() == summary_definition.fingerprint())
+                    .find(|config| config.policy_fingerprint() == stored_output.fingerprint())
                 else {
                     return Err(PrecomputePlanError::CatalogContract(
                         "DAG materialization has no runtime configuration".into(),
@@ -798,8 +821,7 @@ impl PrecomputePlan {
                 || !stored_outputs.insert(schema.stored_output_reference.stored_output_id)
                 || schema.schema_version == 0
                 || schema.encodings.is_empty()
-                || schema.stored_output_reference.validate().is_err()
-                || schema.stored_output_reference.definition_id != schema.materialization
+                || schema.stored_output_reference.stored_output_id != schema.materialization
             {
                 return Err(PrecomputePlanError::InvalidSchema {
                     schema_id: schema.schema_id.clone(),
@@ -912,8 +934,14 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
             planner_types::post_asap::ExactKind::Increase
             | planner_types::post_asap::ExactKind::Rate,
             _,
-        ) => vec![StateEncoding::ExactCounterAccumulatorV2],
-        SummaryFamilyType::ExactAggregate(..) => vec![StateEncoding::ExactAccumulatorV1],
+        ) => vec![
+            StateEncoding::ExactCounterAccumulatorV2,
+            StateEncoding::PlannerExactAccumulatorV1,
+        ],
+        SummaryFamilyType::ExactAggregate(..) => vec![
+            StateEncoding::ExactAccumulatorV1,
+            StateEncoding::PlannerExactAccumulatorV1,
+        ],
         SummaryFamilyType::Sketch(kind, _)
             if matches!(
                 kind.algorithm(),
@@ -1016,7 +1044,7 @@ mod source_window_cohort_tests {
                 .validate_watermark_scope(materialization, &wrong)
                 .is_err());
         }
-        let other_materialization = crate::sds::SummaryDefinitionId(crate::PolicyFingerprint(
+        let other_materialization = crate::sds::StoredOutputId::from(crate::PolicyFingerprint(
             materialization.as_u64().wrapping_add(1),
         ));
         assert!(restored
@@ -1049,7 +1077,7 @@ mod source_window_cohort_tests {
                 reduction: Reduction::by(vec![]),
                 grouping: Default::default(),
             },
-            output_state: ExecutionDataState::MAINTENANCE_SUMMARY,
+            output_state: ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: vec![],
                 time_index: None,

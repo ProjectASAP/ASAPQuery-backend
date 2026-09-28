@@ -582,7 +582,7 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 }
 
 /// Resolve the bucket sid (and `policy_fp`) for a single data point
-/// against a single matching `AggregationConfig`.
+/// against a single matching `PrecomputeMaterialization`.
 ///
 /// B7.6 — sid is the bucket identity in the precompute engine; this
 /// helper folds `(config, grouping-label-values)` into a single u64 via
@@ -602,7 +602,7 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 /// their separate wire-level identity protocol.
 fn resolve_bucket_sid_for_agg_config(
     ingest_state: &Arc<IngestState>,
-    config: &asap_types::aggregation_config::AggregationConfig,
+    config: &asap_types::aggregation_config::PrecomputeMaterialization,
     point_labels: &HashMap<String, String>,
     captured_generation: Option<&asap_types::sds::CatalogGeneration>,
 ) -> Result<(u64, asap_types::PolicyFingerprint), String> {
@@ -1146,7 +1146,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                     } else {
                         None
                     };
-                    let series_key = format_series_key(&canonical_name, &dp.attrs);
+                    let series_key = bound_sketch_series_key(
+                        &canonical_name,
+                        &dp.attrs,
+                        frame_identity.as_ref(),
+                    );
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
                     // Sid resolution — registry-allocated, NOT content-
@@ -1260,7 +1264,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // policy".
                             spatial_filter_canonical: String::new(),
                         };
-                        let agg_kind_canonical = agg_kind.canonical_string();
+                        let agg_kind_canonical = match frame_identity.as_ref() {
+                            Some(frame) => format!(
+                                "{}|output:{}:{}:{}",
+                                agg_kind.canonical_string(),
+                                frame.plan_id,
+                                frame.plan_version,
+                                frame.materialization.as_u64()
+                            ),
+                            None => agg_kind.canonical_string(),
+                        };
                         let definition = frame_identity
                             .as_ref()
                             .map(|frame| frame.materialization)
@@ -1340,6 +1353,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     sketch_algorithm_for(&dp),
                                     &dp.container_config,
                                     &dp.attrs.keys().cloned().collect(),
+                                    Some(frame.materialization),
                                 )
                             });
                         if observed_policy != frame.materialization.fingerprint() {
@@ -1418,6 +1432,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 algorithm.clone(),
                                 &cfg,
                                 &group_by_keys,
+                                frame_identity.as_ref().map(|frame| frame.materialization),
                             );
                             // Per-item dimension (item_label) the controller threaded
                             // into the matched policy's parameters — recorded on the sid
@@ -1783,15 +1798,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // Detection is independent of the legacy dual-write
                     // (it only drives the routed/unconfigured accounting),
                     // so we walk it whether or not the worker push fires.
-                    let matching_configs: Vec<&asap_types::aggregation_config::AggregationConfig> =
-                        agg_configs
-                            .values()
-                            .filter(|config| {
-                                config.metric == canonical_name
-                                    || config.spatial_filter_normalized == canonical_name
-                                    || config.spatial_filter == canonical_name
-                            })
-                            .collect();
+                    let matching_configs: Vec<
+                        &asap_types::aggregation_config::PrecomputeMaterialization,
+                    > = agg_configs
+                        .values()
+                        .filter(|config| {
+                            config.metric == canonical_name
+                                || config.spatial_filter_normalized == canonical_name
+                                || config.spatial_filter == canonical_name
+                        })
+                        .collect();
                     let matched_any = !matching_configs.is_empty();
 
                     // CQ-2 — only pay the worker push (and the per-config
@@ -1869,7 +1885,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         routed += 1;
                     } else {
                         // CQ-6 — a decoded sketch that matched no
-                        // AggregationConfig in the running streaming config.
+                        // PrecomputeMaterialization in the running streaming config.
                         ingest_state
                             .observability
                             .dropped_unconfigured
@@ -1914,7 +1930,7 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// `AggregationType`. Inverse direction is in
 /// `sketch_algorithm_for` above. Used by
 /// [`derive_sketch_policy_fp`] to find the policy whose
-/// `AggregationConfig.aggregation_type` matches a freshly-ingested
+/// `PrecomputeMaterialization.aggregation_type` matches a freshly-ingested
 /// sketch.
 ///
 /// `Any` is a control-plane analysis-time wildcard — it doesn't
@@ -1991,38 +2007,47 @@ fn sketch_config_to_params(
     params
 }
 
-/// Look up the policy fingerprint for a freshly-ingested OTLP sketch
-/// by content-matching against the streaming-config registry.
-///
-/// Sketches arrive with `(metric, attrs, sketch_kind, sketch_config)`
-/// embedded in the DP but no policy reference. The matching pass:
-/// snapshots the current streaming config, derives a
-/// `PolicyRegistry`, and asks `find_policy_by_content` for the
-/// fingerprint of a policy whose contents match. Returns
-/// `PolicyFingerprint::UNSET` when:
-///   1. An unsupported planner algorithm reached this path
-///      (defensive — shouldn't happen).
-///   2. No policy in the registry matches.
-///   3. Multiple policies match (would-have-been-a-bug case;
-///      `find_policy_by_content` returns `None` on ambiguity).
-///
-/// Callers register the sid with the returned fp regardless of
-/// success — UNSET sids are simply absent from the policy_fp →
-/// {sids} reverse index, and remain reachable via the legacy
-/// `instances_matching(metric, gbk)` walk.
+// Snapshot and delta bases are scoped to the producer, never only its semantics.
+fn bound_sketch_series_key(
+    name: &str,
+    labels: &HashMap<String, String>,
+    frame: Option<&asap_types::producer_plan::SummaryFrameIdentity>,
+) -> String {
+    let key = format_series_key(name, labels);
+    match frame {
+        Some(frame) => format!(
+            "{}:{}:{}:{key}",
+            frame.plan_id,
+            frame.plan_version,
+            frame.materialization.as_u64()
+        ),
+        None => key,
+    }
+}
+
+/// Resolve the framed deployed output, then verify its content contract.
+/// Unframed input uses legacy content matching and must have exactly one match.
+/// An absent or ambiguous match returns UNSET and cannot authorize bound writes.
 fn derive_sketch_policy_fp(
     ingest_state: &IngestState,
     metric: &str,
     kind: crate::storage_engines::sketch_db::index::SketchAlgorithm,
     cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
     group_by_keys: &std::collections::BTreeSet<String>,
+    bound_output: Option<asap_types::sds::StoredOutputId>,
 ) -> asap_types::PolicyFingerprint {
     let Some(agg_type) = aggregation_type_for_sketch_algorithm(kind) else {
         return asap_types::PolicyFingerprint::UNSET;
     };
     let params = sketch_config_to_params(cfg);
     let snap = ingest_state.config_snapshot();
-    let index = asap_types::RoutingIndex::build(snap.policy_registry());
+    let registry = snap.policy_registry();
+    let registry = if let Some(output) = bound_output {
+        asap_types::PolicyRegistry::from_configs(registry.get(output.fingerprint()).cloned())
+    } else {
+        registry
+    };
+    let index = asap_types::RoutingIndex::build(registry);
     index
         .find_policy_by_content(metric, group_by_keys, agg_type, &params)
         .unwrap_or(asap_types::PolicyFingerprint::UNSET)
@@ -2303,7 +2328,7 @@ fn preflight_summary_frames(
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         } else {
-            let series_key = format_series_key(canonical_name, &dp.attrs);
+            let series_key = bound_sketch_series_key(canonical_name, &dp.attrs, Some(&frame));
             let (mut base, base_window_start) = ingest_state
                 .sketch_snapshots
                 .get(&series_key)
@@ -2352,6 +2377,7 @@ fn preflight_summary_frames(
                 sketch_algorithm_for(&dp),
                 &dp.container_config,
                 &dp.attrs.keys().cloned().collect(),
+                Some(frame.materialization),
             )
         };
         if observed != frame.materialization.fingerprint() {
@@ -3415,7 +3441,7 @@ mod policy_fp_lookup_tests {
     fn sketch_config_to_params_uses_canonical_keys() {
         // The param-name vocabulary must match what the control plane
         // writes in streaming-config YAML (see
-        // `asap_types::aggregation_config::AggregationConfig::from_yaml_data`).
+        // `asap_types::aggregation_config::PrecomputeMaterialization::from_yaml_data`).
         // Drift surfaces as `find_policy_by_content` missing matches.
         let dd = sketch_config_to_params(&SketchConfig::DDSketch {
             relative_accuracy: 0.01,
@@ -4516,7 +4542,7 @@ mod sid_bucketing_tests {
         metric::Data, number_data_point::Value as NumberValue, Gauge as PbGauge,
         Metric as PbMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
     };
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -4533,8 +4559,8 @@ mod sid_bucketing_tests {
         }
     }
 
-    fn sum_agg_config(metric: &str, grouping: &[&str]) -> AggregationConfig {
-        AggregationConfig::new(
+    fn sum_agg_config(metric: &str, grouping: &[&str]) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             AggregationType::SingleSubpopulation,
             "Sum".to_string(),
             HashMap::new(),

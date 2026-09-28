@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::storage_engines::types::StreamingConfig;
-use asap_types::aggregation_config::AggregationConfig;
+use asap_types::aggregation_config::PrecomputeMaterialization;
 
 use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
 use crate::storage_engines::sketch_db::index::SketchStore;
@@ -87,7 +87,7 @@ pub fn reconcile_from_streaming_config(
         }
         // `live_signatures` is built exclusively from
         // `signature_from_agg_config`, which canonicalizes every
-        // streaming-config `AggregationConfig` to an `AggKind::ExactAgg`
+        // streaming-config `PrecomputeMaterialization` to an `AggKind::ExactAgg`
         // signature (`P`-prefixed). An `AggKind::Sketch` sid (OTLP
         // modified-sketch ingest path: KLL / HLL / DDSketch / CMS /
         // CountSketch) always produces an `S`-prefixed signature, so it
@@ -166,7 +166,7 @@ fn signature_into(
     }
 }
 
-fn signature_from_agg_config(cfg: &AggregationConfig) -> Vec<u8> {
+fn signature_from_agg_config(cfg: &PrecomputeMaterialization) -> Vec<u8> {
     let agg_kind = AggKind::ExactAgg {
         agg_type: cfg.aggregation_type,
         parameters_canonical: canonical_parameters(&cfg.parameters),
@@ -264,7 +264,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -276,8 +276,8 @@ mod tests {
         metric: &str,
         agg_type: AggregationType,
         group_by: Vec<&str>,
-    ) -> AggregationConfig {
-        AggregationConfig::new(
+    ) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             agg_type,
             String::new(),
             HashMap::new(),
@@ -321,7 +321,7 @@ mod tests {
         }
     }
 
-    fn streaming(configs: Vec<AggregationConfig>) -> StreamingConfig {
+    fn streaming(configs: Vec<PrecomputeMaterialization>) -> StreamingConfig {
         let mut map = HashMap::new();
         for (i, c) in configs.into_iter().enumerate() {
             map.insert(i as u64 + 1, c);
