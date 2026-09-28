@@ -6840,6 +6840,11 @@ pub(crate) mod tests {
         let selected = match &selected_root.expr {
             SummaryExpr::SummaryEstimate { summary_input, .. } => summary_input.clone(),
             SummaryExpr::SummaryAgg { .. } => selected_root.clone(),
+            SummaryExpr::ValueOperation {
+                child,
+                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                ..
+            } => child.clone(),
             _ => panic!("expected maintained aggregate fixture"),
         };
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
@@ -7043,15 +7048,6 @@ pub(crate) mod tests {
         let (right, _) = right.into_physical_compilation_request().unwrap();
         let left = request.queries[0].selected_plan_root.clone();
         let right = right.queries[0].selected_plan_root.clone();
-        let right = Rc::new(SummaryNode {
-            expr: SummaryExpr::ValueOperation {
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                child: right.clone(),
-            },
-            schema: right.schema.clone(),
-            guarantee: None,
-        });
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
                 timing: planner_types::post_asap::ExecutionTiming::QueryTime,
