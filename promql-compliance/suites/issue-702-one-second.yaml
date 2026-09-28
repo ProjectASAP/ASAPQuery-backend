@@ -1,0 +1,34 @@
+name: issue-702-one-second
+comparison_defaults:
+  value_tolerance:
+    relative: 0.01
+    absolute: 0.000001
+
+# Exact supported-query subset from PR #741's one-second process test.
+# Current-series expressions evaluate at the latest source sample; temporal
+# expressions trail the source watermark by one second, as in that test.
+queries:
+  - name: quantile-by-job-0.9
+    expr: "quantile by (job) (0.9, issue701_data)"
+    instant_offsets_seconds: &current_offsets [901, 961]
+  - name: sum-by-job
+    expr: "sum by (job) (issue701_data)"
+    instant_offsets_seconds: *current_offsets
+  - name: sum
+    expr: "sum(issue701_data)"
+    instant_offsets_seconds: *current_offsets
+  - name: avg-over-time
+    expr: "avg_over_time(issue701_data[5m])"
+    instant_offsets_seconds: &temporal_offsets [900, 960]
+  - name: count-by-job
+    expr: "count by (job) (issue701_data)"
+    instant_offsets_seconds: *current_offsets
+  - name: count
+    expr: "count(issue701_data)"
+    instant_offsets_seconds: *current_offsets
+  - name: avg-by-job
+    expr: "avg by (job) (issue701_data)"
+    instant_offsets_seconds: *current_offsets
+  - name: sum-by-job-sum-over-time
+    expr: "sum by (job) (sum_over_time(issue701_data[5m]))"
+    instant_offsets_seconds: *temporal_offsets

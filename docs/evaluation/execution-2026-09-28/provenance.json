@@ -1,0 +1,12 @@
+{
+  "planner_revision": "176c1bd565e0c400f9a35996c2bd65de32475e72",
+  "runner_revision": "13e90c8d",
+  "data_plane_revision": "ed944356",
+  "scope": "finite fixture differential execution, not production selection or real ERP calibration",
+  "reports": [
+    {
+      "file": "summary.json",
+      "sha256": "3f7bad5dda4fdb08b235afaca9adacaf825262598fa8d3cd752437b1565bcac3"
+    }
+  ]
+}

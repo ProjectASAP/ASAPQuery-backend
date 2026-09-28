@@ -1,0 +1,23 @@
+[package]
+name = "promql-compliance"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+control_plane = { path = "../../control_plane" }
+asap_types.workspace = true
+planner-types.workspace = true
+prost = "0.13"
+snap = "1.1"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"

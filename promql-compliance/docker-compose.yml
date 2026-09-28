@@ -1,0 +1,23 @@
+name: asapquery-backend-promql-compliance
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.9.1
+    ports: ["${PROMETHEUS_PORT:-19090}:9090"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-remote-write-receiver", "--storage.tsdb.path=/prometheus"]
+    healthcheck:
+      test: ["CMD", "/bin/wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/healthy"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+  data-plane:
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    build:
+      context: ..
+      dockerfile: data_plane/Dockerfile
+    command: ["--enable-remote-write", "--physical-plan", "/config/physical-plan.json", "--prometheus-server", "http://prometheus:9090", "--http-port", "9091", "--output-dir", "/tmp/asap", "--persistence-enabled", "--persistence-dir", "/tmp/asap/state", "--persistence-delete-older-than-secs", "0"]
+    volumes:
+      - ${ASAP_PHYSICAL_PLAN}:/config/physical-plan.json:ro
+    ports: ["${BACKEND_PORT:-19091}:9091"]
