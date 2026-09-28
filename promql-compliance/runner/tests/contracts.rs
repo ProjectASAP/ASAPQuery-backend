@@ -160,6 +160,24 @@ fn snapshot_retains_real_data_and_query_demand() {
         value["query_workload"]["repeating_queries"][0]["query"],
         suite.queries[0].expr
     );
+    // The installed generation is the one whose costs and local execution were checked.
+    let expected = serde_json::to_value(&plan).unwrap();
+    let publication = planning::installation(plan);
+    let publication: asap_types::plan_publication::PhysicalPlanInstallRequest =
+        serde_json::from_slice(&serde_json::to_vec(&publication).unwrap()).unwrap();
+    let actual = serde_json::to_value(publication).unwrap();
+    for field in [
+        "summary_catalog",
+        "collector_plans",
+        "precompute_plan",
+        "query_plan",
+        "transmission_plan",
+    ] {
+        assert_eq!(
+            actual[field], expected[field],
+            "installed {field} drifted from the costed plan"
+        );
+    }
     let mut irregular = data.clone();
     irregular.series[0].samples[1].offset_seconds += 0.01;
     assert!(planning::snapshot(&suite, &irregular, 10000, 0, true).is_err());
@@ -312,6 +330,11 @@ fn report_card_counts_provenance_and_ignores_artifacts() {
     runner::write_json(
         &directory.path().join("pass.plan.json"),
         &json!({"opaque":"plan"}),
+    )
+    .unwrap();
+    runner::write_json(
+        &directory.path().join("pass.install.json"),
+        &json!({"opaque":"publication"}),
     )
     .unwrap();
     runner::report_card(directory.path()).unwrap();

@@ -262,3 +262,19 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     }
     a
 }
+
+/// Publish the exact costed generation; serving must not run candidate selection again.
+pub fn installation(
+    plan: CompiledPhysicalPlan,
+) -> asap_types::plan_publication::PhysicalPlanInstallRequest {
+    asap_types::plan_publication::PhysicalPlanInstallRequest {
+        summary_catalog: plan.summary_catalog,
+        collector_plans: plan.collector_plans,
+        precompute_plan: plan.precompute_plan,
+        transmission_plan: plan.transmission_plan,
+        query_plan: plan.query_plan,
+        // Match the ASAPQuery profile's local routing, as snapshot startup did.
+        storage_routing: None,
+        adaptation_evidence: Vec::new(),
+    }
+}

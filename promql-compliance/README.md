@@ -108,9 +108,10 @@ series count and sample volume; no synthetic one-second cadence is supplied.
 
 The differential runner invokes the Rust control-plane compiler directly, with no external
 workload quotes. It validates automatic costs and the selected local plan before
-starting containers, then passes that same snapshot to backend startup. Planning
-failures produce a JSON report. The selected plan and input snapshot are saved
-beside successful planning reports. Docker Compose is needed only for live
+starting containers, then installs that exact costed deployment plan. Backend
+startup does not repeat candidate selection. Planning failures produce a JSON
+report. The input snapshot, selected plan, and typed `*.install.json` publication
+are saved beside successful planning reports. Docker Compose is needed only for live
 services; fixture, protocol, cost and comparison tests run with Cargo:
 
 ```sh
