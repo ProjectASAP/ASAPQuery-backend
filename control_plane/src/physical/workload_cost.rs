@@ -345,7 +345,11 @@ pub fn manifest(
         );
     }
     Ok(WorkloadCostManifest {
-        dataset_identity: plan.precompute_plan.ingest.dataset_identity.clone()
+        dataset_identity: plan
+            .precompute_plan
+            .ingest
+            .dataset_identity
+            .clone()
             .ok_or_else(|| CompileError::Snapshot("cost manifest lacks dataset identity".into()))?,
         plan_id: plan.envelope.plan_id,
         plan_version: plan.envelope.plan_version,
