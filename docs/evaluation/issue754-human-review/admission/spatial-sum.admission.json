@@ -1,13 +1,13 @@
 [
   {
-    "candidate_id": "asap-explain-v1:candidate:3be3a41143a4f294dd86565f1b6bb5799c2a58b91cc3e2ce693933b2ab70a0ec",
+    "candidate_id": "asap-explain-v1:candidate:a8869d0a16276da98a6fd3da7ad085d0145f165a84e2129cf43a6dcfc6b631b5",
     "logical_root_ids": [
-      "asap-explain-v1:root:ee5d913964ff424fe9ade6bab973515975e867515777cdcdd9134cd0c65e17f7"
+      "asap-explain-v1:root:cca99c7039fe48156cbb90dccd659276ff1a70de776ba616d620f99f776d5cd2"
     ],
-    "physical_candidate_id": "asap-explain-v1:physical:1d8c58c38d15133c78840488619a3327806ef1dacd3bcfb328e7ba437d829c2d",
+    "physical_candidate_id": "asap-explain-v1:physical:d953c94e0cc0efa160db48ee14b791be59a7a83a4667c52f28446629bbecea71",
     "identity_unavailable_reason": null,
     "status": "bound",
-    "plan_id": 3688256239081920855,
+    "plan_id": 1236684965287321759,
     "total_cost": null,
     "unavailable_reason": null
   },
