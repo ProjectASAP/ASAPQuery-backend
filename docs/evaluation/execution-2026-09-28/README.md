@@ -17,3 +17,5 @@ Reproduce with `promql-compliance/runner/Makefile` and the dataset/suite pairs
 listed above; see [runner usage](../../../promql-compliance/README.md). The recorded
 run used the debug binary mounted in the runtime container. No human review,
 performance benefit, or Level 3 selection approval is implied.
+
+Raw reports are gzip-compressed JSON; use `gzip -dc <case>.json.gz` to inspect.
