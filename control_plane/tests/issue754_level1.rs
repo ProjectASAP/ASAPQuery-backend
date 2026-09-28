@@ -100,78 +100,11 @@ fn required_summary_shapes(name: &str, fixture: Fixture) -> Vec<(&'static str, R
         .collect()
 }
 
-/// Binding defects this fixture reaches today. Level 1 records them rather than
-/// tolerating them silently: each entry must still occur exactly `count` times,
-/// so a new instance fails the test and a fixed one forces its line to be
-/// deleted. `main` is green on these paths, so every entry is a regression
-/// introduced inside the #737 → #728 stack, and all of them must be gone before
-/// #775 installs and executes these candidates.
-const KNOWN_BINDING_DEFECTS: &[(&str, &str, usize)] = &[
-    (
-        "grouped-rate",
-        "physical program has incompatible input or result schema",
-        1,
-    ),
-    // The remaining schema defect also reaches workload candidates.
-    (
-        "shared-rate",
-        "physical program has incompatible input or result schema",
-        1,
-    ),
-    (
-        "all-ten",
-        "physical program has incompatible input or result schema",
-        1,
-    ),
-];
-
-/// Classify one admission rejection. A reason that is neither a declared policy
-/// refusal nor a recorded defect fails the scope outright. `scope` is a query
-/// name on the single-query path and an ensemble name on the workload path: a
-/// workload candidate's rejection belongs to the whole ensemble, not to one of
-/// its queries.
+/// Only explicit admission policies may reject a candidate. Loss of operator
+/// semantics or an incompatible Planner result schema is a regression.
 fn assert_rejection_is_accounted_for(name: &str, reason: &str) {
-    if PolicyReason::ALL
-        .iter()
-        .any(|policy| policy.matches(reason))
-    {
-        return;
-    }
-    assert!(
-        KNOWN_BINDING_DEFECTS
-            .iter()
-            .any(|(scope, defect, _)| *scope == name && reason.contains(defect)),
-        "{name}: unaccounted binding rejection: {reason}\n\
-         Add a policy reason if this is a deliberate refusal, or fix the \
-         defect. Level 1 does not accept unexplained bind failures."
-    );
-}
-
-/// Every recorded defect must still occur exactly as often as declared, so that
-/// neither a new occurrence nor a silent fix can pass unnoticed.
-fn assert_recorded_defect_counts(
-    scope: &str,
-    admission: &[control_plane::physical::workload_cost::CandidatePlanEvaluation],
-) {
-    for (recorded, defect, count) in KNOWN_BINDING_DEFECTS {
-        if *recorded != scope {
-            continue;
-        }
-        let observed = admission
-            .iter()
-            .filter(|result| {
-                result
-                    .unavailable_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains(defect))
-            })
-            .count();
-        assert_eq!(
-            observed, *count,
-            "{scope}: recorded defect count changed for {defect:?}; \
-             update KNOWN_BINDING_DEFECTS (delete the entry once fixed)"
-        );
-    }
+    assert!(PolicyReason::ALL.iter().any(|policy| policy.matches(reason)),
+        "{name}: unexpected binding rejection: {reason}. Fix the compiler or input binding; do not allowlist the defect.");
 }
 
 struct ExpectedPlan {
@@ -1021,7 +954,6 @@ fn issue754_queries_have_valid_physical_plans() {
                 ref status => panic!("unexpected pre-pricing status: {status:?}"),
             }
         }
-        assert_recorded_defect_counts(&case.name, &admission);
         if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
             // Mirror the committed layout: `admission/` is the contract, so a
             // downloaded CI artifact drops straight onto the repository copy.
@@ -1252,7 +1184,6 @@ fn ensembles_preserve_all_queries_and_shared_output_identity() {
                 assert_rejection_is_accounted_for(&name, reason);
             }
         }
-        assert_recorded_defect_counts(&name, &admission);
         // Membership holds for the batch too: a heap family that Planner exposes
         // for a member query must still appear in the workload inventory, and
         // must still be refused for the declared reason.
