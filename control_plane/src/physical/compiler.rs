@@ -4014,25 +4014,6 @@ fn reject_uncertified_readouts(
             reason: format!("invalid executable subDAG: {error}"),
         }
     })?;
-    // Leaf guarantees do not certify a composition (for example, division of
-    // two approximate quantiles). Admission checks the complete query result.
-    if dag.nodes.iter().any(|node| {
-        matches!(
-            node.payload,
-            planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
-        )
-    }) && root.guarantee.as_ref().is_none_or(|guarantee| {
-        !asap_aware_mapping::accuracy::AccuracyModel::satisfies(
-            &DefaultAccuracyModel,
-            guarantee,
-            accuracy,
-        )
-    }) {
-        return Err(CompileError::Query {
-            query_id: query_id.into(),
-            reason: "selected query result has no certified accuracy guarantee satisfying the requested accuracy".into(),
-        });
-    }
     for node in &dag.nodes {
         if target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
             && node.guarantee.as_ref().is_some_and(|guarantee| {
@@ -4062,6 +4043,25 @@ fn reject_uncertified_readouts(
                 reason: "selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution".into(),
             });
         }
+    }
+    // Leaf guarantees do not certify a composition (for example, division of
+    // two approximate quantiles). Admission checks the complete query result.
+    if dag.nodes.iter().any(|node| {
+        matches!(
+            node.payload,
+            planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
+        )
+    }) && root.guarantee.as_ref().is_none_or(|guarantee| {
+        !asap_aware_mapping::accuracy::AccuracyModel::satisfies(
+            &asap_aware_mapping::DefaultAccuracyModel,
+            guarantee,
+            accuracy,
+        )
+    }) {
+        return Err(CompileError::Query {
+            query_id: query_id.into(),
+            reason: "selected query result has no certified accuracy guarantee satisfying the requested accuracy".into(),
+        });
     }
     Ok(())
 }
@@ -5870,6 +5870,7 @@ pub(crate) mod tests {
         let error = reject_uncertified_readouts(
             "q",
             &request.queries[0].selected_plan_root,
+            &request.queries[0].accuracy_target,
             PhysicalDeploymentTarget::DistributedCollectors,
         )
         .unwrap_err();
