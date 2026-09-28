@@ -183,6 +183,6 @@ each stage lands; then update the APIs, persistence descriptions and test eviden
 in the same implementation PR.
 
 The open shared-library integration PR is #774, replacing the already merged
-#770. The active order after #771 is #774 → #763 → #765 → #761 → #728
+#770. The active order after #749 is #774 → #763 → #765 → #761 → #728
 → #742 → #775. Real-evidence work in #776, #777, #778 and #759 is deferred;
 old #770 base metadata is not part of this chain.
