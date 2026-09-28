@@ -1452,7 +1452,12 @@ impl DeploymentPlanCompiler {
                 validate_evidence(&query.query_id, e, &environment)?;
             }
             let node = query.selected_plan_root.clone();
-            reject_uncertified_readouts(&query.query_id, &node, environment.target)?;
+            reject_uncertified_readouts(
+                &query.query_id,
+                &node,
+                &query.accuracy_target,
+                environment.target,
+            )?;
             let selected = if super::maintained_population::supported_node(&node) {
                 Vec::new()
             } else {
@@ -1466,7 +1471,12 @@ impl DeploymentPlanCompiler {
                 })?
             };
             if !selected.is_empty() {
-                reject_uncertified_readouts(&query.query_id, &node, environment.target)?;
+                reject_uncertified_readouts(
+                    &query.query_id,
+                    &node,
+                    &query.accuracy_target,
+                    environment.target,
+                )?;
             }
             let selected = selected
                 .into_iter()
@@ -4009,6 +4019,7 @@ fn validate_executable_subdag(node: &Rc<SummaryNode>) -> Result<(), String> {
 fn reject_uncertified_readouts(
     query_id: &str,
     root: &Rc<SummaryNode>,
+    accuracy: &AccuracyTarget,
     target: PhysicalDeploymentTarget,
 ) -> Result<(), CompileError> {
     let dag = planner_types::post_asap::compile_executable_dag(root).map_err(|error| {
@@ -4017,6 +4028,25 @@ fn reject_uncertified_readouts(
             reason: format!("invalid executable subDAG: {error}"),
         }
     })?;
+    // Leaf guarantees do not certify a composition (for example, division of
+    // two approximate quantiles). Admission checks the complete query result.
+    if dag.nodes.iter().any(|node| {
+        matches!(
+            node.payload,
+            planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
+        )
+    }) && root.guarantee.as_ref().is_none_or(|guarantee| {
+        !asap_aware_mapping::accuracy::AccuracyModel::satisfies(
+            &DefaultAccuracyModel,
+            guarantee,
+            accuracy,
+        )
+    }) {
+        return Err(CompileError::Query {
+            query_id: query_id.into(),
+            reason: "selected query result has no certified accuracy guarantee satisfying the requested accuracy".into(),
+        });
+    }
     for node in &dag.nodes {
         if target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
             && node.guarantee.as_ref().is_some_and(|guarantee| {
