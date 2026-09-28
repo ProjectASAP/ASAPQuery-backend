@@ -407,7 +407,9 @@ impl QueryPlanEntry {
                     for (index, field) in contract.schema.fields.iter().enumerate() {
                         use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
                         match &field.dtype {
-                            SummaryFamilyType::Plain(DataType::Float64) => samples += 1,
+                            SummaryFamilyType::Plain(DataType::Float64 | DataType::Int64) => {
+                                samples += 1
+                            }
                             SummaryFamilyType::Plain(DataType::Utf8) => {}
                             SummaryFamilyType::Plain(DataType::Timestamp)
                                 if contract.schema.time_index == Some(index) => {}
