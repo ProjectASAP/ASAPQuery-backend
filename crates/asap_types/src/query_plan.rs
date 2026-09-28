@@ -291,7 +291,6 @@ pub struct QueryPlanEntry {
     #[serde(default)]
     pub language: QueryLanguage,
     pub query_id: String,
-    #[serde(alias = "canonical_promql")]
     pub canonical_query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_evaluation: Option<FixedEvaluationRange>,
@@ -474,7 +473,6 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
-    #[serde(alias = "state_reference")]
     pub stored_output_reference: crate::sds::StoredOutputReference,
     /// Complete-window storage advances independently of its stored extent.
     /// None denotes disjoint pane storage.
@@ -484,16 +482,12 @@ pub struct MaterializationBinding {
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     /// Labels whose values form an item identity inside a keyed sketch.
-    #[serde(default, alias = "itemLabels", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub item_labels: Vec<String>,
     pub window_ms: u64,
     /// Unix millisecond timestamp on the materialized pane-boundary grid.
     /// Legacy plans deserialize this as unknown and fall back at read time.
-    #[serde(
-        default,
-        alias = "paneOriginMs",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_origin_ms: Option<i64>,
     /// Semantic query lookback, independent of the physical pane duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]

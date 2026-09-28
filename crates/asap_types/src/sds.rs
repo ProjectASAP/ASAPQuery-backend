@@ -125,7 +125,6 @@ pub struct CatalogGeneration {
     pub schema_version: u32,
     pub plan_id: u64,
     pub plan_version: u64,
-    #[serde(alias = "snapshot_digest")]
     pub snapshot_sha256: String,
 }
 
@@ -317,7 +316,6 @@ pub enum InstanceLifecycle {
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstance {
     pub instance_id: SummaryInstanceId,
-    #[serde(alias = "state_slot_id")]
     pub stored_output_id: StoredOutputId,
     pub summary_definition_id: SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
@@ -325,9 +323,6 @@ pub struct SummaryInstance {
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
     pub catalog_generation: CatalogGeneration,
-    /// Reserved wire field. Cross-version state adoption is not supported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reused_from_generation: Option<CatalogGeneration>,
     pub placement: SummaryPlacement,
     pub state_reference: SummaryStateReference,
     pub status: SummaryInstanceStatus,
@@ -354,11 +349,6 @@ impl SummaryInstance {
         if self.placement.producer_id.is_empty() || self.placement.storage_node_id.is_empty() {
             return Err(SdsError(
                 "summary instance placement must be resolved".into(),
-            ));
-        }
-        if self.reused_from_generation.is_some() {
-            return Err(SdsError(
-                "cross-version state adoption is not supported".into(),
             ));
         }
         if self.state_reference.store.is_empty()
@@ -934,33 +924,6 @@ impl ValueProjectionIdentity {
     }
 }
 
-/// Compatibility adapter for old config column strings; storage is always typed.
-pub(crate) fn deserialize_optional_value_projection<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<ValueProjectionIdentity>, D::Error> {
-    let value = Option::<Value>::deserialize(deserializer)?;
-    value
-        .map(|value| match value {
-            Value::String(name) => Ok(ValueProjectionIdentity::Column { name }),
-            value => serde_json::from_value(value).map_err(serde::de::Error::custom),
-        })
-        .transpose()
-}
-
-/// Read legacy StateSchema ColumnRef values without retaining a parallel field.
-pub(crate) fn deserialize_state_value_projection<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<ValueProjectionIdentity, D::Error> {
-    let value = Value::deserialize(deserializer)?;
-    if value == "SampleValue" {
-        return Ok(ValueProjectionIdentity::SampleValue);
-    }
-    if let Some(name) = value.get("Named").and_then(Value::as_str) {
-        return Ok(ValueProjectionIdentity::Column { name: name.into() });
-    }
-    serde_json::from_value(value).map_err(serde::de::Error::custom)
-}
-
 /// Whether a materialization preserves source entities or pools a population.
 /// Grouped label names remain in `DataDescriptor::group_by_keys`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1349,7 +1312,6 @@ mod tests {
                 plan_version: 2,
                 snapshot_sha256: "abc".into(),
             },
-            reused_from_generation: None,
             placement: SummaryPlacement {
                 producer_id: "producer".into(),
                 storage_node_id: "store".into(),
@@ -1424,17 +1386,11 @@ mod tests {
     #[test]
     fn new_generation_rejects_cross_version_payload_adoption() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
-        let mut source = instance.catalog_generation.clone();
-        source.plan_version -= 1;
-        instance.reused_from_generation = Some(source.clone());
-        instance.state_reference.generation = source.plan_version;
-        assert!(
-            instance.validate().is_err(),
-            "cross-version adoption must be rejected"
-        );
-        instance.reused_from_generation.as_mut().unwrap().plan_id += 1;
-        assert!(instance.validate().is_err());
-        instance.reused_from_generation = Some(instance.catalog_generation.clone());
+        let mut wire = serde_json::to_value(&instance).unwrap();
+        wire["reused_from_generation"] =
+            serde_json::to_value(&instance.catalog_generation).unwrap();
+        assert!(serde_json::from_value::<SummaryInstance>(wire).is_err());
+        instance.state_reference.generation -= 1;
         assert!(instance.validate().is_err());
     }
 
@@ -1573,19 +1529,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_generation_accepts_legacy_digest_name() {
-        let generation: CatalogGeneration = serde_json::from_value(json!({
+    fn catalog_generation_rejects_legacy_digest_name() {
+        assert!(serde_json::from_value::<CatalogGeneration>(json!({
             "schema_version": 1,
             "plan_id": 2,
             "plan_version": 3,
             "snapshot_digest": "abc"
         }))
-        .unwrap();
-        assert_eq!(generation.snapshot_sha256, "abc");
-        assert!(serde_json::to_value(generation)
-            .unwrap()
-            .get("snapshot_digest")
-            .is_none());
+        .is_err());
     }
     #[test]
     fn wire_roundtrip_and_tampered_id_validation() {
