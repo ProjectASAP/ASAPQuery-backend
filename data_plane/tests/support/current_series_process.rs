@@ -1,7 +1,7 @@
 use super::*;
 use control_plane::physical::{
     compiler::{
-        BackendLocalPlanningInput, PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
+        BackendLocalPlanningInput, DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
     },
     workload_cost::{self, WorkloadCostEvidence, WorkloadQuote},
 };
@@ -27,7 +27,6 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         "../../../docs/examples/asapquery-planning-snapshot.json"
     ))
     .unwrap();
-    snapshot.schema_version = 2;
     // Exercise a short declared horizon; native differential mode keeps its five-minute contract.
     let horizon_ms: i64 = if native.is_some() { 300_000 } else { 5_000 };
     let scrape_ms = horizon_ms / 5;
@@ -68,7 +67,7 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
     let quotes = candidates
         .into_iter()
         .filter_map(|candidate| {
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(candidate.clone(), env.clone())
                 .ok()?;
             let warm = candidate.queries.iter().all(|query| {

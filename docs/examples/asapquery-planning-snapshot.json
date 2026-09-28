@@ -1,5 +1,5 @@
 {
-  "snapshot_version": 2,
+  "snapshot_version": 3,
   "query_workload": {
     "language": "promql",
     "query_batch": null,
@@ -62,6 +62,7 @@
     "scrape_interval_ms": 5000
   },
   "environment": {
+    "dataset_identity": {"namespace": "example", "dataset": "metrics"},
     "target": "backend_local_remote_write",
     "collector_ids": [],
     "capability_snapshot_id": "asapquery-local-v1",

@@ -680,7 +680,7 @@ impl ActivePhysicalPlanHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::AggregationConfig;
+    use crate::storage_engines::types::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -710,11 +710,12 @@ mod tests {
                 summary_catalog: None,
                 envelope: envelope.clone(),
                 ingest: asap_types::precompute_plan::IngestContract {
+                    dataset_identity: None,
                     protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
                     endpoint_path: "/v1/metrics".into(),
                     timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
                     require_plan_identity: true,
-                    require_summary_definition_identity: true,
+                    require_stored_output_identity: true,
                     require_registered_producer: true,
                 },
                 schemas: Vec::new(),
@@ -748,14 +749,15 @@ mod tests {
                 plan_id,
                 plan_version,
                 clickhouse_context: None,
+                selected_dags: Default::default(),
                 entries: Default::default(),
             }),
             storage_routing: Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         }
     }
 
-    fn dummy_agg(id: u64) -> AggregationConfig {
-        AggregationConfig::new(
+    fn dummy_agg(id: u64) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             HashMap::new(),

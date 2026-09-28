@@ -45,7 +45,7 @@ pub enum FrameLineageError {
 struct FrameLineageKey {
     plan_id: u64,
     plan_version: u64,
-    materialization: asap_types::sds::SummaryDefinitionId,
+    materialization: asap_types::sds::StoredOutputId,
     series_identity: String,
     producer_id: String,
     producer_epoch: String,

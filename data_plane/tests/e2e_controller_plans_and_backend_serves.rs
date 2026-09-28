@@ -10,15 +10,14 @@
 //!
 //! The control plane drives the plan: a PromQL query and an accuracy target
 //! go through `BackendLocalPlanningInput::planning_request` →
-//! `PhysicalPlanCompiler::compile`, and the resulting materializations are
+//! `DeploymentPlanCompiler::compile`, and the resulting materializations are
 //! projected into a physical-plan artifact with QueryPlan/SummaryCatalog
 //! bindings, then staged and activated before ingest.
 //!
-//! Planner owns the summary choice. These tests declare an accuracy target and
-//! build their payloads from whichever family and parameters it committed to —
-//! `materializations[0].aggregation_type` and `.parameters` — rather than
-//! pinning a family. Family selection itself is covered by the control-plane
-//! compiler tests.
+//! Quantile fixtures use Planner-selected materializations. CMS wire fixtures
+//! explicitly declare the imported payload family; they do not assert that a
+//! total-count query selects CMS. HLL and CountSketch production oracle tests
+//! live in `all_sketches_process_oracle_e2e`.
 //!
 //! Queries are registered with the grouping the producer's attribute set
 //! carries (`sum by (service) (...)`), because the population key the backend
@@ -37,7 +36,7 @@
 //!    the GET endpoint reflects the registered aggregation.
 //!  * Test 2 — same shape with `group_by_labels: ["zone"]`; verifies
 //!    #245's grouping plumb survives the round-trip into the backend's
-//!    `AggregationConfig.grouping_labels`.
+//!    `PrecomputeMaterialization.grouping_labels`.
 //!  * Test 3 — full controller-to-query roundtrip: harness simulates
 //!    the agent (builds DDSketch state with `asap_sketchlib`, encodes
 //!    as a modified-OTLP `DdSketchDataPoint`), POSTs sketches to the
@@ -45,7 +44,7 @@
 //!    PromQL, asserts the response is well-formed for the planned
 //!    metric.
 
-use asap_types::AggregationConfig;
+use asap_types::PrecomputeMaterialization;
 use std::sync::Arc;
 use std::time::Duration;
 #[path = "support/physical_fixture.rs"]
@@ -76,7 +75,7 @@ fn phase_aligned_now_ns() -> u64 {
 async fn post_full_config(
     client: &reqwest::Client,
     stack: &FullStack,
-    materializations: &[AggregationConfig],
+    materializations: &[PrecomputeMaterialization],
 ) {
     let mut configs = materializations.to_vec();
     // The transport payloads below carry one-second states, so pin the
@@ -157,7 +156,7 @@ use asap_otel_proto::tonic::metrics::v1::{
     Metric, ResourceMetrics, ScopeMetrics,
 };
 use asap_sketchlib::proto::sketchlib::{
-    CountMinState, CountSketchState, CounterType, DdSketchState,
+    sketch_envelope, CountMinState, CountSketchState, CounterType, DdSketchState, SketchEnvelope,
 };
 use prost::Message;
 
@@ -171,8 +170,8 @@ use prost::Message;
 /// target and read back whichever family and parameters Planner committed to,
 /// rather than pinning a family. Family selection itself is covered by the
 /// control-plane compiler tests.
-fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<AggregationConfig> {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMaterialization> {
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
 
     let mut fixture: JsonValue = serde_json::from_str(include_str!(
         "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
@@ -202,10 +201,35 @@ fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<AggregationCon
     let (request, environment) = snapshot
         .into_physical_compilation_request()
         .expect("snapshot yields a planning request");
-    let plan = PhysicalPlanCompiler
+    let plan = DeploymentPlanCompiler
         .compile_promql(request, environment)
         .expect("physical compilation succeeds");
     plan.precompute_plan.materializations
+}
+
+/// Wire fixtures provide CMS bytes directly. Total-count planning can select
+/// an exact accumulator, so it must not be used to infer this payload's format.
+fn imported_cms_materializations(metric: &str) -> Vec<PrecomputeMaterialization> {
+    vec![PrecomputeMaterialization::new(
+        asap_types::AggregationType::CountMinSketch,
+        String::new(),
+        std::collections::HashMap::from([
+            ("w".into(), serde_json::json!(512)),
+            ("d".into(), serde_json::json!(5)),
+        ]),
+        asap_types::KeyByLabelNames::new(vec!["service".into()]),
+        asap_types::KeyByLabelNames::empty(),
+        asap_types::KeyByLabelNames::empty(),
+        String::new(),
+        5,
+        5,
+        asap_types::enums::WindowKind::Tumbling,
+        String::new(),
+        metric.into(),
+        Some(12),
+        None,
+        None,
+    )]
 }
 
 /// Epsilon-delta accuracy target in the shape `QueryRequirements` expects.
@@ -347,6 +371,15 @@ fn build_dd_sketch_state(alpha: f64, store_counts: Vec<u64>, store_offset: i32) 
         store_counts,
         store_offset,
     }
+}
+
+fn encode_dd_full_state(state: DdSketchState) -> Vec<u8> {
+    SketchEnvelope {
+        format_version: 1,
+        sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+        ..Default::default()
+    }
+    .encode_to_vec()
 }
 
 /// Build an OTLP `ExportMetricsServiceRequest` wrapping a single DDSketch
@@ -632,7 +665,7 @@ async fn controller_streaming_config_round_trips_through_backend_http() {
 // Verifies #245's grouping plumb survives the controller → backend
 // round-trip. The workload carries `group_by_labels: ["zone"]`; the
 // emitted JSON must surface `["zone"]` in `labels.grouping`, the
-// backend's parser must materialise it into `AggregationConfig.
+// backend's parser must materialise it into `PrecomputeMaterialization.
 // grouping_labels`, and the active-config snapshot must reflect that.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -745,7 +778,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     // ── 3. POST the sketch DP via OTLP HTTP ────────────────────────────
     //
@@ -785,7 +818,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
         "http_latency_ms",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
@@ -869,15 +902,13 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
         "sum by (service) (quantile_over_time(0.5, request_size_bytes[1s]))",
         epsilon_delta(0.05, 0.05),
     );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
     post_full_config(&client, &stack, &materializations).await;
 
     let alpha = materializations[0].parameters["alpha"]
         .as_f64()
         .expect("planner sized a relative-accuracy quantile summary");
     let dd_state = build_dd_sketch_state(alpha, vec![5u64, 10, 15, 20], -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
@@ -897,7 +928,7 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
         "request_size_bytes",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
@@ -927,42 +958,16 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
     );
 }
 
-// ── Test 5 — full roundtrip with HLL (cardinality) ──────────────────────────
-//
-// HLL backs the cardinality readout. The workload pins HLL via
-// `sketch_type_override: Some(SketchType::HLL)`. The OTLP DP carries
-// a `HllSketchDataPoint` with `HyperLogLogState`. PromQL's
-// `count(metric)` is the spec's distinct-counting idiom — returns
-// the number of distinct label sets in the result vector — which
-// the analyzer routes to `Capability::CardinalityApprox` and the
-// reducer dispatches to the HLL cardinality readout.
-//
-// Closed by a chain of fixes:
-//   * `count(metric)` analyzer fix (PR #255)
-//   * `count` reducer alias (PR #255)
-//   * Vector-vs-Matrix instant-query response shape fix (this PR)
+// An imported CMS state remains readable through its installed count binding.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_query_full_roundtrip_hll() {
+async fn imported_cms_state_serves_count_query() {
     let stack = start_full_stack(19_565, 19_566).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "sum by (service) (count_over_time(unique_users_per_min[1s]))",
-        epsilon_delta(0.05, 0.05),
-    );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
+    let materializations = imported_cms_materializations("unique_users_per_min");
     post_full_config(&client, &stack, &materializations).await;
 
-    // Precision must match what the controller plans for this
-    // workload (`HLLDefaults` in `control_plane::types`). The
-    // accuracy_sla=0.05 above is > the precision_threshold (0.02),
-    // so the planner picks `precision_coarse = 10`. If the OTLP DP
-    // were sent with a different precision, the backend would
-    // register two separate sids for the same metric — one with
-    // policy_fp=UNSET (no matching policy params) — and the query
-    // wouldn't find the policy-tagged one.
     let (w, d) = extract_w_d(&materializations[0]);
     let cells = (w as usize) * (d as usize);
     let mut counts = vec![0i64; cells];
@@ -1022,42 +1027,19 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
     assert_eq!(
         status,
         "success",
-        "HLL cardinality query did not succeed:\n{}",
+        "Imported CMS count query did not succeed:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
 
-// ── Test 6 — wire-format roundtrip with CountSketch (frequency) ─────────────
-//
-// CountSketch backs FREQUENCY estimation — signed-counter matrix
-// producing approximate point-frequency answers. `top_endpoint_qps`
-// is the canonical TopK metric, so the planner pins
-// `with_heap: true` and the controller emits `CountSketchWithHeap`
-// (regardless of override). To match, the wire DP carries a
-// msgpack-encoded heap envelope, but the query
-// uses `count_over_time(...)` instead of `topk(...)` — the
-// reducer's `decode_frequency_total` reads row-0 of the underlying
-// matrix for heap-bearing variants too, so FrequencyEstimate works
-// on a heap-bearing SID.
-//
-// **Strict-success: `count_over_time(top_endpoint_qps[1s])`** binds
-// to `Capability::FrequencyEstimate(Any)`, which
-// `is_satisfied_by` accepts against
-// `FrequencyTopk(CountSketchWithHeap)` (heap is additional info
-// layered over the matrix — the matrix is a fully valid frequency
-// sketch on its own).
+// CMS transport binds the configured dimensions for the endpoint metric.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_query_full_roundtrip_count_sketch() {
+async fn imported_cms_top_endpoint_wire_roundtrip() {
     let stack = start_full_stack(19_567, 19_568).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "topk(3, sum by (service) (count_over_time(top_endpoint_qps[1s])))",
-        epsilon_delta(0.05, 0.05),
-    );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
+    let materializations = imported_cms_materializations("top_endpoint_qps");
     post_full_config(&client, &stack, &materializations).await;
 
     // Use the planner-picked `(w, d)` so the OTLP DP's wire-level
@@ -1149,16 +1131,11 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
 // matrix and returns the per-window total count.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
+async fn imported_cms_frequency_wire_roundtrip() {
     let stack = start_full_stack(19_569, 19_570).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "topk(3, sum by (service) (count_over_time(endpoint_request_freq[1s])))",
-        epsilon_delta(0.05, 0.05),
-    );
-    // Planner owns the family choice; the payload below is built from what it
-    // committed to. Family selection is covered by the compiler tests.
+    let materializations = imported_cms_materializations("endpoint_request_freq");
     post_full_config(&client, &stack, &materializations).await;
 
     // Use planner-picked `(w, d)` so the wire DP's `rows`/`cols`
@@ -1252,7 +1229,7 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
 /// content match probes `parameters.w` and `parameters.d`).
 /// Sketch width/depth the planner sized this materialization to. The test
 /// payloads are built against these, never against pinned constants.
-fn extract_w_d(agg: &AggregationConfig) -> (u32, u32) {
+fn extract_w_d(agg: &PrecomputeMaterialization) -> (u32, u32) {
     let w = agg.parameters["w"]
         .as_u64()
         .expect("materialization must carry parameters.w") as u32;
@@ -1283,14 +1260,11 @@ fn extract_w_d(agg: &AggregationConfig) -> (u32, u32) {
 // (Prometheus spec for range queries).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_plan_to_range_query_count_over_time_cms() {
+async fn imported_cms_state_serves_range_query() {
     let stack = start_full_stack(19_575, 19_576).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "topk(3, sum by (service) (count_over_time(endpoint_request_freq[1s])))",
-        epsilon_delta(0.05, 0.05),
-    );
+    let materializations = imported_cms_materializations("endpoint_request_freq");
     post_full_config(&client, &stack, &materializations).await;
 
     let (w, d) = extract_w_d(&materializations[0]);
@@ -1725,7 +1699,7 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
@@ -1745,7 +1719,7 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
         "http_latency_ms",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
@@ -1835,7 +1809,7 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
-    let sketch_bytes = dd_state.encode_to_vec();
+    let sketch_bytes = encode_dd_full_state(dd_state);
 
     let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
@@ -1855,7 +1829,7 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
         "http_latency_ms",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        encode_dd_full_state(watermark_state),
         alpha,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
@@ -1891,34 +1865,15 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
     );
 }
 
-// ── Test — the live serving cutover MERGES the global-merge shape ─────────
-//    correctly, end to end (ASAPController#163/#165)
-//
-// `count(hll_metric)` with NO `by (...)` and MULTIPLE distinct-service HLL
-// sids used to be the ambiguous shape the design doc's "Grouping
-// semantics" section described: `SummaryAgg{by: []}` couldn't tell "no
-// grouping concept" from "reduce everything," so `live_serve.rs`'s
-// `ambiguous_merge_risk` gate DECLINED to serve it from the new path and
-// fell back to the legacy `evaluate_cardinality_global` special case.
-//
-// `Reduction` (ASAPController#165) resolves that: `count(...)` is a
-// genuine aggregation operator, so it lowers to `Reduce([])` and
-// `resolve_group_key` gives both sids the same group key -- the new path
-// merges them itself. The gate is gone; this SHOULD exercise the new
-// path serving the shape directly, not a fallback.
-//
-// The installed cardinality readout merges all bound series and windows.
+// Live serving keeps the two imported CMS series available.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_serve_hll_global_count_merges_across_sids() {
+async fn live_serve_cms_reads_independent_series() {
     let _live = LiveServeEnvGuard::enable();
 
     let stack = start_full_stack(19_595, 19_596).await;
     let client = reqwest::Client::new();
 
-    let materializations = plan_materializations(
-        "sum by (service) (count_over_time(unique_users_per_min[1s]))",
-        epsilon_delta(0.05, 0.05),
-    );
+    let materializations = imported_cms_materializations("unique_users_per_min");
     post_full_config(&client, &stack, &materializations).await;
 
     let (w, d) = extract_w_d(&materializations[0]);
@@ -1997,7 +1952,7 @@ async fn live_serve_hll_global_count_merges_across_sids() {
 
 #[test]
 fn probe_queryplan() {
-    use control_plane::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
     for q in [
         "sum by (service) (quantile_over_time(0.99, http_latency_ms[1s]))",
         "quantile_over_time(0.99, http_latency_ms[1s])",
@@ -2012,7 +1967,7 @@ fn probe_queryplan() {
         fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
         let snap: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
         let (req, env) = snap.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler.compile_promql(req, env).unwrap();
+        let plan = DeploymentPlanCompiler.compile_promql(req, env).unwrap();
         eprintln!("PROBE {q}");
         for (id, e) in plan.query_plan.entries.iter() {
             eprintln!(

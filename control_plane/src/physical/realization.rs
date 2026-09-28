@@ -3,8 +3,8 @@
 //! Providers may validate and price physical implementations, never rewrite
 //! selected logical roots or infer a pane width from a query's slide.
 use super::compiler::{
-    CompileError, CompiledPhysicalPlan, PhysicalCompilationRequest, PhysicalDeploymentContext,
-    PhysicalPlanCompiler, QueryCompilationInput,
+    CompileError, CompiledPhysicalPlan, DeploymentPlanCompiler, PhysicalCompilationRequest,
+    PhysicalDeploymentContext, QueryCompilationInput,
 };
 use super::workload_cost::{PricedComponents, WorkloadCostEvidence, WorkloadCostManifest};
 use asap_aware_mapping::cost_model::Cost;
@@ -51,9 +51,9 @@ impl RealizationProvider for ExistingRealizations {
         frontend: super::compiler::QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
         if frontend == super::compiler::QueryFrontend::MetricsQl {
-            PhysicalPlanCompiler.compile_metricsql(request, environment)
+            DeploymentPlanCompiler.compile_metricsql(request, environment)
         } else {
-            PhysicalPlanCompiler.compile_promql(request, environment)
+            DeploymentPlanCompiler.compile_promql(request, environment)
         }
     }
 

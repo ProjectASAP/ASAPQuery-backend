@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Validate the unmerged Planner/backend pair without changing immutable IR pins."""
+"""Validate the unmerged Planner/backend pair against Planner main."""
 import argparse
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tempfile
@@ -17,17 +16,6 @@ def main():
     parser.add_argument("cargo_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     backend = Path(__file__).resolve().parents[1]
-    manifest = (backend / "control_plane/Cargo.toml").read_text()
-    declaration = re.search(r"^planner-types(?:\.workspace)?\s*=\s*(.+)$", manifest, re.MULTILINE)
-    if declaration is None:
-        raise RuntimeError("planner-types dependency is missing")
-    if re.search(r"workspace\s*=\s*true", declaration.group(0)):
-        manifest = (backend / "Cargo.toml").read_text()
-        declaration = re.search(r"^planner-types\s*=\s*(.+)$", manifest, re.MULTILINE)
-    revision_match = re.search(r'rev\s*=\s*"([0-9a-f]+)"', declaration.group(1)) if declaration else None
-    if revision_match is None:
-        raise RuntimeError("planner-types must declare a pinned Git revision")
-    revision = revision_match.group(1)
     lock = backend / "Cargo.lock"
     original_lock = lock.read_bytes()
     with tempfile.TemporaryDirectory(prefix="asap-pane-reuse-") as temporary:
@@ -39,7 +27,7 @@ def main():
         old = 'asap-types = { path = "../types" }'
         if old not in source:
             raise RuntimeError("unexpected Planner dependency declaration")
-        cargo_toml.write_text(source.replace(old, 'asap-types = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "' + revision + '" }'))
+        cargo_toml.write_text(source.replace(old, 'asap-types = { git = "https://github.com/ProjectASAP/ASAPPlanner", branch = "main" }'))
         config = root / "validation.toml"
         text = ""
         if args.sketchlib:

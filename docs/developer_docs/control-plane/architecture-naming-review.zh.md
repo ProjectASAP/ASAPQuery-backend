@@ -37,7 +37,7 @@
 
 | 所属边界 / 源码 | 原名称 → 最终名称 |
 |---|---|
-| [编译输入与编译器](../../../control_plane/src/physical/compiler.rs) | `BackendLocalPlanningSnapshot` → `BackendLocalPlanningInput`；`BackendLocalImplementation` → `BackendLocalPhysicalInputs`；`PlanningQuery` → `QueryCompilationInput`；`PlanningRequest` → `PhysicalCompilationRequest`；`PhysicalCompiler` → `PhysicalPlanCompiler`；`PhysicalPlan` → `CompiledPhysicalPlan` |
+| [编译输入与编译器](../../../control_plane/src/physical/compiler.rs) | `BackendLocalPlanningSnapshot` → `BackendLocalPlanningInput`；`BackendLocalImplementation` → `BackendLocalPhysicalInputs`；`PlanningQuery` → `QueryCompilationInput`；`PlanningRequest` → `PhysicalCompilationRequest`；`PhysicalCompiler` → `DeploymentPlanCompiler`；`PhysicalPlan` → `CompiledPhysicalPlan` |
 | 同上：查询语义 | `post_asap` → `selected_plan_root`；`source` → `legacy_query_source`；`window_secs` → `query_lookback_seconds`；`group_by` → `group_by_labels`；`accuracy` → `accuracy_target`；`lifecycle` → `summary_lifecycle_inputs`；`runtime_policy` → `materialization_runtime_policy` |
 | 同上：候选与证据 | `logical_selection` → `planner_selection_trace`；`materialization_policy` → `enabled_materialization_keys`；`evidence` → `topk_membership_evidence_by_query_id`；`hybrid_execution` → `allow_mixed_summary_and_exact_execution`；`synthesized_window_queries` 删除：编译器来源标记改为每个候选的 `derived` / `cohort_only`，不接受序列化输入 |
 | 同上：窗口与成本 | `WindowImplementationCandidate` → `WindowRealizationCandidate`；`ImplementationCostEvidence` → `WindowRealizationCostQuote`；`LifecycleCostEvidence` → `LifecycleUnitCosts`；`LifecyclePlanningInput` → `SummaryLifecyclePlanningInputs`；`window_implementations` → `window_realization_candidates` |
@@ -63,7 +63,7 @@
 |---|---|---|
 | 外部 ASAPPlanner | 解析与语义 IR，合法 summary/exact 候选，精度推理，逻辑选择；backend 提供具体成本和能力约束 | Planner 的语义选择与 backend 的物理候选比较是不同层次，不是两个重复 planner |
 | `control_plane::planner_selection` | 适配 Planner 的选择调用、精度及证据；输出语义 DAG 与诊断 trace | `selection` 必须说明是 logical 还是 physical；trace 不是决定执行行为的配置 |
-| `physical::compiler` | 输入规范化、窗口候选校验、调用逻辑选择，以及绑定具体物理实现，生成多个一致的计划投影 | `PhysicalPlanCompiler` 比 `PhysicalCompiler` 清楚；整个模块当前职责仍比单纯 lowering 更宽 |
+| `physical::compiler` | 输入规范化、窗口候选校验、调用逻辑选择，以及绑定具体物理实现，生成多个一致的计划投影 | `DeploymentPlanCompiler` 比 `PhysicalCompiler` 清楚；整个模块当前职责仍比单纯 lowering 更宽 |
 | `physical::workload_cost` | 枚举工作负载级候选、编译、生成报价清单、核验报价、选择最低成本可行候选 | manifest、quote、evaluation、selection report 不应相互替代 |
 | `physical::erp` | Error–Resource Profile 的部署适配、分布匹配、经验参数与资源估计 | `empirical_runtime_profile` 是错误展开；输入还包含策略与观测，不只一个 profile |
 | `control_plane::clickhouse` | SQL frontend、逻辑选择、物理绑定；支持已有 catalog 输入与自动生成 materialization 两条路径 | `ClickHouseSqlWorkload.sds` 实际是 `SummaryCatalog`；SQL 当前没有走同一套 `workload_cost::select` 整计划报价流程 |
@@ -126,7 +126,7 @@ ClickHouse 的自动路径直接从 SQL 选择与绑定构建 `PhysicalPlanPubli
 | 当前名称 | 建议名称 / 约束 |
 |---|---|
 | `PlanningRequest` | `PhysicalCompilationRequest`；包含 workload 上下文，不是单 query |
-| `PhysicalCompiler` | `PhysicalPlanCompiler` |
+| `PhysicalCompiler` | `DeploymentPlanCompiler` |
 | `PhysicalPlan` | `CompiledPhysicalPlan`；候选和获选结果可继续复用此类型，无须新增 `SelectedPhysicalPlan` wrapper |
 | `logical_selection` | `planner_selection_trace`；说明只做诊断 |
 | `window_implementations` | `window_realization_candidates`；对象 `WindowImplementationCandidate` 也应相应命名 |

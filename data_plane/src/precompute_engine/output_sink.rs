@@ -112,7 +112,7 @@ impl SketchStoreSink {
     /// Missing configuration or incompatible state must surface as failure:
     /// a finite-input completion barrier cannot acknowledge dropped outputs.
     ///
-    /// PR-6 follow-up: resolves the source `AggregationConfig` via
+    /// PR-6 follow-up: resolves the source `PrecomputeMaterialization` via
     /// `PolicyRegistry::get(output.policy_fp)`. The legacy
     /// `aggregation_id` fallback branch (PR 4) is gone — `policy_fp`
     /// is the only identity handle on `PrecomputedOutput`. Outputs
@@ -208,7 +208,7 @@ impl SketchStoreSink {
                 return false;
             };
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
-                summary_definition_id: output.policy_fp.into(),
+                stored_output_id: output.policy_fp.into(),
                 time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
                 group_values,
             };
@@ -338,7 +338,7 @@ mod tests {
     use crate::precompute_engine::operators::{DDSketchAccumulator, SumAccumulator};
     use crate::storage_engines::sketch_db::index::{AggKind, SeriesLookup};
     use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -384,11 +384,13 @@ mod tests {
         );
     }
 
-    fn sum_agg_config(_id: u64, metric: &str, grouping_keys: &[&str]) -> AggregationConfig {
+    fn sum_agg_config(_id: u64, metric: &str, grouping_keys: &[&str]) -> PrecomputeMaterialization {
         // `_id` is unused after PR 5 — identity is content-addressed
         // via `PolicyFingerprint::from_config`. Callers obtain the id
         // via `config.policy_fp_u64()`.
-        AggregationConfig {
+        PrecomputeMaterialization {
+            stored_output_id: None,
+            semantic_fragment: None,
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),

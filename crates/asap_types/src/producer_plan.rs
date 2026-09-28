@@ -8,23 +8,20 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorMaterialization {
     pub query_id: String,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub metric: String,
     pub algorithm: String,
     pub parameters: Value,
     pub group_by: Vec<String>,
     pub window_secs: u64,
     pub abstract_window_framework: SummaryWindowFramework,
-    #[serde(rename = "window_implementation_id", alias = "window_realization_id")]
+    #[serde(rename = "window_implementation_id")]
     pub window_realization_id: String,
     pub slide_secs: u64,
-    #[serde(
-        default,
-        alias = "paneOriginMs",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_origin_ms: Option<i64>,
     pub window_layout: crate::WindowMaterializationLayout,
     pub evidence_source: Option<String>,
@@ -41,8 +38,9 @@ pub struct CollectorLifecycle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorPlan {
-    /// Absent only in legacy artifacts; catalog-aware validation requires it.
+    /// Set when binding the plan; required for catalog-authorized installation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_catalog: Option<crate::sds::CatalogGeneration>,
     pub collector_id: String,
@@ -76,7 +74,7 @@ pub struct FrameIdentityContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionRule {
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub producer_id: String,
     pub schema_id: String,
     pub mode: TransmissionMode,
@@ -194,7 +192,7 @@ pub struct RuntimeRulePolicy {
 pub struct RuntimeAdaptationEvidence {
     pub plan_id: u64,
     pub plan_version: u64,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     pub producer_id: String,
     pub schema_id: String,
     pub producer_version: String,
@@ -205,7 +203,7 @@ pub struct RuntimeAdaptationEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionPlan {
-    /// Absent only in legacy artifacts; catalog-aware validation requires it.
+    /// Set when binding the plan; required for catalog-authorized installation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_catalog: Option<crate::sds::CatalogGeneration>,
     pub envelope: PlanEnvelope,
@@ -230,7 +228,7 @@ pub struct SummaryFrameIdentity {
     pub plan_id: u64,
     pub plan_version: u64,
     pub backend_compat: String,
-    pub materialization: crate::sds::SummaryDefinitionId,
+    pub materialization: crate::sds::StoredOutputId,
     /// Canonical producer-side identity for one concrete retained-label group.
     pub series_identity: String,
     pub schema_id: String,
@@ -275,7 +273,7 @@ pub enum TransmissionPlanError {
 fn validate_catalog_projection(
     reference: Option<&crate::sds::CatalogGeneration>,
     envelope: &PlanEnvelope,
-    materializations: impl IntoIterator<Item = crate::sds::SummaryDefinitionId>,
+    materializations: impl IntoIterator<Item = crate::sds::StoredOutputId>,
     catalog: &crate::summary_catalog::SummaryCatalog,
 ) -> Result<(), TransmissionPlanError> {
     let expected = catalog
@@ -290,7 +288,7 @@ fn validate_catalog_projection(
         ));
     }
     for id in materializations {
-        if !catalog.materializations.contains_key(&id) {
+        if !catalog.outputs.contains_key(&id) {
             return Err(TransmissionPlanError::Catalog(format!(
                 "unknown materialization {}",
                 id.as_u64()

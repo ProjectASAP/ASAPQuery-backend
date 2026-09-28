@@ -1,5 +1,6 @@
-//! Shared SDS metadata contracts. Summary payload bytes remain storage-engine
-//! owned; catalogs and inventories contain identities and state references only.
+//! Shared contracts for summary definitions, stored-summary metadata, and plan
+//! output bindings. Payload bytes remain storage-engine owned and logically
+//! belong to the stored summary identified by this metadata.
 pub const TIMESTAMPED_OBSERVATION_SEMANTICS: &str = "asap.timestamped-observations.v2";
 
 use crate::{AggregationType, PrecomputeMaterialization};
@@ -29,27 +30,68 @@ macro_rules! descriptor_id {
         }
     };
 }
-/// Semantic materialization reference. Wire-compatible with PolicyFingerprint,
-/// but distinct from descriptor IDs and concrete [`SummaryInstanceId`] identity.
+/// Identity of one deployed producer output. Runtime routing uses this identity,
+/// never the semantic definition hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SummaryDefinitionId(pub crate::PolicyFingerprint);
-impl SummaryDefinitionId {
+pub struct StoredOutputId(pub u64);
+impl StoredOutputId {
     pub fn fingerprint(self) -> crate::PolicyFingerprint {
-        self.0
+        crate::PolicyFingerprint(self.0)
     }
     pub fn as_u64(self) -> u64 {
-        self.0 .0
+        self.0
     }
 }
-impl From<crate::PolicyFingerprint> for SummaryDefinitionId {
+impl From<crate::PolicyFingerprint> for StoredOutputId {
     fn from(value: crate::PolicyFingerprint) -> Self {
-        Self(value)
+        Self(value.0)
     }
 }
-impl From<SummaryDefinitionId> for crate::PolicyFingerprint {
-    fn from(value: SummaryDefinitionId) -> Self {
-        value.0
+impl From<StoredOutputId> for crate::PolicyFingerprint {
+    fn from(value: StoredOutputId) -> Self {
+        Self(value.0)
+    }
+}
+
+descriptor_id!(SummaryDefinitionId);
+impl SummaryDefinitionId {
+    pub(crate) fn from_semantics(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(format!("sds-v1:{:x}", Sha256::digest(bytes)))
+    }
+    pub fn validate(&self) -> Result<(), SdsError> {
+        let hash = self.0.strip_prefix("sds-v1:").unwrap_or("");
+        if hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(())
+        } else {
+            Err(SdsError("invalid semantic definition ID".into()))
+        }
+    }
+}
+
+/// The installed writer/reader binding joins deployment identity and semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredOutputReference {
+    pub stored_output_id: StoredOutputId,
+    pub definition_id: SummaryDefinitionId,
+}
+impl StoredOutputReference {
+    /// Internal compilation placeholder. Catalog binding must replace its empty
+    /// semantic identity before installation; it cannot authorize a read/write.
+    pub fn for_output(stored_output_id: StoredOutputId) -> Self {
+        Self {
+            stored_output_id,
+            definition_id: SummaryDefinitionId(String::new()),
+        }
+    }
+    pub fn validate(&self) -> Result<(), SdsError> {
+        self.definition_id.validate()
     }
 }
 
@@ -83,7 +125,6 @@ pub struct CatalogGeneration {
     pub schema_version: u32,
     pub plan_id: u64,
     pub plan_version: u64,
-    #[serde(alias = "snapshot_digest")]
     pub snapshot_sha256: String,
 }
 
@@ -112,7 +153,7 @@ pub struct SummarySourcePartition {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstanceCoordinates {
-    pub summary_definition_id: SummaryDefinitionId,
+    pub stored_output_id: StoredOutputId,
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
 }
@@ -123,7 +164,7 @@ impl SummaryInstanceCoordinates {
             serde_json::to_vec(&self.group_values).map_err(|error| SdsError(error.to_string()))?;
         SummaryInstanceId::new(format!(
             "summary-instance:v1:{}:{}:{}:{}",
-            self.summary_definition_id.as_u64(),
+            self.stored_output_id.as_u64(),
             self.time_range.start_ms,
             self.time_range.end_ms,
             xxhash_rust::xxh64::xxh64(&bytes, 0)
@@ -275,7 +316,7 @@ pub enum InstanceLifecycle {
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstance {
     pub instance_id: SummaryInstanceId,
-    #[serde(alias = "materialization_id")]
+    pub stored_output_id: StoredOutputId,
     pub summary_definition_id: SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
@@ -292,6 +333,7 @@ pub struct SummaryInstance {
 
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
+        self.summary_definition_id.validate()?;
         if self.time_range.start_ms >= self.time_range.end_ms {
             return Err(SdsError(
                 "summary instance time range must be non-empty".into(),
@@ -312,6 +354,7 @@ impl SummaryInstance {
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
+            || self.state_reference.generation != self.catalog_generation.plan_version
         {
             return Err(SdsError(
                 "summary instance has invalid state reference".into(),
@@ -364,6 +407,39 @@ impl ObservedSummaryInventory {
         }
         Ok(())
     }
+
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &crate::summary_catalog::SummaryCatalog,
+    ) -> Result<(), SdsError> {
+        self.validate()?;
+        let generation = catalog
+            .reference()
+            .map_err(|error| SdsError(error.to_string()))?;
+        for instance in self.instances.values() {
+            if instance.catalog_generation != generation {
+                return Err(SdsError(
+                    "summary instance belongs to another plan generation".into(),
+                ));
+            }
+            let definition = catalog
+                .outputs
+                .get(&instance.stored_output_id)
+                .ok_or_else(|| SdsError("summary instance has no catalog definition".into()))?;
+            if instance.summary_definition_id != definition.definition_id
+                || instance.summary_descriptor_id != definition.summary_descriptor_id
+                || instance.data_descriptor_id != definition.data_descriptor_id
+                || instance.state_reference.state_schema_version
+                    != catalog.summary_descriptors[&definition.summary_descriptor_id]
+                        .state_schema_version
+            {
+                return Err(SdsError(
+                    "summary instance differs from its catalog definition".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -383,6 +459,9 @@ pub enum SummaryOperator {
     /// Complete planner materialization configuration, including heap/Hydra
     /// dimensions and readout/update subtype. Never equal to a legacy projection.
     Configured {
+        /// Planner-selected semantic family; grouping and pane layout live in
+        /// the data descriptor and summary definition, respectively.
+        family: planner_types::post_asap::SummaryFamilyType,
         aggregation_type: AggregationType,
         aggregation_sub_type: String,
         parameters: BTreeMap<String, Value>,
@@ -598,13 +677,48 @@ impl SummaryDescriptor {
             return Err(SdsError("state schema version must be positive".into()));
         }
         fidelity.validate()?;
+        if let SummaryOperator::Configured {
+            family,
+            aggregation_type,
+            ..
+        } = &operator
+        {
+            if let Some(expected) = aggregation_type.planner_exact_family() {
+                if family != &expected {
+                    return Err(SdsError(
+                        "configured storage type disagrees with Planner family".into(),
+                    ));
+                }
+            } else {
+                use AggregationType as A;
+                let expected = match aggregation_type {
+                    A::DatasketchesKLL | A::HydraKLL => Some(SketchAlgorithm::Kll),
+                    A::CountMinSketch => Some(SketchAlgorithm::Cms),
+                    A::CountMinSketchWithHeap => Some(SketchAlgorithm::CmsWithHeap),
+                    A::CountSketch => Some(SketchAlgorithm::CountSketch),
+                    A::CountSketchWithHeap => Some(SketchAlgorithm::CountSketchWithHeap),
+                    A::DDSketch => Some(SketchAlgorithm::DDSketch),
+                    A::HLL => Some(SketchAlgorithm::Hll),
+                    A::UnivMon => Some(SketchAlgorithm::UnivMon),
+                    _ => None,
+                };
+                if let Some(expected) = expected {
+                    if !matches!(family, planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) if kind.algorithm() == &expected)
+                    {
+                        return Err(SdsError(
+                            "configured sketch storage disagrees with Planner family".into(),
+                        ));
+                    }
+                }
+            }
+        }
         if !fidelity.is_compatible_with(&operator) {
             return Err(SdsError(
                 "summary operator and fidelity guarantee are incompatible".into(),
             ));
         }
         let content = json!({"operator":operator,"fidelity":fidelity,"state_schema_version":state_schema_version});
-        let id = SummaryDescriptorId(format!("summary:v2:{}", canonical(&content)));
+        let id = SummaryDescriptorId(format!("summary:v3:{}", canonical(&content)));
         Ok(Self {
             id,
             operator,
@@ -640,6 +754,10 @@ impl SummaryDescriptor {
         };
         Self::new(
             SummaryOperator::Configured {
+                family: config
+                    .accumulator_spec()
+                    .map_err(|error| SdsError(error.to_string()))?
+                    .family,
                 aggregation_type: config.aggregation_type,
                 aggregation_sub_type: config.aggregation_sub_type.clone(),
                 parameters: config
@@ -667,11 +785,8 @@ impl FidelityGuarantee {
             matches!(
                 (aggregation_type, self),
                 (A::UnivMon, UnivMonFrequency { .. })
-                    | (
-                        A::Sum | A::MultipleSum | A::Min | A::Max | A::MultipleMin | A::MultipleMax,
-                        Exact
-                    )
-                    | (A::Increase | A::MultipleIncrease, ExactCounter { .. })
+                    | (A::Sum | A::Count | A::Min | A::Max, Exact)
+                    | (A::Increase | A::Rate, ExactCounter { .. })
                     | (A::DatasketchesKLL | A::HydraKLL, KllRankError { .. })
                     | (A::DDSketch, DdSketchRelativeError { .. })
                     | (A::HLL, HllCardinalityError { .. })
@@ -807,33 +922,6 @@ impl ValueProjectionIdentity {
             }
         }
     }
-}
-
-/// Compatibility adapter for old config column strings; storage is always typed.
-pub(crate) fn deserialize_optional_value_projection<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<ValueProjectionIdentity>, D::Error> {
-    let value = Option::<Value>::deserialize(deserializer)?;
-    value
-        .map(|value| match value {
-            Value::String(name) => Ok(ValueProjectionIdentity::Column { name }),
-            value => serde_json::from_value(value).map_err(serde::de::Error::custom),
-        })
-        .transpose()
-}
-
-/// Read legacy StateSchema ColumnRef values without retaining a parallel field.
-pub(crate) fn deserialize_state_value_projection<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<ValueProjectionIdentity, D::Error> {
-    let value = Value::deserialize(deserializer)?;
-    if value == "SampleValue" {
-        return Ok(ValueProjectionIdentity::SampleValue);
-    }
-    if let Some(name) = value.get("Named").and_then(Value::as_str) {
-        return Ok(ValueProjectionIdentity::Column { name: name.into() });
-    }
-    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 /// Whether a materialization preserves source entities or pools a population.
@@ -1136,7 +1224,7 @@ mod tests {
             },
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
             coordinates: SummaryInstanceCoordinates {
-                summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
+                stored_output_id: StoredOutputId::from(crate::PolicyFingerprint(7)),
                 time_range: HalfOpenTimeRange {
                     start_ms: 1_000,
                     end_ms: 2_000,
@@ -1201,7 +1289,8 @@ mod tests {
     fn observed_instance(lifecycle: InstanceLifecycle) -> SummaryInstance {
         SummaryInstance {
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
-            summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
+            stored_output_id: StoredOutputId(7),
+            summary_definition_id: SummaryDefinitionId::from_semantics(b"fixture"),
             summary_descriptor_id: descriptor(
                 200,
                 FidelityGuarantee::KllRankError {
@@ -1231,7 +1320,7 @@ mod tests {
                 store: "summary-store".into(),
                 key: "state/1".into(),
                 state_schema_version: 1,
-                generation: 1,
+                generation: 2,
                 sequence: 3,
                 checksum: None,
             },
@@ -1258,6 +1347,51 @@ mod tests {
             instances: BTreeMap::from([(instance.instance_id.clone(), instance)]),
         };
         inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn stored_output_and_payload_version_must_match_instance_definition() {
+        let mut instance = observed_instance(InstanceLifecycle::Persistent);
+        instance.stored_output_id = StoredOutputId(8);
+        assert!(instance.validate().is_ok());
+        instance.stored_output_id = StoredOutputId(7);
+        instance.state_reference.generation = 3;
+        assert!(instance.validate().is_err());
+        let mut reference = StoredOutputReference::for_output(instance.stored_output_id);
+        reference.stored_output_id = StoredOutputId(8);
+        assert!(reference.validate().is_err());
+    }
+
+    // Old aliases and numeric semantic IDs must not authorize the new format.
+    #[test]
+    fn stored_output_reference_rejects_legacy_identity() {
+        assert!(serde_json::from_value::<StoredOutputReference>(json!({
+            "state_slot_id": 7, "definition_id": 7
+        }))
+        .is_err());
+        let reference = StoredOutputReference {
+            stored_output_id: StoredOutputId(8),
+            definition_id: SummaryDefinitionId::from_semantics(b"fixture"),
+        };
+        reference.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<StoredOutputReference>(
+                serde_json::to_value(&reference).unwrap()
+            )
+            .unwrap(),
+            reference
+        );
+    }
+
+    #[test]
+    fn new_generation_rejects_cross_version_payload_adoption() {
+        let mut instance = observed_instance(InstanceLifecycle::Persistent);
+        let mut wire = serde_json::to_value(&instance).unwrap();
+        wire["reused_from_generation"] =
+            serde_json::to_value(&instance.catalog_generation).unwrap();
+        assert!(serde_json::from_value::<SummaryInstance>(wire).is_err());
+        instance.state_reference.generation -= 1;
+        assert!(instance.validate().is_err());
     }
 
     #[test]
@@ -1395,19 +1529,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_generation_accepts_legacy_digest_name() {
-        let generation: CatalogGeneration = serde_json::from_value(json!({
+    fn catalog_generation_rejects_legacy_digest_name() {
+        assert!(serde_json::from_value::<CatalogGeneration>(json!({
             "schema_version": 1,
             "plan_id": 2,
             "plan_version": 3,
             "snapshot_digest": "abc"
         }))
-        .unwrap();
-        assert_eq!(generation.snapshot_sha256, "abc");
-        assert!(serde_json::to_value(generation)
-            .unwrap()
-            .get("snapshot_digest")
-            .is_none());
+        .is_err());
     }
     #[test]
     fn wire_roundtrip_and_tampered_id_validation() {
@@ -1444,6 +1573,7 @@ mod tests {
         .is_err());
         assert!(SummaryDescriptor::new(
             SummaryOperator::Configured {
+                family: AggregationType::Sum.planner_exact_family().unwrap(),
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: BTreeMap::new(),
@@ -1465,6 +1595,24 @@ mod tests {
                 model: "rank.v1".into(),
             },
             1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn configured_descriptor_rejects_family_storage_disagreement() {
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Configured {
+                family: AggregationType::Rate.planner_exact_family().unwrap(),
+                aggregation_type: AggregationType::Increase,
+                aggregation_sub_type: String::new(),
+                parameters: BTreeMap::new(),
+            },
+            FidelityGuarantee::ExactCounter {
+                model: "prometheus.extrapolated-rate.v1".into(),
+                full_pane_coverage_required: true,
+            },
+            2,
         )
         .is_err());
     }
@@ -1524,11 +1672,13 @@ mod tests {
     #[test]
     fn canonical_nested_parameters_and_model_versions_are_identity() {
         let a = SummaryOperator::Configured {
+            family: AggregationType::Sum.planner_exact_family().unwrap(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: BTreeMap::from([("nested".into(), json!({"z":1,"a":2}))]),
         };
         let b = SummaryOperator::Configured {
+            family: AggregationType::Sum.planner_exact_family().unwrap(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: BTreeMap::from([("nested".into(), json!({"a":2,"z":1}))]),
@@ -1566,9 +1716,9 @@ mod tests {
         assert_ne!(first.id, second.id);
     }
     #[test]
-    fn summary_definition_id_preserves_legacy_wire_identity() {
+    fn stored_output_id_preserves_legacy_wire_identity() {
         let fingerprint = crate::PolicyFingerprint(42);
-        let id = SummaryDefinitionId::from(fingerprint);
+        let id = StoredOutputId::from(fingerprint);
         assert_eq!(id.fingerprint(), fingerprint);
         assert_eq!(id.as_u64(), 42);
         assert_eq!(crate::PolicyFingerprint::from(id), fingerprint);
@@ -1576,10 +1726,7 @@ mod tests {
             serde_json::to_value(id).unwrap(),
             serde_json::to_value(fingerprint).unwrap()
         );
-        assert_eq!(
-            serde_json::from_str::<SummaryDefinitionId>("42").unwrap(),
-            id
-        );
+        assert_eq!(serde_json::from_str::<StoredOutputId>("42").unwrap(), id);
     }
     /// Every supplied alias must agree with the declared fidelity, including runtime w/d keys.
     #[test]

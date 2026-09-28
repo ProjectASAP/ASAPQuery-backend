@@ -1,7 +1,7 @@
 //! Backend-facing projection of one planning cycle.
 //!
 //! These types are the input to [`crate::backend_plan::from_stage_config`] and
-//! to `emit::backend_wire`'s backend JSON builders. `PhysicalPlanCompiler` builds
+//! to `emit::backend_wire`'s backend JSON builders. `DeploymentPlanCompiler` builds
 //! them directly from the summaries ASAPPlanner selected.
 //!
 //! They are deliberately not `Serialize`/`Deserialize`: `SummaryFamilyType`
@@ -35,7 +35,7 @@ pub struct BackendAggregation {
     /// Internal-only id (see struct doc). Not on the wire.
     pub aggregation_id: String,
     /// Source metric the aggregation runs over. Required by the backend's
-    /// `AggregationConfig` parser.
+    /// `PrecomputeMaterialization` parser.
     pub metric_name: String,
     /// Planner-owned committed summary identity. Sketch entries carry a
     /// validated `SketchKind` (category + algorithm + params); exact entries

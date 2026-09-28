@@ -20,7 +20,9 @@ use asap_otel_proto::tonic::metrics::v1::{
     KllSketch as OtelKllSketch, KllSketchDataPoint, KllSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_sketchlib::proto::sketchlib::{HllVariant as ProtoHllVariant, HyperLogLogState, KllState};
+use asap_sketchlib::proto::sketchlib::{
+    sketch_envelope, HllVariant as ProtoHllVariant, HyperLogLogState, KllState, SketchEnvelope,
+};
 use asap_sketchlib::{CountMinSketch, CountSketch, HllSketch, HllVariant, MessagePackCodec};
 use prost::Message;
 use serde_json::Value;
@@ -107,22 +109,23 @@ fn envelope(metric: &str, data: Data) -> ExportMetricsServiceRequest {
     }
 }
 
-async fn start_backend(config_yaml: &str) -> Backend {
+async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) -> Backend {
     let query_port = unused_port();
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
     let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    config
-        .write_all(config_yaml.as_bytes())
-        .expect("write streaming config");
-    config.flush().expect("flush streaming config");
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
-        &serde_yaml::from_str(config_yaml).unwrap(),
+    let mut install =
+        physical_fixture::artifact_from_materializations(vec![materialization.clone()]);
+    serde_yaml::to_writer(
+        &mut config,
+        &serde_json::json!({
+            "precompute_plan": install.precompute_plan,
+        }),
     )
     .unwrap();
+    config.flush().unwrap();
     let mut physical = tempfile::NamedTempFile::new().unwrap();
-    let mut install = physical_fixture::artifact(&runtime);
     for rule in &mut install.transmission_plan.rules {
         if matches!(
             install
@@ -292,9 +295,24 @@ fn scalar_values(response: &Value) -> Vec<(HashMap<String, String>, f64)> {
         .collect()
 }
 
-fn config(metric: &str, kind: &str, parameters: &str) -> String {
-    format!(
-        "aggregations:\n  - aggregationType: {kind}\n    aggregationSubType: ''\n    labels:\n      grouping: [service]\n      rollup: []\n      aggregated: []\n    metric: {metric}\n    parameters:\n{parameters}\n    windowSize: 1\n    windowType: tumbling\n    spatialFilter: ''\n"
+fn config(metric: &str, kind: &str, parameters: &str) -> asap_types::PrecomputeMaterialization {
+    use asap_types::{KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    PrecomputeMaterialization::new(
+        kind.parse().unwrap(),
+        String::new(),
+        serde_yaml::from_str(parameters).unwrap(),
+        KeyByLabelNames::new(vec!["service".into()]),
+        KeyByLabelNames::empty(),
+        KeyByLabelNames::empty(),
+        String::new(),
+        1,
+        1,
+        WindowKind::Tumbling,
+        String::new(),
+        metric.into(),
+        None,
+        None,
+        None,
     )
 }
 
@@ -317,7 +335,12 @@ fn kll_export(metric: &str, timestamp_ns: u64, raw: &[f64]) -> ExportMetricsServ
                 attributes: labels(),
                 start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
                 time_unix_nano: timestamp_ns,
-                sketch: state.encode_to_vec(),
+                sketch: SketchEnvelope {
+                    format_version: 1,
+                    sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
                 encoding: KllSketchEncoding::Proto as i32,
                 flags: 0,
                 series_id: 0,

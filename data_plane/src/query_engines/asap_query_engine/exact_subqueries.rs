@@ -85,9 +85,9 @@ fn leaves(
                 }
                 _ => pending.extend(inputs.iter().map(|input| (*input, at))),
             },
-            // CandidateTopK is a typed composition node rather than a Logical
+            // MembershipFilter is a typed composition node rather than a Logical
             // wrapper, but its value input can still be a Prometheus leaf.
-            QueryPlanNode::CandidateTopK { inputs, .. } => {
+            QueryPlanNode::MembershipFilter { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
             QueryPlanNode::ExternalExact { request, inputs } => {
@@ -650,22 +650,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_exact_is_discovered_and_prepared_behind_candidate_topk_root() {
-        use asap_types::query_plan::{residual::Grouping, CandidateCompleteness};
+    async fn candidate_exact_is_discovered_and_prepared_behind_membership_filter_root() {
+        use asap_types::query_plan::CandidateCompleteness;
         let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");
         entry.nodes.insert(
             QueryNodeId(2),
-            QueryPlanNode::CandidateTopK {
+            QueryPlanNode::MembershipFilter {
                 inputs: [QueryNodeId(1), QueryNodeId(0)],
-                k: 2,
-                grouping: Grouping {
-                    labels: vec![],
-                    without: false,
-                },
                 completeness: CandidateCompleteness::BestEffort { guarantee: None },
             },
         );
-        entry.root = QueryNodeId(2);
+        entry.nodes.insert(
+            QueryNodeId(3),
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::TopKSelection {
+                    k: 2,
+                    grouping: asap_types::query_plan::residual::Grouping {
+                        labels: vec![],
+                        without: false,
+                    },
+                },
+                inputs: vec![QueryNodeId(2)],
+            },
+        );
+        entry.root = QueryNodeId(3);
         let dependencies = external_dependencies(&entry, &[1_000]).unwrap();
         assert_eq!(dependencies, vec![(QueryNodeId(0), QueryNodeId(1), 1_000)]);
         let prepared = prepare_external(
@@ -902,9 +910,9 @@ mod tests {
             sid: 41,
             metric_name: "http_requests_total".into(),
             group_by_keys: std::collections::BTreeSet::from(["job".into()]),
-            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Increase)),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),
             agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::AggregationType::Increase,
+                agg_type: asap_types::AggregationType::Rate,
                 parameters_canonical: String::new(),
                 spatial_filter_canonical: String::new(),
             },
@@ -960,6 +968,10 @@ mod tests {
                         full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: MATERIALIZATION.into(),
+                        stored_output_reference: super::super::test_plan::bound_reference(
+                            &store,
+                            MATERIALIZATION.into(),
+                        ),
                         output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
                         window_ms: AT,
                         pane_origin_ms: Some(0),

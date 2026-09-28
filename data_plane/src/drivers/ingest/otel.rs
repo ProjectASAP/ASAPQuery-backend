@@ -582,7 +582,7 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 }
 
 /// Resolve the bucket sid (and `policy_fp`) for a single data point
-/// against a single matching `AggregationConfig`.
+/// against a single matching `PrecomputeMaterialization`.
 ///
 /// B7.6 — sid is the bucket identity in the precompute engine; this
 /// helper folds `(config, grouping-label-values)` into a single u64 via
@@ -602,7 +602,7 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 /// their separate wire-level identity protocol.
 fn resolve_bucket_sid_for_agg_config(
     ingest_state: &Arc<IngestState>,
-    config: &asap_types::aggregation_config::AggregationConfig,
+    config: &asap_types::aggregation_config::PrecomputeMaterialization,
     point_labels: &HashMap<String, String>,
     captured_generation: Option<&asap_types::sds::CatalogGeneration>,
 ) -> Result<(u64, asap_types::PolicyFingerprint), String> {
@@ -1146,7 +1146,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                     } else {
                         None
                     };
-                    let series_key = format_series_key(&canonical_name, &dp.attrs);
+                    let series_key = bound_sketch_series_key(
+                        &canonical_name,
+                        &dp.attrs,
+                        frame_identity.as_ref(),
+                    );
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
                     // Sid resolution — registry-allocated, NOT content-
@@ -1260,7 +1264,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // policy".
                             spatial_filter_canonical: String::new(),
                         };
-                        let agg_kind_canonical = agg_kind.canonical_string();
+                        let agg_kind_canonical = match frame_identity.as_ref() {
+                            Some(frame) => format!(
+                                "{}|output:{}:{}:{}",
+                                agg_kind.canonical_string(),
+                                frame.plan_id,
+                                frame.plan_version,
+                                frame.materialization.as_u64()
+                            ),
+                            None => agg_kind.canonical_string(),
+                        };
                         let definition = frame_identity
                             .as_ref()
                             .map(|frame| frame.materialization)
@@ -1340,6 +1353,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     sketch_algorithm_for(&dp),
                                     &dp.container_config,
                                     &dp.attrs.keys().cloned().collect(),
+                                    Some(frame.materialization),
                                 )
                             });
                         if observed_policy != frame.materialization.fingerprint() {
@@ -1418,6 +1432,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 algorithm.clone(),
                                 &cfg,
                                 &group_by_keys,
+                                frame_identity.as_ref().map(|frame| frame.materialization),
                             );
                             // Per-item dimension (item_label) the controller threaded
                             // into the matched policy's parameters — recorded on the sid
@@ -1783,15 +1798,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // Detection is independent of the legacy dual-write
                     // (it only drives the routed/unconfigured accounting),
                     // so we walk it whether or not the worker push fires.
-                    let matching_configs: Vec<&asap_types::aggregation_config::AggregationConfig> =
-                        agg_configs
-                            .values()
-                            .filter(|config| {
-                                config.metric == canonical_name
-                                    || config.spatial_filter_normalized == canonical_name
-                                    || config.spatial_filter == canonical_name
-                            })
-                            .collect();
+                    let matching_configs: Vec<
+                        &asap_types::aggregation_config::PrecomputeMaterialization,
+                    > = agg_configs
+                        .values()
+                        .filter(|config| {
+                            config.metric == canonical_name
+                                || config.spatial_filter_normalized == canonical_name
+                                || config.spatial_filter == canonical_name
+                        })
+                        .collect();
                     let matched_any = !matching_configs.is_empty();
 
                     // CQ-2 — only pay the worker push (and the per-config
@@ -1869,7 +1885,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         routed += 1;
                     } else {
                         // CQ-6 — a decoded sketch that matched no
-                        // AggregationConfig in the running streaming config.
+                        // PrecomputeMaterialization in the running streaming config.
                         ingest_state
                             .observability
                             .dropped_unconfigured
@@ -1914,7 +1930,7 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// `AggregationType`. Inverse direction is in
 /// `sketch_algorithm_for` above. Used by
 /// [`derive_sketch_policy_fp`] to find the policy whose
-/// `AggregationConfig.aggregation_type` matches a freshly-ingested
+/// `PrecomputeMaterialization.aggregation_type` matches a freshly-ingested
 /// sketch.
 ///
 /// `Any` is a control-plane analysis-time wildcard — it doesn't
@@ -1991,38 +2007,47 @@ fn sketch_config_to_params(
     params
 }
 
-/// Look up the policy fingerprint for a freshly-ingested OTLP sketch
-/// by content-matching against the streaming-config registry.
-///
-/// Sketches arrive with `(metric, attrs, sketch_kind, sketch_config)`
-/// embedded in the DP but no policy reference. The matching pass:
-/// snapshots the current streaming config, derives a
-/// `PolicyRegistry`, and asks `find_policy_by_content` for the
-/// fingerprint of a policy whose contents match. Returns
-/// `PolicyFingerprint::UNSET` when:
-///   1. An unsupported planner algorithm reached this path
-///      (defensive — shouldn't happen).
-///   2. No policy in the registry matches.
-///   3. Multiple policies match (would-have-been-a-bug case;
-///      `find_policy_by_content` returns `None` on ambiguity).
-///
-/// Callers register the sid with the returned fp regardless of
-/// success — UNSET sids are simply absent from the policy_fp →
-/// {sids} reverse index, and remain reachable via the legacy
-/// `instances_matching(metric, gbk)` walk.
+// Snapshot and delta bases are scoped to the producer, never only its semantics.
+fn bound_sketch_series_key(
+    name: &str,
+    labels: &HashMap<String, String>,
+    frame: Option<&asap_types::producer_plan::SummaryFrameIdentity>,
+) -> String {
+    let key = format_series_key(name, labels);
+    match frame {
+        Some(frame) => format!(
+            "{}:{}:{}:{key}",
+            frame.plan_id,
+            frame.plan_version,
+            frame.materialization.as_u64()
+        ),
+        None => key,
+    }
+}
+
+/// Resolve the framed deployed output, then verify its content contract.
+/// Unframed input uses legacy content matching and must have exactly one match.
+/// An absent or ambiguous match returns UNSET and cannot authorize bound writes.
 fn derive_sketch_policy_fp(
     ingest_state: &IngestState,
     metric: &str,
     kind: crate::storage_engines::sketch_db::index::SketchAlgorithm,
     cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
     group_by_keys: &std::collections::BTreeSet<String>,
+    bound_output: Option<asap_types::sds::StoredOutputId>,
 ) -> asap_types::PolicyFingerprint {
     let Some(agg_type) = aggregation_type_for_sketch_algorithm(kind) else {
         return asap_types::PolicyFingerprint::UNSET;
     };
     let params = sketch_config_to_params(cfg);
     let snap = ingest_state.config_snapshot();
-    let index = asap_types::RoutingIndex::build(snap.policy_registry());
+    let registry = snap.policy_registry();
+    let registry = if let Some(output) = bound_output {
+        asap_types::PolicyRegistry::from_configs(registry.get(output.fingerprint()).cloned())
+    } else {
+        registry
+    };
+    let index = asap_types::RoutingIndex::build(registry);
     index
         .find_policy_by_content(metric, group_by_keys, agg_type, &params)
         .unwrap_or(asap_types::PolicyFingerprint::UNSET)
@@ -2303,7 +2328,7 @@ fn preflight_summary_frames(
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         } else {
-            let series_key = format_series_key(canonical_name, &dp.attrs);
+            let series_key = bound_sketch_series_key(canonical_name, &dp.attrs, Some(&frame));
             let (mut base, base_window_start) = ingest_state
                 .sketch_snapshots
                 .get(&series_key)
@@ -2352,6 +2377,7 @@ fn preflight_summary_frames(
                 sketch_algorithm_for(&dp),
                 &dp.container_config,
                 &dp.attrs.keys().cloned().collect(),
+                Some(frame.materialization),
             )
         };
         if observed != frame.materialization.fingerprint() {
@@ -2565,71 +2591,20 @@ fn decode_modified_otlp_sketch_bytes(
 
     match encoding {
         ENCODING_PROTO => match algorithm {
-            // Phase 3 step 3: DDSketch and KLL envelope-parsing /
-            // sketch reconstruction route through the shared
-            // `edge_runtime_adapter`, which delegates to
-            // `asap-precompute-rs`'s `Sketch` trait. Backend's
-            // accumulator wraps the result. Byte parity with Go is
-            // covered by `asap_sketchlib` PRs #40 (DDSketch) and #41
-            // (KLL).
-            //
-            // HLL / CountSketch / CountMinSketch byte parity is
-            // tracked under ProjectASAP/ASAPCollector#243 — until it
-            // lands those three sketches keep using the backend's
-            // existing per-accumulator decoder.
+            // The neutral codec accepts both full envelopes and supported bare
+            // states. Query accumulators retain their family-specific readouts.
             SketchAlgorithm::DDSketch => {
-                use crate::precompute_engine::operators::edge_runtime_adapter::{
-                    reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
+                let (inner, sample_p) = asap_sketch_codec::reconstruct_ddsketch(bytes)?;
+                let sample_p = if sample_p.is_finite() && sample_p > 0.0 && sample_p < 1.0 {
+                    sample_p
+                } else {
+                    1.0
                 };
-                // Prefer the asap-precompute-rs runtime path (envelope-
-                // wrapped bytes, the canonical edge-framework wire format).
-                // If the input is a bare `DdSketchState` (as some unit-test
-                // / pre-envelope agent payloads still emit, mirrored by the
-                // PR #14 contract on `from_sketchlib_proto_bytes`), the
-                // adapter returns an error decoding the envelope — fall
-                // back to the backend's native decoder which already
-                // accepts both shapes.
-                match reconstruct_via_runtime(RtSketchType::DDSketch, bytes) {
-                    Ok(ReconstructedSketch::DdSketch(inner)) => {
-                        // The runtime reconstruction discards the envelope's
-                        // sample_p; re-read it from the same full-frame bytes
-                        // so a sampled series rescales its Count by 1/p.
-                        let sample_p = DDSketchAccumulator::sample_p_from_envelope_bytes(bytes);
-                        Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
-                    }
-                    Ok(_) => {
-                        Err("edge_runtime_adapter returned non-DDSketch reconstruction".into())
-                    }
-                    Err(_) => Ok(Box::new(DDSketchAccumulator::from_sketchlib_proto_bytes(
-                        bytes,
-                    )?)),
-                }
+                Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
             }
-            SketchAlgorithm::Kll => {
-                use crate::precompute_engine::operators::edge_runtime_adapter::{
-                    reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
-                };
-                // Same envelope-vs-bare-state handling as DDSketch above.
-                // Backend's KLL accumulator owns the wire-format-aligned
-                // `KllSketch` rather than the high-throughput `KLL<f64>`
-                // that asap-precompute-rs's `KLLWrapper` wraps internally
-                // — when the adapter succeeds, bridge by re-feeding the
-                // wrapper's snapshot bytes through backend's existing
-                // decoder. The envelope work (decode + state extraction
-                // + reconstruction) has already happened in the runtime
-                // adapter; this final step just reshapes into backend's
-                // accumulator type. On envelope-decode failure (bare
-                // state bytes) fall through to the native decoder.
-                match reconstruct_via_runtime(RtSketchType::KLLSketch, bytes) {
-                    Ok(ReconstructedSketch::Kll { snapshot_bytes }) => Ok(Box::new(
-                        DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&snapshot_bytes)?,
-                    )),
-                    Ok(_) => Err("edge_runtime_adapter returned non-KLL reconstruction".into()),
-                    Err(_) => Ok(Box::new(
-                        DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
-                    )),
-                }
-            }
+            SketchAlgorithm::Kll => Ok(Box::new(
+                DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
+            )),
             SketchAlgorithm::Cms => Ok(Box::new(
                 CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
             )),
@@ -3466,7 +3441,7 @@ mod policy_fp_lookup_tests {
     fn sketch_config_to_params_uses_canonical_keys() {
         // The param-name vocabulary must match what the control plane
         // writes in streaming-config YAML (see
-        // `asap_types::aggregation_config::AggregationConfig::from_yaml_data`).
+        // `asap_types::aggregation_config::PrecomputeMaterialization::from_yaml_data`).
         // Drift surfaces as `find_policy_by_content` missing matches.
         let dd = sketch_config_to_params(&SketchConfig::DDSketch {
             relative_accuracy: 0.01,
@@ -3849,7 +3824,7 @@ mod sid_resolution_tests {
     async fn delta_apply_rotates_per_series_base_at_window_boundary() {
         use crate::precompute_engine::operators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
-        use asap_sketchlib::proto::sketchlib::DdSketchState;
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -3881,10 +3856,13 @@ mod sid_resolution_tests {
         );
 
         // ── Window 1: full frame. Base buckets [10, 0, 5]. ──
-        let full_w1 = DdSketchState {
-            alpha: 0.01,
-            store_counts: vec![10, 0, 5],
-            store_offset: 0,
+        let full_w1 = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(DdSketchState {
+                alpha: 0.01,
+                store_counts: vec![10, 0, 5],
+                store_offset: 0,
+            })),
+            ..Default::default()
         }
         .encode_to_vec();
         route_modified_otlp_sketches_to_precompute(
@@ -4564,7 +4542,7 @@ mod sid_bucketing_tests {
         metric::Data, number_data_point::Value as NumberValue, Gauge as PbGauge,
         Metric as PbMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
     };
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -4581,8 +4559,8 @@ mod sid_bucketing_tests {
         }
     }
 
-    fn sum_agg_config(metric: &str, grouping: &[&str]) -> AggregationConfig {
-        AggregationConfig::new(
+    fn sum_agg_config(metric: &str, grouping: &[&str]) -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             AggregationType::SingleSubpopulation,
             "Sum".to_string(),
             HashMap::new(),

@@ -4,13 +4,16 @@
 //! It shares the pure accumulator factory and update primitives with live ingest
 //! so both paths use the same sketch semantics.
 
+#[cfg(test)]
 use crate::precompute_engine::accumulator_factory::{
-    create_accumulator_updater, AccumulatorUpdater,
+    create_fixture_accumulator, AccumulatorUpdater,
 };
+#[cfg(test)]
 use crate::precompute_engine::worker::apply_sample;
 use crate::storage_engines::sketch_db::backfill::raw_sample_reader::RawSample;
 use crate::storage_engines::types::AggregateCore;
-use asap_types::aggregation_config::AggregationConfig;
+#[cfg(test)]
+use asap_types::aggregation_config::PrecomputeMaterialization;
 
 /// Construct the accumulator for one `(agg_id, window)` pair by
 /// feeding `samples` in order into a fresh `AccumulatorUpdater`.
@@ -25,11 +28,12 @@ use asap_types::aggregation_config::AggregationConfig;
 /// The function is synchronous + pure (no I/O, no async, no global
 /// state). Suitable to call from inside a `WindowProcessor`
 /// implementation without worrying about the async runtime.
+#[cfg(test)]
 pub fn build_backfilled_accumulator(
-    config: &AggregationConfig,
+    config: &PrecomputeMaterialization,
     samples: &[RawSample],
 ) -> Box<dyn AggregateCore> {
-    let mut updater: Box<dyn AccumulatorUpdater> = create_accumulator_updater(config);
+    let mut updater: Box<dyn AccumulatorUpdater> = create_fixture_accumulator(config);
     for sample in samples {
         apply_sample(
             &mut *updater,
@@ -45,14 +49,14 @@ pub fn build_backfilled_accumulator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
 
-    fn sum_config() -> AggregationConfig {
-        AggregationConfig::new(
+    fn sum_config() -> PrecomputeMaterialization {
+        PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             HashMap::new(),
@@ -155,4 +159,29 @@ mod tests {
         // implementation (identity element).
         assert!(aux.sum == Some(0.0) || aux.sum.is_none());
     }
+}
+
+/// Backfill uses the same selected DAG producer and update expressions as live input.
+pub fn build_dag_accumulator(
+    program: &crate::precompute_engine::raw_dag::RawDagProgram,
+    samples: &[RawSample],
+) -> Result<Box<dyn AggregateCore>, String> {
+    let mut updater = program.updater()?;
+    let mut previous = std::collections::HashMap::new();
+    for sample in samples {
+        let value = if program.uses_counter_delta() {
+            crate::precompute_engine::worker::reset_aware_counter_delta(
+                &mut previous,
+                &sample.labels,
+                sample.value,
+                sample.timestamp_ms,
+            )
+        } else {
+            Some(sample.value)
+        };
+        if let Some(value) = value {
+            program.apply(&mut *updater, &sample.labels, value, sample.timestamp_ms)?;
+        }
+    }
+    Ok(updater.take_accumulator())
 }

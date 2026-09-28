@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::QueryLanguage;
-use crate::{sds::SummaryDefinitionId, PolicyFingerprint};
+use crate::{sds::StoredOutputId, PolicyFingerprint};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +24,10 @@ pub struct QueryPlan {
     pub plan_version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clickhouse_context: Option<ClickHousePlanningContext>,
+    /// Selected semantic roots retained for provenance; serving executes
+    /// `entries` and never reconstructs a plan from these documents.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selected_dags: BTreeMap<String, crate::executable_plan::OwnedPostAsapDag>,
     pub entries: BTreeMap<String, QueryPlanEntry>,
 }
 
@@ -52,6 +56,7 @@ impl QueryPlan {
             plan_id: 0,
             plan_version: 0,
             clickhouse_context: None,
+            selected_dags: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
     }
@@ -88,6 +93,25 @@ impl QueryPlan {
         self.lookup_canonical(QueryLanguage::ClickHouseSql, canonical_sql)
     }
 
+    pub fn bind_catalog(
+        &mut self,
+        catalog: &crate::summary_catalog::SummaryCatalog,
+    ) -> Result<(), QueryPlanError> {
+        catalog
+            .validate()
+            .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+        for entry in self.entries.values_mut() {
+            for node in entry.nodes.values_mut() {
+                if let QueryPlanNode::ReadMaterialization { binding } = node {
+                    binding.stored_output_reference = catalog
+                        .output_reference(binding.materialization)
+                        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                }
+            }
+        }
+        self.validate_against_catalog(catalog)
+    }
+
     /// Validate semantic bindings against the authoritative snapshot before use.
     pub fn validate_against_catalog(
         &self,
@@ -101,43 +125,32 @@ impl QueryPlan {
                 "QueryPlan and SummaryCatalog have different plan identity/version".into(),
             ));
         }
-        let available = catalog
-            .materializations
-            .keys()
-            .copied()
-            .map(Into::into)
-            .collect();
+        let available = catalog.outputs.keys().copied().map(Into::into).collect();
         self.validate(&available)?;
         for entry in self.entries.values() {
             for binding in entry.materialization_bindings() {
                 let identity = catalog
-                    .materializations
+                    .outputs
                     .get(&binding.materialization)
                     .ok_or_else(|| {
                         QueryPlanError::Invalid(
                             "query binding references absent catalog materialization".into(),
                         )
                     })?;
+                if binding.stored_output_reference.definition_id != identity.definition_id {
+                    return Err(QueryPlanError::Invalid(
+                        "read definition differs from installed output".into(),
+                    ));
+                }
                 let _data = &catalog.data_descriptors[&identity.data_descriptor_id];
                 if binding.window_ms == 0 {
                     return Err(QueryPlanError::Invalid(
                         "zero physical pane duration".into(),
                     ));
                 }
-                if binding.full_window_slide_ms.is_some()
-                    != matches!(
-                        identity.window_layout,
-                        crate::WindowMaterializationLayout::FullWindow
-                    )
-                    || binding.full_window_slide_ms == Some(0)
-                {
+                if binding.full_window_slide_ms == Some(0) {
                     return Err(QueryPlanError::Invalid(
-                        "query storage layout differs from catalog definition".into(),
-                    ));
-                }
-                if binding.pane_origin_ms != identity.pane_origin_ms {
-                    return Err(QueryPlanError::Invalid(
-                        "query pane origin differs from catalog definition".into(),
+                        "query full-window cadence must be nonzero".into(),
                     ));
                 }
             }
@@ -154,7 +167,7 @@ impl QueryPlan {
                         "counter readout must directly consume one catalog materialization".into(),
                     ));
                 };
-                let identity = &catalog.materializations[&binding.materialization];
+                let identity = &catalog.outputs[&binding.materialization];
                 let descriptor = &catalog.summary_descriptors[&identity.summary_descriptor_id];
                 if !matches!(
                     descriptor.fidelity,
@@ -177,6 +190,34 @@ impl QueryPlan {
             return Err(QueryPlanError::Invalid(
                 "non-bootstrap QueryPlan has zero plan_version".into(),
             ));
+        }
+        for (query_id, selected) in &self.selected_dags {
+            if query_id != &selected.query_id {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG map key `{query_id}` differs from document query ID `{}`",
+                    selected.query_id
+                )));
+            }
+            if selected.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+            {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` has unsupported schema version {}",
+                    selected.schema_version
+                )));
+            }
+            selected.decode().map_err(|error| {
+                QueryPlanError::Invalid(format!("selected DAG `{query_id}` is invalid: {error}"))
+            })?;
+            let matching_entries = self
+                .entries
+                .values()
+                .filter(|entry| entry.query_id == *query_id)
+                .count();
+            if matching_entries != 1 {
+                return Err(QueryPlanError::Invalid(format!(
+                    "selected DAG `{query_id}` must correspond to exactly one query entry; found {matching_entries}"
+                )));
+            }
         }
         if let Some(context) = &self.clickhouse_context {
             for (template, identities) in &context.window_templates {
@@ -250,7 +291,6 @@ pub struct QueryPlanEntry {
     #[serde(default)]
     pub language: QueryLanguage,
     pub query_id: String,
-    #[serde(alias = "canonical_promql")]
     pub canonical_query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_evaluation: Option<FixedEvaluationRange>,
@@ -369,15 +409,7 @@ impl QueryPlanEntry {
                     ));
                 }
             }
-            if let QueryPlanNode::CandidateTopK {
-                k, completeness, ..
-            } = node
-            {
-                if *k == 0 {
-                    return Err(QueryPlanError::Invalid(
-                        "CandidateTopK requires k > 0".into(),
-                    ));
-                }
+            if let QueryPlanNode::MembershipFilter { completeness, .. } = node {
                 if matches!(
                     completeness,
                     CandidateCompleteness::Certified { guarantee }
@@ -387,7 +419,7 @@ impl QueryPlanEntry {
                             || guarantee.failure_probability.evaluate().is_none()
                 ) {
                     return Err(QueryPlanError::Invalid(
-                        "invalid CandidateTopK completeness certificate".into(),
+                        "invalid MembershipFilter completeness certificate".into(),
                     ));
                 }
             }
@@ -400,6 +432,11 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
+                if binding.stored_output_reference.stored_output_id != binding.materialization {
+                    return Err(QueryPlanError::Invalid(
+                        "read binding has invalid stored output or definition".into(),
+                    ));
+                }
                 if binding.readout_lookback_ms == Some(0) {
                     return Err(QueryPlanError::Invalid(
                         "zero semantic readout lookback".into(),
@@ -436,24 +473,21 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
+    pub stored_output_reference: crate::sds::StoredOutputReference,
     /// Complete-window storage advances independently of its stored extent.
     /// None denotes disjoint pane storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_window_slide_ms: Option<u64>,
-    pub materialization: SummaryDefinitionId,
+    pub materialization: StoredOutputId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     /// Labels whose values form an item identity inside a keyed sketch.
-    #[serde(default, alias = "itemLabels", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub item_labels: Vec<String>,
     pub window_ms: u64,
     /// Unix millisecond timestamp on the materialized pane-boundary grid.
     /// Legacy plans deserialize this as unknown and fall back at read time.
-    #[serde(
-        default,
-        alias = "paneOriginMs",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_origin_ms: Option<i64>,
     /// Semantic query lookback, independent of the physical pane duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -582,13 +616,11 @@ pub enum QueryPlanNode {
     SummaryMerge {
         inputs: Vec<QueryNodeId>,
     },
-    /// Use an approximate heap only as a membership sidecar, then rerank the
-    /// matching exact counter readouts. `inputs[0]` is candidate membership;
-    /// `inputs[1]` is the authoritative exact value vector.
-    CandidateTopK {
+    /// Semijoin value rows against membership identities, preserving their values
+    /// and order. Inputs are membership and authoritative values respectively.
+    /// Ranking, grouping and limiting are separate downstream operators.
+    MembershipFilter {
         inputs: [QueryNodeId; 2],
-        k: u64,
-        grouping: residual::Grouping,
         completeness: CandidateCompleteness,
     },
     /// An exact subtree evaluated outside ASAP. Its results enter the query DAG
@@ -616,7 +648,7 @@ impl QueryPlanNode {
             Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
-            Self::CandidateTopK { inputs, .. } => inputs,
+            Self::MembershipFilter { inputs, .. } => inputs,
         }
     }
 }
@@ -632,6 +664,22 @@ pub enum ExactReadout {
     Rate,
     Min,
     Max,
+}
+
+impl ExactReadout {
+    /// Planner family required by this installed DAG readout node.
+    pub fn planner_family(self) -> planner_types::post_asap::SummaryFamilyType {
+        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
+        let (kind, params) = match self {
+            Self::Sum => (ExactKind::Sum, ExactParams::Sum),
+            Self::Count => (ExactKind::Count, ExactParams::Count),
+            Self::Increase => (ExactKind::Increase, ExactParams::Increase),
+            Self::Rate => (ExactKind::Rate, ExactParams::Rate),
+            Self::Min => (ExactKind::Min, ExactParams::Min),
+            Self::Max => (ExactKind::Max, ExactParams::Max),
+        };
+        SummaryFamilyType::ExactAggregate(kind, params)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

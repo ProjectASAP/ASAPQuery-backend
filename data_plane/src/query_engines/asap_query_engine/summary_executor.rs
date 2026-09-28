@@ -65,8 +65,8 @@ use std::sync::Arc;
 
 use crate::query_engines::asap_query_engine::summary_exec::SummaryExecutor;
 use planner_types::post_asap::{
-    ExactKind, ExactParams, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr,
-    SummaryFamilyType, SummaryNode,
+    ExactKind, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
+    SummaryNode,
 };
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 
@@ -203,11 +203,13 @@ impl GroupState {
         let GroupState::ExactAgg { entries, agg_type } = self else {
             return None;
         };
-        let stat = match agg_type {
-            AggregationType::Sum
-            | AggregationType::MultipleSum
-            | AggregationType::Increase
-            | AggregationType::MultipleIncrease => asap_types::Statistic::Sum,
+        let stat = match agg_type.planner_exact_family()? {
+            SummaryFamilyType::ExactAggregate(ExactKind::Sum, _) => asap_types::Statistic::Sum,
+            SummaryFamilyType::ExactAggregate(ExactKind::Count, _) => asap_types::Statistic::Count,
+            SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => {
+                asap_types::Statistic::Increase
+            }
+            SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => asap_types::Statistic::Rate,
             _ => return None,
         };
         let mut merged: Option<Box<dyn AggregateCore>> = None;
@@ -224,9 +226,7 @@ impl GroupState {
             .ok()
     }
 
-    /// Finalize a compiler-declared exact readout. Rate and increase share
-    /// reset-aware Increase state physically, but remain distinct operations
-    /// in QueryPlan so serving never infers semantics from PromQL text.
+    /// Finalize the Planner-declared exact family with its matching readout.
     pub fn exact_value_for(
         &self,
         readout: asap_types::query_plan::ExactReadout,
@@ -237,40 +237,32 @@ impl GroupState {
         let GroupState::ExactAgg { entries, agg_type } = self else {
             return None;
         };
-        let stat = match (readout, agg_type) {
-            (asap_types::query_plan::ExactReadout::Count, AggregationType::Sum) => {
-                asap_types::Statistic::Count
-            }
-            (
-                asap_types::query_plan::ExactReadout::Sum,
-                AggregationType::Sum | AggregationType::MultipleSum,
-            ) => asap_types::Statistic::Sum,
-            (
-                asap_types::query_plan::ExactReadout::Increase,
-                AggregationType::Increase | AggregationType::MultipleIncrease,
-            ) => asap_types::Statistic::Increase,
-            (
-                asap_types::query_plan::ExactReadout::Rate,
-                AggregationType::Increase | AggregationType::MultipleIncrease,
-            ) => asap_types::Statistic::Rate,
-            (
-                asap_types::query_plan::ExactReadout::Min,
-                AggregationType::Min | AggregationType::MultipleMin,
-            ) => asap_types::Statistic::Min,
-            (
-                asap_types::query_plan::ExactReadout::Max,
-                AggregationType::Max | AggregationType::MultipleMax,
-            ) => asap_types::Statistic::Max,
-            _ => return None,
+        if agg_type.planner_exact_family().as_ref() != Some(&readout.planner_family()) {
+            return None;
+        }
+        let stat = match readout {
+            asap_types::query_plan::ExactReadout::Count => asap_types::Statistic::Count,
+            asap_types::query_plan::ExactReadout::Sum => asap_types::Statistic::Sum,
+            asap_types::query_plan::ExactReadout::Increase => asap_types::Statistic::Increase,
+            asap_types::query_plan::ExactReadout::Rate => asap_types::Statistic::Rate,
+            asap_types::query_plan::ExactReadout::Min => asap_types::Statistic::Min,
+            asap_types::query_plan::ExactReadout::Max => asap_types::Statistic::Max,
         };
 
+        let planner_state = entries.iter().flat_map(|w| w.values()).any(|a| {
+            a.as_any()
+                .is::<crate::precompute_engine::operators::exact_accumulator::ExactAccumulator>()
+        });
         // Temporal exact summaries are the hot path for long-window
         // dashboards. Merge their concrete, fixed-size states in one batch
         // instead of allocating a boxed trait object for every pane.
-        if matches!(
-            agg_type,
-            AggregationType::Increase | AggregationType::MultipleIncrease
-        ) {
+        if !planner_state
+            && matches!(
+                readout,
+                asap_types::query_plan::ExactReadout::Increase
+                    | asap_types::query_plan::ExactReadout::Rate
+            )
+        {
             let accumulators = entries
                 .iter()
                 .flat_map(|windows| windows.values())
@@ -286,11 +278,7 @@ impl GroupState {
             ]);
             return merged.query_statistic(stat, key, &query_kwargs).ok();
         }
-        if matches!(
-            agg_type,
-            AggregationType::Min | AggregationType::MultipleMin
-        ) && readout == asap_types::query_plan::ExactReadout::Min
-        {
+        if !planner_state && readout == asap_types::query_plan::ExactReadout::Min {
             return entries
                 .iter()
                 .flat_map(|windows| windows.values())
@@ -303,11 +291,7 @@ impl GroupState {
                 .into_iter()
                 .reduce(f64::min);
         }
-        if matches!(
-            agg_type,
-            AggregationType::Max | AggregationType::MultipleMax
-        ) && readout == asap_types::query_plan::ExactReadout::Max
-        {
+        if !planner_state && readout == asap_types::query_plan::ExactReadout::Max {
             return entries
                 .iter()
                 .flat_map(|windows| windows.values())
@@ -334,9 +318,6 @@ impl GroupState {
             ("range_end_ms".to_string(), range_end_ms.to_string()),
         ]);
         let merged = merged?;
-        if readout == asap_types::query_plan::ExactReadout::Count {
-            return merged.aux_stats().count.map(|count| count as f64);
-        }
         merged.query_statistic(stat, key, &query_kwargs).ok()
     }
 
@@ -444,13 +425,36 @@ fn validate_binding_phase(
 
 impl QueryExecutionContext<'_> {
     /// Resolve exactly one compiler-bound materialization. This is the formal
-    /// QueryPlan path: fingerprint -> SID is the only lookup; metadata checks
-    /// are integrity checks and never broaden the candidate set.
+    /// QueryPlan path: the validated stored output resolves to its definition's
+    /// generation-scoped SID index. Metadata checks never broaden that set.
     pub fn read_bound_materialization(
         &self,
         binding: &asap_types::query_plan::MaterializationBinding,
     ) -> Result<Vec<(BTreeMap<String, String>, GroupState)>, SummaryExecutorError> {
         use asap_types::query_plan::PhysicalGrouping;
+
+        if binding.stored_output_reference.validate().is_err()
+            || binding.stored_output_reference.stored_output_id != binding.materialization
+        {
+            return Err(SummaryExecutorError::Unsupported(
+                "read binding has invalid stored output",
+            ));
+        }
+
+        let catalog =
+            self.index
+                .summary_catalog_snapshot()
+                .ok_or(SummaryExecutorError::Unsupported(
+                    "bound read requires installed SDS definitions",
+                ))?;
+        let expected = catalog
+            .output_reference(binding.materialization)
+            .map_err(|_| SummaryExecutorError::Unsupported("stored output is not installed"))?;
+        if binding.stored_output_reference != expected {
+            return Err(SummaryExecutorError::Unsupported(
+                "bound read semantic identity differs from installed output",
+            ));
+        }
 
         let inventory_revision = self.index.summary_update_revision();
         let query_range = asap_types::sds::HalfOpenTimeRange {
@@ -590,9 +594,13 @@ impl QueryExecutionContext<'_> {
                     });
                 }
                 Candidate::ExactAgg(agg_type) => {
+                    let exact_family = agg_type.planner_exact_family();
                     if matches!(
-                        agg_type,
-                        AggregationType::Increase | AggregationType::MultipleIncrease
+                        exact_family.as_ref(),
+                        Some(SummaryFamilyType::ExactAggregate(
+                            ExactKind::Increase | ExactKind::Rate,
+                            _
+                        ))
                     ) {
                         // Counter pane statistics are sufficient for Prometheus
                         // extrapolatedRate only when no query boundary cuts a
@@ -608,12 +616,12 @@ impl QueryExecutionContext<'_> {
                             ));
                         }
                     }
-                    if let Some((reduction, is_min)) = match agg_type {
-                        AggregationType::Min | AggregationType::MultipleMin => Some((
+                    if let Some((reduction, is_min)) = match exact_family.as_ref() {
+                        Some(SummaryFamilyType::ExactAggregate(ExactKind::Min, _)) => Some((
                             crate::storage_engines::sketch_db::index::RollupReduction::Min,
                             true,
                         )),
-                        AggregationType::Max | AggregationType::MultipleMax => Some((
+                        Some(SummaryFamilyType::ExactAggregate(ExactKind::Max, _)) => Some((
                             crate::storage_engines::sketch_db::index::RollupReduction::Max,
                             false,
                         )),
@@ -665,8 +673,11 @@ impl QueryExecutionContext<'_> {
                     // counter and extrema state. Additive pane summaries must
                     // remain contiguous because a missing pane is not zero.
                     if matches!(
-                        agg_type,
-                        AggregationType::Sum | AggregationType::MultipleSum
+                        exact_family.as_ref(),
+                        Some(SummaryFamilyType::ExactAggregate(
+                            ExactKind::Sum | ExactKind::Count,
+                            _
+                        ))
                     ) {
                         check_panes(windows.keys().copied().collect())?;
                     }
@@ -911,9 +922,15 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     entries.extend(more);
                 }
                 (
-                    GroupState::ExactAgg { entries, .. },
-                    GroupState::ExactAgg { entries: more, .. },
+                    GroupState::ExactAgg { entries, agg_type },
+                    GroupState::ExactAgg {
+                        entries: more,
+                        agg_type: incoming,
+                    },
                 ) => {
+                    if agg_type.planner_exact_family() != incoming.planner_exact_family() {
+                        return Err(SummaryExecutorError::UnsupportedFamily);
+                    }
                     entries.extend(more);
                 }
                 // `find_candidates`'s exact-match contract never produces a
@@ -1255,29 +1272,19 @@ fn summary_family_matches_sketch(
 /// parameters, so this is a pure `ExactKind` identity check against the sid's
 /// `AggregationType`, mirroring the canonical `AggregationType ->
 /// ExactKind` mapping `asap_types::accumulator_spec` uses on the write
-/// side (`Sum|MultipleSum -> ExactKind::Sum`, `Increase|MultipleIncrease
-/// -> ExactKind::Increase` — confirmed against that module's own
-/// dispatch table rather than invented here).
+/// side. Count and Rate remain distinct families even though their runtime
+/// accumulators share implementations with Sum and Increase.
 ///
-/// `ExactKind::Count`/`Rate`/`Min`/`Max` are not matched by this legacy
-/// family-discovery path. For `Count`/`Rate` the final operation is ambiguous
-/// from the stored accumulator alone. `Min`/`Max` were excluded for a reason
-/// that no longer holds -- direction used to be unrecoverable once a summary
-/// reached `AggKind::ExactAgg`, and is now the family itself -- but admitting
-/// them here widens candidate discovery beyond the family split and is left
-/// as follow-up. Installed QueryPlans carry an explicit `ExactReadout`, and
+/// Installed QueryPlans carry an explicit `ExactReadout`, and
 /// `read_bound_materialization` serves those forms safely.
 fn summary_family_matches_exact(family: &SummaryFamilyType, agg_type: AggregationType) -> bool {
     matches!(
-        (family, agg_type),
-        (
-            SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
-            AggregationType::Sum | AggregationType::MultipleSum,
-        ) | (
-            SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
-            AggregationType::Increase | AggregationType::MultipleIncrease,
+        family,
+        SummaryFamilyType::ExactAggregate(
+            ExactKind::Sum | ExactKind::Count | ExactKind::Increase | ExactKind::Rate,
+            _
         )
-    )
+    ) && agg_type.planner_exact_family().as_ref() == Some(family)
 }
 
 /// Project a full label-values map down to the requested `by` columns --
@@ -1397,7 +1404,7 @@ fn find_metric(node: &SummaryNode) -> Option<String> {
         SummaryExpr::KeepPreAsap(qe) => find_metric_in_query_expr(qe),
         SummaryExpr::SummaryAgg { child, .. } => find_metric(child),
         SummaryExpr::SummaryEstimate { summary_input, .. } => find_metric(summary_input),
-        SummaryExpr::SummaryMerge { children } => children.first().and_then(|c| find_metric(c)),
+        SummaryExpr::SummaryMerge { children, .. } => children.first().and_then(|c| find_metric(c)),
         _ => None,
     }
 }
@@ -1448,11 +1455,66 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    fn keyed_count_state_follows_planner_family_and_query_readout() {
+        use crate::precompute_engine::operators::KeyedSumCountAccumulator;
+        use asap_types::query_plan::ExactReadout;
+
+        let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
+        let mut payload = KeyedSumCountAccumulator::for_family(ExactKind::Count);
+        payload.update(key.clone(), 10.0);
+        payload.update(key.clone(), 20.0);
+        let state = GroupState::ExactAgg {
+            entries: vec![Rc::new(BTreeMap::from([(
+                60_000,
+                Arc::new(payload) as Arc<dyn AggregateCore>,
+            )]))],
+            agg_type: AggregationType::Count,
+        };
+        assert_eq!(
+            state.exact_value_for(ExactReadout::Count, &Some(key.clone()), 0, 60_000),
+            Some(2.0)
+        );
+        assert_eq!(
+            state.exact_value_for(ExactReadout::Sum, &Some(key), 0, 60_000),
+            None
+        );
+    }
+
+    #[test]
+    fn state_merge_rejects_different_planner_families() {
+        let index = SketchStore::new();
+        let context = QueryExecutionContext {
+            index: &index,
+            t0_ms: 0,
+            t1_ms: 60_000,
+            is_cumulative: true,
+            allowed_materializations: None,
+        };
+        let states = vec![
+            GroupState::ExactAgg {
+                entries: vec![],
+                agg_type: AggregationType::Rate,
+            },
+            GroupState::ExactAgg {
+                entries: vec![],
+                agg_type: AggregationType::Increase,
+            },
+        ];
+        assert!(matches!(
+            context.merge_states(states),
+            Err(SummaryExecutorError::UnsupportedFamily)
+        ));
+    }
+
+    #[test]
     fn pane_only_reads_require_the_planned_evaluation_phase() {
         let binding = asap_types::query_plan::MaterializationBinding {
             full_window_slide_ms: None,
             item_labels: Vec::new(),
             materialization: asap_types::PolicyFingerprint(7).into(),
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
+                asap_types::PolicyFingerprint(7).into(),
+            ),
             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
             window_ms: 60_000,
             pane_origin_ms: Some(7_000),
@@ -1888,6 +1950,7 @@ mod tests {
         let binding = MaterializationBinding {
             full_window_slide_ms: Some(20_000),
             materialization: fp.into(),
+            stored_output_reference: super::super::test_plan::bound_reference(&index, fp.into()),
             output_grouping: PhysicalGrouping::PerEntity,
             item_labels: vec![],
             window_ms: 60_000,
@@ -1954,6 +2017,7 @@ mod tests {
         let binding = MaterializationBinding {
             full_window_slide_ms: None,
             materialization: fp.into(),
+            stored_output_reference: super::super::test_plan::bound_reference(&index, fp.into()),
             output_grouping: PhysicalGrouping::PerEntity,
             item_labels: vec![],
             window_ms: 1000,

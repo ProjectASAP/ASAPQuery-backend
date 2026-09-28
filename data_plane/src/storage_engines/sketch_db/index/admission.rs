@@ -1,7 +1,7 @@
 //! Store-owned tracking of accepted, not necessarily published summary updates.
 //! This records known work; it does not infer an event-time watermark.
 
-use asap_types::sds::SummaryDefinitionId;
+use asap_types::sds::StoredOutputId;
 use asap_types::sds::{CatalogGeneration, HalfOpenTimeRange, SummaryInstanceCoordinates};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,7 +27,7 @@ pub(super) struct AdmissionInventory {
     revision: u64,
     windows: BTreeMap<SummaryInstanceCoordinates, WindowRevision>,
     metadata_bytes: usize,
-    replay_floors: BTreeMap<SummaryDefinitionId, i64>,
+    replay_floors: BTreeMap<StoredOutputId, i64>,
     observed_extent: Option<HalfOpenTimeRange>,
     finite_input: FiniteInputState,
     published_series: BTreeMap<u64, u64>,
@@ -70,7 +70,7 @@ impl AdmissionInventory {
         for coordinate in &coordinates {
             if self
                 .replay_floors
-                .get(&coordinate.summary_definition_id)
+                .get(&coordinate.stored_output_id)
                 .is_some_and(|floor| coordinate.time_range.end_ms <= *floor)
             {
                 return Err("summary input precedes retained replay horizon".into());
@@ -252,7 +252,7 @@ impl AdmissionInventory {
 
     pub(super) fn known_empty(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         series_id: u64,
         range: HalfOpenTimeRange,
     ) -> bool {
@@ -261,7 +261,7 @@ impl AdmissionInventory {
 
     pub(super) fn known_empty_with_layout(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         series_id: u64,
         range: HalfOpenTimeRange,
         full_window: bool,
@@ -276,7 +276,7 @@ impl AdmissionInventory {
                 .get(&definition)
                 .is_none_or(|floor| range.start_ms >= *floor)
             && !self.windows.iter().any(|(coordinate, state)| {
-                coordinate.summary_definition_id == definition
+                coordinate.stored_output_id == definition
                     && (if full_window {
                         coordinate.time_range == range
                     } else {
@@ -297,12 +297,12 @@ impl AdmissionInventory {
 
     pub(super) fn has_pending(
         &self,
-        definition: SummaryDefinitionId,
+        definition: StoredOutputId,
         range: HalfOpenTimeRange,
         full_window: bool,
     ) -> bool {
         self.windows.iter().any(|(coordinate, state)| {
-            coordinate.summary_definition_id == definition
+            coordinate.stored_output_id == definition
                 && (if full_window {
                     coordinate.time_range == range
                 } else {
@@ -315,11 +315,7 @@ impl AdmissionInventory {
 
     /// Advancing this configured replay floor also rejects future old admission.
     /// Pending work is never forgotten because a different series ran ahead.
-    pub(super) fn retire_completed_before(
-        &mut self,
-        definition: SummaryDefinitionId,
-        frontier_ms: i64,
-    ) {
+    pub(super) fn retire_completed_before(&mut self, definition: StoredOutputId, frontier_ms: i64) {
         let floor = self.replay_floors.entry(definition).or_insert(i64::MIN);
         *floor = (*floor).max(frontier_ms);
         let frontier_ms = *floor;
@@ -329,7 +325,7 @@ impl AdmissionInventory {
             .flat_map(|state| state.pending.iter().copied())
             .collect();
         self.windows.retain(|coordinate, state| {
-            let remove = coordinate.summary_definition_id == definition
+            let remove = coordinate.stored_output_id == definition
                 && coordinate.time_range.end_ms <= frontier_ms
                 && state.published >= state.admitted
                 && !pending.contains(&state.admitted);
@@ -365,7 +361,7 @@ mod tests {
     }
     fn window(series: &str) -> SummaryInstanceCoordinates {
         SummaryInstanceCoordinates {
-            summary_definition_id: SummaryDefinitionId(asap_types::PolicyFingerprint(7)),
+            stored_output_id: StoredOutputId::from(asap_types::PolicyFingerprint(7)),
             time_range: HalfOpenTimeRange {
                 start_ms: 0,
                 end_ms: 1000,
@@ -385,9 +381,9 @@ mod tests {
             .admit(&generation, BTreeSet::from([a.clone(), b.clone()]))
             .unwrap();
         inventory.acknowledge(&generation, &a, revision).unwrap();
-        assert!(inventory.has_pending(a.summary_definition_id, a.time_range, false));
+        assert!(inventory.has_pending(a.stored_output_id, a.time_range, false));
         inventory.acknowledge(&generation, &b, revision).unwrap();
-        assert!(!inventory.has_pending(a.summary_definition_id, a.time_range, false));
+        assert!(!inventory.has_pending(a.stored_output_id, a.time_range, false));
     }
 
     #[test]
@@ -407,12 +403,8 @@ mod tests {
             .acknowledge(&generation, &coordinate, first)
             .unwrap();
         assert_ne!(before, inventory.revision());
-        assert!(inventory.has_pending(
-            coordinate.summary_definition_id,
-            coordinate.time_range,
-            false
-        ));
-        inventory.retire_completed_before(coordinate.summary_definition_id, 1000);
+        assert!(inventory.has_pending(coordinate.stored_output_id, coordinate.time_range, false));
+        inventory.retire_completed_before(coordinate.stored_output_id, 1000);
         assert_eq!(inventory.windows.len(), 1);
         inventory
             .record_series(&generation, &coordinate, 42)
@@ -420,7 +412,7 @@ mod tests {
         inventory
             .acknowledge(&generation, &coordinate, second)
             .unwrap();
-        inventory.retire_completed_before(coordinate.summary_definition_id, 1000);
+        inventory.retire_completed_before(coordinate.stored_output_id, 1000);
         assert!(inventory.windows.is_empty());
         assert_eq!(
             inventory.published_frontiers().get(&42),
@@ -485,12 +477,12 @@ mod tests {
         let revision = inventory
             .admit(&generation, BTreeSet::from([current.clone(), future]))
             .unwrap();
-        assert!(inventory.has_pending(current.summary_definition_id, current.time_range, true));
+        assert!(inventory.has_pending(current.stored_output_id, current.time_range, true));
         inventory
             .acknowledge(&generation, &current, revision)
             .unwrap();
-        assert!(inventory.has_pending(current.summary_definition_id, current.time_range, false));
-        assert!(!inventory.has_pending(current.summary_definition_id, current.time_range, true));
+        assert!(inventory.has_pending(current.stored_output_id, current.time_range, false));
+        assert!(!inventory.has_pending(current.stored_output_id, current.time_range, true));
     }
 
     // A neighboring full snapshot may overlap an empty query population.
@@ -525,28 +517,28 @@ mod tests {
                 .unwrap();
         }
         assert!(!inventory.known_empty_with_layout(
-            first.summary_definition_id,
+            first.stored_output_id,
             1,
             other.time_range,
             true
         ));
         inventory.seal_finite(&generation).unwrap();
-        assert!(!inventory.known_empty(first.summary_definition_id, 1, other.time_range));
+        assert!(!inventory.known_empty(first.stored_output_id, 1, other.time_range));
         assert!(inventory.known_empty_with_layout(
-            first.summary_definition_id,
+            first.stored_output_id,
             1,
             other.time_range,
             true
         ));
         assert!(!inventory.known_empty_with_layout(
-            first.summary_definition_id,
+            first.stored_output_id,
             2,
             other.time_range,
             true
         ));
-        inventory.retire_completed_before(first.summary_definition_id, 2000);
+        inventory.retire_completed_before(first.stored_output_id, 2000);
         assert!(!inventory.known_empty_with_layout(
-            first.summary_definition_id,
+            first.stored_output_id,
             1,
             other.time_range,
             true
@@ -576,13 +568,13 @@ mod tests {
         inventory
             .acknowledge(&generation, &second, revision)
             .unwrap();
-        assert!(!inventory.known_empty(first.summary_definition_id, 1, second.time_range));
+        assert!(!inventory.known_empty(first.stored_output_id, 1, second.time_range));
         inventory.seal_finite(&generation).unwrap();
-        assert!(inventory.known_empty(first.summary_definition_id, 1, second.time_range));
-        assert!(!inventory.known_empty(first.summary_definition_id, 2, second.time_range));
-        assert!(!inventory.known_empty(first.summary_definition_id, 999, second.time_range));
+        assert!(inventory.known_empty(first.stored_output_id, 1, second.time_range));
+        assert!(!inventory.known_empty(first.stored_output_id, 2, second.time_range));
+        assert!(!inventory.known_empty(first.stored_output_id, 999, second.time_range));
         assert!(!inventory.known_empty(
-            first.summary_definition_id,
+            first.stored_output_id,
             1,
             HalfOpenTimeRange {
                 start_ms: 2000,

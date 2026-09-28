@@ -14,15 +14,13 @@ use std::str::FromStr;
 pub enum AggregationType {
     // ---------- single-population (non-keyed) ----------
     Sum,
+    Count,
     Increase,
+    Rate,
     Min,
     Max,
     DatasketchesKLL,
     // ---------- multi-population (keyed) ----------
-    MultipleSum,
-    MultipleIncrease,
-    MultipleMin,
-    MultipleMax,
     HydraKLL,
     CountMinSketch,
     CountMinSketchWithHeap,
@@ -38,17 +36,31 @@ pub enum AggregationType {
 }
 
 impl AggregationType {
+    /// Adapt a storage/processor tag to Planner's exact family. Keyed storage
+    /// changes the payload layout, not the semantic family.
+    pub fn planner_exact_family(self) -> Option<planner_types::post_asap::SummaryFamilyType> {
+        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
+        let (kind, params) = match self {
+            Self::Sum => (ExactKind::Sum, ExactParams::Sum),
+            Self::Count => (ExactKind::Count, ExactParams::Count),
+            Self::Increase => (ExactKind::Increase, ExactParams::Increase),
+            Self::Rate => (ExactKind::Rate, ExactParams::Rate),
+            Self::Min => (ExactKind::Min, ExactParams::Min),
+            Self::Max => (ExactKind::Max, ExactParams::Max),
+            _ => return None,
+        };
+        Some(SummaryFamilyType::ExactAggregate(kind, params))
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             AggregationType::Sum => "Sum",
+            AggregationType::Count => "Count",
             AggregationType::Increase => "Increase",
+            AggregationType::Rate => "Rate",
             AggregationType::Min => "Min",
             AggregationType::Max => "Max",
             AggregationType::DatasketchesKLL => "DatasketchesKLL",
-            AggregationType::MultipleSum => "MultipleSum",
-            AggregationType::MultipleIncrease => "MultipleIncrease",
-            AggregationType::MultipleMin => "MultipleMin",
-            AggregationType::MultipleMax => "MultipleMax",
             AggregationType::HydraKLL => "HydraKLL",
             AggregationType::CountMinSketch => "CountMinSketch",
             AggregationType::CountMinSketchWithHeap => "CountMinSketchWithHeap",
@@ -67,10 +79,6 @@ impl AggregationType {
         matches!(
             self,
             AggregationType::MultipleSubpopulation
-                | AggregationType::MultipleSum
-                | AggregationType::MultipleIncrease
-                | AggregationType::MultipleMin
-                | AggregationType::MultipleMax
                 | AggregationType::CountMinSketch
                 | AggregationType::CountMinSketchWithHeap
                 | AggregationType::CountSketch
@@ -93,14 +101,12 @@ impl FromStr for AggregationType {
         match s {
             // Canonical names
             "Sum" => Ok(AggregationType::Sum),
+            "Count" => Ok(AggregationType::Count),
             "Increase" => Ok(AggregationType::Increase),
+            "Rate" => Ok(AggregationType::Rate),
             "Min" => Ok(AggregationType::Min),
             "Max" => Ok(AggregationType::Max),
             "DatasketchesKLL" => Ok(AggregationType::DatasketchesKLL),
-            "MultipleSum" => Ok(AggregationType::MultipleSum),
-            "MultipleIncrease" => Ok(AggregationType::MultipleIncrease),
-            "MultipleMin" => Ok(AggregationType::MultipleMin),
-            "MultipleMax" => Ok(AggregationType::MultipleMax),
             "HydraKLL" => Ok(AggregationType::HydraKLL),
             "CountMinSketch" => Ok(AggregationType::CountMinSketch),
             "CountMinSketchWithHeap" => Ok(AggregationType::CountMinSketchWithHeap),
@@ -121,12 +127,6 @@ impl FromStr for AggregationType {
             "DatasketchesKLLAccumulator" | "KLL" | "kll" | "datasketches_kll" => {
                 Ok(AggregationType::DatasketchesKLL)
             }
-            "MultipleSumAccumulator" | "multiple_sum" => Ok(AggregationType::MultipleSum),
-            "MultipleIncreaseAccumulator" | "multiple_increase" => {
-                Ok(AggregationType::MultipleIncrease)
-            }
-            "MultipleMinAccumulator" | "multiple_min" => Ok(AggregationType::MultipleMin),
-            "MultipleMaxAccumulator" | "multiple_max" => Ok(AggregationType::MultipleMax),
             "HydraKllSketchAccumulator" | "hydra_kll" => Ok(AggregationType::HydraKLL),
             "CountMinSketchAccumulator" | "CMS" | "cms" | "count_min_sketch" => {
                 Ok(AggregationType::CountMinSketch)
@@ -149,7 +149,7 @@ impl FromStr for AggregationType {
             | "MultipleMinMaxAccumulator"
             | "multiple_min_max" => Err(format!(
                 "Retired aggregation type: '{s}' -- min and max are separate types now, \
-                 use 'Min'/'Max' (or 'MultipleMin'/'MultipleMax')"
+                 use 'Min'/'Max'"
             )),
             _ => Err(format!("Unknown aggregation type: '{s}'")),
         }
@@ -166,5 +166,50 @@ impl<'de> Deserialize<'de> for AggregationType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
+
+    /// Removed layout tags cannot be installed as semantic families.
+    #[test]
+    fn rejects_keyed_family_aliases() {
+        for name in [
+            "MultipleSum",
+            "MultipleIncrease",
+            "MultipleMin",
+            "MultipleMax",
+        ] {
+            assert!(name.parse::<AggregationType>().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn storage_layout_tags_do_not_create_planner_families() {
+        for (storage, expected) in [
+            (AggregationType::Sum, ExactKind::Sum),
+            (AggregationType::Count, ExactKind::Count),
+            (AggregationType::Increase, ExactKind::Increase),
+            (AggregationType::Rate, ExactKind::Rate),
+        ] {
+            let family = storage.planner_exact_family().unwrap();
+            assert!(
+                matches!(family, SummaryFamilyType::ExactAggregate(kind, _) if kind == expected)
+            );
+        }
+        assert_eq!(
+            AggregationType::Rate.planner_exact_family(),
+            Some(SummaryFamilyType::ExactAggregate(
+                ExactKind::Rate,
+                ExactParams::Rate
+            ))
+        );
+        assert_ne!(
+            AggregationType::Rate.planner_exact_family(),
+            AggregationType::Increase.planner_exact_family()
+        );
     }
 }

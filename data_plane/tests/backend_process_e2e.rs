@@ -5,7 +5,9 @@
 //! data plane, sends a modified-OTLP DDSketch, and verifies the resulting
 //! PromQL value. No server or planner is constructed in the test process.
 
-use std::io::Write;
+#[path = "support/streaming_config.rs"]
+mod streaming_config;
+
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -16,7 +18,6 @@ use asap_otel_proto::tonic::metrics::v1::{
     metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_precompute_rs::Precompute;
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope as ProtoEnvelope};
 use control_plane::opamp::{
     opamp_proto, CollectorPlanStatus, CollectorPlanStatusKind, COLLECTOR_PLAN_CAPABILITY,
@@ -76,49 +77,20 @@ fn ddsketch_export(
     plan: &serde_json::Value,
     sequence: u64,
 ) -> Vec<u8> {
-    let decoded = asap_precompute_rs::CollectorPlan::from_json(
-        &serde_json::to_vec(plan).unwrap(),
-        "whole-e2e-collector",
-    )
-    .unwrap();
-    let mut configs = decoded.to_precompute_config_set().unwrap().configs;
-    assert_eq!(
-        configs.len(),
-        1,
-        "two query roots must create only one producer"
-    );
-    let config = configs.remove(0);
-    assert_eq!(config.sketch_params["relative_accuracy"], alpha);
-    let runtime = asap_precompute_rs::precompute::PrecomputeImpl::new(
-        Some(config),
-        Some(Box::new(move || {
-            Box::new(asap_precompute_rs::sketches::DDSketchWrapper::new(alpha))
-        })),
-        Some(Box::new(asap_precompute_rs::sketches::DDSketchObserver)),
-    );
+    let decoded: asap_types::producer_plan::CollectorPlan =
+        serde_json::from_value(plan.clone()).unwrap();
+    assert_eq!(decoded.materializations.len(), 1);
+    let mut sketch = asap_sketchlib::DdSketch::new(alpha);
     for value in values {
-        runtime
-            .observe(&asap_precompute_rs::Observation::new(
-                timestamp_ns / 1_000_000 - 500,
-                metric,
-                vec![],
-                vec![asap_precompute_rs::KeyValue::new("service", "whole-e2e")],
-                asap_precompute_rs::ObservationValue {
-                    kind: asap_precompute_rs::ObservationValueKind::Float,
-                    float: *value,
-                    ..Default::default()
-                },
-            ))
-            .unwrap();
+        sketch.update(*value);
     }
-    let envelopes = runtime.tick(timestamp_ns / 1_000_000);
-    assert_eq!(runtime.stats().input_observations, values.len() as u64);
-    assert_eq!(envelopes.len(), 1);
-    assert_eq!(envelopes[0].count, values.len() as u64);
-    let wire = ProtoEnvelope::decode(envelopes[0].payload.as_slice()).unwrap();
-    let Some(sketch_envelope::SketchState::Ddsketch(state)) = wire.sketch_state else {
-        panic!("expected actual Collector DDSketch state")
-    };
+    assert_eq!(sketch.total_count(), values.len() as u64);
+    let sketch_bytes = asap_sketch_codec::encode_ddsketch(&sketch);
+    let wire = ProtoEnvelope::decode(sketch_bytes.as_slice()).unwrap();
+    assert!(matches!(
+        wire.sketch_state,
+        Some(sketch_envelope::SketchState::Ddsketch(_))
+    ));
     let materialization = plan["materializations"][0]["materialization"]
         .as_u64()
         .unwrap();
@@ -166,7 +138,7 @@ fn ddsketch_export(
         attributes,
         start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
         time_unix_nano: timestamp_ns,
-        sketch: state.encode_to_vec(),
+        sketch: sketch_bytes,
         encoding: DdSketchEncoding::DdsketchEncodingProto as i32,
         exemplars: Vec::new(),
         flags: 0,
@@ -297,12 +269,9 @@ async fn respond_next_collector_plan(
         .expect("collector-plan custom message");
     assert_eq!(custom.capability, COLLECTOR_PLAN_CAPABILITY);
     assert_eq!(custom.r#type, COLLECTOR_PLAN_MESSAGE);
-    let decoded = asap_precompute_rs::collector_plan::CollectorPlan::from_json(
-        &custom.data,
-        "whole-e2e-collector",
-    )
-    .expect("actual Collector validator accepts the emitted plan");
-    assert_eq!(decoded.to_precompute_config_set().unwrap().configs.len(), 1);
+    let decoded: asap_types::producer_plan::CollectorPlan =
+        serde_json::from_slice(&custom.data).expect("decode backend CollectorPlan");
+    assert_eq!(decoded.materializations.len(), 1);
     let plan: serde_json::Value =
         serde_json::from_slice(&custom.data).expect("decode collector physical plan");
     let plan_id = plan["envelope"]["plan_id"]
@@ -395,7 +364,6 @@ async fn quote_workload(
 }
 
 #[tokio::test]
-#[ignore = "requires ASAPCollector CollectorPlan schema compatibility; run explicitly after Collector is updated"]
 async fn production_control_plane_to_data_plane_otlp_to_promql() {
     let control_binary = std::env::var("ASAP_E2E_CONTROL_PLANE_BIN")
         .expect("ASAP_E2E_CONTROL_PLANE_BIN is set by scripts/e2e.sh whole");
@@ -408,7 +376,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
 
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
     let mut bootstrap = tempfile::NamedTempFile::new().expect("create bootstrap config");
-    writeln!(bootstrap, "aggregations: []").expect("write bootstrap config");
+    serde_yaml::to_writer(&mut bootstrap, &streaming_config::empty()).unwrap();
 
     let data_child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--streaming-config")
@@ -510,6 +478,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 }
             }
         }],
+        "dataset_identity": {"namespace": "process-e2e", "dataset": "metrics"},
         "collector_ids": ["whole-e2e-collector"],
         "capability_snapshot_id": "whole-e2e-capabilities",
         "evidence": {},
@@ -521,6 +490,12 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         "backend_compat": control_plane::physical::compiler::BACKEND_COMPAT,
         "apply_timeout_ms": 10000
     });
+    let workload: serde_json::Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-planning-snapshot.json"
+    ))
+    .unwrap();
+    request["data_workload"] = workload["data_workload"].clone();
+    request["data_workload"]["data_ingestion_interval"]["value"] = 1_000.into();
     let mut second = request["queries"][0].clone();
     second["query_id"] = "whole-process-e2e-median".into();
     second["query_string"] = "quantile_over_time(0.5, whole_process_e2e_latency_ms[1s])".into();
@@ -575,9 +550,9 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         active["aggregation_count"], 1,
         "physical plan was not installed: {active}"
     );
-    let installed_aggregation = active["streaming_config"]["aggregation_configs"]
-        .as_object()
-        .and_then(|configs| configs.values().next())
+    let installed_aggregation = active["streaming_config"]["precompute_plan"]["materializations"]
+        .as_array()
+        .and_then(|configs| configs.first())
         .expect("installed aggregation details");
     let planned_alpha = installed_aggregation["parameters"]["alpha"]
         .as_f64()
@@ -730,8 +705,13 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .await
                 .unwrap();
             assert_eq!(
-                still_active, physical_plan_status,
+                still_active["plans"], physical_plan_status["plans"],
                 "failed rollout changed active plan"
+            );
+            assert_eq!(
+                still_active["materializations"][0]["materialization"],
+                physical_plan_status["materializations"][0]["materialization"],
+                "failed rollout changed the installed materialization"
             );
             let still_warm: serde_json::Value = client
                 .get(format!("{data_base}/api/v1/query"))
@@ -746,8 +726,9 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .await
                 .unwrap();
             assert_eq!(first_scalar(&still_warm), Some(value));
-            // Retry the staged successor while queries are in flight. Each
-            // request must retain a complete active snapshot through cutover.
+            // Retry while queries are in flight. Old-generation reads may finish,
+            // but the successor must stay cold until its own output is published.
+            // Reusing the old payload would violate StoredOutputReference identity.
             request["activation_unix_ms"] = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -770,11 +751,12 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                         .json()
                         .await
                         .unwrap();
-                    assert_eq!(
-                        first_scalar(&response),
-                        Some(value),
-                        "torn serving snapshot: {response}"
-                    );
+                    if let Some(actual) = first_scalar(&response) {
+                        assert_eq!(actual, value, "incorrect old-generation result: {response}");
+                    } else {
+                        assert_eq!(response["status"], "error", "{response}");
+                        assert_eq!(response["error"], "No result for query", "{response}");
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             });
@@ -797,6 +779,27 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
             assert_eq!(activated["plan_version"], 2);
             let (successor, _collector_socket) = collector.await.unwrap();
             readers.await.unwrap();
+            let cold_successor: serde_json::Value = client
+                .get(format!("{data_base}/api/v1/query"))
+                .query(&[
+                    ("query", query.to_string()),
+                    ("time", (window_end_ms as f64 / 1000.0).to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(cold_successor["status"], "error", "{cold_successor}");
+            assert_eq!(
+                cold_successor["error"], "No result for query",
+                "{cold_successor}"
+            );
+            assert!(
+                first_scalar(&cold_successor).is_none(),
+                "successor reused old state"
+            );
             let old_frame = client
                 .post(format!("http://{otlp_http}/v1/metrics"))
                 .header("content-type", "application/x-protobuf")

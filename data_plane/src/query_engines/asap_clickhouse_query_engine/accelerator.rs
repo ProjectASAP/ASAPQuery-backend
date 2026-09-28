@@ -558,7 +558,7 @@ mod tests {
         config.pane_origin_ms = Some(0);
         config.table_timestamp_column = Some("timestamp_ms".into());
         let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
-        let materialization = *sds.materializations.keys().next().unwrap();
+        let materialization = *sds.outputs.keys().next().unwrap();
         let read = QueryNodeId(0);
         let readout = QueryNodeId(1);
         let input_schema = relation_schema(&[
@@ -590,6 +590,7 @@ mod tests {
                         binding: MaterializationBinding {
             full_window_slide_ms: None,
                             materialization,
+                            stored_output_reference: sds.output_reference(materialization).unwrap(),
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
                             item_labels: Vec::new(),
                             window_ms: 1_000,
@@ -667,7 +668,7 @@ mod tests {
                     root,
                     QueryPlanNode::Relational {
                         input: sort,
-                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0 })
+                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0, partition_by: planner_types::pre_asap::GroupKeys::by(vec![]) })
                             .unwrap(),
                         input_schema: projected_schema.clone(),
                         output_schema: projected_schema,
@@ -728,6 +729,7 @@ mod tests {
                 tables,
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
+            selected_dags: Default::default(),
             entries: BTreeMap::from([(
                 QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &canonical_sql),
                 entry,
@@ -782,7 +784,7 @@ mod tests {
             &["fixture".into()],
         )
         .unwrap();
-        precompute.summary_catalog = Some(sds.reference().unwrap());
+        precompute.bind_catalog(&sds).unwrap();
         let mut transmission = control_plane::physical::compiler::build_transmission_plan(
             envelope.clone(),
             &precompute,

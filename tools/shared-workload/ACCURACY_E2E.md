@@ -14,8 +14,8 @@ The repository's existing backend CI is unchanged.
 
 Runtime scope is **backend-local precompute**. No ASAPCollector service is
 started or called: the generator sends Remote Write directly to the backend.
-The `asap-precompute-rs` build dependency and offline Google mapper source happen
-to live in the ASAPCollector repository; they are not an extra running collector.
+The optional offline Google mapper source lives in the ASAPCollector repository;
+the backend build and runtime do not depend on that repository.
 
 ## Query matrix
 
@@ -328,7 +328,7 @@ a scheduled live-load or throughput benchmark.
 
 `planned_run.py` connects one selected corpus query to the existing production
 planning/replay workflow. It owns fresh, separate Prometheus baseline/fallback
-stores, invokes the normal compiler on measured version-2 cost evidence, installs
+stores, invokes the normal compiler on measured version-3 cost evidence, installs
 its selected artifact, loads data, drains finite-input materialization and probes
 **every evaluation window** before timed replay. A readiness probe requires a
 nonempty warm response, positive summary-readout count and zero exact-subquery RPCs;

@@ -9,7 +9,7 @@ mod status;
 pub use status::{CandidateEvaluationStatus, CandidateSearchScope};
 
 #[cfg(test)]
-use super::compiler::PhysicalPlanCompiler;
+use super::compiler::DeploymentPlanCompiler;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1034,7 +1034,7 @@ mod tests {
         );
         entries.push(second);
         let (request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request.clone(), env)
             .unwrap();
         let costs = manifest(&plan, &request.queries).unwrap();
@@ -1091,7 +1091,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .len();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(candidate.clone(), environment.clone())
                 .unwrap();
             assert!(identities.insert(plan.envelope.plan_id));
@@ -1146,7 +1146,7 @@ mod tests {
         let quotes = candidates
             .iter()
             .map(|candidate| {
-                let plan = PhysicalPlanCompiler
+                let plan = DeploymentPlanCompiler
                     .compile_promql(candidate.clone(), env.clone())
                     .unwrap();
                 let manifest = manifest(&plan, &candidate.queries).unwrap();
@@ -1186,10 +1186,10 @@ mod tests {
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         assert!(candidates.len() >= 2);
-        let local = PhysicalPlanCompiler
+        let local = DeploymentPlanCompiler
             .compile_promql(candidates[0].clone(), environment.clone())
             .unwrap();
-        let native = PhysicalPlanCompiler
+        let native = DeploymentPlanCompiler
             .compile_promql(candidates.last().unwrap().clone(), environment)
             .unwrap();
         assert_ne!(local.envelope.plan_id, native.envelope.plan_id);
@@ -1245,7 +1245,7 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(exact.clone(), env.clone())
                 .unwrap();
             let manifest = manifest(&plan, &exact.queries).unwrap();
@@ -1397,7 +1397,7 @@ mod tests {
     fn second_consumer_adds_reads_not_another_shared_state() {
         let (request, env) = fixture().into_physical_compilation_request().unwrap();
         let first = manifest(
-            &PhysicalPlanCompiler
+            &DeploymentPlanCompiler
                 .compile_promql(request.clone(), env.clone())
                 .unwrap(),
             &request.queries,
@@ -1438,7 +1438,7 @@ mod tests {
             &shared.exact_composition_costs,
         )
         .unwrap();
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(shared.clone(), env)
             .unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);

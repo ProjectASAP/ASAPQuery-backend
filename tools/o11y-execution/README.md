@@ -15,7 +15,7 @@ No family override, candidate index, or benchmark-selected winner is accepted.
   Export the pinned upstream task queries, not the historical 27-query fixture.
   Provide generator revision, command and seed separately; a file hash cannot
   establish that provenance.
-- A canonical **version 2** planning snapshot registering exactly the corpus's
+- A canonical **version 3** planning snapshot registering exactly the corpus's
   unique queries and containing valid complete-workload provider cost evidence.
   Collect evidence using `workload_cost_manifest`; keep calibration inputs and
   evaluation inputs distinct. Do not reuse the demo snapshot's declared costs.

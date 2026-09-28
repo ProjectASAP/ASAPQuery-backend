@@ -1,6 +1,6 @@
 //! Export every bindable candidate for isolated measurement, without selecting a winner.
 use control_plane::physical::{
-    compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler},
+    compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler},
     workload_cost,
 };
 use planner_types::post_asap::{SummaryExpr, SummaryNode};
@@ -36,17 +36,6 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 "BinaryOp",
                 vec![lhs, rhs],
                 json!({"operator_debug":format!("{operator:?}"),"timing_debug":format!("{timing:?}")}),
-            ),
-            SummaryExpr::CandidateTopK {
-                candidates,
-                values,
-                k,
-                grouping,
-                completeness,
-            } => (
-                "CandidateTopK",
-                vec![candidates, values],
-                json!({"k":k,"grouping_debug":format!("{grouping:?}"),"completeness_debug":format!("{completeness:?}")}),
             ),
             SummaryExpr::ValueOperation {
                 child,
@@ -84,10 +73,11 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 right,
                 kind,
                 pred,
+                pruning,
             } => (
                 "RelationalJoin",
                 vec![left, right],
-                json!({"kind_debug":format!("{kind:?}"),"predicate_debug":format!("{pred:?}")}),
+                json!({"kind_debug":format!("{kind:?}"),"predicate_debug":format!("{pred:?}"), "pruning_debug":format!("{pruning:?}")}),
             ),
             SummaryExpr::SummarySubtract { left, right } => {
                 ("SummarySubtract", vec![left, right], json!({}))
@@ -105,7 +95,7 @@ fn planner_forest(queries: &[control_plane::physical::compiler::QueryCompilation
                 vec![summary_input],
                 json!({"query_debug":format!("{query:?}")}),
             ),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 ("SummaryMerge", children.iter().collect(), json!({}))
             }
         };
@@ -138,9 +128,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let enabled_materialization_keys = candidate.enabled_materialization_keys.clone();
         let planner_selected_queries = planner_forest(&queries);
         let compiled = if metricsql {
-            PhysicalPlanCompiler.compile_metricsql(candidate, environment.clone())
+            DeploymentPlanCompiler.compile_metricsql(candidate, environment.clone())
         } else {
-            PhysicalPlanCompiler.compile_promql(candidate, environment.clone())
+            DeploymentPlanCompiler.compile_promql(candidate, environment.clone())
         };
         let plan = match compiled {
             Ok(plan) => plan,

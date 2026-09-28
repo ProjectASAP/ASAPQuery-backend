@@ -361,11 +361,32 @@ pub(super) fn residual_nodes(
     horizons(residual, &mut intervals);
     intervals.sort_unstable();
     intervals.dedup();
+    // Accuracy annotations select a candidate, but exact execution still
+    // implements that candidate's computation. Reconstruct the same typed IR
+    // before comparing it; do not erase operators or source predicates.
+    let accuracy = match residual {
+        planner_types::pre_asap::QueryExpr::Aggregate { measures, .. } => measures
+            .iter()
+            .find_map(|intent| {
+                use planner_types::pre_asap::AggIntent;
+                match intent {
+                    AggIntent::Quantile { accuracy, .. }
+                    | AggIntent::Cardinality { accuracy, .. }
+                    | AggIntent::Count { accuracy }
+                    | AggIntent::TopK { accuracy, .. }
+                    | AggIntent::FrequencyL2 { accuracy, .. }
+                    | AggIntent::FrequencyEntropy { accuracy, .. } => Some(accuracy.clone()),
+                    _ => None,
+                }
+            })
+            .unwrap_or(planner_types::types::AccuracyTarget::Exact),
+        _ => planner_types::types::AccuracyTarget::Exact,
+    };
     for expression in expressions {
         for interval in &intervals {
             if let Ok(candidate) = crate::query_parser::parse_query_expr_with_interval(
                 &expression.to_string(),
-                planner_types::types::AccuracyTarget::Exact,
+                accuracy.clone(),
                 *interval,
             ) {
                 if &candidate == residual {
@@ -442,11 +463,34 @@ pub(crate) fn selected_residual_nodes(
     original: &str,
     selected: &planner_types::post_asap::SummaryNode,
 ) -> Result<(QueryNodeId, BTreeMap<QueryNodeId, QueryPlanNode>), QueryPlanError> {
+    let expression = selected_native_expression(original, selected)?;
+    let mut lower = Lower {
+        nodes: BTreeMap::new(),
+        seen: BTreeMap::new(),
+    };
+    let root = lower.lower(&expression)?;
+    Ok((root, lower.nodes))
+}
+
+/// Resolve the selected exact subtree to a verified native expression before
+/// binding an external input. Never substitute the top-level query's child.
+pub(super) fn selected_native_expression(
+    original: &str,
+    selected: &planner_types::post_asap::SummaryNode,
+) -> Result<Expr, QueryPlanError> {
     if !selected.guarantee.as_ref().is_some_and(|g| g.is_exact()) {
         return Err(invalid(
             "native residual substitution requires an exact selected value",
         ));
     }
+    let selected = match &selected.expr {
+        planner_types::post_asap::SummaryExpr::ValueOperation {
+            child,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            ..
+        } => child.as_ref(),
+        _ => selected,
+    };
     fn visit<'a>(expr: &'a Expr, output: &mut Vec<&'a Expr>) {
         output.push(expr);
         match expr {
@@ -485,11 +529,6 @@ pub(crate) fn selected_residual_nodes(
                 rhs: right,
                 ..
             }
-            | SummaryExpr::CandidateTopK {
-                candidates: left,
-                values: right,
-                ..
-            }
             | SummaryExpr::RelationalJoin { left, right, .. }
             | SummaryExpr::SummaryJoin {
                 outer: left,
@@ -500,7 +539,7 @@ pub(crate) fn selected_residual_nodes(
                 selected_horizons(left, out);
                 selected_horizons(right, out);
             }
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     selected_horizons(child, out);
                 }
@@ -530,12 +569,7 @@ pub(crate) fn selected_residual_nodes(
             let candidates = SketchAlgorithmStrategy::new(&asap_aware_mapping::DefaultCostModel)
                 .replacements(&TargetSubDAG::new(&root));
             if candidates.iter().any(|candidate| matches!(&candidate.replacement, Replacement::Summary(node) if node.as_ref() == selected)) {
-                let mut lower = Lower {
-                    nodes: BTreeMap::new(),
-                    seen: BTreeMap::new(),
-                };
-                let root = lower.lower(expression)?;
-                let candidate = (root, lower.nodes);
+                let candidate = expression.clone();
                 if matched
                     .as_ref()
                     .is_some_and(|previous| previous != &candidate)
@@ -576,6 +610,24 @@ mod hybrid_tests {
     use super::*;
     use crate::query_plan::{MaterializationBinding, PhysicalGrouping};
     #[test]
+    fn external_binding_rejects_an_unrelated_selected_exact_subtree() {
+        let exact = crate::query_parser::parse_query_expr_with_interval(
+            "sum_over_time(other_metric[5m])",
+            planner_types::types::AccuracyTarget::Exact,
+            1_000,
+        )
+        .unwrap();
+        let selected = crate::planner_selection::plan_test_query(&exact).unwrap();
+        assert!(selected_native_expression("topk(2, sum_over_time(m[5m]))", &selected).is_err());
+        assert_eq!(
+            selected_native_expression("sum_over_time(other_metric[5m])", &selected)
+                .unwrap()
+                .to_string(),
+            "sum_over_time(other_metric[5m])"
+        );
+    }
+
+    #[test]
     fn selected_summary_and_filtered_residual_share_installed_binary() {
         // Both filtered and unfiltered leaves bind independently.
         let query = "sum_over_time(m[5m]) + sum_over_time(m{job=\"api\"}[5m])";
@@ -607,6 +659,14 @@ mod hybrid_tests {
                             if spatial_filter.is_empty() { 7 } else { 8 },
                         )
                         .into(),
+                        stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
+                            asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
+                                7
+                            } else {
+                                8
+                            })
+                            .into(),
+                        ),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
                         pane_origin_ms: Some(0),
@@ -668,7 +728,7 @@ mod hybrid_tests {
 #[cfg(test)]
 mod planner_workload_tests {
     use super::*;
-    use crate::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use crate::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
 
     fn compile_one(query: &str) -> crate::physical::compiler::CompiledPhysicalPlan {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -683,7 +743,7 @@ mod planner_workload_tests {
         let (request, environment) = snapshot
             .into_physical_compilation_request()
             .unwrap_or_else(|error| panic!("{query}: {error}"));
-        PhysicalPlanCompiler
+        DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap_or_else(|error| panic!("{query}: {error}"))
     }
@@ -769,7 +829,7 @@ mod planner_workload_tests {
         let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         assert!(request.allow_mixed_summary_and_exact_execution);
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         assert_eq!(plan.query_plan.entries.len(), 24);
@@ -1077,19 +1137,13 @@ pub fn eligible_materialization_keys(
                 visit(original, left, keys)?;
                 visit(original, right, keys)?;
             }
-            SummaryExpr::CandidateTopK {
-                candidates, values, ..
-            } => {
-                visit(original, candidates, keys)?;
-                visit(original, values, keys)?;
-            }
             SummaryExpr::ValueOperation { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryAgg { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryEstimate { summary_input, .. }
             | SummaryExpr::SummaryDelete { summary_input, .. } => {
                 visit(original, summary_input, keys)?
             }
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     visit(original, child, keys)?;
                 }
@@ -1300,7 +1354,7 @@ mod remote_boundary_regressions {
     use super::*;
 
     #[test]
-    fn summary_definition_identity_is_independent_of_matcher_order() {
+    fn stored_output_identity_is_independent_of_matcher_order() {
         let first = LabelMatcher {
             name: "job".into(),
             value: "orders".into(),

@@ -199,7 +199,8 @@ struct CompileAndPublishPhysicalPlanRequest {
     workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
     data_workload: planner_types::workload::DataWorkload,
-    #[serde(rename = "collector_ids", alias = "target_collector_ids")]
+    dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
+    #[serde(rename = "collector_ids")]
     target_collector_ids: Vec<String>,
     capability_snapshot_id: String,
     #[serde(default)]
@@ -234,13 +235,13 @@ use physical::compiler::QueryFrontend;
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
     cost_comparison: Option<physical::workload_cost::CandidatePlanSelectionReport>,
-    #[serde(rename = "logical_selection", alias = "planner_selection_trace")]
+    #[serde(rename = "logical_selection")]
     planner_selection_trace: Vec<serde_json::Value>,
     plan_id: u64,
     plan_version: u64,
     status: &'static str,
     generated_at_unix_ms: u64,
-    #[serde(rename = "collector_ids", alias = "target_collector_ids")]
+    #[serde(rename = "collector_ids")]
     target_collector_ids: Vec<String>,
     lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
@@ -630,6 +631,7 @@ fn compile_physical_plan_request(
         retained_summary_memory_budget_bytes: None,
     };
     let environment = physical::compiler::PhysicalDeploymentContext {
+        dataset_identity: request.dataset_identity,
         target: request.target,
         target_collector_ids: request.target_collector_ids.clone(),
         capability_snapshot_id: request.capability_snapshot_id,
@@ -852,6 +854,7 @@ mod api_tests {
                 "metric": "m", "window_secs": 60, "accuracy": query.accuracy_target,
                 "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": snapshot.physical_inputs.window_cost_model
             }],
+            "dataset_identity": snapshot.environment.dataset_identity,
             "collector_ids": ["test"], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
             "max_evidence_age_ms": 60000, "plan_version": 1,
@@ -929,6 +932,7 @@ mod api_tests {
                 "metric": metric, "window_secs": query.query_lookback_seconds, "accuracy": query.accuracy_target,
                 "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_realization_candidates[0].cost }
             }],
+            "dataset_identity": snapshot.environment.dataset_identity,
             "collector_ids": [], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
             "max_evidence_age_ms": 60000, "plan_version": 1,

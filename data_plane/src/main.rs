@@ -52,7 +52,7 @@ struct Args {
 
     /// Versioned canonical QueryWorkload + DataWorkload and backend-local
     /// implementation evidence. The ASAPQuery profile invokes the pinned
-    /// Planner and PhysicalPlanCompiler at startup when this is supplied.
+    /// Planner and DeploymentPlanCompiler at startup when this is supplied.
     #[arg(long)]
     planning_snapshot: Option<std::path::PathBuf>,
 
@@ -746,11 +746,12 @@ async fn main() -> Result<()> {
             capability_snapshot_id: "bootstrap".into(),
         },
         ingest: asap_types::precompute_plan::IngestContract {
+            dataset_identity: None,
             protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
             endpoint_path: "/v1/metrics".into(),
             timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
             require_plan_identity: false,
-            require_summary_definition_identity: false,
+            require_stored_output_identity: false,
             require_registered_producer: false,
         },
         schemas: Vec::new(),

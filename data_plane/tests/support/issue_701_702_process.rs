@@ -2,7 +2,7 @@
 use super::*;
 use control_plane::physical::{
     compiler::{
-        BackendLocalPlanningInput, PhysicalPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
+        BackendLocalPlanningInput, DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
     },
     workload_cost::{self, WorkloadCostEvidence, WorkloadQuote},
 };
@@ -152,14 +152,15 @@ async fn run_warm_workload(queries: Vec<(String, u64, u64)>) {
     let quotes = candidates
         .into_iter()
         .filter_map(|candidate| {
-            let plan =
-                match PhysicalPlanCompiler.compile_promql(candidate.clone(), environment.clone()) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        errors.push(error.to_string());
-                        return None;
-                    }
-                };
+            let plan = match DeploymentPlanCompiler
+                .compile_promql(candidate.clone(), environment.clone())
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    return None;
+                }
+            };
             let warm = fully_warm(&plan);
 
             found |= warm;
@@ -346,7 +347,7 @@ fn issue_701_702_uncertified_ratios_require_exact_fallback() {
             workload_cost::enumerate_exact_and_materialized_candidates(request).unwrap();
         assert!(!candidates.is_empty());
         for candidate in candidates {
-            let plan = PhysicalPlanCompiler
+            let plan = DeploymentPlanCompiler
                 .compile_promql(candidate, environment.clone())
                 .unwrap();
             assert!(plan.precompute_plan.materializations.is_empty(), "{query}");

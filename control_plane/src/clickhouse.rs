@@ -204,8 +204,9 @@ fn moving_window(canonical: &QueryExpr) -> Option<(String, (u64, u64))> {
 pub use asap_frontend_sql::SqlCatalog as ClickHouseSqlCatalog;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClickHouseSqlWorkload {
-    #[serde(rename = "sds", alias = "summary_catalog")]
+    #[serde(rename = "sds")]
     pub summary_catalog: SummaryCatalog,
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
@@ -247,6 +248,7 @@ pub async fn compile_automatic_clickhouse_workload(
     let mut entries = std::collections::BTreeMap::new();
     let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
+    let mut selected_dags = std::collections::BTreeMap::new();
     let mut materializations = std::collections::BTreeMap::new();
     let mut selection_traces = std::collections::BTreeMap::new();
     for query in &request.queries {
@@ -267,6 +269,9 @@ pub async fn compile_automatic_clickhouse_workload(
                 )
                 .then_some(config.slide_interval.saturating_mul(1_000)),
                 materialization: config.policy_fingerprint().into(),
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
+                    config.policy_fingerprint().into(),
+                ),
                 output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
                 window_ms: config.stored_window_ms(),
                 pane_origin_ms: config.pane_origin_ms,
@@ -286,7 +291,13 @@ pub async fn compile_automatic_clickhouse_workload(
                 "duplicate canonical SQL query identity".into(),
             ));
         }
-        installed_dags.insert(query.sql.clone(), installed);
+        selected_dags.insert(query.sql.clone(), installed.document.clone());
+        installed_dags.insert(
+            query.sql.clone(),
+            installed
+                .maintenance_projection()
+                .map_err(ClickHousePlanningError::Lower)?,
+        );
     }
     let configs: Vec<_> = materializations.into_values().collect();
     let sds = SummaryCatalog::from_materializations(
@@ -297,11 +308,10 @@ pub async fn compile_automatic_clickhouse_workload(
     .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut precompute = PrecomputePlan::build_backend_local(request.envelope.clone(), configs)
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
-    precompute.summary_catalog = Some(
-        sds.reference()
-            .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?,
-    );
     precompute.executable_dags = installed_dags;
+    precompute
+        .bind_catalog(&sds)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut transmission = crate::physical::compiler::build_transmission_plan(
         request.envelope.clone(),
         &precompute,
@@ -309,7 +319,7 @@ pub async fn compile_automatic_clickhouse_workload(
     )
     .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     transmission.summary_catalog = precompute.summary_catalog.clone();
-    let publication = crate::physical::publication::PhysicalPlanPublication {
+    let mut publication = crate::physical::publication::PhysicalPlanPublication {
         summary_catalog: sds,
         precompute_plan: precompute,
         collector_plans: Vec::new(),
@@ -322,9 +332,14 @@ pub async fn compile_automatic_clickhouse_workload(
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
+            selected_dags,
             entries,
         },
     };
+    publication
+        .query_plan
+        .bind_catalog(&publication.summary_catalog)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     publication
         .validate()
         .map_err(ClickHousePlanningError::Lower)?;
@@ -378,7 +393,7 @@ fn materialize_selected_sql(
     let aggregation = BackendAggregation {
         aggregation_id: String::new(),
         metric_name: format!("{table}.{}", value.column().unwrap_or("constant")),
-        family: crate::physical::compiler::physical_materialization_family(family),
+        family: family.clone(),
         window_secs,
         spatial_filter: String::new(),
         grouping: grouping.names(),
@@ -423,6 +438,7 @@ pub async fn compile_clickhouse_workload(
     let mut entries = std::collections::BTreeMap::new();
     let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
+    let mut selected_dags = std::collections::BTreeMap::new();
     for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
         let template = planned.canonical_sql.clone();
@@ -430,7 +446,13 @@ pub async fn compile_clickhouse_workload(
             bind_selected_node(node, family, query, request)
         })?;
         index_sql_template(&mut window_templates, template, &executable);
-        installed_dags.insert(query.sql.clone(), installed);
+        selected_dags.insert(query.sql.clone(), installed.document.clone());
+        installed_dags.insert(
+            query.sql.clone(),
+            installed
+                .maintenance_projection()
+                .map_err(ClickHousePlanningError::Lower)?,
+        );
         let identity =
             QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &executable.canonical_query);
         if entries.insert(identity.clone(), executable).is_some() {
@@ -441,7 +463,7 @@ pub async fn compile_clickhouse_workload(
     }
     let mut precompute_plan = request.precompute_plan.clone();
     precompute_plan.executable_dags = installed_dags;
-    let publication = crate::physical::publication::PhysicalPlanPublication {
+    let mut publication = crate::physical::publication::PhysicalPlanPublication {
         summary_catalog: request.summary_catalog.clone(),
         precompute_plan,
         collector_plans: Vec::new(),
@@ -454,9 +476,14 @@ pub async fn compile_clickhouse_workload(
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
+            selected_dags,
             entries,
         },
     };
+    publication
+        .query_plan
+        .bind_catalog(&publication.summary_catalog)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     publication
         .validate()
         .map_err(ClickHousePlanningError::Lower)?;
@@ -591,7 +618,7 @@ fn bind_selected_node(
         ..
     } = clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)
         .map_err(crate::query_plan::QueryPlanError::Invalid)?;
-    let expected = crate::physical::compiler::physical_materialization_family(family);
+    let expected = family.clone();
     let selected = select_materialization(
         &request.precompute_plan.materializations,
         &table_ref,
@@ -612,6 +639,9 @@ fn bind_selected_node(
         )
         .then_some(selected.slide_interval.saturating_mul(1_000)),
         materialization: selected.policy_fingerprint().into(),
+        stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
+            selected.policy_fingerprint().into(),
+        ),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),
         window_ms: selected.stored_window_ms(),
         pane_origin_ms: selected.pane_origin_ms,
@@ -1405,7 +1435,7 @@ mod tests {
         };
         let mut precompute =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
-        precompute.summary_catalog = Some(sds.reference().unwrap());
+        precompute.bind_catalog(&sds).unwrap();
         let mut transmission = crate::physical::compiler::build_transmission_plan(
             envelope,
             &precompute,
@@ -1641,10 +1671,16 @@ mod tests {
             installed.binding.nodes.len(),
             installed.document.nodes.len()
         );
-        assert!(installed.binding.nodes.values().any(|binding| matches!(
+        assert!(!installed.binding.nodes.values().any(|binding| matches!(
             binding,
             crate::physical::executable_binding::BackendNodeBinding::Query { .. }
         )));
+        assert!(
+            publication.query_plan.selected_dags[&request.queries[0].sql]
+                .nodes
+                .len()
+                > installed.document.nodes.len()
+        );
         let entry = publication.query_plan.entries.values().next().unwrap();
         // External SQL retains its literal time range until it can be bound.
         assert!(!entry.canonical_query.starts_with("moving-window-v1:"));
@@ -1717,8 +1753,10 @@ mod tests {
         let envelope = request.precompute_plan.envelope.clone();
         request.precompute_plan =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
-        request.precompute_plan.summary_catalog =
-            Some(request.summary_catalog.reference().unwrap());
+        request
+            .precompute_plan
+            .bind_catalog(&request.summary_catalog)
+            .unwrap();
         request.transmission_plan = crate::physical::compiler::build_transmission_plan(
             envelope,
             &request.precompute_plan,

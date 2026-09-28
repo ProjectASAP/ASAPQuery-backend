@@ -62,7 +62,7 @@ pub struct PrecomputedOutput {
     #[serde(default)]
     pub origin: Origin,
     /// Content-addressed policy identity. The data plane's only handle
-    /// on which source `AggregationConfig` produced this output.
+    /// on which source `PrecomputeMaterialization` produced this output.
     /// `#[serde(default)]` on read preserves forward-compat with
     /// PR-3 / PR-4-era records that may not have carried the field;
     /// sinks treat `PolicyFingerprint::UNSET` as "skip this output"
@@ -75,7 +75,7 @@ impl PrecomputedOutput {
     /// Construct a `Native` precompute.
     ///
     /// `policy_fp` is the content-addressed handle on the source
-    /// [`asap_types::AggregationConfig`]; sinks use it to look up the
+    /// [`asap_types::PrecomputeMaterialization`]; sinks use it to look up the
     /// config via `PolicyRegistry::get(policy_fp)`. Construction sites
     /// that lack a source config (raw-mode fast-path) pass
     /// [`PolicyFingerprint::UNSET`]; sinks then skip the output.
