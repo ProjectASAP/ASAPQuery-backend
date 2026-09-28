@@ -3603,10 +3603,10 @@ impl SketchStore {
                             && generation.plan_version < installed_generation.plan_version
                             && catalog.outputs.contains_key(definition)
                         {
-                            self.removed_sids
-                                .write()
-                                .unwrap()
-                                .insert(rec.sid, (Some(Arc::clone(generation)), Some(*definition)));
+                            self.removed_sids.write().unwrap().insert(
+                                rec.storage_handle,
+                                (Some(Arc::clone(generation)), Some(*definition)),
+                            );
                         }
                         tracing::warn!(
                             sid = rec.storage_handle,
