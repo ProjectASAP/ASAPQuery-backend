@@ -586,6 +586,9 @@ pub fn cumulative_summary_state(
     let mut rolling: Option<SummaryState> = None;
     for (_window_end, state) in samples {
         match state.encoding {
+            SketchEncoding::NativeBatchV1 => {
+                return Err("native batch requires the physical batch reader".into());
+            }
             SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull => {
                 let new_state = decode_full(&kind, &state.bytes, state.encoding)?;
                 rolling = Some(match rolling.take() {
@@ -701,6 +704,9 @@ pub fn per_window_summary_states(
         }
 
         match state.encoding {
+            SketchEncoding::NativeBatchV1 => {
+                return Err("native batch requires the physical batch reader".into());
+            }
             SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull => {
                 // A Full (re)sets this window's base.
                 rolling = Some(decode_full(&kind, &state.bytes, state.encoding)?);
@@ -783,6 +789,17 @@ mod tests {
     //! got wrong — fails the build.
     use super::*;
     use asap_sketchlib::HllVariant;
+
+    #[test]
+    fn native_batches_are_not_legacy_sketch_frames() {
+        let state = SketchSampleState {
+            bytes: vec![],
+            encoding: SketchEncoding::NativeBatchV1,
+        };
+        let samples = [(1000, &state)];
+        assert!(cumulative_summary_state(&samples, DeltaSketchKind::Kll { k: 200 }).is_err());
+        assert!(per_window_summary_states(&samples, DeltaSketchKind::Kll { k: 200 }).is_err());
+    }
 
     fn encode_dd(sk: &DdSketch) -> Vec<u8> {
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
