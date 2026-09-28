@@ -96,6 +96,7 @@ enum MaintenanceInputs<'a> {
     },
     Frozen(&'a [crate::storage_engines::sketch_db::index::FrozenExactWindows]),
     Complete(&'a crate::storage_engines::sketch_db::index::CompleteRawMaintenanceCohort),
+    Captured(&'a [crate::storage_engines::sketch_db::index::FrozenExactWindows]),
 }
 
 impl MaintenanceInputs<'_> {
@@ -104,7 +105,7 @@ impl MaintenanceInputs<'_> {
     ) -> Option<&[crate::storage_engines::sketch_db::index::FrozenExactWindows]> {
         match self {
             Self::Live { .. } => None,
-            Self::Frozen(inputs) => Some(inputs),
+            Self::Frozen(inputs) | Self::Captured(inputs) => Some(inputs),
             Self::Complete(cohort) => Some(cohort.inputs()),
         }
     }
@@ -175,6 +176,9 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
             MaintenanceInputs::Live { .. } => Ok(None),
             MaintenanceInputs::Frozen(inputs) => {
                 frozen_population_value(inputs, definition, family, false)
+            }
+            MaintenanceInputs::Captured(inputs) => {
+                frozen_population_value(inputs, definition, family, true)
             }
             MaintenanceInputs::Complete(cohort) => {
                 frozen_population_value(cohort.inputs(), definition, family, true)
@@ -4422,4 +4426,201 @@ mod tests {
         ));
         assert!(commits.get(&key).unwrap().is_none());
     }
+}
+
+/// Captured local input provides fixed population membership for this revision.
+/// All compatible sinks share one native execution cache for each output window.
+pub(crate) fn execute_revision_outputs(
+    plan: &crate::storage_engines::types::RuntimePhysicalPlan,
+    raw: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],
+    revision: u64,
+    limit: usize,
+    publish: &mut crate::precompute_engine::revisions::Publisher<'_>,
+) -> Result<(), MaintenanceError> {
+    use crate::precompute_engine::revisions::{encode_state, RevisionRecord};
+    let generation = plan
+        .precompute_plan
+        .summary_catalog
+        .as_ref()
+        .ok_or("revision generation missing")?;
+    for installed in plan.precompute_plan.executable_dags.values() {
+        let mut windows: BTreeMap<(u64, u64), Vec<(PostAsapNodeId, MaterializationCommitKey)>> =
+            BTreeMap::new();
+        let mut result: BTreeMap<asap_types::sds::StoredOutputId, Vec<RevisionRecord>> =
+            BTreeMap::new();
+        for sink in &installed.binding.precompute_sinks {
+            let Some(BackendNodeBinding::Materialization {
+                stored_output: target,
+            }) = installed.binding.node(*sink)
+            else {
+                continue;
+            };
+            let config = plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|c| c.policy_fingerprint() == target.fingerprint())
+                .ok_or("revision target configuration missing")?;
+            let Some(derived) = &config.derived_input else {
+                continue;
+            };
+            result.entry(*target).or_default();
+            let inputs: Vec<_> = raw
+                .iter()
+                .filter(|r| derived.inputs.contains(&r.definition))
+                .collect();
+            let width = config.stored_window_ms();
+            if width == 0 {
+                return Err("revision output has zero window extent".into());
+            }
+            let possible: BTreeSet<_> = inputs
+                .iter()
+                .flat_map(|i| i.windows.keys())
+                .filter_map(|(start, _)| {
+                    ((*start as i128 - config.pane_origin_ms.unwrap_or(0) as i128)
+                        .rem_euclid(width as i128)
+                        == 0)
+                        .then(|| start.checked_add(width).map(|end| (*start, end)))
+                        .flatten()
+                })
+                .collect();
+            for window in possible {
+                let selected: Vec<_> = inputs
+                    .iter()
+                    .map(
+                        |input| crate::storage_engines::sketch_db::index::FrozenExactWindows {
+                            stored_output_reference: input.stored_output_reference.clone(),
+                            storage_handle: input.storage_handle,
+                            definition: input.definition,
+                            generation: Arc::clone(&input.generation),
+                            group: input.group.clone(),
+                            windows: input
+                                .windows
+                                .iter()
+                                .filter(|((s, e), _)| *s >= window.0 && *e <= window.1)
+                                .map(|(w, s)| (*w, Arc::clone(s)))
+                                .collect(),
+                            singleton_population_complete: true,
+                        },
+                    )
+                    .collect();
+                // Every contributing population must have contiguous pane coverage.
+                if selected.is_empty()
+                    || selected.iter().any(|i| {
+                        let mut cursor = window.0;
+                        for (start, end) in i.windows.keys() {
+                            if *start != cursor {
+                                return true;
+                            }
+                            cursor = *end;
+                        }
+                        cursor != window.1
+                    })
+                {
+                    continue;
+                }
+                let (_, mut key) = prepare_frozen_maintenance_sink(
+                    installed,
+                    &plan.precompute_plan.materializations,
+                    *sink,
+                    &selected,
+                    window,
+                )?;
+                // The captured input revision, rather than a sink-specific digest,
+                // identifies the common evaluation frontier for shared producers.
+                key.input_lineage = revision.to_be_bytes().to_vec();
+                windows.entry(window).or_default().push((*sink, key));
+            }
+        }
+        let dag = installed.document.decode()?;
+        for (window, sinks) in windows {
+            let inputs: Vec<_> = raw
+                .iter()
+                .filter_map(|input| {
+                    let windows: BTreeMap<_, _> = input
+                        .windows
+                        .iter()
+                        .filter(|((s, e), _)| *s >= window.0 && *e <= window.1)
+                        .map(|(w, s)| (*w, Arc::clone(s)))
+                        .collect();
+                    (!windows.is_empty()).then(|| {
+                        crate::storage_engines::sketch_db::index::FrozenExactWindows {
+                            stored_output_reference: input.stored_output_reference.clone(),
+                            storage_handle: input.storage_handle,
+                            definition: input.definition,
+                            generation: Arc::clone(&input.generation),
+                            group: input.group.clone(),
+                            windows,
+                            singleton_population_complete: true,
+                        }
+                    })
+                })
+                .collect();
+            let adapter = OperatorAdapter {
+                binding: &installed.binding,
+                inputs: MaintenanceInputs::Captured(&inputs),
+                configs: &plan.precompute_plan.materializations,
+            };
+            let context = RunContext::new(
+                asap_physical_operators::dag::Scope::Ingestion {
+                    window_start_ms: window.0 as i64,
+                    window_end_ms: window.1 as i64,
+                    revision,
+                },
+                asap_physical_operators::dag::Limits {
+                    max_bytes: limit,
+                    ..Default::default()
+                },
+            )?;
+            let values = execute_precompute_sinks(
+                &dag,
+                &installed.binding,
+                &sinks,
+                &adapter,
+                &CommitRegistry::default(),
+                context,
+            )
+            .map_err(schedule_error)?;
+            for ((_, key), value) in sinks.iter().zip(values) {
+                let group = match value.as_ref() {
+                    MaintenanceValue::SummaryWindows { states, .. } if states.len() == 1 => {
+                        states.keys().next().unwrap().clone()
+                    }
+                    MaintenanceValue::Summary { .. } => BTreeMap::new(),
+                    _ => {
+                        return Err(
+                            "revision sink must explicitly reduce its output population".into()
+                        )
+                    }
+                };
+                let config = plan
+                    .precompute_plan
+                    .materializations
+                    .iter()
+                    .find(|c| c.policy_fingerprint() == key.stored_output.fingerprint())
+                    .ok_or("revision output configuration missing")?;
+                result
+                    .get_mut(&key.stored_output)
+                    .unwrap()
+                    .push(RevisionRecord {
+                        reference: plan
+                            .installed_precompute_plan
+                            .stored_output_reference(key.stored_output)
+                            .ok_or("revision output binding missing")?,
+                        group,
+                        start_ms: window.0,
+                        end_ms: window.1,
+                        payload: encode_state(
+                            Arc::clone(value.state()?),
+                            config.accumulator_spec()?.family,
+                        )?,
+                    });
+            }
+        }
+        for (output, records) in result {
+            publish(output, records)?;
+        }
+    }
+    let _ = generation;
+    Ok(())
 }

@@ -609,6 +609,7 @@ impl Drop for StateMutation<'_> {
 
 #[derive(Default)]
 pub struct SketchStore {
+    pub(crate) revisions: RwLock<Option<Arc<crate::precompute_engine::revisions::RevisionRuntime>>>,
     pub current_series: std::sync::Mutex<super::current_series::CurrentSeriesStore>,
     /// Held through each state append; completion takes the exclusive guard.
     completed_windows: RwLock<HashMap<u64, u64>>,
@@ -6815,5 +6816,101 @@ mod tests {
             .unwrap();
         assert!(store.storage_handles_for_output(&output).is_empty());
         assert!(!store.is_current_storage_handle(100));
+    }
+}
+
+impl SketchStore {
+    /// Build an isolated read view from one already pinned query-wide snapshot.
+    pub(crate) fn from_revision(
+        plan: &crate::storage_engines::types::RuntimePhysicalPlan,
+        pinned: &crate::precompute_engine::revisions::PinnedRevision,
+    ) -> Result<Self, crate::precompute_engine::revisions::RevisionError> {
+        use crate::storage_engines::types::{KeyByLabelValues, PrecomputedOutput};
+        let view = Self::new();
+        view.install_precompute_plan(
+            plan.summary_catalog
+                .clone()
+                .ok_or("revision view requires catalog")?,
+            &plan.precompute_plan,
+        )?;
+        let generation = Arc::new(
+            plan.precompute_plan
+                .summary_catalog
+                .clone()
+                .ok_or("revision view requires generation")?,
+        );
+        let mut sids = BTreeMap::new();
+        for record in &pinned.records {
+            let definition = record.reference.stored_output_id;
+            let expected = plan
+                .installed_precompute_plan
+                .stored_output_reference(definition)
+                .ok_or("revision view has unbound output")?;
+            if expected != record.reference {
+                return Err("revision view semantic binding mismatch".into());
+            }
+            let config = plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|c| c.policy_fingerprint() == definition.fingerprint())
+                .ok_or("revision view lacks output configuration")?;
+            let next_sid = sids.len() as u64 + 1;
+            let sid = *sids
+                .entry((definition, record.group.clone()))
+                .or_insert(next_sid);
+            let mut output = PrecomputedOutput::new(
+                record.start_ms,
+                record.end_ms,
+                Some(KeyByLabelValues::new_with_labels(
+                    config
+                        .grouping_labels
+                        .iter()
+                        .map(|k| record.group.get(k).cloned().unwrap_or_default())
+                        .collect(),
+                )),
+                definition.fingerprint(),
+            );
+            output.population_labels = Some(record.group.clone());
+            output.catalog_generation = Some(Arc::clone(&generation));
+            output.stored_output_reference = Some(record.reference.clone());
+            let state = crate::precompute_engine::revisions::decode_state(record, config)?;
+            let labels = view
+                .register_precompute_output(sid, config, &output)
+                .ok_or("revision view rejected output metadata")?;
+            // This is an immutable read view of already committed revisions,
+            // not additive producer admission (which correctly rejects derived
+            // writes). Every payload was decoded against its installed family.
+            let accepted =
+                match crate::storage_engines::sketch_db::data::agg_kind_for_config(config) {
+                    AggKind::Sketch { .. } => view.append_sample_with_binding(
+                        sid,
+                        labels,
+                        (record.start_ms, record.end_ms),
+                        SketchSampleState {
+                            bytes: state.serialize_to_bytes(),
+                            encoding: SketchEncoding::MsgpackFull,
+                        },
+                    ),
+                    AggKind::ExactAgg { .. } => view.append_precompute_with_binding(
+                        sid,
+                        labels,
+                        (record.start_ms, record.end_ms),
+                        state.clone_boxed_core(),
+                    ),
+                };
+            if !accepted {
+                return Err("revision view rejected committed payload".into());
+            }
+        }
+        let mut samples =
+            crate::drivers::ingest::prometheus_remote_write::revision_samples(&pinned.inputs)?;
+        samples
+            .sort_by(|a, b| (a.timestamp_ms, &a.series_key).cmp(&(b.timestamp_ms, &b.series_key)));
+        view.current_series
+            .lock()
+            .map_err(|_| "revision current-series view poisoned")?
+            .ingest(&plan.query_plan, &samples);
+        Ok(view)
     }
 }

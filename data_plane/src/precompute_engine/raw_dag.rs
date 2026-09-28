@@ -228,13 +228,13 @@ impl RawDagProgram {
         false
     }
 
-    pub fn apply(
+    /// Validate admission with the same weight semantics used during execution,
+    /// without mutating an accumulator or accepting part of a request.
+    pub fn validate_sample(
         &self,
-        updater: &mut dyn AccumulatorUpdater,
-        series: &str,
+        updater: &dyn AccumulatorUpdater,
         value: f64,
-        timestamp: i64,
-    ) -> Result<(), String> {
+    ) -> Result<f64, String> {
         let weight = match &self.input.weight {
             SummaryInputExpr::Constant(c) => *c,
             // The worker retains one previous value per series across pane rotation.
@@ -245,6 +245,17 @@ impl RawDagProgram {
             && !updater.is_keyed();
         let weight = if scalar_frequency { value } else { weight };
         updater.validate_single_input(weight)?;
+        Ok(weight)
+    }
+
+    pub fn apply(
+        &self,
+        updater: &mut dyn AccumulatorUpdater,
+        series: &str,
+        value: f64,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        let weight = self.validate_sample(updater, value)?;
         if updater.is_keyed() {
             let labels = super::worker::parse_labels_from_series_key(series);
             fn eval(

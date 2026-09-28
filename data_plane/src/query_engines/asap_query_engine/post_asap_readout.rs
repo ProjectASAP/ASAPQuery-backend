@@ -541,6 +541,48 @@ fn execute_physical_query_payload(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    // Pin once for every branch; publication cannot switch a later read to r2.
+    let revisions = index
+        .revisions
+        .read()
+        .map_err(|_| LoweringSkip::ExecuteFailed("revision installation poisoned".into()))?
+        .clone();
+    let view = if let Some(revisions) = revisions {
+        let required = entry
+            .materialization_bindings()
+            .into_iter()
+            .map(|b| b.stored_output_reference.stored_output_id)
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| LoweringSkip::ExecuteFailed(e.to_string()))?
+            .as_millis() as u64;
+        let ranges: Vec<_> = entry
+            .materialization_bindings()
+            .into_iter()
+            .map(|b| (b.materialization, t0_ms, t1_ms))
+            .collect();
+        Some(
+            revisions
+                .query_view(
+                    &required,
+                    now,
+                    &ranges,
+                    index
+                        .active_catalog_generation()
+                        .as_deref()
+                        .ok_or_else(|| {
+                            LoweringSkip::ExecuteFailed(
+                                "query revision requires a catalog generation".into(),
+                            )
+                        })?,
+                )
+                .map_err(|e| LoweringSkip::ExecuteFailed(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let index = view.as_ref().unwrap_or(index);
     let revision = index.summary_update_revision();
     let result = (|| {
         let runtime = PhysicalQueryRuntime {

@@ -3,7 +3,8 @@
 Audience: backend designers and developers.
 
 This document specifies the precompute engine design: how it receives a
-Planner-selected computation, runs it across data partitions, and publishes the
+Planner-provided physical candidate selected by Backend, runs its DAGs over
+data partitions, and publishes the
 stored outputs consumed by query plans. The [plan split](asapplanner-integration.md)
 and [SDS contract](summary-catalog-sds-architecture.md) define the compiler and
 storage contracts used here.
@@ -290,11 +291,12 @@ For the initial deployment, derived graphs use one owning worker and execute
 serially. Cross-worker shuffle and parallel grouped maintenance are outside this
 scope. Independent raw-input partitions may still execute on separate workers.
 
-### Continuous local input: revision snapshots (target)
+### Continuous local input: revision snapshots
 
 The first continuous-input deployment receives Remote Write directly in Backend.
-A window may be revised under the Planner-selected maintenance contract. Each
-evaluation consumes a fixed input revision; its dependent outputs must describe
+A window may be revised under the maintenance lifecycle of the physical candidate
+selected by Backend from Planner-provided candidates. Each evaluation consumes a
+fixed input revision; its dependent outputs must describe
 compatible snapshots. Later input can produce a new revision of the same stored
 output without installing a new plan version.
 
@@ -329,11 +331,15 @@ the query. Concurrent publication or retention cannot switch one branch to a
 different snapshot. An unavailable snapshot follows the installed QueryPlan's
 availability policy; cancellation and resource errors remain execution failures.
 
-### Bounded corrections and recovery (target)
+### Bounded corrections and recovery
 
-Deployment requirements include a finite correction horizon. Planner selects a
-maintenance candidate that retains enough input to recompute affected windows;
-Backend binds and enforces that requirement. The deduplication cache lifetime,
+Deployment requirements include a finite correction horizon. Planner enumerates
+legal summary maintenance lifecycle choices and compiles them into physical
+candidates. A candidate supporting corrections must retain enough input to
+recompute affected windows. Backend selects a feasible physical candidate, binds
+its inputs and stored outputs, and enforces its retention and correction
+requirements. Here, maintenance describes the lifecycle; the executable graph is
+the precompute Physical DAG, following Planner’s terminology. The deduplication cache lifetime,
 flush timer, and maximum observed event timestamp are not substitutes for this
 contract.
 
@@ -369,10 +375,45 @@ a new plan version does not implicitly inherit this revision history.
 | Restart with the same plan version | Preserve the correction boundary and revision eligibility |
 | Install a new plan version | Require its own input/history and warm-up |
 
-The production implementation currently establishes finite-input closure only.
-The continuous contracts above require coordinated changes to source capture,
-versioned storage, query snapshot selection and recovery; they are not established
-by the existing finite-input tests.
+The local Remote Write implementation captures and checkpoints accepted input
+before execution. Installation first verifies that each selected raw producer has
+a supported native recovery codec; unsupported storage formats fail before input
+admission. It publishes each stored output independently, using Planner's native
+typed state codec. A query pins one compatible snapshot before preparing
+its inputs; the same snapshot supplies every branch and every range-query step.
+The store exposes committed records through an immutable read view, never through
+the additive producer-write path.
+
+This initial realization serially replays bounded retained input through the
+selected operators. It deliberately trades update cost for simple correction
+semantics; it is not an incremental-update optimization. Input retention covers
+the larger of the correction horizon, installed query lookback and configured
+output retention, plus overlapping windows and query freshness. The correction
+horizon bounds sample age against Backend's admission clock. Whole requests with
+an older or future-dated sample are rejected before durable admission.
+
+A periodic capture closes newly elapsed windows even without a later sample. It
+only describes locally accepted input as of that capture; it does not claim that
+all upstream events have arrived. A late event inside the horizon creates another
+revision. A failed capture stops execution; pending durable input can be retried
+or recovered without replacing already committed randomized sketch bytes.
+
+Enable this path with `--remote-write-revision-dir`. Deployment configuration sets
+`--remote-write-correction-horizon-ms`, `--remote-write-revision-freshness-ms` and
+`--remote-write-revision-max-bytes`. The last separately bounds serialized
+checkpoint size and operator workspace; exceeding it returns an explicit resource error. The checkpoint is
+one atomically replaced, fsynced file per plan version, protected by a single-writer
+lock. Both raw input history and eligible output history are bounded. The existing
+finite-input path remains available when continuous revisions are not configured;
+its drain barrier cannot seal a continuous input.
+
+Process E2E tests exercise one- and two-source Planner-generated DAGs through HTTP
+Remote Write, derived summary construction, bound queries, late corrections,
+retries, whole-batch rejection, same-version restart and new-version warm-up.
+Storage regression tests cover partial publication, fresh common-snapshot
+selection, pinned readers, recovery and explicit memory/cancellation failures.
+Cross-worker shuffle and cross-producer completion protocols remain outside this
+local-input realization.
 
 ## 6. Publish the selected DAG outputs
 
