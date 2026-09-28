@@ -59,6 +59,7 @@ fn encoding_to_tag(enc: SketchEncoding) -> u8 {
         SketchEncoding::ProtoDelta => t::PROTO_DELTA,
         SketchEncoding::MsgpackFull => t::MSGPACK_FULL,
         SketchEncoding::MsgpackDelta => t::MSGPACK_DELTA,
+        SketchEncoding::NativeBatchV1 => t::NATIVE_BATCH_V1,
     }
 }
 
@@ -72,6 +73,7 @@ fn tag_to_encoding(tag: u8) -> SketchEncoding {
         t::PROTO_DELTA => SketchEncoding::ProtoDelta,
         t::MSGPACK_FULL => SketchEncoding::MsgpackFull,
         t::MSGPACK_DELTA => SketchEncoding::MsgpackDelta,
+        t::NATIVE_BATCH_V1 => SketchEncoding::NativeBatchV1,
         // t::PROTO_FULL and t::UNKNOWN (legacy) both → Full.
         _ => SketchEncoding::ProtoFull,
     }
