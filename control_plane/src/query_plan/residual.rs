@@ -862,7 +862,7 @@ mod planner_workload_tests {
 
     fn assert_local_limit(node: &QueryPlanNode) {
         match node {
-            QueryPlanNode::Physical { dag, .. } => {
+            QueryPlanNode::PhysicalFragment { dag, .. } => {
                 let plan =
                     asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                         .unwrap();

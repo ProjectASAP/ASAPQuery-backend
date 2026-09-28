@@ -282,7 +282,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                 }
                 self.logical(operator, inputs, dependencies, at, context)?
             }
-            QueryPlanNode::Physical {
+            QueryPlanNode::PhysicalFragment {
                 dag,
                 row_input,
                 pruning,
@@ -561,7 +561,7 @@ fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i6
             operator: ResidualQueryOperator::CurrentSeries { .. },
             ..
         } => Ok(vec![]),
-        QueryPlanNode::Physical { inputs, .. } | QueryPlanNode::Logical { inputs, .. } => {
+        QueryPlanNode::PhysicalFragment { inputs, .. } | QueryPlanNode::Logical { inputs, .. } => {
             Ok(inputs.iter().map(|&id| (id, at)).collect())
         }
         QueryPlanNode::RelationalJoin { inputs, .. } => {
