@@ -347,7 +347,7 @@ impl QueryPlanEntry {
     /// The initial stored-vector adapter binds exact per-series counter reads.
     /// Recovery validates source identities and schemas without logical lowering.
     #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
-        fields(stage = "physical.recover_validate", query_id = %self.query_id, input_kind = "stored_counter_readout"), err)]
+        fields(stage = "physical.recover_validate", query_id = %self.query_id, input_kind = "bound_native_input"), err)]
     pub fn recover_vector_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
         let invalid = |message: &str| QueryPlanError::Invalid(message.into());
         let (inputs, source_nodes, max_bytes) = self

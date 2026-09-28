@@ -266,6 +266,8 @@ impl SketchStore {
 
     /// A complete native batch is stored atomically under one global address.
     /// Logical grouping remains in the batch; reads never allocate a resolver ID.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "sds.read_bound_native", plan_version = address.plan_version, stored_output_id = ?reference.stored_output_id, start_ms = address.window.start_ms, end_ms = address.window.end_ms, max_bytes), err)]
     pub fn read_bound_native_summary(
         &self,
         address: &asap_types::sds::StoredSummaryKey,

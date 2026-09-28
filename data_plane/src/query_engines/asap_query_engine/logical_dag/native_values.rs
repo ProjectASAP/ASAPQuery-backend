@@ -131,7 +131,7 @@ pub(super) fn semi_join(
 }
 
 #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
-    fields(stage = "physical.execute", query_id = %entry.query_id, evaluation_time_ms = at,
+    fields(stage = "physical.bind_vectors", query_id = %entry.query_id, evaluation_time_ms = at,
         input_kind = "bound_promql_vector", bound_counter_state = entry.physical_vector_binding().is_some()), err)]
 pub(super) fn execute_vectors<F>(
     entry: &asap_types::query_plan::QueryPlanEntry,
@@ -200,6 +200,8 @@ where
     )
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(stage = "physical.bind_stored_summary", query_id = %entry.query_id, evaluation_time_ms = at, plan_id, plan_version), err)]
 pub(in crate::query_engines::asap_query_engine) fn execute_stored(
     entry: &asap_types::query_plan::QueryPlanEntry,
     plan_id: u64,
@@ -254,6 +256,8 @@ pub(in crate::query_engines::asap_query_engine) fn execute_stored(
     })
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(stage = "physical.execute", input_count, evaluation_time_ms = at, max_bytes), err)]
 fn execute_batches(
     program: &asap_physical_operators::physical_planner::CompiledPhysicalDag,
     max_bytes: u64,
@@ -294,7 +298,7 @@ fn execute_batches(
     }
     let graph = {
         let _binding = tracing::debug_span!(target: "asap_runtime_debug", "physical_input_binding",
-            stage = "physical.bind_inputs", input_count = sources.len(), input_bytes, input_kind = "bound_promql_vector").entered();
+            stage = "physical.bind_inputs", input_count = sources.len(), input_bytes, input_kind = "native_batch").entered();
         program
             .instantiate(sources)
             .map_err(|e| miss(e.to_string()))?
