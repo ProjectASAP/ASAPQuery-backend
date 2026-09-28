@@ -478,6 +478,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 }
             }
         }],
+        "dataset_identity": {"namespace": "process-e2e", "dataset": "metrics"},
         "collector_ids": ["whole-e2e-collector"],
         "capability_snapshot_id": "whole-e2e-capabilities",
         "evidence": {},
