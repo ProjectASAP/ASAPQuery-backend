@@ -541,6 +541,13 @@ pub(super) fn estimate(
             let mut detail = json!({"input_rows":input_rows});
             let mut network = 0.0;
             let cpu = match node {
+                Node::PhysicalFragment { dag, .. } => {
+                    let program: Value =
+                        serde_json::from_slice(dag).map_err(|error| invalid(error.to_string()))?;
+                    let (cpu, workspace) = physical_work(&program, input_rows)?;
+                    detail = json!({"input_rows":input_rows,"physical_program":program,"workspace_bytes_bound":workspace});
+                    cpu
+                }
                 Node::Physical { .. } => {
                     let (cpu, workspace) = snapshot_work(entry, input_rows)?;
                     detail = json!({"input_rows":input_rows,"physical_program":entry.physical_dag,"workspace_bytes_bound":workspace});
