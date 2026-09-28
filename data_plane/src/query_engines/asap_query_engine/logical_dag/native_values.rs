@@ -1,4 +1,4 @@
-//! Bind protocol vectors to native batch operators; computation stays in Planner.
+//! Bind deployment inputs to retained native programs and decode PromQL results.
 use super::{grouping_key, miss, EngineError, Grouping, Labels, Vector};
 use asap_physical_operators::dag::{
     self, batch_execution,
@@ -224,7 +224,7 @@ pub(in crate::query_engines::asap_query_engine) fn execute_stored(
         let Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding }) =
             entry.nodes.get(&inputs[index])
         else {
-            return Err(miss("native stored source is not a bound heap"));
+            return Err(miss("native stored source has no deployed summary binding"));
         };
         let end = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
         let start = at
@@ -315,21 +315,36 @@ fn execute_batches(
                 .schema()
                 .fields
                 .iter()
-                .position(|field| field.name == SERIES_IDENTITY_COLUMN)
-                .ok_or_else(|| miss("physical output loses series identity"))?;
+                .position(|field| field.name == SERIES_IDENTITY_COLUMN);
             let value = batch
                 .schema()
                 .fields
                 .iter()
-                .position(|field| field.name == "value")
+                .position(|field| field.dtype == SummaryFamilyType::Plain(DataType::Float64))
                 .ok_or_else(|| miss("physical output loses sample value"))?;
             for row in batch.rows() {
-                let (Value::Utf8(encoded), Value::Float64(sample)) = (&row[identity], &row[value])
-                else {
-                    return Err(miss("invalid population physical output"));
+                let Value::Float64(sample) = &row[value] else {
+                    return Err(miss("invalid physical result value"));
                 };
-                let labels =
-                    decode_series_identity(encoded).map_err(|error| miss(error.to_string()))?;
+                let labels = if let Some(identity) = identity {
+                    let Value::Utf8(encoded) = &row[identity] else {
+                        return Err(miss("invalid physical series identity"));
+                    };
+                    decode_series_identity(encoded).map_err(|error| miss(error.to_string()))?
+                } else {
+                    batch
+                        .schema()
+                        .fields
+                        .iter()
+                        .zip(row)
+                        .filter_map(|(field, value)| match value {
+                            Value::Utf8(label) if !label.is_empty() => {
+                                Some((field.name.clone(), label.to_string()))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
                 values.push(
                     InstantVectorElement::new(
                         KeyByLabelValues::new_with_labels(labels.values().cloned().collect()),

@@ -65,9 +65,9 @@ invalid DAG: ranking requires one exact per-series Rate frontier
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:6219775e8046a4b30bd0f2d13d52bd99f992801282b1c1ac7f41965b9822b2bb"]` | `"selected"` | `95.0` | `null` |
-| 1 | `["asap-explain-v1:root:392bbc491e7a16723958fb2179b6fae06732ae0f42a062a6b6e5b1b9c71dca3c"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:f14c62ab20494a5075946fed95fd263e2c110d49a8e0b72f27cc08238603fb6b"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 0 | `["asap-explain-v1:root:ded85760335cdff2c017ddc4f55852bb07fa5e4199cd348e3f711f4f2d35f265"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:8161e1fd955edc970415f0296701e178dc8549534e95bf0c9aa2be91c77f57d4"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:3d7e2af334c24d7e91dd07729e79ad69d3d76949f746da20a8d9f1bacfb6187b"]` | `"unselected"` | `61000000000000.0` | `null` |
 
 Successfully compiled candidate plans: [temporal-quantile-0](candidates/temporal-quantile-0.json), [temporal-quantile-1](candidates/temporal-quantile-1.json), [temporal-quantile-2](candidates/temporal-quantile-2.json)
 

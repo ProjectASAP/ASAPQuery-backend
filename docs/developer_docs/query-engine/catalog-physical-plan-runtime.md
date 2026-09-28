@@ -108,7 +108,10 @@ and resets. Rates from different windows are never added as heap updates.
 This placement runs after the finite input cohort is closed and durable. It does
 not infer population completeness from a timer or a missing series. Continuous
 maintenance needs an explicit population/window completion contract before it can
-use this path. Binding requires matching nonoverlapping complete source windows.
+use this path. Binding requires matching complete source windows at the query's
+evaluation cadence. Full windows may overlap: a 60-second lookback evaluated
+every five seconds stores independent `(t-60s,t]` outputs every five seconds.
+A bound read selects exact window endpoints and never adds neighboring snapshots.
 
 Each native heap output is one atomic batch record per window. Logical groups
 and series identities remain in the typed batch; its outer storage address uses
@@ -121,3 +124,9 @@ input/output node identities. Recovery validates those boundaries against the
 installed semantic document and stored-output bindings. The query resolves its
 exact deployed output through the store index, checks the definition, generation,
 window, encoding and batch schema, then executes the retained query graph.
+
+Grouped Rate supports the same placement choice. Planner can emit per-series
+Rate readout → grouped Sum → Sum readout entirely at query time, or persist the
+complete grouped Sum batch during maintenance. Both preserve grouping and drop
+ungrouped series labels in the result. Backend prices both physical programs;
+it does not move Sum across Rate or pool raw counters before calculating Rate.

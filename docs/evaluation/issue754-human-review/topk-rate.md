@@ -72,7 +72,7 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:496497707aa2833c8230c315e5022287410866d3e8ac5c4960a04e7d7e0571fe"`.
+Logical root: `"asap-explain-v1:root:cd8d58532ced0954eb6dee4f40babf574410c2137999b7fc4ae4954bcca9910f"`.
 
 top-3 heavy-hitters realizes as a CmsWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent); fixed-window precompute over complete per-series counter states
 
@@ -104,7 +104,7 @@ Roots: `[7]`.
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:3e71cb6b909990d20b7d3a2a17275df1b43bf7680f964360762588f0597424fc"`.
+Logical root: `"asap-explain-v1:root:ec50b2a3ab2acf52587d69138433ae7e0aa525df93ada9e5fb087afa57e89caa"`.
 
 top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent); fixed-window precompute over complete per-series counter states
 
@@ -136,7 +136,7 @@ Roots: `[7]`.
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:ba8eeff4b130d8b06e9faf25bc465ff618ba30cd5e7857c44fc68762c82dc16b"`.
+Logical root: `"asap-explain-v1:root:ff175f2c427d9949807e2bd5169591d1dc41e1bd57baf68829309d6bf53efa65"`.
 
 select exact Top-K from independently maintained temporal values
 
@@ -154,7 +154,7 @@ Roots: `[4]`.
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:a74eff3b7896e52dae2dadd25bb9d301eaa6268fa1304c0cbeb9699ad5f8558b"`.
+Logical root: `"asap-explain-v1:root:7c0ca598df442f28b14ab8b6b82c4071766750a438b47008db140848fbb80374"`.
 
 top-3 heavy-hitters realizes as a CmsWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)
 
@@ -175,7 +175,7 @@ Roots: `[7]`.
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:adfaa23eb6d420ae8122a87f94158cec0987aec159752067f711cb41a339b5a9"`.
+Logical root: `"asap-explain-v1:root:cb14776f9b6a08d08dbd095533579fb8b8fb6baa3f59d13f177b010e8123df05"`.
 
 top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)
 
@@ -197,14 +197,14 @@ Roots: `[7]`.
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:674fdf1bceb4e87877e0c53d71974952465151ea8c6f6c1c3e21f3e73db168ac"]` | `"unselected"` | `155.0` | `null` |
-| 1 | `["asap-explain-v1:root:deece59c58a71ff7517b2846500eda002e6a31ae4e7a3cf99c54029c25cffb53"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:7b07535373f722165f9d399a6ded1bd2f6b76440fd2d21bf9c1f1d636c373c02"]` | `"unselected"` | `242.0` | `null` |
-| 3 | `["asap-explain-v1:root:496497707aa2833c8230c315e5022287410866d3e8ac5c4960a04e7d7e0571fe"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
-| 4 | `["asap-explain-v1:root:3e71cb6b909990d20b7d3a2a17275df1b43bf7680f964360762588f0597424fc"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
-| 5 | `["asap-explain-v1:root:ba8eeff4b130d8b06e9faf25bc465ff618ba30cd5e7857c44fc68762c82dc16b"]` | `"selected"` | `125.0` | `null` |
-| 6 | `["asap-explain-v1:root:a74eff3b7896e52dae2dadd25bb9d301eaa6268fa1304c0cbeb9699ad5f8558b"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
-| 7 | `["asap-explain-v1:root:adfaa23eb6d420ae8122a87f94158cec0987aec159752067f711cb41a339b5a9"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 0 | `["asap-explain-v1:root:f0c94e03e570989e93edbfab0f772b40c3f91ab4f8c5ef4ec2c358afed9fa40b"]` | `"unselected"` | `155.0` | `null` |
+| 1 | `["asap-explain-v1:root:76385b579aa7ad029c49286fa41a3ce4dd16ff0f8341067025d8820107be52cb"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:198684922b0bfbc2d1a2c2639fd790356a6950798dd395e5c40ebd6e4dc302ec"]` | `"unselected"` | `242.0` | `null` |
+| 3 | `["asap-explain-v1:root:cd8d58532ced0954eb6dee4f40babf574410c2137999b7fc4ae4954bcca9910f"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 4 | `["asap-explain-v1:root:ec50b2a3ab2acf52587d69138433ae7e0aa525df93ada9e5fb087afa57e89caa"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 5 | `["asap-explain-v1:root:ff175f2c427d9949807e2bd5169591d1dc41e1bd57baf68829309d6bf53efa65"]` | `"selected"` | `125.0` | `null` |
+| 6 | `["asap-explain-v1:root:7c0ca598df442f28b14ab8b6b82c4071766750a438b47008db140848fbb80374"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 7 | `["asap-explain-v1:root:cb14776f9b6a08d08dbd095533579fb8b8fb6baa3f59d13f177b010e8123df05"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
 
 Successfully compiled candidate plans: [topk-rate-0](candidates/topk-rate-0.json), [topk-rate-1](candidates/topk-rate-1.json), [topk-rate-2](candidates/topk-rate-2.json), [topk-rate-5](candidates/topk-rate-5.json)
 
