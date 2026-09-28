@@ -1498,8 +1498,6 @@ mod remote_boundary_regressions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // A workload horizon changes the equality witness, never its filter or explicit range.
-    #[test]
     // A grouped query's residual carries the grouping label in its leaf scan
     // schema, because Planner resolves that schema against the whole query.
     // Re-parsing the subtree alone cannot know the label, so requiring equal
@@ -1556,6 +1554,8 @@ mod tests {
         .is_err());
     }
 
+    // A workload horizon changes the equality witness, never its filter or explicit range.
+    #[test]
     fn workload_horizon_residual_keeps_semantic_equality() {
         let residual = crate::query_parser::parse_query_expr_with_interval(
             "sum(m{job=\"api\"})",
