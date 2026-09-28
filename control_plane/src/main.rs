@@ -381,7 +381,7 @@ async fn compile_and_publish_physical_plan(
 
     Json(CompileAndPublishPhysicalPlanResponse {
         cost_comparison: bundle.cost_comparison,
-        planner_selection_trace: bundle.planner_selection_trace,
+        planner_selection_trace: bundle.planner_selection_trace.as_ref().clone(),
         plan_id: bundle.envelope.plan_id,
         plan_version: bundle.envelope.plan_version,
         status: "active",
@@ -656,7 +656,7 @@ fn compile_physical_plan_request(
     }
     let compilation_request = physical::compiler::PhysicalCompilationRequest {
         planner_candidate_forests: Vec::new(),
-        planner_selection_trace,
+        planner_selection_trace: planner_selection_trace.into(),
         query_workload: Some(query_workload),
         data_workload: Some(request.data_workload),
         canonical_roots,
@@ -688,7 +688,7 @@ fn compile_physical_plan_request(
         compilation_request.clone(),
     )
     .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
-    let planner_selection_trace = compilation_request.planner_selection_trace.clone();
+    let planner_selection_trace = compilation_request.planner_selection_trace.as_ref().clone();
     let (manifests, candidate_evaluations) =
         physical::workload_cost::compile_candidates_for_pricing(
             candidates.clone(),
