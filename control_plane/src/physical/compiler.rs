@@ -1394,6 +1394,7 @@ impl DeploymentPlanCompiler {
         for (id, root) in planner_types::post_asap::share_common_summary_subtrees(roots) {
             request.queries[id].selected_plan_root = root;
         }
+        let population_operators = super::maintained_population::operators(&request)?;
         let mut compiled_materializations = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
         let mut plan_materializations = Vec::with_capacity(request.queries.len());
@@ -1500,9 +1501,7 @@ impl DeploymentPlanCompiler {
                 .collect::<Vec<_>>();
             // An exact native fallback has no maintained state and must not
             // depend on evidence for unused window/state implementations.
-            if selected.is_empty()
-                && super::maintained_population::operator(&request, query)?.is_none()
-            {
+            if selected.is_empty() && population_operators[query_index].is_none() {
                 continue;
             }
             let executable = planner_types::post_asap::compile_executable_dag_with_node_ids(
@@ -2249,8 +2248,7 @@ impl DeploymentPlanCompiler {
                     query_node_bindings.insert((query_index, compiled.dag.root), root);
                 }
                 Ok(entry)
-            } else if let Some(operator) = super::maintained_population::operator(&request, query)?
-            {
+            } else if let Some(operator) = population_operators[query_index].clone() {
                 let root = crate::query_plan::QueryNodeId(0);
                 let compiled = executable_dags[query_index]
                     .as_ref()
