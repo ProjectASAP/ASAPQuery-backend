@@ -1,3 +1,6 @@
+> Deferred follow-up. This audit is not required by the current synthetic-cost
+> selection and execution milestone (#728 → #742 → #775).
+
 # Level 3: measured selection quality
 
 This is an offline audit tool for #759. It does not collect telemetry, run a
