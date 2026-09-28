@@ -624,7 +624,7 @@ fn issue754_queries_have_valid_physical_plans() {
             "topk-rate" => &["CmsWithHeap", "CountSketchWithHeap"],
             _ => &[],
         };
-        let heap_roots =
+        let mut heap_roots =
             heap_families
                 .iter()
                 .map(|family| {
@@ -658,6 +658,34 @@ fn issue754_queries_have_valid_physical_plans() {
                     trace["logical_root_id"].as_str().unwrap().to_owned()
                 })
                 .collect::<Vec<_>>();
+        if case.name == "topk-rate" {
+            for family in heap_families {
+                let trace = request
+                    .planner_selection_trace
+                    .iter()
+                    .find(|trace| {
+                        trace["stage"] == "planner.physical_candidate"
+                            && trace["physical_candidate"].to_string().contains(family)
+                    })
+                    .unwrap_or_else(|| panic!("missing fixed-window {family} candidate"));
+                let split = asap_physical_operators::physical_planner::PhysicalCandidate::decode(
+                    &serde_json::to_vec(&trace["physical_candidate"]).unwrap(),
+                )
+                .unwrap();
+                let maintenance =
+                    String::from_utf8(split.precompute.as_ref().unwrap().encode().unwrap())
+                        .unwrap();
+                let query = String::from_utf8(split.query.encode().unwrap()).unwrap();
+                assert!(maintenance.contains("Rate") && maintenance.contains("KeyedSummaryBuild"));
+                assert!(query.contains("KeyedReadout") && !query.contains("KeyedSummaryBuild"));
+                assert_eq!(split.materialized_outputs.len(), 1);
+                assert!(split
+                    .query
+                    .input_contracts()
+                    .all(|(id, _)| split.materialized_outputs.contains_key(&id)));
+                heap_roots.push(trace["logical_root_id"].as_str().unwrap().to_owned());
+            }
+        }
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let mut valid_plans = Vec::new();
         let mut quotes = Vec::new();

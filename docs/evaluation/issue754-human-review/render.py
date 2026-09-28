@@ -116,9 +116,15 @@ for path in sorted(BASE.glob('*.json')):
                       f"Logical root: {cell(trace.get('logical_root_id'))}.", '',
                       trace.get('rationale', '').replace('alternatives', 'candidates'), '',
                       'Guarantee: ' + cell(trace.get('guarantee')), '']
-            program = trace.get('physical_dag')
-            if program:
-                lines += ['| Node | Dependencies | Native operator / input |', '| --- | --- | --- |']
+            programs = [('Query physical DAG', trace.get('physical_dag'))]
+            split = trace.get('physical_candidate')
+            if split:
+                lines += ['Materialized boundaries: ' + cell(split['materialized_outputs']), '']
+                programs = [('Maintenance physical DAG', split.get('precompute')), ('Query physical DAG', split['query'])]
+            for title, program in programs:
+                if not program:
+                    continue
+                lines += [f'#### {title}', '', '| Node | Dependencies | Native operator / input |', '| --- | --- | --- |']
                 for node_id, node in program['nodes'].items():
                     op = node.get('Operator')
                     lines.append(f"| {node_id} | {cell(op['inputs'] if op else [])} | {cell(op['operator']['kind'] if op else {'Input': node['Input']})} |")
@@ -180,9 +186,12 @@ CountSketch heaps above its bound per-series Rate readout. This fixture lacks
 heap proof and records the rejection. Separate controlled tests select each
 program through Backend costs; process E2E tests verify both heap families over
 durable counter SDS, including reset, window changes and process restart.
-Those paths build the heap at query time. Stored-heap precompute and the complete
-physical-candidate handoff remain outstanding; other PromQL paths retain the
-documented Backend adapter representation.
+Planner also exposes fixed-window candidates that finalize Rate and build the
+heap during precompute. Their typed stored boundary and both physical DAGs are
+listed below. Certified process E2E tests cover CMS and CountSketch heap SDS,
+multiple groups, resets, missing windows and restart. This placement requires
+the finite complete-input barrier; it does not claim continuous completeness.
+Other PromQL paths retain the documented Backend adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
 currently evaluates single-root substitutions in a preferred workload context;
