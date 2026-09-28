@@ -1,0 +1,23 @@
+name: issue-702-one-second
+# Mirrors data_plane/tests/support/issue_701_702_process.rs: three series,
+# one sample per second from 1 through 961, factor * (1 + second % 31).
+series:
+  - metric: issue701_data
+    labels: {pod: a, job: api}
+    generated_samples: &factor_one
+      start_offset_seconds: 1
+      end_offset_seconds: 961
+      step_seconds: 1
+      multiplier: 1
+      base: 1
+      modulo: 31
+  - metric: issue701_data
+    labels: {pod: b, job: api}
+    generated_samples:
+      <<: *factor_one
+      multiplier: 2
+  - metric: issue701_data
+    labels: {pod: c, job: db}
+    generated_samples:
+      <<: *factor_one
+      multiplier: 3

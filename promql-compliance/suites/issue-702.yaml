@@ -1,0 +1,49 @@
+name: issue-702
+comparison_defaults:
+  value_tolerance:
+    relative: 0.01
+    absolute: 0.000001
+
+# These are the exact expressions reported as manually tested in PR #741.
+# The final ratio is intentionally retained: it is a known fallback shape and
+# therefore must make this strict suite fail until ASAPQuery answers it locally.
+queries:
+  - name: quantile-by-job-0.9
+    expr: "quantile by (job) (0.9, data)"
+    instant_offsets_seconds: &evaluation_offsets [300, 600, 900, 1200]
+    range: &evaluation_range
+      start_offset_seconds: 300
+      end_offset_seconds: 1200
+      step_seconds: 60
+  - name: sum-by-job
+    expr: "sum by (job) (data)"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range
+  - name: sum
+    expr: "sum(data)"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range
+  - name: avg-over-time
+    expr: "avg_over_time(data[5m])"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range
+  - name: count-by-job
+    expr: "count by (job) (data)"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range
+  - name: count
+    expr: "count(data)"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range
+  - name: avg-by-job
+    expr: "avg by (job) (data)"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range
+  - name: sum-by-job-sum-over-time
+    expr: "sum by (job) (sum_over_time(data[5m]))"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range
+  - name: avg-over-time-div-quantile-over-time
+    expr: "avg_over_time(data[5m]) / quantile_over_time(0.5, data[5m])"
+    instant_offsets_seconds: *evaluation_offsets
+    range: *evaluation_range

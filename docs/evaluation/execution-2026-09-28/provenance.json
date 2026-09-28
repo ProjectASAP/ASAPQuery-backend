@@ -1,0 +1,40 @@
+{
+  "planner_revision": "176c1bd565e0c400f9a35996c2bd65de32475e72",
+  "runner_revision": "13e90c8d",
+  "data_plane_revision": "ed944356",
+  "scope": "finite fixture differential execution, not production selection or real ERP calibration",
+  "reports": [
+    {
+      "file": "aggregations.json",
+      "sha256": "9ea33fedbfedf43c6effcfb1646e2c640db3083caf79fd26002776e9a24d048d"
+    },
+    {
+      "file": "summary.json",
+      "sha256": "3f7bad5dda4fdb08b235afaca9adacaf825262598fa8d3cd752437b1565bcac3"
+    },
+    {
+      "file": "issue-702.json",
+      "sha256": "eb1efcce0bcfe654c6e5e6bb26786a39338c7c8b30e386b2f06bc18d574a249f"
+    },
+    {
+      "file": "sparse-checkout-temporal.json",
+      "sha256": "fd45b6c6c836f2bed5895acfd54f6f1084f0957b5a6e54fc666f832ced09c19d"
+    },
+    {
+      "file": "issue-702-one-second.json",
+      "sha256": "9b7531a809fed6cc378dfd6d29b3ff0f77a2d60410b72e231da6761a9bee0a6f"
+    },
+    {
+      "file": "single-rate-temporal.json",
+      "sha256": "323ddb3d1cbda1cb3c6eb069eebd51bf70b17a8cc5d846dc62336b560a3fac89"
+    },
+    {
+      "file": "aggregations-dense-cadence.json",
+      "sha256": "f4b4ebd20d968bac6bf7135d0aecb5ef2824d3b248f2aebe324325badac9b1af"
+    },
+    {
+      "file": "issue-754.json",
+      "sha256": "2b12542b677f8ac1412c209354f5f59b603fd811f5508feac386ff0e8e19755a"
+    }
+  ]
+}

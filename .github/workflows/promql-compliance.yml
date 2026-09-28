@@ -1,0 +1,42 @@
+name: PromQL compliance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ASAPQuery-backend
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectASAP/ASAPCollector
+          path: ASAPCollector
+      - uses: actions/checkout@v4
+        with:
+          repository: ProjectASAP/asap_sketchlib
+          path: asap_sketchlib
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Test Rust compliance harness
+        working-directory: ASAPQuery-backend
+        run: cargo test --locked -p promql-compliance
+      - name: Run every differential corpus
+        working-directory: ASAPQuery-backend/promql-compliance/runner
+        run: make run-all REPORT_DIR="$GITHUB_WORKSPACE/artifacts/reports" LOGS_DIR="$GITHUB_WORKSPACE/artifacts/logs"
+      - name: Upload reports and service logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promql-compliance-evidence
+          path: artifacts
+          if-no-files-found: warn

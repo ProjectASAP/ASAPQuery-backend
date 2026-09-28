@@ -65,3 +65,23 @@ Every installed range evaluation uses the shared DAG execution path and reports
 its actual local-summary and external-exact work. The differential and benefit
 runners require successful local execution evidence as well as matching values.
 Routing to the ASAP endpoint alone is insufficient.
+
+## Planner physical candidates and precompute boundaries
+
+Planner #462 exposes `physical_planner::compile_candidates` and
+`select_candidate`. A candidate carries precompute/query Physical DAGs and
+typed materialized outputs. For grouped rate, Planner can compile both
+per-series Rate → stored values → query-side Sum and precompute Rate → Sum →
+stored grouped values. Counter-state inputs remain explicit maintenance
+dependencies; raw-counter Sum before Rate is not equivalent.
+
+The backend reports source/state/operator feasibility and complete workload
+costs. `implementation.require_backend_local_execution` rejects external exact
+dependencies before pricing when the deployment has no such service. The runner
+sets this requirement because its deployment disables forwarding, and declares
+actual replay rate/cadence rather than synthetic compatibility demand.
+
+Planner capability does not prove that the backend can persist every value-output
+frontier. Result-row publication, revision/coverage and retention bindings must
+be admitted explicitly; the deployment compiler must reject unsupported
+frontiers instead of moving operators.
