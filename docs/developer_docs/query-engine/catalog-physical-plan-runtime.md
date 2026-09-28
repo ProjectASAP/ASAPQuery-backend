@@ -33,6 +33,9 @@ definition identity does not authorize cross-version payload reuse; that would
 require a future adoption protocol. A same-version restart can recover eligible
 state; a new version remains cold until its own state is populated.
 
+Fresh writes allocate a new physical series on a version change, including after
+restart, so they cannot append to an older version's completed windows.
+
 ## Persisted physical computation and outputs
 
 Installed SQL entries include a serialized native physical DAG. Installation
