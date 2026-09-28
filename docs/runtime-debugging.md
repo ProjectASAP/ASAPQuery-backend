@@ -63,12 +63,27 @@ JSON API. Missing a completion event can indicate an interrupted process; it
 is not proof that work committed. Publication receipts and recovered state remain
 the source of truth.
 
-A missing candidate is not evidence that its placement costs more. For example,
-the retained #728 grouped-rate fixture exports per-series Rate state plus
-query-time Sum and an exact fallback; it does not export a precomputed grouped
-Rate-result candidate. The selected plan therefore cannot establish that query-time
-Sum beats that absent candidate. Search coverage is scoped to the declared
-inventory, never a claim of exhaustive physical optimization.
+A missing candidate is not evidence that its placement costs more. The #728
+inventory now includes grouped Rate with query-time Sum and precomputed Sum;
+compare their admission and resource costs before interpreting selection. Search
+coverage is scoped to the declared inventory, never a claim of exhaustive
+physical optimization.
+
+### Native Rate aggregation stages
+
+`physical.maintenance.execute` runs the retained Planner maintenance program over
+complete bound counter windows. It covers per-series Rate followed by grouped
+Sum or CMS/CountSketch heap construction. `sds.publish_native` publishes one
+atomic grouped batch for that window. Overlapping complete windows are separate
+executions and records.
+
+On a bound query, `sds.read_bound_native` resolves the installed stored output;
+`physical.bind_stored_summary` binds the recovered batch. Query-time candidates
+instead use `physical.bind_vectors` for the per-series Rate vector. Both call
+`physical.execute` for the retained query graph. These spans expose the selected
+placement; they never move an operator between query and maintenance phases.
+The finite complete-input barrier is required for precomputed grouped outputs;
+an elapsed-time event does not prove the population is complete.
 
 ### Installed SQL physical DAG stages
 
