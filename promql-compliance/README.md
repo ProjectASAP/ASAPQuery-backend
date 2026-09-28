@@ -1,3 +1,7 @@
+> This PR owns execution correctness. Level 2 (#742) now means synthetic cost
+> ranking; Level 3 (#759) means real-evidence selection and result validation.
+> These differential runs do not establish either cost calibration or an optimum.
+
 # PromQL compliance suite
 
 The Rust `promql-compliance` workspace crate sends one deterministic Remote Write fixture to Prometheus and ASAPQuery-backend, then compares their Prometheus API responses. It also derives the backend planning snapshot from the same suite queries.

@@ -48,9 +48,11 @@ def cpu_per_op(row, op):
         raise ValueError("unaligned CPU/rate/time samples")
     values = []
     for r, elapsed, user, system in zip(*samples):
+        if any(not math.isfinite(x) or x < 0 for x in (r, elapsed, user, system)):
+            raise ValueError("invalid raw CPU/rate/time measurement")
         work = r * elapsed / 1000
-        if work <= 0:
-            raise ValueError("zero benchmark work")
+        if not math.isfinite(work) or work <= 0:
+            raise ValueError("invalid benchmark work")
         values.append((user + system) * 1_000_000 / work)
     result = measurement(values)
     result["method"] = "mean of paired run (process user+system CPU ns)/(throughput*wall seconds); per " + ("binary merge" if op == "merge" else "input item" if op == "insert" else "point-frequency key lookup")
@@ -61,8 +63,12 @@ def cpu_batch(row, op):
     cpu = row.get(op + "_cpu_time_ms")
     if not cpu:
         return None
-    return measurement([(u + s) * 1_000_000 for u, s in
-                        zip(cpu["user_ms"]["samples"], cpu["sys_ms"]["samples"])])
+    user, system = cpu["user_ms"]["samples"], cpu["sys_ms"]["samples"]
+    if len(user) != len(system):
+        raise ValueError("unaligned user/system CPU samples")
+    if any(not math.isfinite(x) or x < 0 for x in user + system):
+        raise ValueError("invalid raw CPU measurement")
+    return measurement([(u + s) * 1_000_000 for u, s in zip(user, system)])
 
 
 def export(raw, manifest, operation_reports, memory_rows, resource_rows=None):
