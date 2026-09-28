@@ -1,0 +1,41 @@
+# Companion to issue-754, built so that a top-k heap can actually be certified.
+#
+# issue-754 itself cannot certify one: its per-series value domains overlap, so
+# no scalar `topk_selected_lower_bound > topk_excluded_upper_bound` holds across
+# the validity window. Here each series occupies a decade of its own and the
+# modulo is 1, so the domains are disjoint by construction:
+#
+#   value_i(t) in [multiplier_i * base_i, multiplier_i * (base_i + modulo_i)]
+#
+#   group a: a1 [10,11]  a2 [100,101]  a3 [1000,1001]  a4 [10000,10001]
+#   group b: b1 [20,21]  b2 [200,201]  b3 [2000,2001]  b4 [20000,20001]
+#
+# topk by (label_0) (3, ...) selects {a2,a3,a4} and {b2,b3,b4}. The lowest
+# selected bound is 100 and the highest excluded bound is 21, so the separation
+# contract holds for both groups at once with a single scalar pair.
+name: issue-754-certified-topk
+series:
+  - metric: data
+    labels: {label_0: a, instance: a1}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 10, modulo: 1}
+  - metric: data
+    labels: {label_0: a, instance: a2}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 100, modulo: 1}
+  - metric: data
+    labels: {label_0: a, instance: a3}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 1000, modulo: 1}
+  - metric: data
+    labels: {label_0: a, instance: a4}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 10000, modulo: 1}
+  - metric: data
+    labels: {label_0: b, instance: b1}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 20, modulo: 1}
+  - metric: data
+    labels: {label_0: b, instance: b2}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 200, modulo: 1}
+  - metric: data
+    labels: {label_0: b, instance: b3}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 2000, modulo: 1}
+  - metric: data
+    labels: {label_0: b, instance: b4}
+    generated_samples: {start_offset_seconds: 0, end_offset_seconds: 180, step_seconds: 0.1, multiplier: 1, base: 20000, modulo: 1}
