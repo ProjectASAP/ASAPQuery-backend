@@ -23,7 +23,6 @@ fn schema(fields: &[(&str, DataType)]) -> Schema {
         time_index: None,
     })
 }
-
 fn key<T: serde::Serialize>(value: &T) -> Value {
     Value::Utf8(
         serde_json::to_string(value)
@@ -51,7 +50,7 @@ fn ranked_batch(values: &Vector, grouping: &Grouping) -> Result<Batch, EngineErr
             })
             .collect(),
     )
-    .map_err(|e| miss(e.to_string()))
+    .map_err(EngineError::from)
 }
 fn output(values: Vector, batches: Vec<dag::SharedValue<Batch>>) -> Result<Vector, EngineError> {
     batches
@@ -70,7 +69,7 @@ pub(super) fn sort(
     values: Vector,
     grouping: &Grouping,
     descending: bool,
-    context: &dag::RunContext,
+    context: dag::RunContext,
 ) -> Result<Vector, EngineError> {
     let batch = ranked_batch(&values, grouping)?;
     let op = Operator::sort(
@@ -82,9 +81,9 @@ pub(super) fn sort(
         }],
         vec![1],
     )
-    .map_err(|e| miss(e.to_string()))?;
-    let result = batch_execution::evaluate_batch(batch, vec![op], context.clone())
-        .map_err(|e| miss(e.to_string()))?;
+    .map_err(EngineError::from)?;
+    let result =
+        batch_execution::evaluate_batch(batch, vec![op], context).map_err(EngineError::from)?;
     output(values, result)
 }
 pub(super) fn limit(
@@ -92,42 +91,359 @@ pub(super) fn limit(
     grouping: &Grouping,
     n: u64,
     offset: u64,
-    context: &dag::RunContext,
+    context: dag::RunContext,
 ) -> Result<Vector, EngineError> {
     let batch = ranked_batch(&values, grouping)?;
-    let op = Operator::limit(batch.schema().clone(), n, offset, vec![1])
-        .map_err(|e| miss(e.to_string()))?;
-    let result = batch_execution::evaluate_batch(batch, vec![op], context.clone())
-        .map_err(|e| miss(e.to_string()))?;
+    let op =
+        Operator::limit(batch.schema().clone(), n, offset, vec![1]).map_err(EngineError::from)?;
+    let result =
+        batch_execution::evaluate_batch(batch, vec![op], context).map_err(EngineError::from)?;
     output(values, result)
 }
-pub(super) fn semi_join(
+/// Relational boundary used by explicit row plans. Planner owns predicate lowering.
+pub(super) fn relation(
     values: Vector,
-    candidates: &Vector,
-    left_key: &impl Fn(&Labels) -> Vec<String>,
-    right_key: &impl Fn(&Labels) -> Vec<String>,
-    context: &dag::RunContext,
+    candidates: Vector,
+    predicate: planner_types::pre_asap::Predicate,
+    left: Schema,
+    right: Schema,
+    output_schema: Schema,
+    completeness: Option<planner_types::post_asap::CandidateCompleteness>,
+    at: i64,
+    context: dag::RunContext,
 ) -> Result<Vector, EngineError> {
-    let schema = schema(&[("index", DataType::Int64), ("key", DataType::Utf8)]);
-    let batch = |rows: &Vector, identity: &dyn Fn(&Labels) -> Vec<String>| {
-        Batch::try_new(
-            schema.clone(),
-            rows.iter()
-                .enumerate()
-                .map(|(i, (labels, _))| vec![Value::Int64(i as i64), key(&identity(labels))])
-                .collect(),
-        )
-        .map_err(|e| miss(e.to_string()))
+    use asap_physical_operators::physical_planner::{
+        compile_node, CompiledPhysicalDag, InputContract,
     };
-    let op = Operator::semi_join(schema.clone(), schema.clone(), vec![(1, 1)])
-        .map_err(|e| miss(e.to_string()))?;
-    let result = batch_execution::evaluate_inputs(
-        vec![batch(&values, left_key)?, batch(candidates, right_key)?],
-        op,
-        context.clone(),
-    )
-    .map_err(|e| miss(e.to_string()))?;
-    output(values, result)
+    use planner_types::post_asap::{
+        ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+    };
+    let pruning = completeness
+        .as_ref()
+        .map(|completeness| {
+            Ok::<_, EngineError>(asap_types::query_plan::PruningInputContract {
+                candidate_input: 1,
+                keys: asap_physical_operators::physical_planner::equijoin_keys(
+                    &predicate, &left, &right,
+                )?,
+                completeness: completeness.clone(),
+            })
+        })
+        .transpose()?;
+    let node = ExecutableDagNode {
+        id: PostAsapNodeId(2),
+        output_state: ExecutionDataState::QUERY_ROWS,
+        output_schema: (*output_schema).clone(),
+        guarantee: None,
+        payload: ExecutableOperatorPayload::RelationalJoin {
+            join_kind: planner_types::pre_asap::JoinKind::Semi,
+            pred: predicate,
+            pruning: completeness,
+        },
+    };
+    let operator = compile_node(&node, &[left.clone(), right.clone()])?;
+    let compiled = CompiledPhysicalDag::from_operators(
+        [
+            (0, InputContract::bounded(left)),
+            (1, InputContract::bounded(right)),
+        ]
+        .into(),
+        [(2, (vec![0, 1], operator))].into(),
+        vec![2],
+    )?;
+    let encoded = compiled.encode()?;
+    let inputs = vec![values, candidates];
+    if let Some(pruning) = pruning {
+        validate_pruning(&encoded, &inputs, 0, &pruning, at, context.clone())?;
+    }
+    physical(&encoded, inputs, 0, at, context)
+}
+
+// Equality keys canonicalize signed zero and NaNs; row transport must preserve their bits.
+fn identity_key(value: &Value) -> Result<Vec<u8>, asap_physical_operators::Error> {
+    if let Value::Float64(number) = value {
+        let mut key = vec![0xff];
+        key.extend_from_slice(&number.to_bits().to_be_bytes());
+        Ok(key)
+    } else {
+        value.key()
+    }
+}
+
+/// Bind protocol values to the selected physical input contracts; no operator lowering.
+pub(super) fn physical(
+    encoded: &[u8],
+    inputs: Vec<Vector>,
+    row_input: usize,
+    at: i64,
+    context: dag::RunContext,
+) -> Result<Vector, EngineError> {
+    use asap_physical_operators::physical_planner::{CompiledPhysicalDag, Source};
+    use futures::{FutureExt, StreamExt};
+    use std::collections::{BTreeMap, VecDeque};
+    let compiled = CompiledPhysicalDag::decode(encoded)?;
+    let contracts = compiled.input_contracts().collect::<Vec<_>>();
+    if contracts.len() != inputs.len() || row_input >= inputs.len() {
+        return Err(asap_physical_operators::Error::Invalid(
+            "physical input arity mismatch".into(),
+        )
+        .into());
+    }
+    let mut identities: BTreeMap<Vec<Vec<u8>>, VecDeque<(Labels, f64)>> = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for (position, ((id, contract), values)) in contracts.iter().zip(inputs).enumerate() {
+        let rows = values
+            .iter()
+            .map(|(labels, sample)| {
+                contract
+                    .schema
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(column, field)| {
+                        if Some(column) == contract.schema.time_index {
+                            return Ok(Value::Timestamp(at));
+                        }
+                        match &field.dtype {
+                            SummaryFamilyType::Plain(DataType::Float64) => {
+                                Ok(Value::Float64(*sample))
+                            }
+                            SummaryFamilyType::Plain(DataType::Int64) => {
+                                if sample.is_finite() && sample.fract() == 0. && sample.abs() <= (1_u64 << 53) as f64 {
+                                    Ok(Value::Int64(*sample as i64))
+                                } else {
+                                    Err(asap_physical_operators::Error::Invalid("protocol sample cannot represent the required Int64 input exactly".into()).into())
+                                }
+                            }
+                            SummaryFamilyType::Plain(DataType::Utf8) => {
+                                Ok(labels.get(&field.name).map_or_else(
+                                    || {
+                                        if field.nullable {
+                                            Value::Null
+                                        } else {
+                                            Value::Utf8("".into())
+                                        }
+                                    },
+                                    |value| Value::Utf8(value.clone().into()),
+                                ))
+                            }
+                            _ => Err(miss(format!(
+                                "PromQL input cannot supply field {} of type {:?}",
+                                field.name, field.dtype
+                            ))),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, EngineError>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if position == row_input {
+            for (row, original) in rows.iter().zip(values) {
+                let key = row
+                    .iter()
+                    .map(identity_key)
+                    .collect::<Result<Vec<_>, _>>()?;
+                identities.entry(key).or_default().push_back(original);
+            }
+        }
+        let batch = Batch::try_new(contract.schema.clone(), rows)?;
+        sources.insert(
+            *id,
+            Box::new(Operator::source(contract.schema.clone(), vec![batch])?) as Source<'_>,
+        );
+    }
+    let graph = compiled.instantiate(sources)?;
+    let mut streams = graph.execute(compiled.roots(), context)?;
+    if streams.len() != 1 {
+        return Err(
+            asap_physical_operators::Error::Invalid("expected one physical output".into()).into(),
+        );
+    }
+    let mut stream = streams.remove(0);
+    let mut result = Vec::new();
+    loop {
+        match stream.next().now_or_never() {
+            Some(Some(batch)) => {
+                for row in batch?.rows() {
+                    let key = row
+                        .iter()
+                        .map(identity_key)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let original = identities
+                        .get_mut(&key)
+                        .and_then(VecDeque::pop_front)
+                        .ok_or_else(|| {
+                            asap_physical_operators::Error::Invalid(
+                                "physical row has no protocol identity".into(),
+                            )
+                        })?;
+                    result.push(original);
+                }
+            }
+            Some(None) => return Ok(result),
+            None => continue,
+        }
+    }
+}
+
+pub(super) fn validate_pruning(
+    encoded: &[u8],
+    inputs: &[Vector],
+    row_input: usize,
+    contract: &asap_types::query_plan::PruningInputContract,
+    at: i64,
+    context: dag::RunContext,
+) -> Result<(), EngineError> {
+    use asap_physical_operators::physical_planner::{CompiledPhysicalDag, InputContract};
+    use planner_types::post_asap::CandidateCompleteness;
+    if !matches!(
+        contract.completeness,
+        CandidateCompleteness::Certified { .. }
+    ) {
+        return Ok(());
+    }
+    let compiled = CompiledPhysicalDag::decode(encoded)?;
+    let schemas = compiled
+        .input_contracts()
+        .map(|(_, c)| c.schema.clone())
+        .collect::<Vec<_>>();
+    let candidates = inputs
+        .get(contract.candidate_input)
+        .ok_or_else(|| miss("missing candidate input"))?;
+    let values = inputs
+        .get(row_input)
+        .ok_or_else(|| miss("missing authoritative input"))?;
+    let coverage = Operator::semi_join(
+        schemas[contract.candidate_input].clone(),
+        schemas[row_input].clone(),
+        contract.keys.iter().map(|&(l, r)| (r, l)).collect(),
+    )?;
+    let check = CompiledPhysicalDag::from_operators(
+        [
+            (
+                0,
+                InputContract::bounded(schemas[contract.candidate_input].clone()),
+            ),
+            (1, InputContract::bounded(schemas[row_input].clone())),
+        ]
+        .into(),
+        [(2, (vec![0, 1], coverage))].into(),
+        vec![2],
+    )?;
+    let matched = physical(
+        &check.encode()?,
+        vec![candidates.clone(), values.clone()],
+        0,
+        at,
+        context,
+    )?;
+    if matched.len() != candidates.len() {
+        return Err(miss("certified pruning key has no authoritative value"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asap_physical_operators::{
+        physical_planner::{CompiledPhysicalDag, InputContract},
+        Error,
+    };
+
+    fn sorted() -> Vec<u8> {
+        let input = schema(&[("value", DataType::Float64)]);
+        CompiledPhysicalDag::from_operators(
+            [(0, InputContract::bounded(input.clone()))].into(),
+            [(
+                1,
+                (
+                    vec![0],
+                    Operator::sort(
+                        input,
+                        vec![SortKey {
+                            column: 0,
+                            descending: false,
+                            nulls_first: false,
+                        }],
+                        vec![],
+                    )
+                    .unwrap(),
+                ),
+            )]
+            .into(),
+            vec![1],
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+    fn context(max_bytes: usize) -> dag::RunContext {
+        dag::RunContext::new(
+            dag::Scope::Query {
+                evaluation_time_ms: 42,
+                revision: 7,
+            },
+            dag::Limits {
+                max_bytes,
+                ..dag::Limits::default()
+            },
+        )
+        .unwrap()
+    }
+    fn cause(error: &Error) -> &Error {
+        match error {
+            Error::AtNode { source, .. } => cause(source),
+            other => other,
+        }
+    }
+
+    // A real native execution failure must remain typed through the protocol adapter.
+    #[test]
+    fn physical_budget_and_cancellation_are_terminal() {
+        for cancelled in [false, true] {
+            let run = context(if cancelled { 4096 } else { 1 });
+            if cancelled {
+                run.cancel();
+            }
+            let error = physical(
+                &sorted(),
+                vec![vec![(Labels::new(), 2.), (Labels::new(), 1.)]],
+                0,
+                42,
+                run.clone(),
+            )
+            .unwrap_err();
+            let EngineError::Physical(error) = error else {
+                panic!("physical failure lost its type")
+            };
+            assert!(
+                if cancelled {
+                    matches!(cause(&error), Error::Cancelled)
+                } else {
+                    matches!(cause(&error), Error::MemoryLimit)
+                },
+                "{error}"
+            );
+            assert_eq!(run.retained_bytes(), 0);
+        }
+    }
+
+    // Transport identity preserves the exact value selected by native total-order sorting.
+    #[test]
+    fn native_sort_preserves_signed_zero_bits() {
+        let rows = physical(
+            &sorted(),
+            vec![vec![(Labels::new(), 0.), (Labels::new(), -0.)]],
+            0,
+            42,
+            context(4096),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.1.to_bits()).collect::<Vec<_>>(),
+            vec![0.0_f64.to_bits(), (-0.0_f64).to_bits()]
+        );
+    }
 }
 
 pub(super) fn execute_vectors<F>(
