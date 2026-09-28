@@ -16,7 +16,7 @@ already-squashed documentation history. Fixes are in `070fad6e` and `3c840ff9`.
 
 Metadata, store-visibility and live-reactivation regressions fail before their
 fixes. The process test also exposed the completed-series rejection before the
-fresh-allocation fix. Those failure logs are retained.
+fresh-allocation fix. Generated failure logs are kept outside version control.
 
 ## Validation
 
@@ -43,4 +43,3 @@ identity and explicit logical dataset identity land in #774 using Planner #462;
 subsequent PRs complete shared execution and storage integration. The developer
 installation guide and PR description make that boundary explicit.
 
-Compressed logs are checked by `SHA256SUMS`.
