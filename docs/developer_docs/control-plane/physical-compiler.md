@@ -50,34 +50,30 @@ compiler never invents a framework or assigns it an optimistic zero cost.
 
 ## 1. Code architecture
 
-The control plane has three public layers:
+The planning and deployment boundary is:
 
 ```text
-PhysicalCompilationRequest + DataWorkload + concrete implementation evidence
-      |                                      ^
-      | abstract candidates                  | complete physical costs
-      v                                      |
-ASAPPlanner selection <---------- DeploymentPlanCompiler
-      |
-      v
-DeploymentPlanCompiler -------> CompiledPhysicalPlan
-                            |       |       |      |
-                            v       v       v      v
-                      Collector  Precompute Backend Query
-                         Plan       Plan     Plan   DAG
+Query workload + accuracy requirements
+                 ↓
+ASAPPlanner: supported, semantically legal physical candidates
+                 ↓
+Backend: feasibility checks + workload-scoped candidate costs
+                 ↓
+DeploymentPlanCompiler: select and bind a physical candidate
+                 ↓
+CompiledPhysicalPlan
+    CollectorPlan + PrecomputePlan + TransmissionPlan + QueryPlan
+                 ↓
+Publication and execution
 ```
 
-- **Planner selection boundary** is
-  `planner_selection::select_summary_with_evidence`. It enumerates Planner's
-  candidates and commits only a legal candidate.
-- **Physical compiler** enumerates concrete window/pane/state-layout,
-  placement, transport, and runtime implementations without changing the
-  Planner-owned abstract framework.
-- **CompiledPhysicalPlan** is the only output passed to publication. Its SummaryCatalog,
-  CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan are created together and share identities.
+Planner owns computation, operator choices, sharing and materialization
+boundaries. Backend supplies deployment capabilities and evidence, selects among
+admitted physical candidates, and binds the chosen graph to concrete inputs and
+stored outputs. It does not reinterpret summary operations into another logical
+plan. All published projections share the same catalog and identities.
 
-Logical query parsing, summary alternatives, guarantees, and candidate search
-remain public ASAPPlanner interfaces. Runtime publication is documented in
+Runtime publication is documented in
 [Runtime plan publication](plan-publication.md).
 
 ## 2. Public interfaces and definitions
