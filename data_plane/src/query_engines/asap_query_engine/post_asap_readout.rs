@@ -305,7 +305,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     })
             }
             QueryPlanNode::Logical { .. }
-            | QueryPlanNode::CandidateTopK { .. }
+            | QueryPlanNode::MembershipFilter { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
             | QueryPlanNode::RelationalJoin { .. } => Err(PhysicalNodeError::Fallback(

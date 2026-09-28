@@ -205,16 +205,13 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 }
                 self.logical(operator, &inputs, at)?
             }
-            QueryPlanNode::CandidateTopK {
+            QueryPlanNode::MembershipFilter {
                 inputs,
-                k,
-                grouping,
                 completeness,
             } => {
                 let candidates = vector(self.eval(inputs[0], at)?)?;
                 let values = vector(self.eval(inputs[1], at)?)?;
-                let (selected, warning) =
-                    candidate_topk(k, &grouping, candidates, values, &completeness)?;
+                let (selected, warning) = membership_filter(candidates, values, &completeness)?;
                 if let Some(warning) = warning {
                     self.warnings.push(warning);
                 }
@@ -423,9 +420,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
     }
 }
 
-fn candidate_topk(
-    k: u64,
-    grouping: &Grouping,
+fn membership_filter(
     candidates: Vector,
     values: Vector,
     completeness: &CandidateCompleteness,
@@ -435,30 +430,21 @@ fn candidate_topk(
         labels.remove("__name__");
         labels
     };
-    let candidate_ids: BTreeSet<_> = candidates
-        .iter()
-        .map(|(labels, _)| identity(labels))
-        .collect();
+    let candidate_ids: BTreeSet<_> = candidates.iter().map(|(labels, _)| identity(labels)).collect();
     let value_ids: BTreeSet<_> = values.iter().map(|(labels, _)| identity(labels)).collect();
-    let dangling = candidate_ids
-        .iter()
-        .any(|candidate| !value_ids.contains(candidate));
-    if dangling && matches!(completeness, CandidateCompleteness::Certified { .. }) {
-        return Err(miss("certified TopK candidate has no exact counter value"));
+    let missing: BTreeSet<_> = candidate_ids.difference(&value_ids).collect();
+    let selected = values.into_iter().filter(|(labels, _)| candidate_ids.contains(&identity(labels))).collect();
+    if !missing.is_empty() && matches!(completeness, CandidateCompleteness::Certified { .. }) {
+        return Err(miss("certified membership key has no authoritative value"));
     }
-    let matched = values
-        .into_iter()
-        .filter(|(labels, _)| candidate_ids.contains(&identity(labels)))
-        .collect();
-    let selected = topk_selection(k, grouping, matched);
     let warning = match completeness {
         CandidateCompleteness::Certified { .. } => None,
         CandidateCompleteness::BestEffort { guarantee } => Some(match guarantee {
             Some(guarantee) => format!(
-                "ASAP TopK candidate membership is approximate: {:?}",
+                "ASAP membership pruning is approximate: {:?}",
                 guarantee.metric
             ),
-            None => "ASAP TopK candidate membership is approximate and uncertified".into(),
+            None => "ASAP membership pruning is approximate and uncertified".into(),
         }),
     };
     Ok((selected, warning))
@@ -908,6 +894,14 @@ mod topk_tests {
                 (labels(&[("series", "high")]), 3.0),
             ],
         );
+        let selected = topk_selection(
+            2,
+            &Grouping {
+                labels: vec![],
+                without: false,
+            },
+            selected,
+        );
         assert_eq!(
             selected
                 .iter()
@@ -1177,12 +1171,7 @@ mod topk_tests {
             (labels(&[("pod", "b")]), 8.0),
             (labels(&[("pod", "c")]), 9.0),
         ];
-        let (selected, warning) = candidate_topk(
-            2,
-            &Grouping {
-                labels: vec![],
-                without: false,
-            },
+        let (selected, warning) = membership_filter(
             candidates,
             exact,
             &CandidateCompleteness::Certified {
@@ -1190,6 +1179,14 @@ mod topk_tests {
             },
         )
         .unwrap();
+        let selected = topk_selection(
+            2,
+            &Grouping {
+                labels: vec![],
+                without: false,
+            },
+            selected,
+        );
         assert_eq!(
             selected
                 .iter()
@@ -1204,7 +1201,8 @@ mod topk_tests {
     fn installed_candidate_sidecar_reads_both_summary_inputs() {
         let candidate_id = QueryNodeId(0);
         let value_id = QueryNodeId(1);
-        let root = QueryNodeId(2);
+        let filter = QueryNodeId(2);
+        let root = QueryNodeId(3);
         let entry = QueryPlanEntry {
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "candidate-topk".into(),
@@ -1225,17 +1223,25 @@ mod topk_tests {
                     },
                 ),
                 (
-                    root,
-                    QueryPlanNode::CandidateTopK {
+                    filter,
+                    QueryPlanNode::MembershipFilter {
                         inputs: [candidate_id, value_id],
-                        k: 1,
-                        grouping: Grouping {
-                            labels: vec![],
-                            without: false,
-                        },
                         completeness: CandidateCompleteness::Certified {
                             guarantee: topk_membership_guarantee(),
                         },
+                    },
+                ),
+                (
+                    root,
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::TopKSelection {
+                            k: 1,
+                            grouping: Grouping {
+                                labels: vec![],
+                                without: false,
+                            },
+                        },
+                        inputs: vec![filter],
                     },
                 ),
             ]),
@@ -1251,7 +1257,10 @@ mod topk_tests {
             (
                 (candidate_id, at),
                 PreparedLeaf {
-                    value: Value::Vector(vec![(labels(&[("pod", "b")]), 100.0)]),
+                    value: Value::Vector(vec![
+                        (labels(&[("pod", "b")]), 100.0),
+                        (labels(&[("pod", "c")]), 1.0),
+                    ]),
                     remote: false,
                     remote_evaluations: 0,
                     remote_rpcs: 0,
@@ -1263,6 +1272,7 @@ mod topk_tests {
                     value: Value::Vector(vec![
                         (labels(&[("pod", "a")]), 2.0),
                         (labels(&[("pod", "b")]), 1.0),
+                        (labels(&[("pod", "c")]), 3.0),
                     ]),
                     remote: false,
                     remote_evaluations: 0,
@@ -1278,8 +1288,8 @@ mod topk_tests {
             panic!("vector expected")
         };
         assert_eq!(result.values.len(), 1);
-        assert_eq!(result.values[0].value, 1.0, "exact value is authoritative");
-        assert_eq!(result.values[0].labels.labels, vec!["b"]);
+        assert_eq!(result.values[0].value, 3.0, "exact value is authoritative");
+        assert_eq!(result.values[0].labels.labels, vec!["c"]);
         assert_eq!(stats.summary_readout_evaluations, 2);
         assert!(result.warnings.is_empty());
     }
@@ -1288,30 +1298,20 @@ mod topk_tests {
     fn uncertified_candidate_sidecar_warns_or_falls_back_explicitly() {
         let candidates = vec![(labels(&[("pod", "a")]), 1.0)];
         let exact = vec![(labels(&[("pod", "a")]), 2.0)];
-        let (_, warning) = candidate_topk(
-            1,
-            &Grouping {
-                labels: vec![],
-                without: false,
-            },
+        let (_, warning) = membership_filter(
             candidates.clone(),
             exact.clone(),
             &CandidateCompleteness::BestEffort { guarantee: None },
         )
         .unwrap();
         assert!(warning.unwrap().contains("approximate"));
-        // Exact queries never lower an uncertified CandidateTopK. The Planner
+        // Exact queries never lower an uncertified MembershipFilter. The Planner
         // emits its ordinary exact fallback instead; this runtime node is only
         // valid for certified or explicitly approximate plans.
         let certified = CandidateCompleteness::Certified {
             guarantee: topk_membership_guarantee(),
         };
-        assert!(candidate_topk(
-            1,
-            &Grouping {
-                labels: vec![],
-                without: false
-            },
+        assert!(membership_filter(
             vec![(labels(&[("pod", "missing")]), 1.0)],
             exact,
             &certified,

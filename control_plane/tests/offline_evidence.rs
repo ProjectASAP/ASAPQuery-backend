@@ -351,7 +351,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
     let child = bound(&model());
     let root = std::rc::Rc::new(SummaryNode {
         expr: SummaryExpr::BinaryOp {
-            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             lhs: child.clone(),
             rhs: child.clone(),
             operator: BinaryOperator {

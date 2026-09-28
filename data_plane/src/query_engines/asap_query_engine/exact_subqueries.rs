@@ -85,9 +85,9 @@ fn leaves(
                 }
                 _ => pending.extend(inputs.iter().map(|input| (*input, at))),
             },
-            // CandidateTopK is a typed composition node rather than a Logical
+            // MembershipFilter is a typed composition node rather than a Logical
             // wrapper, but its value input can still be a Prometheus leaf.
-            QueryPlanNode::CandidateTopK { inputs, .. } => {
+            QueryPlanNode::MembershipFilter { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
             QueryPlanNode::ExternalExact { request, inputs } => {
@@ -650,22 +650,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_exact_is_discovered_and_prepared_behind_candidate_topk_root() {
-        use asap_types::query_plan::{residual::Grouping, CandidateCompleteness};
+    async fn candidate_exact_is_discovered_and_prepared_behind_membership_filter_root() {
+        use asap_types::query_plan::CandidateCompleteness;
         let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");
         entry.nodes.insert(
             QueryNodeId(2),
-            QueryPlanNode::CandidateTopK {
+            QueryPlanNode::MembershipFilter {
                 inputs: [QueryNodeId(1), QueryNodeId(0)],
-                k: 2,
-                grouping: Grouping {
-                    labels: vec![],
-                    without: false,
-                },
                 completeness: CandidateCompleteness::BestEffort { guarantee: None },
             },
         );
-        entry.root = QueryNodeId(2);
+        entry.nodes.insert(
+            QueryNodeId(3),
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::TopKSelection {
+                    k: 2,
+                    grouping: asap_types::query_plan::residual::Grouping {
+                        labels: vec![],
+                        without: false,
+                    },
+                },
+                inputs: vec![QueryNodeId(2)],
+            },
+        );
+        entry.root = QueryNodeId(3);
         let dependencies = external_dependencies(&entry, &[1_000]).unwrap();
         assert_eq!(dependencies, vec![(QueryNodeId(0), QueryNodeId(1), 1_000)]);
         let prepared = prepare_external(

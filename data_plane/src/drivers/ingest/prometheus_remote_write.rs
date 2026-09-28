@@ -988,6 +988,7 @@ mod tests {
                 summary_catalog: Some(generation),
                 envelope: envelope.clone(),
                 ingest: IngestContract {
+                    dataset_identity: None,
                     protocol: IngestProtocol::PrometheusRemoteWriteV1,
                     endpoint_path: "/api/v1/write".into(),
                     timestamp_unit: TimestampUnit::UnixMilliseconds,
@@ -1207,7 +1208,8 @@ mod tests {
                 table_timestamp_column: None,
                 partitioning: None,
                 value_source_column: None,
-            };
+            }
+        };
         let cms = config(
             AggregationType::CountMinSketchWithHeap,
             vec![],

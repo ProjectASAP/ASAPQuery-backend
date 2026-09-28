@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct QueryNodeId(pub u64);
 
-pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 2;
-pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 3;
+pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 3;
+pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 4;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
 /// Plan lifecycle belongs to the enclosing `PrecomputePlan`; this document
@@ -293,7 +293,7 @@ impl BackendExecutableBinding {
         for node in &dag.nodes {
             match (node.output_state.timing, self.node(node.id)) {
                 (
-                    ExecutionTiming::MaintenanceTime,
+                    ExecutionTiming::IngestionTime,
                     Some(
                         BackendNodeBinding::MaintenanceInput
                         | BackendNodeBinding::Materialization { .. },
@@ -331,11 +331,10 @@ impl BackendExecutableBinding {
         }
         for node in &dag.nodes {
             match (node.output_state.timing, self.node(node.id).unwrap()) {
-                (ExecutionTiming::ReadTime, BackendNodeBinding::Query { .. })
-                | (ExecutionTiming::ReadTime, BackendNodeBinding::QueryInput)
-                | (ExecutionTiming::MaintenanceTime, BackendNodeBinding::MaintenanceInput)
-                | (ExecutionTiming::MaintenanceTime, BackendNodeBinding::Materialization { .. }) => {
-                }
+                (ExecutionTiming::QueryTime, BackendNodeBinding::Query { .. })
+                | (ExecutionTiming::QueryTime, BackendNodeBinding::QueryInput)
+                | (ExecutionTiming::IngestionTime, BackendNodeBinding::MaintenanceInput)
+                | (ExecutionTiming::IngestionTime, BackendNodeBinding::Materialization { .. }) => {}
                 _ => {
                     return Err(format!(
                         "backend placement disagrees with node {} mode",

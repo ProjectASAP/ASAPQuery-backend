@@ -22,7 +22,7 @@ pub enum SummarySemantics {
     /// Restricted raw-input adapter for explicit native summary configurations.
     /// General expressions must use the Planner fragment variant.
     Configured {
-        computation: SummaryComputation,
+        computation: Box<SummaryComputation>,
         value_source_column: Option<planner_types::pre_asap::Column>,
         aggregated_labels: crate::KeyByLabelNames,
         rollup_labels: crate::KeyByLabelNames,
@@ -59,7 +59,7 @@ impl SummaryDefinition {
                 value_source_column: None,
                 aggregated_labels: crate::KeyByLabelNames::empty(),
                 rollup_labels: crate::KeyByLabelNames::empty(),
-                computation: SummaryComputation {
+                computation: Box::new(SummaryComputation {
                     operator: summary.operator.clone(),
                     source: data.source.clone(),
                     value: data.value_projection.clone(),
@@ -67,7 +67,7 @@ impl SummaryDefinition {
                     grouping: data.group_by_keys.clone(),
                     timestamp_column: data.timestamp_column.clone(),
                     observation_semantics: data.observation_semantics.clone(),
-                },
+                }),
             },
         })
     }

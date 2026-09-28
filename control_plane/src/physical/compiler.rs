@@ -199,6 +199,8 @@ pub struct TopKMembershipEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDeploymentContext {
+    /// Semantic dataset served by this deployment's input channel; never an endpoint.
+    pub dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
     pub target: PhysicalDeploymentTarget,
     #[serde(rename = "collector_ids")]
     pub target_collector_ids: Vec<String>,
@@ -219,7 +221,7 @@ pub enum PhysicalDeploymentTarget {
 }
 
 /// Startup and candidate-discovery input for backend-local planning.
-/// Version 2 is the sole supported schema; deployment always requires quotes.
+/// Version 3 requires an explicit logical dataset identity; it is the sole supported schema; deployment always requires quotes.
 /// Query/data semantics use ASAPPlanner's canonical workload types directly;
 /// this wrapper adds only backend-owned implementation evidence and lifecycle
 /// identity required to choose a concrete physical realization.
@@ -569,9 +571,9 @@ impl BackendLocalPlanningInput {
     pub fn into_physical_compilation_request(
         self,
     ) -> Result<(PhysicalCompilationRequest, PhysicalDeploymentContext), CompileError> {
-        if self.schema_version != 2 {
+        if self.schema_version != 3 {
             return Err(CompileError::Snapshot(format!(
-                "unsupported workload snapshot version {}; only version 2 is supported",
+                "unsupported workload snapshot version {}; only version 3 is supported",
                 self.schema_version
             )));
         }
@@ -807,7 +809,7 @@ fn has_unsafe_raw_entity_leaf(
         SummaryExpr::SummaryEstimate { summary_input, .. } => {
             has_unsafe_raw_entity_leaf(summary_input, selected, false)
         }
-        SummaryExpr::SummaryMerge { children } => children
+        SummaryExpr::SummaryMerge { children, .. } => children
             .iter()
             .any(|child| has_unsafe_raw_entity_leaf(child, selected, false)),
         _ => false,
@@ -963,6 +965,10 @@ impl DeploymentPlanCompiler {
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
+        environment
+            .dataset_identity
+            .validate()
+            .map_err(CompileError::Snapshot)?;
         if let Some(data) = &request.data_workload {
             data.validate()
                 .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -1480,9 +1486,10 @@ impl DeploymentPlanCompiler {
                             reason: "persisted semantic root is absent".into(),
                         })?;
                 runtime_materialization.semantic_fragment = Some(
-                    asap_types::semantic_fragment::SemanticFragment::from_stored_output(
+                    asap_types::semantic_fragment::SemanticFragment::from_stored_output_in_dataset(
                         &compiled_dag.dag,
                         semantic_root,
+                        environment.dataset_identity.clone(),
                     )
                     .map_err(|reason| CompileError::Query {
                         query_id: query.query_id.clone(),
@@ -2002,6 +2009,7 @@ impl DeploymentPlanCompiler {
             query_id: "precompute-plan".into(),
             reason: error.to_string(),
         })?;
+        precompute_plan.ingest.dataset_identity = Some(environment.dataset_identity.clone());
         let mut transmission_plan = crate::physical::compiler::build_transmission_plan(
             envelope.clone(),
             &precompute_plan,
@@ -2089,15 +2097,9 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
-            SummaryExpr::CandidateTopK {
-                candidates, values, ..
-            } => {
-                walk(candidates, metrics);
-                walk(values, metrics);
-            }
             SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     walk(child, metrics);
                 }
@@ -2165,10 +2167,9 @@ fn observed_population_matches_root(
         || !measures.iter().all(|intent| {
             matches!(
                 intent,
-                AggIntent::Cardinality { col: None, .. }
-                    | AggIntent::FrequencyL2 { col: None, .. }
+                AggIntent::FrequencyL2 { col: None, .. }
                     | AggIntent::FrequencyEntropy { col: None, .. }
-            )
+            ) || matches!(intent, AggIntent::Cardinality { cols, .. } if cols.is_empty())
         })
     {
         return false;
@@ -2354,7 +2355,7 @@ fn requires_exact_erp_fallback(
                 child: summary_input,
                 ..
             } => walk(summary_input, out),
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 children.iter().for_each(|child| walk(child, out))
             }
             SummaryExpr::SummaryJoin { outer, inner, .. } => {
@@ -2370,12 +2371,6 @@ fn requires_exact_erp_fallback(
             } => {
                 walk(left, out);
                 walk(right, out);
-            }
-            SummaryExpr::CandidateTopK {
-                candidates, values, ..
-            } => {
-                walk(candidates, out);
-                walk(values, out);
             }
             SummaryExpr::KeepPreAsap(_) => {}
         }
@@ -3241,7 +3236,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
                 lhs,
                 rhs,
                 operator,
-                timing: ExecutionTiming::MaintenanceTime,
+                timing: ExecutionTiming::IngestionTime,
             } if operator.vector_match.is_none()
                 && matches!(
                     operator.kind,
@@ -3254,7 +3249,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
             SummaryExpr::ValueOperation {
                 child: source,
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                timing: ExecutionTiming::MaintenanceTime,
+                timing: ExecutionTiming::IngestionTime,
             } if matches!(&source.expr,
                     SummaryExpr::SummaryAgg { family: SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), child, .. }
                     if matches!(child.expr, SummaryExpr::KeepPreAsap(_))) =>
@@ -3570,8 +3565,10 @@ fn collect_selected_materializations(
             }
         }
         match &node.expr {
-            SummaryExpr::CandidateTopK {
-                candidates, values, ..
+            SummaryExpr::RelationalJoin {
+                right: candidates, left: values,
+                kind: planner_types::pre_asap::JoinKind::Semi,
+                pruning: Some(_), ..
             } => {
                 walk(candidates, readout, composable, grouping.clone(), selected)?;
                 // In a hybrid TopK, the sketch is only a candidate-membership
@@ -3624,7 +3621,7 @@ fn collect_selected_materializations(
                 grouping.clone(),
                 selected,
             )?,
-            SummaryExpr::SummaryMerge { children } => {
+            SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
                     walk(child, readout, composable, grouping.clone(), selected)?;
                 }
@@ -3665,16 +3662,6 @@ fn collect_selected_materializations(
                             SummaryInputExpr::Column(
                                 planner_types::pre_asap::ColumnRef::SampleValue,
                             ) => "value",
-                            SummaryInputExpr::ResetAwareCounterDelta { .. }
-                                if matches!(
-                                    input.weight_domain,
-                                    planner_types::post_asap::WeightDomain::NonNegative {
-                                        proof: planner_types::post_asap::NonNegativeWeightProof::ResetAwareCounterDerivative
-                                    }
-                                ) => "counter_delta",
-                            SummaryInputExpr::ResetAwareCounterDelta { .. } => {
-                                return Err("counter-delta TopK input lacks a non-negative reset-aware proof".into())
-                            }
                             _ => return Err("unsupported TopK SummaryUpdate weight".into()),
                         };
                         parameters["weight_mode"] = mode.into();
@@ -4257,7 +4244,7 @@ pub(crate) mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap();
-        for version in [0, 1, 3] {
+        for version in [0, 1, 2, 4] {
             let mut old = snapshot.clone();
             old.schema_version = version;
             assert!(old
@@ -4265,7 +4252,7 @@ pub(crate) mod tests {
                 .into_physical_compilation_request()
                 .unwrap_err()
                 .to_string()
-                .contains("only version 2"));
+                .contains("only version 3"));
             assert!(old.compile_promql().is_err());
         }
         assert!(snapshot.into_physical_compilation_request().is_ok());
@@ -4496,10 +4483,17 @@ pub(crate) mod tests {
             .compile_promql(request, environment(10_000))
             .unwrap();
         let entry = plan.query_plan.entries.values().next().unwrap();
-        let crate::query_plan::QueryPlanNode::CandidateTopK { inputs, .. } =
-            &entry.nodes[&entry.root]
+        let crate::query_plan::QueryPlanNode::Logical {
+            operator: asap_types::query_plan::residual::ResidualQueryOperator::TopKSelection { .. },
+            inputs,
+        } = &entry.nodes[&entry.root]
         else {
-            panic!("Planner weighted TopK must lower to CandidateTopK: {entry:#?}");
+            panic!("expected ordinary TopK root")
+        };
+        let crate::query_plan::QueryPlanNode::MembershipFilter { inputs, .. } =
+            &entry.nodes[&inputs[0]]
+        else {
+            panic!("Planner weighted TopK must lower to MembershipFilter: {entry:#?}");
         };
         assert!(matches!(
             entry.nodes[&inputs[0]],
@@ -4596,7 +4590,14 @@ pub(crate) mod tests {
             asap_types::AggregationType::CountMinSketchWithHeap
         );
         let entry = plan.query_plan.lookup(query).unwrap();
-        let QueryPlanNode::CandidateTopK { inputs, .. } = &entry.nodes[&entry.root] else {
+        let QueryPlanNode::Logical {
+            operator: ResidualQueryOperator::TopKSelection { .. },
+            inputs,
+        } = &entry.nodes[&entry.root]
+        else {
+            panic!("expected ordinary TopK root")
+        };
+        let QueryPlanNode::MembershipFilter { inputs, .. } = &entry.nodes[&inputs[0]] else {
             panic!("expected candidate TopK: {entry:#?}");
         };
         assert!(matches!(
@@ -4637,7 +4638,7 @@ pub(crate) mod tests {
             .nodes
             .iter()
             .all(|node| node.output_state.timing
-                == planner_types::post_asap::ExecutionTiming::MaintenanceTime));
+                == planner_types::post_asap::ExecutionTiming::IngestionTime));
         assert_eq!(installed.binding.query_plan_sink, entry.root);
         let mut mismatched = plan.to_publication_artifact().unwrap();
         let projected = mismatched
@@ -4747,8 +4748,51 @@ pub(crate) mod tests {
         );
     }
 
+    /// Dataset changes alter persisted meaning; relocating the same input does not.
+    #[test]
+    fn dataset_identity_survives_binding_and_rejects_wrong_input() {
+        let compile = |env| {
+            DeploymentPlanCompiler
+                .compile_promql(request("q", "sum_over_time(m[1m])"), env)
+                .unwrap()
+        };
+        let first = compile(environment(10_000));
+        assert!(!first.summary_catalog.definitions.is_empty());
+        let mut other = environment(10_000);
+        other.dataset_identity.namespace = "other-tenant".into();
+        let second = compile(other);
+        assert_ne!(
+            first.summary_catalog.definitions.keys().collect::<Vec<_>>(),
+            second
+                .summary_catalog
+                .definitions
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        let mut relocated = environment(10_000);
+        relocated.target_collector_ids = vec!["relocated-source".into()];
+        let relocated = compile(relocated);
+        assert_eq!(
+            first.summary_catalog.definitions,
+            relocated.summary_catalog.definitions
+        );
+        let mut forged = first.precompute_plan.clone();
+        forged.ingest.dataset_identity.as_mut().unwrap().namespace = "other-tenant".into();
+        assert!(forged
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("dataset"));
+        forged.ingest.dataset_identity = None;
+        assert!(forged.validate().is_err());
+    }
+
     fn environment(now: u64) -> PhysicalDeploymentContext {
         PhysicalDeploymentContext {
+            dataset_identity: planner_types::post_asap::LogicalDatasetIdentity {
+                namespace: "test".into(),
+                dataset: "metrics".into(),
+            },
             target: PhysicalDeploymentTarget::DistributedCollectors,
             target_collector_ids: vec!["edge-a".into(), "edge-b".into()],
             capability_snapshot_id: "caps-7".into(),
@@ -5820,7 +5864,7 @@ pub(crate) mod tests {
         };
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 lhs: selected.clone(),
                 rhs: selected.clone(),
                 operator: planner_types::post_asap::BinaryOperator {
@@ -6021,7 +6065,7 @@ pub(crate) mod tests {
         let right = right.queries[0].selected_plan_root.clone();
         let right = Rc::new(SummaryNode {
             expr: SummaryExpr::ValueOperation {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
                 child: right.clone(),
             },
@@ -6030,7 +6074,7 @@ pub(crate) mod tests {
         });
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 lhs: left.clone(),
                 rhs: right,
                 operator: planner_types::post_asap::BinaryOperator {
@@ -7296,6 +7340,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         envelope_plan.ingest = IngestContract {
+            dataset_identity: envelope_plan.ingest.dataset_identity.clone(),
             protocol: IngestProtocol::PrometheusRemoteWriteV1,
             endpoint_path: "/api/v1/write".into(),
             timestamp_unit: TimestampUnit::UnixMilliseconds,
@@ -7383,7 +7428,7 @@ pub(crate) mod tests {
             .queries
             .remove(0);
         let snapshot = BackendLocalPlanningInput {
-            schema_version: 2,
+            schema_version: 3,
             workload_cost_evidence: None,
             query_workload,
             data_workload,
@@ -7652,6 +7697,7 @@ pub(crate) mod tests {
         };
         let merge = Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryMerge {
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
                 children: vec![left.clone(), right.clone()],
             },
             schema: left.schema.clone(),
