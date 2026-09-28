@@ -799,7 +799,15 @@ fn execute_physical_query_payload(
             .map_err(execution_failure)?;
         readout_outcome(output, t1_ms)
     })();
-    if !revision.matches(index.summary_update_revision()) {
+    finish_readout(result, revision.matches(index.summary_update_revision()))
+}
+
+// A revision race must never replace a terminal physical execution error.
+fn finish_readout(
+    result: Result<PostAsapReadoutOutcome, LoweringSkip>,
+    revision_unchanged: bool,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    if !revision_unchanged {
         return Err(LoweringSkip::ExecuteFailed(
             "summary input changed during query DAG evaluation".into(),
         ));
@@ -994,6 +1002,19 @@ mod tests {
                 "{engine:?}"
             );
             assert_eq!(context.retained_bytes(), 0);
+        }
+    }
+
+    // Even when a writer invalidates the read fence, resource errors stay terminal.
+    #[test]
+    fn revision_change_cannot_mask_terminal_execution_failure() {
+        for error in [dag::Error::MemoryLimit, dag::Error::Cancelled] {
+            let result = finish_readout(Err(LoweringSkip::Execution(error)), false);
+            let engine: crate::query_engines::EngineError = result.err().unwrap().into();
+            assert!(
+                matches!(engine, crate::query_engines::EngineError::Physical(_)),
+                "{engine:?}"
+            );
         }
     }
 
