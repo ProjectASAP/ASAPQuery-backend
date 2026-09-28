@@ -10,8 +10,9 @@ in the serialized API.
 
 | Term | Meaning |
 | --- | --- |
-| Selected post-ASAP DAG | Planner-selected computation graph, including summary producers, shared dependencies and query readouts. |
+| Selected post-ASAP DAG | The Planner-produced logical computation underlying the physical candidate selected by Backend, including summary producers, shared dependencies and query readouts. |
 | Physical DAG | Planner-owned concrete operators, typed input boundaries, dependencies and roots; no storage identities or placement. |
+| Physical candidate | A Planner-produced physical realization of a workload; Backend checks deployment feasibility and selects using scoped costs. |
 | Deployment plan | System instantiation of physical computation with concrete source/state bindings and operational policy. |
 | Summary producer | An operation or subgraph that builds summary state. Multiple queries may share its stored output. |
 | `SummaryMaintenanceLifecyclePlan` | Planner result associating a post-ASAP root with selected maintenance requirements for its unique reachable summary producers, plus workload and costing context. |
@@ -21,7 +22,7 @@ in the serialized API.
 | `QueryPlan` | Planner query Physical DAGs plus backend input bindings, query/result associations and fallback policy. |
 | Readout / `SummaryEstimate` | Operation that obtains a query value from summary state, such as p99 from KLL. |
 | Derived summary state | Stored summary state computed from existing summary states. Earlier discussion calls this a “derived materialization”; it does not require a separate catalog object. |
-| Exact residual | Part of the selected query computed exactly around summary operations, such as supported filtering or arithmetic after readout. It does not make the whole approximate result exact. |
+| Exact computation around summaries | Part of the selected query computed exactly around summary operations, such as supported filtering or arithmetic after readout. It does not make the whole approximate result exact. |
 | Exact fallback | Configured execution of the original query through an exact route when the summary plan cannot serve it. |
 
 For example, merging five compatible one-minute KLL summaries and storing the
@@ -51,6 +52,7 @@ Migration of existing types and fields is covered in the
 | Schema / encoding | Schema describes the state structure; encoding describes how that structure is represented as bytes. |
 | Semantic discovery | Future Planner search for legal query rewrites over persisted definitions; distinct from fingerprint equality and record lookup. |
 | Deployment resolution | Backend selection of authorized stored outputs realizing a selected definition. |
+| Logical dataset identity | Stable semantic source identity supplied before Planner definition export; distinguishes datasets independently of endpoints or replicas. |
 | Definition ID | Fingerprint of a versioned canonical semantic description; different input expressions must remain distinguishable. |
 | Provenance | Mapping from physical plan operations back to the selected Planner computation. |
 
@@ -68,7 +70,7 @@ reclassifying logical nodes or changing that boundary.
 | Retention | How long state remains available; distinct from its input range and refresh cadence. |
 | Readiness | Whether the required state is available with valid format and sufficient coverage/completeness for a read. Plan installation alone does not establish readiness. |
 | Backend capability | Declaration of supported implementation combinations: algorithm/parameters, maintenance mode, input kind, window behavior and format. |
-| Physical cost evidence | Scoped measurements or estimates used to compare executable alternatives; includes workload and implementation context. |
+| Physical cost evidence | Scoped measurements or estimates used to compare executable candidates; includes workload and implementation context. |
 | Compiler contract | Required inputs, outputs, validation rules and guarantees, including matching writer/reader definitions, formats, partitions and plan versions. |
 
 ## Compilation ownership
