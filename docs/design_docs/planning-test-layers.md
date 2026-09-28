@@ -8,7 +8,7 @@ ERP collection, feedback-driven replanning and deployment switching are deferred
 
 | PR | Input | Assertion |
 | --- | --- | --- |
-| #728: structure | workload and declared execution/accuracy contracts | Every supported candidate has a valid physical DAG or an explicit binding rejection; no prices or winner assertions |
+| #728: structure | workload and declared execution/accuracy contracts | Membership: required shapes appear in the inventory and resolve as declared (bind, or refuse for a named policy reason); every other rejection is a recorded defect with a fixed occurrence count. No prices, no winner |
 | #742: ranking | same candidates plus synthetic complete quotes | Selection follows costs, reverses with costs, and excludes unavailable candidates |
 | #775: execution | workload, synthetic quotes, finite fixture data | Mutate quotes to select each admitted candidate, install and execute it; validate every query result and execution provenance |
 
@@ -36,6 +36,14 @@ once, ingests its fixture once, and checks every query in that workload.
 “All candidates” means the supported inventory exposed by Planner and admitted
 under the fixture's contracts, not an exhaustive Cartesian product of hypothetical
 query plans. Binding rejections remain visible; prices cannot override them.
+
+A rejection is not self-justifying. Level 1 separates *policy* refusals — the
+fixture declining to certify a candidate, which are asserted as required
+outcomes — from *defects*, which are bugs recorded with exact occurrence counts
+so that neither a new instance nor a silent fix can pass unnoticed. Level 1's
+enumerated candidate plans and ensembles are CI artifacts, not repository
+content: they are fully derived, and their identities change with the Planner
+pin. Only the per-query admission reports are committed.
 
 ## Synthetic cost scope
 
