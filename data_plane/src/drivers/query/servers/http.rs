@@ -1354,6 +1354,10 @@ async fn process_via_named_engine(
             )
                 .into_response()
         }
+        Err(error @ EngineError::Physical(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"status": "error", "errorType": "execution", "error": error.to_string()})),
+        ).into_response(),
         Err(EngineError::Backend { .. }) => {
             warn!(
                 data_source_id = data_source_id,
@@ -1483,6 +1487,10 @@ async fn process_via_router(
                 EngineError::CapabilityMiss { .. } => {
                     forward_instant_to_fallback(state, parsed_request, headers).await
                 }
+                EngineError::Physical(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"status": "error", "errorType": "execution", "error": last.to_string()})),
+                ).into_response(),
                 EngineError::Backend { .. } => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
@@ -2297,6 +2305,10 @@ async fn process_range_query_request(
                         }
                     }
                 }
+                EngineError::Physical(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"status": "error", "errorType": "execution", "error": last.to_string()})),
+                ).into_response(),
                 EngineError::Backend { .. } => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
@@ -3576,6 +3588,7 @@ mod tests {
 
     #[derive(Clone)]
     enum MockOutcome {
+        Physical(asap_physical_operators::Error),
         /// Empty instant vector — the Prometheus adapter still
         /// produces `status=success` with `data.result=[]`.
         OkEmpty,
@@ -3604,7 +3617,8 @@ mod tests {
     impl QueryEngine for MockQueryEngine {
         async fn execute(&self, _query: &str) -> Result<QueryResult, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            match self.outcome {
+            match &self.outcome {
+                MockOutcome::Physical(error) => Err(EngineError::Physical(error.clone())),
                 MockOutcome::OkEmpty => Ok(QueryResult::vector(Vec::new(), 0)),
                 MockOutcome::Backend => Err(EngineError::backend(
                     self.caps.data_source_id,
@@ -3624,7 +3638,8 @@ mod tests {
             _step_ms: u64,
         ) -> Result<QueryResult, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            match self.outcome {
+            match &self.outcome {
+                MockOutcome::Physical(error) => Err(EngineError::Physical(error.clone())),
                 MockOutcome::OkEmpty => Ok(QueryResult::matrix(Vec::new())),
                 MockOutcome::Backend => Err(EngineError::backend(
                     self.caps.data_source_id,
@@ -4072,6 +4087,54 @@ mod tests {
             .expect("accuracy field must round-trip on router path");
         assert_eq!(accuracy["epsilon"], 0.0);
         assert_eq!(accuracy["delta"], 0.0);
+    }
+
+    // Execution failure must survive the router and HTTP boundary without failover.
+    #[tokio::test]
+    async fn physical_resource_errors_never_forward_instant_or_range_queries() {
+        for cause in [
+            asap_physical_operators::Error::MemoryLimit,
+            asap_physical_operators::Error::Cancelled,
+        ] {
+            let error = asap_physical_operators::Error::AtNode {
+                node: 7,
+                operation: "sort".into(),
+                source: Box::new(cause.clone()),
+            };
+            let (warm, warm_calls) =
+                MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::Physical(error));
+            let (other, other_calls) =
+                MockQueryEngine::new(StorageBackend::DoubleWrite, MockOutcome::OkEmpty);
+            let port =
+                setup_test_server_with_router(StorageBackend::DoubleWrite, vec![warm, other]).await;
+            for endpoint in ["query", "query_range"] {
+                let response = Client::new()
+                    .get(format!("http://127.0.0.1:{port}/api/v1/{endpoint}"))
+                    .query(&[
+                        ("query", "sum_over_time(foo[5m])"),
+                        ("time", "1700000000"),
+                        ("start", "1700000000"),
+                        ("end", "1700000060"),
+                        ("step", "15"),
+                    ])
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                );
+                let body: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(body["status"], "error");
+                assert_eq!(body["errorType"], "execution");
+                assert!(
+                    body["error"].as_str().unwrap().contains(&cause.to_string()),
+                    "{body}"
+                );
+            }
+            assert_eq!(warm_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(other_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

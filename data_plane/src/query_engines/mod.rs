@@ -55,6 +55,10 @@ use thiserror::Error;
 /// `CapabilityMiss` does not — the caller should escalate).
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// A failed physical execution is terminal; it must never select another engine.
+    #[error(transparent)]
+    Physical(#[from] asap_physical_operators::Error),
+
     /// The engine has no aggregation that can answer this query. Mirrors
     /// `ASAPQueryEngine::handle_query` returning `None`. The router treats
     /// this as a "hard miss" and falls through to the next backend in

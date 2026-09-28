@@ -768,6 +768,22 @@ mod planner_workload_tests {
             .unwrap_or_else(|error| panic!("{query}: {error}"))
     }
 
+    fn assert_local_limit(node: &QueryPlanNode) {
+        match node {
+            QueryPlanNode::Physical { dag, .. } => {
+                let plan =
+                    asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                        .unwrap();
+                assert_eq!(plan.operator_name(plan.roots()[0]), Some("Limit"));
+            }
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::Limit { .. },
+                ..
+            } => {}
+            _ => panic!("expected local Limit, got {node:?}"),
+        }
+    }
+
     #[test]
     fn evaluation_topk_queries_retain_a_local_selection_root() {
         for query in [
@@ -779,17 +795,7 @@ mod planner_workload_tests {
         ] {
             let plan = compile_one(query);
             let entry = plan.query_plan.entries.values().next().unwrap();
-            assert!(
-                matches!(
-                    entry.nodes[&entry.root],
-                    QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Limit { .. },
-                        ..
-                    }
-                ),
-                "{query}: {:?}",
-                entry.nodes[&entry.root]
-            );
+            assert_local_limit(&entry.nodes[&entry.root]);
             assert!(
                 !entry
                     .nodes
@@ -808,13 +814,7 @@ mod planner_workload_tests {
         ] {
             let plan = compile_one(query);
             let entry = plan.query_plan.entries.values().next().unwrap();
-            assert!(matches!(
-                entry.nodes[&entry.root],
-                QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Limit { .. },
-                    ..
-                }
-            ));
+            assert_local_limit(&entry.nodes[&entry.root]);
             assert!(
                 !entry.materialization_bindings().is_empty(),
                 "{query} must retain its SummaryStore child: {:?}",
