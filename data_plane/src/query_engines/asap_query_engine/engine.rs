@@ -754,7 +754,7 @@ impl ASAPQueryEngine {
                     matches!(
                         node,
                         asap_types::query_plan::QueryPlanNode::Logical { .. }
-                            | asap_types::query_plan::QueryPlanNode::Physical { .. }
+                            | asap_types::query_plan::QueryPlanNode::PhysicalFragment { .. }
                     )
                 }) {
                     return self

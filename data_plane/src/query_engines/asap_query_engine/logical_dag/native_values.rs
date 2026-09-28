@@ -428,6 +428,43 @@ mod tests {
         }
     }
 
+    // Count-like values are bound as integers only when the protocol sample is exact.
+    #[test]
+    fn integer_input_binding_preserves_type_and_rejects_rounding() {
+        let input = schema(&[("count", DataType::Int64)]);
+        let compiled = CompiledPhysicalDag::from_operators(
+            [(0, InputContract::bounded(input.clone()))].into(),
+            [(1, (vec![0], Operator::limit(input, 1, 0, vec![]).unwrap()))].into(),
+            vec![1],
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        for (sample, valid) in [
+            (3., true),
+            (-4., true),
+            (0.5, false),
+            (f64::INFINITY, false),
+            (9_007_199_254_740_994., false),
+        ] {
+            let result = physical(
+                &compiled,
+                vec![vec![(Labels::new(), sample)]],
+                0,
+                42,
+                context(4096),
+            );
+            if valid {
+                assert_eq!(result.unwrap()[0].1, sample);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(EngineError::Physical(Error::Invalid(_)))
+                ));
+            }
+        }
+    }
+
     // Transport identity preserves the exact value selected by native total-order sorting.
     #[test]
     fn native_sort_preserves_signed_zero_bits() {

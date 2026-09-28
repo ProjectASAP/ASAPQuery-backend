@@ -199,7 +199,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .ok_or_else(|| miss("missing installed node"))?
             .clone();
         let value = match node {
-            QueryPlanNode::Physical {
+            QueryPlanNode::PhysicalFragment {
                 inputs,
                 dag,
                 row_input,

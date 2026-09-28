@@ -201,7 +201,7 @@ fn compile_native_fragment(
     } else {
         None
     };
-    Ok(QueryPlanNode::Physical {
+    Ok(QueryPlanNode::PhysicalFragment {
         pruning,
         row_input,
         inputs: physical
@@ -248,7 +248,7 @@ where
         }
         for (local, mut physical) in nodes {
             match &mut physical {
-                QueryPlanNode::Physical { inputs, .. }
+                QueryPlanNode::PhysicalFragment { inputs, .. }
                 | QueryPlanNode::Logical { inputs, .. }
                 | QueryPlanNode::SummaryMerge { inputs }
                 | QueryPlanNode::ExternalExact { inputs, .. } => {
@@ -1384,7 +1384,7 @@ mod tests {
                     ),
                     (
                         QueryNodeId(1),
-                        QueryPlanNode::Physical {
+                        QueryPlanNode::PhysicalFragment {
                             inputs: vec![QueryNodeId(0)],
                             dag: compiled.encode().unwrap(),
                             row_input: 0,
