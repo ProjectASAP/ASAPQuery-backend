@@ -112,7 +112,7 @@ pub struct MaterializationSearchCoverage {
 pub struct CandidatePlanSelectionReport {
     #[serde(default)]
     #[serde(rename = "logical_selection")]
-    pub planner_selection_trace: Vec<Value>,
+    pub planner_selection_trace: std::sync::Arc<Vec<Value>>,
     #[serde(default)]
     pub materialization_search_coverage: Option<MaterializationSearchCoverage>,
     pub data_snapshot_id: String,

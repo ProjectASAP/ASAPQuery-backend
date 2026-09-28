@@ -157,8 +157,8 @@ pub struct PhysicalCompilationRequest {
     /// Complete Planner candidates retained until deployment admission/pricing.
     /// Empty for callers that explicitly supply one already-selected forest.
     pub planner_candidate_forests: Vec<Vec<QueryCompilationInput>>,
-    /// Diagnostic projections of the original Planner search; never consumed by selection.
-    pub planner_selection_trace: Vec<serde_json::Value>,
+    /// Immutable search diagnostics shared across candidates; never consumed by selection.
+    pub planner_selection_trace: std::sync::Arc<Vec<serde_json::Value>>,
     /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
     pub allow_mixed_summary_and_exact_execution: bool,
     /// Deployment feasibility: external exact dependencies cannot be bound.
@@ -620,7 +620,7 @@ pub struct CompiledPhysicalPlan {
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
     pub cost_comparison: Option<super::workload_cost::CandidatePlanSelectionReport>,
-    pub planner_selection_trace: Vec<serde_json::Value>,
+    pub planner_selection_trace: std::sync::Arc<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1051,12 +1051,14 @@ impl BackendLocalPlanningInput {
         let mut planner_candidate_forests = Vec::new();
         for roots in candidate_roots {
             let mut forest = queries.clone();
+            let changed: BTreeSet<_> = roots.iter().map(|(index, _)| *index).collect();
             for (index, root) in roots {
                 forest[index].selected_plan_root = root;
             }
-            let preparation = forest.iter_mut().try_for_each(|query| {
+            // Unchanged roots already have prepared windows in `queries`.
+            let preparation = changed.into_iter().try_for_each(|index| {
                 prepare_window_implementations(
-                    query,
+                    &mut forest[index],
                     &self.physical_inputs.window_cost_model,
                     self.environment.target,
                     self.physical_inputs.query_retention_margin_ms,
@@ -1078,7 +1080,7 @@ impl BackendLocalPlanningInput {
         Ok((
             PhysicalCompilationRequest {
                 planner_candidate_forests,
-                planner_selection_trace,
+                planner_selection_trace: planner_selection_trace.into(),
                 allow_mixed_summary_and_exact_execution: true,
                 require_backend_local_execution: self
                     .physical_inputs
@@ -5491,7 +5493,7 @@ pub(crate) mod tests {
         }
         Ok(PhysicalCompilationRequest {
             planner_candidate_forests: Vec::new(),
-            planner_selection_trace: Vec::new(),
+            planner_selection_trace: Default::default(),
             canonical_roots: Vec::new(),
             allow_mixed_summary_and_exact_execution: false,
             require_backend_local_execution: false,
