@@ -35,4 +35,6 @@ Recovery at this stage is limited to the same installed catalog generation.
 Installing a new plan version never adopts previous-version state, even for an
 unchanged definition. New input must populate that version before it can serve
 accelerated results; the query follows its installed fallback/unavailability
-policy while cold. Cross-version adoption metadata is rejected.
+policy while cold. Fresh writes allocate a new physical series instead of using
+the previous generation's completed series, both after restart and during live
+activation. Cross-version adoption metadata is rejected.

@@ -2806,15 +2806,17 @@ impl SketchStore {
             if matches!(
                 binding.data_descriptor.source,
                 asap_types::sds::DataSourceIdentity::Derived { .. }
-            ) {
+            ) || binding.catalog_generation.as_deref()
+                != self.active_catalog_generation().as_deref()
+            {
                 let (catalog, generation) = self
                     .descriptors
                     .authoritative_snapshot()
-                    .ok_or("derived reactivation requires an authoritative catalog")?;
+                    .ok_or("series reactivation requires an authoritative catalog")?;
                 if binding.metadata.policy_fp != definition.fingerprint()
                     || !catalog.definitions.contains_key(&definition)
                 {
-                    return Err("derived reactivation differs from its installed definition".into());
+                    return Err("series reactivation differs from its installed definition".into());
                 }
                 if binding.catalog_generation.as_deref() != Some(generation.as_ref()) {
                     return Ok(Some(generation));
@@ -3368,6 +3370,18 @@ impl SketchStore {
                     if generation != installed_generation
                         || !catalog.definitions.contains_key(definition)
                     {
+                        // A new version must allocate a fresh physical series. Otherwise
+                        // the persisted resolver can route fresh input back to this
+                        // excluded series and its already-completed windows.
+                        if generation.plan_id == installed_generation.plan_id
+                            && generation.plan_version < installed_generation.plan_version
+                            && catalog.definitions.contains_key(definition)
+                        {
+                            self.removed_sids
+                                .write()
+                                .unwrap()
+                                .insert(rec.sid, (Some(Arc::clone(generation)), Some(*definition)));
+                        }
                         tracing::warn!(
                             sid = rec.sid,
                             "persisted summary catalog provenance differs; leaving state unbound"
@@ -5054,6 +5068,13 @@ mod tests {
         assert!(
             store.series_ids_for_policy(fingerprint).is_empty(),
             "new version must start cold"
+        );
+        assert!(
+            store
+                .authorize_series_reactivation(509, fingerprint.into())
+                .unwrap()
+                .is_some(),
+            "live version change must allocate a fresh physical series"
         );
         let output = asap_types::sds::StoredOutputReference::for_definition(fingerprint.into())
             .stored_output_id;
