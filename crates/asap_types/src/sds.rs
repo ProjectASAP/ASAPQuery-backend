@@ -321,8 +321,7 @@ pub struct SummaryInstance {
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
     pub catalog_generation: CatalogGeneration,
-    /// Source generation selected by an explicit compatibility decision when
-    /// an unchanged definition reuses a committed payload.
+    /// Reserved wire field. Cross-version state adoption is not supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from_generation: Option<CatalogGeneration>,
     pub placement: SummaryPlacement,
@@ -359,23 +358,15 @@ impl SummaryInstance {
                 "summary instance placement must be resolved".into(),
             ));
         }
-        let payload_generation = if let Some(source) = &self.reused_from_generation {
-            validate_catalog_generation(source)?;
-            if source.plan_id != self.catalog_generation.plan_id
-                || source.plan_version >= self.catalog_generation.plan_version
-            {
-                return Err(SdsError(
-                    "stored summary has invalid reuse provenance".into(),
-                ));
-            }
-            source.plan_version
-        } else {
-            self.catalog_generation.plan_version
-        };
+        if self.reused_from_generation.is_some() {
+            return Err(SdsError(
+                "cross-version state adoption is not supported".into(),
+            ));
+        }
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
-            || self.state_reference.generation != payload_generation
+            || self.state_reference.generation != self.catalog_generation.plan_version
         {
             return Err(SdsError(
                 "summary instance has invalid state reference".into(),
@@ -1426,13 +1417,16 @@ mod tests {
     }
 
     #[test]
-    fn reused_payload_requires_an_older_compatible_plan_generation() {
+    fn new_generation_rejects_cross_version_payload_adoption() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
         let mut source = instance.catalog_generation.clone();
         source.plan_version -= 1;
         instance.reused_from_generation = Some(source.clone());
         instance.state_reference.generation = source.plan_version;
-        instance.validate().unwrap();
+        assert!(
+            instance.validate().is_err(),
+            "cross-version adoption must be rejected"
+        );
         instance.reused_from_generation.as_mut().unwrap().plan_id += 1;
         assert!(instance.validate().is_err());
         instance.reused_from_generation = Some(instance.catalog_generation.clone());
