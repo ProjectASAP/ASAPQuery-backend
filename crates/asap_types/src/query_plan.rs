@@ -790,6 +790,7 @@ impl QueryPlanNode {
                 R::Subquery { .. } => "logical/subquery",
             },
             Self::Physical { .. } => "physical_dag",
+            Self::PhysicalFragment { .. } => "physical_fragment",
             Self::Scalar { .. } => "scalar",
             Self::Binary { .. } => "binary",
             Self::ReduceSum { .. } => "reduce_sum",
@@ -867,6 +868,9 @@ impl QueryPlanNode {
                     offset_ms,
                 } => format!("range_ms={range_ms} step_ms={step_ms} offset_ms={offset_ms}"),
             },
+            Self::PhysicalFragment {
+                inputs, row_input, ..
+            } => format!("input_count={} row_input={row_input}", inputs.len()),
             Self::Physical {
                 inputs,
                 source_nodes,
