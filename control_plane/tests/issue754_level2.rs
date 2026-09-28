@@ -15,28 +15,32 @@ use control_plane::physical::{
 /// Missing/infeasible cheapest quotes must not become a zero-cost winner.
 #[test]
 fn workload_candidates_follow_prices_and_feasibility() {
-    for case in workload::suite().queries {
-        let (request, env) = workload::input(&case)
-            .into_physical_compilation_request()
-            .unwrap();
+    let mut workloads: Vec<_> = workload::suite()
+        .queries
+        .into_iter()
+        .map(|case| (case.name.clone(), workload::input(&case)))
+        .collect();
+    workloads.extend(
+        workload::ensembles()
+            .into_iter()
+            .map(|(name, cases)| (name, workload::ensemble_input(&cases))),
+    );
+    for (name, input) in workloads {
+        let (request, env) = input.into_physical_compilation_request().unwrap();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let (mut manifests, admission) =
             compile_candidates_for_pricing(candidates.clone(), env.clone(), QueryFrontend::PromQl);
         // Equivalent manifests need one quote, irrespective of search duplicates.
         let mut seen = std::collections::BTreeSet::new();
         manifests.retain(|m| seen.insert(serde_json::to_string(m).unwrap()));
-        assert!(
-            manifests.len() >= 2,
-            "{} needs competing candidates",
-            case.name
-        );
+        assert!(manifests.len() >= 2, "{} needs competing candidates", name);
         assert!(admission.iter().all(|c| c.total_cost.is_none()));
         let mut winners = std::collections::BTreeSet::new();
         for preferred in 0..manifests.len() {
             let evidence = WorkloadCostEvidence {
                 backend_revision: BACKEND_REVISION.into(),
                 planner_revision: PLANNER_REVISION.into(),
-                data_snapshot_id: format!("synthetic-ranking-{}", case.name),
+                data_snapshot_id: format!("synthetic-ranking-{}", name),
                 model_version: "synthetic-complete-quotes-v1".into(),
                 observed_at_unix_ms: env.observed_at_unix_ms,
                 valid_for_ms: env.max_evidence_age_ms,
@@ -55,13 +59,9 @@ fn workload_candidates_follow_prices_and_feasibility() {
                     .collect(),
             };
             let plan = select_lowest_cost_candidate(candidates.clone(), env.clone(), &evidence)
-                .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+                .unwrap_or_else(|e| panic!("{}: {e}", name));
             let report = plan.cost_comparison.unwrap();
-            assert_eq!(
-                report.selected_manifest, manifests[preferred],
-                "{}",
-                case.name
-            );
+            assert_eq!(report.selected_manifest, manifests[preferred], "{}", name);
             assert_eq!(report.model_version, "synthetic-complete-quotes-v1");
             let minimum = report
                 .candidate_evaluations
@@ -112,7 +112,7 @@ fn workload_candidates_follow_prices_and_feasibility() {
             winners.len(),
             manifests.len(),
             "{}: selection did not reverse",
-            case.name
+            name
         );
     }
 }
