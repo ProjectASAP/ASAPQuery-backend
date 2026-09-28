@@ -3858,7 +3858,7 @@ pub(crate) mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap();
-        snapshot.schema_version = 2;
+        snapshot.schema_version = 3;
         snapshot.data_workload.data_ingestion_interval.value = Some(DurationMs(1_000));
         let template = snapshot.query_workload.repeating_queries.as_ref().unwrap()[0].clone();
         let queries = [
