@@ -228,7 +228,7 @@ cargo build --locked -p control_plane --example compile_workload_artifact
 cargo build --locked -p data_plane --bin data_plane
 python3 tools/o11y-execution/replay.py \
   --metrics /path/metrics.txt --queries /path/queries.json \
-  --snapshot /path/costed-version2-snapshot.json \
+  --snapshot /path/costed-version3-snapshot.json \
   --compiler target/debug/examples/compile_workload_artifact \
   --data-plane target/debug/data_plane \
   --exact-url http://127.0.0.1:9090 --output /path/new-run

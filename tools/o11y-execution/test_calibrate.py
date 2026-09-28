@@ -1,4 +1,9 @@
 import copy
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from calibrate import calibrate
 
@@ -20,6 +25,36 @@ class CalibrationTests(unittest.TestCase):
                                for key in ("install", "ingest_and_build", "residency", "retirement")},
             "queries": {"q": {"cpu_ns": 100, "evaluations": 10, "classification": "warm",
                               "correct": True, "raw_measurement_file": "q.json"}}}]}
+
+    def test_cli_preserves_current_snapshot_and_dataset_identity(self):
+        # Calibration adds quotes without downgrading or inventing dataset semantics.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            metrics = root / "metrics.prom"
+            metrics.write_text("m 1\n")
+            measurements = copy.deepcopy(self.measurements)
+            measurements["data_snapshot_id"] = "sha256:" + hashlib.sha256(metrics.read_bytes()).hexdigest()
+            dataset = {"namespace": "test-tenant", "dataset": "metrics"}
+            snapshot = {"snapshot_version": 3, "environment": {
+                "observed_at_unix_ms": 1000, "max_evidence_age_ms": 1000,
+                "dataset_identity": dataset}}
+            for name, value in [("candidates", self.candidates), ("measurements", measurements), ("snapshot", snapshot)]:
+                (root / (name + ".json")).write_text(json.dumps(value))
+            command = ["python3", str(Path(__file__).with_name("calibrate.py")),
+                       "--candidates", str(root / "candidates.json"),
+                       "--measurements", str(root / "measurements.json"),
+                       "--metrics", str(metrics), "--snapshot", str(root / "snapshot.json"),
+                       "--output", str(root / "output.json")]
+            subprocess.run(command, check=True, capture_output=True)
+            output = json.loads((root / "output.json").read_text())
+            self.assertEqual(output["snapshot_version"], 3)
+            self.assertEqual(output["environment"]["dataset_identity"], dataset)
+            self.assertTrue(output["workload_cost_evidence"]["quotes"])
+            snapshot["snapshot_version"] = 2
+            (root / "snapshot.json").write_text(json.dumps(snapshot))
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("snapshot_version 3", result.stderr)
 
     def run_provider(self):
         return calibrate(self.candidates, self.measurements, "d", 1000, 1000)
