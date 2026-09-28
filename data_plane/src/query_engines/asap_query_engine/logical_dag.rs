@@ -200,7 +200,7 @@ where
                 return Err(error
                     .borrow_mut()
                     .take()
-                    .unwrap_or_else(|| EngineError::Physical(failure)));
+                    .unwrap_or(EngineError::Physical(failure)));
             }
             Some(None) => {
                 return Err(physical::Error::Operator("query DAG produced no result".into()).into())
