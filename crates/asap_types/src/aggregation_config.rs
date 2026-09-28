@@ -716,7 +716,7 @@ mod tests {
         assert_eq!(cfg.policy_fp_u64(), cfg.policy_fingerprint().as_u64());
     }
 
-    /// PR 5: `serialize_to_json` no longer emits `aggregationId`.
+    /// Installed materializations reject the removed externally assigned identity.
     #[test]
     fn canonical_wire_rejects_aggregation_id() {
         let cfg = PrecomputeMaterialization::from_yaml_data(
@@ -728,7 +728,7 @@ mod tests {
         let mut json = serde_json::to_value(&cfg).unwrap();
         assert!(
             json.get("aggregationId").is_none(),
-            "PR 5: aggregationId must not appear on the wire — readers derive it from content"
+            "aggregationId must not appear in the canonical wire format"
         );
         json["aggregationId"] = serde_json::json!(42);
         assert!(serde_json::from_value::<PrecomputeMaterialization>(json).is_err());
@@ -767,7 +767,8 @@ mod tests {
         );
         let mut yaml = sample_yaml(false);
         yaml["tableName"] = serde_yaml::to_value("telemetry").unwrap();
-        yaml["valueProjection"] = serde_yaml::to_value(&config.value_projection).unwrap();
+        yaml["valueProjection"] =
+            serde_yaml::to_value(serde_json::to_value(&config.value_projection).unwrap()).unwrap();
         let decoded =
             PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::ClickHouseSql)
                 .unwrap();
