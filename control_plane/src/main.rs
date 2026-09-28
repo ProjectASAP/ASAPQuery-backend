@@ -199,6 +199,7 @@ struct CompileAndPublishPhysicalPlanRequest {
     workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
     data_workload: planner_types::workload::DataWorkload,
+    dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
     #[serde(rename = "collector_ids", alias = "target_collector_ids")]
     target_collector_ids: Vec<String>,
     capability_snapshot_id: String,
@@ -630,6 +631,7 @@ fn compile_physical_plan_request(
         retained_summary_memory_budget_bytes: None,
     };
     let environment = physical::compiler::PhysicalDeploymentContext {
+        dataset_identity: request.dataset_identity,
         target: request.target,
         target_collector_ids: request.target_collector_ids.clone(),
         capability_snapshot_id: request.capability_snapshot_id,

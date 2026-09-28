@@ -199,6 +199,8 @@ pub struct TopKMembershipEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDeploymentContext {
+    /// Semantic dataset served by this deployment's input channel; never an endpoint.
+    pub dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
     pub target: PhysicalDeploymentTarget,
     #[serde(rename = "collector_ids")]
     pub target_collector_ids: Vec<String>,
@@ -219,7 +221,7 @@ pub enum PhysicalDeploymentTarget {
 }
 
 /// Startup and candidate-discovery input for backend-local planning.
-/// Version 2 is the sole supported schema; deployment always requires quotes.
+/// Version 3 requires an explicit logical dataset identity; it is the sole supported schema; deployment always requires quotes.
 /// Query/data semantics use ASAPPlanner's canonical workload types directly;
 /// this wrapper adds only backend-owned implementation evidence and lifecycle
 /// identity required to choose a concrete physical realization.
@@ -569,9 +571,9 @@ impl BackendLocalPlanningInput {
     pub fn into_physical_compilation_request(
         self,
     ) -> Result<(PhysicalCompilationRequest, PhysicalDeploymentContext), CompileError> {
-        if self.schema_version != 2 {
+        if self.schema_version != 3 {
             return Err(CompileError::Snapshot(format!(
-                "unsupported workload snapshot version {}; only version 2 is supported",
+                "unsupported workload snapshot version {}; only version 3 is supported",
                 self.schema_version
             )));
         }
@@ -963,6 +965,10 @@ impl DeploymentPlanCompiler {
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
+        environment
+            .dataset_identity
+            .validate()
+            .map_err(CompileError::Snapshot)?;
         if let Some(data) = &request.data_workload {
             data.validate()
                 .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -1477,9 +1483,10 @@ impl DeploymentPlanCompiler {
                             reason: "persisted semantic root is absent".into(),
                         })?;
                 runtime_materialization.semantic_fragment = Some(
-                    asap_types::semantic_fragment::SemanticFragment::from_stored_output(
+                    asap_types::semantic_fragment::SemanticFragment::from_stored_output_in_dataset(
                         &compiled_dag.dag,
                         semantic_root,
+                        environment.dataset_identity.clone(),
                     )
                     .map_err(|reason| CompileError::Query {
                         query_id: query.query_id.clone(),
@@ -1999,6 +2006,7 @@ impl DeploymentPlanCompiler {
             query_id: "precompute-plan".into(),
             reason: error.to_string(),
         })?;
+        precompute_plan.ingest.dataset_identity = Some(environment.dataset_identity.clone());
         let mut transmission_plan = crate::physical::compiler::build_transmission_plan(
             envelope.clone(),
             &precompute_plan,
@@ -4634,8 +4642,51 @@ pub(crate) mod tests {
         );
     }
 
+    /// Dataset changes alter persisted meaning; relocating the same input does not.
+    #[test]
+    fn dataset_identity_survives_binding_and_rejects_wrong_input() {
+        let compile = |env| {
+            DeploymentPlanCompiler
+                .compile_promql(request("q", "sum_over_time(m[1m])"), env)
+                .unwrap()
+        };
+        let first = compile(environment(10_000));
+        assert!(!first.summary_catalog.definitions.is_empty());
+        let mut other = environment(10_000);
+        other.dataset_identity.namespace = "other-tenant".into();
+        let second = compile(other);
+        assert_ne!(
+            first.summary_catalog.definitions.keys().collect::<Vec<_>>(),
+            second
+                .summary_catalog
+                .definitions
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        let mut relocated = environment(10_000);
+        relocated.target_collector_ids = vec!["relocated-source".into()];
+        let relocated = compile(relocated);
+        assert_eq!(
+            first.summary_catalog.definitions,
+            relocated.summary_catalog.definitions
+        );
+        let mut forged = first.precompute_plan.clone();
+        forged.ingest.dataset_identity.as_mut().unwrap().namespace = "other-tenant".into();
+        assert!(forged
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("dataset"));
+        forged.ingest.dataset_identity = None;
+        assert!(forged.validate().is_err());
+    }
+
     fn environment(now: u64) -> PhysicalDeploymentContext {
         PhysicalDeploymentContext {
+            dataset_identity: planner_types::post_asap::LogicalDatasetIdentity {
+                namespace: "test".into(),
+                dataset: "metrics".into(),
+            },
             target: PhysicalDeploymentTarget::DistributedCollectors,
             target_collector_ids: vec!["edge-a".into(), "edge-b".into()],
             capability_snapshot_id: "caps-7".into(),
@@ -7192,6 +7243,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         envelope_plan.ingest = IngestContract {
+            dataset_identity: envelope_plan.ingest.dataset_identity.clone(),
             protocol: IngestProtocol::PrometheusRemoteWriteV1,
             endpoint_path: "/api/v1/write".into(),
             timestamp_unit: TimestampUnit::UnixMilliseconds,
@@ -7279,7 +7331,7 @@ pub(crate) mod tests {
             .queries
             .remove(0);
         let snapshot = BackendLocalPlanningInput {
-            schema_version: 2,
+            schema_version: 3,
             workload_cost_evidence: None,
             query_workload,
             data_workload,
