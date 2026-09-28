@@ -651,10 +651,47 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         query.accuracy_target.clone(),
     )
     .unwrap();
-    let model = control_plane::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
-        query.accuracy_target.clone(),
-        algorithm.clone(),
-    );
+    // Family ordering alone does not select a whole DAG. Price the desired
+    // legal heap candidate explicitly so this process test exercises its runtime.
+    struct HeapFixtureCost(planner_types::post_asap::SketchAlgorithm);
+    impl asap_aware_mapping::CostModel for HeapFixtureCost {
+        fn rank_candidates(
+            &self,
+            _: &planner_types::pre_asap::AggIntent,
+            candidates: &[planner_types::post_asap::SketchAlgorithm],
+        ) -> Vec<planner_types::post_asap::SketchAlgorithm> {
+            let mut ranked = candidates.to_vec();
+            ranked.sort_by_key(|kind| kind != &self.0);
+            ranked
+        }
+        fn candidate_cost(
+            &self,
+            candidate: &asap_aware_mapping::ReplacementSubDAG,
+            _: &asap_aware_mapping::TargetSubDAG<'_>,
+        ) -> Option<asap_aware_mapping::cost_model::Cost> {
+            let heap =
+                if let asap_aware_mapping::Replacement::Summary(root) = &candidate.replacement {
+                    planner_types::post_asap::compile_executable_dag(root)
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .any(|node| {
+                            matches!(&node.payload,
+                        planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                            family: SummaryFamilyType::Sketch(kind, _), ..
+                        } if kind.algorithm() == &self.0)
+                        })
+                } else {
+                    false
+                };
+            Some(asap_aware_mapping::cost_model::Cost(if heap {
+                1.0
+            } else {
+                1e12
+            }))
+        }
+    }
+    let model = HeapFixtureCost(algorithm.clone());
     query.selected_plan_root = control_plane::planner_selection::select_query_with_models(
         &expr,
         &model,
@@ -942,7 +979,6 @@ async fn run_shared_dashboard(multi_pane: bool) {
             }
         })
         .collect();
-    typed.schema_version = 2;
     typed.workload_cost_evidence = Some(
         control_plane::physical::workload_cost::WorkloadCostEvidence {
             backend_revision: control_plane::physical::compiler::BACKEND_REVISION.into(),
@@ -1547,12 +1583,12 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         Some(1)
     );
     assert_eq!(
-        topk_sum["data"]["result"][0]["metric"]["item"],
-        "asap_demo_gauge{job=\"worker\"}"
+        topk_sum["data"]["result"][0]["metric"]["job"], "worker",
+        "TopK must preserve the selected series labels: {topk_sum}"
     );
     assert_eq!(
-        topk_count["data"]["result"][0]["metric"]["item"],
-        "asap_demo_gauge{job=\"api\"}"
+        topk_count["data"]["result"][0]["metric"]["job"], "api",
+        "TopK must preserve the selected series labels: {topk_count}"
     );
     assert!((first_value(&sum, "value").expect("sum value") - 240.0).abs() < 1e-9);
 
