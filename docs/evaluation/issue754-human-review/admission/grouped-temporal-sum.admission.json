@@ -1,13 +1,13 @@
 [
   {
-    "candidate_id": "asap-explain-v1:candidate:cac6fd2d1eb23e36d3d6dea26d91383b5bfb2bde71ff43eeb9b873bffc20008d",
+    "candidate_id": "asap-explain-v1:candidate:47249a7520d1624e50b877075f6f97aa5e1cb072e6f172910c2a5e8db82eff76",
     "logical_root_ids": [
-      "asap-explain-v1:root:28231b067827d80533657884eba8ae0be47e51c3defd43281e202fca0be5e549"
+      "asap-explain-v1:root:448e345cb243745ba15d18995976d0c9a66cae45011ff106e159e97f293aaab2"
     ],
-    "physical_candidate_id": "asap-explain-v1:physical:4b0cb19a0a9c053291f2d7bb6ed032a80a76f706df42047961b51c490cfb6f1c",
+    "physical_candidate_id": "asap-explain-v1:physical:bfd305549407f3e5ef862a6064f74690ec29b7bdebf66c7fdd296048b54e3c10",
     "identity_unavailable_reason": null,
     "status": "bound",
-    "plan_id": 398383639928265061,
+    "plan_id": 17508439989252383247,
     "total_cost": null,
     "unavailable_reason": null
   },
@@ -28,12 +28,12 @@
     "logical_root_ids": [
       "asap-explain-v1:root:afed30a788e560b32b6a5e3d72e6aca13b8cd09c2fc184e950bc6a6f68ec7e57"
     ],
-    "physical_candidate_id": null,
+    "physical_candidate_id": "asap-explain-v1:physical:5c44b4cb533eb97040236079b2ded3a65af5484c45409bd7b36e53ade0e95744",
     "identity_unavailable_reason": null,
-    "status": "bind_failed",
-    "plan_id": null,
+    "status": "bound",
+    "plan_id": 13773692493706998879,
     "total_cost": null,
-    "unavailable_reason": "failed to construct QueryPlan: invalid QueryPlan: Planner logical fragment does not match any original query subtree"
+    "unavailable_reason": null
   },
   {
     "candidate_id": "asap-explain-v1:candidate:40dd21fdc165cc2a65b26c4c5a11e3c2da152435497b9e879db9a04015725322",
