@@ -276,6 +276,19 @@ fn sketch(node: &SummaryNode) -> (&SketchAlgorithm, &SketchParams) {
 
 fn assert_exact_count(node: &SummaryNode) {
     match &node.expr {
+        SummaryExpr::ValueOperation {
+            child,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            timing: planner_types::post_asap::ExecutionTiming::QueryTime,
+        } => {
+            assert!(node
+                .schema
+                .fields
+                .iter()
+                .all(|field| matches!(field.dtype, SummaryFamilyType::Plain(_))));
+            assert_exact_count(child);
+        }
+
         SummaryExpr::SummaryEstimate { summary_input, .. } => assert_exact_count(summary_input),
         SummaryExpr::SummaryAgg {
             family:
