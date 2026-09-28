@@ -7012,8 +7012,7 @@ pub(crate) mod tests {
             schema.as_object_mut().unwrap().remove("value_projection");
             schema["value_column"] = serde_json::json!("SampleValue");
         }
-        let decoded: PrecomputePlan = serde_json::from_value(legacy).unwrap();
-        decoded.validate_against_catalog(catalog).unwrap();
+        assert!(serde_json::from_value::<PrecomputePlan>(legacy).is_err());
         let reject =
             |mutated: PrecomputePlan| assert!(mutated.validate_against_catalog(catalog).is_err());
         let mut bad = original.clone();
