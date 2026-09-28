@@ -144,7 +144,6 @@ pub struct IngestContract {
     pub endpoint_path: String,
     pub timestamp_unit: TimestampUnit,
     pub require_plan_identity: bool,
-    #[serde(alias = "require_materialization_identity")]
     pub require_stored_output_identity: bool,
     pub require_registered_producer: bool,
 }
@@ -223,17 +222,12 @@ impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StateSchemaContract {
-    #[serde(alias = "state_reference")]
     pub stored_output_reference: crate::sds::StoredOutputReference,
     pub schema_id: String,
     pub schema_version: u32,
     pub materialization: crate::sds::StoredOutputId,
     pub family: StateFamilyContract,
     pub source: Source,
-    #[serde(
-        alias = "value_column",
-        deserialize_with = "crate::sds::deserialize_state_value_projection"
-    )]
     pub value_projection: crate::sds::ValueProjectionIdentity,
     pub group_by: crate::GroupingProjection,
     pub window: StateWindowContract,
@@ -246,11 +240,7 @@ pub struct StateWindowContract {
     pub kind: crate::WindowKind,
     pub size_ms: u64,
     pub slide_ms: Option<u64>,
-    #[serde(
-        default,
-        alias = "paneOriginMs",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_origin_ms: Option<i64>,
 }
 
@@ -263,9 +253,8 @@ pub struct ProducerContract {
     pub collector_id: String,
     pub materialization: crate::sds::StoredOutputId,
     pub schema_id: String,
-    /// Authoritative partitions for completion barriers. Empty legacy contracts
-    /// authorize state ingestion only, never completion claims.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    /// Authoritative partitions for completion barriers. An explicitly empty
+    /// roster cannot authorize completion claims.
     pub partition_ids: BTreeSet<String>,
 }
 
@@ -1080,9 +1069,11 @@ mod source_window_cohort_tests {
             "producer_id":"p", "collector_id":"c",
             "materialization":materialization, "schema_id":plan.schemas[0].schema_id,
         });
-        let producer: ProducerContract = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(serde_json::from_value::<ProducerContract>(legacy.clone()).is_err());
+        let mut current = legacy;
+        current["partition_ids"] = serde_json::json!([]);
+        let producer: ProducerContract = serde_json::from_value(current).unwrap();
         assert!(producer.partition_ids.is_empty());
-        assert_eq!(serde_json::to_value(&producer).unwrap(), legacy);
         plan.producers.push(producer);
         let barrier = crate::sds::SummaryWatermarkBarrier {
             catalog_generation: generation,

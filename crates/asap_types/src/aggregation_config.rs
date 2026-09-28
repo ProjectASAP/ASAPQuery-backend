@@ -91,6 +91,7 @@ impl WindowMaterializationLayout {
 /// This descriptor cannot authorize execution: the enclosing PrecomputePlan
 /// must bind it to a compatible Planner DAG producer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrecomputeMaterialization {
     /// Explicit deployment output allocation; independent of semantic identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,13 +122,9 @@ pub struct PrecomputeMaterialization {
     pub window_type: WindowKind, // Tumbling or Sliding
     pub window_layout: WindowMaterializationLayout,
     /// Unix millisecond timestamp on the pane-boundary grid selected from
-    /// the consuming query workload. Missing on legacy definitions, which
-    /// must not be used for certified pane-only reads.
-    #[serde(
-        default,
-        alias = "paneOriginMs",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// the consuming query workload. An absent origin cannot authorize certified
+    /// pane-only reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_origin_ms: Option<i64>,
 
     pub spatial_filter: String,
@@ -137,26 +134,12 @@ pub struct PrecomputeMaterialization {
 
     // SQL-specific fields (optional, used when query_language=sql)
     pub table_name: Option<String>, // SQL mode: table name
-    #[serde(
-        default,
-        alias = "value_column",
-        alias = "valueColumn",
-        alias = "valueProjection",
-        deserialize_with = "crate::sds::deserialize_optional_value_projection"
-    )]
+    #[serde(default)]
     pub value_projection: Option<crate::sds::ValueProjectionIdentity>,
     /// Table timestamp projection, in Unix milliseconds.
-    #[serde(
-        default,
-        alias = "tableTimestampColumn",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_timestamp_column: Option<String>,
-    #[serde(
-        default,
-        alias = "tablePopulation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_population: Option<crate::table_population::TablePopulation>,
     /// Producer typing for a SQL table value projection: the source column's
     /// declared type and nullability.
@@ -173,11 +156,7 @@ pub struct PrecomputeMaterialization {
     ///
     /// `None` ⇒ PromQL-mode materializations and legacy SQL definitions, which
     /// keep the pre-typed behaviour (read the column as it comes).
-    #[serde(
-        default,
-        alias = "valueSourceColumn",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_source_column: Option<planner_types::pre_asap::Column>,
 }
 
@@ -936,17 +915,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("paneOriginMs".into(), origin);
-        let decoded: PrecomputeMaterialization = serde_json::from_value(derived.clone()).unwrap();
+        assert!(serde_json::from_value::<PrecomputeMaterialization>(derived).is_err());
+        let decoded: PrecomputeMaterialization =
+            serde_json::from_value(serde_json::to_value(&epoch).unwrap()).unwrap();
         assert_eq!(decoded.pane_origin_ms, Some(7_000));
-
-        let mut legacy = derived;
-        legacy.as_object_mut().unwrap().remove("paneOriginMs");
-        assert_eq!(
-            serde_json::from_value::<PrecomputeMaterialization>(legacy)
-                .expect("decode legacy wire")
-                .pane_origin_ms,
-            None
-        );
     }
 
     /// The `policy_fp_u64()` accessor is exactly the fingerprint u64.
@@ -978,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_projection_roundtrips_and_legacy_column_keeps_identity() {
+    fn typed_projection_roundtrips_and_untyped_column_is_rejected() {
         use crate::sds::ValueProjectionIdentity;
         use planner_types::pre_asap::ScalarValue;
         let mut config = PrecomputeMaterialization::from_yaml_data(
@@ -995,8 +967,10 @@ mod tests {
         let mut legacy = serde_json::to_value(&config).unwrap();
         legacy.as_object_mut().unwrap().remove("value_projection");
         legacy["value_column"] = serde_json::json!("value");
-        let decoded: PrecomputeMaterialization = serde_json::from_value(legacy).unwrap();
-        assert_eq!(decoded.policy_fingerprint(), column_identity);
+        assert!(serde_json::from_value::<PrecomputeMaterialization>(legacy).is_err());
+        let mut untyped = serde_json::to_value(&config).unwrap();
+        untyped["value_projection"] = serde_json::json!("value");
+        assert!(serde_json::from_value::<PrecomputeMaterialization>(untyped).is_err());
         config.value_projection = Some(ValueProjectionIdentity::Constant {
             value: ScalarValue::Int64(1),
         });
