@@ -114,6 +114,21 @@ encoding, not display strings or temporary node IDs. Its encoding and compatibil
 rules must be established before persistence; internal Planner refactoring alone
 must not force state migration. Unknown semantic versions fail validation.
 
+### Source identity
+
+Source semantics include a stable logical dataset identity, supplied by Backend
+to Planner before semantic definitions are exported. It distinguishes datasets
+and includes their semantic namespace where needed, such as tenant scope.
+`KLL(latency)` over tenant A's dataset and tenant B's dataset therefore has different
+definition IDs, even when field names and types match. An endpoint, replica or
+storage location is a deployment binding and does not change dataset identity.
+
+The authority resolving a source must preserve that identity across relocation
+and assign a different identity when the logical dataset changes. Installation
+validates that the concrete binding realizes the identity in the definition.
+Definition equality never grants cross-tenant or cross-deployment authorization.
+Future discovery must match source identity as well as expression semantics.
+
 ### Definition boundary
 
 The definition stops at the persisted output.
@@ -300,6 +315,33 @@ It does not decide whether KLL merging is semantically legal; Planner already
 made that decision. Missing or invalid state follows the installed fallback or
 unavailability policy. Plan installation alone does not establish readiness.
 
+### Consistent reads
+
+Per-record metadata/payload atomicity is necessary but insufficient. All inputs
+consumed by one QueryPlan DAG must pass the existing whole-query store-revision
+fence, including inputs on different branches. A concurrent publication that
+invalidates the fence prevents that result from being served; the installed
+failure policy applies. Preserve the
+[publication completeness contract](continuous-summary-completeness.md), including
+its conservative global fence and its distinction between accepted-input
+completeness and source event-time completeness.
+
+### Recovery and plan-version changes
+
+The initial rollout recovers records only under the same authoritative installed
+plan version and compatible bindings. Persisting definitions and payloads does
+not itself make admission metadata durable or establish exactly-once processing
+across crashes. Recovery must re-establish required eligibility; missing proof
+cannot be treated as complete input.
+
+A new plan version populates its own output namespace. Even a scheduling-only
+change with equal definition IDs does not automatically adopt the old version's
+records. Queries use the new version's installed fallback or unavailability policy
+until its state is ready. This entails rebuild work and a warm-up interval.
+In-flight runs retain their installed version, and cleanup respects active readers.
+Explicit cross-version state adoption is deferred to a separate compatibility and
+authorization design; it is not part of initial recovery or binary rollback.
+
 ## 7. Future: discovering SDS for an unregistered query
 
 The same definitions can later support queries not known when the SDS was created.
@@ -385,7 +427,7 @@ find_compatible(query)
 ```
 
 Semantic compatibility, mergeability, grouping, window composition, accuracy,
-and residual computation remain Planner decisions. Backend capability and
+and the computation over reused state remain Planner decisions. Backend capability and
 availability evidence can inform selection; a definition alone does not guarantee
 an executable deployment. Availability must be checked again at execution time.
 This extension does not require another catalog service or a new operator IR.
@@ -398,7 +440,7 @@ This extension does not require another catalog service or a new operator IR.
 3. Equal definition IDs do not make different deployed outputs interchangeable.
 4. A writer cannot publish state with a definition different from its installed binding.
 5. Runtime reads require both semantic compatibility and eligible concrete state.
-6. Bound QueryPlans directly resolve their selected outputs; they do not search for alternatives.
+6. Bound QueryPlans directly resolve their selected outputs; they do not search for substitute outputs.
 7. Ad-hoc SDS discovery happens through Planner and produces a new bound QueryPlan.
 8. SummaryStore reports available state; it never decides query rewrite legality.
 
