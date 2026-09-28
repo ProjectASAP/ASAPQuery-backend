@@ -117,7 +117,6 @@ pub(super) fn operators(
             without: input.without,
         },
         lookback_ms: input.lookback_ms,
-        history_retention_ms: request.query_retention_margin_ms,
         max_k: spec.max_k as u64,
         quantiles: spec.quantiles,
         max_bytes,
