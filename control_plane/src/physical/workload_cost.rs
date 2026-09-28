@@ -40,6 +40,7 @@ pub struct CostComponentDemand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadCostManifest {
+    pub dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
     pub plan_id: u64,
     pub plan_version: u64,
     pub planner_revision: String,
@@ -344,6 +345,12 @@ pub fn manifest(
         );
     }
     Ok(WorkloadCostManifest {
+        dataset_identity: plan
+            .precompute_plan
+            .ingest
+            .dataset_identity
+            .clone()
+            .ok_or_else(|| CompileError::Snapshot("cost manifest lacks dataset identity".into()))?,
         plan_id: plan.envelope.plan_id,
         plan_version: plan.envelope.plan_version,
         planner_revision: plan.envelope.planner_revision.clone(),

@@ -1418,10 +1418,6 @@ impl SketchStore {
             if !Self::instance_visible_in_generation(binding, Some(&generation)) {
                 continue;
             }
-            let reused_from_generation = (binding.catalog_generation.as_deref()
-                != Some(&generation))
-            .then(|| binding.catalog_generation.as_deref().cloned())
-            .flatten();
             let stored_output_id = StoredOutputId::from(binding.metadata.policy_fp);
             if binding.metadata.policy_fp.is_unset()
                 || !catalog.outputs.contains_key(&stored_output_id)
@@ -1479,11 +1475,7 @@ impl SketchStore {
                     address.storage_key().map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| e.to_string())?;
-                let mut payload_address = address;
-                if let Some(source) = &reused_from_generation {
-                    payload_address.plan_id = source.plan_id;
-                    payload_address.plan_version = source.plan_version;
-                }
+                let payload_address = address;
                 let instance = SummaryInstance {
                     instance_id: instance_id.clone(),
                     stored_output_id: *stored_output_id,
@@ -1498,7 +1490,7 @@ impl SketchStore {
                     time_range: HalfOpenTimeRange { start_ms, end_ms },
                     group_values,
                     catalog_generation: generation.clone(),
-                    reused_from_generation: reused_from_generation.clone(),
+                    reused_from_generation: None,
                     placement: SummaryPlacement {
                         producer_id: producer_id.clone(),
                         storage_node_id: storage_node_id.into(),
@@ -1507,9 +1499,7 @@ impl SketchStore {
                         store: "summary-store".into(),
                         key: payload_address.storage_key().map_err(|e| e.to_string())?,
                         state_schema_version: binding.summary_descriptor.state_schema_version,
-                        generation: reused_from_generation
-                            .as_ref()
-                            .map_or(generation.plan_version, |source| source.plan_version),
+                        generation: generation.plan_version,
                         sequence: window.1,
                         checksum: None,
                     },

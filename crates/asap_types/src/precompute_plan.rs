@@ -138,6 +138,8 @@ pub enum TimestampUnit {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IngestContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_identity: Option<planner_types::post_asap::LogicalDatasetIdentity>,
     pub protocol: IngestProtocol,
     pub endpoint_path: String,
     pub timestamp_unit: TimestampUnit,
@@ -375,11 +377,16 @@ impl PrecomputePlan {
                 })
             })
             .collect();
+        let dataset_identity = materializations
+            .iter()
+            .filter_map(|m| m.semantic_fragment.as_ref()?.dataset_identity.clone())
+            .next();
         let plan = Self {
             summary_catalog: None,
             envelope,
             ingest: if backend_local {
                 IngestContract {
+                    dataset_identity: dataset_identity.clone(),
                     protocol: IngestProtocol::PrometheusRemoteWriteV1,
                     endpoint_path: "/api/v1/write".into(),
                     timestamp_unit: TimestampUnit::UnixMilliseconds,
@@ -389,6 +396,7 @@ impl PrecomputePlan {
                 }
             } else {
                 IngestContract {
+                    dataset_identity: dataset_identity.clone(),
                     protocol: IngestProtocol::ModifiedOtlpMetricsV1,
                     endpoint_path: "/v1/metrics".into(),
                     timestamp_unit: TimestampUnit::UnixNanoseconds,
@@ -471,6 +479,23 @@ impl PrecomputePlan {
     }
 
     pub fn validate(&self) -> Result<(), PrecomputePlanError> {
+        if let Some(dataset) = &self.ingest.dataset_identity {
+            dataset
+                .validate()
+                .map_err(PrecomputePlanError::CatalogContract)?;
+        }
+        for materialization in &self.materializations {
+            if let Some(fragment) = &materialization.semantic_fragment {
+                fragment
+                    .validate()
+                    .map_err(PrecomputePlanError::CatalogContract)?;
+                if fragment.dataset_identity != self.ingest.dataset_identity {
+                    return Err(PrecomputePlanError::CatalogContract(
+                        "semantic dataset differs from installed input binding".into(),
+                    ));
+                }
+            }
+        }
         let valid_ingest = match self.ingest.protocol {
             IngestProtocol::ModifiedOtlpMetricsV1 => {
                 self.ingest.endpoint_path == "/v1/metrics"
