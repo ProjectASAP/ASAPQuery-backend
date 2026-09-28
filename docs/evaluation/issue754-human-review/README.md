@@ -5,7 +5,7 @@ recorded. Selected plans and successfully compiled candidate plans are retained
 as JSON/DOT; each page shows accuracy rejections and deployment cost decisions.
 
 Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
-`c899084019580eac55e6502eb641d42e748c6ff2`.
+`574bef34c3792c9ebc76773eeff159ffd14194fd`.
 
 ## Current implementation boundary
 
@@ -24,9 +24,12 @@ CountSketch heaps above its bound per-series Rate readout. This fixture lacks
 heap proof and records the rejection. Separate controlled tests select each
 program through Backend costs; process E2E tests verify both heap families over
 durable counter SDS, including reset, window changes and process restart.
-Those paths build the heap at query time. Stored-heap precompute and the complete
-physical-candidate handoff remain outstanding; other PromQL paths retain the
-documented Backend adapter representation.
+Planner also exposes fixed-window candidates that finalize Rate and build the
+heap during precompute. Their typed stored boundary and both physical DAGs are
+listed below. Certified process E2E tests cover CMS and CountSketch heap SDS,
+multiple groups, resets, missing windows and restart. This placement requires
+the finite complete-input barrier; it does not claim continuous completeness.
+Other PromQL paths retain the documented Backend adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
 currently evaluates single-root substitutions in a preferred workload context;

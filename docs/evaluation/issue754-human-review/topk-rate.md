@@ -72,11 +72,77 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:908757ed9c20f3cd5c92d8329e3880c6c876a7b154c4551a78f5d641634ed6f2"`.
+Logical root: `"asap-explain-v1:root:496497707aa2833c8230c315e5022287410866d3e8ac5c4960a04e7d7e0571fe"`.
+
+top-3 heavy-hitters realizes as a CmsWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent); fixed-window precompute over complete per-series counter states
+
+Guarantee: `{"bound":{"op":"unknown","statistic":"topk_membership_margin"},"failure_probability":{"op":"union_bound","terms":[{"op":"unknown","statistic":"topk_interval_failure_probability"},{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.006737946999085467},"op":"scaled"}]},"metric":"top_k_membership","provenance":[{"guarantee":{"bound":{"op":"constant","value":0.009993683192864136},"failure_probability":{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.006737946999085467},"op":"scaled"},"metric":"frequency","provenance":[{"algorithm":"CmsWithHeap","contract":"count_min_l1_markov_v1","kind":"sketch_readout","params":{"CmsWithHeap":{"depth":5,"heap_size":100,"width":272}},"query":"TopK { k: 100 }"},{"kind":"unavailable_statistic","statistic":"topk_max_distinct_items"},{"kind":"composition_step","operator":{"op":"approximate_aggregate"},"rule":"simultaneous_score_bounds_over_distinct_partition_item_identities"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"unavailable_statistic","statistic":"topk_selected_lower_bound"},{"kind":"unavailable_statistic","statistic":"topk_excluded_upper_bound"},{"kind":"unavailable_statistic","statistic":"topk_interval_failure_probability"},{"kind":"composition_step","operator":{"op":"top_k_selection"},"rule":"topk_membership_margin_certificate"}]}`
+
+Materialized boundaries: `{"3":{"properties":{"boundedness":"Bounded","emission":"Unknown"},"schema":{"fields":[{"dtype":{"Plain":"utf8"},"name":"label_0","nullable":true},{"dtype":{"Sketch":[{"algorithm":"CmsWithHeap","category":"TopK","params":{"CmsWithHeap":{"depth":5,"heap_size":100,"width":272}}},"PerSubpopulationInstance"]},"name":"topk_3","nullable":false}],"time_index":null}}}`
+
+#### Maintenance physical DAG
+
+| Node | Dependencies | Native operator / input |
+| --- | --- | --- |
+| 1 | `[]` | `{"Input":{"properties":{"boundedness":"Bounded","emission":"Unknown"},"schema":{"fields":[{"dtype":{"Plain":"timestamp"},"name":"ts","nullable":false},{"dtype":{"ExactAggregate":["Rate","Rate"]},"name":"value","nullable":false},{"dtype":{"Plain":"utf8"},"name":"label_0","nullable":true},{"dtype":{"Plain":"utf8"},"name":"$promql_series_identity","nullable":false}],"time_index":0}}}` |
+| 2 | `[1]` | `{"Readout":{"parameters":{"logical_lookback_ms":"60000"},"state":1,"statistic":"Rate"}}` |
+| 3 | `[2]` | `{"KeyedSummaryBuild":{"family":{"Sketch":[{"algorithm":"CmsWithHeap","category":"TopK","params":{"CmsWithHeap":{"depth":5,"heap_size":100,"width":272}}},"PerSubpopulationInstance"]},"groups":[2],"items":[0,3],"value":1}}` |
+
+Roots: `[3]`.
+
+#### Query physical DAG
+
+| Node | Dependencies | Native operator / input |
+| --- | --- | --- |
+| 3 | `[]` | `{"Input":{"properties":{"boundedness":"Bounded","emission":"Unknown"},"schema":{"fields":[{"dtype":{"Plain":"utf8"},"name":"label_0","nullable":true},{"dtype":{"Sketch":[{"algorithm":"CmsWithHeap","category":"TopK","params":{"CmsWithHeap":{"depth":5,"heap_size":100,"width":272}}},"PerSubpopulationInstance"]},"name":"topk_3","nullable":false}],"time_index":null}}}` |
+| 4 | `[3]` | `{"KeyedReadout":{"k":100,"state":1}}` |
+| 5 | `[4]` | `{"Project":[{"Planner":{"expression":{"Column":1},"output":["timestamp",false],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}},{"Planner":{"expression":{"Column":3},"output":["float64",false],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}},{"Planner":{"expression":{"Column":0},"output":["utf8",true],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}},{"Planner":{"expression":{"Column":2},"output":["utf8",false],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}}]}` |
+| 6 | `[5]` | `{"Sort":{"groups":[2],"keys":[{"column":1,"descending":true,"nulls_first":false}]}}` |
+| 7 | `[6]` | `{"Limit":{"groups":[2],"n":3,"offset":0}}` |
+
+Roots: `[7]`.
+
+### Planner physical candidate
+
+Logical root: `"asap-explain-v1:root:3e71cb6b909990d20b7d3a2a17275df1b43bf7680f964360762588f0597424fc"`.
+
+top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent); fixed-window precompute over complete per-series counter states
+
+Guarantee: `{"bound":{"op":"unknown","statistic":"topk_membership_margin"},"failure_probability":{"op":"union_bound","terms":[{"op":"unknown","statistic":"topk_interval_failure_probability"},{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.009940766872773949},"op":"scaled"}]},"metric":"top_k_membership","provenance":[{"guarantee":{"bound":{"op":"constant","value":0.01},"failure_probability":{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.009940766872773949},"op":"scaled"},"metric":"l2_frequency","provenance":[{"algorithm":"CountSketchWithHeap","contract":"count_sketch_l2_median_hoeffding_v1","kind":"sketch_readout","params":{"CountSketchWithHeap":{"depth":83,"heap_size":100,"width":30000}},"query":"TopK { k: 100 }"},{"kind":"unavailable_statistic","statistic":"topk_max_distinct_items"},{"kind":"composition_step","operator":{"op":"approximate_aggregate"},"rule":"simultaneous_score_bounds_over_distinct_partition_item_identities"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"unavailable_statistic","statistic":"topk_selected_lower_bound"},{"kind":"unavailable_statistic","statistic":"topk_excluded_upper_bound"},{"kind":"unavailable_statistic","statistic":"topk_interval_failure_probability"},{"kind":"composition_step","operator":{"op":"top_k_selection"},"rule":"topk_membership_margin_certificate"}]}`
+
+Materialized boundaries: `{"3":{"properties":{"boundedness":"Bounded","emission":"Unknown"},"schema":{"fields":[{"dtype":{"Plain":"utf8"},"name":"label_0","nullable":true},{"dtype":{"Sketch":[{"algorithm":"CountSketchWithHeap","category":"TopK","params":{"CountSketchWithHeap":{"depth":83,"heap_size":100,"width":30000}}},"PerSubpopulationInstance"]},"name":"topk_3","nullable":false}],"time_index":null}}}`
+
+#### Maintenance physical DAG
+
+| Node | Dependencies | Native operator / input |
+| --- | --- | --- |
+| 1 | `[]` | `{"Input":{"properties":{"boundedness":"Bounded","emission":"Unknown"},"schema":{"fields":[{"dtype":{"Plain":"timestamp"},"name":"ts","nullable":false},{"dtype":{"ExactAggregate":["Rate","Rate"]},"name":"value","nullable":false},{"dtype":{"Plain":"utf8"},"name":"label_0","nullable":true},{"dtype":{"Plain":"utf8"},"name":"$promql_series_identity","nullable":false}],"time_index":0}}}` |
+| 2 | `[1]` | `{"Readout":{"parameters":{"logical_lookback_ms":"60000"},"state":1,"statistic":"Rate"}}` |
+| 3 | `[2]` | `{"KeyedSummaryBuild":{"family":{"Sketch":[{"algorithm":"CountSketchWithHeap","category":"TopK","params":{"CountSketchWithHeap":{"depth":83,"heap_size":100,"width":30000}}},"PerSubpopulationInstance"]},"groups":[2],"items":[0,3],"value":1}}` |
+
+Roots: `[3]`.
+
+#### Query physical DAG
+
+| Node | Dependencies | Native operator / input |
+| --- | --- | --- |
+| 3 | `[]` | `{"Input":{"properties":{"boundedness":"Bounded","emission":"Unknown"},"schema":{"fields":[{"dtype":{"Plain":"utf8"},"name":"label_0","nullable":true},{"dtype":{"Sketch":[{"algorithm":"CountSketchWithHeap","category":"TopK","params":{"CountSketchWithHeap":{"depth":83,"heap_size":100,"width":30000}}},"PerSubpopulationInstance"]},"name":"topk_3","nullable":false}],"time_index":null}}}` |
+| 4 | `[3]` | `{"KeyedReadout":{"k":100,"state":1}}` |
+| 5 | `[4]` | `{"Project":[{"Planner":{"expression":{"Column":1},"output":["timestamp",false],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}},{"Planner":{"expression":{"Column":3},"output":["float64",false],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}},{"Planner":{"expression":{"Column":0},"output":["utf8",true],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}},{"Planner":{"expression":{"Column":2},"output":["utf8",false],"schema":{"closed":false,"columns":[{"dtype":"utf8","name":"label_0","nullable":true,"table":null},{"dtype":"timestamp","name":"ts","nullable":false,"table":null},{"dtype":"utf8","name":"$promql_series_identity","nullable":false,"table":null},{"dtype":"float64","name":"__asap_estimate","nullable":false,"table":null}],"time_index":null,"unique_keys":[]}}}]}` |
+| 6 | `[5]` | `{"Sort":{"groups":[2],"keys":[{"column":1,"descending":true,"nulls_first":false}]}}` |
+| 7 | `[6]` | `{"Limit":{"groups":[2],"n":3,"offset":0}}` |
+
+Roots: `[7]`.
+
+### Planner physical candidate
+
+Logical root: `"asap-explain-v1:root:ba8eeff4b130d8b06e9faf25bc465ff618ba30cd5e7857c44fc68762c82dc16b"`.
 
 select exact Top-K from independently maintained temporal values
 
 Guarantee: `{"bound":{"op":"zero"},"failure_probability":{"op":"zero"},"metric":"absolute_value","provenance":[{"kind":"exact","reason":"ExactAggregate(Rate)"},{"guarantee":{"bound":{"op":"zero"},"failure_probability":{"op":"zero"},"metric":"absolute_value","provenance":[{"kind":"exact","reason":"KeepPreAsap"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"composition_step","operator":{"op":"counter_rate"},"rule":"exact_input"}]}`
+
+#### Query physical DAG
 
 | Node | Dependencies | Native operator / input |
 | --- | --- | --- |
@@ -88,11 +154,13 @@ Roots: `[4]`.
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:9c781a6f8ee6ff1521a78043c04c2b6b9781949e93de89a494c70a6dd2a0b50d"`.
+Logical root: `"asap-explain-v1:root:a74eff3b7896e52dae2dadd25bb9d301eaa6268fa1304c0cbeb9699ad5f8558b"`.
 
 top-3 heavy-hitters realizes as a CmsWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)
 
 Guarantee: `{"bound":{"op":"unknown","statistic":"topk_membership_margin"},"failure_probability":{"op":"union_bound","terms":[{"op":"unknown","statistic":"topk_interval_failure_probability"},{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.006737946999085467},"op":"scaled"}]},"metric":"top_k_membership","provenance":[{"guarantee":{"bound":{"op":"constant","value":0.009993683192864136},"failure_probability":{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.006737946999085467},"op":"scaled"},"metric":"frequency","provenance":[{"algorithm":"CmsWithHeap","contract":"count_min_l1_markov_v1","kind":"sketch_readout","params":{"CmsWithHeap":{"depth":5,"heap_size":100,"width":272}},"query":"TopK { k: 100 }"},{"kind":"unavailable_statistic","statistic":"topk_max_distinct_items"},{"kind":"composition_step","operator":{"op":"approximate_aggregate"},"rule":"simultaneous_score_bounds_over_distinct_partition_item_identities"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"unavailable_statistic","statistic":"topk_selected_lower_bound"},{"kind":"unavailable_statistic","statistic":"topk_excluded_upper_bound"},{"kind":"unavailable_statistic","statistic":"topk_interval_failure_probability"},{"kind":"composition_step","operator":{"op":"top_k_selection"},"rule":"topk_membership_margin_certificate"}]}`
+
+#### Query physical DAG
 
 | Node | Dependencies | Native operator / input |
 | --- | --- | --- |
@@ -107,11 +175,13 @@ Roots: `[7]`.
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:4a670de6282d46c41df7fa3295bf3e5b6e058fd05d6222234784f260dc4e3d64"`.
+Logical root: `"asap-explain-v1:root:adfaa23eb6d420ae8122a87f94158cec0987aec159752067f711cb41a339b5a9"`.
 
 top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)
 
 Guarantee: `{"bound":{"op":"unknown","statistic":"topk_membership_margin"},"failure_probability":{"op":"union_bound","terms":[{"op":"unknown","statistic":"topk_interval_failure_probability"},{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.009940766872773949},"op":"scaled"}]},"metric":"top_k_membership","provenance":[{"guarantee":{"bound":{"op":"constant","value":0.01},"failure_probability":{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.009940766872773949},"op":"scaled"},"metric":"l2_frequency","provenance":[{"algorithm":"CountSketchWithHeap","contract":"count_sketch_l2_median_hoeffding_v1","kind":"sketch_readout","params":{"CountSketchWithHeap":{"depth":83,"heap_size":100,"width":30000}},"query":"TopK { k: 100 }"},{"kind":"unavailable_statistic","statistic":"topk_max_distinct_items"},{"kind":"composition_step","operator":{"op":"approximate_aggregate"},"rule":"simultaneous_score_bounds_over_distinct_partition_item_identities"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"unavailable_statistic","statistic":"topk_selected_lower_bound"},{"kind":"unavailable_statistic","statistic":"topk_excluded_upper_bound"},{"kind":"unavailable_statistic","statistic":"topk_interval_failure_probability"},{"kind":"composition_step","operator":{"op":"top_k_selection"},"rule":"topk_membership_margin_certificate"}]}`
+
+#### Query physical DAG
 
 | Node | Dependencies | Native operator / input |
 | --- | --- | --- |
@@ -127,14 +197,16 @@ Roots: `[7]`.
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:1f040959f6bd310c8f43ccf79eb37d38a12469a6e08588a848bb41449d3778f4"]` | `"unselected"` | `155.0` | `null` |
-| 1 | `["asap-explain-v1:root:a3ecbd11f7f96eb2a85dd1ae44e8bce5973e9f61259d430b00a6e1f7377b5595"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:42fd4198d4b9045cf6d14bde2491b9197b60744dde46e589df25704f16013d01"]` | `"unselected"` | `242.0` | `null` |
-| 3 | `["asap-explain-v1:root:908757ed9c20f3cd5c92d8329e3880c6c876a7b154c4551a78f5d641634ed6f2"]` | `"selected"` | `125.0` | `null` |
-| 4 | `["asap-explain-v1:root:9c781a6f8ee6ff1521a78043c04c2b6b9781949e93de89a494c70a6dd2a0b50d"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
-| 5 | `["asap-explain-v1:root:4a670de6282d46c41df7fa3295bf3e5b6e058fd05d6222234784f260dc4e3d64"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 0 | `["asap-explain-v1:root:674fdf1bceb4e87877e0c53d71974952465151ea8c6f6c1c3e21f3e73db168ac"]` | `"unselected"` | `155.0` | `null` |
+| 1 | `["asap-explain-v1:root:deece59c58a71ff7517b2846500eda002e6a31ae4e7a3cf99c54029c25cffb53"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:7b07535373f722165f9d399a6ded1bd2f6b76440fd2d21bf9c1f1d636c373c02"]` | `"unselected"` | `242.0` | `null` |
+| 3 | `["asap-explain-v1:root:496497707aa2833c8230c315e5022287410866d3e8ac5c4960a04e7d7e0571fe"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 4 | `["asap-explain-v1:root:3e71cb6b909990d20b7d3a2a17275df1b43bf7680f964360762588f0597424fc"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 5 | `["asap-explain-v1:root:ba8eeff4b130d8b06e9faf25bc465ff618ba30cd5e7857c44fc68762c82dc16b"]` | `"selected"` | `125.0` | `null` |
+| 6 | `["asap-explain-v1:root:a74eff3b7896e52dae2dadd25bb9d301eaa6268fa1304c0cbeb9699ad5f8558b"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 7 | `["asap-explain-v1:root:adfaa23eb6d420ae8122a87f94158cec0987aec159752067f711cb41a339b5a9"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
 
-Successfully compiled candidate plans: [topk-rate-0](candidates/topk-rate-0.json), [topk-rate-1](candidates/topk-rate-1.json), [topk-rate-2](candidates/topk-rate-2.json), [topk-rate-3](candidates/topk-rate-3.json)
+Successfully compiled candidate plans: [topk-rate-0](candidates/topk-rate-0.json), [topk-rate-1](candidates/topk-rate-1.json), [topk-rate-2](candidates/topk-rate-2.json), [topk-rate-5](candidates/topk-rate-5.json)
 
 ## Persisted boundaries
 

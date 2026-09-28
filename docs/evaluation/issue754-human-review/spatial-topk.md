@@ -64,11 +64,13 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:4787547f619c2df86e3374054965b3ad497d25e53cb42dad069dd51fce5fafea"`.
+Logical root: `"asap-explain-v1:root:cd34fea63097fb2fcf8b219ec4be8de476ce61574e8a06ee40d888613116f208"`.
 
 top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)
 
 Guarantee: `{"bound":{"op":"unknown","statistic":"topk_membership_margin"},"failure_probability":{"op":"union_bound","terms":[{"op":"unknown","statistic":"topk_interval_failure_probability"},{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.009940766872773949},"op":"scaled"}]},"metric":"top_k_membership","provenance":[{"guarantee":{"bound":{"op":"constant","value":0.01},"failure_probability":{"count":{"op":"unknown","statistic":"topk_max_distinct_items"},"inner":{"op":"constant","value":0.009940766872773949},"op":"scaled"},"metric":"l2_frequency","provenance":[{"algorithm":"CountSketchWithHeap","contract":"count_sketch_l2_median_hoeffding_v1","kind":"sketch_readout","params":{"CountSketchWithHeap":{"depth":83,"heap_size":100,"width":30000}},"query":"TopK { k: 100 }"},{"kind":"unavailable_statistic","statistic":"topk_max_distinct_items"},{"kind":"composition_step","operator":{"op":"approximate_aggregate"},"rule":"simultaneous_score_bounds_over_distinct_partition_item_identities"}]},"input_index":0,"kind":"child_guarantee"},{"kind":"unavailable_statistic","statistic":"topk_selected_lower_bound"},{"kind":"unavailable_statistic","statistic":"topk_excluded_upper_bound"},{"kind":"unavailable_statistic","statistic":"topk_interval_failure_probability"},{"kind":"composition_step","operator":{"op":"top_k_selection"},"rule":"topk_membership_margin_certificate"}]}`
+
+#### Query physical DAG
 
 | Node | Dependencies | Native operator / input |
 | --- | --- | --- |
@@ -84,10 +86,10 @@ Roots: `[6]`.
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:54d39c0b1ca8f4666729a2ee4bd473828d883206bc76edc27b57daf451be36e9"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
-| 1 | `["asap-explain-v1:root:abf768f94bef2e820457146939248d0df406fef3a70da171cbf2c6e34f4269b6"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:7edfeb167e264152810f299c5f3e6e96ed5db3c7f284488e52dc4c316c692cf0"]` | `"selected"` | `130.0` | `null` |
-| 3 | `["asap-explain-v1:root:4787547f619c2df86e3374054965b3ad497d25e53cb42dad069dd51fce5fafea"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 0 | `["asap-explain-v1:root:ac0ac7d5f573754e55e5f37a75d60ace6d3a74eeb081ce85a7dc96334ca31d73"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| 1 | `["asap-explain-v1:root:e13e67835975ec59bb3fdbe296544ae7da37f949b359f5deaa7103b77ac9c2f1"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:01d98a8e246904cf0d42a2404bae63f7818f902759c57e16e178802f080b9ec3"]` | `"selected"` | `130.0` | `null` |
+| 3 | `["asap-explain-v1:root:cd34fea63097fb2fcf8b219ec4be8de476ce61574e8a06ee40d888613116f208"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
 
 Successfully compiled candidate plans: [spatial-topk-1](candidates/spatial-topk-1.json), [spatial-topk-2](candidates/spatial-topk-2.json)
 

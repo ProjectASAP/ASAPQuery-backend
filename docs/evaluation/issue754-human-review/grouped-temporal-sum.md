@@ -61,10 +61,10 @@ invalid DAG: ranking requires one exact per-series Rate frontier
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:5efffd4a80a801d5afec54dd73b388d1bf3fd8552c8c5bf7a5e6266c7914289c"]` | `"selected"` | `95.0` | `null` |
-| 1 | `["asap-explain-v1:root:bb5e147f97964e9682b5a4f4cbc408bff8def6352684f3d8a409a93bcb43af41"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:d4790d6fa34e8c3a9f8880f785ad17b1b33bb6b11fb3cac6b491e7e88407c1ab"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
-| 3 | `["asap-explain-v1:root:1e5ddc1f0dbddbf7c2e03528cc8d8651f5373f981dfbf13a38df07e54a91ad7a"]` | `"unselected"` | `125.0` | `null` |
+| 0 | `["asap-explain-v1:root:8492ff42f5224c3239a07010f49880c0a97804c0cb921389030caf247feafdd8"]` | `"selected"` | `95.0` | `null` |
+| 1 | `["asap-explain-v1:root:76e0822b51b6b442d8f321a0bbc40d20bf34f4d426b73fae8987961e4df8cdf5"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:3bccca2e3d1880ea0d44df539815b25b11872617a15fe018c045ab024a9d2f4a"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
+| 3 | `["asap-explain-v1:root:2dd96824c844e931a34bf6f653f2e27b26915a05365963aa4fe03ee31ab35267"]` | `"unselected"` | `125.0` | `null` |
 
 Successfully compiled candidate plans: [grouped-temporal-sum-0](candidates/grouped-temporal-sum-0.json), [grouped-temporal-sum-1](candidates/grouped-temporal-sum-1.json), [grouped-temporal-sum-3](candidates/grouped-temporal-sum-3.json)
 

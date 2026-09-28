@@ -400,11 +400,28 @@ impl ASAPQueryEngine {
             .summary_store
             .as_ref()
             .map(|index| index.summary_update_revision());
-        let result = super::logical_dag::execute_installed(
-            entry,
-            leaves,
-            at,
-            |root, evaluation_ms| {
+        let result = if entry
+            .physical_vector_binding()
+            .is_some_and(|(inputs, _, _)| {
+                inputs.iter().all(|input| {
+                    matches!(
+                        entry.nodes.get(input),
+                        Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { .. })
+                    )
+                })
+            }) {
+            let store = self.summary_store.as_ref().ok_or_else(|| {
+                EngineError::capability_miss("native_stored", "summary store unavailable")
+            })?;
+            super::logical_dag::native_values::execute_stored(
+                entry,
+                physical.query_plan.plan_id,
+                physical.query_plan.plan_version,
+                store,
+                at,
+            )
+        } else {
+            super::logical_dag::execute_installed(entry, leaves, at, |root, evaluation_ms| {
                 if let Some(asap_types::query_plan::QueryPlanNode::Logical {
                     operator:
                         asap_types::query_plan::residual::ResidualQueryOperator::CurrentSeries {
@@ -521,8 +538,8 @@ impl ASAPQueryEngine {
                     evaluation_ms,
                     false,
                 ))
-            },
-        );
+            })
+        };
         let current = self
             .summary_store
             .as_ref()

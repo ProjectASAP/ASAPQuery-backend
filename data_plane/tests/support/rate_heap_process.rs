@@ -12,15 +12,25 @@ use control_plane::physical::{
 // -> HTTP. Restart reads the same bound SDS and retained physical program.
 #[tokio::test]
 async fn rate_countsketch_heap_survives_counter_reset_and_durable_restart() {
-    run("CountSketchWithHeap").await;
+    run("CountSketchWithHeap", false).await;
 }
 
 #[tokio::test]
 async fn rate_cms_heap_survives_counter_reset_and_durable_restart() {
-    run("CmsWithHeap").await;
+    run("CmsWithHeap", false).await;
 }
 
-async fn run(algorithm: &str) {
+// The maintenance graph publishes the heap itself before HTTP readout and restart.
+#[tokio::test]
+async fn precomputed_rate_countsketch_heap_survives_durable_restart() {
+    run("CountSketchWithHeap", true).await;
+}
+#[tokio::test]
+async fn precomputed_rate_cms_heap_survives_durable_restart() {
+    run("CmsWithHeap", true).await;
+}
+
+async fn run(algorithm: &str, precomputed: bool) {
     let query = "topk by (job) (1, rate(requests_total[1m]))";
     let mut wire: Value = serde_json::from_str(include_str!(
         "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
@@ -35,7 +45,7 @@ async fn run(algorithm: &str) {
     wire["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
     wire["implementation"]["topk_evidence"] = serde_json::json!({});
     wire["implementation"]["data_snapshot_id"] = "rate-heap-process".into();
-    // Fixture rates: winner >=500, excluded rates <=10, at most three series.
+    // Fixture rates: winner >=500, excluded rates <=10, at most three series per ranking group.
     wire["implementation"]["accuracy_evidence"] = serde_json::json!({query:{
         "query_string":query,"data_snapshot_id":"rate-heap-process",
         "data_workload":wire["data_workload"],"source":"enforced-test-population",
@@ -62,6 +72,13 @@ async fn run(algorithm: &str) {
                     .as_ref()
                     .is_some_and(|program| program.to_string().contains(algorithm))
             });
+            let heap = heap
+                && plan
+                    .precompute_plan
+                    .executable_dags
+                    .values()
+                    .any(|dag| !dag.native_programs.is_empty())
+                    == precomputed;
             saw_heap |= heap;
             let manifest = manifest(&plan, &candidate.queries).unwrap();
             Some(WorkloadQuote {
@@ -94,7 +111,17 @@ async fn run(algorithm: &str) {
         .to_string()
         .contains(algorithm));
     entry.recover_vector_physical_dag().unwrap();
-    assert_eq!(plan.precompute_plan.materializations.len(), 1);
+    assert_eq!(
+        plan.precompute_plan.materializations.len(),
+        if precomputed { 2 } else { 1 }
+    );
+    assert_eq!(
+        plan.precompute_plan
+            .executable_dags
+            .values()
+            .any(|dag| !dag.native_programs.is_empty()),
+        precomputed
+    );
 
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
@@ -200,6 +227,20 @@ async fn run(algorithm: &str) {
                         &samples,
                     )
                 })
+                .chain(std::iter::once(series_with_labels(
+                    "requests_total",
+                    &[("job", "worker"), ("unreferenced_instance", "d")],
+                    &[
+                        (1000, 2000.),
+                        (20000, 40000.),
+                        (40000, 80000.),
+                        (60000, 120000.),
+                        (61000, 122000.),
+                        (80000, 160000.),
+                        (100000, 200000.),
+                        (120000, 240000.),
+                    ],
+                )))
                 .collect(),
             };
             assert_eq!(remote_write(&client, &backend, &request).await, 204);
@@ -218,13 +259,26 @@ async fn run(algorithm: &str) {
             )
             .await;
             let rows = body["data"]["result"].as_array().unwrap();
-            assert_eq!(rows.len(), 1, "{body}");
-            assert_eq!(rows[0]["metric"]["unreferenced_instance"], winner, "{body}");
-            let value = rows[0]["value"][1]
-                .as_str()
-                .unwrap()
-                .parse::<f64>()
+            assert_eq!(rows.len(), 2, "{body}");
+            assert!(
+                rows.iter()
+                    .all(|row| row["metric"].get("__name__").is_none()),
+                "Rate must drop the metric name: {body}"
+            );
+            let api = rows
+                .iter()
+                .find(|row| row["metric"]["job"] == "api")
                 .unwrap();
+            let worker = rows
+                .iter()
+                .find(|row| row["metric"]["job"] == "worker")
+                .unwrap();
+            assert_eq!(worker["metric"]["unreferenced_instance"], "d");
+            assert!(
+                (worker["value"][1].as_str().unwrap().parse::<f64>().unwrap() - 2000.).abs() < 1e-8
+            );
+            assert_eq!(api["metric"]["unreferenced_instance"], winner, "{body}");
+            let value = api["value"][1].as_str().unwrap().parse::<f64>().unwrap();
             assert!((value - score).abs() < 1e-8, "{body}, expected {score}");
             if restart {
                 assert_eq!(body["data"]["result"], expected[index]);

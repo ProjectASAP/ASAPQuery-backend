@@ -6,7 +6,7 @@
     "activation_unix_ms": 10000,
     "expiry_unix_ms": null,
     "backend_compat": "asap-query-backend.v1",
-    "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
+    "planner_revision": "574bef34c3792c9ebc76773eeff159ffd14194fd",
     "capability_snapshot_id": "asapquery-local-v1"
   },
   "summary_catalog": {
@@ -197,7 +197,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
+      "planner_revision": "574bef34c3792c9ebc76773eeff159ffd14194fd",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "ingest": {
@@ -663,7 +663,7 @@
       "activation_unix_ms": 10000,
       "expiry_unix_ms": null,
       "backend_compat": "asap-query-backend.v1",
-      "planner_revision": "c899084019580eac55e6502eb641d42e748c6ff2",
+      "planner_revision": "574bef34c3792c9ebc76773eeff159ffd14194fd",
       "capability_snapshot_id": "asapquery-local-v1"
     },
     "frame_identity": {
@@ -1240,7 +1240,7 @@
       "candidate_assembly_rejections": [],
       "committed_roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:0e31a8d3445c715a2134c5af0a5ea3f922da28603611abeb514a6bd3a11c083e",
+          "logical_root_id": "asap-explain-v1:root:ec6e34299f31b0a7f44d9733258d7a4edfd2bc8e05f780ab635e8f37bd77ee90",
           "query_index": 0
         }
       ],
@@ -1256,7 +1256,7 @@
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:b222e331b2a69f97f9beeff824e7d2b6f2033c46f0c3221dc1aff347d680eac4",
+              "candidate_id": "asap-explain-v1:candidate:be34339fdb274fc15495c73fbb9ba537faf694bb4b26eeac29ae716e0cf2beb7",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -1347,13 +1347,13 @@
           "consumer_count": 1,
           "group_id": 0,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:d836370a86589848b769a0c02974967d025d0a1c8bdec5a3314662e52b93b0ec"
+          "target_id": "asap-explain-v1:target:22b8f77239e6e1aab8509310ad0991c6c005e0103efb4d293f4e311409d14f6c"
         },
         {
           "candidates": [
             {
               "accuracy_status": "known",
-              "candidate_id": "asap-explain-v1:candidate:a6925dc98136d616dcea4a0336a2cb8a27916e4ce81cff47330b17d299c2e984",
+              "candidate_id": "asap-explain-v1:candidate:227dd6f61d0d560eb2f852b591fd57c6ba82c405068f6c92b597dc1eefdf4b27",
               "cost_estimate": {
                 "erp_record_ids": [],
                 "model": "backend_state_footprint_v1",
@@ -1418,233 +1418,36 @@
           "consumer_count": 1,
           "group_id": 1,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:b8b8189857cb686ee6417f8a5f4983dcc56989b208cc012b38d99528e9aad496"
+          "target_id": "asap-explain-v1:target:deeff0ae6c5730550cf0d9dea0740a264186e0cb7d4e7e80f88405f406290374"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 2,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:3b9064ebf966ec0eaec1af0985a979564b15eb5ec7f8cbcd8f4bfe14c6a476fe"
+          "target_id": "asap-explain-v1:target:6b56045ca6e7ea2c0b00b4ec9f6ccc22b307be8932521c63dfe8e248e8f539eb"
         },
         {
           "candidates": [],
           "consumer_count": 1,
           "group_id": 3,
           "rejected": [],
-          "target_id": "asap-explain-v1:target:65d5f761dcf95671dffb45e7742a12eef3531e6f3d03e4e0d8c07a7612f09525"
+          "target_id": "asap-explain-v1:target:6c6784e903f49f88c3e6ccc6cc9f37327cc4987bbf8bb3c46eecdc0fd049168a"
         }
       ],
       "roots": [
         {
-          "logical_root_id": "asap-explain-v1:root:0e31a8d3445c715a2134c5af0a5ea3f922da28603611abeb514a6bd3a11c083e",
+          "logical_root_id": "asap-explain-v1:root:ec6e34299f31b0a7f44d9733258d7a4edfd2bc8e05f780ab635e8f37bd77ee90",
           "query_index": 0
         }
       ],
       "schema_version": 1
     },
     {
-      "guarantee": {
-        "bound": {
-          "op": "zero"
-        },
-        "failure_probability": {
-          "op": "zero"
-        },
-        "metric": "absolute_value",
-        "provenance": [
-          {
-            "kind": "exact",
-            "reason": "ExactAggregate(Sum)"
-          },
-          {
-            "guarantee": {
-              "bound": {
-                "op": "zero"
-              },
-              "failure_probability": {
-                "op": "zero"
-              },
-              "metric": "absolute_value",
-              "provenance": [
-                {
-                  "kind": "exact",
-                  "reason": "ExactAggregate(Rate)"
-                },
-                {
-                  "guarantee": {
-                    "bound": {
-                      "op": "zero"
-                    },
-                    "failure_probability": {
-                      "op": "zero"
-                    },
-                    "metric": "absolute_value",
-                    "provenance": [
-                      {
-                        "kind": "exact",
-                        "reason": "KeepPreAsap"
-                      }
-                    ]
-                  },
-                  "input_index": 0,
-                  "kind": "child_guarantee"
-                },
-                {
-                  "kind": "composition_step",
-                  "operator": {
-                    "op": "counter_rate"
-                  },
-                  "rule": "exact_input"
-                }
-              ]
-            },
-            "input_index": 0,
-            "kind": "child_guarantee"
-          },
-          {
-            "kind": "composition_step",
-            "operator": {
-              "op": "exact_sum"
-            },
-            "rule": "exact_input"
-          }
-        ]
-      },
-      "logical_root_id": "asap-explain-v1:root:0e5bd63bf2b058035044a1c50ec5912afbfbd59dd75611d27ff23b9420d09851",
-      "physical_dag": {
-        "nodes": {
-          "2": {
-            "Input": {
-              "properties": {
-                "boundedness": "Bounded",
-                "emission": "Unknown"
-              },
-              "schema": {
-                "fields": [
-                  {
-                    "dtype": {
-                      "Plain": "timestamp"
-                    },
-                    "name": "ts",
-                    "nullable": false
-                  },
-                  {
-                    "dtype": {
-                      "Plain": "float64"
-                    },
-                    "name": "value",
-                    "nullable": false
-                  },
-                  {
-                    "dtype": {
-                      "Plain": "utf8"
-                    },
-                    "name": "label_0",
-                    "nullable": true
-                  },
-                  {
-                    "dtype": {
-                      "Plain": "utf8"
-                    },
-                    "name": "$promql_series_identity",
-                    "nullable": false
-                  }
-                ],
-                "time_index": 0
-              }
-            }
-          },
-          "3": {
-            "Operator": {
-              "inputs": [
-                2
-              ],
-              "operator": {
-                "inputs": [
-                  {
-                    "fields": [
-                      {
-                        "dtype": {
-                          "Plain": "timestamp"
-                        },
-                        "name": "ts",
-                        "nullable": false
-                      },
-                      {
-                        "dtype": {
-                          "Plain": "float64"
-                        },
-                        "name": "value",
-                        "nullable": false
-                      },
-                      {
-                        "dtype": {
-                          "Plain": "utf8"
-                        },
-                        "name": "label_0",
-                        "nullable": true
-                      },
-                      {
-                        "dtype": {
-                          "Plain": "utf8"
-                        },
-                        "name": "$promql_series_identity",
-                        "nullable": false
-                      }
-                    ],
-                    "time_index": 0
-                  }
-                ],
-                "kind": {
-                  "SummaryBuild": {
-                    "family": {
-                      "ExactAggregate": [
-                        "Sum",
-                        "Sum"
-                      ]
-                    },
-                    "groups": [
-                      2
-                    ],
-                    "time": 0,
-                    "value": 1
-                  }
-                },
-                "output": {
-                  "fields": [
-                    {
-                      "dtype": {
-                        "Plain": "utf8"
-                      },
-                      "name": "label_0",
-                      "nullable": true
-                    },
-                    {
-                      "dtype": {
-                        "ExactAggregate": [
-                          "Sum",
-                          "Sum"
-                        ]
-                      },
-                      "name": "sum",
-                      "nullable": false
-                    }
-                  ],
-                  "time_index": null
-                }
-              }
-            }
-          }
-        },
-        "roots": [
-          3
-        ],
-        "version": 1
-      },
       "query_id": "compat-query-0",
-      "rationale": "Sum { col: None } realizes as an exact Sum accumulator — the only realization realizations_for_intent produces for this intent (no approximate candidate applies)",
-      "stage": "planner.physical_candidate"
+      "reason": "invalid DAG: ranking requires one exact per-series Rate frontier",
+      "stage": "planner.physical_candidate",
+      "status": "unsupported"
     }
   ]
 }

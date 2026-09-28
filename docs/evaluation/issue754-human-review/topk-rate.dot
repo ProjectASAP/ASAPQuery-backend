@@ -19,5 +19,13 @@ digraph compiled_physical_plan {
     query_0_2 [label="Planner Physical DAG\nbound sources [2]", shape=doubleoctagon];
     query_0_1 -> query_0_0;
     query_0_0 -> query_0_2;
+    subgraph cluster_native_query_0 {
+      label="Planner query operators";
+    native_query_0_2 [label="#2\nBound physical input"];
+    native_query_0_3 [label="#3\n{\"Sort\":{\"groups\":[2],\"keys\":[{\"column\":1,\"descending\":true,\"nulls_first\":false}]}}"];
+      native_query_0_2 -> native_query_0_3;
+    native_query_0_4 [label="#4\n{\"Limit\":{\"groups\":[2],\"n\":3,\"offset\":0}}"];
+      native_query_0_3 -> native_query_0_4;
+    }
   }
 }
