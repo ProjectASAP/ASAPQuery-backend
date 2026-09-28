@@ -186,6 +186,16 @@ fn query_node_label(node: &QueryPlanNode) -> String {
         QueryPlanNode::Physical { source_nodes, .. } => {
             format!("Planner Physical DAG\nbound sources {source_nodes:?}")
         }
+        QueryPlanNode::PhysicalFragment { dag, .. } => {
+            asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                .map(|plan| {
+                    format!(
+                        "Physical\n{}",
+                        plan.operator_name(plan.roots()[0]).unwrap_or("Input")
+                    )
+                })
+                .unwrap_or_else(|_| "Invalid physical DAG".into())
+        }
         QueryPlanNode::RelationalJoin { .. } => "RelationalJoin".into(),
         QueryPlanNode::Relational { .. } => "Relational".into(),
         QueryPlanNode::Logical { operator, .. } => format!("Logical\n{}", residual_label(operator)),
