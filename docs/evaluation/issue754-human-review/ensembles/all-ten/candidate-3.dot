@@ -1,0 +1,55 @@
+digraph compiled_physical_plan {
+  rankdir=LR;
+  node [shape=box, fontname=Helvetica];
+  subgraph cluster_precompute {
+    label="PrecomputePlan";
+  }
+  subgraph cluster_query_0 {
+    label="QueryPlan: quantile by (label_0) (0.9, data)";
+    query_0_0 [label="Logical\nCurrentSeries", shape=doubleoctagon];
+  }
+  subgraph cluster_query_1 {
+    label="QueryPlan: quantile_over_time(0.9, data[1m])";
+    query_1_0 [label="ExactFallback\npost-ASAP node requires exact execution", shape=doubleoctagon];
+  }
+  subgraph cluster_query_2 {
+    label="QueryPlan: quantile_over_time(0.9, data[1m]) / quantile_over_time(0.5, data[1m])";
+    query_2_0 [label="ExactFallback\npost-ASAP node requires exact execution", shape=doubleoctagon];
+  }
+  subgraph cluster_query_3 {
+    label="QueryPlan: rate(data[1m])";
+    query_3_0 [label="ExactFallback\npost-ASAP node requires exact execution", shape=doubleoctagon];
+  }
+  subgraph cluster_query_4 {
+    label="QueryPlan: sum by (label_0) (data)";
+    query_4_0 [label="Logical\nCurrentSeries", shape=doubleoctagon];
+  }
+  subgraph cluster_query_5 {
+    label="QueryPlan: sum by (label_0) (rate(data[1m]))";
+    query_5_0 [label="ExactFallback\npost-ASAP node requires exact execution", shape=doubleoctagon];
+  }
+  subgraph cluster_query_6 {
+    label="QueryPlan: sum by (label_0) (sum_over_time(data[1m]))";
+    query_6_0 [label="ExactFallback\npost-ASAP node requires exact execution", shape=doubleoctagon];
+  }
+  subgraph cluster_query_7 {
+    label="QueryPlan: sum_over_time(data[1m])";
+    query_7_0 [label="ExactFallback\npost-ASAP node requires exact execution", shape=doubleoctagon];
+  }
+  subgraph cluster_query_8 {
+    label="QueryPlan: topk by (label_0) (3, data)";
+    query_8_0 [label="Logical\nCurrentSeries", shape=doubleoctagon];
+    subgraph cluster_native_query_8 {
+      label="Planner query operators";
+    native_query_8_1 [label="#1\nBound physical input"];
+    native_query_8_18446744073709551615 [label="#18446744073709551615\n{\"Sort\":{\"groups\":[2],\"keys\":[{\"column\":1,\"descending\":true,\"nulls_first\":false}]}}"];
+      native_query_8_1 -> native_query_8_18446744073709551615;
+    native_query_8_2 [label="#2\n{\"Limit\":{\"groups\":[2],\"n\":3,\"offset\":0}}"];
+      native_query_8_18446744073709551615 -> native_query_8_2;
+    }
+  }
+  subgraph cluster_query_9 {
+    label="QueryPlan: topk by (label_0) (3, rate(data[1m]))";
+    query_9_0 [label="ExactFallback\npost-ASAP node requires exact execution", shape=doubleoctagon];
+  }
+}

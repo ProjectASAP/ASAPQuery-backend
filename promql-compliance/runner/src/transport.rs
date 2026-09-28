@@ -83,11 +83,16 @@ pub async fn push(client: &Client, body: &[u8], targets: &[&str]) -> Result<()> 
     Ok(())
 }
 pub async fn drain(client: &Client, url: &str) -> Result<()> {
-    client
+    let response = client
         .post(format!("{url}/api/v1/precompute/drain"))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let status = response.status();
+    ensure!(
+        status.is_success(),
+        "precompute drain returned {status}: {}",
+        response.text().await?
+    );
     Ok(())
 }
 pub async fn wait(client: &Client, url: &str) -> Result<()> {

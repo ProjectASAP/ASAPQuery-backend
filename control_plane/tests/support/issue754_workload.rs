@@ -70,3 +70,49 @@ pub fn input(case: &Case) -> BackendLocalPlanningInput {
     }
     serde_json::from_value(snapshot).unwrap()
 }
+
+pub fn ensembles() -> Vec<(String, Vec<Case>)> {
+    let groups: [(&str, &[&str]); 3] = [
+        (
+            "shared-rate",
+            &["temporal-rate", "grouped-rate", "topk-rate"],
+        ),
+        ("shared-quantiles", &["temporal-quantile", "quantile-ratio"]),
+        ("all-ten", &[]),
+    ];
+    groups
+        .into_iter()
+        .map(|(name, names)| {
+            (
+                name.to_owned(),
+                suite()
+                    .queries
+                    .into_iter()
+                    .filter(|case| names.is_empty() || names.contains(&case.name.as_str()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+pub fn ensemble_input(cases: &[Case]) -> BackendLocalPlanningInput {
+    let mut combined = serde_json::to_value(input(&cases[0])).unwrap();
+    let mut queries = Vec::new();
+    let mut evidence = serde_json::Map::new();
+    for case in cases {
+        let wire = serde_json::to_value(input(case)).unwrap();
+        queries.extend(
+            wire["query_workload"]["repeating_queries"]
+                .as_array()
+                .unwrap()
+                .clone(),
+        );
+        if let Some(items) = wire["implementation"]["accuracy_evidence"].as_object() {
+            evidence.extend(items.clone());
+        }
+    }
+    combined["query_workload"]["repeating_queries"] = json!(queries);
+    combined["implementation"]["data_snapshot_id"] = json!("issue-754-level1");
+    combined["implementation"]["accuracy_evidence"] = json!(evidence);
+    serde_json::from_value(combined).unwrap()
+}
