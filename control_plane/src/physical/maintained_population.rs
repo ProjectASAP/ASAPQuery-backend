@@ -1,5 +1,7 @@
 //! Lower typed population operators according to executor membership capabilities.
-use super::compiler::{CompileError, PhysicalCompilationRequest, QueryCompilationInput};
+#[cfg(test)]
+use super::compiler::QueryCompilationInput;
+use super::compiler::{CompileError, PhysicalCompilationRequest};
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
     residual::{Grouping, LabelMatch, LabelMatcher, ResidualQueryOperator},
@@ -67,22 +69,21 @@ pub(super) fn supported(request: &PhysicalCompilationRequest) -> bool {
         .any(|q| supported_node(&q.selected_plan_root))
 }
 
-pub(super) fn operator(
+/// Resolve population bindings once per candidate. Scanning every workload
+/// root for each consumer recompiles the same native ranking graphs quadratically.
+pub(super) fn operators(
     request: &PhysicalCompilationRequest,
-    query: &QueryCompilationInput,
-) -> Result<Option<ResidualQueryOperator>, CompileError> {
-    let Some((spec, readout)) = selected(&query.selected_plan_root) else {
-        return Ok(None);
-    };
-    let PopulationInput::CurrentSeries(input) = &spec.input else {
-        return Err(CompileError::Query { query_id: query.query_id.clone(), reason: "maintained table-row populations require a row-update executor; remote-write current-series state is incompatible".into() });
-    };
-    let populations: std::collections::BTreeSet<_> = request
+) -> Result<Vec<Option<ResidualQueryOperator>>, CompileError> {
+    let selected = request
         .queries
         .iter()
-        .filter_map(|q| {
-            selected(&q.selected_plan_root)
-                .map(|(p, _)| serde_json::to_string(&p).expect("typed population serializes"))
+        .map(|query| selected(&query.selected_plan_root))
+        .collect::<Vec<_>>();
+    let populations: std::collections::BTreeSet<_> = selected
+        .iter()
+        .flatten()
+        .map(|(population, _)| {
+            serde_json::to_string(population).expect("typed population serializes")
         })
         .collect();
     let max_bytes = request
@@ -90,6 +91,11 @@ pub(super) fn operator(
         .unwrap_or(64 * 1024 * 1024)
         .min(1_073_741_824)
         / populations.len().max(1) as u64;
+    selected.into_iter().zip(&request.queries).map(|(selected, query)| {
+        let Some((spec, readout)) = selected else { return Ok(None); };
+    let PopulationInput::CurrentSeries(input) = &spec.input else {
+        return Err(CompileError::Query { query_id: query.query_id.clone(), reason: "maintained table-row populations require a row-update executor; remote-write current-series state is incompatible".into() });
+    };
     let population = SeriesPopulation {
         metric: input.metric.clone(),
         matchers: input
@@ -135,6 +141,20 @@ pub(super) fn operator(
         population,
         readout,
     }))
+    }).collect()
+}
+
+#[cfg(test)]
+pub(super) fn operator(
+    request: &PhysicalCompilationRequest,
+    query: &QueryCompilationInput,
+) -> Result<Option<ResidualQueryOperator>, CompileError> {
+    let index = request
+        .queries
+        .iter()
+        .position(|q| q.query_id == query.query_id)
+        .expect("query belongs to the compilation request");
+    Ok(operators(request)?.remove(index))
 }
 
 /// The maintained population is a deployment source; ranking is compiled by
