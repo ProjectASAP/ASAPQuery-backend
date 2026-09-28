@@ -491,7 +491,7 @@ impl ClickHouseRelationalAdapter {
             } => {
                 if !partition_by.keys().is_empty() || partition_by.is_without() {
                     return Err(ClickHouseRelationalError::Unsupported(
-                        "partitioned Limit".into(),
+                        "partitioned relation Limit is not bound".into(),
                     ));
                 }
                 input.rows = input.rows.into_iter().skip(*offset).take(*n).collect();
@@ -1616,7 +1616,7 @@ mod tests {
             ValueOperation::Limit {
                 n: 1,
                 offset: 0,
-                partition_by: planner_types::pre_asap::GroupKeys::by(vec![]),
+                partition_by: planner_types::pre_asap::GroupKeys::none(),
             },
         ] {
             relation = adapter

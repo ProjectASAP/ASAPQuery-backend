@@ -1,8 +1,0 @@
-[package]
-name = "asap_sketch_codec"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
-prost = "0.13"

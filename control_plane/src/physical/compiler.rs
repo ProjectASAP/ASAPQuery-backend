@@ -2105,6 +2105,7 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
+
             SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
             SummaryExpr::SummaryMerge { children, .. } => {
@@ -2173,11 +2174,12 @@ fn observed_population_matches_root(
     };
     if measures.is_empty()
         || !measures.iter().all(|intent| {
-            matches!(
-                intent,
-                AggIntent::FrequencyL2 { col: None, .. }
-                    | AggIntent::FrequencyEntropy { col: None, .. }
-            ) || matches!(intent, AggIntent::Cardinality { cols, .. } if cols.is_empty())
+            matches!(intent, AggIntent::Cardinality { cols, .. } if cols.is_empty())
+                || matches!(
+                    intent,
+                    AggIntent::FrequencyL2 { col: None, .. }
+                        | AggIntent::FrequencyEntropy { col: None, .. }
+                )
         })
     {
         return false;
@@ -2380,6 +2382,7 @@ fn requires_exact_erp_fallback(
                 walk(left, out);
                 walk(right, out);
             }
+
             SummaryExpr::KeepPreAsap(_) => {}
         }
     }
@@ -3612,16 +3615,14 @@ fn collect_selected_materializations(
         }
         match &node.expr {
             SummaryExpr::RelationalJoin {
-                right: candidates,
                 left: values,
+                right: candidates,
                 kind: planner_types::pre_asap::JoinKind::Semi,
                 pruning: Some(_),
                 ..
             } => {
                 walk(candidates, readout, composable, grouping.clone(), selected)?;
-                // In a hybrid TopK, the sketch is only a candidate-membership
-                // sidecar. Prometheus owns the authoritative value subtree;
-                // provisioning local exact state here duplicates that work.
+                // Explicit external authoritative values do not need duplicate local state.
                 if !composable {
                     walk(values, readout, composable, grouping.clone(), selected)?;
                 }
@@ -4490,6 +4491,7 @@ pub(crate) mod tests {
         }
     }
 
+    // The explicit rate-value frontier cannot be rebound as raw counter deltas.
     #[test]
     fn unsupported_rate_heap_uses_explicit_exact_route() {
         let query = "topk(2, sum by (job) (rate(m[1m])))";
@@ -4517,6 +4519,7 @@ pub(crate) mod tests {
         assert!(plan.precompute_plan.materializations.is_empty());
     }
 
+    // Native exact values remain explicit; unsupported heaps publish no stored state.
     #[test]
     fn hybrid_rate_topk_preserves_the_original_exact_subquery() {
         let query = "topk(2, sum by (job) (rate(m[1m])))";
@@ -4541,7 +4544,7 @@ pub(crate) mod tests {
         assert!(matches!(
             &entry.nodes[&entry.root],
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::TopKSelection { k: 2, .. },
+                operator: ResidualQueryOperator::Limit { n: 2, .. },
                 ..
             }
         ));
@@ -5764,6 +5767,11 @@ pub(crate) mod tests {
         let selected = match &selected_root.expr {
             SummaryExpr::SummaryEstimate { summary_input, .. } => summary_input.clone(),
             SummaryExpr::SummaryAgg { .. } => selected_root.clone(),
+            SummaryExpr::ValueOperation {
+                child,
+                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                ..
+            } => child.clone(),
             _ => panic!("expected maintained aggregate fixture"),
         };
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
@@ -5967,15 +5975,6 @@ pub(crate) mod tests {
         let (right, _) = right.into_physical_compilation_request().unwrap();
         let left = request.queries[0].selected_plan_root.clone();
         let right = right.queries[0].selected_plan_root.clone();
-        let right = Rc::new(SummaryNode {
-            expr: SummaryExpr::ValueOperation {
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                child: right.clone(),
-            },
-            schema: right.schema.clone(),
-            guarantee: None,
-        });
         request.queries[0].selected_plan_root = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
                 timing: planner_types::post_asap::ExecutionTiming::QueryTime,

@@ -746,6 +746,8 @@ async fn main() -> Result<()> {
             capability_snapshot_id: "bootstrap".into(),
         },
         ingest: asap_types::precompute_plan::IngestContract {
+            // Bootstrap envelope: no plan is installed yet, so there is no
+            // dataset to bind to. A published plan supplies the identity.
             dataset_identity: None,
             protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
             endpoint_path: "/v1/metrics".into(),

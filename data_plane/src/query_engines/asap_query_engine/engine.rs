@@ -286,7 +286,7 @@ impl ASAPQueryEngine {
         // Candidate-filtered exact cuts have a data dependency: read the
         // installed membership subtree once, then use that vector to build the
         // Prometheus selector. Keeping the result as a prepared leaf also means
-        // MembershipFilter reuses the same membership readout during composition.
+        // semi-join reuses the same membership readout during composition.
         let dependencies = super::exact_subqueries::external_dependencies(entry, times)?;
         let mut prepared = super::logical_dag::PreparedLeaves::new();
         let unique_inputs = dependencies
@@ -751,7 +751,11 @@ impl ASAPQueryEngine {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
                 if entry.nodes.values().any(|node| {
-                    matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
+                    matches!(
+                        node,
+                        asap_types::query_plan::QueryPlanNode::Logical { .. }
+                            | asap_types::query_plan::QueryPlanNode::PhysicalFragment { .. }
+                    )
                 }) {
                     return self
                         .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
@@ -1394,11 +1398,10 @@ mod sketch_query_tests {
 #[cfg(test)]
 mod aux_pushdown_tests {
     use super::*;
-    use crate::precompute_engine::operators::{
-        max_accumulator::MaxAccumulator, min_accumulator::MinAccumulator,
-        sum_accumulator::SumAccumulator,
-    };
     use crate::storage_engines::types::AggregationType;
+    use asap_physical_operators::summary_kernels::{
+        max::MaxAccumulator, min::MinAccumulator, sum::SumAccumulator,
+    };
     use asap_types::Statistic;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1613,9 +1616,9 @@ mod asap_tier_classify_tests {
     /// results instead of a CapabilityMiss.
     #[tokio::test]
     async fn execute_sum_by_zone_dispatches_to_exact_agg_reducer() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
+        use asap_physical_operators::summary_kernels::sum::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         // Mirror the acceptance-test setup: four ExactAgg(Sum) sids, one
@@ -2263,9 +2266,9 @@ mod asap_tier_classify_tests {
     /// `OuterFn::Plain` instant sums.
     #[tokio::test]
     async fn execute_instant_sum_accumulates_all_windows_not_last() {
-        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
+        use asap_physical_operators::summary_kernels::sum::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = 600_000_u64;

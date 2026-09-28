@@ -104,7 +104,11 @@ fn execute_relation_subtree(
             left_schema,
             right_schema,
             output_schema,
+            pruning,
         }) => {
+            if pruning.is_some() {
+                return Err("candidate pruning requires a certified semi-join binding".into());
+            }
             if !matches!(join_kind, planner_types::pre_asap::JoinKind::Inner) {
                 return Err("only inner relational joins are executable".into());
             }

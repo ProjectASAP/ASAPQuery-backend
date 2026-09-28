@@ -167,7 +167,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
         inputs: &[Arc<MaintenanceValue>],
     ) -> Result<MaintenanceValue, Self::Error> {
         if node.output_state.timing != planner_types::post_asap::ExecutionTiming::IngestionTime {
-            return Err("maintenance runtime requires ingestion-time nodes".into());
+            return Err("ingestion executor received a query-time node".into());
         }
         match &node.payload {
             ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
@@ -253,7 +253,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                         "keyed maintenance updates require explicit row identity routing".into(),
                     );
                 }
-                let mut updater = super::accumulator_factory::create_planner_accumulator(
+                let mut updater = asap_physical_operators::factory::create_planner_accumulator(
                     family, input, grouping,
                 )?;
                 if updater.is_keyed() {
@@ -466,8 +466,9 @@ fn evaluate_aligned_binary(
             let right = right_rows
                 .get(&timestamp)
                 .ok_or("maintenance binary requires matching timestamp sets")?;
-            let value =
-                crate::utils::arithmetic::evaluate_float64_arithmetic(arithmetic, left, *right);
+            let value = asap_physical_operators::arithmetic::evaluate_float64_arithmetic(
+                arithmetic, left, *right,
+            );
             if !value.is_finite() {
                 return Err("maintenance binary produced a non-finite update".into());
             }
@@ -2148,7 +2149,7 @@ pub(crate) fn affected_materializations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precompute_engine::operators::SumAccumulator;
+    use asap_physical_operators::summary_kernels::SumAccumulator;
     use planner_types::post_asap::{
         EdgeRole, ExecutableDag, ExecutableDagEdge, GroupingEdgeCompatibility, SummarySchema,
         WindowEdgeCompatibility,
@@ -2182,7 +2183,7 @@ mod tests {
     fn cohort_lineage_is_order_independent_and_binds_every_input() {
         use crate::storage_engines::sketch_db::index::FrozenExactWindows;
         let make = |sid, id, value| {
-            let mut state = crate::precompute_engine::operators::SumAccumulator::new();
+            let mut state = asap_physical_operators::summary_kernels::SumAccumulator::new();
             state.update(value);
             FrozenExactWindows {
                 sid,
@@ -3411,6 +3412,7 @@ mod tests {
         assert!(frozen
             .execute(&operation, &[left.clone(), right.clone()])
             .is_err());
+        operation.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
 
         for invalid in [
             rows(vec![]),

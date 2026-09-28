@@ -170,12 +170,20 @@ impl Lower {
                             )?
                         }
                     };
-                    return self.operation(
-                        ResidualQueryOperator::TopKSelection {
-                            k: u64::try_from(k).unwrap_or(0),
-                            grouping,
+                    let sorted = self.operation(
+                        ResidualQueryOperator::Sort {
+                            descending: true,
+                            grouping: grouping.clone(),
                         },
                         vec![input],
+                    )?;
+                    return self.operation(
+                        ResidualQueryOperator::Limit {
+                            n: u64::try_from(k).unwrap_or(0),
+                            offset: 0,
+                            grouping,
+                        },
+                        vec![sorted],
                     );
                 }
                 if a.param.is_some() {
@@ -202,8 +210,20 @@ impl Lower {
                 let operator = match c.func.name {
                     "scalar" => ResidualQueryOperator::VectorToScalar,
                     "histogram_quantile" => ResidualQueryOperator::HistogramQuantile,
-                    "sort" => ResidualQueryOperator::Sort { descending: false },
-                    "sort_desc" => ResidualQueryOperator::Sort { descending: true },
+                    "sort" => ResidualQueryOperator::Sort {
+                        descending: false,
+                        grouping: Grouping {
+                            labels: vec![],
+                            without: false,
+                        },
+                    },
+                    "sort_desc" => ResidualQueryOperator::Sort {
+                        descending: true,
+                        grouping: Grouping {
+                            labels: vec![],
+                            without: false,
+                        },
+                    },
                     name => ResidualQueryOperator::Temporal {
                         operation: match name {
                             "rate" => TemporalOperation::Rate,
@@ -840,6 +860,22 @@ mod planner_workload_tests {
             .unwrap_or_else(|error| panic!("{query}: {error}"))
     }
 
+    fn assert_local_limit(node: &QueryPlanNode) {
+        match node {
+            QueryPlanNode::PhysicalFragment { dag, .. } => {
+                let plan =
+                    asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                        .unwrap();
+                assert_eq!(plan.operator_name(plan.roots()[0]), Some("Limit"));
+            }
+            QueryPlanNode::Logical {
+                operator: ResidualQueryOperator::Limit { .. },
+                ..
+            } => {}
+            _ => panic!("expected local Limit, got {node:?}"),
+        }
+    }
+
     #[test]
     fn evaluation_topk_queries_retain_a_local_selection_root() {
         for query in [
@@ -851,17 +887,7 @@ mod planner_workload_tests {
         ] {
             let plan = compile_one(query);
             let entry = plan.query_plan.entries.values().next().unwrap();
-            assert!(
-                matches!(
-                    entry.nodes[&entry.root],
-                    QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::TopKSelection { .. },
-                        ..
-                    }
-                ),
-                "{query}: {:?}",
-                entry.nodes[&entry.root]
-            );
+            assert_local_limit(&entry.nodes[&entry.root]);
             assert!(
                 !entry
                     .nodes
@@ -880,13 +906,7 @@ mod planner_workload_tests {
         ] {
             let plan = compile_one(query);
             let entry = plan.query_plan.entries.values().next().unwrap();
-            assert!(matches!(
-                entry.nodes[&entry.root],
-                QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::TopKSelection { .. },
-                    ..
-                }
-            ));
+            assert_local_limit(&entry.nodes[&entry.root]);
             assert!(
                 !entry.materialization_bindings().is_empty(),
                 "{query} must retain its SummaryStore child: {:?}",
@@ -1003,6 +1023,14 @@ pub(crate) fn selected_range_max_materialization(
     node: &planner_types::post_asap::SummaryNode,
 ) -> Result<Option<String>, QueryPlanError> {
     use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
+    let node = match &node.expr {
+        SummaryExpr::ValueOperation {
+            child,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            ..
+        } => child.as_ref(),
+        _ => node,
+    };
     if !matches!(
         &node.expr,
         SummaryExpr::SummaryAgg {
@@ -1229,6 +1257,7 @@ pub fn eligible_materialization_keys(
                 visit(original, left, keys)?;
                 visit(original, right, keys)?;
             }
+
             SummaryExpr::ValueOperation { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryAgg { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryEstimate { summary_input, .. }
@@ -1342,7 +1371,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         ) || matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::TopKSelection { .. },
+                operator: ResidualQueryOperator::Limit { .. },
                 ..
             }
         );
@@ -1679,7 +1708,7 @@ mod tests {
             assert!(matches!(
                 entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::TopKSelection { k: actual, .. },
+                    operator: ResidualQueryOperator::Limit { n: actual, .. },
                     ..
                 } if actual == k
             ));
@@ -1698,7 +1727,7 @@ mod tests {
         assert!(matches!(
             entry.nodes[&entry.root],
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::TopKSelection { k: 3, .. },
+                operator: ResidualQueryOperator::Limit { n: 3, .. },
                 ..
             }
         ));
@@ -1727,7 +1756,7 @@ mod tests {
             assert!(matches!(
                 &entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::TopKSelection { grouping, .. },
+                    operator: ResidualQueryOperator::Limit { grouping, .. },
                     ..
                 } if grouping.labels == labels && grouping.without == without
             ));

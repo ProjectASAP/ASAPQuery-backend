@@ -1,6 +1,6 @@
 //! Bind raw ingestion to a selected Planner producer and its raw dependency edge.
-use super::accumulator_factory::{create_planner_accumulator, AccumulatorUpdater};
 use crate::storage_engines::types::KeyByLabelValues;
+use asap_physical_operators::factory::{create_planner_accumulator, AccumulatorUpdater};
 use asap_types::{executable_plan::BackendNodeBinding, PrecomputeMaterialization};
 use planner_types::post_asap::{
     EdgeRole, ExecutableOperatorPayload, GroupingStrategy, PostAsapNodeId, SummaryFamilyType,
@@ -224,6 +224,7 @@ impl RawDagProgram {
     }
 
     pub fn uses_counter_delta(&self) -> bool {
+        // Planner represents rate computation as an explicit upstream operator.
         false
     }
 

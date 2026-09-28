@@ -5,3 +5,5 @@ pub mod trait_design_tests;
 
 #[cfg(test)]
 pub mod test_utilities;
+
+pub(crate) mod accumulator_fixture;

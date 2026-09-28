@@ -170,7 +170,7 @@ mod tests {
                 9,
                 BTreeMap::new(),
                 (start, end),
-                Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(value)),
+                Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(value)),
             );
         }
         let entry = asap_types::query_plan::QueryPlanEntry {

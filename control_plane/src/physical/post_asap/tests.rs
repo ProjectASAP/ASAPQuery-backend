@@ -18,6 +18,24 @@ use crate::types::AccuracyTarget;
 use planner_types::pre_asap::{AggIntent, QueryExpr, Reduction, Schema, Source};
 use planner_types::pre_asap::{Column, DataType};
 
+// Query outputs are values; inspect the explicitly retained accumulator below them.
+fn exact_query_state(node: &SummaryNode) -> &SummaryNode {
+    let SummaryExpr::ValueOperation {
+        child,
+        operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+        timing: planner_types::post_asap::ExecutionTiming::QueryTime,
+    } = &node.expr
+    else {
+        panic!("query must finalize its exact state: {:?}", node.expr)
+    };
+    assert!(node
+        .schema
+        .fields
+        .iter()
+        .all(|field| matches!(field.dtype, SummaryFamilyType::Plain(_))));
+    child
+}
+
 fn sketch_family(kind: SketchAlgorithm, params: SketchParams) -> SummaryFamilyType {
     SummaryFamilyType::Sketch(SketchKind::new(kind, params), GroupingStrategy::default())
 }
@@ -116,6 +134,7 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
         SummaryExpr::SummaryJoin { outer, inner, .. } => {
             node_is_archive(outer) || node_is_archive(inner)
         }
+
         SummaryExpr::SummarySubtract { left, right }
         | SummaryExpr::RelationalJoin { left, right, .. }
         | SummaryExpr::BinaryOp {
@@ -342,7 +361,7 @@ fn uncertified_hll_keeps_exact_execution() {
 
 #[test]
 fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
-    // `AggIntent::Sum` binds to a bare `SummaryAgg` with `summary:
+    // `AggIntent::Sum` binds to a readout over `SummaryAgg` with `summary:
     // SummaryKind::Sum` and no `SummaryEstimate` wrapper (the partial
     // state *is* the value — see `asap_aware_mapping::replacement`'s module docs). The
     // old locally-defined `PhysicalExpr::ExactAgg { agg_type, .. }`
@@ -360,16 +379,18 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     match bound {
-        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg { family, .. } => {
-                assert_eq!(
-                    family,
-                    &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
-                    "Sum should bind to SummaryAgg(Sum)"
-                );
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
+            match &exact_query_state(&node).expr {
+                SummaryExpr::SummaryAgg { family, .. } => {
+                    assert_eq!(
+                        family,
+                        &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+                        "Sum should bind to SummaryAgg(Sum)"
+                    );
+                }
+                other => panic!("expected Sum state below the query readout, got {other:?}"),
             }
-            other => panic!("expected bare SummaryAgg(Sum), got {other:?}"),
-        },
+        }
         other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
@@ -440,7 +461,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
 /// `ONLY_TEMPORAL` — `sum_over_time(m[5m])` (and the count/avg/min/max
 /// variants that legacy `single_query.rs` accepts).
 ///
-/// Control plane path: `Aggregate{Sum}` over `Window` → binds to a bare
+/// Control plane path: `Aggregate{Sum}` over `Window` → binds to a readout over
 /// `SummaryAgg{summary: SummaryKind::Sum}` (an exact mergeable
 /// accumulator — see `sum_now_binds_to_exact_agg_after_pr_6_followup`'s
 /// doc comment for the `ExactAgg` → `SummaryAgg` unification).
@@ -455,15 +476,17 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg { family, .. } => {
-                assert_eq!(
-                    family,
-                    &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
-                );
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
+            match &exact_query_state(&node).expr {
+                SummaryExpr::SummaryAgg { family, .. } => {
+                    assert_eq!(
+                        family,
+                        &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
+                    );
+                }
+                other => panic!("expected SummaryAgg(Sum), got {other:?}"),
             }
-            other => panic!("expected SummaryAgg(Sum), got {other:?}"),
-        },
+        }
         other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
@@ -483,22 +506,24 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_grouped_sum() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg {
-                family, reduction, ..
-            } => {
-                assert_eq!(
-                    family,
-                    &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
-                );
-                assert_eq!(
-                    reduction.group_keys().map(|k| k.keys()),
-                    Some(&[1][..]),
-                    "Sum reduction must retain the group-by column"
-                );
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
+            match &exact_query_state(&node).expr {
+                SummaryExpr::SummaryAgg {
+                    family, reduction, ..
+                } => {
+                    assert_eq!(
+                        family,
+                        &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
+                    );
+                    assert_eq!(
+                        reduction.group_keys().map(|k| k.keys()),
+                        Some(&[1][..]),
+                        "Sum reduction must retain the group-by column"
+                    );
+                }
+                other => panic!("expected SummaryAgg(Sum, by=[1]), got {other:?}"),
             }
-            other => panic!("expected SummaryAgg(Sum, by=[1]), got {other:?}"),
-        },
+        }
         other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
@@ -516,18 +541,20 @@ fn phase_b_pattern_temporal_and_spatial_combined_preserves_rate() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg {
-                family, reduction, ..
-            } => {
-                assert_eq!(
-                    family,
-                    &SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate)
-                );
-                assert_eq!(reduction.group_keys().map(|k| k.keys()), Some(&[1][..]));
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
+            match &exact_query_state(&node).expr {
+                SummaryExpr::SummaryAgg {
+                    family, reduction, ..
+                } => {
+                    assert_eq!(
+                        family,
+                        &SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate)
+                    );
+                    assert_eq!(reduction.group_keys().map(|k| k.keys()), Some(&[1][..]));
+                }
+                other => panic!("expected SummaryAgg(Rate, by=[1]), got {other:?}"),
             }
-            other => panic!("expected SummaryAgg(Rate, by=[1]), got {other:?}"),
-        },
+        }
         other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }

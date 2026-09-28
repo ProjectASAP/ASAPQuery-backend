@@ -139,6 +139,16 @@ fn escape(value: &str) -> String {
 
 fn query_node_label(node: &QueryPlanNode) -> String {
     match node {
+        QueryPlanNode::PhysicalFragment { dag, .. } => {
+            asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                .map(|plan| {
+                    format!(
+                        "Physical\n{}",
+                        plan.operator_name(plan.roots()[0]).unwrap_or("Input")
+                    )
+                })
+                .unwrap_or_else(|_| "Invalid physical DAG".into())
+        }
         QueryPlanNode::RelationalJoin { .. } => "RelationalJoin".into(),
         QueryPlanNode::Relational { .. } => "Relational".into(),
         QueryPlanNode::Logical { operator, .. } => format!("Logical\n{}", residual_label(operator)),
@@ -154,7 +164,6 @@ fn query_node_label(node: &QueryPlanNode) -> String {
         QueryPlanNode::SummaryEstimate { query, .. } => format!("SummaryEstimate\n{query:?}"),
         QueryPlanNode::ExactReadout { readout, .. } => format!("ExactReadout\n{readout:?}"),
         QueryPlanNode::SummaryMerge { .. } => "SummaryMerge".into(),
-        QueryPlanNode::MembershipFilter { .. } => "MembershipFilter".into(),
         QueryPlanNode::ExternalExact { .. } => "ExternalExact".into(),
         QueryPlanNode::ExactFallback { reason } => format!("ExactFallback\n{reason}"),
     }
@@ -169,7 +178,7 @@ fn residual_label(operator: &ResidualQueryOperator) -> &'static str {
         ResidualQueryOperator::UnaryNegate => "UnaryNegate",
         ResidualQueryOperator::VectorToScalar => "VectorToScalar",
         ResidualQueryOperator::Aggregate { .. } => "Aggregate",
-        ResidualQueryOperator::TopKSelection { .. } => "TopKSelection",
+        ResidualQueryOperator::Limit { .. } => "Limit",
         ResidualQueryOperator::Binary { .. } => "Binary",
         ResidualQueryOperator::Temporal { .. } => "Temporal",
         ResidualQueryOperator::Sort { .. } => "Sort",

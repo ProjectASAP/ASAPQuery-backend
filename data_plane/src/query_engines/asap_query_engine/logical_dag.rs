@@ -1,4 +1,5 @@
 //! Executes the installed typed logical DAG. No serving-time PromQL parsing.
+mod native_values;
 use crate::query_engines::{
     query_result::{InstantVectorElement, QueryResult},
     EngineError,
@@ -112,6 +113,14 @@ where
         memo: BTreeMap::new(),
         active: BTreeSet::new(),
         warnings: Vec::new(),
+        context: asap_physical_operators::dag::RunContext::new(
+            asap_physical_operators::dag::Scope::Query {
+                evaluation_time_ms: i64::try_from(at)
+                    .map_err(|_| miss("evaluation timestamp overflow"))?,
+                revision: 0,
+            },
+            asap_physical_operators::dag::Limits::default(),
+        )?,
     };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
     let evaluated = evaluator.eval(entry.root, at_signed)?;
@@ -149,9 +158,13 @@ struct Evaluator<'a, F> {
     memo: BTreeMap<(QueryNodeId, i64), Value>,
     active: BTreeSet<(QueryNodeId, i64)>,
     warnings: Vec<String>,
+    context: asap_physical_operators::dag::RunContext,
 }
 impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'_, F> {
     fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
+        if self.context.is_cancelled() {
+            return Err(asap_physical_operators::Error::Cancelled.into());
+        }
         if let Some(value) = self.memo.get(&(id, at)) {
             self.stats.memo_hits += 1;
             return Ok(value.clone());
@@ -168,11 +181,16 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             self.memo.insert((id, at), value.clone());
             return Ok(value);
         }
-        if self.active.len() >= 256 || !self.active.insert((id, at)) {
-            return Err(miss("cyclic or excessively deep installed DAG"));
+        if self.active.len() >= 256 || self.memo.len() >= 200_000 {
+            return Err(asap_physical_operators::Error::Operator(
+                "installed DAG evaluation budget exceeded".into(),
+            )
+            .into());
         }
-        if self.memo.len() >= 200_000 {
-            return Err(miss("installed DAG evaluation budget exceeded"));
+        if !self.active.insert((id, at)) {
+            return Err(
+                asap_physical_operators::Error::Invalid("cyclic installed DAG".into()).into(),
+            );
         }
         let node = self
             .entry
@@ -181,6 +199,38 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .ok_or_else(|| miss("missing installed node"))?
             .clone();
         let value = match node {
+            QueryPlanNode::PhysicalFragment {
+                inputs,
+                dag,
+                row_input,
+                pruning,
+            } => {
+                let values = inputs
+                    .iter()
+                    .map(|id| self.eval(*id, at).and_then(vector))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(contract) = &pruning {
+                    native_values::validate_pruning(
+                        &dag,
+                        &values,
+                        row_input,
+                        contract,
+                        at,
+                        self.context.clone(),
+                    )?;
+                    if let Some(warning) = pruning_warning(Some(&contract.completeness)) {
+                        self.warnings.push(warning);
+                    }
+                }
+                Value::Vector(native_values::physical(
+                    &dag,
+                    values,
+                    row_input,
+                    at,
+                    self.context.clone(),
+                )?)
+            }
+
             QueryPlanNode::Scalar { value } => Value::Scalar(value),
             QueryPlanNode::Logical {
                 operator: ResidualQueryOperator::CurrentSeries { .. },
@@ -205,17 +255,33 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 }
                 self.logical(operator, &inputs, at)?
             }
-            QueryPlanNode::MembershipFilter {
+            QueryPlanNode::RelationalJoin {
                 inputs,
-                completeness,
+                join_kind: planner_types::pre_asap::JoinKind::Semi,
+                pred,
+                pruning,
+                left_schema,
+                right_schema,
+                output_schema,
             } => {
-                let candidates = vector(self.eval(inputs[0], at)?)?;
-                let values = vector(self.eval(inputs[1], at)?)?;
-                let (selected, warning) = membership_filter(candidates, values, &completeness)?;
-                if let Some(warning) = warning {
+                let values = vector(self.eval(inputs[0], at)?)?;
+                let candidates = vector(self.eval(inputs[1], at)?)?;
+                let predicate = serde_json::from_value(pred)
+                    .map_err(|_| miss("invalid semi-join predicate"))?;
+                if let Some(warning) = pruning_warning(pruning.as_ref()) {
                     self.warnings.push(warning);
                 }
-                Value::Vector(selected)
+                Value::Vector(native_values::relation(
+                    values,
+                    candidates,
+                    predicate,
+                    std::sync::Arc::new(left_schema),
+                    std::sync::Arc::new(right_schema),
+                    std::sync::Arc::new(output_schema),
+                    pruning,
+                    at,
+                    self.context.clone(),
+                )?)
             }
             _ => {
                 self.stats.summary_readout_evaluations += 1;
@@ -277,9 +343,19 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Vector(aggregate(operation, &grouping, values)))
             }
-            ResidualQueryOperator::TopKSelection { k, grouping } => {
+            ResidualQueryOperator::Limit {
+                n,
+                offset,
+                grouping,
+            } => {
                 let values = vector(self.eval(input(0)?, at)?)?;
-                Ok(Value::Vector(topk_selection(k, &grouping, values)))
+                Ok(Value::Vector(native_values::limit(
+                    values,
+                    &grouping,
+                    n,
+                    offset,
+                    self.context.clone(),
+                )?))
             }
             ResidualQueryOperator::Binary {
                 operation,
@@ -350,22 +426,17 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                         .collect(),
                 ))
             }
-            ResidualQueryOperator::Sort { descending } => {
-                let mut values = vector(self.eval(input(0)?, at)?)?;
-                values.sort_by(|a, b| {
-                    if a.1.is_nan() && b.1.is_nan() {
-                        std::cmp::Ordering::Equal
-                    } else if a.1.is_nan() {
-                        std::cmp::Ordering::Greater
-                    } else if b.1.is_nan() {
-                        std::cmp::Ordering::Less
-                    } else if descending {
-                        b.1.total_cmp(&a.1)
-                    } else {
-                        a.1.total_cmp(&b.1)
-                    }
-                });
-                Ok(Value::Vector(values))
+            ResidualQueryOperator::Sort {
+                descending,
+                grouping,
+            } => {
+                let values = vector(self.eval(input(0)?, at)?)?;
+                Ok(Value::Vector(native_values::sort(
+                    values,
+                    &grouping,
+                    descending,
+                    self.context.clone(),
+                )?))
             }
             ResidualQueryOperator::HistogramQuantile => {
                 let Value::Scalar(quantile) = self.eval(input(0)?, at)? else {
@@ -420,40 +491,81 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
     }
 }
 
-fn membership_filter(
-    candidates: Vector,
-    values: Vector,
-    completeness: &CandidateCompleteness,
-) -> Result<(Vector, Option<String>), EngineError> {
-    let identity = |labels: &Labels| {
-        let mut labels = labels.clone();
-        labels.remove("__name__");
-        labels
-    };
-    let candidate_ids: BTreeSet<_> = candidates
-        .iter()
-        .map(|(labels, _)| identity(labels))
-        .collect();
-    let value_ids: BTreeSet<_> = values.iter().map(|(labels, _)| identity(labels)).collect();
-    let missing: BTreeSet<_> = candidate_ids.difference(&value_ids).collect();
-    let selected = values
-        .into_iter()
-        .filter(|(labels, _)| candidate_ids.contains(&identity(labels)))
-        .collect();
-    if !missing.is_empty() && matches!(completeness, CandidateCompleteness::Certified { .. }) {
-        return Err(miss("certified membership key has no authoritative value"));
-    }
-    let warning = match completeness {
-        CandidateCompleteness::Certified { .. } => None,
-        CandidateCompleteness::BestEffort { guarantee } => Some(match guarantee {
+fn pruning_warning(completeness: Option<&CandidateCompleteness>) -> Option<String> {
+    match completeness {
+        None | Some(CandidateCompleteness::Certified { .. }) => None,
+        Some(CandidateCompleteness::BestEffort { guarantee }) => Some(match guarantee {
             Some(guarantee) => format!(
                 "ASAP membership pruning is approximate: {:?}",
                 guarantee.metric
             ),
             None => "ASAP membership pruning is approximate and uncertified".into(),
         }),
+    }
+}
+
+#[cfg(test)]
+fn semi_join(
+    candidates: Vector,
+    values: Vector,
+    keys: &[(String, String)],
+    completeness: Option<&CandidateCompleteness>,
+) -> Result<(Vector, Option<String>), EngineError> {
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::{CompareOpKind, DataType, Predicate, QueryExpr},
     };
-    Ok((selected, warning))
+    use std::{rc::Rc, sync::Arc};
+    let schema = |right: bool| {
+        Arc::new(SummarySchema {
+            fields: keys
+                .iter()
+                .map(|(l, r)| {
+                    let name = if right { r } else { l };
+                    SummaryField {
+                        name: name.clone(),
+                        dtype: SummaryFamilyType::Plain(if name == "value" {
+                            DataType::Float64
+                        } else {
+                            DataType::Utf8
+                        }),
+                        nullable: false,
+                    }
+                })
+                .collect(),
+            time_index: None,
+        })
+    };
+    let left = schema(false);
+    let right = schema(true);
+    let predicate = Predicate(Rc::new(QueryExpr::BoolAnd(
+        (0..keys.len())
+            .map(|i| QueryExpr::Compare {
+                left: Rc::new(QueryExpr::Column(i)),
+                op: CompareOpKind::Eq,
+                right: Rc::new(QueryExpr::Column(keys.len() + i)),
+            })
+            .collect(),
+    )));
+    let context = asap_physical_operators::dag::RunContext::new(
+        asap_physical_operators::dag::Scope::Query {
+            evaluation_time_ms: 0,
+            revision: 0,
+        },
+        Default::default(),
+    )?;
+    let rows = native_values::relation(
+        values,
+        candidates,
+        predicate,
+        left.clone(),
+        right,
+        left,
+        completeness.cloned(),
+        0,
+        context,
+    )?;
+    Ok((rows, pruning_warning(completeness)))
 }
 
 fn aggregate(operation: Aggregation, grouping: &Grouping, values: Vector) -> Vector {
@@ -511,31 +623,24 @@ fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
 /// Select by the child sample value while retaining every selected series'
 /// labels. NaN ranks below every numeric value, matching Prometheus' TOPK heap.
 /// Stable sorting also leaves equal-valued series in the child's order.
+#[cfg(test)]
 fn topk_selection(k: u64, grouping: &Grouping, values: Vector) -> Vector {
-    if k == 0 {
-        return Vec::new();
-    }
-    let mut groups: BTreeMap<Labels, Vector> = BTreeMap::new();
-    for (labels, value) in values {
-        groups
-            .entry(grouping_key(&labels, grouping))
-            .or_default()
-            .push((labels, value));
-    }
-    let limit = usize::try_from(k).unwrap_or(usize::MAX);
-    groups
-        .into_values()
-        .flat_map(|mut group| {
-            group.sort_by(|a, b| match (a.1.is_nan(), b.1.is_nan()) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                (false, false) => b.1.total_cmp(&a.1),
-            });
-            group.truncate(limit);
-            group
-        })
-        .collect()
+    let context = asap_physical_operators::dag::RunContext::new(
+        asap_physical_operators::dag::Scope::Query {
+            evaluation_time_ms: 0,
+            revision: 0,
+        },
+        Default::default(),
+    )
+    .unwrap();
+    native_values::limit(
+        native_values::sort(values, grouping, true, context.clone()).unwrap(),
+        grouping,
+        k,
+        0,
+        context,
+    )
+    .unwrap()
 }
 
 fn binary(
@@ -782,7 +887,7 @@ mod topk_tests {
     // An overflowing sum cannot implement average, but zero/subnormal averages remain valid.
     #[test]
     fn finite_division_guards_temporal_average_without_rejecting_zero() {
-        let mut sum = crate::precompute_engine::operators::sum_accumulator::SumAccumulator::new();
+        let mut sum = asap_physical_operators::summary_kernels::sum::SumAccumulator::new();
         sum.update(1e308);
         sum.update(1e308);
         assert!(binary(
@@ -1093,8 +1198,22 @@ mod topk_tests {
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::TopKSelection {
-                            k: 2,
+                        operator: ResidualQueryOperator::Limit {
+                            offset: 0,
+                            n: 2,
+                            grouping: Grouping {
+                                labels: vec![],
+                                without: false,
+                            },
+                        },
+                        inputs: vec![QueryNodeId(98)],
+                    },
+                ),
+                (
+                    QueryNodeId(98),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Sort {
+                            descending: true,
                             grouping: Grouping {
                                 labels: vec![],
                                 without: false,
@@ -1166,6 +1285,52 @@ mod topk_tests {
         }
     }
 
+    // Numeric boundary fields must reach Planner as numbers, never absent labels.
+    #[test]
+    fn semi_join_does_not_match_unequal_numeric_samples() {
+        let (rows, _) = semi_join(
+            vec![(Labels::new(), 2.0)],
+            vec![(Labels::new(), 1.0)],
+            &[("value".into(), "value".into())],
+            None,
+        )
+        .unwrap();
+        assert!(rows.is_empty(), "unequal numeric samples matched: {rows:?}");
+    }
+
+    #[test]
+    fn native_join_preserves_renamed_and_multiple_typed_keys() {
+        let left = vec![
+            (
+                labels(&[("instance", "a"), ("zone", "east"), ("extra", "kept")]),
+                1.,
+            ),
+            (labels(&[("instance", "a"), ("zone", "west")]), 2.),
+        ];
+        let right = vec![(labels(&[("pod", "a"), ("region", "east")]), 99.)];
+        let (selected, _) = semi_join(
+            right,
+            left.clone(),
+            &[
+                ("instance".into(), "pod".into()),
+                ("zone".into(), "region".into()),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected, vec![left[0].clone()]);
+        for (a, b, matched) in [(f64::NAN, f64::NAN, false), (-0., 0., true), (1., 1., true)] {
+            let (rows, _) = semi_join(
+                vec![(Labels::new(), b)],
+                vec![(Labels::new(), a)],
+                &[("value".into(), "value".into())],
+                None,
+            )
+            .unwrap();
+            assert_eq!(!rows.is_empty(), matched);
+        }
+    }
+
     #[test]
     fn candidate_sidecar_intersects_then_reranks_exact_values() {
         let candidates = vec![
@@ -1177,12 +1342,13 @@ mod topk_tests {
             (labels(&[("pod", "b")]), 8.0),
             (labels(&[("pod", "c")]), 9.0),
         ];
-        let (selected, warning) = membership_filter(
+        let (selected, warning) = semi_join(
             candidates,
             exact,
-            &CandidateCompleteness::Certified {
+            &[("pod".into(), "pod".into())],
+            Some(&CandidateCompleteness::Certified {
                 guarantee: topk_membership_guarantee(),
-            },
+            }),
         )
         .unwrap();
         let selected = topk_selection(
@@ -1228,20 +1394,59 @@ mod topk_tests {
                         reason: "prepared exact counter readout".into(),
                     },
                 ),
-                (
-                    filter,
-                    QueryPlanNode::MembershipFilter {
-                        inputs: [candidate_id, value_id],
-                        completeness: CandidateCompleteness::Certified {
+                (filter, {
+                    let schema = planner_types::post_asap::SummarySchema {
+                        fields: vec![planner_types::post_asap::SummaryField {
+                            name: "pod".into(),
+                            dtype: planner_types::post_asap::SummaryFamilyType::Plain(
+                                planner_types::pre_asap::DataType::Utf8,
+                            ),
+                            nullable: false,
+                        }],
+                        time_index: None,
+                    };
+                    QueryPlanNode::RelationalJoin {
+                        inputs: [value_id, candidate_id],
+                        join_kind: planner_types::pre_asap::JoinKind::Semi,
+                        pred: serde_json::to_value(planner_types::pre_asap::Predicate(
+                            std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
+                                left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
+                                    0,
+                                )),
+                                op: planner_types::pre_asap::CompareOpKind::Eq,
+                                right: std::rc::Rc::new(
+                                    planner_types::pre_asap::QueryExpr::Column(1),
+                                ),
+                            }),
+                        ))
+                        .unwrap(),
+                        pruning: Some(CandidateCompleteness::Certified {
                             guarantee: topk_membership_guarantee(),
-                        },
-                    },
-                ),
+                        }),
+                        left_schema: schema.clone(),
+                        right_schema: schema.clone(),
+                        output_schema: schema,
+                    }
+                }),
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::TopKSelection {
-                            k: 1,
+                        operator: ResidualQueryOperator::Limit {
+                            offset: 0,
+                            n: 1,
+                            grouping: Grouping {
+                                labels: vec![],
+                                without: false,
+                            },
+                        },
+                        inputs: vec![QueryNodeId(98)],
+                    },
+                ),
+                (
+                    QueryNodeId(98),
+                    QueryPlanNode::Logical {
+                        operator: ResidualQueryOperator::Sort {
+                            descending: true,
                             grouping: Grouping {
                                 labels: vec![],
                                 without: false,
@@ -1304,23 +1509,25 @@ mod topk_tests {
     fn uncertified_candidate_sidecar_warns_or_falls_back_explicitly() {
         let candidates = vec![(labels(&[("pod", "a")]), 1.0)];
         let exact = vec![(labels(&[("pod", "a")]), 2.0)];
-        let (_, warning) = membership_filter(
+        let (_, warning) = semi_join(
             candidates.clone(),
             exact.clone(),
-            &CandidateCompleteness::BestEffort { guarantee: None },
+            &[("pod".into(), "pod".into())],
+            Some(&CandidateCompleteness::BestEffort { guarantee: None }),
         )
         .unwrap();
         assert!(warning.unwrap().contains("approximate"));
-        // Exact queries never lower an uncertified MembershipFilter. The Planner
+        // Exact queries never lower an uncertified pruning semi-join. The Planner
         // emits its ordinary exact fallback instead; this runtime node is only
         // valid for certified or explicitly approximate plans.
         let certified = CandidateCompleteness::Certified {
             guarantee: topk_membership_guarantee(),
         };
-        assert!(membership_filter(
+        assert!(semi_join(
             vec![(labels(&[("pod", "missing")]), 1.0)],
             exact,
-            &certified,
+            &[("pod".into(), "pod".into())],
+            Some(&certified),
         )
         .is_err());
     }

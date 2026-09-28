@@ -59,6 +59,7 @@ fn encoding_to_tag(enc: SketchEncoding) -> u8 {
         SketchEncoding::ProtoDelta => t::PROTO_DELTA,
         SketchEncoding::MsgpackFull => t::MSGPACK_FULL,
         SketchEncoding::MsgpackDelta => t::MSGPACK_DELTA,
+        SketchEncoding::NativeBatchV1 => t::NATIVE_BATCH_V1,
     }
 }
 
@@ -72,6 +73,7 @@ fn tag_to_encoding(tag: u8) -> SketchEncoding {
         t::PROTO_DELTA => SketchEncoding::ProtoDelta,
         t::MSGPACK_FULL => SketchEncoding::MsgpackFull,
         t::MSGPACK_DELTA => SketchEncoding::MsgpackDelta,
+        t::NATIVE_BATCH_V1 => SketchEncoding::NativeBatchV1,
         // t::PROTO_FULL and t::UNKNOWN (legacy) both → Full.
         _ => SketchEncoding::ProtoFull,
     }
@@ -91,13 +93,13 @@ fn reconstruct_exact_agg(
     type_name: &str,
     bytes: &[u8],
 ) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
-    use crate::precompute_engine::operators::{
+    use crate::storage_engines::types::AggregateCore;
+    use asap_physical_operators::summary_kernels::{
         IncreaseAccumulator, KeyedCounterState, KeyedSumCountAccumulator, MaxAccumulator,
         MinAccumulator, SumAccumulator,
     };
-    use crate::storage_engines::types::AggregateCore;
     match type_name {
-        "PlannerExactAccumulatorV1" => crate::precompute_engine::operators::exact_accumulator::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
+        "PlannerExactAccumulatorV1" => asap_physical_operators::summary_kernels::exact::ExactAccumulator::deserialize_from_bytes(bytes).ok().map(|a|Box::new(a) as Box<dyn AggregateCore>),
         "SumAccumulator" => SumAccumulator::deserialize_from_bytes(bytes)
             .ok()
             .map(|a| Box::new(a) as Box<dyn AggregateCore>),
@@ -1522,12 +1524,12 @@ impl SketchStore {
         // string that had to agree with it.
         let rollup_value = payload
             .as_any()
-            .downcast_ref::<crate::precompute_engine::operators::MinAccumulator>()
+            .downcast_ref::<asap_physical_operators::summary_kernels::MinAccumulator>()
             .map(|acc| (RollupReduction::Min, acc.value))
             .or_else(|| {
                 payload
                     .as_any()
-                    .downcast_ref::<crate::precompute_engine::operators::MaxAccumulator>()
+                    .downcast_ref::<asap_physical_operators::summary_kernels::MaxAccumulator>()
                     .map(|acc| (RollupReduction::Max, acc.value))
             });
         let store = self
@@ -4413,7 +4415,7 @@ mod tests {
 
     #[test]
     fn precompute_payload_round_trips_through_storage() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
 
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
@@ -4454,7 +4456,7 @@ mod tests {
 
     #[test]
     fn query_precomputes_by_agg_returns_data_grouped_by_label_values() {
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
 
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
@@ -4608,7 +4610,7 @@ mod tests {
         assert!(sketch.as_sketch().is_some());
         assert!(sketch.as_exact_agg().is_none());
 
-        use crate::precompute_engine::operators::SumAccumulator;
+        use asap_physical_operators::summary_kernels::SumAccumulator;
         let exact_agg = AggPayload::ExactAgg(Arc::new(SumAccumulator::with_sum(1.0)));
         assert!(exact_agg.as_sketch().is_none());
         assert!(exact_agg.as_exact_agg().is_some());
@@ -5188,7 +5190,7 @@ mod tests {
             )
             .unwrap();
         assert!(inventory.instances.is_empty());
-        store.register(meta_with_policy(510, fingerprint));
+        store.register(meta_for_config(510, &state_config));
         store.append_sample(510, BTreeMap::new(), (0, 10_000), sample(2));
         assert_eq!(store.series_ids_for_policy(fingerprint), vec![510]);
         let incompatible = asap_types::summary_catalog::SummaryCatalog::from_materializations(
@@ -5420,7 +5422,7 @@ mod tests {
             850,
             BTreeMap::new(),
             (0, 30_000),
-            Box::new(crate::precompute_engine::operators::SumAccumulator::new())
+            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::new())
         ));
         // A flusher that captured metadata before completion cannot reopen it.
         writer.upsert_all(&[stale_record]).unwrap();
@@ -5882,7 +5884,7 @@ mod tests {
                     lv_zone("z0"),
                     (s, s + 30_000),
                     Box::new(
-                        crate::precompute_engine::operators::SumAccumulator::with_sum(
+                        asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
                             (i + 1) as f64,
                         ),
                     ),
@@ -6101,7 +6103,9 @@ mod tests {
                 lv_zone("z0"),
                 (s, s + 30_000),
                 Box::new(
-                    crate::precompute_engine::operators::SumAccumulator::with_sum((i + 1) as f64),
+                    asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
+                        (i + 1) as f64,
+                    ),
                 ),
             );
         }
@@ -6165,7 +6169,7 @@ mod tests {
                 lv_zone("z0"),
                 (s, s + 30_000),
                 Box::new({
-                    let mut acc = crate::precompute_engine::operators::SumAccumulator::new();
+                    let mut acc = asap_physical_operators::summary_kernels::SumAccumulator::new();
                     acc.update((i + 1) as f64);
                     acc.update(10.0);
                     acc
@@ -6358,8 +6362,8 @@ mod tests {
     // Flush and reopen must preserve Planner family rather than reconstructing Rate as Increase.
     #[test]
     fn planner_exact_families_survive_disk_eviction_and_restart() {
-        use crate::precompute_engine::operators::exact_accumulator::ExactAccumulator;
         use crate::storage_engines::types::{AggregateCore, AggregationType};
+        use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
         let kinds = [
             AggregationType::Sum,
             AggregationType::Count,

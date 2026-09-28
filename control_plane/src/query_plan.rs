@@ -136,6 +136,82 @@ where
     Ok(entry)
 }
 
+fn compile_native_fragment(
+    root: &Rc<SummaryNode>,
+    query_inputs: &[QueryNodeId],
+) -> Result<QueryPlanNode, QueryPlanError> {
+    use asap_physical_operators::physical_planner::{compile, InputContract};
+    use planner_types::post_asap::{compile_executable_dag, EdgeRole};
+    let invalid = |e: String| QueryPlanError::Invalid(e);
+    let dag = compile_executable_dag(root).map_err(|e| invalid(e.to_string()))?;
+    let mut edges = dag
+        .edges
+        .iter()
+        .filter(|e| e.consumer == dag.root)
+        .collect::<Vec<_>>();
+    edges.sort_by_key(|e| match e.role {
+        EdgeRole::Left => 0,
+        EdgeRole::Input => 1,
+        EdgeRole::Right => 2,
+    });
+    if edges.len() != query_inputs.len() {
+        return Err(invalid("physical frontier arity mismatch".into()));
+    }
+    let bindings = edges
+        .iter()
+        .zip(query_inputs)
+        .map(|(edge, &id)| (u64::from(edge.producer.0), id))
+        .collect::<BTreeMap<_, _>>();
+    let contracts = edges
+        .iter()
+        .map(|edge| {
+            (
+                u64::from(edge.producer.0),
+                InputContract::bounded(std::sync::Arc::new(edge.intermediate_schema.clone())),
+            )
+        })
+        .collect();
+    let physical =
+        compile(&dag, contracts, &[u64::from(dag.root.0)]).map_err(|e| invalid(e.to_string()))?;
+    let row_input = physical
+        .input_contracts()
+        .position(|(id, _)| bindings[&id] == query_inputs[0])
+        .unwrap();
+    let pruning = if let SummaryExpr::RelationalJoin {
+        left,
+        right,
+        pred,
+        pruning: Some(completeness),
+        ..
+    } = &root.expr
+    {
+        Some(asap_types::query_plan::PruningInputContract {
+            candidate_input: physical
+                .input_contracts()
+                .position(|(id, _)| bindings[&id] == query_inputs[1])
+                .unwrap(),
+            keys: asap_physical_operators::physical_planner::equijoin_keys(
+                pred,
+                &left.schema,
+                &right.schema,
+            )
+            .map_err(|e| invalid(e.to_string()))?,
+            completeness: completeness.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(QueryPlanNode::PhysicalFragment {
+        pruning,
+        row_input,
+        inputs: physical
+            .input_contracts()
+            .map(|(id, _)| bindings[&id])
+            .collect(),
+        dag: physical.encode().map_err(|e| invalid(e.to_string()))?,
+    })
+}
+
 struct DagCompiler<'a, F> {
     next_id: u64,
     nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
@@ -172,15 +248,15 @@ where
         }
         for (local, mut physical) in nodes {
             match &mut physical {
-                QueryPlanNode::Logical { inputs, .. }
+                QueryPlanNode::PhysicalFragment { inputs, .. }
+                | QueryPlanNode::Logical { inputs, .. }
                 | QueryPlanNode::SummaryMerge { inputs }
                 | QueryPlanNode::ExternalExact { inputs, .. } => {
                     for input in inputs {
                         *input = remap[input];
                     }
                 }
-                QueryPlanNode::MembershipFilter { inputs, .. }
-                | QueryPlanNode::Binary { inputs, .. }
+                QueryPlanNode::Binary { inputs, .. }
                 | QueryPlanNode::RelationalJoin { inputs, .. } => {
                     for input in inputs {
                         *input = remap[input];
@@ -257,10 +333,11 @@ where
                 right,
                 kind,
                 pred,
-                pruning: None,
+                pruning,
             } if self.preserve_relational => QueryPlanNode::RelationalJoin {
                 inputs: [self.lower(left)?, self.lower(right)?],
                 join_kind: kind.clone(),
+                pruning: pruning.clone(),
                 pred: serde_json::to_value(pred).map_err(|error| {
                     QueryPlanError::Invalid(format!(
                         "cannot serialize relational join predicate: {error}"
@@ -315,7 +392,6 @@ where
                     AggIntent::Min { .. } => Some(residual::Aggregation::Min),
                     AggIntent::Max { .. } => Some(residual::Aggregation::Max),
                     AggIntent::Avg { .. } => Some(residual::Aggregation::Avg),
-                    AggIntent::TopK { .. } => None,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported exact value aggregation".into(),
@@ -347,16 +423,9 @@ where
                     labels,
                     without: keys.is_without(),
                 };
-                let operator = if let AggIntent::TopK { k, .. } = &measures[0] {
-                    residual::ResidualQueryOperator::TopKSelection {
-                        k: *k as u64,
-                        grouping,
-                    }
-                } else {
-                    residual::ResidualQueryOperator::Aggregate {
-                        operation: operation.expect("aggregate operation"),
-                        grouping,
-                    }
+                let operator = residual::ResidualQueryOperator::Aggregate {
+                    operation: operation.expect("aggregate operation"),
+                    grouping,
                 };
                 QueryPlanNode::Logical {
                     operator,
@@ -364,91 +433,16 @@ where
                 }
             }
             SummaryExpr::ValueOperation {
-                child: sort,
+                child,
                 operation:
-                    planner_types::post_asap::ValueOperation::Limit {
-                        n,
-                        offset: 0,
-                        partition_by: limit_partition,
-                    },
+                    planner_types::post_asap::ValueOperation::Limit { .. }
+                    | planner_types::post_asap::ValueOperation::Sort { .. }
+                    | planner_types::post_asap::ValueOperation::Filter { .. },
                 timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             } => {
-                let SummaryExpr::ValueOperation {
-                    child,
-                    operation: planner_types::post_asap::ValueOperation::Sort { keys, partition_by },
-                    timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-                } = &sort.expr
-                else {
-                    return Err(QueryPlanError::Invalid(
-                        "query-time Limit must consume a query-time Sort".into(),
-                    ));
-                };
-                if limit_partition != partition_by {
-                    return Err(QueryPlanError::Invalid(
-                        "TopK Limit and Sort grouping differ".into(),
-                    ));
-                }
-                if keys.len() != 1 || keys[0].ascending {
-                    return Err(QueryPlanError::Invalid(
-                        "only descending value-ranked TopK is executable".into(),
-                    ));
-                }
-                let planner_types::pre_asap::QueryExpr::Column(sort_column) = &keys[0].expr else {
-                    return Err(QueryPlanError::Invalid(
-                        "TopK sort key must reference the child value column".into(),
-                    ));
-                };
-                if !matches!(
-                    child
-                        .schema
-                        .fields
-                        .get(*sort_column)
-                        .map(|field| &field.dtype),
-                    Some(SummaryFamilyType::Plain(
-                        planner_types::pre_asap::DataType::Float64
-                    )) | Some(SummaryFamilyType::ExactAggregate(..))
-                ) {
-                    return Err(QueryPlanError::Invalid(
-                        "TopK sort key must produce a numeric value".into(),
-                    ));
-                }
-                let labels = partition_by
-                    .keys()
-                    .iter()
-                    .map(|&column| {
-                        child
-                            .schema
-                            .fields
-                            .get(column)
-                            .map(|field| field.name.clone())
-                            .ok_or_else(|| {
-                                QueryPlanError::Invalid("unresolved TopK partition column".into())
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                QueryPlanNode::Logical {
-                    operator: residual::ResidualQueryOperator::TopKSelection {
-                        k: u64::try_from(*n).map_err(|_| {
-                            QueryPlanError::Invalid("TopK limit exceeds u64".into())
-                        })?,
-                        grouping: residual::Grouping {
-                            labels,
-                            without: partition_by.is_without(),
-                        },
-                    },
-                    inputs: vec![self.lower(child)?],
-                }
+                let input = self.lower(child)?;
+                compile_native_fragment(node, &[input])?
             }
-            SummaryExpr::ValueOperation {
-                child,
-                operation: planner_types::post_asap::ValueOperation::Sort { keys, .. },
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } if keys.len() == 1 => QueryPlanNode::Logical {
-                operator: residual::ResidualQueryOperator::Sort {
-                    descending: !keys[0].ascending,
-                },
-                inputs: vec![self.lower(child)?],
-            },
             SummaryExpr::ValueOperation { .. } => QueryPlanNode::ExactFallback {
                 reason: "unsupported post-ASAP value operation".into(),
             },
@@ -456,35 +450,14 @@ where
                 right: candidates,
                 left: values,
                 kind: planner_types::pre_asap::JoinKind::Semi,
-                pruning: Some(completeness),
-                pred,
-            } if !self.preserve_relational => {
-                validate_membership_join(pred, &values.schema, &candidates.schema)?;
+                pruning,
+                ..
+            } => {
                 let candidate_input = self.lower(candidates)?;
-                let value_input = if let Some(original) = &self.logical_source {
+                let value_input = if let Some(original) =
+                    self.logical_source.as_ref().filter(|_| pruning.is_some())
+                {
                     let exact_expression = residual::selected_native_expression(original, values)?;
-                    fn item_label(node: &SummaryNode) -> Option<String> {
-                        match &node.expr {
-                            SummaryExpr::SummaryEstimate { summary_input, .. } => {
-                                item_label(summary_input)
-                            }
-                            SummaryExpr::SummaryAgg { input, .. } => match &input.item {
-                                Some(planner_types::post_asap::SummaryInputExpr::Column(
-                                    planner_types::pre_asap::ColumnRef::Named(label),
-                                )) => Some(label.clone()),
-                                Some(planner_types::post_asap::SummaryInputExpr::Column(
-                                    planner_types::pre_asap::ColumnRef::Qualified { name, .. },
-                                )) => Some(name.clone()),
-                                _ => None,
-                            },
-                            _ => None,
-                        }
-                    }
-                    let item_label = item_label(candidates).ok_or_else(|| {
-                        QueryPlanError::Invalid(
-                            "MembershipFilter membership has no named item label".into(),
-                        )
-                    })?;
                     let value_id = QueryNodeId(self.next_id);
                     self.next_id += 1;
                     self.nodes.insert(
@@ -497,25 +470,51 @@ where
                                 parameters: BTreeMap::new(),
                                 start_parameter: None,
                                 end_parameter: None,
-                                input_contracts: vec![ExternalExactInput::CandidateMembership {
-                                    item_label,
-                                }],
+                                // The external source provides values; the Planner DAG owns matching.
+                                input_contracts: vec![],
                             },
-                            inputs: vec![candidate_input],
+                            inputs: vec![],
                         },
                     );
                     value_id
                 } else {
                     self.lower(values)?
                 };
-                QueryPlanNode::MembershipFilter {
-                    inputs: [candidate_input, value_input],
-                    completeness: completeness.clone(),
-                }
+                compile_native_fragment(node, &[value_input, candidate_input])?
             }
             SummaryExpr::RelationalJoin { .. } => QueryPlanNode::ExactFallback {
-                reason: "read-time relational join requires the relational compiler".into(),
+                reason: "unsupported join in vector adapter".into(),
             },
+            SummaryExpr::BinaryOp {
+                lhs,
+                rhs,
+                operator,
+                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
+            } if matches!(
+                operator.kind,
+                planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+            ) && operator.vector_match.is_none()
+                && !operator.checked_relative_division
+                && !operator.checked_finite_division
+                && node.guarantee.as_ref().is_some_and(|g| !g.has_unknown())
+                && [lhs, rhs].iter().all(|operand| {
+                    matches!(
+                        operand.expr,
+                        SummaryExpr::SummaryEstimate {
+                            query: planner_types::post_asap::SketchQuery::Quantile { .. },
+                            ..
+                        }
+                    )
+                }) =>
+            {
+                let planner_types::pre_asap::BinaryOpKind::Arithmetic(kind) = &operator.kind else {
+                    unreachable!()
+                };
+                QueryPlanNode::Binary {
+                    inputs: [self.lower(lhs)?, self.lower(rhs)?],
+                    operator: kind.clone(),
+                }
+            }
             SummaryExpr::BinaryOp {
                 lhs,
                 rhs,
@@ -1337,6 +1336,82 @@ mod tests {
         assert_eq!(plan.lookup_clickhouse("shared").unwrap().query_id, "sql");
     }
 
+    // A protocol-vector binding cannot silently invent fields or reconstruct changed rows.
+    #[test]
+    fn physical_binding_rejects_invented_samples_and_changed_rows() {
+        use asap_physical_operators::{
+            operators::{Expression, Operator},
+            physical_planner::{CompiledPhysicalDag, InputContract},
+        };
+        use planner_types::{
+            post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+            pre_asap::DataType,
+        };
+        for duplicate_sample in [false, true] {
+            let schema = std::sync::Arc::new(SummarySchema {
+                fields: (0..if duplicate_sample { 2 } else { 1 })
+                    .map(|i| SummaryField {
+                        name: format!("v{i}"),
+                        dtype: SummaryFamilyType::Plain(DataType::Float64),
+                        nullable: false,
+                    })
+                    .collect(),
+                time_index: None,
+            });
+            let op = if duplicate_sample {
+                Operator::limit(schema.clone(), 1, 0, vec![]).unwrap()
+            } else {
+                Operator::project(schema.clone(), vec![("v0".into(), Expression::Column(0))])
+                    .unwrap()
+            };
+            let compiled = CompiledPhysicalDag::from_operators(
+                [(0, InputContract::bounded(schema))].into(),
+                [(1, (vec![0], op))].into(),
+                vec![1],
+            )
+            .unwrap();
+            let entry = QueryPlanEntry {
+                language: QueryLanguage::PromQl,
+                query_id: "q".into(),
+                canonical_query: "topk(1, m)".into(),
+                fixed_evaluation: None,
+                root: QueryNodeId(1),
+                nodes: BTreeMap::from([
+                    (
+                        QueryNodeId(0),
+                        QueryPlanNode::ExactFallback {
+                            reason: "prepared source".into(),
+                        },
+                    ),
+                    (
+                        QueryNodeId(1),
+                        QueryPlanNode::PhysicalFragment {
+                            inputs: vec![QueryNodeId(0)],
+                            dag: compiled.encode().unwrap(),
+                            row_input: 0,
+                            pruning: None,
+                        },
+                    ),
+                ]),
+                instant: InstantExecution {
+                    lookback_ms: 0,
+                    full_history: false,
+                    cumulative_readout: false,
+                },
+                fallback: FallbackPolicy::Reject,
+            };
+            let error = entry.validate(&BTreeSet::new()).unwrap_err().to_string();
+            assert!(
+                error.contains(if duplicate_sample {
+                    "one numeric sample"
+                } else {
+                    "preserve its bound input rows"
+                }),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn graph_validation_rejects_cycles() {
         let mut nodes = BTreeMap::new();
@@ -1368,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_filter_rejects_invalid_completeness_contract() {
+    fn semi_join_rejects_invalid_completeness_contract() {
         let leaf = QueryPlanNode::ExactFallback {
             reason: "prepared".into(),
         };
@@ -1381,11 +1456,33 @@ mod tests {
             nodes: BTreeMap::from([
                 (QueryNodeId(0), leaf.clone()),
                 (QueryNodeId(1), leaf),
-                (
-                    QueryNodeId(2),
-                    QueryPlanNode::MembershipFilter {
-                        inputs: [QueryNodeId(0), QueryNodeId(1)],
-                        completeness: CandidateCompleteness::Certified {
+                (QueryNodeId(2), {
+                    let schema = planner_types::post_asap::SummarySchema {
+                        fields: vec![planner_types::post_asap::SummaryField {
+                            name: "pod".into(),
+                            dtype: planner_types::post_asap::SummaryFamilyType::Plain(
+                                planner_types::pre_asap::DataType::Utf8,
+                            ),
+                            nullable: false,
+                        }],
+                        time_index: None,
+                    };
+                    QueryPlanNode::RelationalJoin {
+                        inputs: [QueryNodeId(1), QueryNodeId(0)],
+                        join_kind: planner_types::pre_asap::JoinKind::Semi,
+                        pred: serde_json::to_value(planner_types::pre_asap::Predicate(
+                            std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
+                                left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
+                                    0,
+                                )),
+                                op: planner_types::pre_asap::CompareOpKind::Eq,
+                                right: std::rc::Rc::new(
+                                    planner_types::pre_asap::QueryExpr::Column(1),
+                                ),
+                            }),
+                        ))
+                        .unwrap(),
+                        pruning: Some(CandidateCompleteness::Certified {
                             guarantee: planner_types::post_asap::ResultGuarantee {
                                 metric: planner_types::post_asap::ErrorMetric::Frequency,
                                 bound: planner_types::post_asap::BoundExpr::Unknown {
@@ -1397,9 +1494,12 @@ mod tests {
                                     },
                                 provenance: vec![],
                             },
-                        },
-                    },
-                ),
+                        }),
+                        left_schema: schema.clone(),
+                        right_schema: schema.clone(),
+                        output_schema: schema,
+                    }
+                }),
             ]),
             instant: InstantExecution {
                 lookback_ms: 300_000,
@@ -1409,132 +1509,5 @@ mod tests {
             fallback: FallbackPolicy::ExactBackend,
         };
         assert!(entry.validate(&BTreeSet::new()).is_err());
-    }
-}
-
-// The vector adapter matches complete label identities. Reject joins whose
-// predicate would require a different projection instead of silently widening it.
-fn validate_membership_join(
-    pred: &planner_types::pre_asap::Predicate,
-    left: &planner_types::post_asap::SummarySchema,
-    right: &planner_types::post_asap::SummarySchema,
-) -> Result<(), QueryPlanError> {
-    use planner_types::post_asap::SummaryFamilyType;
-    use planner_types::pre_asap::{CompareOpKind, DataType, QueryExpr};
-    use std::collections::BTreeSet;
-    fn collect(
-        expr: &QueryExpr,
-        width: usize,
-        keys: &mut Vec<(usize, usize)>,
-    ) -> Result<(), QueryPlanError> {
-        match expr {
-            QueryExpr::BoolAnd(parts) => {
-                for part in parts {
-                    collect(part, width, keys)?;
-                }
-            }
-            QueryExpr::Compare {
-                left,
-                op: CompareOpKind::Eq,
-                right,
-            } => {
-                let (QueryExpr::Column(a), QueryExpr::Column(b)) = (left.as_ref(), right.as_ref())
-                else {
-                    return Err(QueryPlanError::Invalid(
-                        "membership join requires column equality".into(),
-                    ));
-                };
-                let (a, b) = if a < b { (*a, *b) } else { (*b, *a) };
-                if a >= width || b < width {
-                    return Err(QueryPlanError::Invalid(
-                        "membership join requires cross-input keys".into(),
-                    ));
-                }
-                keys.push((a, b - width));
-            }
-            _ => {
-                return Err(QueryPlanError::Invalid(
-                    "unsupported membership join predicate".into(),
-                ))
-            }
-        }
-        Ok(())
-    }
-    let labels = |schema: &planner_types::post_asap::SummarySchema| {
-        schema
-            .fields
-            .iter()
-            .filter(|f| {
-                f.name != "__name__" && matches!(f.dtype, SummaryFamilyType::Plain(DataType::Utf8))
-            })
-            .map(|f| f.name.clone())
-            .collect::<BTreeSet<_>>()
-    };
-    let mut keys = Vec::new();
-    collect(&pred.0, left.fields.len(), &mut keys)?;
-    let mut matched = BTreeSet::new();
-    for (a, b) in keys {
-        let Some((a, b)) = left.fields.get(a).zip(right.fields.get(b)) else {
-            return Err(QueryPlanError::Invalid(
-                "membership join key out of bounds".into(),
-            ));
-        };
-        if a.name != b.name {
-            return Err(QueryPlanError::Invalid(
-                "membership join requires matching label names".into(),
-            ));
-        }
-        matched.insert(a.name.clone());
-    }
-    if matched.is_empty() || matched != labels(left) || matched != labels(right) {
-        return Err(QueryPlanError::Invalid(
-            "membership join must match the complete label identity".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod membership_binding_tests {
-    use super::*;
-    use planner_types::{
-        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
-        pre_asap::{CompareOpKind, DataType, Predicate, QueryExpr},
-    };
-
-    // This adapter can implement full-label equality only; reject narrower joins.
-    #[test]
-    fn membership_binding_rejects_other_join_semantics() {
-        let schema = |names: &[&str]| SummarySchema {
-            fields: names
-                .iter()
-                .map(|name| SummaryField {
-                    name: (*name).into(),
-                    dtype: SummaryFamilyType::Plain(DataType::Utf8),
-                    nullable: false,
-                })
-                .collect(),
-            time_index: None,
-        };
-        let eq = |a, b| QueryExpr::Compare {
-            left: Rc::new(QueryExpr::Column(a)),
-            op: CompareOpKind::Eq,
-            right: Rc::new(QueryExpr::Column(b)),
-        };
-        let one = schema(&["job"]);
-        assert!(validate_membership_join(&Predicate(Rc::new(eq(0, 1))), &one, &one).is_ok());
-        assert!(
-            validate_membership_join(&Predicate(Rc::new(eq(0, 1))), &one, &schema(&["host"]))
-                .is_err()
-        );
-        assert!(validate_membership_join(&Predicate(Rc::new(eq(0, 2))), &one, &one).is_err());
-        assert!(validate_membership_join(
-            &Predicate(Rc::new(QueryExpr::BoolAnd(vec![]))),
-            &one,
-            &one
-        )
-        .is_err());
-        let two = schema(&["job", "host"]);
-        assert!(validate_membership_join(&Predicate(Rc::new(eq(0, 2))), &two, &two).is_err());
     }
 }

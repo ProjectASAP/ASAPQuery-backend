@@ -3,9 +3,35 @@
 > Interface status: implemented MVP API in
 > `control_plane::physical::compiler`.
 
+## Dataset-bound planning input
+
+Planning snapshots use version 3 and require an explicit identity:
+
+```json
+{
+  "snapshot_version": 3,
+  "environment": {
+    "dataset_identity": {"namespace": "tenant-a", "dataset": "requests"}
+  }
+}
+```
+
+This is an excerpt; the normal workload, capabilities and policy fields remain
+required. All input source names in this deployment resolve within that logical
+dataset. The source authority must supply the identity; the compiler does not
+infer a tenant from a metric name or endpoint. Separate datasets require separate
+bindings rather than multiplexing indistinguishable inputs through this channel.
+
+Planner exports dataset-bound semantic fragments (version 2). The precompute
+input contract carries the same identity and validates it against stored-output
+semantics. Catalog schema 6 marks the changed contract; old planning snapshots
+and catalog schemas fail validation. Changing an endpoint or replica for the same
+dataset does not change the semantic definition. Dataset identity participates
+in workload cost manifests so quotes cannot cross dataset scopes.
+
 ## Current implementation boundary
 
-The compiler consumes ASAPPlanner types from `main`, with the resolved revision
+The compiler consumes pinned ASAPPlanner types, with the resolved revision
 exposed as `physical::compiler::PLANNER_REVISION`, and selects
 from Planner's legal candidate space with backend-owned cost and evidence
 inputs, and emits one `CompiledPhysicalPlan`. The plan contains one SummaryCatalog plus
@@ -15,44 +41,39 @@ for every target collector. Legacy
 `StageAllocator`/`ThreeStageEmitter` paths remain for older publication flows;
 they are not a second semantic planner.
 
-ASAPPlanner owns abstract semantics and selection: summary family and
-parameters, summary-maintenance lifecycle, and summary-window framework. The
-backend enumerates executor-feasible concrete implementations and supplies
-complete workload-scoped cost evidence to Planner. It then retains the
-concrete identity corresponding to Planner's selected abstract framework.
+ASAPPlanner owns semantics and physical candidate construction, including summary
+families, maintenance lifecycles and physical boundaries. Backend evaluates
+candidate feasibility and complete workload-scoped costs, then selects and binds
+the deployment without changing its computation.
 Missing or stale implementation evidence makes the candidate unavailable; the
 compiler never invents a framework or assigns it an optimistic zero cost.
 
 ## 1. Code architecture
 
-The control plane has three public layers:
+The planning and deployment boundary is:
 
 ```text
-PhysicalCompilationRequest + DataWorkload + concrete implementation evidence
-      |                                      ^
-      | abstract candidates                  | complete physical costs
-      v                                      |
-ASAPPlanner selection <---------- DeploymentPlanCompiler
-      |
-      v
-DeploymentPlanCompiler -------> CompiledPhysicalPlan
-                            |       |       |      |
-                            v       v       v      v
-                      Collector  Precompute Backend Query
-                         Plan       Plan     Plan   DAG
+Query workload + accuracy requirements
+                 ↓
+ASAPPlanner: supported, semantically legal physical candidates
+                 ↓
+Backend: feasibility checks + workload-scoped candidate costs
+                 ↓
+DeploymentPlanCompiler: select and bind a physical candidate
+                 ↓
+CompiledPhysicalPlan
+    CollectorPlan + PrecomputePlan + TransmissionPlan + QueryPlan
+                 ↓
+Publication and execution
 ```
 
-- **Planner selection boundary** is
-  `planner_selection::select_summary_with_evidence`. It enumerates Planner's
-  candidates and commits only a legal candidate.
-- **Physical compiler** enumerates concrete window/pane/state-layout,
-  placement, transport, and runtime implementations without changing the
-  Planner-owned abstract framework.
-- **CompiledPhysicalPlan** is the only output passed to publication. Its SummaryCatalog,
-  CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan are created together and share identities.
+Planner owns computation, operator choices, sharing and materialization
+boundaries. Backend supplies deployment capabilities and evidence, selects among
+admitted physical candidates, and binds the chosen graph to concrete inputs and
+stored outputs. It does not reinterpret summary operations into another logical
+plan. All published projections share the same catalog and identities.
 
-Logical query parsing, summary alternatives, guarantees, and candidate search
-remain public ASAPPlanner interfaces. Runtime publication is documented in
+Runtime publication is documented in
 [Runtime plan publication](plan-publication.md).
 
 ## 2. Public interfaces and definitions
