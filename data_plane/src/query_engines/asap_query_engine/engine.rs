@@ -470,12 +470,7 @@ impl ASAPQueryEngine {
                     &subtree,
                     evaluation_ms,
                 )
-                .map_err(|e| {
-                    EngineError::capability_miss(
-                        "installed_logical_dag",
-                        format!("bound readout failed: {e:?}"),
-                    )
-                })?;
+                .map_err(EngineError::from)?;
                 let active = self.active_physical_plan.as_ref().ok_or_else(|| {
                     EngineError::capability_miss(
                         "installed_logical_dag",
@@ -847,6 +842,9 @@ impl ASAPQueryEngine {
             }
             Ok(result)
         }).map_err(|reason| {
+            if let super::post_asap_readout::LoweringSkip::Execution(error) = reason {
+                return crate::query_engines::EngineError::Physical(error);
+            }
             if let Some(req) = Self::requirements_from_query_str(query) {
             }
             crate::query_engines::EngineError::capability_miss(
@@ -1099,6 +1097,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 }
                 Ok((result, t0_ms))
             }).map_err(|reason| {
+            if let super::post_asap_readout::LoweringSkip::Execution(error) = reason {
+                return crate::query_engines::EngineError::Physical(error);
+            }
                     if let Some(req) = Self::requirements_from_query_str(query) {
                     }
                     crate::query_engines::EngineError::capability_miss(
