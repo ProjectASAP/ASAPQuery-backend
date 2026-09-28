@@ -55,6 +55,7 @@ pub fn install_selected_dag(
     }
     precompute_sinks.sort();
     let installed = InstalledPostAsapDag {
+        native_programs: std::collections::BTreeMap::new(),
         document: OwnedPostAsapDag::from_executable(query_id, dag)?,
         binding: BackendExecutableBinding {
             nodes,

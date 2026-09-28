@@ -78,11 +78,14 @@ fn snapshot_work(
     entry: &asap_types::query_plan::QueryPlanEntry,
     rows: f64,
 ) -> Result<(f64, f64), CompileError> {
-    use planner_types::post_asap::{SketchParams, SummaryFamilyType};
     let program = entry
         .physical_dag
         .as_ref()
         .ok_or_else(|| invalid("missing snapshot physical program"))?;
+    physical_work(program, rows)
+}
+fn physical_work(program: &Value, rows: f64) -> Result<(f64, f64), CompileError> {
+    use planner_types::post_asap::{SketchParams, SummaryFamilyType};
     let nodes = program["nodes"]
         .as_object()
         .ok_or_else(|| invalid("invalid snapshot program"))?;
@@ -129,6 +132,7 @@ fn snapshot_work(
                 items += rows * (depth + capacity.max(2.0).log2());
                 bytes += groups * (width * depth * 8.0 + capacity * (SERIES_BYTES + 24.0));
             }
+            "Readout" => items += rows,
             "KeyedReadout" => items += rows * rows.max(2.0).log2(),
             _ => {
                 return Err(invalid(format!(
@@ -355,6 +359,31 @@ pub(super) fn estimate(
                     vec![],
                     json!({"input_samples": items, "retained_raw_bytes": raw_retained, "cpu_seconds_per_sample": CPU_PER_ITEM,
                     "backend_summary_decode_charged_in_transport": remote_backend}),
+                ),
+            )?;
+        } else if id.starts_with("maintenance:") {
+            let binding = &demand.implementation;
+            let interval = binding["interval_ms"]
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| invalid("invalid native maintenance interval"))?
+                as f64
+                / 1000.0;
+            let window = binding["window_ms"]
+                .as_u64()
+                .ok_or_else(|| invalid("missing native window"))? as f64
+                / 1000.0;
+            let (cpu, workspace) = physical_work(&binding["physical_program"], cardinality)?;
+            let runs = (horizon / interval).ceil();
+            let counter_scan = cardinality * (window / cadence).ceil() * CPU_PER_ITEM;
+            insert(
+                id.clone(),
+                resources(
+                    runs * (cpu + counter_scan),
+                    workspace * horizon,
+                    0.0,
+                    vec![],
+                    json!({"runs":runs,"input_series":cardinality,"window_seconds":window,"workspace_bytes_bound":workspace,"physical_program":binding["physical_program"]}),
                 ),
             )?;
         } else if id.starts_with("state:") {

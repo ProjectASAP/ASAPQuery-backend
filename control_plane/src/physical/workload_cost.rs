@@ -215,6 +215,28 @@ pub fn manifest(
             }
         }
     }
+    for installed in plan.precompute_plan.executable_dags.values() {
+        for (sink, program) in &installed.native_programs {
+            let Some(asap_types::executable_plan::BackendNodeBinding::Materialization {
+                stored_output,
+            }) = installed.binding.node(*sink)
+            else {
+                return Err(invalid("native maintenance sink is unbound"));
+            };
+            let config = plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|m| m.policy_fingerprint() == stored_output.fingerprint())
+                .ok_or_else(|| invalid("native maintenance config is absent"))?;
+            add(
+                format!("maintenance:{}", stored_output.0),
+                json!({"physical_program":program,"stored_output":stored_output,"window_ms":config.stored_window_ms(),"interval_ms":config.slide_interval.saturating_mul(1000)}),
+                "horizon",
+                1.0,
+            );
+        }
+    }
     for rule in &plan.transmission_plan.rules {
         add(
             format!("transport:{}:{}", rule.producer_id, rule.materialization.0),
