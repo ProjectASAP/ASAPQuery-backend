@@ -77,7 +77,6 @@ def main():
                             "declared_interval_ms": interval, "evaluation_phase_ms": phase,
                             "lookback_method": "derived by the backend compiler from PromQL and the declared scrape cadence"})
     snapshot["query_workload"].update(repeating_queries=registrations, query_batch=None)
-    snapshot["snapshot_version"] = 2
     snapshot.pop("workload_cost_evidence", None)
     implementation = snapshot["implementation"]
     implementation.pop("source_sample_interval_ms", None)

@@ -104,7 +104,6 @@ def main():
     evidence, audit = calibrate(json.loads(args.candidates.read_text()), json.loads(args.measurements.read_text()),
                                 "sha256:" + digest(args.metrics), snapshot["environment"]["observed_at_unix_ms"],
                                 snapshot["environment"]["max_evidence_age_ms"])
-    snapshot["snapshot_version"] = 2
     snapshot["workload_cost_evidence"] = evidence
     args.output.write_text(json.dumps(snapshot, indent=2, allow_nan=False) + "\n")
     args.output.with_suffix(".calibration.json").write_text(json.dumps(audit, indent=2, allow_nan=False) + "\n")
