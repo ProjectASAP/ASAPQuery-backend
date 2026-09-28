@@ -2,7 +2,7 @@
 use super::compiler::{CompileError, PhysicalCompilationRequest, QueryCompilationInput};
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
-    residual::{Grouping, LabelMatch, LabelMatcher, ResidualQueryOperator},
+    query_time::{Grouping, LabelMatch, LabelMatcher, QueryTimeOperator},
 };
 use planner_types::post_asap::{
     maintained_population::*, SummaryExpr, SummaryNode, ValueOperation,
@@ -43,7 +43,7 @@ pub(super) fn supported(request: &PhysicalCompilationRequest) -> bool {
 pub(super) fn operator(
     request: &PhysicalCompilationRequest,
     query: &QueryCompilationInput,
-) -> Result<Option<ResidualQueryOperator>, CompileError> {
+) -> Result<Option<QueryTimeOperator>, CompileError> {
     let Some((spec, readout)) = selected(&query.selected_plan_root) else {
         return Ok(None);
     };
@@ -104,7 +104,7 @@ pub(super) fn operator(
         PopulationReadout::Count => SeriesReadout::Count,
         PopulationReadout::Average => SeriesReadout::Average,
     };
-    Ok(Some(ResidualQueryOperator::CurrentSeries {
+    Ok(Some(QueryTimeOperator::CurrentSeries {
         population,
         readout,
     }))

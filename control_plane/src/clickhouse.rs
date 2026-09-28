@@ -295,7 +295,7 @@ pub async fn compile_automatic_clickhouse_workload(
         installed_dags.insert(
             query.sql.clone(),
             installed
-                .maintenance_projection()
+                .precompute_projection()
                 .map_err(ClickHousePlanningError::Lower)?,
         );
     }
@@ -450,7 +450,7 @@ pub async fn compile_clickhouse_workload(
         installed_dags.insert(
             query.sql.clone(),
             installed
-                .maintenance_projection()
+                .precompute_projection()
                 .map_err(ClickHousePlanningError::Lower)?,
         );
         let identity =

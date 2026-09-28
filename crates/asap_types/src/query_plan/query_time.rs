@@ -1,4 +1,4 @@
-//! Typed installed residual operators; no Planner selection or AST lowering.
+//! Typed installed query-time operators; no Planner selection or AST lowering.
 use super::QueryPlanError;
 use promql_parser::parser::{self, Expr};
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ fn invalid(message: impl Into<String>) -> QueryPlanError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResidualQueryOperator {
+pub enum QueryTimeOperator {
     /// Readout over a bounded current-value population maintained at ingest.
     CurrentSeries {
         population: super::current_series::SeriesPopulation,
@@ -123,7 +123,7 @@ pub enum TemporalOperation {
     Count,
 }
 
-impl ResidualQueryOperator {
+impl QueryTimeOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
         if let Self::CurrentSeries {
             population,
@@ -184,5 +184,5 @@ impl ResidualQueryOperator {
 }
 
 // Compatibility imports; new callers use the domain names above.
-#[deprecated(note = "Use ResidualQueryOperator")]
-pub use ResidualQueryOperator as LogicalOperator;
+#[deprecated(note = "Use QueryTimeOperator")]
+pub use QueryTimeOperator as LogicalOperator;

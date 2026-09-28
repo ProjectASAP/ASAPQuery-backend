@@ -375,10 +375,10 @@ impl ASAPQueryEngine {
             asap_types::query_plan::QueryPlanNode::ExternalExact { .. } => false,
             asap_types::query_plan::QueryPlanNode::Logical { operator, .. } => !matches!(
                 operator,
-                asap_types::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
-                    | asap_types::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }
-                    | asap_types::query_plan::residual::ResidualQueryOperator::Subquery { .. }
-                    | asap_types::query_plan::residual::ResidualQueryOperator::Scan { .. }
+                asap_types::query_plan::query_time::QueryTimeOperator::ExactSubquery { .. }
+                    | asap_types::query_plan::query_time::QueryTimeOperator::CandidateExactSubquery { .. }
+                    | asap_types::query_plan::query_time::QueryTimeOperator::Subquery { .. }
+                    | asap_types::query_plan::query_time::QueryTimeOperator::Scan { .. }
             ),
             _ => true,
         }) {
@@ -502,7 +502,7 @@ impl ASAPQueryEngine {
             |root, evaluation_ms| {
                 if let Some(asap_types::query_plan::QueryPlanNode::Logical {
                     operator:
-                        asap_types::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                        asap_types::query_plan::query_time::QueryTimeOperator::CurrentSeries {
                             population,
                             readout,
                         },

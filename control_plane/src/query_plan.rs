@@ -2,7 +2,7 @@
 //! Serving consumes asap_types::query_plan; compilation stays in this component.
 
 mod clickhouse_exact;
-pub mod residual;
+pub mod query_time;
 
 pub use asap_types::query_plan::*;
 #[cfg(test)]
@@ -132,7 +132,7 @@ where
         instant,
         fallback,
     };
-    residual::finalize_residuals(&mut entry)?;
+    query_time::finalize_query_time_nodes(&mut entry)?;
     Ok(entry)
 }
 
@@ -304,9 +304,9 @@ where
         let id = QueryNodeId(self.next_id);
         self.next_id += 1;
         self.seen.insert(identity, id);
-        let residual = match (&self.logical_source, &node.expr) {
+        let query_time = match (&self.logical_source, &node.expr) {
             (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
-                Some(residual::residual_nodes(original, expr)?)
+                Some(query_time::query_time_nodes(original, expr)?)
             }
             (Some(original), SummaryExpr::SummaryAgg { child, .. })
                 if matches!(child.expr, SummaryExpr::KeepPreAsap(_))
@@ -315,11 +315,11 @@ where
                         Ok((_, Some(_), _))
                     ) =>
             {
-                Some(residual::selected_residual_nodes(original, node)?)
+                Some(query_time::selected_query_time_nodes(original, node)?)
             }
             _ => None,
         };
-        if let Some((root, nodes)) = residual {
+        if let Some((root, nodes)) = query_time {
             let id = self.graft(id, root, nodes)?;
             if let Some(lowered) = &mut self.lowered {
                 lowered(node, id);
@@ -387,11 +387,11 @@ where
             } if measures.len() == 1 => {
                 use planner_types::pre_asap::AggIntent;
                 let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => Some(residual::Aggregation::Sum),
-                    AggIntent::Count { .. } => Some(residual::Aggregation::Count),
-                    AggIntent::Min { .. } => Some(residual::Aggregation::Min),
-                    AggIntent::Max { .. } => Some(residual::Aggregation::Max),
-                    AggIntent::Avg { .. } => Some(residual::Aggregation::Avg),
+                    AggIntent::Sum { .. } => Some(query_time::Aggregation::Sum),
+                    AggIntent::Count { .. } => Some(query_time::Aggregation::Count),
+                    AggIntent::Min { .. } => Some(query_time::Aggregation::Min),
+                    AggIntent::Max { .. } => Some(query_time::Aggregation::Max),
+                    AggIntent::Avg { .. } => Some(query_time::Aggregation::Avg),
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported exact value aggregation".into(),
@@ -419,11 +419,11 @@ where
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let grouping = residual::Grouping {
+                let grouping = query_time::Grouping {
                     labels,
                     without: keys.is_without(),
                 };
-                let operator = residual::ResidualQueryOperator::Aggregate {
+                let operator = query_time::QueryTimeOperator::Aggregate {
                     operation: operation.expect("aggregate operation"),
                     grouping,
                 };
@@ -457,7 +457,8 @@ where
                 let value_input = if let Some(original) =
                     self.logical_source.as_ref().filter(|_| pruning.is_some())
                 {
-                    let exact_expression = residual::selected_native_expression(original, values)?;
+                    let exact_expression =
+                        query_time::selected_native_expression(original, values)?;
                     let value_id = QueryNodeId(self.next_id);
                     self.next_id += 1;
                     self.nodes.insert(
@@ -524,7 +525,7 @@ where
                 || operator.checked_relative_division
                 || operator.checked_finite_division =>
             {
-                let operator = residual::binary_operator(operator)?;
+                let operator = query_time::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,
                     inputs: vec![self.lower(lhs)?, self.lower(rhs)?],
@@ -544,7 +545,7 @@ where
                     planner_types::post_asap::ExactKind::Sum
                         | planner_types::post_asap::ExactKind::Count
                 ) {
-                    let operator = residual::selected_aggregate_operator(
+                    let operator = query_time::selected_aggregate_operator(
                         self.logical_source.as_deref().unwrap(),
                         node,
                     )?;
@@ -559,8 +560,8 @@ where
                     return Ok(id);
                 }
                 let operation = match kind {
-                    planner_types::post_asap::ExactKind::Sum => residual::Aggregation::Sum,
-                    planner_types::post_asap::ExactKind::Count => residual::Aggregation::Count,
+                    planner_types::post_asap::ExactKind::Sum => query_time::Aggregation::Sum,
+                    planner_types::post_asap::ExactKind::Count => query_time::Aggregation::Count,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported aggregation over selected summary values".into(),
@@ -587,9 +588,9 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 QueryPlanNode::Logical {
-                    operator: residual::ResidualQueryOperator::Aggregate {
+                    operator: query_time::QueryTimeOperator::Aggregate {
                         operation,
-                        grouping: residual::Grouping {
+                        grouping: query_time::Grouping {
                             labels,
                             without: keys.is_without(),
                         },
@@ -725,7 +726,7 @@ where
                         Err(error) => {
                             if let Some(original) = &self.logical_source {
                                 let (root, nodes) =
-                                    residual::selected_residual_nodes(original, node)?;
+                                    query_time::selected_query_time_nodes(original, node)?;
                                 return self.graft(id, root, nodes);
                             }
                             return Err(error);
@@ -1216,7 +1217,7 @@ mod tests {
                 }
                 .unwrap();
                 let QueryPlanNode::Logical {
-                    operator: residual::ResidualQueryOperator::Binary { operation, .. },
+                    operator: query_time::QueryTimeOperator::Binary { operation, .. },
                     ..
                 } = &entry.nodes[&entry.root]
                 else {
@@ -1228,9 +1229,9 @@ mod tests {
                 assert_eq!(
                     *operation,
                     if relative {
-                        residual::BinaryOperation::CheckedDiv
+                        query_time::BinaryOperation::CheckedDiv
                     } else {
-                        residual::BinaryOperation::FiniteDiv
+                        query_time::BinaryOperation::FiniteDiv
                     }
                 );
                 assert!(!entry.materialization_bindings().is_empty());

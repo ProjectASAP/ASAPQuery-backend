@@ -1952,14 +1952,14 @@ impl IdempotentCommitSink<MaintenanceValue> for CommitRegistry {
 
 /// Decorates the ordinary store sink with installed maintenance DAG execution.
 /// With no matching DAG, the source output is forwarded unchanged.
-pub struct MaintenanceDagSink {
+pub struct PrecomputeDagSink {
     inner: Arc<dyn OutputSink>,
     plans: InstalledPrecomputePlanHandle,
     commits: CommitRegistry,
     batch_guard: Mutex<()>,
 }
 
-impl MaintenanceDagSink {
+impl PrecomputeDagSink {
     pub fn new(inner: Arc<dyn OutputSink>, plans: InstalledPrecomputePlanHandle) -> Self {
         Self {
             inner,
@@ -2186,7 +2186,7 @@ fn dependencies_until(
     seen
 }
 
-impl OutputSink for MaintenanceDagSink {
+impl OutputSink for PrecomputeDagSink {
     fn emit_batch(
         &self,
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
@@ -2829,7 +2829,7 @@ mod tests {
             )
             .unwrap(),
         );
-        document.schema_version = asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+        document.schema_version = asap_types::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION;
         let mut durable_binding = scheduled_binding.clone();
         durable_binding.nodes.insert(
             PostAsapNodeId(3),
@@ -3207,7 +3207,7 @@ mod tests {
             )
             .unwrap(),
         );
-        document.schema_version = asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+        document.schema_version = asap_types::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION;
         let mut binding = binding.clone();
         for (node, stored_output) in [
             (1, first_id),
@@ -4189,7 +4189,7 @@ mod tests {
                     let mut document =
                         OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap();
                     document.schema_version =
-                        asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+                        asap_types::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION;
                     document
                 },
                 binding,
@@ -4214,7 +4214,7 @@ mod tests {
                 fail_at,
                 ..Default::default()
             });
-            let sink = MaintenanceDagSink::new(
+            let sink = PrecomputeDagSink::new(
                 downstream.clone(),
                 InstalledPrecomputePlanHandle::from_active_physical_plan(
                     ActivePhysicalPlanHandle::new(active.clone()),

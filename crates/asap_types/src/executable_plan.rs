@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub struct QueryNodeId(pub u64);
 
 pub const OWNED_POST_ASAP_DAG_SCHEMA_VERSION: u32 = 5;
-pub const MAINTENANCE_DAG_SCHEMA_VERSION: u32 = 6;
+pub const PRECOMPUTE_DAG_SCHEMA_VERSION: u32 = 6;
 
 /// Versioned, language-neutral Planner DAG persisted with an installed plan.
 /// Plan lifecycle belongs to the enclosing `PrecomputePlan`; this document
@@ -187,15 +187,15 @@ impl InstalledPostAsapDag {
         if self.document.query_id.trim().is_empty() {
             return Err("invalid post-ASAP DAG document identity/version".into());
         }
-        if self.document.schema_version != MAINTENANCE_DAG_SCHEMA_VERSION {
+        if self.document.schema_version != PRECOMPUTE_DAG_SCHEMA_VERSION {
             return Err("unsupported maintenance DAG document version".into());
         }
-        self.binding.validate_maintenance(&self.document.decode()?)
+        self.binding.validate_precompute(&self.document.decode()?)
     }
 
     /// Project the selected semantic DAG onto the maintenance ancestors of its
     /// stored outputs.
-    pub fn maintenance_projection(mut self) -> Result<Self, String> {
+    pub fn precompute_projection(mut self) -> Result<Self, String> {
         if self.document.schema_version != OWNED_POST_ASAP_DAG_SCHEMA_VERSION {
             return Err("selected DAG has an unsupported document version".into());
         }
@@ -230,7 +230,7 @@ impl InstalledPostAsapDag {
             .retain(|edge| included.contains(&edge.producer) && included.contains(&edge.consumer));
         self.binding.nodes.retain(|id, _| included.contains(id));
         self.document.root = *self.binding.precompute_sinks.first().unwrap();
-        self.document.schema_version = MAINTENANCE_DAG_SCHEMA_VERSION;
+        self.document.schema_version = PRECOMPUTE_DAG_SCHEMA_VERSION;
         self.validate()?;
         Ok(self)
     }
@@ -268,7 +268,7 @@ impl BackendExecutableBinding {
         self.nodes.get(&id)
     }
 
-    pub fn validate_maintenance(&self, dag: &ExecutableDag) -> Result<(), String> {
+    pub fn validate_precompute(&self, dag: &ExecutableDag) -> Result<(), String> {
         let ids = dag
             .nodes
             .iter()

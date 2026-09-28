@@ -5,7 +5,7 @@
 
 use super::compiler::CompiledPhysicalPlan;
 use crate::query_plan::QueryPlanNode;
-use asap_types::query_plan::residual::ResidualQueryOperator;
+use asap_types::query_plan::query_time::QueryTimeOperator;
 
 /// Render the selected precompute and query execution DAGs as deterministic DOT.
 pub fn render(plan: &CompiledPhysicalPlan) -> String {
@@ -151,7 +151,9 @@ fn query_node_label(node: &QueryPlanNode) -> String {
         }
         QueryPlanNode::RelationalJoin { .. } => "RelationalJoin".into(),
         QueryPlanNode::Relational { .. } => "Relational".into(),
-        QueryPlanNode::Logical { operator, .. } => format!("Logical\n{}", residual_label(operator)),
+        QueryPlanNode::Logical { operator, .. } => {
+            format!("Logical\n{}", query_time_label(operator))
+        }
         QueryPlanNode::Scalar { value } => format!("Scalar\n{value}"),
         QueryPlanNode::Binary { operator, .. } => format!("Binary\n{operator:?}"),
         QueryPlanNode::ReduceSum { .. } => "ReduceSum".into(),
@@ -169,21 +171,21 @@ fn query_node_label(node: &QueryPlanNode) -> String {
     }
 }
 
-fn residual_label(operator: &ResidualQueryOperator) -> &'static str {
+fn query_time_label(operator: &QueryTimeOperator) -> &'static str {
     match operator {
-        ResidualQueryOperator::CurrentSeries { .. } => "CurrentSeries",
-        ResidualQueryOperator::ExactSubquery { .. } => "ExactSubquery",
-        ResidualQueryOperator::CandidateExactSubquery { .. } => "CandidateExactSubquery",
-        ResidualQueryOperator::Scan { .. } => "Scan",
-        ResidualQueryOperator::UnaryNegate => "UnaryNegate",
-        ResidualQueryOperator::VectorToScalar => "VectorToScalar",
-        ResidualQueryOperator::Aggregate { .. } => "Aggregate",
-        ResidualQueryOperator::Limit { .. } => "Limit",
-        ResidualQueryOperator::Binary { .. } => "Binary",
-        ResidualQueryOperator::Temporal { .. } => "Temporal",
-        ResidualQueryOperator::Sort { .. } => "Sort",
-        ResidualQueryOperator::HistogramQuantile => "HistogramQuantile",
-        ResidualQueryOperator::Subquery { .. } => "Subquery",
+        QueryTimeOperator::CurrentSeries { .. } => "CurrentSeries",
+        QueryTimeOperator::ExactSubquery { .. } => "ExactSubquery",
+        QueryTimeOperator::CandidateExactSubquery { .. } => "CandidateExactSubquery",
+        QueryTimeOperator::Scan { .. } => "Scan",
+        QueryTimeOperator::UnaryNegate => "UnaryNegate",
+        QueryTimeOperator::VectorToScalar => "VectorToScalar",
+        QueryTimeOperator::Aggregate { .. } => "Aggregate",
+        QueryTimeOperator::Limit { .. } => "Limit",
+        QueryTimeOperator::Binary { .. } => "Binary",
+        QueryTimeOperator::Temporal { .. } => "Temporal",
+        QueryTimeOperator::Sort { .. } => "Sort",
+        QueryTimeOperator::HistogramQuantile => "HistogramQuantile",
+        QueryTimeOperator::Subquery { .. } => "Subquery",
     }
 }
 

@@ -2,7 +2,7 @@
 use crate::drivers::ingest::prometheus_remote_write::CanonicalSample;
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
-    residual::{LabelMatch, ResidualQueryOperator},
+    query_time::{LabelMatch, QueryTimeOperator},
     QueryPlan, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -223,7 +223,7 @@ impl Population {
             match readout {
                 SeriesReadout::Quantile { q } => {
                     // `values` is only populated for a quantile-carrying population.
-                    // `ResidualQueryOperator::validate` rejects the mismatched pairing at
+                    // `QueryTimeOperator::validate` rejects the mismatched pairing at
                     // install, so this is defensive: answer like Prometheus does for
                     // an empty group rather than underflow `values.len() - 1` while
                     // holding the lock every remote-write batch waits on.
@@ -303,7 +303,7 @@ impl CurrentSeriesStore {
             for entry in plan.entries.values() {
                 for node in entry.nodes.values() {
                     if let QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::CurrentSeries { population, .. },
+                        operator: QueryTimeOperator::CurrentSeries { population, .. },
                         ..
                     } = node
                     {
@@ -474,7 +474,7 @@ mod tests {
         SeriesPopulation {
             metric: "a".into(),
             matchers: vec![],
-            grouping: asap_types::query_plan::residual::Grouping {
+            grouping: asap_types::query_plan::query_time::Grouping {
                 labels: vec!["job".into()],
                 without: false,
             },
@@ -606,7 +606,7 @@ mod tests {
                 nodes: BTreeMap::from([(
                     QueryNodeId(0),
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::CurrentSeries {
+                        operator: QueryTimeOperator::CurrentSeries {
                             population: p.clone(),
                             readout: SeriesReadout::Quantile { q: 0.5 },
                         },
