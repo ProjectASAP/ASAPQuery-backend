@@ -10,7 +10,7 @@ ERP collection, feedback-driven replanning and deployment switching are deferred
 | --- | --- | --- |
 | #728: structure | workload and declared execution/accuracy contracts | Every supported candidate has a valid physical DAG or an explicit binding rejection; no prices or winner assertions |
 | #742: ranking | same candidates plus synthetic complete quotes | Selection follows costs, reverses with costs, and excludes unavailable candidates |
-| #775: execution | workload, synthetic quotes, finite fixture data | Select, install and execute the exact physical plan; validate results and execution provenance |
+| #775: execution | workload, synthetic quotes, finite fixture data | Mutate quotes to select each admitted candidate, install and execute it; validate every query result and execution provenance |
 
 ```text
 workload → Planner physical candidates
@@ -23,6 +23,19 @@ owns deployment selection and binding. Serving loads the selected typed plan;
 it must not silently re-plan it at startup. The executor's existing operator,
 shared-producer, window, bound-SDS and recovery tests remain part of the baseline.
 Synthetic pricing does not relax query accuracy admission or SDS identity checks.
+
+## Workload ensembles
+
+Each layer tests the ten individual queries plus three workload ensembles:
+shared-rate (temporal-rate, grouped-rate, topk-rate), shared-quantiles
+(temporal-quantile, quantile-ratio), and all ten queries together. Structure checks
+preserve every query and validate shared output identities. Ranking checks change
+prices for whole workload candidates. Execution installs each selected workload
+once, ingests its fixture once, and checks every query in that workload.
+
+“All candidates” means the supported inventory exposed by Planner and admitted
+under the fixture's contracts, not an exhaustive Cartesian product of hypothetical
+query plans. Binding rejections remain visible; prices cannot override them.
 
 ## Synthetic cost scope
 
