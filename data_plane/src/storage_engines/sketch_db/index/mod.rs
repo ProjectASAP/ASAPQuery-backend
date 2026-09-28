@@ -1490,7 +1490,6 @@ impl SketchStore {
                     time_range: HalfOpenTimeRange { start_ms, end_ms },
                     group_values,
                     catalog_generation: generation.clone(),
-                    reused_from_generation: None,
                     placement: SummaryPlacement {
                         producer_id: producer_id.clone(),
                         storage_node_id: storage_node_id.into(),
