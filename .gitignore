@@ -10,3 +10,6 @@ uuid
 /store/
 
 .claude/
+
+# Generated evaluation archives stay outside version control.
+/docs/evaluation/**/*.gz
