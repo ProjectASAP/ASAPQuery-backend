@@ -475,7 +475,7 @@ fn select_workload_impl(
         .iter()
         .map(|(id, root)| {
             selection
-                .assemble_selected_dag(root)
+                .assemble_selected_query(root)
                 .map_err(|error| SelectionError::Workload(error.to_string()))?
                 .map(|node| (*id, node))
                 .ok_or_else(|| SelectionError::Workload(format!("missing query root {id}")))
@@ -509,7 +509,7 @@ pub fn select_query_with_models(
     );
     space
         .global_selection(cost_model)
-        .assemble_selected_dag(&space.roots[0].1)
+        .assemble_selected_query(&space.roots[0].1)
         .map_err(|error| SelectionError::Workload(error.to_string()))?
         .ok_or(SelectionError::NoLegalCandidate)
 }
