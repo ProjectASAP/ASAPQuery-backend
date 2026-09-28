@@ -522,8 +522,7 @@ mod tests {
                 vec![vec![Value::Float64(1.)]],
             )?)
         })
-        .err()
-        .expect("input must exceed the byte budget");
+        .expect_err("input must exceed the byte budget");
         assert!(
             matches!(error, EngineError::Physical(Error::MemoryLimit)),
             "{error}"
