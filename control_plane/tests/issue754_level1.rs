@@ -47,6 +47,12 @@ enum PolicyReason {
     NoCertifiedGuarantee,
     /// The realized family cannot meet the query's declared accuracy target.
     AccuracyTargetUnmet,
+    /// A workload candidate proposed sharing one deployed output between
+    /// queries that need different semantics from it. Refusing it is correct,
+    /// not a bug: the sharing would silently change what one of the queries
+    /// computes. Only the batch path can reach this, which is why the
+    /// single-query fixtures never produce it.
+    ConflictingSharedOutput,
 }
 
 impl PolicyReason {
@@ -54,10 +60,17 @@ impl PolicyReason {
         match self {
             Self::NoCertifiedGuarantee => reason.contains("accuracy guarantee"),
             Self::AccuracyTargetUnmet => reason.contains("does not satisfy"),
+            Self::ConflictingSharedOutput => {
+                reason.contains("one deployed output cannot have different semantic definitions")
+            }
         }
     }
 
-    const ALL: &'static [Self] = &[Self::NoCertifiedGuarantee, Self::AccuracyTargetUnmet];
+    const ALL: &'static [Self] = &[
+        Self::NoCertifiedGuarantee,
+        Self::AccuracyTargetUnmet,
+        Self::ConflictingSharedOutput,
+    ];
 }
 
 /// Sketch/heap families each query must expose, and how the given fixture is
@@ -114,10 +127,37 @@ const KNOWN_BINDING_DEFECTS: &[(&str, &str, usize)] = &[
         "Planner logical fragment does not match any original query subtree",
         1,
     ),
+    // Workload candidates. The same defect reaches the batch path, and the
+    // fragment mismatch scales with workload size: one occurrence when three
+    // queries are planned together, fifteen across all ten. shared-quantiles
+    // reaches neither, so it has no entry.
+    (
+        "shared-rate",
+        "Planner logical fragment does not match any original query subtree",
+        1,
+    ),
+    (
+        "shared-rate",
+        "physical program has incompatible input or result schema",
+        1,
+    ),
+    (
+        "all-ten",
+        "Planner logical fragment does not match any original query subtree",
+        15,
+    ),
+    (
+        "all-ten",
+        "physical program has incompatible input or result schema",
+        1,
+    ),
 ];
 
 /// Classify one admission rejection. A reason that is neither a declared policy
-/// refusal nor a recorded defect fails the query outright.
+/// refusal nor a recorded defect fails the scope outright. `scope` is a query
+/// name on the single-query path and an ensemble name on the workload path: a
+/// workload candidate's rejection belongs to the whole ensemble, not to one of
+/// its queries.
 fn assert_rejection_is_accounted_for(name: &str, reason: &str) {
     if PolicyReason::ALL
         .iter()
@@ -128,11 +168,38 @@ fn assert_rejection_is_accounted_for(name: &str, reason: &str) {
     assert!(
         KNOWN_BINDING_DEFECTS
             .iter()
-            .any(|(query, defect, _)| *query == name && reason.contains(defect)),
+            .any(|(scope, defect, _)| *scope == name && reason.contains(defect)),
         "{name}: unaccounted binding rejection: {reason}\n\
          Add a policy reason if this is a deliberate refusal, or fix the \
          defect. Level 1 does not accept unexplained bind failures."
     );
+}
+
+/// Every recorded defect must still occur exactly as often as declared, so that
+/// neither a new occurrence nor a silent fix can pass unnoticed.
+fn assert_recorded_defect_counts(
+    scope: &str,
+    admission: &[control_plane::physical::workload_cost::CandidatePlanEvaluation],
+) {
+    for (recorded, defect, count) in KNOWN_BINDING_DEFECTS {
+        if *recorded != scope {
+            continue;
+        }
+        let observed = admission
+            .iter()
+            .filter(|result| {
+                result
+                    .unavailable_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(defect))
+            })
+            .count();
+        assert_eq!(
+            observed, *count,
+            "{scope}: recorded defect count changed for {defect:?}; \
+             update KNOWN_BINDING_DEFECTS (delete the entry once fixed)"
+        );
+    }
 }
 
 struct ExpectedPlan {
@@ -938,28 +1005,7 @@ fn issue754_queries_have_valid_physical_plans() {
                 ref status => panic!("unexpected pre-pricing status: {status:?}"),
             }
         }
-        // Each recorded defect must still occur exactly as often as declared:
-        // a new occurrence and a silently fixed one both fail here.
-        for (query, defect, count) in KNOWN_BINDING_DEFECTS {
-            if *query != case.name {
-                continue;
-            }
-            let observed = admission
-                .iter()
-                .filter(|result| {
-                    result
-                        .unavailable_reason
-                        .as_deref()
-                        .is_some_and(|reason| reason.contains(defect))
-                })
-                .count();
-            assert_eq!(
-                observed, *count,
-                "{}: recorded defect count changed for {defect:?}; \
-                 update KNOWN_BINDING_DEFECTS (delete the entry once fixed)",
-                case.name
-            );
-        }
+        assert_recorded_defect_counts(&case.name, &admission);
         if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
             // Mirror the committed layout: `admission/` is the contract, so a
             // downloaded CI artifact drops straight onto the repository copy.
@@ -1170,10 +1216,64 @@ fn ensembles_preserve_all_queries_and_shared_output_identity() {
             .into_physical_compilation_request()
             .unwrap();
         assert_eq!(request.queries.len(), cases.len());
+        let request_traces = request.planner_selection_trace.clone();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let (_, admission) =
             compile_candidates_for_pricing(candidates.clone(), env.clone(), QueryFrontend::PromQl);
         assert_eq!(admission.len(), candidates.len());
+        // The same discipline as the single-query path. A workload candidate's
+        // rejection is attributed to the ensemble, since it covers every query
+        // in it: either a declared policy refusal or a recorded defect, never
+        // an unexplained bind failure.
+        for result in &admission {
+            assert!(
+                result.total_cost.is_none(),
+                "{name}: Level 1 must not price workload candidates"
+            );
+            if result.status == CandidateEvaluationStatus::CompilationFailed {
+                let reason = result.unavailable_reason.as_deref().unwrap_or_default();
+                assert!(!reason.is_empty(), "{name}: bind failure without a reason");
+                assert_rejection_is_accounted_for(&name, reason);
+            }
+        }
+        assert_recorded_defect_counts(&name, &admission);
+        // Membership holds for the batch too: a heap family that Planner exposes
+        // for a member query must still appear in the workload inventory, and
+        // must still be refused for the declared reason.
+        for case in &cases {
+            for (family, resolution) in required_summary_shapes(&case.name, Fixture::Strict) {
+                let Some(trace) = request_traces.iter().find(|trace| {
+                    trace["stage"] == "planner.physical_candidate"
+                        && trace["physical_dag"].to_string().contains(family)
+                }) else {
+                    panic!("{name}: {} lost its native {family}", case.name);
+                };
+                let root_id = trace["logical_root_id"].as_str().unwrap().to_owned();
+                let heap: Vec<_> = admission
+                    .iter()
+                    .filter(|candidate| candidate.logical_root_ids.contains(&root_id))
+                    .collect();
+                assert!(
+                    !heap.is_empty(),
+                    "{name}: {} heap candidate left the workload inventory",
+                    case.name
+                );
+                let Resolution::MustReject(policy) = resolution else {
+                    panic!("the strict fixture declares refusing shapes");
+                };
+                assert!(
+                    heap.iter().all(|candidate| candidate.status
+                        == CandidateEvaluationStatus::CompilationFailed
+                        && candidate.total_cost.is_none()
+                        && candidate
+                            .unavailable_reason
+                            .as_deref()
+                            .is_some_and(|reason| policy.matches(reason))),
+                    "{name}: {} heap must stay an explicit {policy:?} refusal in the workload: {heap:?}",
+                    case.name
+                );
+            }
+        }
         let mut bound = 0;
         let mut shared = false;
         for (index, candidate) in candidates.into_iter().enumerate() {
