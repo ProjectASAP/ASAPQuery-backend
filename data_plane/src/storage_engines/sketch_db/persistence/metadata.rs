@@ -35,7 +35,7 @@
 //!
 //! ## Format
 //!
-//! A single JSON object `{ "<sid>": StoredOutputMetadataRecord, ... }` written
+//! A versioned JSON object containing descriptors and series bindings, written
 //! atomically (tmp + rename) on every upsert. JSON (not the custom
 //! binary part format) because the record count equals live sid
 //! cardinality (small) and the schema is human-inspectable for
@@ -46,7 +46,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -442,7 +442,7 @@ struct StoredOutputBindingRecord {
     last_immutable: Option<super::immutable_output::ImmutableOutputReservation>,
 }
 
-/// Version-3 normalized sidecar with authoritative catalog provenance. Descriptors appear once and SeriesId bindings hold
+/// Version-5 normalized sidecar with authoritative catalog provenance. Descriptors appear once and SeriesId bindings hold
 /// foreign keys, mirroring the in-memory SDS registry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SdsSidecar {
@@ -694,62 +694,10 @@ impl StoredOutputMetadataFile {
         &self.path
     }
 
-    /// Load every durable record. Returns an empty vec when the sidecar
-    /// doesn't exist yet (fresh dir, or parts written before this feature
-    /// landed) or when it is unparsable (treated as "no recoverable
-    /// metadata" — the live ingest path still re-registers on first DP).
+    /// Load current-format durable records. A missing file denotes a fresh store;
+    /// malformed or unsupported persisted metadata is an error.
     pub fn load(&self) -> PersistResult<Vec<StoredOutputMetadataRecord>> {
-        let mut f = match File::open(&self.path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(PersistError::Io(e)),
-        };
-        let mut buf = String::new();
-        f.read_to_string(&mut buf)?;
-        if buf.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let value: serde_json::Value = match serde_json::from_str(&buf) {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "sid metadata sidecar unparsable; ignoring (live ingest will re-register)"
-                );
-                return Ok(Vec::new());
-            }
-        };
-        if matches!(
-            value.get("schema_version").and_then(|v| v.as_u64()),
-            Some(5)
-        ) {
-            let sidecar: SdsSidecar = match serde_json::from_value(value) {
-                Ok(sidecar) => sidecar,
-                Err(error) => {
-                    tracing::warn!(
-                        path = %self.path.display(),
-                        %error,
-                        "SDS metadata sidecar is invalid; ignoring"
-                    );
-                    return Ok(Vec::new());
-                }
-            };
-            return match sidecar.into_records() {
-                Ok(records) => Ok(records),
-                Err(error) => {
-                    tracing::warn!(
-                        path = %self.path.display(),
-                        %error,
-                        "SDS metadata sidecar has broken descriptor references; ignoring"
-                    );
-                    Ok(Vec::new())
-                }
-            };
-        }
-        Err(PersistError::Format(
-            "stored-output metadata requires schema version 4".into(),
-        ))
+        self.load_strict()
     }
 
     /// Upsert a batch of records, merging with whatever is already on
@@ -807,20 +755,18 @@ impl StoredOutputMetadataFile {
         };
         let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|error| PersistError::Format(format!("invalid SID metadata: {error}")))?;
-        if let Some(version) = value.get("schema_version") {
-            if !matches!(version.as_u64(), Some(5)) {
-                return Err(PersistError::Format(
-                    "unsupported SID metadata version".into(),
-                ));
-            }
-            let sidecar: SdsSidecar = serde_json::from_value(value)
-                .map_err(|error| PersistError::Format(error.to_string()))?;
-            sidecar.into_records()
-        } else {
-            Err(PersistError::Format(
-                "stored-output metadata requires schema version 4".into(),
-            ))
+        if value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(5)
+        {
+            return Err(PersistError::Format(
+                "unsupported SID metadata version".into(),
+            ));
         }
+        let sidecar: SdsSidecar = serde_json::from_value(value)
+            .map_err(|error| PersistError::Format(error.to_string()))?;
+        sidecar.into_records()
     }
 
     pub(super) fn transaction<T>(
@@ -1028,19 +974,25 @@ mod tests {
             .remove(&missing_id);
         std::fs::write(store.path(), serde_json::to_vec(&persisted).unwrap()).unwrap();
 
-        assert!(store.load().unwrap().is_empty());
+        assert!(store.load().is_err());
     }
 
     #[test]
-    fn legacy_flat_sidecar_is_rejected_without_rewriting_it() {
+    fn unsupported_sidecars_are_rejected_without_overwriting() {
         let tmp = TempDir::new().unwrap();
         let store = StoredOutputMetadataFile::new(tmp.path());
-        let legacy =
-            serde_json::to_vec(&HashMap::from([("1".to_string(), sketch_meta(1))])).unwrap();
-        std::fs::write(store.path(), &legacy).unwrap();
-        assert!(store.load().is_err());
-        assert!(store.upsert_all(&[exact_meta(2)]).is_err());
-        assert_eq!(std::fs::read(store.path()).unwrap(), legacy);
+        let flat = serde_json::to_value(HashMap::from([("1", sketch_meta(1))])).unwrap();
+        let mut cases = vec![flat];
+        for version in [1, 2, 3, 4, 6, 999] {
+            cases.push(serde_json::json!({"schema_version": version}));
+        }
+        for value in cases {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            std::fs::write(store.path(), &bytes).unwrap();
+            assert!(store.load().is_err());
+            assert!(store.upsert_all(&[exact_meta(2)]).is_err());
+            assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -1078,10 +1030,10 @@ mod tests {
     }
 
     #[test]
-    fn unparsable_file_loads_as_empty() {
+    fn unparsable_file_is_rejected() {
         let tmp = TempDir::new().unwrap();
         let s = StoredOutputMetadataFile::new(tmp.path());
         std::fs::write(s.path(), b"{not json").unwrap();
-        assert!(s.load().unwrap().is_empty());
+        assert!(s.load().is_err());
     }
 }
