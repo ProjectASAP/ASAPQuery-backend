@@ -343,6 +343,18 @@ fn assert_candidate_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Stri
             .get(&materialization.policy_fingerprint().into())
             .expect("precompute producer has no catalog definition");
         let semantics = &plan.summary_catalog.definitions[&definition.definition_id];
+        if let asap_types::summary_semantics::SummarySemantics::Planner { fragment } =
+            &semantics.semantics
+        {
+            assert!(
+                fragment.dataset_identity.is_some(),
+                "persisted Planner output lacks dataset identity"
+            );
+            assert_eq!(
+                fragment.dataset_identity,
+                plan.precompute_plan.ingest.dataset_identity
+            );
+        }
         assert_eq!(
             semantics.id().unwrap(),
             definition.definition_id,
@@ -920,6 +932,20 @@ fn ensembles_preserve_all_queries_and_shared_output_identity() {
             };
             bound += 1;
             assert_eq!(plan.query_plan.entries.len(), cases.len());
+            assert_eq!(
+                plan.precompute_plan.ingest.dataset_identity.as_ref(),
+                Some(&env.dataset_identity)
+            );
+            for definition in plan.summary_catalog.definitions.values() {
+                if let asap_types::summary_semantics::SummarySemantics::Planner { fragment } =
+                    &definition.semantics
+                {
+                    assert_eq!(
+                        fragment.dataset_identity.as_ref(),
+                        Some(&env.dataset_identity)
+                    );
+                }
+            }
             let mut consumers = std::collections::BTreeMap::new();
             for case in &cases {
                 let entry = plan

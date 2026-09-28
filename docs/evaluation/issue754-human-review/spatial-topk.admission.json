@@ -1,0 +1,50 @@
+[
+  {
+    "candidate_id": "asap-explain-v1:candidate:7d3e10d14fca58a7ecf3bb41932c6a4e644eca1b9a1ebb18d6a36365c2f16c64",
+    "logical_root_ids": [
+      "asap-explain-v1:root:ce68b3daf9be1bebe2252ca6957c8880a59ef03d33608d76b51ee0ae5eab3166"
+    ],
+    "physical_candidate_id": null,
+    "identity_unavailable_reason": null,
+    "status": "bind_failed",
+    "plan_id": null,
+    "total_cost": null,
+    "unavailable_reason": "failed to construct QueryPlan: invalid QueryPlan: Planner logical fragment does not match any original query subtree"
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:8750d56b757927cf51befebf02d41ed72de02bc2454d8789f943f6a70fffaedd",
+    "logical_root_ids": [
+      "asap-explain-v1:root:d3fb125ea5076ac3e0310f3fefda894380e5160a9a66a6f6cf0385cfe2fce9fb"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:49338bca64db2ee6610bfc59cb2b7f92c0ff6d0a5b63b58abf431638e2ee6919",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 5538412219857372274,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:f35b353455f28664f5d479b20dfa5d8c7d15bdb38e38c3001760ceea861e427a",
+    "logical_root_ids": [
+      "asap-explain-v1:root:3f042e8731583d1bff8e7f8fea235b22aa7b91c197f24377269b9aba882e7293"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:0ab57dcc6b6f25ddacf1dcde8778b86eb14f1ab19142418d9f4becbc87c853b4",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 2697027346875258477,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:fa96fd113280e9693ebe25570e56388d43c994536c3e011fda2a12378ad92cf4",
+    "logical_root_ids": [
+      "asap-explain-v1:root:37837d0f71bf4f773d9158fa9240f3476c7be0ac5797fb00368e60c152740a21"
+    ],
+    "physical_candidate_id": null,
+    "identity_unavailable_reason": null,
+    "status": "bind_failed",
+    "plan_id": null,
+    "total_cost": null,
+    "unavailable_reason": "query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"
+  }
+]

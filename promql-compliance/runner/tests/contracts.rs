@@ -417,6 +417,35 @@ fn synthetic_selection_installs_the_exact_selected_generation() {
     );
     assert_eq!(installed.summary_catalog, plan.summary_catalog);
     assert!(installed.adaptation_evidence.is_empty());
+    assert_eq!(
+        installed
+            .precompute_plan
+            .ingest
+            .dataset_identity
+            .as_ref()
+            .unwrap()
+            .dataset,
+        "data"
+    );
+    assert_eq!(
+        plan.cost_comparison
+            .as_ref()
+            .unwrap()
+            .selected_manifest
+            .dataset_identity,
+        input.environment.dataset_identity
+    );
+    let mut wrong_input = installed.precompute_plan.clone();
+    wrong_input
+        .ingest
+        .dataset_identity
+        .as_mut()
+        .unwrap()
+        .namespace = "another-tenant".into();
+    assert!(wrong_input
+        .validate_against_catalog(&installed.summary_catalog)
+        .is_err());
+
     for mutation in 0..3 {
         let mut invalid = plan.clone();
         let report = invalid.cost_comparison.as_mut().unwrap();
