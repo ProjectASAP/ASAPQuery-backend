@@ -155,7 +155,12 @@ impl PhysicalQueryRuntime<'_> {
         match node {
             QueryPlanNode::Scalar { value } => super::logical_dag::native_scalar(*value, context)
                 .map(PhysicalQueryOutput::Scalar)
-                .map_err(|error| PhysicalNodeError::Fallback(error.to_string())),
+                .map_err(|error| match error {
+                    crate::query_engines::EngineError::Physical(error) => {
+                        PhysicalNodeError::Physical(error)
+                    }
+                    other => PhysicalNodeError::Fallback(other.to_string()),
+                }),
             QueryPlanNode::Binary { operator, .. } => {
                 let [lhs, rhs] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
@@ -929,6 +934,68 @@ mod tests {
     use crate::query_engines::asap_query_engine::test_plan;
     use asap_types::query_plan::{ExactReadout, PhysicalGrouping, QueryReadout};
     use planner_types::pre_asap::ArithmeticOpKind;
+
+    // Real DAG resource failures survive both summary-readout and engine error adapters.
+    #[test]
+    fn summary_dag_resource_failures_never_become_capability_misses() {
+        use asap_types::query_plan::{
+            FallbackPolicy, InstantExecution, QueryLanguage, QueryPlanEntry,
+        };
+        let store = SketchStore::new();
+        let runtime = PhysicalQueryRuntime {
+            counter_parameters: Default::default(),
+            language: QueryLanguage::PromQl,
+            catalog: None,
+            context: QueryExecutionContext {
+                index: &store,
+                t0_ms: 0,
+                t1_ms: 42,
+                is_cumulative: false,
+                allowed_materializations: None,
+            },
+        };
+        let entry = QueryPlanEntry {
+            language: QueryLanguage::PromQl,
+            query_id: "resource-test".into(),
+            canonical_query: "1".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: [(QueryNodeId(0), QueryPlanNode::Scalar { value: 1. })].into(),
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        for cancelled in [false, true] {
+            let context = dag::RunContext::new(
+                dag::Scope::Query {
+                    evaluation_time_ms: 42,
+                    revision: 1,
+                },
+                dag::Limits {
+                    max_bytes: if cancelled { 4096 } else { 1 },
+                    ..dag::Limits::default()
+                },
+            )
+            .unwrap();
+            if cancelled {
+                context.cancel();
+            }
+            let error =
+                match execute_bound_queries(&entry, &[entry.root], &runtime, context.clone()) {
+                    Err(error) => error,
+                    Ok(_) => panic!("resource-limited execution succeeded"),
+                };
+            let engine: crate::query_engines::EngineError = execution_failure(error).into();
+            assert!(
+                matches!(engine, crate::query_engines::EngineError::Physical(_)),
+                "{engine:?}"
+            );
+            assert_eq!(context.retained_bytes(), 0);
+        }
+    }
 
     // A sparse counter is omitted without dropping other series in the vector.
     #[test]
