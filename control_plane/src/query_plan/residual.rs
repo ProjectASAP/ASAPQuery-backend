@@ -1024,6 +1024,14 @@ pub(crate) fn selected_range_max_materialization(
     node: &planner_types::post_asap::SummaryNode,
 ) -> Result<Option<String>, QueryPlanError> {
     use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
+    let node = match &node.expr {
+        SummaryExpr::ValueOperation {
+            child,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            ..
+        } => child.as_ref(),
+        _ => node,
+    };
     if !matches!(
         &node.expr,
         SummaryExpr::SummaryAgg {
