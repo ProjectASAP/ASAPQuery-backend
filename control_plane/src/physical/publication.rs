@@ -15,10 +15,3 @@ impl CompiledPhysicalPlan {
         Ok(artifact)
     }
 }
-
-impl CompiledPhysicalPlan {
-    #[deprecated(note = "Use to_publication_artifact")]
-    pub fn publication(&self) -> Result<PhysicalPlanPublication, String> {
-        self.to_publication_artifact()
-    }
-}

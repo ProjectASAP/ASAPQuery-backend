@@ -2,7 +2,7 @@
 use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
 use crate::query_engines::EngineError;
 use asap_types::query_plan::{
-    logical::ResidualQueryOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage,
+    residual::ResidualQueryOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage,
     QueryNodeId, QueryPlanEntry, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -651,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_exact_is_discovered_and_prepared_behind_candidate_topk_root() {
-        use asap_types::query_plan::{logical::Grouping, CandidateCompleteness};
+        use asap_types::query_plan::{residual::Grouping, CandidateCompleteness};
         let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");
         entry.nodes.insert(
             QueryNodeId(2),
@@ -888,7 +888,7 @@ mod tests {
         };
         use crate::storage_engines::types::{KeyByLabelValues, Measurement};
         use asap_types::query_plan::{
-            logical::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
+            residual::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
         };
         use std::sync::{
             atomic::{AtomicUsize, Ordering},

@@ -9,8 +9,8 @@
 //!   query answer
 //!
 //! The control plane drives the plan: a PromQL query and an accuracy target
-//! go through `BackendLocalPlanningSnapshot::planning_request` →
-//! `PhysicalCompiler::compile`, and the resulting materializations are
+//! go through `BackendLocalPlanningInput::planning_request` →
+//! `PhysicalPlanCompiler::compile`, and the resulting materializations are
 //! projected into a physical-plan artifact with QueryPlan/SummaryCatalog
 //! bindings, then staged and activated before ingest.
 //!

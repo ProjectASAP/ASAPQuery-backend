@@ -1,8 +1,8 @@
 //! Lower typed population operators according to executor membership capabilities.
-use super::compiler::{CompileError, PhysicalCompilationRequest, PlanningQuery};
+use super::compiler::{CompileError, PhysicalCompilationRequest, QueryCompilationInput};
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
-    logical::{Grouping, LabelMatch, LabelMatcher, ResidualQueryOperator},
+    residual::{Grouping, LabelMatch, LabelMatcher, ResidualQueryOperator},
 };
 use planner_types::post_asap::{
     maintained_population::*, SummaryExpr, SummaryNode, ValueOperation,
@@ -42,7 +42,7 @@ pub(super) fn supported(request: &PhysicalCompilationRequest) -> bool {
 
 pub(super) fn operator(
     request: &PhysicalCompilationRequest,
-    query: &PlanningQuery,
+    query: &QueryCompilationInput,
 ) -> Result<Option<ResidualQueryOperator>, CompileError> {
     let Some((spec, readout)) = selected(&query.selected_plan_root) else {
         return Ok(None);
