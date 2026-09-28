@@ -549,9 +549,6 @@ impl PrecomputePlan {
                 return Err(invalid());
             }
             validated_source_window_cohort(config, &sources)?;
-            if config.window_size != config.slide_interval {
-                return Err(invalid());
-            }
             let mut matched = false;
             for installed in self.executable_dags.values() {
                 let dag = installed
@@ -581,12 +578,16 @@ impl PrecomputePlan {
                         return Err(invalid());
                     }
                     if native.is_none() {
+                        if config.window_size != config.slide_interval {
+                            return Err(invalid());
+                        }
                         validate_maintenance_reduction(config, target_node)
                             .map_err(PrecomputePlanError::CatalogContract)?;
                     } else if !matches!(
                         config.aggregation_type,
                         crate::AggregationType::CountMinSketchWithHeap
                             | crate::AggregationType::CountSketchWithHeap
+                            | crate::AggregationType::Sum
                     ) {
                         return Err(invalid());
                     }

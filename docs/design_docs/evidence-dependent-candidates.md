@@ -339,3 +339,9 @@ candidate. This placement requires a complete, durable counter population for th
 same window and does not authorize merging rates across windows. The initial
 runtime realization uses the finite-source completion barrier. Candidate admission
 must reject deployments unable to satisfy that completion requirement.
+
+For grouped Rate, the exact grouped Sum also has query-time and precompute
+physical candidates. A stored complete-window Sum does not combine raw counters
+across series before Rate. Its producer cadence must satisfy the query recurrence;
+selecting a 60-second lookback cannot silently reduce five-second evaluations to
+one output per minute. Overlapping full windows remain independent stored results.

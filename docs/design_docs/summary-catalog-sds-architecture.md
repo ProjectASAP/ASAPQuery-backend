@@ -176,12 +176,16 @@ the producer's input contract, not inferred from interval endpoints alone.
 A replacement snapshot replaces a record's revision; readers must not mix its
 old metadata with new bytes or count both snapshots as separate inputs.
 
-The stored output also fixes its publication granularity. A native grouped heap
+The stored output also fixes its publication granularity. A native grouped heap or grouped Sum
 may publish all groups as one typed batch for a complete window, with an empty
 outer `group_key`. Group columns remain inside that batch and in its semantic
 definition. The installed query reads the batch and runs Planner's grouped
 readout. This makes the complete group set atomic across publication and recovery;
-it does not claim that the logical computation has no grouping. A per-group record
+it does not claim that the logical computation has no grouping. Full-window
+snapshots may overlap when the evaluation cadence is shorter than the lookback.
+An installed full-window read selects its exact endpoints; other overlapping
+snapshots are neither combined nor mistaken for ambiguous versions of that record.
+A per-group record
 layout and a complete-batch layout cannot silently substitute for each other.
 
 ## 5. Semantic identity vs. deployed-output identity

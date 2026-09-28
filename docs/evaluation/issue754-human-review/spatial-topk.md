@@ -64,7 +64,7 @@ Costs below come from the controlled Level 1 fixture, not production measurement
 
 ### Planner physical candidate
 
-Logical root: `"asap-explain-v1:root:cd34fea63097fb2fcf8b219ec4be8de476ce61574e8a06ee40d888613116f208"`.
+Logical root: `"asap-explain-v1:root:4eb9fdb841402310608f87e857fb8605677de3b84f7526b07543ad93fe9bad29"`.
 
 top-3 heavy-hitters realizes as a CountSketchWithHeap sketch — one of summary_candidates' candidates for this intent (asap_aware_mapping::replacement::realizations_for_intent)
 
@@ -86,10 +86,10 @@ Roots: `[6]`.
 
 | Candidate | Logical root IDs | Status | Fixture cost | Rejection / unavailable reason |
 | --- | --- | --- | --- | --- |
-| 0 | `["asap-explain-v1:root:ac0ac7d5f573754e55e5f37a75d60ace6d3a74eeb081ce85a7dc96334ca31d73"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner residual does not match any original query subtree"` |
-| 1 | `["asap-explain-v1:root:e13e67835975ec59bb3fdbe296544ae7da37f949b359f5deaa7103b77ac9c2f1"]` | `"unselected"` | `61000000000000.0` | `null` |
-| 2 | `["asap-explain-v1:root:01d98a8e246904cf0d42a2404bae63f7818f902759c57e16e178802f080b9ec3"]` | `"selected"` | `130.0` | `null` |
-| 3 | `["asap-explain-v1:root:cd34fea63097fb2fcf8b219ec4be8de476ce61574e8a06ee40d888613116f208"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
+| 0 | `["asap-explain-v1:root:ca91f1619565c87414e32bc57a5fb4e4f9e246ddf226a9153eb0a0f293725e92"]` | `"bind_failed"` | `null` | `"failed to construct QueryPlan: invalid QueryPlan: Planner logical fragment does not match any original query subtree"` |
+| 1 | `["asap-explain-v1:root:a3f319101755c7c188def0e38d71d955d58bebcbf7b8227a7a0cb5f8e922b5a1"]` | `"unselected"` | `61000000000000.0` | `null` |
+| 2 | `["asap-explain-v1:root:d18c7dca81eae12ef65bad09268a4150e809fcc227eb5743dea862c01257298a"]` | `"selected"` | `130.0` | `null` |
+| 3 | `["asap-explain-v1:root:4eb9fdb841402310608f87e857fb8605677de3b84f7526b07543ad93fe9bad29"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
 
 Successfully compiled candidate plans: [spatial-topk-1](candidates/spatial-topk-1.json), [spatial-topk-2](candidates/spatial-topk-2.json)
 

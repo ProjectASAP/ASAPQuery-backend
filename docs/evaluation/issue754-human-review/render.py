@@ -191,6 +191,12 @@ heap during precompute. Their typed stored boundary and both physical DAGs are
 listed below. Certified process E2E tests cover CMS and CountSketch heap SDS,
 multiple groups, resets, missing windows and restart. This placement requires
 the finite complete-input barrier; it does not claim continuous completeness.
+Grouped Rate exposes both query-time and precomputed Sum as native physical
+candidates. In both, each series is finalized with PromQL Rate semantics before
+Sum groups the values. The precomputed candidate retains independent complete
+60-second windows at this fixture's 10-second query cadence; it does not merge finalized
+rates across windows. Process E2E tests compare both placements, including a
+five-second cadence with a 65-second evaluation, missing grouping labels and durable restart.
 Other PromQL paths retain the documented Backend adapter representation.
 
 Candidate discovery preserves each root's admitted computations. Deployment
