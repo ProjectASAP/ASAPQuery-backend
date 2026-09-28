@@ -127,3 +127,18 @@ cargo clippy --locked -p promql-compliance --all-targets -- -D warnings
 ```
 
 There is no Go toolchain, runner, module or generated Go code in this harness.
+
+### Candidate execution matrix
+
+Run `make candidates` in `promql-compliance/runner` to test each issue-754 query,
+the shared-rate and shared-quantile ensembles, and the complete ten-query workload.
+For every admitted executable candidate, the harness changes only synthetic quotes
+to make that candidate cheapest, asserts that production selection chose it,
+compiles and installs its deployment plan, ingests the fixture once, and compares
+every query in that workload with Prometheus. A failed candidate fails the matrix.
+
+The report retains candidate admissions, quoted snapshots, selected plans and typed
+installations. Coverage means all candidates exposed and admitted for this fixture;
+it does not claim an exhaustive Cartesian product of all possible DAGs. Candidates
+rejected by accuracy admission or deployment binding remain recorded as rejected.
+Online ERP measurements and runtime replanning are outside this test.

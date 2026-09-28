@@ -890,3 +890,90 @@ fn issue754_queries_have_valid_physical_plans() {
         }
     }
 }
+
+/// Ensembles retain every query and coherent shared producer bindings in each
+/// exposed workload candidate. This does not claim exhaustive joint search.
+#[test]
+fn ensembles_preserve_all_queries_and_shared_output_identity() {
+    for (name, cases) in workload::ensembles() {
+        let (request, env) = workload::ensemble_input(&cases)
+            .into_physical_compilation_request()
+            .unwrap();
+        assert_eq!(request.queries.len(), cases.len());
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let (_, admission) =
+            compile_candidates_for_pricing(candidates.clone(), env.clone(), QueryFrontend::PromQl);
+        assert_eq!(admission.len(), candidates.len());
+        let mut bound = 0;
+        let mut shared = false;
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, env.clone()) else {
+                assert_eq!(
+                    admission[index].status,
+                    CandidateEvaluationStatus::CompilationFailed
+                );
+                assert!(admission[index]
+                    .unavailable_reason
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty()));
+                continue;
+            };
+            bound += 1;
+            assert_eq!(plan.query_plan.entries.len(), cases.len());
+            let mut consumers = std::collections::BTreeMap::new();
+            for case in &cases {
+                let entry = plan
+                    .query_plan
+                    .lookup(&case.expr)
+                    .expect("ensemble query disappeared");
+                assert!(entry.nodes.contains_key(&entry.root));
+                if let Some(dag) = plan.precompute_plan.executable_dags.get(&entry.query_id) {
+                    dag.validate().unwrap();
+                    validate_query_plan(dag, entry).unwrap();
+                }
+                for binding in entry.materialization_bindings() {
+                    let reference = &binding.stored_output_reference;
+                    let output = &plan.summary_catalog.outputs[&reference.stored_output_id];
+                    assert_eq!(reference.definition_id, output.definition_id);
+                    consumers
+                        .entry(reference.stored_output_id)
+                        .or_insert_with(std::collections::BTreeSet::new)
+                        .insert(entry.query_id.clone());
+                }
+            }
+            let producers: std::collections::BTreeSet<_> = plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .map(|m| m.policy_fingerprint())
+                .collect();
+            assert_eq!(producers.len(), plan.precompute_plan.materializations.len());
+            shared |= consumers.values().any(|readers| readers.len() > 1);
+            if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
+                let root = std::path::Path::new(&directory)
+                    .join("ensembles")
+                    .join(&name);
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(
+                    root.join(format!("candidate-{index}.json")),
+                    serde_json::to_vec_pretty(&plan).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join(format!("candidate-{index}.dot")),
+                    control_plane::physical::plan_dot::render(&plan),
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("admission.json"),
+                    serde_json::to_vec_pretty(&admission).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        assert!(bound > 0, "{name}: no bound ensemble candidate");
+        if name == "shared-rate" {
+            assert!(shared, "Rate consumers never share a stored producer");
+        }
+    }
+}
