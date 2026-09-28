@@ -23,7 +23,7 @@ pane width, without bypassing capability checks. Serialization does not confer
 compiler provenance: incoming quotes are always measured/provider evidence.
 Unquoted layouts use supplied lifecycle unit costs multiplied by structural
 counts. Layout changes never inherit another layout's measured scalar cost.
-Workload-versus-exact deployment evidence is still required by snapshot version 2.
+Workload-versus-exact deployment evidence is still required by snapshot version 3.
 
 Temporal requirements are derived from PromQL. A range selector supplies its
 own readout window; each rangeless source uses required

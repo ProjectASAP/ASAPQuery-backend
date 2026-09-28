@@ -4256,7 +4256,7 @@ pub(crate) mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap();
-        for version in [0, 1, 3] {
+        for version in [0, 1, 2, 4] {
             let mut old = snapshot.clone();
             old.schema_version = version;
             assert!(old
@@ -4264,7 +4264,7 @@ pub(crate) mod tests {
                 .into_physical_compilation_request()
                 .unwrap_err()
                 .to_string()
-                .contains("only version 2"));
+                .contains("only version 3"));
             assert!(old.compile_promql().is_err());
         }
         assert!(snapshot.into_physical_compilation_request().is_ok());
