@@ -428,6 +428,24 @@ mod tests {
         }
     }
 
+    // The complete selected-candidate adapter must not classify a byte budget as capability.
+    #[test]
+    fn selected_candidate_input_budget_is_a_terminal_error() {
+        let plan = CompiledPhysicalDag::decode(&sorted()).unwrap();
+        let error = execute_batches(&plan, 1, 1, 42, |_, schema| {
+            Ok(Batch::try_new(
+                schema.clone(),
+                vec![vec![Value::Float64(1.)]],
+            )?)
+        })
+        .err()
+        .expect("input must exceed the byte budget");
+        assert!(
+            matches!(error, EngineError::Physical(Error::MemoryLimit)),
+            "{error}"
+        );
+    }
+
     // Count-like values are bound as integers only when the protocol sample is exact.
     #[test]
     fn integer_input_binding_preserves_type_and_rejects_rounding() {
