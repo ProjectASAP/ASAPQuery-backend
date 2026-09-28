@@ -55,7 +55,7 @@ instantiates the compiled DAG. `CompiledPhysicalDag::from_operators` supports
 adapters that already have a concrete physical fragment. Unsupported deployment
 input frontiers are reported to Planner as feasibility evidence, before selection.
 
-Selected Sort, Limit and semi-join fragments are compiled by Planner and persisted
+Selected Filter, Sort, Limit and semi-join fragments are compiled by Planner and persisted
 with typed input contracts. Runtime binds protocol vectors to these contracts;
 renamed or multiple join keys retain their original types and positions. External
 Prometheus bindings fetch the selected authoritative subquery without rewriting

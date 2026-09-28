@@ -436,7 +436,8 @@ where
                 child,
                 operation:
                     planner_types::post_asap::ValueOperation::Limit { .. }
-                    | planner_types::post_asap::ValueOperation::Sort { .. },
+                    | planner_types::post_asap::ValueOperation::Sort { .. }
+                    | planner_types::post_asap::ValueOperation::Filter { .. },
                 timing: planner_types::post_asap::ExecutionTiming::QueryTime,
             } => {
                 let input = self.lower(child)?;
