@@ -24,6 +24,9 @@ class DiscoverSnapshotTests(unittest.TestCase):
                 "--template", str(template), "--output", str(output), "--repetitions", "1",
             ], check=True)
             snapshot = json.loads(output.read_text())
+            self.assertEqual(snapshot["snapshot_version"], 3)
+            self.assertEqual(snapshot["environment"]["dataset_identity"],
+                             json.loads(template.read_text())["environment"]["dataset_identity"])
             self.assertEqual(snapshot["query_workload"]["repeating_queries"][0]["demand"], {"fixed_interval_at": {"interval": 60000, "evaluation_phase": 0}})
             # Discovery output must obey the same schema as the compiler input.
             self.assertIsNone(snapshot["query_workload"]["repeating_queries"][0]["time_selection"].get("lookback"))
