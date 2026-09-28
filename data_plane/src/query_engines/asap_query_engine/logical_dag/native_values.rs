@@ -753,9 +753,7 @@ fn execute_batches(
     let graph = {
         let _binding = tracing::debug_span!(target: "asap_runtime_debug", "physical_input_binding",
             stage = "physical.bind_inputs", input_count = sources.len(), input_bytes, input_kind = "native_batch").entered();
-        program
-            .instantiate(sources)
-            .map_err(EngineError::from)?
+        program.instantiate(sources).map_err(EngineError::from)?
     };
     let context = dag::RunContext::new(
         dag::Scope::Query {
