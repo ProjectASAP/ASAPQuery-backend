@@ -109,42 +109,14 @@ fn required_summary_shapes(name: &str, fixture: Fixture) -> Vec<(&'static str, R
 const KNOWN_BINDING_DEFECTS: &[(&str, &str, usize)] = &[
     (
         "grouped-rate",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
-    (
-        "grouped-rate",
         "physical program has incompatible input or result schema",
         1,
     ),
-    (
-        "grouped-temporal-sum",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
-    (
-        "spatial-topk",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
-    // Workload candidates. The same defect reaches the batch path, and the
-    // fragment mismatch scales with workload size: one occurrence when three
-    // queries are planned together, fifteen across all ten. shared-quantiles
-    // reaches neither, so it has no entry.
-    (
-        "shared-rate",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
+    // The remaining schema defect also reaches workload candidates.
     (
         "shared-rate",
         "physical program has incompatible input or result schema",
         1,
-    ),
-    (
-        "all-ten",
-        "Planner logical fragment does not match any original query subtree",
-        15,
     ),
     (
         "all-ten",
@@ -386,6 +358,41 @@ fn topk_rate_sort_contract_rejects_wrong_value_expression() {
         sort.payload["operation"]["Sort"]["keys"][0]["expr"] = json!({"Column": column});
         assert!(std::panic::catch_unwind(|| assert_rate_sort_expression(&wrong)).is_err());
     }
+}
+
+// Assert the selected native operator and its typed key/group positions, not just its name.
+fn assert_selection_fragment(node: &Value, expected: &str) {
+    use asap_physical_operators::physical_planner::CompiledPhysicalDag;
+    assert_eq!(node["op"], "physical_fragment");
+    let bytes: Vec<u8> = serde_json::from_value(node["dag"].clone()).unwrap();
+    let plan = CompiledPhysicalDag::decode(&bytes).unwrap();
+    let contracts = plan.input_contracts().collect::<Vec<_>>();
+    assert_eq!(contracts.len(), 1);
+    let schema = &contracts[0].1.schema;
+    let grouping = schema
+        .fields
+        .iter()
+        .position(|field| field.name == "label_0")
+        .unwrap();
+    let sample = schema
+        .fields
+        .iter()
+        .position(|field| {
+            field.dtype == SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
+        })
+        .unwrap();
+    let encoded: Value = serde_json::from_slice(&bytes).unwrap();
+    let root = &encoded["nodes"][plan.roots()[0].to_string()]["Operator"];
+    assert_eq!(root["inputs"], json!([contracts[0].0]));
+    assert_eq!(plan.operator_name(plan.roots()[0]), Some(expected));
+    assert_eq!(
+        root["operator"]["kind"][expected],
+        if expected == "Limit" {
+            json!({"n":3,"offset":0,"groups":[grouping]})
+        } else {
+            json!({"keys":[{"column":sample,"descending":true,"nulls_first":false}],"groups":[grouping]})
+        }
+    );
 }
 
 fn assert_native_ranking(installed: &asap_types::query_plan::QueryPlanEntry) {
@@ -709,7 +716,16 @@ fn assert_candidate_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Stri
     let Some(family) = expected.family.as_ref() else {
         panic!("{name}: no physical plan contract");
     };
-    if let Some(operation) = expected.root_operation {
+    if expected.root_operation == Some("limit") && node["op"] == "physical_fragment" {
+        assert_selection_fragment(node, "Limit");
+        let inputs = node["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1);
+        node = &nodes[&inputs[0].to_string()];
+        assert_selection_fragment(node, "Sort");
+        let inputs = node["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1);
+        node = &nodes[&inputs[0].to_string()];
+    } else if let Some(operation) = expected.root_operation {
         assert_eq!(node["op"], "logical", "{name}: missing root operator");
         assert_eq!(
             node["operator"]["kind"], operation,
