@@ -28,3 +28,8 @@ Foundation checks passed locally:
 The accompanying `cleanup-*.log.gz` files record these checks. The restart process test covers same-version recovery without re-ingestion and new-version cold start followed by fresh input. Downstream verification checks the restacked Level 1/2 plans and current storage schema.
 
 No manual deployment verification or human approval is claimed.
+
+Downstream checks on the restacked #775 branch also passed: Level 1 (3 tests),
+Level 2 (1 exhaustive cost-selection test), storage (332 tests), and serving
+integration (13 tests). Workspace formatting passed. Concurrent remote fixture
+fixes were merged and retained before push.
