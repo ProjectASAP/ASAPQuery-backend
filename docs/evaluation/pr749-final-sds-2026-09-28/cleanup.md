@@ -25,7 +25,7 @@ Foundation checks passed locally:
 | Restart and new-version warm-up process | 1 passed |
 | Strict Clippy, all targets for the three crates | passed |
 
-The accompanying `cleanup-*.log.gz` files record these checks. The restart process test covers same-version recovery without re-ingestion and new-version cold start followed by fresh input. Downstream verification checks the restacked Level 1/2 plans and current storage schema.
+Generated logs are kept outside version control. The restart process test covers same-version recovery without re-ingestion and new-version cold start followed by fresh input. Downstream verification checks the restacked Level 1/2 plans and current storage schema.
 
 No manual deployment verification or human approval is claimed.
 
