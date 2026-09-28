@@ -30,7 +30,11 @@ On the corrected #749 code:
 The data-plane suite and process test were rerun after the final allocation fix.
 No production-cost or independent human approval claim is made.
 
-## Scope
+## Historical scope
+
+This report records the earlier foundation validation. The final SDS identity
+contract and its new test results supersede the scope below; see
+[final identity validation](../pr749-final-sds-2026-09-28/README.md).
 
 This is the plan/schema foundation described in #737's staged migration, not the
 completed SDS implementation. Its policy-fingerprint-based schema remains
