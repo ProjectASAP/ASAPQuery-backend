@@ -14,9 +14,11 @@ Derived outputs require the complete Planner closure at installation.
 
 Writes must match the installed output's operator and format. Durable metadata
 records both identities and the immutable catalog snapshot. Recovery validates
-that snapshot before restoring authoritative state. Old payload decoders remain
-available, but legacy metadata without semantic identity cannot authorize bound
-reads. Reinstall/rebuild those outputs rather than guessing their meaning.
+that snapshot before restoring authoritative state. Only the current metadata
+schema is accepted. Unsupported versions, flat-map sidecars, corrupt metadata,
+obsolete identity aliases, and untyped projection encodings are rejected. There
+is no automatic format migration or cross-version state-adoption path. Rebuild
+unsupported persisted state using the installed plan.
 
 See [SDS architecture](../../design_docs/summary-catalog-sds-architecture.md)
 for the contract and [migration gates](../../design_docs/asapplanner-migration-plan.md#5-bound-query-sds-implementation-across-the-pr-stack)
