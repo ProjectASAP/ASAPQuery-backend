@@ -17,7 +17,7 @@ services:
     build:
       context: ..
       dockerfile: data_plane/Dockerfile
-    command: ["--profile", "asapquery", "--physical-plan", "/config/physical-plan.json", "--prometheus-server", "http://prometheus:9090", "--http-port", "9091", "--output-dir", "/tmp/asap", "--persistence-enabled", "--persistence-dir", "/tmp/asap/state", "--persistence-delete-older-than-secs", "0"]
+    command: ["--enable-remote-write", "--physical-plan", "/config/physical-plan.json", "--prometheus-server", "http://prometheus:9090", "--http-port", "9091", "--output-dir", "/tmp/asap", "--persistence-enabled", "--persistence-dir", "/tmp/asap/state", "--persistence-delete-older-than-secs", "0"]
     volumes:
       - ${ASAP_PHYSICAL_PLAN}:/config/physical-plan.json:ro
     ports: ["${BACKEND_PORT:-19091}:9091"]
