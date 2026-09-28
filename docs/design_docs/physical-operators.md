@@ -68,7 +68,7 @@ Every installed range evaluation uses the shared DAG execution path and reports
 its actual local-summary and external-exact work. The differential and benefit
 runners require successful local execution evidence as well as matching values.
 Routing to the ASAP endpoint alone is insufficient.
-Selected Sort, Limit and semi-join fragments are compiled by Planner and persisted
+Selected Filter, Sort, Limit and semi-join fragments are compiled by Planner and persisted
 with typed input contracts. Runtime binds protocol vectors to these contracts;
 renamed or multiple join keys retain their original types and positions. External
 Prometheus bindings fetch the selected authoritative subquery without rewriting
