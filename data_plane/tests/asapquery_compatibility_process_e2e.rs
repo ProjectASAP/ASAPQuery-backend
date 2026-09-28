@@ -210,7 +210,10 @@ fn unused_port() -> u16 {
 }
 
 async fn wait_until_ready(client: &reqwest::Client, url: &str, child: &mut Child) {
-    for _ in 0..120 {
+    // Startup compiles the complete workload candidate set before serving.
+    // This is a readiness budget, not a query latency assertion.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while tokio::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("inspect backend process") {
             panic!("backend exited before readiness: {status}");
         }
