@@ -142,3 +142,8 @@ installations. Coverage means all candidates exposed and admitted for this fixtu
 it does not claim an exhaustive Cartesian product of all possible DAGs. Candidates
 rejected by accuracy admission or deployment binding remain recorded as rejected.
 Online ERP measurements and runtime replanning are outside this test.
+
+The Compose deployment enables Remote Write and durable summary storage. Some
+candidates read persisted intermediate state during precompute; an in-memory-only
+profile cannot execute them. State stays within the fresh container for a trial,
+and teardown discards it before installing the next candidate.
