@@ -63,8 +63,11 @@ fn workload_candidates_follow_prices_and_feasibility() {
                 for quote in &mut wrong_dataset.quotes {
                     quote.manifest.dataset_identity.namespace = "another-tenant".into();
                 }
-                assert!(select_lowest_cost_candidate(candidates.clone(), env.clone(), &wrong_dataset).is_err(),
-                    "quotes for another dataset must not price this workload");
+                assert!(
+                    select_lowest_cost_candidate(candidates.clone(), env.clone(), &wrong_dataset)
+                        .is_err(),
+                    "quotes for another dataset must not price this workload"
+                );
             }
             let plan = select_lowest_cost_candidate(candidates.clone(), env.clone(), &evidence)
                 .unwrap_or_else(|e| panic!("{}: {e}", name));
