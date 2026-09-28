@@ -45,9 +45,8 @@ Passed locally on the final implementation:
 - Production-process restart/new-version warm-up: **1 test**.
 - All-target strict Clippy for all three packages and workspace formatting.
 
-Compressed logs are verified by `SHA256SUMS`. The before-fix log records the
-identity collisions exposed while extracting the contract ahead of typed
-Count/Rate support.
+Identity collisions were exposed while extracting the contract ahead of typed
+Count/Rate support. Generated logs are kept outside version control.
 The production-process test covers same-version restart without re-ingestion,
 new-version cold state, and fresh input becoming queryable in that version.
 No production workload, production-cost, or independent human approval claim is
