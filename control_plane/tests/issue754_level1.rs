@@ -251,6 +251,94 @@ fn assert_native_ranking(installed: &asap_types::query_plan::QueryPlanEntry) {
     assert_eq!(limit["inputs"], json!([sort_id]));
 }
 
+// Check the computation on each side of the persisted frontier, not just the
+// presence of Sum: per-series Rate must be finalized before grouped aggregation.
+fn assert_native_grouped_rate(plan: &CompiledPhysicalPlan) -> bool {
+    let entry = plan.query_plan.entries.values().next().unwrap();
+    let query = entry.recover_vector_physical_dag().unwrap();
+    let query: Value = serde_json::from_slice(&query.encode().unwrap()).unwrap();
+    let installed = &plan.precompute_plan.executable_dags[&entry.query_id];
+    let stored = !installed.native_programs.is_empty();
+    let maintenance;
+    let aggregation = if stored {
+        assert_eq!(installed.native_programs.len(), 1);
+        let sink = *installed.native_programs.keys().next().unwrap();
+        maintenance = serde_json::from_slice::<Value>(
+            &installed
+                .native_program(sink)
+                .unwrap()
+                .unwrap()
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        &maintenance
+    } else {
+        &query
+    };
+    let nodes = aggregation["nodes"].as_object().unwrap();
+    let sum = nodes
+        .values()
+        .filter_map(|node| node.get("Operator"))
+        .find(|op| op["operator"]["kind"].get("SummaryBuild").is_some())
+        .expect("grouped Rate candidate must explicitly build Sum");
+    let build = &sum["operator"]["kind"]["SummaryBuild"];
+    assert!(build["family"].to_string().contains("Sum"));
+    assert_eq!(sum["inputs"].as_array().unwrap().len(), 1);
+    let producer = &nodes[&sum["inputs"][0].to_string()];
+    let fields = producer
+        .get("Input")
+        .map(|input| &input["schema"]["fields"])
+        .unwrap_or(&producer["Operator"]["operator"]["output"]["fields"])
+        .as_array()
+        .unwrap();
+    let groups: Vec<_> = build["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|column| {
+            fields[column.as_u64().unwrap() as usize]["name"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(groups, ["label_0"]);
+    let value = build["value"].as_u64().unwrap() as usize;
+    assert_eq!(fields[value]["dtype"], json!({"Plain":"float64"}));
+    if stored {
+        let rate = &producer["Operator"]["operator"]["kind"]["Readout"];
+        assert_eq!(rate["statistic"], "Rate");
+        assert_eq!(rate["parameters"]["logical_lookback_ms"], "60000");
+        assert!(!query.to_string().contains("SummaryBuild"));
+        assert!(query.to_string().contains("Readout"));
+        assert!(
+            plan.precompute_plan
+                .materializations
+                .iter()
+                .all(|state| state.window_size == 60 && state.slide_interval == 10),
+            "stored Sum must cover each 60-second query window at the fixture's 10-second cadence"
+        );
+    } else {
+        assert!(
+            producer.get("Input").is_some(),
+            "Sum consumes the bound Rate vector"
+        );
+        let wire = serde_json::to_value(entry).unwrap();
+        let bound_nodes = wire["nodes"].as_object().unwrap();
+        let root = &bound_nodes[&wire["root"].to_string()];
+        assert_eq!(root["op"], "physical");
+        assert_eq!(root["inputs"].as_array().unwrap().len(), 1);
+        let rate = &bound_nodes[&root["inputs"][0].to_string()];
+        assert_eq!(rate["op"], "exact_readout");
+        assert_eq!(rate["readout"], "rate");
+        let state = &bound_nodes[&rate["input"].to_string()];
+        assert_eq!(state["op"], "read_materialization");
+        assert_eq!(state["binding"]["readout_lookback_ms"], 60_000);
+        assert_eq!(state["binding"]["output_grouping"]["mode"], "per_entity");
+    }
+    stored
+}
+
 fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<String> {
     if name == "topk-rate" {
         for dag in plan.query_plan.selected_dags.values() {
@@ -291,6 +379,19 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
             &materialization.accumulator_spec().unwrap().family,
             "{name}: precompute producer and catalog disagree about Planner family"
         );
+    }
+    if name == "grouped-rate"
+        && plan
+            .query_plan
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .physical_vector_binding()
+            .is_some()
+    {
+        assert_native_grouped_rate(plan);
+        return None;
     }
     let mut expected = expected_plan(name);
     let artifact = serde_json::to_value(plan).unwrap();
@@ -688,6 +789,7 @@ fn issue754_queries_have_valid_physical_plans() {
         }
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let mut valid_plans = Vec::new();
+        let mut grouped_rate_placements = std::collections::BTreeSet::new();
         let mut quotes = Vec::new();
         let mut errors = Vec::new();
         for (candidate_index, candidate) in candidates.into_iter().enumerate() {
@@ -719,6 +821,9 @@ fn issue754_queries_have_valid_physical_plans() {
                             assert_eq!(assert_selected_plan(&case.name, &plan), None,
                                 "every admitted local candidate must preserve grouped/window semantics");
                         }
+                    }
+                    if case.name == "grouped-rate" && entry.physical_vector_binding().is_some() {
+                        grouped_rate_placements.insert(assert_native_grouped_rate(&plan));
                     }
                     let dot = control_plane::physical::plan_dot::render(&plan);
                     assert!(dot.contains("PrecomputePlan") && dot.contains("QueryPlan:"));
@@ -763,6 +868,13 @@ fn issue754_queries_have_valid_physical_plans() {
                 }
                 Err(error) => errors.push(error.to_string()),
             }
+        }
+        if case.name == "grouped-rate" {
+            assert_eq!(
+                grouped_rate_placements,
+                std::collections::BTreeSet::from([false, true]),
+                "Planner must expose query-time and precomputed grouped Rate/Sum: {errors:?}"
+            );
         }
         assert!(
             !valid_plans.is_empty(),
