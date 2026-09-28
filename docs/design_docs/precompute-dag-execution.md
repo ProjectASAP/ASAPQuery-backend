@@ -310,10 +310,69 @@ twice. Queries cannot combine dependent outputs from incompatible revisions.
 An external producer/partition completion protocol is not required for this
 initial local-input design.
 
+The query selects the latest compatible input snapshot that satisfies its
+selected freshness requirement. Physical record versions need not have identical
+counters: an unchanged output may remain valid for a newer snapshot. An output
+whose dependencies changed cannot be carried forward until its replacement is
+ready. For two affected outputs:
+
+| Available records | Query needs A | Query needs A and B |
+| --- | --- | --- |
+| A:r1, B:r1 | Read r1 | Read r1 |
+| A:r1/r2, B:r1; B:r2 pending | Read r2 | Read r1 if fresh enough |
+| A:r1/r2, B:r1/r2 | Read r2 | Read r2 |
+| Only common r1 exceeds freshness | A may use r2 | No eligible snapshot |
+
+Independent publication is permitted. Query eligibility is checked for the
+whole required read set before execution, and that read set stays pinned for
+the query. Concurrent publication or retention cannot switch one branch to a
+different snapshot. An unavailable snapshot follows the installed QueryPlan's
+availability policy; cancellation and resource errors remain execution failures.
+
+### Bounded corrections and recovery (target)
+
+Deployment requirements include a finite correction horizon. Planner selects a
+maintenance candidate that retains enough input to recompute affected windows;
+Backend binds and enforces that requirement. The deduplication cache lifetime,
+flush timer, and maximum observed event timestamp are not substitutes for this
+contract.
+
+Admission validates the complete Remote Write request against the retained
+correction range before enqueuing any of it. An out-of-range write is rejected
+explicitly, including an unseen series in an old window. A rejected batch must
+not advance the input revision, update deduplication state, or partially modify
+stored results. Keeping output bytes alone does not establish that the inputs
+needed for a correction remain available.
+
+A successful input snapshot identifies a durable, fixed set of accepted input.
+Source capture must exclude later admissions and retain dependency membership,
+including all contributing populations. Derived execution may overlap later
+admission, but must use the captured snapshot rather than rereading mutable live
+state. Every affected sink is evaluated against that same snapshot; shared
+ancestors execute once for the selected sinks.
+
+Recovery restores the installed generation, input revision, retained correction
+boundary, and committed result versions before accepting input or serving reads.
+A partially published newer revision does not invalidate an older compatible
+snapshot that remains fresh enough. Retrying the same input snapshot must not
+add a full recomputed result to its prior version or publish it twice. Starting
+a new plan version does not implicitly inherit this revision history.
+
+| Acceptance case | Required behavior |
+| --- | --- |
+| Late value 4 joins values 2 and 3 | r2 reads 9, never 14; r1 remains 5 while eligible |
+| A:r2 commits and B:r2 fails | A+B reads compatible r1 if fresh; never A:r2 with affected B:r1 |
+| A changes but B's dependency set does not | Unchanged B may serve the newer compatible snapshot |
+| Old common revision exceeds freshness | The query cannot serve it as an eligible summary hit |
+| One sample in a batch exceeds the correction range | Reject the complete batch before any admission |
+| Crash between sibling publications | Recover committed versions and resume without duplicate publication |
+| Restart with the same plan version | Preserve the correction boundary and revision eligibility |
+| Install a new plan version | Require its own input/history and warm-up |
+
 The production implementation currently establishes finite-input closure only.
-Continuous revision snapshots still require durable input capture, publication
-and recovery rules. Selection of an older consistent revision under freshness
-requirements, and the permitted correction horizon, remain design decisions.
+The continuous contracts above require coordinated changes to source capture,
+versioned storage, query snapshot selection and recovery; they are not established
+by the existing finite-input tests.
 
 ## 6. Publish the selected DAG outputs
 
