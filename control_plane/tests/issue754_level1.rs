@@ -116,33 +116,13 @@ fn required_summary_shapes(name: &str, fixture: Fixture) -> Vec<(&'static str, R
 const KNOWN_BINDING_DEFECTS: &[(&str, &str, usize)] = &[
     (
         "grouped-rate",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
-    (
-        "grouped-rate",
         "physical program has incompatible input or result schema",
         1,
     ),
-    (
-        "grouped-temporal-sum",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
-    (
-        "spatial-topk",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
-    // Workload candidates. The same defect reaches the batch path, and the
-    // fragment mismatch scales with workload size: one occurrence when three
-    // queries are planned together, fifteen across all ten. shared-quantiles
-    // reaches neither, so it has no entry.
-    (
-        "shared-rate",
-        "Planner logical fragment does not match any original query subtree",
-        1,
-    ),
+    // Workload candidates. The fragment-mismatch entries are gone: #781 fixed
+    // that defect, and removing it exposed a second schema incompatibility in
+    // `all-ten` that had been hidden behind the earlier rejection, so that
+    // count is 2 rather than 1. `shared-quantiles` reaches neither defect.
     (
         "shared-rate",
         "physical program has incompatible input or result schema",
@@ -150,13 +130,8 @@ const KNOWN_BINDING_DEFECTS: &[(&str, &str, usize)] = &[
     ),
     (
         "all-ten",
-        "Planner logical fragment does not match any original query subtree",
-        15,
-    ),
-    (
-        "all-ten",
         "physical program has incompatible input or result schema",
-        1,
+        2,
     ),
 ];
 
