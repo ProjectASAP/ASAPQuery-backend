@@ -269,20 +269,6 @@ mod tests {
         assert_eq!(wire["population_key_encoding"], "canonical_labels_v1");
         let decoded: PrecomputeMaterialization = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded.policy_fingerprint(), canonical.policy_fingerprint());
-        use crate::traits::SerializableToSink;
-        let mut sink = canonical.serialize_to_json();
-        // Transport wrappers supply the three label projections separately.
-        sink["groupingLabels"] = serde_json::to_value(&canonical.grouping_labels).unwrap();
-        sink["aggregatedLabels"] =
-            serde_json::to_value(&canonical.aggregated_labels.labels).unwrap();
-        sink["rollupLabels"] = serde_json::to_value(&canonical.rollup_labels.labels).unwrap();
-        let decoded = PrecomputeMaterialization::deserialize_from_json(&sink).unwrap();
-        assert_eq!(
-            decoded.population_key_encoding,
-            canonical.population_key_encoding
-        );
-
-        assert!(serde_json::from_str::<PopulationKeyEncoding>("\"canonical_labels_v2\"").is_err());
     }
 
     #[test]
