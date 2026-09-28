@@ -204,8 +204,9 @@ fn moving_window(canonical: &QueryExpr) -> Option<(String, (u64, u64))> {
 pub use asap_frontend_sql::SqlCatalog as ClickHouseSqlCatalog;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClickHouseSqlWorkload {
-    #[serde(rename = "sds", alias = "summary_catalog")]
+    #[serde(rename = "sds")]
     pub summary_catalog: SummaryCatalog,
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
