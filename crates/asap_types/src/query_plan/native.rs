@@ -449,9 +449,11 @@ impl QueryPlanEntry {
                     || output.schema.fields.iter().any(|field| !matches!(field.dtype, SummaryFamilyType::Plain(DataType::Utf8 | DataType::Float64 | DataType::Timestamp)))
             }
         {
-            return Err(invalid(
-                "physical program has incompatible input or result schema",
-            ));
+            return Err(invalid(&format!(
+                "physical program has incompatible input or result schema: inputs {:?}; output {:?}",
+                dag.input_contracts().map(|(id, contract)| (id, &contract.schema)).collect::<Vec<_>>(),
+                dag.output_contract(dag.roots()[0]).map_err(|error| QueryPlanError::Invalid(error.to_string()))?.schema,
+            )));
         }
         Ok(dag)
     }
