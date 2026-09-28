@@ -991,7 +991,6 @@ async fn run_shared_dashboard(multi_pane: bool) {
             }
         })
         .collect();
-    typed.schema_version = 2;
     typed.workload_cost_evidence = Some(
         control_plane::physical::workload_cost::WorkloadCostEvidence {
             backend_revision: control_plane::physical::compiler::BACKEND_REVISION.into(),
