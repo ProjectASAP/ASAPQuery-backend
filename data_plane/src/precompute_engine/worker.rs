@@ -546,15 +546,7 @@ impl Worker {
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let value = if state.program.as_deref().map_or_else(
-                || {
-                    matches!(
-                        state.config.sample_update_rule(),
-                        SampleUpdateRule::CounterDelta { .. }
-                    )
-                },
-                |p| p.uses_counter_delta(),
-            ) {
+            let value = if legacy_counter_delta(state) {
                 reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
             } else {
                 Some(*val)
@@ -605,15 +597,7 @@ impl Worker {
                             // Never feed the raw counter value into a membership
                             // heap; the authoritative ExactCounter branch remains
                             // responsible for the visible result.
-                            if state.program.as_deref().map_or_else(
-                                || {
-                                    matches!(
-                                        state.config.sample_update_rule(),
-                                        SampleUpdateRule::CounterDelta { .. }
-                                    )
-                                },
-                                |p| p.uses_counter_delta(),
-                            ) {
+                            if legacy_counter_delta(state) {
                                 if let Some(input) = state.input_revisions.get_mut(&bucket_start) {
                                     Arc::make_mut(input).first_revision = 0;
                                 }
@@ -1612,6 +1596,21 @@ pub(crate) fn apply_sample(
 /// Convert a cumulative counter sample into a non-negative, reset-aware
 /// increment. Only the immediately preceding sample per series is retained;
 /// pane rotation therefore cannot lose the boundary increment.
+/// Whether a sample must be converted to a counter delta before it reaches the
+/// accumulator.
+///
+/// Only the legacy configured update rule does this. A selected Planner program
+/// never does: rate is an explicit upstream operator in the DAG, so the sample
+/// reaches the accumulator unchanged. Both call sites used to ask the program
+/// and were always told `false`.
+fn legacy_counter_delta(state: &GroupState) -> bool {
+    state.program.is_none()
+        && matches!(
+            state.config.sample_update_rule(),
+            SampleUpdateRule::CounterDelta { .. }
+        )
+}
+
 pub(crate) fn reset_aware_counter_delta(
     previous: &mut HashMap<String, (i64, f64)>,
     series_key: &str,

@@ -223,11 +223,6 @@ impl RawDagProgram {
         self.updater().map(|_| ())
     }
 
-    pub fn uses_counter_delta(&self) -> bool {
-        // Planner represents rate computation as an explicit upstream operator.
-        false
-    }
-
     pub fn apply(
         &self,
         updater: &mut dyn AccumulatorUpdater,
