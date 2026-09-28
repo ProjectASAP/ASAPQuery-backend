@@ -152,14 +152,15 @@ async fn run_warm_workload(queries: Vec<(String, u64, u64)>) {
     let quotes = candidates
         .into_iter()
         .filter_map(|candidate| {
-            let plan =
-                match DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone()) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        errors.push(error.to_string());
-                        return None;
-                    }
-                };
+            let plan = match DeploymentPlanCompiler
+                .compile_promql(candidate.clone(), environment.clone())
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    return None;
+                }
+            };
             let warm = fully_warm(&plan);
 
             found |= warm;
