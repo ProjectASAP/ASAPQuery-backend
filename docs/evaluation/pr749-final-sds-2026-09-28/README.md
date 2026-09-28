@@ -53,3 +53,7 @@ new-version cold state, and fresh input becoming queryable in that version.
 No production workload, production-cost, or independent human approval claim is
 made. #728/#742/#775 retain their structural, synthetic-selection, and deployment
 execution acceptance roles.
+
+## Obsolete-format cleanup
+
+See [cleanup and validation](cleanup.md) for removed wire adapters, strict metadata recovery, and downstream verification.
