@@ -89,8 +89,11 @@ recorded as a policy reason rather than a defect.
 
 **Binding defects** are bugs. Three candidates fail with `Planner logical
 fragment does not match any original query subtree` and one with a schema
-incompatibility. `main` is green on these paths, so each is a regression
-introduced inside the #737 → #728 stack. They are enumerated in
+incompatibility. They are older than this stack: `residual_nodes` is
+substantively identical on `main`, which is green only because its tests never
+plan these queries. The fragment mismatch is a context-derived leaf schema
+compared for equality against an isolated re-parse that cannot reproduce it;
+#781 fixes it on `main` by comparing those schemas by containment. They are enumerated in
 `KNOWN_BINDING_DEFECTS` in the Level-1 test with exact occurrence counts: a new
 instance fails the test, and a fixed one forces its entry to be deleted. Every
 entry must be gone before #775 installs and executes these candidates. The same

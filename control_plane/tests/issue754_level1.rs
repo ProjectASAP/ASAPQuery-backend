@@ -103,9 +103,16 @@ fn required_summary_shapes(name: &str, fixture: Fixture) -> Vec<(&'static str, R
 /// Binding defects this fixture reaches today. Level 1 records them rather than
 /// tolerating them silently: each entry must still occur exactly `count` times,
 /// so a new instance fails the test and a fixed one forces its line to be
-/// deleted. `main` is green on these paths, so every entry is a regression
-/// introduced inside the #737 → #728 stack, and all of them must be gone before
-/// #775 installs and executes these candidates.
+/// deleted. All of them must be gone before #775 installs and executes these
+/// candidates.
+///
+/// These are *not* regressions introduced by this stack, which is what an
+/// earlier revision of this comment claimed on the grounds that `main` is
+/// green. `residual_nodes` is substantively identical on `main`; the stack
+/// changed only how it derives the accuracy target and the wording of this
+/// message. `main` is green because its tests never plan these queries, not
+/// because the code is correct. The fragment mismatch is fixed on `main` by
+/// #781, which compares context-derived leaf schemas by containment.
 const KNOWN_BINDING_DEFECTS: &[(&str, &str, usize)] = &[
     (
         "grouped-rate",
