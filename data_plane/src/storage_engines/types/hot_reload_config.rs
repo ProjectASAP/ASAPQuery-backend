@@ -717,6 +717,7 @@ mod tests {
                 summary_catalog: None,
                 envelope: envelope.clone(),
                 ingest: asap_types::precompute_plan::IngestContract {
+                    dataset_identity: None,
                     protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
                     endpoint_path: "/v1/metrics".into(),
                     timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,

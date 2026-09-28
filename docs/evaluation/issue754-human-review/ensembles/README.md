@@ -1,7 +1,8 @@
 # Query ensemble candidate exports
 
-Generated from Backend `cf9d0770` (test code `dcddbfcf`) and Planner
-`176c1bd565e0c400f9a35996c2bd65de32475e72` using the Level 1 fixture contracts.
+Generated from Backend `af507e08` and Planner
+`bccc837f5caf21c888b2cce73c64a1be283b679a`, including explicit logical dataset
+identity, using the Level 1 fixture contracts.
 All three Level 1 tests passed. These are structural exports, not cost selections
 or human approval. JSON files are gzip-compressed; DOT files show each bound DAG.
 Admission reports retain rejected candidates and reasons.

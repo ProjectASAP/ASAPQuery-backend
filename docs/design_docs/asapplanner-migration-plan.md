@@ -71,6 +71,15 @@ can reference semantic fingerprints. Definitions derived from incomplete legacy
 metadata must be reconstructed from authoritative plans or rejected for rebuild;
 do not infer missing expressions from source and grouping alone.
 
+Supply stable logical dataset identities to Planner before semantic export, and
+validate that concrete source bindings realize those identities. Different datasets
+must not acquire equal definitions merely because expressions use the same names.
+
+Planner exposes physical workload candidates. Backend evaluates binding feasibility
+and scoped costs before selecting a deployment; it does not rewrite candidate DAGs.
+The initial tests inject synthetic costs. Online measurements and feedback-driven
+replanning remain deferred.
+
 Consume the selected Physical DAGs, physical boundary identities, query
 associations and maintenance requirements. Replace semantic-node classification
 with mappings from declared input/output boundaries to deployment resources.
@@ -116,9 +125,10 @@ Migrate publishers and consumers together with pinned dependencies and matching
 rollback artifacts. Remove obsolete plan adapters, full-logical-DAG execution
 and duplicated operators after the new path passes its gates.
 
-Storage payload readers remain governed by the supported format policy. Reuse
-across plan versions requires an explicit compatibility decision independently
-of a binary rollback.
+Storage payload readers remain governed by the supported format policy. Initial
+recovery supports the same installed plan version. New versions populate
+their own state and use their installed fallback/unavailability policy during
+warm-up. Cross-version state adoption is deferred independently of binary rollback.
 
 ## 4. Acceptance evidence
 
@@ -132,11 +142,15 @@ Acceptance includes:
 - Supported query-time construction and precomputed finalized outputs follow the
   selected phases; unsupported output bindings fail explicitly.
 - Missing, overlapping, incomplete or incompatible state fails eligibility.
+- Dataset identity changes alter definitions; endpoint/replica changes do not.
+- Query branches preserve the whole-query revision fence during publication.
+- Same-version recovery validates bindings and completeness; new-version reads
+  never silently adopt old state and follow warm-up failure policy.
 - Staging failure, cancellation, resource limits, restart and version switching
   preserve documented behavior.
 - Obsolete plans are rejected and backend builds/tests do not require Collector.
 
-Trace a query from Planner selection through physical compilation, deployment
+Trace a query from Planner candidate construction through Backend selection, deployment
 binding, state publication and query execution. Verify exact operations against
 independent results and sketches against their supported guarantees. The design
 is not accepted solely because example schemas parse or unit tests pass.
@@ -155,7 +169,7 @@ Ad-hoc discovery is deferred.
 | Planner dependency integration (#774) | Consume the shared semantic export and propagate it from selected physical outputs into deployment compilation. | No backend expression normalization or synthetic semantic fingerprint from incomplete config fields. |
 | Precompute/storage integration (#763) | Persist definitions and output-scoped records; authorize writes against installed bindings and recover them consistently. | Restart retains semantic descriptions; wrong-output writes fail; replacement metadata and payload remain consistent. |
 | Query integration (#765) | Resolve the installed deployed output and validate definition, revision, format and coverage before invoking shared execution. | A hot-bound query never reads rebuild state; stale, missing or incompatible records take the explicit failure route. |
-| Acceptance PRs (#728, #742, #759) | Update fixtures and process tests for the new contract; retain existing behavioral and performance gates. | End-to-end producer → persisted definition/record → recovery → bound read, with negative identity and coverage cases. |
+| Acceptance PRs (#728, #742, #775) | Update fixtures and process tests for the new contract; validate individual queries and ensembles using synthetic costs. | End-to-end producer → persisted definition/record → recovery → bound read, with negative identity and coverage cases. |
 
 These are implementation responsibilities and acceptance gates. PR ordering
 must follow actual dependency commits, not an outdated stack list.
@@ -170,4 +184,5 @@ in the same implementation PR.
 
 The open shared-library integration PR is #774, replacing the already merged
 #770. The active order after #771 is #774 → #763 → #765 → #761 → #728
-→ #742 → #759; old #770 base metadata is not part of this chain.
+→ #742 → #775. Real-evidence work in #776, #777, #778 and #759 is deferred;
+old #770 base metadata is not part of this chain.

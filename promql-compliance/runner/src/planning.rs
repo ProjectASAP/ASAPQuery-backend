@@ -69,6 +69,9 @@ pub fn snapshot(
     value["environment"]["activation_unix_ms"] = json!(now);
     value["environment"]["max_evidence_age_ms"] = json!(600_000);
     value["environment"]["capability_snapshot_id"] = json!("promql-compliance");
+    value["environment"]["dataset_identity"] = json!({
+        "namespace": "promql-compliance", "dataset": dataset.name,
+    });
     // Both paths describe the actual finite replay. Differential data can
     // have irregular gaps; its cadence contract bounds the largest gap.
     // Benefit requires uniform cadence for comparable maintenance demand.
