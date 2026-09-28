@@ -30,8 +30,21 @@ async fn precomputed_rate_cms_heap_survives_durable_restart() {
     run("CmsWithHeap", true).await;
 }
 
+#[tokio::test]
+async fn precomputed_grouped_rate_sum_survives_durable_restart() {
+    run("Sum", true).await;
+}
+#[tokio::test]
+async fn query_time_grouped_rate_sum_survives_durable_restart() {
+    run("Sum", false).await;
+}
+
 async fn run(algorithm: &str, precomputed: bool) {
-    let query = "topk by (job) (1, rate(requests_total[1m]))";
+    let query = if algorithm == "Sum" {
+        "sum by (job) (rate(requests_total[1m]))"
+    } else {
+        "topk by (job) (1, rate(requests_total[1m]))"
+    };
     let mut wire: Value = serde_json::from_str(include_str!(
         "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
     ))
@@ -40,7 +53,14 @@ async fn run(algorithm: &str, precomputed: bool) {
     entry["query"] = query.into();
     entry["requirements"]["accuracy"] =
         serde_json::json!({"explicit":{"EpsilonDelta":{"epsilon":0.1,"delta":0.1}}});
-    entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
+    entry["demand"]["fixed_interval_at"]["interval"] = if algorithm == "Sum" {
+        5_000.into()
+    } else {
+        60_000.into()
+    };
+    if algorithm == "Sum" {
+        entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
+    }
     entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
     wire["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
     wire["implementation"]["topk_evidence"] = serde_json::json!({});
@@ -53,6 +73,9 @@ async fn run(algorithm: &str, precomputed: bool) {
         "topk_selected_lower_bound":500.0,"topk_excluded_upper_bound":10.0,
         "topk_interval_failure_probability":0.001
     }});
+    if algorithm == "Sum" {
+        wire["implementation"]["accuracy_evidence"] = serde_json::json!({});
+    }
     let mut snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
     let (request, environment) = snapshot
         .clone()
@@ -122,6 +145,19 @@ async fn run(algorithm: &str, precomputed: bool) {
             .any(|dag| !dag.native_programs.is_empty()),
         precomputed
     );
+
+    if precomputed {
+        assert!(
+            plan.precompute_plan
+                .materializations
+                .iter()
+                .all(
+                    |state| state.slide_interval == if algorithm == "Sum" { 5 } else { 60 }
+                        && state.window_size == 60
+                ),
+            "maintenance must match the query cadence, not publish only every 60 seconds"
+        );
+    }
 
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
@@ -241,15 +277,37 @@ async fn run(algorithm: &str, precomputed: bool) {
                         (120000, 240000.),
                     ],
                 )))
+                .chain((algorithm == "Sum").then(|| {
+                    series_with_labels(
+                        "requests_total",
+                        &[("unreferenced_instance", "no-job")],
+                        &[
+                            (1000, 3.),
+                            (20000, 60.),
+                            (40000, 120.),
+                            (60000, 180.),
+                            (61000, 183.),
+                            (80000, 240.),
+                            (100000, 300.),
+                            (120000, 360.),
+                        ],
+                    )
+                }))
                 .collect(),
             };
             assert_eq!(remote_write(&client, &backend, &request).await, 204);
             drain_precompute(&client, &backend).await;
         }
-        for (index, (at, winner, score)) in [(60., "a", 1000.), (120., "b", 39050. / 59.)]
-            .into_iter()
-            .enumerate()
-        {
+        let evaluations = if algorithm == "Sum" {
+            vec![
+                (60., "a", 1000.),
+                (65., "a", 1000.),
+                (120., "b", 39050. / 59.),
+            ]
+        } else {
+            vec![(60., "a", 1000.), (120., "b", 39050. / 59.)]
+        };
+        for (index, (at, winner, score)) in evaluations.into_iter().enumerate() {
             let body = wait_for_warm_instant(
                 &client,
                 &backend,
@@ -259,7 +317,20 @@ async fn run(algorithm: &str, precomputed: bool) {
             )
             .await;
             let rows = body["data"]["result"].as_array().unwrap();
-            assert_eq!(rows.len(), 2, "{body}");
+            assert_eq!(rows.len(), if algorithm == "Sum" { 3 } else { 2 }, "{body}");
+            if algorithm == "Sum" {
+                let empty = rows
+                    .iter()
+                    .find(|row| {
+                        row["metric"]
+                            .as_object()
+                            .is_some_and(|labels| labels.is_empty())
+                    })
+                    .unwrap_or_else(|| panic!("missing grouping labels must be omitted: {body}"));
+                assert!(
+                    (empty["value"][1].as_str().unwrap().parse::<f64>().unwrap() - 3.).abs() < 1e-8
+                );
+            }
             assert!(
                 rows.iter()
                     .all(|row| row["metric"].get("__name__").is_none()),
@@ -273,12 +344,35 @@ async fn run(algorithm: &str, precomputed: bool) {
                 .iter()
                 .find(|row| row["metric"]["job"] == "worker")
                 .unwrap();
-            assert_eq!(worker["metric"]["unreferenced_instance"], "d");
+            if algorithm != "Sum" {
+                assert_eq!(worker["metric"]["unreferenced_instance"], "d");
+            }
             assert!(
                 (worker["value"][1].as_str().unwrap().parse::<f64>().unwrap() - 2000.).abs() < 1e-8
             );
-            assert_eq!(api["metric"]["unreferenced_instance"], winner, "{body}");
+            if algorithm == "Sum" {
+                assert!(
+                    api["metric"].get("unreferenced_instance").is_none(),
+                    "grouped Sum must drop ungrouped labels: {body}"
+                );
+            } else {
+                assert_eq!(api["metric"]["unreferenced_instance"], winner, "{body}");
+            }
             let value = api["value"][1].as_str().unwrap().parse::<f64>().unwrap();
+            let score = score
+                + if algorithm == "Sum" {
+                    if at == 60. {
+                        1.1
+                    } else if at == 65. {
+                        // b's zero-point extrapolation truncates the left edge:
+                        // (980 * 45 / 41 + 20) / 60, plus c's constant 0.1.
+                        (980. * 45. / 41. + 20.) / 60. + 0.1
+                    } else {
+                        0.1
+                    }
+                } else {
+                    0.
+                };
             assert!((value - score).abs() < 1e-8, "{body}, expected {score}");
             if restart {
                 assert_eq!(body["data"]["result"], expected[index]);

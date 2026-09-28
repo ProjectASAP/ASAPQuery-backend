@@ -28,6 +28,10 @@ pub(super) fn is_full_cohort(candidate: &WindowRealizationCandidate) -> bool {
             }
 }
 
+pub(super) fn is_complete_window(candidate: &WindowRealizationCandidate) -> bool {
+    matches!(candidate.layout, WindowMaterializationLayout::FullWindow) || is_full_cohort(candidate)
+}
+
 pub(super) fn cohort_nodes(states: &[SelectedMaterialization]) -> BTreeSet<usize> {
     let mut nodes = BTreeSet::new();
     for state in states {
@@ -153,6 +157,7 @@ pub fn prepare_window_implementations(
         reason,
     })?;
     let cohorts = cohort_nodes(&states);
+    let native_cohort = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).is_ok();
     let requirements = states
         .iter()
         .map(|state| {
@@ -171,7 +176,7 @@ pub fn prepare_window_implementations(
                 &model,
                 &query.summary_lifecycle_inputs,
                 window,
-                cohort,
+                cohort && !native_cohort,
                 target,
                 staleness_margin_ms,
             )
@@ -196,7 +201,11 @@ pub fn prepare_window_implementations(
         }
         let applicable = requirements.iter().any(|&(window, cohort)| {
             quote.window_secs == window
-                && if cohort {
+                && if cohort && native_cohort {
+                    is_complete_window(quote)
+                        && quote.slide_secs.saturating_mul(1000)
+                            == u64::from(query.summary_lifecycle_inputs.evaluation_interval_ms)
+                } else if cohort {
                     is_full_cohort(quote)
                 } else {
                     quote.slide_secs.saturating_mul(1_000)

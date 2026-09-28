@@ -1,4 +1,4 @@
-//! Installation of native SQL fragments; recovery only decodes physical operators.
+//! Retained physical programs for SQL relations and PromQL vectors.
 use super::*;
 use asap_physical_operators::{dag, physical_planner::CompiledPhysicalDag};
 use planner_types::post_asap::{
@@ -344,8 +344,8 @@ impl QueryPlanEntry {
         }
     }
 
-    /// The initial stored-vector adapter binds exact per-series counter reads.
-    /// Recovery validates source identities and schemas without logical lowering.
+    /// Validate bound counter vectors or stored aggregate batches against the
+    /// retained physical program; recovery never lowers logical operators.
     #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
         fields(stage = "physical.recover_validate", query_id = %self.query_id, input_kind = "bound_native_input"), err)]
     pub fn recover_vector_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
@@ -444,17 +444,21 @@ impl QueryPlanEntry {
                 let position = source_nodes.iter().position(|source| *source == id).unwrap();
                 if matches!(self.nodes.get(&inputs[position]), Some(QueryPlanNode::ReadMaterialization { .. })) {
                     let summaries = input.schema.fields.iter().filter(|field| !matches!(field.dtype, SummaryFamilyType::Plain(_))).collect::<Vec<_>>();
-                    !matches!(summaries.as_slice(), [field] if matches!(&field.dtype, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), planner_types::post_asap::SketchAlgorithm::CmsWithHeap | planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap)))
+                    !matches!(summaries.as_slice(), [field] if match &field.dtype {
+                        SummaryFamilyType::Sketch(kind, _) => matches!(kind.algorithm(), planner_types::post_asap::SketchAlgorithm::CmsWithHeap | planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap),
+                        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _) => true,
+                        _ => false,
+                    })
                 } else { !vector_schema(&input.schema) }
             })
-            || !vector_schema(
-                &dag.output_contract(dag.roots()[0])
-                    .map_err(|e| QueryPlanError::Invalid(e.to_string()))?
-                    .schema,
-            )
+            || {
+                let output = dag.output_contract(dag.roots()[0]).map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                output.schema.fields.iter().filter(|field| field.dtype == SummaryFamilyType::Plain(DataType::Float64)).count() != 1
+                    || output.schema.fields.iter().any(|field| !matches!(field.dtype, SummaryFamilyType::Plain(DataType::Utf8 | DataType::Float64 | DataType::Timestamp)))
+            }
         {
             return Err(invalid(
-                "physical vector program loses complete identity, timestamp or value",
+                "physical program has incompatible input or result schema",
             ));
         }
         Ok(dag)

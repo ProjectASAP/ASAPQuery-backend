@@ -387,6 +387,11 @@ impl SketchStore {
                 .get_or_load(part.part_id)
                 .map_err(|e| e.to_string())?;
             for record in reader.window_records(sid, start_ms, end_ms) {
+                // A bound full-window read selects its exact coordinates; other
+                // overlapping snapshots do not contribute to this computation.
+                if !expected_windows.contains(&(record.start_ts, record.end_ts)) {
+                    continue;
+                }
                 let entry = reader.load_entry(&record).map_err(|e| e.to_string())?;
                 if entry.label.as_ref().map_or(0, |label| label.labels.len()) != keys.len() {
                     return Err("immutable input label arity differs from its descriptor".into());

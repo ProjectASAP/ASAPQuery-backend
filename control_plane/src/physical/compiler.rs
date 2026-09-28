@@ -988,9 +988,12 @@ impl BackendLocalPlanningInput {
                 &strategy,
                 &asap_aware_mapping::TargetSubDAG::new(&typed),
             );
+            proposed
+                .candidates
+                .extend(strategy.fixed_window_rate_candidates(&typed).candidates);
             proposed.candidates.extend(
                 strategy
-                    .fixed_window_rate_topk_candidates(&typed)
+                    .query_time_rate_aggregation_candidates(&typed)
                     .candidates,
             );
             proposed.candidates.extend(direct.candidates);
@@ -1004,7 +1007,7 @@ impl BackendLocalPlanningInput {
                     input_kind = "bound_promql_vector").entered();
                 let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
                     .or_else(|_| asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(&root).map(|(_, program)| program));
-                if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&root) {
+                if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&root) {
                     planner_selection_trace.push(serde_json::json!({
                         "stage":"planner.physical_candidate", "query_id":query.query_id,
                         "logical_root_id":crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
@@ -1559,7 +1562,7 @@ impl DeploymentPlanCompiler {
                 for state in &selected {
                     if matches!(&state.node.expr, SummaryExpr::SummaryAgg {
                         reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
-                    } if keys.is_empty()) || asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&query.selected_plan_root).is_ok()
+                    } if keys.is_empty()) || asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).is_ok()
                     {
                         if let Some(sources) = immutable_materialization_sources(&state.node) {
                             canonical_nodes.insert(Rc::as_ptr(&state.node) as usize);
@@ -1570,6 +1573,7 @@ impl DeploymentPlanCompiler {
                 }
             }
             let cohort_nodes = windows::cohort_nodes(&selected);
+            let native_cohort = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).is_ok();
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let mut branch_query = query.clone();
                 branch_query.query_lookback_ms = selected
@@ -1586,7 +1590,17 @@ impl DeploymentPlanCompiler {
                         candidate.window_secs.saturating_mul(1_000)
                             == branch_query.query_lookback_ms
                             && if cohort_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
-                                windows::is_full_cohort(candidate)
+                                if native_cohort {
+                                    windows::is_complete_window(candidate)
+                                        && candidate.slide_secs.saturating_mul(1000)
+                                            == u64::from(
+                                                query
+                                                    .summary_lifecycle_inputs
+                                                    .evaluation_interval_ms,
+                                            )
+                                } else {
+                                    windows::is_full_cohort(candidate)
+                                }
                             } else {
                                 !candidate.cohort_only
                             }
@@ -1802,7 +1816,9 @@ impl DeploymentPlanCompiler {
                         query_id: query.query_id.clone(),
                         reason: error.to_string(),
                     })?;
-                    if runtime_materialization.window_size != runtime_materialization.slide_interval
+                    if !native_cohort
+                        && runtime_materialization.window_size
+                            != runtime_materialization.slide_interval
                     {
                         return Err(CompileError::Query { query_id: query.query_id.clone(),
                             reason: "immutable scalar composition runtime requires nonoverlapping windows".into() });
@@ -2142,10 +2158,10 @@ impl DeploymentPlanCompiler {
                 )
                 .ok();
             let native_rate = native_rate.or_else(|| {
-                let physical = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&query.selected_plan_root).ok()?;
+                let physical = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).ok()?;
                 fn heap(node: &Rc<SummaryNode>) -> Option<Rc<SummaryNode>> {
                     match &node.expr {
-                        SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(..), .. } => Some(node.clone()),
+                        SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(..) | SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _), .. } => Some(node.clone()),
                         SummaryExpr::ValueOperation { child, .. } => heap(child),
                         SummaryExpr::SummaryEstimate { summary_input, .. } => heap(summary_input),
                         _ => None,
@@ -2155,7 +2171,9 @@ impl DeploymentPlanCompiler {
             });
             let mut entry = if let Some((source, program)) = native_rate {
                 let native_state_binding = if let SummaryExpr::SummaryAgg {
-                    family: SummaryFamilyType::Sketch(..),
+                    family:
+                        SummaryFamilyType::Sketch(..)
+                        | SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
                     ..
                 } = &source.expr
                 {
@@ -2166,28 +2184,46 @@ impl DeploymentPlanCompiler {
                 } else {
                     None
                 };
-                let mut entry = crate::query_plan::compile_bound_composable_mapped(
-                    query.query_id.clone(),
-                    canonical.clone(),
-                    &source,
-                    instant,
-                    FallbackPolicy::ExactBackend,
-                    binding,
-                    |node, query_node| {
-                        if let Some(id) = executable_dags[query_index]
-                            .as_ref()
-                            .and_then(|compiled| compiled.node_ids.node_id(node))
-                        {
-                            query_node_bindings.insert((query_index, id), query_node);
-                        }
-                    },
-                )?;
-                if let Some(binding) = native_state_binding {
-                    entry.nodes.insert(
-                        entry.root,
-                        crate::query_plan::QueryPlanNode::ReadMaterialization { binding },
-                    );
-                }
+                let mut entry = if let Some(binding) = native_state_binding {
+                    let root = crate::query_plan::QueryNodeId(0);
+                    if let Some(id) = executable_dags[query_index]
+                        .as_ref()
+                        .and_then(|compiled| compiled.node_ids.node_id(&source))
+                    {
+                        query_node_bindings.insert((query_index, id), root);
+                    }
+                    crate::query_plan::QueryPlanEntry {
+                        physical_dag: None,
+                        language: crate::query_plan::QueryLanguage::PromQl,
+                        query_id: query.query_id.clone(),
+                        canonical_query: canonical.clone(),
+                        fixed_evaluation: None,
+                        root,
+                        nodes: BTreeMap::from([(
+                            root,
+                            crate::query_plan::QueryPlanNode::ReadMaterialization { binding },
+                        )]),
+                        instant,
+                        fallback: FallbackPolicy::ExactBackend,
+                    }
+                } else {
+                    crate::query_plan::compile_bound_composable_mapped(
+                        query.query_id.clone(),
+                        canonical.clone(),
+                        &source,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        binding,
+                        |node, query_node| {
+                            if let Some(id) = executable_dags[query_index]
+                                .as_ref()
+                                .and_then(|compiled| compiled.node_ids.node_id(node))
+                            {
+                                query_node_bindings.insert((query_index, id), query_node);
+                            }
+                        },
+                    )?
+                };
                 let root = crate::query_plan::QueryNodeId(
                     entry.nodes.keys().map(|id| id.0).max().unwrap_or(0) + 1,
                 );
@@ -2369,7 +2405,7 @@ impl DeploymentPlanCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
-            if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&request.queries[query_index].selected_plan_root) {
+            if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&request.queries[query_index].selected_plan_root) {
                 let program = physical.precompute.ok_or_else(|| CompileError::Snapshot("fixed-window candidate has no maintenance program".into()))?;
                 let sink = PostAsapNodeId(u32::try_from(program.roots()[0]).map_err(|_| CompileError::Snapshot("maintenance sink overflow".into()))?);
                 installed.native_programs.insert(sink, serde_json::from_slice(&program.encode().map_err(|e| CompileError::Snapshot(e.to_string()))?).map_err(|e| CompileError::Snapshot(e.to_string()))?);
@@ -3521,7 +3557,7 @@ pub(crate) fn retained_partition_count(
         || (materialization.derived_input.is_some()
             && matches!(
                 materialization.aggregation_type,
-                A::CountMinSketchWithHeap | A::CountSketchWithHeap
+                A::CountMinSketchWithHeap | A::CountSketchWithHeap | A::Sum
             ))
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
@@ -3841,7 +3877,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
     let SummaryExpr::SummaryAgg {
         child,
         input,
-        family: SummaryFamilyType::Sketch(..),
+        family: SummaryFamilyType::Sketch(..) | SummaryFamilyType::ExactAggregate(ExactKind::Sum, _),
         ..
     } = &node.expr
     else {
@@ -3852,6 +3888,13 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
     };
     if matches!(&node.expr, SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. }
         if matches!(kind.algorithm(), SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
+        || matches!(
+            &node.expr,
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, _),
+                ..
+            }
+        )
     {
         if let SummaryExpr::ValueOperation {
             child: source,
@@ -3864,6 +3907,15 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
                 return Some(vec![source.clone()]);
             }
         }
+    }
+    if matches!(
+        &node.expr,
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, _),
+            ..
+        }
+    ) {
+        return None;
     }
     if input.item.is_some()
         || !matches!(
@@ -4206,6 +4258,7 @@ fn collect_selected_materializations(
         node: &Rc<SummaryNode>,
         readout: Option<&SketchQuery>,
         composable: bool,
+        native_maintenance: bool,
         inherited_grouping: Option<Vec<String>>,
         selected: &mut Vec<SelectedMaterialization>,
     ) -> Result<(), String> {
@@ -4239,9 +4292,26 @@ fn collect_selected_materializations(
         } else {
             None
         };
-        if let Some(source) = immutable_materialization_sources(node) {
+        // A nested legacy Sum is a query reduction unless Planner supplied a
+        // complete native maintenance graph for this selected root.
+        let immutable_sources = if !native_maintenance
+            && matches!(
+                &node.expr,
+                SummaryExpr::SummaryAgg {
+                    family: SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Sum,
+                        _
+                    ),
+                    ..
+                }
+            ) {
+            None
+        } else {
+            immutable_materialization_sources(node)
+        };
+        if let Some(source) = &immutable_sources {
             for source in source {
-                walk(&source, None, composable, None, selected)?;
+                walk(source, None, composable, native_maintenance, None, selected)?;
             }
         }
         match &node.expr {
@@ -4252,24 +4322,73 @@ fn collect_selected_materializations(
                 pruning: Some(_),
                 ..
             } => {
-                walk(candidates, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    candidates,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
                 // Explicit external authoritative values do not need duplicate local state.
                 if !composable {
-                    walk(values, readout, composable, grouping.clone(), selected)?;
+                    walk(
+                        values,
+                        readout,
+                        composable,
+                        native_maintenance,
+                        grouping.clone(),
+                        selected,
+                    )?;
                 }
             }
             SummaryExpr::ValueOperation { child, .. } => {
-                walk(child, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    child,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::RelationalJoin { left, right, .. } => {
-                walk(left, readout, composable, grouping.clone(), selected)?;
-                walk(right, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    left,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
+                walk(
+                    right,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::BinaryOp { lhs, rhs, .. }
                 if composable || crate::query_plan::exact_value_executable(node) =>
             {
-                walk(lhs, readout, composable, grouping.clone(), selected)?;
-                walk(rhs, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    lhs,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
+                walk(
+                    rhs,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::SummaryAgg {
                 child,
@@ -4277,15 +4396,23 @@ fn collect_selected_materializations(
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
                 ..
             } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                && immutable_sources.is_none()
                 && ((composable
                     && crate::query_plan::exact_accumulator_value_source(child).is_some())
                     || crate::query_plan::exact_value_executable(node)) =>
             {
-                walk(child, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    child,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::SummaryAgg { child, .. }
                 if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
-                    && immutable_materialization_sources(node).is_none() => {}
+                    && immutable_sources.is_none() => {}
             SummaryExpr::SummaryAgg {
                 family:
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
@@ -4298,12 +4425,20 @@ fn collect_selected_materializations(
                 summary_input,
                 Some(query),
                 composable,
+                native_maintenance,
                 grouping.clone(),
                 selected,
             )?,
             SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
-                    walk(child, readout, composable, grouping.clone(), selected)?;
+                    walk(
+                        child,
+                        readout,
+                        composable,
+                        native_maintenance,
+                        grouping.clone(),
+                        selected,
+                    )?;
                 }
             }
             SummaryExpr::SummaryAgg {
@@ -4408,6 +4543,7 @@ fn collect_selected_materializations(
         physical_source.as_ref().unwrap_or(node),
         None,
         composable,
+        asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(node).is_ok(),
         None,
         &mut selected,
     )?;

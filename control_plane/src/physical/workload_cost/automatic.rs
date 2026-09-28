@@ -132,6 +132,19 @@ fn physical_work(program: &Value, rows: f64) -> Result<(f64, f64), CompileError>
                 items += rows * (depth + capacity.max(2.0).log2());
                 bytes += groups * (width * depth * 8.0 + capacity * (SERIES_BYTES + 24.0));
             }
+            "SummaryBuild" => {
+                let family: SummaryFamilyType =
+                    serde_json::from_value(parameters["family"].clone())
+                        .map_err(|e| invalid(e.to_string()))?;
+                if !matches!(
+                    family,
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _)
+                ) {
+                    return Err(invalid("no native aggregate cost for this family"));
+                }
+                items += rows;
+                bytes += rows * 64.0;
+            }
             "Readout" => items += rows,
             "KeyedReadout" => items += rows * rows.max(2.0).log2(),
             _ => {

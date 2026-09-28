@@ -41,6 +41,9 @@ impl NativeSummaryOutput {
                 SketchAlgorithm::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
                 _ => None,
             },
+            SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _) => {
+                Some(AggregationType::Sum)
+            }
             _ => None,
         };
         let mut kind = schema_kind;

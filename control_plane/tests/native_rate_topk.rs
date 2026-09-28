@@ -282,3 +282,62 @@ fn fixed_window_heap_costs_include_native_maintenance() {
                 && resource.calculation.get("physical_program").is_some()));
     }
 }
+
+// Rate must precede grouped Sum in both placements; deployment chooses ownership.
+#[test]
+fn grouped_rate_has_native_query_and_maintenance_candidates() {
+    let mut wire = serde_json::to_value(fixture(false)).unwrap();
+    let entry = &mut wire["query_workload"]["repeating_queries"][0];
+    entry["query"] = "sum by(job)(rate(requests_total[1m]))".into();
+    entry["requirements"]["accuracy"] = json!({"explicit":"Exact"});
+    entry["demand"]["fixed_interval_at"]["interval"] = 5_000.into();
+    entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
+    wire["implementation"]["accuracy_evidence"] = json!({});
+    let input: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+    let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+    let mut placements = std::collections::BTreeSet::new();
+    let mut errors = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
+        let plan = match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                errors.push(error.to_string());
+                continue;
+            }
+        };
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        let Some(program) = &entry.physical_dag else {
+            continue;
+        };
+        if entry.physical_vector_binding().is_none() {
+            continue;
+        }
+        entry.recover_vector_physical_dag().unwrap();
+        let stored = plan
+            .precompute_plan
+            .executable_dags
+            .values()
+            .any(|dag| !dag.native_programs.is_empty());
+        assert_eq!(program.to_string().contains("SummaryBuild"), !stored);
+        placements.insert(stored);
+        ids.insert(plan.envelope.plan_id);
+    }
+    assert_eq!(
+        placements,
+        std::collections::BTreeSet::from([false, true]),
+        "{errors:#?}"
+    );
+    let report = input.compile_promql().unwrap().cost_comparison.unwrap();
+    for candidate in report
+        .candidate_evaluations
+        .iter()
+        .filter(|candidate| candidate.plan_id.is_some_and(|id| ids.contains(&id)))
+    {
+        assert!(
+            candidate.total_cost.is_some(),
+            "{:?}",
+            candidate.unavailable_reason
+        );
+    }
+}
