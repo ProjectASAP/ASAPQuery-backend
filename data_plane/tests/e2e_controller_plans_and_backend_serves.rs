@@ -210,13 +210,25 @@ fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMate
 /// Wire fixtures provide CMS bytes directly. Total-count planning can select
 /// an exact accumulator, so it must not be used to infer this payload's format.
 fn imported_cms_materializations(metric: &str) -> Vec<PrecomputeMaterialization> {
-    vec![physical_fixture::materialization(
-        metric,
+    vec![PrecomputeMaterialization::new(
         asap_types::AggregationType::CountMinSketch,
+        String::new(),
         std::collections::HashMap::from([
             ("w".into(), serde_json::json!(512)),
             ("d".into(), serde_json::json!(5)),
         ]),
+        asap_types::KeyByLabelNames::new(vec!["service".into()]),
+        asap_types::KeyByLabelNames::empty(),
+        asap_types::KeyByLabelNames::empty(),
+        String::new(),
+        5,
+        5,
+        asap_types::enums::WindowKind::Tumbling,
+        String::new(),
+        metric.into(),
+        Some(12),
+        None,
+        None,
     )]
 }
 
