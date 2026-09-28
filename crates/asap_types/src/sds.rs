@@ -356,8 +356,7 @@ pub struct SummaryInstance {
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
     pub catalog_generation: CatalogGeneration,
-    /// Source generation selected by an explicit compatibility decision when
-    /// an unchanged definition reuses a committed payload.
+    /// Reserved wire field. Initial rollout rejects cross-version adoption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from_generation: Option<CatalogGeneration>,
     pub placement: SummaryPlacement,
@@ -388,19 +387,12 @@ impl SummaryInstance {
                 "summary instance placement must be resolved".into(),
             ));
         }
-        let payload_generation = if let Some(source) = &self.reused_from_generation {
-            validate_catalog_generation(source)?;
-            if source.plan_id != self.catalog_generation.plan_id
-                || source.plan_version >= self.catalog_generation.plan_version
-            {
-                return Err(SdsError(
-                    "stored summary has invalid reuse provenance".into(),
-                ));
-            }
-            source.plan_version
-        } else {
-            self.catalog_generation.plan_version
-        };
+        if self.reused_from_generation.is_some() {
+            return Err(SdsError(
+                "cross-version stored state adoption is unsupported".into(),
+            ));
+        }
+        let payload_generation = self.catalog_generation.plan_version;
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
@@ -1505,13 +1497,16 @@ mod tests {
     }
 
     #[test]
-    fn reused_payload_requires_an_older_compatible_plan_generation() {
+    fn cross_version_payload_adoption_is_rejected() {
         let mut instance = observed_instance(InstanceLifecycle::Persistent);
         let mut source = instance.catalog_generation.clone();
         source.plan_version -= 1;
         instance.reused_from_generation = Some(source.clone());
         instance.state_reference.generation = source.plan_version;
-        instance.validate().unwrap();
+        assert!(
+            instance.validate().is_err(),
+            "new plan must not adopt old-version payload"
+        );
         instance.reused_from_generation.as_mut().unwrap().plan_id += 1;
         assert!(instance.validate().is_err());
         instance.reused_from_generation = Some(instance.catalog_generation.clone());

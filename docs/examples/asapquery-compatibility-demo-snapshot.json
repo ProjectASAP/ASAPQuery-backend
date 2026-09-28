@@ -1,5 +1,5 @@
 {
-  "snapshot_version": 2,
+  "snapshot_version": 3,
   "query_workload": {
     "language": "promql",
     "query_batch": null,
@@ -111,6 +111,7 @@
     }
   },
   "environment": {
+    "dataset_identity": {"namespace": "example", "dataset": "metrics"},
     "target": "backend_local_remote_write",
     "collector_ids": [],
     "capability_snapshot_id": "asapquery-compatibility-demo-v1",

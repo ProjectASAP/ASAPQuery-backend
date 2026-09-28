@@ -12,7 +12,7 @@ use crate::sds::{
 use crate::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 6;
 
 /// Canonical definition binds operator and population descriptors. Writer
 /// layout and concrete state belong to installed plans and runtime instances.

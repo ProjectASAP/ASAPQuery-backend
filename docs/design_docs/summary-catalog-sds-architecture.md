@@ -114,6 +114,45 @@ encoding, not display strings or temporary node IDs. Its encoding and compatibil
 rules must be established before persistence; internal Planner refactoring alone
 must not force state migration. Unknown semantic versions fail validation.
 
+### Source identity
+
+**Design question 1: What identifies the source data in a SummaryDefinition?**
+
+Two deployments both compute `KLL(latency)`. One reads tenant A's dataset and
+one reads tenant B's. Should they have the same definition ID?
+
+**Decision:** no. Backend supplies a stable logical dataset identity to Planner
+before semantic definitions are exported. Dataset identity is part of semantics;
+endpoint, replica and storage location are deployment bindings.
+
+```text
+Same expression, different datasets:
+
+  tenant-A/requests → KLL(latency) → definition D_A
+  tenant-B/requests → KLL(latency) → definition D_B
+
+  D_A ≠ D_B
+
+Same dataset, different endpoints:
+
+  tenant-A/requests ── bound to endpoint east ── definition D_A
+  tenant-A/requests ── bound to endpoint west ── definition D_A
+
+  Relocation preserves D_A when the logical dataset is unchanged.
+```
+
+| Change | Definition identity | Binding requirement |
+| --- | --- | --- |
+| Tenant A's dataset → tenant B's dataset | Changes | Bind the newly identified dataset |
+| Endpoint east → endpoint west for the same dataset | Unchanged | Verify the endpoint realizes the same dataset |
+| `latency` → `log(latency)` in the same dataset | Changes | Preserve the new input expression |
+
+The authority resolving a source preserves dataset identity across relocation and
+assigns a different identity when the logical dataset changes. Installation checks
+that the concrete source realizes the identity in the definition. Equal definitions
+do not grant cross-tenant or cross-deployment authorization. Future discovery must
+match dataset identity as well as expression semantics.
+
 ### Definition boundary
 
 The definition stops at the persisted output.
@@ -312,6 +351,61 @@ It does not decide whether KLL merging is semantically legal; Planner already
 made that decision. Missing or invalid state follows the installed fallback or
 unavailability policy. Plan installation alone does not establish readiness.
 
+### Consistent reads
+
+Per-record metadata/payload atomicity is necessary but insufficient. All inputs
+consumed by one QueryPlan DAG must pass the existing whole-query store-revision
+fence, including inputs on different branches. A concurrent publication that
+invalidates the fence prevents that result from being served; the installed
+failure policy applies. Preserve the
+[publication completeness contract](continuous-summary-completeness.md), including
+its conservative global fence and its distinction between accepted-input
+completeness and source event-time completeness.
+
+### Recovery and plan-version changes
+
+**Design question 2: Must the initial rollout reuse stored state across plan versions?**
+
+Version 42 already stores `KLL(latency)`. Version 43 changes only the scheduling
+policy and keeps the same semantic definition. Can version 43 read version 42's
+records immediately?
+
+**Decision:** no. Initial recovery supports the same installed plan version.
+Each new version populates its own output namespace. Cross-version state adoption
+is deferred, even when definitions match.
+
+```text
+Existing deployment:
+  version 42 → output latency-kll → definition D → ready records
+
+Restart version 42:
+  recover version-42 records
+      → validate bindings and required completeness proof
+      → serve eligible state
+
+Install version 43 (same definition D, changed schedule):
+  version 43 → output latency-kll → definition D → no ready records yet
+      → populate version-43 state
+      → fallback or unavailable while warming up
+      → serve version-43 state when eligible
+
+  Equal D does not authorize reading version-42 records from version 43.
+```
+
+| Event | Initial-rollout behavior |
+| --- | --- |
+| Restart the same installed version | Recover compatible records and revalidate eligibility |
+| Install a new version with equal definitions | Populate new-version state; no automatic adoption |
+| Query before new-version state is ready | Apply the installed fallback or unavailability policy |
+| Old-version query already in flight | Keep its installed version; cleanup respects active readers |
+
+This choice incurs rebuild work and a warm-up interval. Persisting definitions
+and payloads does not itself make admission metadata durable or establish
+exactly-once processing across crashes. Missing completeness proof cannot be
+interpreted as complete input after restart. Cross-version adoption requires a
+separate compatibility and authorization design; binary rollback does not itself
+authorize it.
+
 ## 7. Future: discovering SDS for an unregistered query
 
 The same definitions can later support queries not known when the SDS was created.
@@ -397,7 +491,7 @@ find_compatible(query)
 ```
 
 Semantic compatibility, mergeability, grouping, window composition, accuracy,
-and residual computation remain Planner decisions. Backend capability and
+and the computation over reused state remain Planner decisions. Backend capability and
 availability evidence can inform selection; a definition alone does not guarantee
 an executable deployment. Availability must be checked again at execution time.
 This extension does not require another catalog service or a new operator IR.
@@ -410,7 +504,7 @@ This extension does not require another catalog service or a new operator IR.
 3. Equal definition IDs do not make different deployed outputs interchangeable.
 4. A writer cannot publish state with a definition different from its installed binding.
 5. Runtime reads require both semantic compatibility and eligible concrete state.
-6. Bound QueryPlans directly resolve their selected outputs; they do not search for alternatives.
+6. Bound QueryPlans directly resolve their selected outputs; they do not search for substitute outputs.
 7. Ad-hoc SDS discovery happens through Planner and produces a new bound QueryPlan.
 8. SummaryStore reports available state; it never decides query rewrite legality.
 
