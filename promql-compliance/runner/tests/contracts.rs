@@ -172,6 +172,13 @@ fn automatic_cost_gate_checks_real_compiler_output() {
     use control_plane::physical::workload_cost::CandidateEvaluationStatus as Status;
     let original = plan();
     planning::validate_cost(&original).unwrap();
+    // v2 includes native query/maintenance resources. Old or provider-only
+    // reports cannot stand in for this runner's automatic costing path.
+    for version in ["backend-workload-resources-v1", "provider-quote"] {
+        let mut plan = original.clone();
+        plan.cost_comparison.as_mut().unwrap().model_version = version.into();
+        assert!(planning::validate_cost(&plan).is_err());
+    }
     for mutation in 0..6 {
         let mut plan = original.clone();
         let report = plan.cost_comparison.as_mut().unwrap();
