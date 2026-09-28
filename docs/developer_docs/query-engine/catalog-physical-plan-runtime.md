@@ -6,11 +6,14 @@ envelope containing the authoritative `SummaryCatalog` snapshot plus the
 `PrecomputePlan`, optional `CollectorPlan`, `TransmissionPlan`, and `QueryPlan`
 that reference installed stored outputs and their semantic definitions.
 
-Catalog schema 4 separates `StoredOutputId` (deployment routing) from
+Catalog schema 6 separates `StoredOutputId` (deployment routing) from
 `SummaryDefinitionId` (versioned semantic SHA-256). `StoredOutputReference`
 binds both. Planner exports the persisted output's typed semantic dependency
 closure; explicit raw summary configurations use a restricted typed description.
-Derived outputs require the complete Planner closure at installation.
+Derived outputs require the complete Planner closure at installation. Planner-bound
+definitions also carry the declared logical dataset; installation checks that it
+matches the ingestion contract. Endpoints and replicas are deployment bindings,
+not semantic identity.
 
 Writes must match the installed output's operator and format. Durable metadata
 records both identities and the immutable catalog snapshot. Recovery validates
@@ -27,4 +30,5 @@ The HTTP lifecycle is exposed through `/api/v1/physical-plan`,
 
 The current V1 storage path reads only the installed plan version. Matching
 definition identity does not authorize cross-version payload reuse; that would
-require an explicit reader binding and separate compatibility support.
+require a future adoption protocol. A same-version restart can recover eligible
+state; a new version remains cold until its own state is populated.

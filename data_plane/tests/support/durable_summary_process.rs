@@ -18,7 +18,9 @@ async fn persisted_summary_restarts_without_live_reregistration() {
         serde_json::json!(5000);
     let snapshot: control_plane::physical::compiler::BackendLocalPlanningInput =
         serde_json::from_value(fixture).unwrap();
-    let plan = quote_snapshot_for_test(snapshot).compile_promql().unwrap();
+    let plan = quote_snapshot_for_test(snapshot.clone())
+        .compile_promql()
+        .unwrap();
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
         collector_plans: plan.collector_plans,
@@ -153,4 +155,72 @@ async fn persisted_summary_restarts_without_live_reregistration() {
     assert!(is_warm(&after), "{after}");
     assert_eq!(after["data"]["result"], before["data"]["result"]);
     assert_eq!(after["data"]["result"][0]["value"][1], "15");
+    drop(second);
+
+    // Equal semantics do not grant a new plan version access to old disk state.
+    let mut next_snapshot = snapshot;
+    next_snapshot.environment.plan_version += 1;
+    let next = quote_snapshot_for_test(next_snapshot)
+        .compile_promql()
+        .unwrap();
+    assert_eq!(
+        install.summary_catalog.definitions,
+        next.summary_catalog.definitions
+    );
+    let next_install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        summary_catalog: next.summary_catalog,
+        collector_plans: next.collector_plans,
+        precompute_plan: next.precompute_plan,
+        transmission_plan: next.transmission_plan,
+        query_plan: next.query_plan,
+        storage_routing: None,
+        adaptation_evidence: vec![],
+    };
+    std::fs::write(&artifact, serde_json::to_vec(&next_install).unwrap()).unwrap();
+    let port = unused_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut third = spawn(port);
+    wait_until_ready(&client, &format!("{base}/api/v1/health"), &mut third.0).await;
+    let cold: Value = client
+        .get(format!("{base}/api/v1/query"))
+        .query(&[("query", query.as_str()), ("time", "5")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!is_warm(&cold), "new version adopted old state: {cold}");
+    assert_eq!(
+        remote_write(
+            &client,
+            &base,
+            &WriteRequest {
+                timeseries: vec![series(
+                    "asap_demo_gauge",
+                    &[
+                        (1000, 2.0),
+                        (2000, 4.0),
+                        (3000, 6.0),
+                        (4000, 8.0),
+                        (5000, 10.0)
+                    ]
+                )],
+            }
+        )
+        .await,
+        204
+    );
+    drain_precompute(&client, &base).await;
+    let rebuilt: Value = client
+        .get(format!("{base}/api/v1/query"))
+        .query(&[("query", query.as_str()), ("time", "5")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(is_warm(&rebuilt), "{rebuilt}");
+    assert_eq!(rebuilt["data"]["result"][0]["value"][1], "30");
 }
