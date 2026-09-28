@@ -7,7 +7,6 @@
 #[path = "support/physical_fixture.rs"]
 mod physical_fixture;
 
-use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -126,30 +125,29 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create log directory");
     let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    write!(
-        config,
-        r#"aggregations:
-  - aggregationType: DDSketch
-    aggregationSubType: ''
-    labels:
-      grouping: [service]
-      rollup: []
-      aggregated: []
-    metric: component_process_e2e_latency_ms
-    parameters:
-      relative_accuracy: 0.01
-    windowSize: 1
-    windowType: tumbling
-    spatialFilter: ''
-"#
-    )
-    .expect("write streaming config");
-
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
-        &serde_yaml::from_slice(&std::fs::read(config.path()).unwrap()).unwrap(),
+    let materialization = asap_types::PrecomputeMaterialization::new(
+        asap_types::AggregationType::DDSketch,
+        String::new(),
+        std::collections::HashMap::from([("relative_accuracy".into(), serde_json::json!(0.01))]),
+        asap_types::KeyByLabelNames::new(vec!["service".into()]),
+        asap_types::KeyByLabelNames::empty(),
+        asap_types::KeyByLabelNames::empty(),
+        String::new(),
+        1,
+        1,
+        asap_types::WindowKind::Tumbling,
+        String::new(),
+        "component_process_e2e_latency_ms".into(),
+        None,
+        None,
+        None,
+    );
+    let install = physical_fixture::artifact_from_materializations(vec![materialization]);
+    serde_yaml::to_writer(
+        &mut config,
+        &serde_json::json!({"precompute_plan": install.precompute_plan}),
     )
     .unwrap();
-    let install = physical_fixture::artifact(&runtime);
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();
 

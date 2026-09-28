@@ -402,7 +402,7 @@ async fn certified_kll_state_to_query_oracle() {
     let mut bootstrap_config = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(
         &mut bootstrap_config,
-        &serde_json::json!({"aggregations": []}),
+        &serde_json::json!({"precompute_plan": install.precompute_plan}),
     )
     .unwrap();
     let mut child = ChildGuard(
