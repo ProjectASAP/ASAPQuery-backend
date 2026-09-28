@@ -2,8 +2,8 @@
 
 All seven container runs passed against Prometheus: single-rate-temporal,
 sparse-checkout-temporal, aggregations, aggregations-dense-cadence, issue-702,
-issue-702-one-second and issue-754. Raw result reports and their hashes are
-retained here; see [provenance](provenance.json) for the exact runner/runtime
+issue-702-one-second and issue-754. See the retained summary and
+[provenance](provenance.json) for the exact runner/runtime
 revisions. The execution harness has been moved without changing its behavior.
 
 The runner compiled a plan offline, validated its local execution path, and
@@ -18,4 +18,4 @@ listed above; see [runner usage](../../../promql-compliance/README.md). The reco
 run used the debug binary mounted in the runtime container. No human review,
 performance benefit, or Level 3 selection approval is implied.
 
-Raw reports are gzip-compressed JSON; use `gzip -dc <case>.json.gz` to inspect.
+Generated detailed reports are kept outside version control.
