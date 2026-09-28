@@ -1,4 +1,11 @@
 //! Shared query/accuracy fixture; contains no candidate prices or expected winner.
+//!
+//! This module is `#[path]`-included by each level's test binary, so every
+//! binary compiles all of it while using only the parts that level needs.
+//! Unused-code lints are therefore about the including binary, not about the
+//! fixture, and under `-D warnings` they would fail a level for helpers that
+//! another level relies on.
+#![allow(dead_code)]
 use control_plane::physical::compiler::BackendLocalPlanningInput;
 use serde::Deserialize;
 use serde_json::{json, Value};
