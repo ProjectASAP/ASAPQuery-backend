@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Register the complete real corpus for candidate discovery, never cost selection.
 
-Unit discovery costs are an explicit uncalibrated enumeration seed. Version 2
+Unit discovery costs are an explicit uncalibrated enumeration seed. Version 3
 without quotes cannot select/deploy. Replace implementation evidence with measured
 calibration and re-export candidates before producing final deployment quotes.
 """
@@ -47,6 +47,8 @@ def main():
             first_timestamp_ms = timestamp if first_timestamp_ms is None else first_timestamp_ms
             last_timestamp_ms = timestamp
     snapshot = json.loads(args.template.read_text())
+    if snapshot.get("snapshot_version") != 3:
+        raise ValueError("snapshot_version 3 with explicit dataset identity is required")
     now = int(time.time() * 1000)
     input_span = (last_timestamp_ms - first_timestamp_ms) / 1000
     horizon = args.repetitions * args.interval_ms / 1000
@@ -77,7 +79,6 @@ def main():
                             "declared_interval_ms": interval, "evaluation_phase_ms": phase,
                             "lookback_method": "derived by the backend compiler from PromQL and the declared scrape cadence"})
     snapshot["query_workload"].update(repeating_queries=registrations, query_batch=None)
-    snapshot["snapshot_version"] = 2
     snapshot.pop("workload_cost_evidence", None)
     implementation = snapshot["implementation"]
     implementation.pop("source_sample_interval_ms", None)
