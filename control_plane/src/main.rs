@@ -854,6 +854,7 @@ mod api_tests {
                 "metric": "m", "window_secs": 60, "accuracy": query.accuracy_target,
                 "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": snapshot.physical_inputs.window_cost_model
             }],
+            "dataset_identity": snapshot.environment.dataset_identity,
             "collector_ids": ["test"], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
             "max_evidence_age_ms": 60000, "plan_version": 1,
@@ -931,6 +932,7 @@ mod api_tests {
                 "metric": metric, "window_secs": query.query_lookback_seconds, "accuracy": query.accuracy_target,
                 "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_realization_candidates[0].cost }
             }],
+            "dataset_identity": snapshot.environment.dataset_identity,
             "collector_ids": [], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
             "max_evidence_age_ms": 60000, "plan_version": 1,
