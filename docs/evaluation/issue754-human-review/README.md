@@ -80,6 +80,13 @@ requires no uncertified-readout refusal to remain. Without that test, a heap
 candidate that silently left the inventory would still satisfy the strict
 fixture.
 
+The three ensembles (`shared-rate`, `shared-quantiles`, `all-ten`) are planned
+as a single workload input rather than one query at a time, and they carry the
+same discipline. The batch path reaches one refusal the single-query path
+cannot: a workload candidate that would share one deployed output between
+queries needing different semantics from it. Refusing that is correct, so it is
+recorded as a policy reason rather than a defect.
+
 **Binding defects** are bugs. Three candidates fail with `Planner logical
 fragment does not match any original query subtree` and one with a schema
 incompatibility. `main` is green on these paths, so each is a regression
@@ -89,6 +96,13 @@ instance fails the test, and a fixed one forces its entry to be deleted. Every
 entry must be gone before #775 installs and executes these candidates. The same
 error fails `repeated_dashboard_executes_multiple_selected_panes` and
 `shared_exact_dashboard_executes_selected_workload` in CI today.
+
+The defect is worse in batch than the single-query counts suggest, and it
+scales with workload size: one fragment mismatch when `shared-rate` plans three
+queries together, and **fifteen** across `all-ten`, plus one schema
+incompatibility each. `shared-quantiles` reaches neither. Those counts are
+recorded alongside the per-query ones, so the batch path can no longer absorb
+them silently.
 
 ## Review order
 
