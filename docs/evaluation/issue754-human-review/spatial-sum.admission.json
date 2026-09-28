@@ -1,0 +1,50 @@
+[
+  {
+    "candidate_id": "asap-explain-v1:candidate:3be3a41143a4f294dd86565f1b6bb5799c2a58b91cc3e2ce693933b2ab70a0ec",
+    "logical_root_ids": [
+      "asap-explain-v1:root:ee5d913964ff424fe9ade6bab973515975e867515777cdcdd9134cd0c65e17f7"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:1d8c58c38d15133c78840488619a3327806ef1dacd3bcfb328e7ba437d829c2d",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 3688256239081920855,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:abf5efc0850b4b6277747e6f1854128d7d317036073049557d7bc8aa5901fe4e",
+    "logical_root_ids": [
+      "asap-explain-v1:root:7ff3b3d94ab998a2379b3ece3415130f068445e61bf76faca2580b9745c1a573"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:839f658c5abbda84fa3ff561ec9b91abdcde972208cb67b0bb151aebd56049d1",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 17875413431231421451,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:b7db63ce72644bb7114426c030589f6da8b1e031aa40c794b8d1272179443c21",
+    "logical_root_ids": [
+      "asap-explain-v1:root:3052368e6a27c889cd28866ab95cd2d31700861582303eeeeca4916ace17d75c"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:7b333a16d4d53d7be8adb6a0c1414c99f31dfd03738ab16958868fd20eb0755d",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 8064649510529993241,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:04b75c822a626cb540735532131ced917dd2268098297c88a225f235275466b7",
+    "logical_root_ids": [
+      "asap-explain-v1:root:45fc4ceb0dfc3aa52fefb47dd50844411b0ff858390366fef488ab3244f0810e"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:941c854f10c2cb6f50e13c6f540d817009530956e216850f704af41bc6eedef6",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 10907830462850005469,
+    "total_cost": null,
+    "unavailable_reason": null
+  }
+]

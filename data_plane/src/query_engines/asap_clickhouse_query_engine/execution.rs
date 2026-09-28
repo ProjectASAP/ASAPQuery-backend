@@ -26,6 +26,12 @@ pub enum ClickHouseDagFallback {
     ResultEncoding(String),
 }
 
+#[cfg(test)]
+thread_local! {
+    // Deterministically publish between branches without timing-dependent threads.
+    static AFTER_BRANCH: std::cell::Cell<Option<fn(&SketchStore)>> = const { std::cell::Cell::new(None) };
+}
+
 struct RelationDagExecutor<'a> {
     index: &'a SketchStore,
     entry: &'a QueryPlanEntry,
@@ -136,6 +142,10 @@ impl RelationDagExecutor<'_> {
         let mut first = true;
         for id in sources {
             let relation = self.execute_source(id, &schemas[&id], &stored)?;
+            #[cfg(test)]
+            if let Some(publish) = AFTER_BRANCH.with(|hook| hook.take()) {
+                publish(self.index);
+            }
             coverage = if first {
                 first = false;
                 relation.coverage
@@ -634,6 +644,69 @@ mod tests {
             evaluations: BTreeMap::new(),
         };
         assert!(executor.execute(entry.root, &schema).is_err());
+    }
+
+    /// A publication between query branches invalidates the entire result.
+    #[test]
+    fn query_wide_fence_rejects_publication_between_join_branches() {
+        use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
+        let schema = relation_schema("x");
+        let mut entry = external_entry(&schema);
+        entry
+            .nodes
+            .insert(QueryNodeId(2), entry.nodes[&QueryNodeId(0)].clone());
+        let mut output = schema.clone();
+        output.fields.push(schema.fields[0].clone());
+        entry.nodes.insert(
+            QueryNodeId(1),
+            QueryPlanNode::RelationalJoin {
+                inputs: [QueryNodeId(0), QueryNodeId(2)],
+                join_kind: JoinKind::Cross,
+                pred: serde_json::to_value(Predicate::<usize>(
+                    QueryExpr::Literal(ScalarValue::Boolean(true)).into(),
+                ))
+                .unwrap(),
+                left_schema: schema.clone(),
+                right_schema: schema.clone(),
+                output_schema: output,
+                pruning: None,
+            },
+        );
+        entry.root = QueryNodeId(1);
+        entry.compile_relational_physical_dag().unwrap();
+        let relation = ClickHouseRelation::from_json_compact(
+            &schema,
+            br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1],[2]]}"#,
+        )
+        .unwrap();
+        let prepared = BTreeMap::from([
+            (QueryNodeId(0), relation.clone()),
+            (QueryNodeId(2), relation),
+        ]);
+        let index = SketchStore::new();
+        let catalog = SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
+        let run =
+            || execute_sql_dag_with_external(&index, &entry, &catalog, &prepared, 0, 1000, false);
+        assert!(matches!(run(), ClickHouseDagOutcome::Accelerated(_)));
+        AFTER_BRANCH.with(|hook| {
+            hook.set(Some(|index| {
+                use crate::storage_engines::sketch_db::index::{SketchEncoding, SketchSampleState};
+                index.append_sample(
+                    1,
+                    BTreeMap::new(),
+                    (0, 1000),
+                    SketchSampleState {
+                        bytes: vec![1],
+                        encoding: SketchEncoding::ProtoFull,
+                    },
+                );
+            }))
+        });
+        assert!(
+            matches!(run(), ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(reason))
+            if reason.contains("changed during SQL DAG"))
+        );
+        assert!(AFTER_BRANCH.with(|hook| hook.get().is_none()));
     }
 
     #[test]
