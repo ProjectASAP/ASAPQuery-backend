@@ -1,0 +1,98 @@
+[
+  {
+    "candidate_id": "asap-explain-v1:candidate:a327bc875dc0442d14ff542121c4dbae359d13824d2f1e05cf7a14d8d7a6c931",
+    "logical_root_ids": [
+      "asap-explain-v1:root:f0c94e03e570989e93edbfab0f772b40c3f91ab4f8c5ef4ec2c358afed9fa40b"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:37dec2c54420e8acdb1f6b425d0abba0cda66ef485eaa1e7a01b8d7011dd5066",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 14733843382488271694,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:b9e7353b08881f81af8934010b159498e31e7842ec5a3a2a672c5b1f41837dab",
+    "logical_root_ids": [
+      "asap-explain-v1:root:76385b579aa7ad029c49286fa41a3ce4dd16ff0f8341067025d8820107be52cb"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:7d7f051f253b853bd6a092b38e1ea274fda9465ab7540f0bc06a7af618282e8a",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 15833270860732361489,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:60a26ce929f7e27340ebd8555bba5b691e41eb0d57d6a730d69735baa6720476",
+    "logical_root_ids": [
+      "asap-explain-v1:root:198684922b0bfbc2d1a2c2639fd790356a6950798dd395e5c40ebd6e4dc302ec"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:6ec1a661f1ddc81ab2b7c771ed6ec852332aefc8d3e7827a3551c88dda52598f",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 5379663311087285901,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:1660105b2e06cd9a9f498679cb2179aab28d2d3a674d3990e76e80cc0450694d",
+    "logical_root_ids": [
+      "asap-explain-v1:root:cd8d58532ced0954eb6dee4f40babf574410c2137999b7fc4ae4954bcca9910f"
+    ],
+    "physical_candidate_id": null,
+    "identity_unavailable_reason": null,
+    "status": "bind_failed",
+    "plan_id": null,
+    "total_cost": null,
+    "unavailable_reason": "query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:a6ddc5cbfd0d2f2b509df334546e3e21f276ac4a1e1e54ab15d3b919e088bf3c",
+    "logical_root_ids": [
+      "asap-explain-v1:root:ec50b2a3ab2acf52587d69138433ae7e0aa525df93ada9e5fb087afa57e89caa"
+    ],
+    "physical_candidate_id": null,
+    "identity_unavailable_reason": null,
+    "status": "bind_failed",
+    "plan_id": null,
+    "total_cost": null,
+    "unavailable_reason": "query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:601ebe163e70ba24555540e00da90a72d682308b06cc53215f610dd6412a52c5",
+    "logical_root_ids": [
+      "asap-explain-v1:root:ff175f2c427d9949807e2bd5169591d1dc41e1bd57baf68829309d6bf53efa65"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:c4f2aa987a95e97b99f6f5089af4b78f0f4d4c8d28f121321398c738c3f125ce",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 11938117179177087264,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:17dca7f80f586da96d29b00d6655e70cb4e3a253938d65efd838318e9f425a08",
+    "logical_root_ids": [
+      "asap-explain-v1:root:7c0ca598df442f28b14ab8b6b82c4071766750a438b47008db140848fbb80374"
+    ],
+    "physical_candidate_id": null,
+    "identity_unavailable_reason": null,
+    "status": "bind_failed",
+    "plan_id": null,
+    "total_cost": null,
+    "unavailable_reason": "query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:0658ec7508f74f5c5ad81379a01ac60dff7cd5adcd52e589a6c35b51bad75dce",
+    "logical_root_ids": [
+      "asap-explain-v1:root:cb14776f9b6a08d08dbd095533579fb8b8fb6baa3f59d13f177b010e8123df05"
+    ],
+    "physical_candidate_id": null,
+    "identity_unavailable_reason": null,
+    "status": "bind_failed",
+    "plan_id": null,
+    "total_cost": null,
+    "unavailable_reason": "query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"
+  }
+]

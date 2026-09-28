@@ -1,8 +1,15 @@
 # Issue #754 plans for human review
 
-These are actual plans exported by the Level 1 fixture. No human approval is
-recorded. Selected plans and successfully compiled candidate plans are retained
-as JSON/DOT; each page shows accuracy rejections and deployment cost decisions.
+The `candidates/` directory contains physical plans for structural review. No
+human approval is recorded. Level 1 now exports candidate JSON/DOT and per-query
+`*.admission.json` reports before pricing, including `bind_failed` reasons. It
+never asserts a cost-selected winner.
+
+The top-level selected-plan pages are historical exports from the revision in
+`source-commit.txt`, using synthetic fixture prices. They remain useful for
+comparison, but are not the current Level 1 contract or production selection
+evidence. Ranking belongs to Level 2; observed selection quality belongs to
+Level 3. See [test responsibilities](../../design_docs/planning-test-layers.md).
 
 Backend source revision is in [source-commit.txt](source-commit.txt). Planner:
 `176c1bd565e0c400f9a35996c2bd65de32475e72`.
@@ -52,8 +59,8 @@ are not evidence of production-optimal placement.
 
 The strict spatial-quantile fixture rejects the default KLL guarantee. A separate
 assertion with relaxed accuracy verifies that both KLL and DDSketch reach costing
-when admitted. The grouped-temporal-sum test checks cost-dependent placement;
-it does not establish this for every query. Sort-key mutation tests reject ranking
+when admitted. Level 1 checks grouped-temporal-sum structure and minute coverage; Level 2
+checks cost-dependent placement. Sort-key mutation tests reject ranking
 by timestamp or label instead of the finalized rate value.
 
 | Query | PromQL |
@@ -78,8 +85,7 @@ ASAP_LEVEL1_ARTIFACT_DIR=/tmp/issue754-plans \
   cargo test -p control_plane --test issue754_level1 --locked -- --test-threads=1
 ```
 
-The test also exports enumerated candidates into `candidates/`; the ten selected
-plans are at the top level. Copy those `.json` and `.dot` files here and run
-`python3 docs/evaluation/issue754-human-review/render.py` to regenerate the pages.
+The test exports enumerated candidates into `candidates/` and admission reports
+at the top level. It does not regenerate the historical selected-plan pages.
 Actual execution and recovery evidence is maintained in the downstream
 [bound SDS validation report](https://github.com/ProjectASAP/ASAPQuery-backend/blob/test/issue754-level3/docs/evaluation/bound-sds-2026-09-26/README.md).

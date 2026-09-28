@@ -1,0 +1,38 @@
+[
+  {
+    "candidate_id": "asap-explain-v1:candidate:c0821021fb0f0ede52cc359b062a25b521f59529c0b01d3045450e51f843bde9",
+    "logical_root_ids": [
+      "asap-explain-v1:root:ded85760335cdff2c017ddc4f55852bb07fa5e4199cd348e3f711f4f2d35f265"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:06abad4563c1f00189e8f718354c7bf380a2bf216c2c64e19eeea9dae227fff5",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 11818444224054941250,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:625dc2ecb160daea9220f3c11ad598a06b50664ef7bc9790d442644a1f9a94e6",
+    "logical_root_ids": [
+      "asap-explain-v1:root:8161e1fd955edc970415f0296701e178dc8549534e95bf0c9aa2be91c77f57d4"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:ae3c88d23a919c5e1c0d2a743822ed3338945c29a827849ada3bd37c3ebc182d",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 4754089690189431057,
+    "total_cost": null,
+    "unavailable_reason": null
+  },
+  {
+    "candidate_id": "asap-explain-v1:candidate:985b7f5c84ddcdf36ce558a4da7e86d7e4511ddcdcb470dba23ae48759cb0317",
+    "logical_root_ids": [
+      "asap-explain-v1:root:3d7e2af334c24d7e91dd07729e79ad69d3d76949f746da20a8d9f1bacfb6187b"
+    ],
+    "physical_candidate_id": "asap-explain-v1:physical:d0c2addd51491030e110e2534c0cb0fe7ce47b67a72e0faf17cfdb7edb0371d2",
+    "identity_unavailable_reason": null,
+    "status": "bound",
+    "plan_id": 11545774673163874085,
+    "total_cost": null,
+    "unavailable_reason": null
+  }
+]

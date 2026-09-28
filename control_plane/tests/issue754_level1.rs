@@ -1,28 +1,20 @@
-//! Issue #754 level 1: every shared workload query has a valid physical plan.
+//! Level 1: inspect every supported candidate and binding rejection, without cost selection.
 use asap_types::sds::SummaryOperator;
 use control_plane::physical::compiler::{
-    BackendLocalPlanningInput, CompiledPhysicalPlan, DeploymentPlanCompiler, BACKEND_REVISION,
-    PLANNER_REVISION,
+    CompiledPhysicalPlan, DeploymentPlanCompiler, QueryFrontend,
 };
 use control_plane::physical::executable_binding::validate_query_plan;
 use control_plane::physical::workload_cost::{
-    enumerate_exact_and_materialized_candidates, manifest, WorkloadCostEvidence, WorkloadQuote,
+    compile_candidates_for_pricing, enumerate_exact_and_materialized_candidates,
+    CandidateEvaluationStatus,
 };
 use control_plane::query_plan::QueryPlanNode;
 use planner_types::post_asap::{ExactKind, SketchAlgorithm, SummaryFamilyType};
-use serde::Deserialize;
 use serde_json::{json, Value};
 
-#[derive(Deserialize)]
-struct Suite {
-    queries: Vec<Case>,
-}
-
-#[derive(Deserialize)]
-struct Case {
-    name: String,
-    expr: String,
-}
+#[path = "support/issue754_workload.rs"]
+mod workload;
+use workload::Suite;
 
 struct ExpectedPlan {
     family: Option<ExpectedFamily>,
@@ -36,8 +28,7 @@ enum ExpectedFamily {
     QuantileSketch,
 }
 
-// Expectations below are specific to this controlled fixture. Candidate
-// semantics and cost-dependent placement are validated separately.
+// Expectations describe semantic structure, never a cost-selected winner.
 fn expected_plan(name: &str) -> ExpectedPlan {
     match name {
         "spatial-sum" => ExpectedPlan {
@@ -596,62 +587,11 @@ fn assert_selected_plan(name: &str, plan: &CompiledPhysicalPlan) -> Option<Strin
 /// The same ten expressions used by level 2 must compile to typed, connected plans.
 #[test]
 fn issue754_queries_have_valid_physical_plans() {
-    let suite: Suite = serde_yaml::from_str(include_str!(
-        "../../promql-compliance/suites/issue-754.yaml"
-    ))
-    .unwrap();
+    let suite: Suite = workload::suite();
     assert_eq!(suite.queries.len(), 10, "the issue-754 contract changed");
-    let mut missing_local_plans = Vec::new();
     for case in suite.queries {
         let expected = expected_plan(&case.name);
-        let mut snapshot: Value = serde_json::from_str(include_str!(
-            "../../docs/examples/asapquery-planning-snapshot.json"
-        ))
-        .unwrap();
-        snapshot["query_workload"]["repeating_queries"][0]["query"] = case.expr.clone().into();
-        if case.name == "quantile-ratio" {
-            // The issue-754 generator defines the entire positive finite input
-            // population. Supply its domain contract rather than certifying a
-            // ratio from sample observations or weakening the admission rule.
-            let fixture: Value = serde_yaml::from_str(include_str!(
-                "../../promql-compliance/datasets/issue-754.yaml"
-            ))
-            .unwrap();
-            let mut lower = f64::INFINITY;
-            let mut upper = f64::NEG_INFINITY;
-            let mut count = 0u64;
-            for series in fixture["series"].as_array().unwrap() {
-                let g = &series["generated_samples"];
-                let n = |k: &str| g[k].as_f64().unwrap();
-                assert!(n("multiplier") > 0.0 && n("modulo") > 0.0 && n("base") > 0.0);
-                lower = lower.min(n("multiplier") * n("base"));
-                upper = upper.max(n("multiplier") * (n("base") + n("modulo")));
-                count += ((n("end_offset_seconds") - n("start_offset_seconds")) / n("step_seconds"))
-                    .round() as u64
-                    + 1;
-            }
-            let root = control_plane::query_parser::parse_query_expr_canonical(
-                &case.expr,
-                planner_types::types::AccuracyTarget::EpsilonDelta {
-                    epsilon: 0.01,
-                    delta: 0.01,
-                },
-            )
-            .unwrap();
-            let planner_types::pre_asap::QueryExpr::BinaryOp { lhs, rhs, .. } = root else {
-                panic!("ratio fixture");
-            };
-            snapshot["implementation"]["data_snapshot_id"] = json!("issue-754-level1");
-            snapshot["implementation"]["accuracy_evidence"][&case.expr] = json!({
-                "query_string":case.expr,"data_snapshot_id":"issue-754-level1",
-                "data_workload":snapshot["data_workload"],"source":"issue-754-finite-generator",
-                "observed_at_unix_ms":9500,"valid_for_ms":60000,
-                "quantile_operand_domains":([lhs,rhs].into_iter().map(|operand| json!({
-                    "operand":operand,"lower":lower,"upper":upper,"max_samples":count,
-                    "contract":"complete finite issue-754 generator population"})).collect::<Vec<_>>())
-            });
-        }
-        let mut input: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
+        let input = workload::input(&case);
         let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
         if case.name == "spatial-quantile" {
             // The fixture's admissible sketch families must reach deployment
@@ -790,7 +730,34 @@ fn issue754_queries_have_valid_physical_plans() {
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let mut valid_plans = Vec::new();
         let mut grouped_rate_placements = std::collections::BTreeSet::new();
-        let mut quotes = Vec::new();
+        let (_, admission) = compile_candidates_for_pricing(
+            candidates.clone(),
+            environment.clone(),
+            QueryFrontend::PromQl,
+        );
+        assert_eq!(admission.len(), candidates.len());
+        for result in &admission {
+            assert!(
+                result.total_cost.is_none(),
+                "Level 1 must not price candidates"
+            );
+            match result.status {
+                CandidateEvaluationStatus::AwaitingQuote => assert!(result.plan_id.is_some()),
+                CandidateEvaluationStatus::CompilationFailed => assert!(result
+                    .unavailable_reason
+                    .as_ref()
+                    .is_some_and(|reason| !reason.is_empty())),
+                ref status => panic!("unexpected pre-pricing status: {status:?}"),
+            }
+        }
+        if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join(format!("{}.admission.json", case.name)),
+                serde_json::to_vec_pretty(&admission).unwrap(),
+            )
+            .unwrap();
+        }
         let mut errors = Vec::new();
         for (candidate_index, candidate) in candidates.into_iter().enumerate() {
             match DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone()) {
@@ -839,31 +806,6 @@ fn issue754_queries_have_valid_physical_plans() {
                         .unwrap();
                         std::fs::write(base.with_extension("dot"), &dot).unwrap();
                     }
-                    // Fixture-specific admission/selection costs. These do not
-                    // establish a production optimum or require one split for
-                    // every workload; the reversal test below covers placement.
-                    let cost = if plan.query_plan.entries.values().any(|entry| {
-                        entry
-                            .nodes
-                            .values()
-                            .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. }))
-                    }) {
-                        1e12
-                    } else if plan.precompute_plan.materializations.is_empty() {
-                        2.0
-                    } else {
-                        1.0
-                    };
-                    let manifest = manifest(&plan, &candidate.queries).unwrap();
-                    quotes.push(WorkloadQuote {
-                        unit_costs: manifest
-                            .components
-                            .keys()
-                            .map(|key| (key.clone(), cost))
-                            .collect(),
-                        manifest,
-                        executable: true,
-                    });
                     valid_plans.push(plan);
                 }
                 Err(error) => errors.push(error.to_string()),
@@ -901,22 +843,8 @@ fn issue754_queries_have_valid_physical_plans() {
                 case.name
             );
         }
-        input.workload_cost_evidence = Some(WorkloadCostEvidence {
-            backend_revision: BACKEND_REVISION.into(),
-            planner_revision: PLANNER_REVISION.into(),
-            data_snapshot_id: "issue-754-level1".into(),
-            model_version: "deterministic-test-costs".into(),
-            observed_at_unix_ms: environment.observed_at_unix_ms,
-            valid_for_ms: environment.max_evidence_age_ms,
-            quotes,
-        });
-        let selected = input
-            .compile_promql()
-            .unwrap_or_else(|error| panic!("{} selected plan failed: {error}", case.name));
         for root_id in heap_roots {
-            let report = selected.cost_comparison.as_ref().unwrap();
-            let heap = report
-                .candidate_evaluations
+            let heap = admission
                 .iter()
                 .filter(|candidate| candidate.logical_root_ids.contains(&root_id))
                 .collect::<Vec<_>>();
@@ -925,7 +853,9 @@ fn issue754_queries_have_valid_physical_plans() {
                 "physical heap candidate disappeared before admission"
             );
             assert!(
-                heap.iter().all(|candidate| candidate.total_cost.is_none()
+                heap.iter().all(|candidate| candidate.status
+                    == CandidateEvaluationStatus::CompilationFailed
+                    && candidate.total_cost.is_none()
                     && candidate
                         .unavailable_reason
                         .as_ref()
@@ -933,185 +863,5 @@ fn issue754_queries_have_valid_physical_plans() {
                 "missing proof must be an explicit admission failure: {heap:?}"
             );
         }
-        let selected_entry = selected.query_plan.lookup(&case.expr).unwrap();
-        assert!(selected_entry.nodes.contains_key(&selected_entry.root));
-        if let Some(error) = assert_selected_plan(&case.name, &selected) {
-            missing_local_plans.push(error);
-        }
-        if let Some(installed) = selected
-            .precompute_plan
-            .executable_dags
-            .get(&selected_entry.query_id)
-        {
-            installed.validate().unwrap();
-            validate_query_plan(installed, selected_entry).unwrap();
-        }
-        if let Ok(directory) = std::env::var("ASAP_LEVEL1_ARTIFACT_DIR") {
-            let plan = &selected;
-            std::fs::create_dir_all(&directory).unwrap();
-            let base = std::path::Path::new(&directory).join(&case.name);
-            std::fs::write(
-                base.with_extension("json"),
-                serde_json::to_vec_pretty(plan).unwrap(),
-            )
-            .unwrap();
-            std::fs::write(
-                base.with_extension("dot"),
-                control_plane::physical::plan_dot::render(plan),
-            )
-            .unwrap();
-        }
-    }
-    assert!(
-        missing_local_plans.is_empty(),
-        "{}",
-        missing_local_plans.join("\n")
-    );
-}
-
-/// Workload cost must reverse the admitted grouped temporal Sum split.
-#[test]
-fn grouped_temporal_sum_candidates_preserve_coverage_and_reverse_selection() {
-    use asap_aware_mapping::cost_model::Cost;
-    use asap_aware_mapping::{CostModel, Replacement, ReplacementSubDAG, TargetSubDAG};
-    use planner_types::post_asap::SummaryExpr;
-    use planner_types::pre_asap::{AggIntent, Reduction};
-    struct PreferSplit {
-        grouped: bool,
-    }
-    impl CostModel for PreferSplit {
-        fn rank_candidates(
-            &self,
-            _: &AggIntent,
-            candidates: &[SketchAlgorithm],
-        ) -> Vec<SketchAlgorithm> {
-            candidates.to_vec()
-        }
-        fn candidate_cost(
-            &self,
-            candidate: &ReplacementSubDAG,
-            _: &TargetSubDAG<'_>,
-        ) -> Option<Cost> {
-            let grouped = matches!(&candidate.replacement, Replacement::Summary(node)
-                if matches!(&node.expr, SummaryExpr::SummaryAgg { reduction: Reduction::Reduce(_), child, .. }
-                    if matches!(child.expr, SummaryExpr::KeepPreAsap(_))));
-            Some(Cost(if grouped == self.grouped { 1. } else { 1000. }))
-        }
-    }
-    let expression = "sum by (label_0) (sum_over_time(data[1m]))";
-    let canonical = control_plane::query_parser::parse_query_expr_canonical(
-        expression,
-        planner_types::types::AccuracyTarget::Exact,
-    )
-    .unwrap();
-    let mut snapshot: Value = serde_json::from_str(include_str!(
-        "../../docs/examples/asapquery-planning-snapshot.json"
-    ))
-    .unwrap();
-    snapshot["query_workload"]["repeating_queries"][0]["query"] = json!(expression);
-    let input: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();
-    let (request, environment) = input.into_physical_compilation_request().unwrap();
-    let mut plans = Vec::new();
-    let mut candidates = Vec::new();
-    for grouped in [false, true] {
-        let mut candidate = request.clone();
-        candidate.queries[0].selected_plan_root =
-            control_plane::planner_selection::select_query(&canonical, &PreferSplit { grouped })
-                .unwrap();
-        let plan = DeploymentPlanCompiler
-            .compile_promql(candidate.clone(), environment.clone())
-            .unwrap();
-        candidates.push(candidate);
-        assert_eq!(assert_selected_plan("grouped-temporal-sum", &plan), None);
-        // A stored five-second pane cannot shorten the semantic minute read.
-        let mut incomplete = plan.clone();
-        for entry in incomplete.query_plan.entries.values_mut() {
-            for node in entry.nodes.values_mut() {
-                if let QueryPlanNode::ReadMaterialization { binding } = node {
-                    binding.readout_lookback_ms = Some(5_000);
-                }
-            }
-        }
-        assert!(std::panic::catch_unwind(|| assert_selected_plan(
-            "grouped-temporal-sum",
-            &incomplete
-        ))
-        .is_err());
-        let entry = plan.query_plan.lookup(expression).unwrap();
-        let root = &entry.nodes[&entry.root];
-        let is_grouped = matches!(root, QueryPlanNode::ExactReadout { .. });
-        assert_eq!(
-            is_grouped, grouped,
-            "controlled cost must change the executable split"
-        );
-        plans.push(plan);
-    }
-    assert_ne!(plans[0].query_plan, plans[1].query_plan);
-    // Controlled scoped resource prices, not observed production measurements.
-    // Maintenance-heavy grouped output loses in the first fixture; expensive
-    // repeated query-side reduction makes it win in the second fixture.
-    for prefer_grouped in [false, true] {
-        let quotes = plans
-            .iter()
-            .zip(&candidates)
-            .enumerate()
-            .map(|(index, (plan, candidate))| {
-                let manifest = manifest(plan, &candidate.queries).unwrap();
-                let unit_costs = manifest
-                    .components
-                    .iter()
-                    .map(|(key, demand)| {
-                        let grouped_state = index == 1 && key.starts_with("state:");
-                        let query_reduction =
-                            demand.implementation["node"]["operator"]["kind"] == "aggregate";
-                        let cost = if (!prefer_grouped && grouped_state)
-                            || (prefer_grouped && query_reduction)
-                        {
-                            10_000.
-                        } else {
-                            1.
-                        };
-                        (key.clone(), cost)
-                    })
-                    .collect();
-                WorkloadQuote {
-                    manifest,
-                    unit_costs,
-                    executable: true,
-                }
-            })
-            .collect();
-        let evidence = WorkloadCostEvidence {
-            backend_revision: BACKEND_REVISION.into(),
-            planner_revision: PLANNER_REVISION.into(),
-            data_snapshot_id: "grouped-sum-frontier-fixture".into(),
-            model_version: "controlled-maintenance-query-costs".into(),
-            observed_at_unix_ms: environment.observed_at_unix_ms,
-            valid_for_ms: environment.max_evidence_age_ms,
-            quotes,
-        };
-        let selected = control_plane::physical::workload_cost::select_lowest_cost_candidate(
-            candidates.clone(),
-            environment.clone(),
-            &evidence,
-        )
-        .unwrap();
-        assert_eq!(
-            assert_selected_plan("grouped-temporal-sum", &selected),
-            None
-        );
-        let entry = selected.query_plan.lookup(expression).unwrap();
-        assert_eq!(
-            matches!(entry.nodes[&entry.root], QueryPlanNode::ExactReadout { .. }),
-            prefer_grouped
-        );
-        let report = selected.cost_comparison.unwrap();
-        let selected_cost = report.component_costs.values().sum::<f64>();
-        let minimum = report
-            .candidate_evaluations
-            .iter()
-            .filter_map(|candidate| candidate.total_cost)
-            .fold(f64::INFINITY, f64::min);
-        assert_eq!(selected_cost, minimum);
     }
 }
