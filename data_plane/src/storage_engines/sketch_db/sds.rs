@@ -157,15 +157,12 @@ impl SummaryDescriptorRegistry {
                 );
             }
             let materialization = asap_types::sds::SummaryDefinitionId::from(metadata.policy_fp);
-            let identity = catalog
-                .materializations
-                .get(&materialization)
-                .ok_or_else(|| {
-                    format!(
-                        "materialization {} is absent from the installed SummaryCatalog",
-                        materialization.as_u64()
-                    )
-                })?;
+            let identity = catalog.definitions.get(&materialization).ok_or_else(|| {
+                format!(
+                    "materialization {} is absent from the installed SummaryCatalog",
+                    materialization.as_u64()
+                )
+            })?;
             Some((
                 catalog.summary_descriptors[&identity.summary_descriptor_id].clone(),
                 catalog.data_descriptors[&identity.data_descriptor_id].clone(),
@@ -399,7 +396,6 @@ mod tests {
                 asap_types::PolicyFingerprint(7),
                 summary.clone(),
                 data.clone(),
-                asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
             )],
         )
         .unwrap();

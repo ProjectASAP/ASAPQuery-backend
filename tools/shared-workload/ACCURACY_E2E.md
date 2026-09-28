@@ -14,8 +14,8 @@ The repository's existing backend CI is unchanged.
 
 Runtime scope is **backend-local precompute**. No ASAPCollector service is
 started or called: the generator sends Remote Write directly to the backend.
-The `asap-precompute-rs` build dependency and offline Google mapper source happen
-to live in the ASAPCollector repository; they are not an extra running collector.
+The optional offline Google mapper source lives in the ASAPCollector repository;
+the backend build and runtime do not depend on that repository.
 
 ## Query matrix
 

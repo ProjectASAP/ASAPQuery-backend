@@ -89,6 +89,7 @@ async fn main() {
             tables: HashMap::from([("raw_samples".into(), schema)]),
             accuracy: AccuracyTarget::Epsilon(0.01),
         }),
+        selected_dags: Default::default(),
         entries: BTreeMap::new(),
     };
     let active = validate_and_build_runtime_plan(

@@ -283,9 +283,8 @@ impl SummaryState {
             SummaryState::Dd(sk) => {
                 match encoding {
                     // PROTO_DELTA: dispatch on the payload SHAPE, mirroring the
-                    // edge's own `DDSketchWrapper::apply_delta`
-                    // (asap-precompute-rs/src/sketches/ddsketch.rs) — which
-                    // tries the full-envelope decode first, then falls back to
+                    // supported DDSketch frame decoder, which tries the
+                    // full-envelope decode first, then falls back to
                     // the bucket-delta proto. Two wire shapes can arrive on the
                     // ProtoDelta channel:
                     //

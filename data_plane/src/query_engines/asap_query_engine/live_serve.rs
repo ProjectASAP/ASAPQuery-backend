@@ -194,6 +194,10 @@ mod tests {
                             full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
+                            stored_output_reference:
+                                asap_types::sds::StoredOutputReference::for_definition(
+                                    policy.into(),
+                                ),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,
                             pane_origin_ms: Some(0),

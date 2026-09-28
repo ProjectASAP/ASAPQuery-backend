@@ -5,8 +5,8 @@
 
 ## Current implementation boundary
 
-The compiler consumes ASAPPlanner types pinned to the revision exposed as
-`physical::compiler::PLANNER_REVISION`, selects
+The compiler consumes ASAPPlanner types from `main`, with the resolved revision
+exposed as `physical::compiler::PLANNER_REVISION`, and selects
 from Planner's legal candidate space with backend-owned cost and evidence
 inputs, and emits one `CompiledPhysicalPlan`. The plan contains one SummaryCatalog plus
 CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan projections
@@ -32,10 +32,10 @@ PhysicalCompilationRequest + DataWorkload + concrete implementation evidence
       |                                      ^
       | abstract candidates                  | complete physical costs
       v                                      |
-ASAPPlanner selection <---------- PhysicalPlanCompiler
+ASAPPlanner selection <---------- DeploymentPlanCompiler
       |
       v
-PhysicalPlanCompiler -------> CompiledPhysicalPlan
+DeploymentPlanCompiler -------> CompiledPhysicalPlan
                             |       |       |      |
                             v       v       v      v
                       Collector  Precompute Backend Query
@@ -112,7 +112,7 @@ identity. Physical identities never enter post-ASAP IR.
 ### Physical compiler
 
 ```rust
-impl PhysicalPlanCompiler {
+impl DeploymentPlanCompiler {
     pub fn compile_promql(
         &self,
         request: PhysicalCompilationRequest,
@@ -338,7 +338,7 @@ identity.
 ### Add a deployment topology
 
 1. Add a public `PhysicalDeploymentTarget` variant and its required target fields.
-2. Teach `PhysicalPlanCompiler::compile_promql` how selected operators can be placed on it.
+2. Teach `DeploymentPlanCompiler::compile_promql` how selected operators can be placed on it.
 3. Reject plans requiring an unavailable stage/capability.
 4. Verify the output contains one complete CollectorPlan for every producer and
    one SummaryCatalog and matching QueryPlan referencing all produced materializations.

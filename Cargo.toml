@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/asap_otel_proto",
     "crates/asap_types",
+    "crates/asap_sketch_codec",
     "data_plane",
     "control_plane",
 ]
@@ -10,12 +11,6 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-
-# ASAPCollector's `asap-precompute-rs` currently declares Sketchlib as a
-# relative path. When Collector is consumed from Git, resolve that dependency
-# to the same Git-sourced Sketchlib package as the backend.
-[patch."https://github.com/ProjectASAP/ASAPCollector"]
-asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
 
 [workspace.dependencies]
 # Keep Planner frontends, selection, and IR on the same immutable revision.

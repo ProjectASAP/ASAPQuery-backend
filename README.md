@@ -241,8 +241,8 @@ git -C ../ASAPCollector checkout main
 
 [MVP CI](.github/workflows/mvp-ci.yml) is the source for compatible dependency
 checkouts; currently Collector uses its default branch. For reproducible runs,
-record all three exact revisions. ASAPPlanner is fetched at the revision pinned
-in Cargo manifests; do not substitute an unrelated local planner checkout.
+record the exact revisions. ASAPPlanner is fetched at the revision pinned in
+the Cargo manifests; do not substitute an unrelated local planner checkout.
 
 ### 2. Check prerequisites and build
 

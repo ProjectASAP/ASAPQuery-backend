@@ -14,7 +14,7 @@ impl PrecomputePlan {
     pub fn bind_catalog(&mut self, catalog: &SummaryCatalog) -> Result<(), PrecomputePlanError> {
         for config in &self.materializations {
             let id = SummaryDefinitionId::from(config.policy_fingerprint());
-            catalog.materializations.get(&id).ok_or_else(|| {
+            catalog.definitions.get(&id).ok_or_else(|| {
                 invalid(format!("missing catalog materialization {}", id.as_u64()))
             })?;
         }
@@ -53,21 +53,18 @@ impl PrecomputePlan {
             .iter()
             .map(|m| SummaryDefinitionId::from(m.policy_fingerprint()))
             .collect();
-        if ids != catalog.materializations.keys().copied().collect() {
+        if ids != catalog.definitions.keys().copied().collect() {
             return Err(invalid("catalog/reference/materialization sets differ"));
         }
         for config in &self.materializations {
             let id = SummaryDefinitionId::from(config.policy_fingerprint());
-            let binding = &catalog.materializations[&id];
+            let binding = &catalog.definitions[&id];
             let expected =
                 SummaryDescriptor::from_config(config).map_err(|e| invalid(e.to_string()))?;
             if binding.summary_descriptor_id != expected.id {
                 return Err(invalid(
                     "summary operator/update contract differs from catalog",
                 ));
-            }
-            if binding.pane_origin_ms != config.pane_origin_ms {
-                return Err(invalid("pane origin differs from catalog definition"));
             }
             let data = &catalog.data_descriptors[&binding.data_descriptor_id];
             let expected_source = config.source_identity();

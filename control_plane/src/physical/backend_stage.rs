@@ -1,7 +1,7 @@
 //! Backend-facing projection of one planning cycle.
 //!
 //! These types are the input to [`crate::backend_plan::from_stage_config`] and
-//! to `emit::backend_wire`'s backend JSON builders. `PhysicalPlanCompiler` builds
+//! to `emit::backend_wire`'s backend JSON builders. `DeploymentPlanCompiler` builds
 //! them directly from the summaries ASAPPlanner selected.
 //!
 //! They are deliberately not `Serialize`/`Deserialize`: `SummaryFamilyType`

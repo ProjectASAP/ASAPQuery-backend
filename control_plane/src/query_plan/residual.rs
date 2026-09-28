@@ -585,37 +585,46 @@ mod hybrid_tests {
         )
         .unwrap();
         let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
-        let entry =
-            crate::query_plan::compile_bound_composable_mapped(
-                "hybrid".into(),
-                query.into(),
-                &selected,
-                InstantExecution {
-                    lookback_ms: 300_000,
-                    full_history: false,
-                    cumulative_readout: false,
-                },
-                FallbackPolicy::Reject,
-                |node, _| {
-                    let (_, _, spatial_filter) =
-                        crate::physical::compiler::raw_materialization_input_contract(node)
-                            .map_err(QueryPlanError::Invalid)?;
-                    Ok(MaterializationBinding {
-                        full_window_slide_ms: None,
-                        item_labels: Vec::new(),
-                        materialization: asap_types::PolicyFingerprint(
-                            if spatial_filter.is_empty() { 7 } else { 8 },
-                        )
-                        .into(),
-                        output_grouping: PhysicalGrouping::PerEntity,
-                        window_ms: 300_000,
-                        pane_origin_ms: Some(0),
-                        readout_lookback_ms: Some(300_000),
+        let entry = crate::query_plan::compile_bound_composable_mapped(
+            "hybrid".into(),
+            query.into(),
+            &selected,
+            InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            FallbackPolicy::Reject,
+            |node, _| {
+                let (_, _, spatial_filter) =
+                    crate::physical::compiler::raw_materialization_input_contract(node)
+                        .map_err(QueryPlanError::Invalid)?;
+                Ok(MaterializationBinding {
+                    full_window_slide_ms: None,
+                    item_labels: Vec::new(),
+                    materialization: asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
+                        7
+                    } else {
+                        8
                     })
-                },
-                |_, _| {},
-            )
-            .unwrap();
+                    .into(),
+                    stored_output_reference: asap_types::sds::StoredOutputReference::for_definition(
+                        asap_types::PolicyFingerprint(if spatial_filter.is_empty() {
+                            7
+                        } else {
+                            8
+                        })
+                        .into(),
+                    ),
+                    output_grouping: PhysicalGrouping::PerEntity,
+                    window_ms: 300_000,
+                    pane_origin_ms: Some(0),
+                    readout_lookback_ms: Some(300_000),
+                })
+            },
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(entry.materialization_bindings().len(), 2);
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
@@ -668,7 +677,7 @@ mod hybrid_tests {
 #[cfg(test)]
 mod planner_workload_tests {
     use super::*;
-    use crate::physical::compiler::{BackendLocalPlanningInput, PhysicalPlanCompiler};
+    use crate::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
 
     fn compile_one(query: &str) -> crate::physical::compiler::CompiledPhysicalPlan {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -683,7 +692,7 @@ mod planner_workload_tests {
         let (request, environment) = snapshot
             .into_physical_compilation_request()
             .unwrap_or_else(|error| panic!("{query}: {error}"));
-        PhysicalPlanCompiler
+        DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap_or_else(|error| panic!("{query}: {error}"))
     }
@@ -769,7 +778,7 @@ mod planner_workload_tests {
         let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
         assert!(request.allow_mixed_summary_and_exact_execution);
-        let plan = PhysicalPlanCompiler
+        let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
         assert_eq!(plan.query_plan.entries.len(), 24);

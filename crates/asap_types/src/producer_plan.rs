@@ -290,7 +290,7 @@ fn validate_catalog_projection(
         ));
     }
     for id in materializations {
-        if !catalog.materializations.contains_key(&id) {
+        if !catalog.definitions.contains_key(&id) {
             return Err(TransmissionPlanError::Catalog(format!(
                 "unknown materialization {}",
                 id.as_u64()

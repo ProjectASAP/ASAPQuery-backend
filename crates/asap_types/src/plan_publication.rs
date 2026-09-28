@@ -33,6 +33,109 @@ pub struct PhysicalPlanInstallRequest {
     pub adaptation_evidence: Vec<crate::producer_plan::RuntimeAdaptationEvidence>,
 }
 
+/// A projected writer must refer to the query entry installed in the same
+/// generation.
+pub fn validate_maintenance_query_bindings(
+    precompute: &PrecomputePlan,
+    query: &QueryPlan,
+) -> Result<(), String> {
+    for (query_id, installed) in &precompute.executable_dags {
+        installed.validate()?;
+        let mut entries = query
+            .entries
+            .values()
+            .filter(|entry| &entry.query_id == query_id);
+        let entry = entries
+            .next()
+            .ok_or("maintenance projection has no query entry")?;
+        if entries.next().is_some() {
+            return Err("maintenance projection has ambiguous query entries".into());
+        }
+        if entry.root != installed.binding.query_plan_sink {
+            return Err("maintenance projection and query entry have different roots".into());
+        }
+        let selected = query
+            .selected_dags
+            .get(query_id)
+            .ok_or("maintenance projection has no selected semantic provenance")?;
+        if selected.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION
+            || selected.query_id != *query_id
+        {
+            return Err("selected semantic provenance has invalid identity/version".into());
+        }
+        selected.decode()?;
+        if installed
+            .document
+            .nodes
+            .iter()
+            .any(|node| !selected.nodes.contains(node))
+            || installed
+                .document
+                .edges
+                .iter()
+                .any(|edge| !selected.edges.contains(edge))
+        {
+            return Err("maintenance projection differs from its selected DAG".into());
+        }
+    }
+    Ok(())
+}
+
+/// Every query read must target the installed writer's exact stored output and
+/// physical window contract. The catalog describes semantics; these choices
+/// belong to the executable plans.
+pub fn validate_stored_output_references(
+    precompute: &PrecomputePlan,
+    query: &QueryPlan,
+) -> Result<(), String> {
+    let writers = precompute
+        .schemas
+        .iter()
+        .map(|schema| (schema.materialization, schema))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let configs = precompute
+        .materializations
+        .iter()
+        .map(|config| (config.policy_fingerprint().into(), config))
+        .collect::<std::collections::BTreeMap<crate::sds::SummaryDefinitionId, _>>();
+    for entry in query.entries.values() {
+        for binding in entry.materialization_bindings() {
+            let writer = writers.get(&binding.materialization).ok_or_else(|| {
+                format!(
+                    "query binding for definition {} has no precompute stored-summary writer",
+                    binding.materialization.as_u64()
+                )
+            })?;
+            if binding.stored_output_reference != writer.stored_output_reference {
+                return Err(
+                    "query read and precompute writer have different stored outputs".into(),
+                );
+            }
+            let config = configs.get(&binding.materialization).ok_or_else(|| {
+                format!(
+                    "query binding for definition {} has no precompute configuration",
+                    binding.materialization.as_u64()
+                )
+            })?;
+            let full_slide = matches!(
+                config.window_layout,
+                crate::WindowMaterializationLayout::FullWindow
+            )
+            .then_some(config.slide_interval.saturating_mul(1_000));
+            if binding.full_window_slide_ms != full_slide {
+                return Err("query full-window cadence differs from precompute definition".into());
+            }
+            if config.stored_window_ms() != binding.window_ms {
+                return Err("query pane differs from precompute stored window".into());
+            }
+            if config.pane_origin_ms != binding.pane_origin_ms {
+                return Err("query pane origin differs from precompute definition".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl PhysicalPlanPublication {
     /// Validate every plan against the shared catalog snapshot.
     pub fn validate(&self) -> Result<(), String> {
@@ -49,36 +152,8 @@ impl PhysicalPlanPublication {
         self.query_plan
             .validate_against_catalog(catalog)
             .map_err(|e| e.to_string())?;
-        let materializations = self
-            .precompute_plan
-            .materializations
-            .iter()
-            .map(|config| (config.policy_fingerprint(), config))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        for entry in self.query_plan.entries.values() {
-            for binding in entry.materialization_bindings() {
-                let config = materializations
-                    .get(&binding.materialization.fingerprint())
-                    .copied()
-                    .ok_or("query binding has no precompute materialization")?;
-                let full_slide = matches!(
-                    config.window_layout,
-                    crate::WindowMaterializationLayout::FullWindow
-                )
-                .then_some(config.slide_interval.saturating_mul(1_000));
-                if binding.full_window_slide_ms != full_slide {
-                    return Err(
-                        "query full-window cadence differs from precompute definition".into(),
-                    );
-                }
-                if config.stored_window_ms() != binding.window_ms {
-                    return Err("query pane differs from precompute stored window".into());
-                }
-                if config.pane_origin_ms != binding.pane_origin_ms {
-                    return Err("query pane origin differs from precompute definition".into());
-                }
-            }
-        }
+        validate_maintenance_query_bindings(&self.precompute_plan, &self.query_plan)?;
+        validate_stored_output_references(&self.precompute_plan, &self.query_plan)?;
         let mut collectors = std::collections::BTreeSet::new();
         for collector in &self.collector_plans {
             if collector.envelope != self.precompute_plan.envelope
