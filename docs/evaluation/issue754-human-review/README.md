@@ -38,18 +38,17 @@ previous revision in this file came to be wrong.
 
 | Query | Candidates | Bound | Refused |
 | --- | --- | --- | --- |
-| spatial-sum | 4 | 4 | — |
-| spatial-quantile | 4 | 4 | — |
-| temporal-sum | 3 | 3 | — |
-| temporal-rate | 4 | 4 | — |
-| temporal-quantile | 3 | 3 | — |
+| grouped-rate | 5 | 5 | — |
+| grouped-temporal-sum | 4 | 4 | — |
 | quantile-ratio | 3 | 3 | — |
-| grouped-rate | 6 | 4 | 1 fragment mismatch, 1 schema incompatibility |
-| grouped-temporal-sum | 4 | 3 | 1 fragment mismatch |
-| spatial-topk | 4 | 2 | 1 no certified guarantee, 1 fragment mismatch |
+| spatial-quantile | 4 | 4 | — |
+| spatial-sum | 4 | 4 | — |
+| spatial-topk | 4 | 3 | 1 no certified guarantee |
+| temporal-quantile | 3 | 3 | — |
+| temporal-rate | 5 | 5 | — |
+| temporal-sum | 3 | 3 | — |
 | topk-rate | 8 | 4 | 4 no certified guarantee |
-
-Two kinds of refusal appear here and they are not equivalent.
+Only explicit admission policy refusals remain in these fixtures. Unexpected binding failures fail Level 1.
 
 **Policy refusals** are the fixture declining to certify a candidate, and they
 are asserted as required outcomes. The heap candidates are the whole of this
@@ -87,22 +86,11 @@ cannot: a workload candidate that would share one deployed output between
 queries needing different semantics from it. Refusing that is correct, so it is
 recorded as a policy reason rather than a defect.
 
-**Binding defects** are bugs. Three candidates fail with `Planner logical
-fragment does not match any original query subtree` and one with a schema
-incompatibility. `main` is green on these paths, so each is a regression
-introduced inside the #737 → #728 stack. They are enumerated in
-`KNOWN_BINDING_DEFECTS` in the Level-1 test with exact occurrence counts: a new
-instance fails the test, and a fixed one forces its entry to be deleted. Every
-entry must be gone before #775 installs and executes these candidates. The same
-error fails `repeated_dashboard_executes_multiple_selected_panes` and
-`shared_exact_dashboard_executes_selected_workload` in CI today.
-
-The defect is worse in batch than the single-query counts suggest, and it
-scales with workload size: one fragment mismatch when `shared-rate` plans three
-queries together, and **fifteen** across `all-ten`, plus one schema
-incompatibility each. `shared-quantiles` reaches neither. Those counts are
-recorded alongside the per-query ones, so the batch path can no longer absorb
-them silently.
+**Binding defects are not allowed.** Planner query-result finalization and
+Backend typed bindings now preserve the selected semantics. The former fragment
+mismatch and accumulator-output schema failures have been fixed, and their
+allowlist has been removed. The same rejection checks apply to single queries
+and the three query ensembles.
 
 ## Review order
 

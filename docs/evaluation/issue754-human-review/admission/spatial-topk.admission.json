@@ -4,12 +4,12 @@
     "logical_root_ids": [
       "asap-explain-v1:root:ce68b3daf9be1bebe2252ca6957c8880a59ef03d33608d76b51ee0ae5eab3166"
     ],
-    "physical_candidate_id": null,
+    "physical_candidate_id": "asap-explain-v1:physical:aeb2a2838d761656a89dbcc21a02624af8c301ef5270287176f230318139422b",
     "identity_unavailable_reason": null,
-    "status": "bind_failed",
-    "plan_id": null,
+    "status": "bound",
+    "plan_id": 1305595822516651180,
     "total_cost": null,
-    "unavailable_reason": "failed to construct QueryPlan: invalid QueryPlan: Planner logical fragment does not match any original query subtree"
+    "unavailable_reason": null
   },
   {
     "candidate_id": "asap-explain-v1:candidate:8750d56b757927cf51befebf02d41ed72de02bc2454d8789f943f6a70fffaedd",
