@@ -751,7 +751,11 @@ impl ASAPQueryEngine {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
                 if entry.nodes.values().any(|node| {
-                    matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
+                    matches!(
+                        node,
+                        asap_types::query_plan::QueryPlanNode::Logical { .. }
+                            | asap_types::query_plan::QueryPlanNode::Physical { .. }
+                    )
                 }) {
                     return self
                         .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)

@@ -307,6 +307,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
             QueryPlanNode::Logical { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
+            | QueryPlanNode::Physical { .. }
             | QueryPlanNode::RelationalJoin { .. } => Err(PhysicalNodeError::Fallback(
                 "logical node requires installed logical runtime".into(),
             )),
