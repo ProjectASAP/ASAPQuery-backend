@@ -1443,15 +1443,17 @@ fn execute_finite_complete_populations(
         .collect::<Result<Vec<_>, _>>()?;
     asap_types::precompute_plan::validated_source_window_cohort(config, &sources)
         .map_err(|error| error.to_string())?;
+    let native_program = installed.native_program(sink)?;
     if std::iter::once(config)
         .chain(sources.iter().copied())
         .any(|config| {
             config.population_key_encoding != asap_types::PopulationKeyEncoding::CanonicalLabelsV1
-                || config.slide_interval.checked_mul(1000) != Some(config.stored_window_ms())
+                || (native_program.is_none()
+                    && config.slide_interval.checked_mul(1000) != Some(config.stored_window_ms()))
         })
     {
         return Err(
-            "complete population execution requires canonical nonoverlapping full windows".into(),
+            "complete population execution requires canonical windows supported by the bound program".into(),
         );
     }
     let dag = installed.document.decode()?;
@@ -1460,7 +1462,6 @@ fn execute_finite_complete_populations(
         .iter()
         .find(|node| node.id == sink)
         .ok_or("complete target node is absent")?;
-    let native_program = installed.native_program(sink)?;
     if native_program.is_none() {
         asap_types::precompute_plan::validate_maintenance_reduction(config, target_node)?;
     }
@@ -1486,11 +1487,16 @@ fn execute_finite_complete_populations(
                 }
                 for (start, end) in windows {
                     let width = source.stored_window_ms();
+                    let stride = source
+                        .slide_interval
+                        .checked_mul(1000)
+                        .ok_or("source cadence overflow")?;
                     if width == 0
+                        || stride == 0
                         || end.checked_sub(*start) != Some(width)
                         || *end > i64::MAX as u64
                         || (*start as i128 - source.pane_origin_ms.unwrap_or(0) as i128)
-                            .rem_euclid(width as i128)
+                            .rem_euclid(stride as i128)
                             != 0
                     {
                         return Err(
