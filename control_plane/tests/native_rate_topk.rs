@@ -41,6 +41,14 @@ fn rate_heap_candidates_bind_durable_counter_windows() {
         let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) else {
             continue;
         };
+        if plan
+            .precompute_plan
+            .executable_dags
+            .values()
+            .any(|dag| !dag.native_programs.is_empty())
+        {
+            continue;
+        }
         let entry = plan.query_plan.entries.values().next().unwrap();
         let Some(program) = &entry.physical_dag else {
             continue;
@@ -129,6 +137,11 @@ fn rate_heap_costs_can_select_each_compiled_candidate() {
                     .map(ToString::to_string)
                     .unwrap_or_default();
                 let preferred_plan = entry.physical_vector_binding().is_some()
+                    && !plan
+                        .precompute_plan
+                        .executable_dags
+                        .values()
+                        .any(|dag| !dag.native_programs.is_empty())
                     && if preferred == "exact" {
                         !program.contains("WithHeap")
                     } else {
@@ -164,5 +177,108 @@ fn rate_heap_costs_can_select_each_compiled_candidate() {
         } else {
             assert!(program.contains(preferred));
         }
+    }
+}
+
+// Fixed-window candidates retain a native maintenance graph and read its heap
+// state directly; removing that graph must make recovered installation invalid.
+#[test]
+fn fixed_window_rate_heap_candidates_install_both_physical_graphs() {
+    let mut input = fixture(true);
+    let mut wire = serde_json::to_value(&input).unwrap();
+    wire["query_workload"]["repeating_queries"][0]["demand"]["fixed_interval_at"]["interval"] =
+        60_000.into();
+    wire["query_workload"]["repeating_queries"][0]["demand"]["fixed_interval_at"]
+        ["evaluation_phase"] = 0.into();
+    input = serde_json::from_value(wire).unwrap();
+    let (request, environment) = input.into_physical_compilation_request().unwrap();
+    let mut families = std::collections::BTreeSet::new();
+    let mut errors = Vec::new();
+    for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
+        let plan = match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                errors.push(error.to_string());
+                continue;
+            }
+        };
+        for installed in plan.precompute_plan.executable_dags.values() {
+            for sink in installed.native_programs.keys() {
+                let program = installed.native_program(*sink).unwrap().unwrap();
+                let encoded = String::from_utf8(program.encode().unwrap()).unwrap();
+                for family in ["CmsWithHeap", "CountSketchWithHeap"] {
+                    if encoded.contains(family) {
+                        families.insert(family);
+                    }
+                }
+                assert!(encoded.contains("Rate"));
+                let entry = plan.query_plan.entries.values().next().unwrap();
+                let query = entry.recover_vector_physical_dag().unwrap();
+                assert!(!String::from_utf8(query.encode().unwrap())
+                    .unwrap()
+                    .contains("KeyedSummaryBuild"));
+                let mut broken = plan.precompute_plan.clone();
+                for installed in broken.executable_dags.values_mut() {
+                    installed.native_programs.clear();
+                }
+                assert!(broken.validate().is_err());
+            }
+        }
+    }
+    assert_eq!(
+        families,
+        std::collections::BTreeSet::from(["CmsWithHeap", "CountSketchWithHeap"]),
+        "{errors:#?}"
+    );
+}
+
+// Candidate costs include the persisted maintenance graph, not just its cheap readout.
+#[test]
+fn fixed_window_heap_costs_include_native_maintenance() {
+    let mut wire = serde_json::to_value(fixture(true)).unwrap();
+    wire["query_workload"]["repeating_queries"][0]["demand"]["fixed_interval_at"]["interval"] =
+        60_000.into();
+    wire["query_workload"]["repeating_queries"][0]["demand"]["fixed_interval_at"]
+        ["evaluation_phase"] = 0.into();
+    let input: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+    let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+    let ids = enumerate_exact_and_materialized_candidates(request)
+        .unwrap()
+        .into_iter()
+        .filter_map(|candidate| {
+            DeploymentPlanCompiler
+                .compile_promql(candidate, environment.clone())
+                .ok()
+        })
+        .filter(|plan| {
+            plan.precompute_plan
+                .executable_dags
+                .values()
+                .any(|dag| !dag.native_programs.is_empty())
+        })
+        .map(|plan| plan.envelope.plan_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!ids.is_empty());
+    let report = input.compile_promql().unwrap().cost_comparison.unwrap();
+    let candidates = report
+        .candidate_evaluations
+        .iter()
+        .filter(|candidate| candidate.plan_id.is_some_and(|id| ids.contains(&id)))
+        .collect::<Vec<_>>();
+    assert!(!candidates.is_empty());
+    for candidate in candidates {
+        assert!(
+            candidate.total_cost.is_some(),
+            "{:?}",
+            candidate.unavailable_reason
+        );
+        let resources = candidate.automatic_cost.as_ref().unwrap();
+        assert!(resources
+            .components
+            .iter()
+            .any(|(id, resource)| id.starts_with("maintenance:")
+                && resource.cpu_seconds > 0.
+                && resource.memory_byte_seconds > 0.
+                && resource.calculation.get("physical_program").is_some()));
     }
 }

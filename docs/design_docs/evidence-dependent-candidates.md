@@ -332,3 +332,10 @@ is sufficient. Exact ranking remains available. The installed physical program
 consumes the complete per-series Rate vector from bound counter SDS; Backend
 quotes can select any of the three programs, and automatic costs charge the
 actual native workspace. Operator support alone does not supply accuracy proof.
+
+A fixed-window Rate heap candidate places Rate finalization and heap construction
+in precompute and persists the heap. Query-time construction remains a separate
+candidate. This placement requires a complete, durable counter population for the
+same window and does not authorize merging rates across windows. The initial
+runtime realization uses the finite-source completion barrier. Candidate admission
+must reject deployments unable to satisfy that completion requirement.

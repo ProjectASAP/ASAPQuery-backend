@@ -178,6 +178,10 @@ impl OwnedPostAsapDag {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledPostAsapDag {
+    /// Planner-compiled bounded programs keyed by persisted output node.
+    /// Deployment bindings below identify their stored input/output instances.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub native_programs: BTreeMap<PostAsapNodeId, serde_json::Value>,
     pub document: OwnedPostAsapDag,
     pub binding: BackendExecutableBinding,
 }
@@ -190,7 +194,64 @@ impl InstalledPostAsapDag {
         if self.document.schema_version != MAINTENANCE_DAG_SCHEMA_VERSION {
             return Err("unsupported maintenance DAG document version".into());
         }
-        self.binding.validate_maintenance(&self.document.decode()?)
+        self.binding
+            .validate_maintenance(&self.document.decode()?)?;
+        for sink in self.native_programs.keys() {
+            self.native_program(*sink)?;
+        }
+        Ok(())
+    }
+
+    /// Recovery validates the physical producer's typed storage boundaries;
+    /// it never lowers the semantic provenance document again.
+    pub fn native_program(
+        &self,
+        sink: PostAsapNodeId,
+    ) -> Result<Option<asap_physical_operators::physical_planner::CompiledPhysicalDag>, String>
+    {
+        let Some(value) = self.native_programs.get(&sink) else {
+            return Ok(None);
+        };
+        let program = asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(
+            &serde_json::to_vec(value).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if program.roots() != [u64::from(sink.0)] || !self.binding.precompute_sinks.contains(&sink)
+        {
+            return Err("native maintenance program differs from its installed sink".into());
+        }
+        let dag = self.document.decode()?;
+        for (id, contract) in program.input_contracts() {
+            let id = PostAsapNodeId(u32::try_from(id).map_err(|_| "physical source id overflow")?);
+            if id == sink
+                || !matches!(
+                    self.binding.node(id),
+                    Some(BackendNodeBinding::Materialization { .. })
+                )
+                || dag
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == id)
+                    .is_none_or(|n| n.output_schema != *contract.schema)
+            {
+                return Err(
+                    "native maintenance source differs from installed state boundary".into(),
+                );
+            }
+        }
+        let output = program
+            .output_contract(u64::from(sink.0))
+            .map_err(|e| e.to_string())?;
+        if program.input_contracts().count() == 0
+            || dag
+                .nodes
+                .iter()
+                .find(|n| n.id == sink)
+                .is_none_or(|n| n.output_schema != *output.schema)
+        {
+            return Err("native maintenance output differs from semantic schema".into());
+        }
+        Ok(Some(program))
     }
 
     /// Project the selected semantic DAG onto the maintenance ancestors of its
@@ -379,6 +440,7 @@ mod tests {
     #[test]
     fn installed_maintenance_dag_rejects_complete_dag_version() {
         let installed = InstalledPostAsapDag {
+            native_programs: std::collections::BTreeMap::new(),
             document: OwnedPostAsapDag {
                 schema_version: OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
                 query_id: "q".into(),
