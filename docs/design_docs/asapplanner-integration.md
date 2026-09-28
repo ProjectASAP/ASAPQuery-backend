@@ -35,11 +35,13 @@ Deployment at e9390031](https://github.com/ProjectASAP/ASAPPlanner/blob/e9390031
 
 ```text
 ASAPPlanner
-  Logical Post-ASAP DAG + selected Summary Maintenance Lifecycle
+  Logical Post-ASAP candidates + legal Summary Maintenance Lifecycles
       ↓ Physical Plan Compiler
-  Physical DAGs + typed input/output boundaries
+  Supported physical candidates + typed input/output boundaries
       ↓
 Backend
+  Feasibility and cost selection over workload candidates
+      ↓
   Deployment Plan Compiler + sources/store + operational policy
       ↓
   PrecomputePlan + QueryPlan + summary definitions
@@ -49,8 +51,9 @@ Backend
 
 | Owner | Decisions |
 | --- | --- |
-| Planner logical and maintenance selection | Computation semantics, guarantees, window/retention/reuse requirements |
+| Planner logical and maintenance candidate construction | Computation semantics, guarantees, window/retention/reuse requirements |
 | Planner Physical Plan Compiler | Concrete operators, schemas, dependencies, roots, sharing and materialization frontiers |
+| Backend candidate selection | Deployable workload candidate, using capabilities and scoped cost inputs; shared work is costed once within that candidate |
 | Backend Deployment Plan Compiler | Concrete source/state bindings, stored-output identities, placement, scheduling and installation version |
 | Backend engines | Resolve inputs, drive execution, publish results, check actual readiness and apply installed fallback policy |
 | Shared physical library | Operator execution, per-run sharing, backpressure, cancellation and resource contracts |
@@ -67,10 +70,13 @@ policy rather than a minimum, the binding must preserve that policy.
 Planner may place a build in a query DAG or a readout before a persisted scalar
 output. Backend execution respects the selected graph boundaries.
 
-Capabilities and scoped cost evidence flow from the backend to Planner selection.
-Missing support makes a candidate unavailable. Deployment compilation validates
-the selected realization; it does not repair an unsupported candidate by changing
-operators, windows or boundaries. Such changes require replanning.
+Planner exposes supported, semantically legal physical candidates for the workload.
+Backend evaluates deployment feasibility and compares their scoped costs, then
+selects a candidate and binds its deployment. Binding failures exclude candidates;
+missing costs must not silently become zero. Backend may evaluate binding while
+pricing candidates, but cannot change their operators, windows or boundaries.
+The current validation uses synthetic costs. Online resource collection and
+feedback-driven replanning are deferred.
 
 A maintenance lifecycle is a contract associated with computation, not another
 operator IR. A deployment plan is an operational wrapper around Physical DAGs,
@@ -97,12 +103,24 @@ A physical graph may be embedded or referenced within the bundle; either way,
 its operator vocabulary and computation remain Planner-owned. The backend does
 not copy it into a second set of Build/Merge/Estimate node variants.
 
+Two concrete decisions govern these bindings:
+
+| Design question | Decision and example |
+| --- | --- |
+| What identifies the source dataset? | Tenant A's and tenant B's `KLL(latency)` have different definitions. Moving tenant A's dataset to another endpoint preserves its definition. See [source identity examples](summary-catalog-sds-architecture.md#source-identity). |
+| Can a new plan version reuse old state immediately? | Version 43 populates its own state even if version 42 has the same definition. Same-version restart can recover eligible records. See [recovery examples](summary-catalog-sds-architecture.md#recovery-and-plan-version-changes). |
+
 Bindings attach only to declared physical boundaries:
 
 ```text
 physical input slot → concrete raw source or stored-output reference
 physical output     → persisted output or query result
 ```
+
+Backend resolves a stable logical dataset identity before requesting Planner
+semantic definitions. Physical source bindings must realize that identity; changing
+an endpoint or replica does not change it. Binding a different dataset requires a
+new semantic definition, not reuse of a matching field name.
 
 The compiler assigns each persisted output a `stored_output_id` within the plan
 version. Its writer and all readers refer to the same definition and compatible
@@ -195,7 +213,7 @@ For each selected physical candidate, the compiler:
 Backend feasibility includes persisting the selected output type. Planner may
 produce scalar/result frontiers as well as sketches; this does not imply the
 backend supports all of them. An unsupported output is rejected or excluded
-through Planner feasibility selection, never silently replaced with another
+during Backend candidate selection, never silently replaced with another
 frontier.
 
 A query-only candidate can build state during a query; a precompute candidate
@@ -220,10 +238,16 @@ invokes the same executor and adapts results. Both propagate cancellation and
 resource limits. Neither interprets logical Post-ASAP nodes at runtime.
 
 Cleanup respects retention and active readers/dependent producers. Storage lookup
-uses installed references; it does not search for an alternative summary at
+uses installed references; it does not search for a substitute summary at
 serving time. See SDS for record eligibility and recovery requirements.
 
-## 7. Alternatives and tradeoffs
+Initial recovery is limited to the same installed plan version. A new version
+populates its own state, even when definitions match the previous version. During
+warm-up it uses its installed fallback or unavailability policy. Cross-version
+state adoption is deferred; equal definitions do not authorize it. See the
+[SDS recovery contract](summary-catalog-sds-architecture.md#recovery-and-plan-version-changes).
+
+## 7. Design choices and tradeoffs
 
 Re-lowering logical nodes in the backend would duplicate physical selection and
 allow deployment and Planner graphs to drift. Consuming Physical DAGs avoids that
