@@ -200,7 +200,7 @@ struct CompileAndPublishPhysicalPlanRequest {
     queries: Vec<PhysicalPlanQueryRequest>,
     data_workload: planner_types::workload::DataWorkload,
     dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
-    #[serde(rename = "collector_ids", alias = "target_collector_ids")]
+    #[serde(rename = "collector_ids")]
     target_collector_ids: Vec<String>,
     capability_snapshot_id: String,
     #[serde(default)]
@@ -239,13 +239,13 @@ use physical::compiler::QueryFrontend;
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
     cost_comparison: Option<physical::workload_cost::CandidatePlanSelectionReport>,
-    #[serde(rename = "logical_selection", alias = "planner_selection_trace")]
+    #[serde(rename = "logical_selection")]
     planner_selection_trace: Vec<serde_json::Value>,
     plan_id: u64,
     plan_version: u64,
     status: &'static str,
     generated_at_unix_ms: u64,
-    #[serde(rename = "collector_ids", alias = "target_collector_ids")]
+    #[serde(rename = "collector_ids")]
     target_collector_ids: Vec<String>,
     lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
