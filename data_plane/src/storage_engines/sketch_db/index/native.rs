@@ -19,20 +19,49 @@ struct NativeSummaryOutput {
 }
 impl NativeSummaryOutput {
     fn new(batch: Batch, max_bytes: usize) -> Result<Self, String> {
-        let [row] = batch.rows() else {
-            return Err("one stored summary record requires one output row".into());
-        };
-        let states: Vec<_> = row
+        let families = batch
+            .schema()
+            .fields
             .iter()
-            .filter_map(|value| match value {
-                Value::Summary { state, .. } => Some(state),
-                _ => None,
+            .filter_map(|field| {
+                (!matches!(
+                    field.dtype,
+                    planner_types::post_asap::SummaryFamilyType::Plain(_)
+                ))
+                .then_some(&field.dtype)
             })
-            .collect();
-        let [state] = states.as_slice() else {
-            return Err("stored native summary requires exactly one summary state".into());
+            .collect::<Vec<_>>();
+        let [family] = families.as_slice() else {
+            return Err("native stored batch requires one summary column".into());
         };
-        let kind = state.get_accumulator_type();
+        use planner_types::post_asap::{SketchAlgorithm, SummaryFamilyType};
+        let schema_kind = match family {
+            SummaryFamilyType::Sketch(sketch, _) => match sketch.algorithm() {
+                SketchAlgorithm::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
+                SketchAlgorithm::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut kind = schema_kind;
+        for row in batch.rows() {
+            let states = row
+                .iter()
+                .filter_map(|value| match value {
+                    Value::Summary { state, .. } => Some(state),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [state] = states.as_slice() else {
+                return Err("native stored row requires one summary state".into());
+            };
+            let row_kind = state.get_accumulator_type();
+            if kind.is_some_and(|kind| kind != row_kind) {
+                return Err("native stored rows have different summary families".into());
+            }
+            kind = Some(row_kind);
+        }
+        let kind = kind.ok_or("empty native batch has no supported summary family")?;
         let bytes = encode_batch(&batch).map_err(|error| error.to_string())?;
         if bytes.len() > max_bytes || batch.bytes() > max_bytes {
             return Err("native summary exceeds publication/read budget".into());
@@ -48,7 +77,11 @@ impl NativeSummaryOutput {
                 .iter()
                 .position(|field| &field.name == key)
                 .ok_or("native output is missing its stored group key")?;
-            if !matches!(&self.batch.rows()[0][column], Value::Utf8(actual) if actual.as_ref() == value)
+            if self
+                .batch
+                .rows()
+                .iter()
+                .any(|row| !matches!(&row[column], Value::Utf8(actual) if actual.as_ref() == value))
             {
                 return Err("native output group differs from stored address".into());
             }
@@ -131,7 +164,22 @@ impl SketchStore {
         let (population_key, group) = build_attrs_fp_and_label_map(config, output)?;
         let state = NativeSummaryOutput::new(batch, max_bytes)?;
         let family = config.accumulator_spec().map_err(|e| e.to_string())?.family;
-        for value in &state.batch.rows()[0] {
+        if state
+            .batch
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| {
+                !matches!(
+                    field.dtype,
+                    planner_types::post_asap::SummaryFamilyType::Plain(_)
+                )
+            })
+            .any(|field| field.dtype != family)
+        {
+            return Err("native output schema differs from installed definition".into());
+        }
+        for value in state.batch.rows().iter().flatten() {
             if let Value::Summary { family: actual, .. } = value {
                 if actual != &family {
                     return Err("native output family differs from installed definition".into());
@@ -213,6 +261,46 @@ impl SketchStore {
         let sid = resolver
             .lookup("stored-output", &population_key, &identity)
             .ok_or("native stored output/group is unavailable")?;
+        self.read_native_summary_handle(sid, address, reference, expected_schema, max_bytes)
+    }
+
+    /// A complete native batch is stored atomically under one global address.
+    /// Logical grouping remains in the batch; reads never allocate a resolver ID.
+    pub fn read_bound_native_summary(
+        &self,
+        address: &asap_types::sds::StoredSummaryKey,
+        reference: &StoredOutputReference,
+        expected_schema: Schema,
+        max_bytes: usize,
+    ) -> Result<Batch, String> {
+        if !address.population.is_empty() {
+            return Err("native batch binding requires the complete stored output".into());
+        }
+        let handles = self.storage_handles_for_output(reference);
+        let [sid] = handles.as_slice() else {
+            return Err("native stored output is absent or ambiguous".into());
+        };
+        self.read_native_summary_handle(*sid, address, reference, expected_schema, max_bytes)
+    }
+
+    fn read_native_summary_handle(
+        &self,
+        sid: u64,
+        address: &asap_types::sds::StoredSummaryKey,
+        reference: &StoredOutputReference,
+        expected_schema: Schema,
+        max_bytes: usize,
+    ) -> Result<Batch, String> {
+        address.validate().map_err(|e| e.to_string())?;
+        let generation = self
+            .active_catalog_generation()
+            .ok_or("native read has no active generation")?;
+        if (address.plan_id, address.plan_version) != (generation.plan_id, generation.plan_version)
+            || address.stored_output_id != reference.stored_output_id
+            || self.stored_output_for_handle(sid).as_ref() != Some(reference)
+        {
+            return Err("native read differs from its installed output binding".into());
+        }
         let window = (
             u64::try_from(address.window.start_ms).map_err(|_| "negative native window")?,
             u64::try_from(address.window.end_ms).map_err(|_| "negative native window")?,
@@ -490,6 +578,13 @@ mod tests {
                     1 << 20,
                 )
                 .unwrap();
+            let direct = store
+                .read_bound_native_summary(&address, &reference, expected_schema.clone(), 1 << 20)
+                .unwrap();
+            assert_eq!(
+                encode_batch(&direct).unwrap(),
+                encode_batch(&batch).unwrap()
+            );
             let handles = store.storage_handles_for_output(&reference);
             assert_eq!(handles.len(), 1);
             let frames = store.query_range(handles[0], 0, 60_000);

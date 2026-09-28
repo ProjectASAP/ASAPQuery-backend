@@ -150,15 +150,7 @@ where
         u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, EngineError>,
 {
-    use crate::{
-        query_engines::query_result::{InstantVectorElement, QueryResult},
-        storage_engines::types::KeyByLabelValues,
-    };
-    use asap_physical_operators::physical_planner::{
-        promql_rows::{decode_series_identity, series_row, SERIES_IDENTITY_COLUMN},
-        Source,
-    };
-    use futures::{executor::block_on, StreamExt};
+    use asap_physical_operators::physical_planner::promql_rows::series_row;
     use std::collections::BTreeMap;
     let (program, bindings, max_bytes) =
         if let Some((inputs, source_nodes, budget)) = entry.physical_vector_binding() {
@@ -184,19 +176,112 @@ where
                 entry.population_snapshot().unwrap().max_bytes,
             )
         };
+    execute_batches(
+        &program,
+        max_bytes,
+        bindings.len(),
+        at,
+        |input_id, schema| {
+            let values = super::vector(super::from_result(callback(bindings[&input_id], at)?)?)?;
+            let rows = values
+                .into_iter()
+                .map(|(labels, value)| {
+                    series_row(
+                        schema,
+                        &labels,
+                        i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?,
+                        value,
+                    )
+                    .map_err(|e| miss(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Batch::try_new(schema.clone(), rows).map_err(|e| miss(e.to_string()))
+        },
+    )
+}
+
+pub(in crate::query_engines::asap_query_engine) fn execute_stored(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    plan_id: u64,
+    plan_version: u64,
+    store: &crate::storage_engines::sketch_db::index::SketchStore,
+    at: u64,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+> {
+    let (inputs, sources, max_bytes) = entry
+        .physical_vector_binding()
+        .ok_or_else(|| miss("missing native stored binding"))?;
+    let program = entry
+        .recover_vector_physical_dag()
+        .map_err(|e| miss(e.to_string()))?;
+    execute_batches(&program, max_bytes, inputs.len(), at, |id, schema| {
+        let index = sources
+            .iter()
+            .position(|source| *source == id)
+            .ok_or_else(|| miss("native source is unbound"))?;
+        let Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding }) =
+            entry.nodes.get(&inputs[index])
+        else {
+            return Err(miss("native stored source is not a bound heap"));
+        };
+        let end = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
+        let start = at
+            .checked_sub(binding.window_ms)
+            .ok_or_else(|| miss("native window underflow"))?;
+        let address = asap_types::sds::StoredSummaryKey {
+            plan_id,
+            plan_version,
+            stored_output_id: binding.stored_output_reference.stored_output_id,
+            population: std::collections::BTreeMap::new(),
+            window: asap_types::sds::HalfOpenTimeRange {
+                start_ms: start as i64,
+                end_ms: end,
+            },
+        };
+        store
+            .read_bound_native_summary(
+                &address,
+                &binding.stored_output_reference,
+                schema.clone(),
+                max_bytes as usize,
+            )
+            .map_err(miss)
+    })
+}
+
+fn execute_batches(
+    program: &asap_physical_operators::physical_planner::CompiledPhysicalDag,
+    max_bytes: u64,
+    input_count: usize,
+    at: u64,
+    mut input_batch: impl FnMut(u64, &Schema) -> Result<Batch, EngineError>,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+> {
+    use crate::{
+        query_engines::query_result::{InstantVectorElement, QueryResult},
+        storage_engines::types::KeyByLabelValues,
+    };
+    use asap_physical_operators::physical_planner::{
+        promql_rows::{decode_series_identity, SERIES_IDENTITY_COLUMN},
+        Source,
+    };
+    use futures::{executor::block_on, StreamExt};
+    use std::collections::BTreeMap;
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
     let mut sources = BTreeMap::new();
     let mut input_bytes = 0usize;
     for (input_id, input) in program.input_contracts() {
-        let values = super::vector(super::from_result(callback(bindings[&input_id], at)?)?)?;
-        let rows = values
-            .into_iter()
-            .map(|(labels, value)| {
-                series_row(&input.schema, &labels, at_signed, value)
-                    .map_err(|e| miss(e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let batch = Batch::try_new(input.schema.clone(), rows).map_err(|e| miss(e.to_string()))?;
+        let batch = input_batch(input_id, &input.schema)?;
         input_bytes = input_bytes
             .checked_add(batch.bytes())
             .ok_or_else(|| miss("physical input size overflow"))?;
@@ -266,7 +351,7 @@ where
     Ok((
         QueryResult::vector(values, at),
         super::ExecutionStats {
-            summary_readout_evaluations: bindings.len(),
+            summary_readout_evaluations: input_count,
             ..Default::default()
         },
     ))

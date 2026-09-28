@@ -362,6 +362,16 @@ impl QueryPlanEntry {
             return Err(invalid("invalid physical vector source mapping or budget"));
         }
         for input in inputs {
+            if let Some(QueryPlanNode::ReadMaterialization { binding }) = self.nodes.get(input) {
+                if binding.readout_lookback_ms != Some(self.instant.lookback_ms)
+                    || binding.window_ms != self.instant.lookback_ms
+                    || binding.window_ms == 0
+                    || !matches!(&binding.output_grouping, PhysicalGrouping::Reduce(labels) if labels.is_empty())
+                {
+                    return Err(invalid(&format!("stored native batch requires one complete bound window: {binding:?}, query lookback {}", self.instant.lookback_ms)));
+                }
+                continue;
+            }
             let Some(QueryPlanNode::ExactReadout {
                 input: state,
                 readout: ExactReadout::Rate,
@@ -430,7 +440,13 @@ impl QueryPlanEntry {
         };
         if dag
             .input_contracts()
-            .any(|(_, input)| !vector_schema(&input.schema))
+            .any(|(id, input)| {
+                let position = source_nodes.iter().position(|source| *source == id).unwrap();
+                if matches!(self.nodes.get(&inputs[position]), Some(QueryPlanNode::ReadMaterialization { .. })) {
+                    let summaries = input.schema.fields.iter().filter(|field| !matches!(field.dtype, SummaryFamilyType::Plain(_))).collect::<Vec<_>>();
+                    !matches!(summaries.as_slice(), [field] if matches!(&field.dtype, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), planner_types::post_asap::SketchAlgorithm::CmsWithHeap | planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap)))
+                } else { !vector_schema(&input.schema) }
+            })
             || !vector_schema(
                 &dag.output_contract(dag.roots()[0])
                     .map_err(|e| QueryPlanError::Invalid(e.to_string()))?

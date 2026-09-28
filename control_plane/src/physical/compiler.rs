@@ -988,6 +988,11 @@ impl BackendLocalPlanningInput {
                 &strategy,
                 &asap_aware_mapping::TargetSubDAG::new(&typed),
             );
+            proposed.candidates.extend(
+                strategy
+                    .fixed_window_rate_topk_candidates(&typed)
+                    .candidates,
+            );
             proposed.candidates.extend(direct.candidates);
             proposed.rejected.extend(direct.rejected);
             for candidate in proposed.candidates {
@@ -999,6 +1004,16 @@ impl BackendLocalPlanningInput {
                     input_kind = "bound_promql_vector").entered();
                 let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
                     .or_else(|_| asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(&root).map(|(_, program)| program));
+                if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&root) {
+                    planner_selection_trace.push(serde_json::json!({
+                        "stage":"planner.physical_candidate", "query_id":query.query_id,
+                        "logical_root_id":crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
+                        "rationale":candidate.rationale, "physical_candidate":serde_json::from_slice::<Value>(&physical.encode().map_err(|e| CompileError::Snapshot(e.to_string()))?).map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                        "guarantee":root.guarantee,
+                    }));
+                    candidate_roots.push(vec![(index, root)]);
+                    continue;
+                }
                 match compiled {
                     Ok(program) => {
                         planner_selection_trace.push(serde_json::json!({
@@ -1544,7 +1559,7 @@ impl DeploymentPlanCompiler {
                 for state in &selected {
                     if matches!(&state.node.expr, SummaryExpr::SummaryAgg {
                         reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
-                    } if keys.is_empty())
+                    } if keys.is_empty()) || asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&query.selected_plan_root).is_ok()
                     {
                         if let Some(sources) = immutable_materialization_sources(&state.node) {
                             canonical_nodes.insert(Rc::as_ptr(&state.node) as usize);
@@ -2126,7 +2141,31 @@ impl DeploymentPlanCompiler {
                     &query.selected_plan_root,
                 )
                 .ok();
+            let native_rate = native_rate.or_else(|| {
+                let physical = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&query.selected_plan_root).ok()?;
+                fn heap(node: &Rc<SummaryNode>) -> Option<Rc<SummaryNode>> {
+                    match &node.expr {
+                        SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(..), .. } => Some(node.clone()),
+                        SummaryExpr::ValueOperation { child, .. } => heap(child),
+                        SummaryExpr::SummaryEstimate { summary_input, .. } => heap(summary_input),
+                        _ => None,
+                    }
+                }
+                Some((heap(&query.selected_plan_root)?, physical.query))
+            });
             let mut entry = if let Some((source, program)) = native_rate {
+                let native_state_binding = if let SummaryExpr::SummaryAgg {
+                    family: SummaryFamilyType::Sketch(..),
+                    ..
+                } = &source.expr
+                {
+                    let SummaryExpr::SummaryAgg { family, .. } = &source.expr else {
+                        unreachable!()
+                    };
+                    Some(binding(&source, family)?)
+                } else {
+                    None
+                };
                 let mut entry = crate::query_plan::compile_bound_composable_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
@@ -2143,6 +2182,12 @@ impl DeploymentPlanCompiler {
                         }
                     },
                 )?;
+                if let Some(binding) = native_state_binding {
+                    entry.nodes.insert(
+                        entry.root,
+                        crate::query_plan::QueryPlanNode::ReadMaterialization { binding },
+                    );
+                }
                 let root = crate::query_plan::QueryNodeId(
                     entry.nodes.keys().map(|id| id.0).max().unwrap_or(0) + 1,
                 );
@@ -2308,7 +2353,7 @@ impl DeploymentPlanCompiler {
                 .find(|entry| entry.query_id == query_id)
                 .expect("compiled query entry exists")
                 .root;
-            let installed = super::executable_binding::install_selected_dag(
+            let mut installed = super::executable_binding::install_selected_dag(
                 query_id.clone(),
                 &compiled.dag,
                 query_plan_sink,
@@ -2324,11 +2369,35 @@ impl DeploymentPlanCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
+            if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_ranking(&request.queries[query_index].selected_plan_root) {
+                let program = physical.precompute.ok_or_else(|| CompileError::Snapshot("fixed-window candidate has no maintenance program".into()))?;
+                let sink = PostAsapNodeId(u32::try_from(program.roots()[0]).map_err(|_| CompileError::Snapshot("maintenance sink overflow".into()))?);
+                installed.native_programs.insert(sink, serde_json::from_slice(&program.encode().map_err(|e| CompileError::Snapshot(e.to_string()))?).map_err(|e| CompileError::Snapshot(e.to_string()))?);
+            }
             query_plan
                 .selected_dags
                 .insert(query_id.clone(), installed.document.clone());
             installed_dags.insert(query_id, installed);
         }
+        let maintenance_lookbacks = materializations
+            .iter()
+            .filter_map(|target| {
+                target
+                    .derived_input
+                    .as_ref()
+                    .map(|input| (input, target.stored_window_ms()))
+            })
+            .flat_map(|(input, window)| input.inputs.iter().map(move |source| (*source, window)))
+            .fold(
+                BTreeMap::<asap_types::sds::StoredOutputId, u64>::new(),
+                |mut windows, (source, window)| {
+                    windows
+                        .entry(source)
+                        .and_modify(|old| *old = (*old).max(window))
+                        .or_insert(window);
+                    windows
+                },
+            );
         for materialization in &mut materializations {
             let fingerprint = materialization.policy_fingerprint();
             let max_lookback_ms = query_plan
@@ -2337,6 +2406,7 @@ impl DeploymentPlanCompiler {
                 .flat_map(QueryPlanEntry::materialization_bindings)
                 .filter(|binding| binding.materialization.fingerprint() == fingerprint)
                 .filter_map(|binding| binding.readout_lookback_ms)
+                .chain(maintenance_lookbacks.get(&fingerprint.into()).copied())
                 .max();
             if let Some(lookback_ms) = max_lookback_ms {
                 materialization.num_aggregates_to_retain = Some(retained_state_count(
@@ -3448,6 +3518,11 @@ pub(crate) fn retained_partition_count(
             A::Increase | A::Rate | A::Min | A::Max
         )
         || !materialization.grouping_labels.names().is_empty()
+        || (materialization.derived_input.is_some()
+            && matches!(
+                materialization.aggregation_type,
+                A::CountMinSketchWithHeap | A::CountSketchWithHeap
+            ))
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
     } else {
@@ -3775,6 +3850,21 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
         // because Planner made the exact accumulator boundary explicit.
         return None;
     };
+    if matches!(&node.expr, SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. }
+        if matches!(kind.algorithm(), SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
+    {
+        if let SummaryExpr::ValueOperation {
+            child: source,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            timing: ExecutionTiming::IngestionTime,
+        } = &child.expr
+        {
+            if matches!(&source.expr, SummaryExpr::SummaryAgg { family: SummaryFamilyType::ExactAggregate(ExactKind::Rate, _), reduction: planner_types::pre_asap::Reduction::PerEntity, child, .. } if matches!(child.expr, SummaryExpr::KeepPreAsap(_)))
+            {
+                return Some(vec![source.clone()]);
+            }
+        }
+    }
     if input.item.is_some()
         || !matches!(
             input.weight,
@@ -3948,6 +4038,22 @@ fn scoped_materialization(
     let SummaryExpr::SummaryAgg { reduction, .. } = &node.expr else {
         anyhow::bail!("materialization lacks SummaryAgg partition contract");
     };
+    if immutable_materialization_sources(node).is_some_and(|sources| {
+        sources.iter().any(|source| {
+            matches!(
+                &source.expr,
+                SummaryExpr::SummaryAgg {
+                    family: SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Rate,
+                        _
+                    ),
+                    ..
+                }
+            )
+        })
+    }) {
+        config.grouping_labels = asap_types::KeyByLabelNames { labels: Vec::new() }.into();
+    }
     config.partitioning = Some(match reduction {
         planner_types::pre_asap::Reduction::PerEntity => {
             asap_types::sds::PopulationPartitioning::PerEntity

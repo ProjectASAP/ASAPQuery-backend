@@ -549,12 +549,6 @@ impl PrecomputePlan {
                 return Err(invalid());
             }
             validated_source_window_cohort(config, &sources)?;
-            if sources
-                .iter()
-                .any(|source| !matches!(source.aggregation_type, crate::AggregationType::Sum))
-            {
-                return Err(invalid());
-            }
             if config.window_size != config.slide_interval {
                 return Err(invalid());
             }
@@ -576,8 +570,26 @@ impl PrecomputePlan {
                         .iter()
                         .find(|node| node.id == *sink)
                         .ok_or_else(invalid)?;
-                    validate_maintenance_reduction(config, target_node)
+                    let native = installed
+                        .native_program(*sink)
                         .map_err(PrecomputePlanError::CatalogContract)?;
+                    if sources.iter().any(|source| {
+                        !matches!(source.aggregation_type, crate::AggregationType::Sum)
+                            && !(native.is_some()
+                                && matches!(source.aggregation_type, crate::AggregationType::Rate))
+                    }) {
+                        return Err(invalid());
+                    }
+                    if native.is_none() {
+                        validate_maintenance_reduction(config, target_node)
+                            .map_err(PrecomputePlanError::CatalogContract)?;
+                    } else if !matches!(
+                        config.aggregation_type,
+                        crate::AggregationType::CountMinSketchWithHeap
+                            | crate::AggregationType::CountSketchWithHeap
+                    ) {
+                        return Err(invalid());
+                    }
                     let inputs: Vec<_> = dag
                         .edges
                         .iter()

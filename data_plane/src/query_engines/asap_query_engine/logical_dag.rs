@@ -1,5 +1,5 @@
 //! Executes the installed typed logical DAG. No serving-time PromQL parsing.
-mod native_values;
+pub(super) mod native_values;
 use crate::query_engines::{
     query_result::{InstantVectorElement, QueryResult},
     EngineError,
