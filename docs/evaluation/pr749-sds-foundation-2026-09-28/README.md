@@ -42,4 +42,3 @@ transitional. Canonical semantic definitions, independent deployed-output
 identity and explicit logical dataset identity land in #774 using Planner #462;
 subsequent PRs complete shared execution and storage integration. The developer
 installation guide and PR description make that boundary explicit.
-
