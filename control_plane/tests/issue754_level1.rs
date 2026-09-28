@@ -27,13 +27,16 @@ use workload::Suite;
 /// one, so the fixture, not a second test path, carries the difference.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Resolution {
-    // No fixture constructs this yet: the issue-754 generator cannot certify a
-    // heap (see `required_summary_shapes`), so every required shape here is a
-    // rejection. The variant is the half of the contract a certified fixture
-    // fills in, and deleting it would delete that contract.
-    #[allow(dead_code)]
     MustBind,
     MustReject(PolicyReason),
+}
+
+/// Which fixture a query is being planned under. The strict issue-754 generator
+/// certifies nothing; its certified companion separates the top-k boundary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fixture {
+    Strict,
+    Certified,
 }
 
 /// Reasons a fixture may legitimately refuse an otherwise well-formed
@@ -57,40 +60,31 @@ impl PolicyReason {
     const ALL: &'static [Self] = &[Self::NoCertifiedGuarantee, Self::AccuracyTargetUnmet];
 }
 
-/// Sketch/heap families each query must expose, with how this fixture resolves
-/// them. The strict issue-754 fixture certifies no heap, so every heap family
-/// is required to be present *and* rejected; that is a positive assertion about
-/// the inventory, not silence about it.
+/// Sketch/heap families each query must expose, and how the given fixture is
+/// required to resolve them.
 ///
-/// A certified companion fixture cannot be derived from this generator. Scoped
-/// evidence needs `topk_selected_lower_bound > topk_excluded_upper_bound`, and
-/// under the generator's own per-series domain (`multiplier * base` to
-/// `multiplier * (base + modulo)`, as `issue754_workload` reads it for the
-/// quantile operands) the third- and fourth-ranked series overlap in both
-/// groups: group `a` selects down to 40 while excluding a series reaching 130,
-/// and group `b` selects down to 360 while excluding one reaching 850. The
-/// pointwise ordering never actually changes, but the queries evaluate in
-/// `real_time` scope, so the contract must hold across the whole validity
-/// window, not at one instant. Certifying a heap needs a generator with
-/// non-overlapping per-series domains.
-fn required_summary_shapes(name: &str) -> &'static [(&'static str, Resolution)] {
-    match name {
-        "spatial-topk" => &[(
-            "CountSketchWithHeap",
-            Resolution::MustReject(PolicyReason::NoCertifiedGuarantee),
-        )],
-        "topk-rate" => &[
-            (
-                "CmsWithHeap",
-                Resolution::MustReject(PolicyReason::NoCertifiedGuarantee),
-            ),
-            (
-                "CountSketchWithHeap",
-                Resolution::MustReject(PolicyReason::NoCertifiedGuarantee),
-            ),
-        ],
+/// The inventory is the same either way -- Planner exposes the heap candidates
+/// regardless. What changes is the evidence: under `Strict` the fixture
+/// certifies nothing, so every heap family must be present *and* refused; under
+/// `Certified` the same families must bind. Asserting both directions is what
+/// keeps the refusal meaningful, since a heap that quietly left the inventory
+/// would otherwise satisfy the strict fixture on its own.
+fn required_summary_shapes(name: &str, fixture: Fixture) -> Vec<(&'static str, Resolution)> {
+    let families: &[&str] = match name {
+        "spatial-topk" => &["CountSketchWithHeap"],
+        "topk-rate" => &["CmsWithHeap", "CountSketchWithHeap"],
         _ => &[],
-    }
+    };
+    families
+        .iter()
+        .map(|family| {
+            let resolution = match fixture {
+                Fixture::Strict => Resolution::MustReject(PolicyReason::NoCertifiedGuarantee),
+                Fixture::Certified => Resolution::MustBind,
+            };
+            (*family, resolution)
+        })
+        .collect()
 }
 
 /// Binding defects this fixture reaches today. Level 1 records them rather than
@@ -847,7 +841,7 @@ fn issue754_queries_have_valid_physical_plans() {
                 "root substitutions must not be reported as exhaustive joint search"
             );
         }
-        let heap_families = required_summary_shapes(&case.name);
+        let heap_families = required_summary_shapes(&case.name, Fixture::Strict);
         let mut heap_roots =
             heap_families
                 .iter()
@@ -886,7 +880,7 @@ fn issue754_queries_have_valid_physical_plans() {
                 })
                 .collect::<Vec<_>>();
         if case.name == "topk-rate" {
-            for (family, resolution) in heap_families {
+            for (family, resolution) in &heap_families {
                 let trace = request
                     .planner_selection_trace
                     .iter()
@@ -1093,6 +1087,76 @@ fn issue754_queries_have_valid_physical_plans() {
                     "missing proof must be an explicit {policy:?} admission failure: {heap:?}"
                 ),
             }
+        }
+    }
+}
+
+/// The other half of the membership contract: under a fixture that *can*
+/// certify a heap, the shapes the strict fixture must refuse have to bind.
+///
+/// This is what keeps `MustReject(NoCertifiedGuarantee)` honest. Without it,
+/// a heap candidate that vanished from the inventory, or one refused for some
+/// unrelated reason, would still satisfy the strict fixture.
+#[test]
+fn certified_fixture_admits_the_heaps_the_strict_fixture_refuses() {
+    for name in ["spatial-topk", "topk-rate"] {
+        let case = workload::suite()
+            .queries
+            .into_iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("{name} left the issue-754 suite"));
+        let (request, environment) = workload::certified_topk_input(&case)
+            .into_physical_compilation_request()
+            .unwrap();
+        let shapes = required_summary_shapes(name, Fixture::Certified);
+        let heap_roots: Vec<(String, Resolution)> = shapes
+            .iter()
+            .map(|(family, resolution)| {
+                let trace = request
+                    .planner_selection_trace
+                    .iter()
+                    .find(|trace| {
+                        trace["stage"] == "planner.physical_candidate"
+                            && trace["physical_dag"].to_string().contains(family)
+                    })
+                    .unwrap_or_else(|| panic!("{name}: Planner must expose native {family}"));
+                (
+                    trace["logical_root_id"].as_str().unwrap().to_owned(),
+                    *resolution,
+                )
+            })
+            .collect();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let (_, admission) =
+            compile_candidates_for_pricing(candidates, environment, QueryFrontend::PromQl);
+        assert!(
+            !admission.iter().any(|candidate| candidate
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| PolicyReason::NoCertifiedGuarantee.matches(reason))),
+            "{name}: certified evidence must remove every uncertified-readout refusal"
+        );
+        for (root_id, resolution) in heap_roots {
+            let heap: Vec<_> = admission
+                .iter()
+                .filter(|candidate| candidate.logical_root_ids.contains(&root_id))
+                .collect();
+            assert!(
+                !heap.is_empty(),
+                "{name}: heap candidate left the inventory"
+            );
+            assert_eq!(
+                resolution,
+                Resolution::MustBind,
+                "the certified fixture declares binding shapes"
+            );
+            assert!(
+                heap.iter().any(|candidate| candidate.status
+                    == CandidateEvaluationStatus::AwaitingQuote
+                    && candidate.plan_id.is_some()
+                    && candidate.total_cost.is_none()),
+                "{name}: certified heap must reach pricing, unpriced: {heap:?}"
+            );
         }
     }
 }
