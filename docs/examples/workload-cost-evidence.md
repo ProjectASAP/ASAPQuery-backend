@@ -1,6 +1,6 @@
 # Complete workload cost evidence
 
-Planning snapshots use one schema, `snapshot_version: 2`. Version 1 is rejected.
+Planning snapshots use one schema, `snapshot_version: 3`. Versions 1 and 2 are rejected; the environment must declare its logical dataset identity.
 Candidate discovery may omit `workload_cost_evidence`; compiling a deployable
 snapshot requires complete, valid quotes and selects by complete workload cost.
 There is no unquoted snapshot deployment path. The checked-in JSON examples are
@@ -9,7 +9,7 @@ discovery templates, not ready-to-deploy plans.
 ## Workflow
 
 1. Prepare the canonical workload, deployment capabilities and implementation
-   evidence as in `asapquery-planning-snapshot.json`. Set version 2.
+   evidence as in `asapquery-planning-snapshot.json`. Set version 3.
 2. Obtain requirements without deploying:
 
    ```sh

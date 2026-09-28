@@ -27,7 +27,7 @@ class PlannedTests(unittest.TestCase):
             manifest = accuracy_suite.corpus("google")
             (root / "queries.json").write_text(json.dumps(manifest))
             (root / "snapshot.json").write_text(json.dumps({
-                "snapshot_version": 2,
+                "snapshot_version": 3,
                 "query_workload": {"repeating_queries": [{"query": "sum_over_time(google_cluster_cpu_rate[1m])"}]},
                 "workload_cost_evidence": {"quotes": [{"test_placeholder": True}]}}))
             argv = ["planned_run.py", "--data", str(root / "data"), "--manifest", str(root / "queries.json"),
@@ -73,11 +73,13 @@ class PlannedTests(unittest.TestCase):
             root = Path(tmp)
             dataset.write(root / "data", dataset.synthetic(1, 1, 0, 120000), 2402, {"dataset": "synthetic"})
             manifest = accuracy_suite.corpus("synthetic")
-            snapshot = {"snapshot_version": 2, "query_workload": {"repeating_queries": [{"query": "sum_over_time(fake_metric[1m])"}]}}
+            snapshot = {"snapshot_version": 3, "query_workload": {"repeating_queries": [{"query": "sum_over_time(fake_metric[1m])"}]}}
             qid = "synthetic/1m/False/temporal_sum"
             with self.assertRaisesRegex(ValueError, "cost evidence"):
                 prepare(root / "data", manifest, qid, snapshot, None, 2)
             snapshot["workload_cost_evidence"] = {"quotes": [{"test_placeholder": True}]}
+            with self.assertRaisesRegex(ValueError, "cost evidence"):
+                prepare(root / "data", manifest, qid, {**snapshot, "snapshot_version": 2}, None, 2)
             _, corpus = prepare(root / "data", manifest, qid, snapshot, None, 2)
             self.assertEqual(corpus["queries"][0]["eval_timestamp_ms"], 120000)
             with self.assertRaisesRegex(ValueError, "full temporal history"):
