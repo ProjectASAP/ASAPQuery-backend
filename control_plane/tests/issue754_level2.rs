@@ -3,7 +3,7 @@
 mod workload;
 
 use control_plane::physical::{
-    compiler::{QueryFrontend, BACKEND_REVISION, PLANNER_REVISION},
+    compiler::{CompileError, QueryFrontend, BACKEND_REVISION, PLANNER_REVISION},
     workload_cost::{
         compile_candidates_for_pricing, enumerate_exact_and_materialized_candidates,
         select_lowest_cost_candidate, CandidateEvaluationStatus, WorkloadCostEvidence,
@@ -30,7 +30,8 @@ fn workload_candidates_follow_prices_and_feasibility() {
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
         let (mut manifests, admission) =
             compile_candidates_for_pricing(candidates.clone(), env.clone(), QueryFrontend::PromQl);
-        // Equivalent manifests need one quote, irrespective of search duplicates.
+        // The search is expected to reach one manifest through several candidates;
+        // equivalent manifests need exactly one quote.
         let mut seen = std::collections::BTreeSet::new();
         manifests.retain(|m| seen.insert(serde_json::to_string(m).unwrap()));
         assert!(manifests.len() >= 2, "{} needs competing candidates", name);
@@ -58,15 +59,36 @@ fn workload_candidates_follow_prices_and_feasibility() {
                     })
                     .collect(),
             };
-            if preferred == 0 {
-                let mut wrong_dataset = evidence.clone();
-                for quote in &mut wrong_dataset.quotes {
-                    quote.manifest.dataset_identity.namespace = "another-tenant".into();
-                }
+            // The preference must follow from construction, not fixture multiplicities.
+            let totals: Vec<f64> = evidence
+                .quotes
+                .iter()
+                .map(|quote| {
+                    quote
+                        .manifest
+                        .components
+                        .iter()
+                        .map(|(key, demand)| quote.unit_costs[key] * demand.occurrences_per_horizon)
+                        .sum()
+                })
+                .collect();
+            for (index, total) in totals.iter().enumerate() {
                 assert!(
+                    index == preferred || *total > totals[preferred],
+                    "{name}: candidate {index} is not costlier than preferred {preferred}"
+                );
+            }
+            if preferred == 0 {
+                // A single foreign quote, even a losing one, invalidates the generation.
+                let mut wrong_dataset = evidence.clone();
+                let foreign = &mut wrong_dataset.quotes.last_mut().unwrap().manifest;
+                foreign.dataset_identity.namespace = "another-tenant".into();
+                let error =
                     select_lowest_cost_candidate(candidates.clone(), env.clone(), &wrong_dataset)
-                        .is_err(),
-                    "quotes for another dataset must not price this workload"
+                        .unwrap_err();
+                assert!(
+                    matches!(error, CompileError::CostEvidenceDataset { .. }),
+                    "{name}: quotes for another dataset must not price this workload: {error}"
                 );
             }
             let plan = select_lowest_cost_candidate(candidates.clone(), env.clone(), &evidence)
@@ -102,21 +124,29 @@ fn workload_candidates_follow_prices_and_feasibility() {
             );
             for missing in [false, true] {
                 let mut unavailable = evidence.clone();
-                if missing {
+                let expected = if missing {
                     unavailable.quotes.remove(preferred);
+                    CandidateEvaluationStatus::EvidenceMissing
                 } else {
                     unavailable.quotes[preferred].executable = false;
-                }
+                    CandidateEvaluationStatus::ProviderRejected
+                };
                 let report =
                     select_lowest_cost_candidate(candidates.clone(), env.clone(), &unavailable)
                         .unwrap()
                         .cost_comparison
                         .unwrap();
                 assert_ne!(report.selected_manifest, manifests[preferred]);
-                assert!(report
+                let preferred_evaluations: Vec<_> = report
                     .candidate_evaluations
                     .iter()
-                    .any(|c| c.unavailable_reason.is_some() && c.total_cost.is_none()));
+                    .filter(|c| c.plan_id == Some(manifests[preferred].plan_id))
+                    .collect();
+                assert!(!preferred_evaluations.is_empty(), "{name}");
+                for c in preferred_evaluations {
+                    assert_eq!(c.status, expected, "{name}");
+                    assert!(c.unavailable_reason.is_some() && c.total_cost.is_none());
+                }
             }
         }
         assert_eq!(
