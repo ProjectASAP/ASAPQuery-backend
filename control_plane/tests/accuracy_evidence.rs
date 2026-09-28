@@ -61,7 +61,7 @@ fn inapplicable_accuracy_cannot_be_rescued_by_a_low_price() {
 #[test]
 fn missing_evidence_preserves_the_declared_fallback_mode() {
     for mode in [ErpAccuracyMode::Hybrid, ErpAccuracyMode::Empirical] {
-        let mut policy = fixture::policy(mode.clone());
+        let mut policy = fixture::policy(mode);
         policy.artifact.records.clear();
         match (mode, decision(&policy)) {
             (ErpAccuracyMode::Hybrid, ErpParameterDecision::TheoreticalFallback { params, .. }) => {
