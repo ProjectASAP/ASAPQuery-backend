@@ -37,6 +37,11 @@ once, ingests its fixture once, and checks every query in that workload.
 under the fixture's contracts, not an exhaustive Cartesian product of hypothetical
 query plans. Binding rejections remain visible; prices cannot override them.
 
+Required shapes are asserted in both directions: the strict fixture must refuse
+the heap candidates for a named policy reason, and a certified companion fixture
+must admit the same shapes to pricing. A refusal asserted alone would also pass
+if the candidate had vanished.
+
 A rejection is not self-justifying. Level 1 separates *policy* refusals — the
 fixture declining to certify a candidate, which are asserted as required
 outcomes — from *defects*, which are bugs recorded with exact occurrence counts
