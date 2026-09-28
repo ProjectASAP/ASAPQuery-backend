@@ -1,6 +1,6 @@
-> This PR owns execution correctness. Level 2 (#742) now means synthetic cost
-> ranking; Level 3 (#759) means real-evidence selection and result validation.
-> These differential runs do not establish either cost calibration or an optimum.
+> Current milestone: #728 candidate structure → #742 synthetic ranking → #775
+> selected-plan execution. Online ERP collection and runtime replanning are deferred.
+> This suite establishes execution correctness, not measured cost optimality.
 
 # PromQL compliance suite
 
@@ -98,7 +98,7 @@ Use a distinct label set for each series of a metric. Ensure query windows have 
 
 ## Planning workload and metric vocabulary
 
-There is no separate hand-written Physical DAG. The runner derives a deployment planning input from the fixture and suite; Planner selects computation candidates using backend feasibility and automatic workload-cost evidence.
+There is no separate hand-written Physical DAG. The runner derives a deployment planning input from the fixture and suite; Planner exposes physical candidates; Backend selects using explicit synthetic quotes and local execution feasibility.
 
 The suite query expression is the workload query. Dataset metric names must cover
 its named sources. `runner/src/planning.rs` builds a typed backend planning input:
@@ -110,9 +110,12 @@ and use the largest per-series sample gap as the declared cadence bound.
 Benefit fixtures require uniform source cadence. Both paths retain the actual
 series count and sample volume; no synthetic one-second cadence is supplied.
 
-The differential runner invokes the Rust control-plane compiler directly, with no external
-workload quotes. It validates automatic costs and the selected local plan before
-starting containers, then installs that exact costed deployment plan. Backend
+The differential runner invokes the Rust control-plane compiler directly. It quotes
+every component at a deterministic unit price of 1.0 under
+`synthetic-execution-fixture-v1`; non-local candidates are infeasible for this
+fixture. These fake prices select a plan through the production quote path, without
+ERP measurements or runtime feedback. The runner validates the synthetic cost
+report and local execution before installing that exact deployment plan. Backend
 startup does not repeat candidate selection. Planning failures produce a JSON
 report. The input snapshot, selected plan, and typed `*.install.json` publication
 are saved beside successful planning reports. Docker Compose is needed only for live

@@ -386,3 +386,47 @@ fn aggregation_workload_has_local_deployment() {
     let result = input.compile_promql();
     assert!(result.is_ok(), "{}", result.unwrap_err());
 }
+
+/// The current E2E path selects with fake costs and installs that exact plan;
+/// it neither consumes ERP nor silently switches to automatic resource pricing.
+#[test]
+fn synthetic_selection_installs_the_exact_selected_generation() {
+    let input = planning::with_fixture_costs(
+        planning::snapshot(&suite(), &dataset(), 10000, 0, false).unwrap(),
+    )
+    .unwrap();
+    assert!(input.physical_inputs.erp.is_none());
+    let evidence = input.workload_cost_evidence.as_ref().unwrap();
+    assert_eq!(evidence.model_version, planning::FIXTURE_COST_MODEL);
+    assert!(evidence
+        .quotes
+        .iter()
+        .all(|q| q.unit_costs.values().all(|v| *v == 1.0)));
+    let restored = serde_json::from_value::<
+        control_plane::physical::compiler::BackendLocalPlanningInput,
+    >(serde_json::to_value(&input).unwrap())
+    .unwrap();
+    let plan = restored.compile_promql().unwrap();
+    planning::validate_fixture_cost(&plan).unwrap();
+    planning::validate_local(&plan).unwrap();
+    let installed = planning::installation(plan.clone());
+    assert_eq!(installed.query_plan, plan.query_plan);
+    assert_eq!(
+        serde_json::to_value(&installed.precompute_plan).unwrap(),
+        serde_json::to_value(&plan.precompute_plan).unwrap()
+    );
+    assert_eq!(installed.summary_catalog, plan.summary_catalog);
+    assert!(installed.adaptation_evidence.is_empty());
+    for mutation in 0..3 {
+        let mut invalid = plan.clone();
+        let report = invalid.cost_comparison.as_mut().unwrap();
+        match mutation {
+            0 => report.model_version = "backend-workload-resources-v2".into(),
+            1 => {
+                report.component_costs.pop_first();
+            }
+            _ => report.selected_plan_id += 1,
+        }
+        assert!(planning::validate_fixture_cost(&invalid).is_err());
+    }
+}
