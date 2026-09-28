@@ -367,9 +367,23 @@ mod tests {
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let QueryExpr::Filter { child, pred } = logical else {
-            panic!("expected selector filter: {logical:?}")
+        let QueryExpr::TimeRange { child, .. } = logical else {
+            panic!("expected instant source")
         };
+        let QueryExpr::Scan {
+            source,
+            predicates,
+            schema,
+        } = child.as_ref()
+        else {
+            panic!("expected source selector")
+        };
+        let pred = predicates[0].clone();
+        let child = std::rc::Rc::new(QueryExpr::Scan {
+            source: source.clone(),
+            predicates: vec![],
+            schema: schema.clone(),
+        });
         let input = std::rc::Rc::new(SummaryNode {
             schema: lift_plain(&child.output_schema().unwrap()),
             guarantee: None,
