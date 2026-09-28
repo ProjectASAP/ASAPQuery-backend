@@ -206,7 +206,7 @@ Roots: `[7]`.
 | 6 | `["asap-explain-v1:root:a74eff3b7896e52dae2dadd25bb9d301eaa6268fa1304c0cbeb9699ad5f8558b"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
 | 7 | `["asap-explain-v1:root:adfaa23eb6d420ae8122a87f94158cec0987aec159752067f711cb41a339b5a9"]` | `"bind_failed"` | `null` | `"query compat-query-0: selected summary readout has no certified accuracy guarantee; provide scoped evidence or use exact execution"` |
 
-Successfully compiled candidate plans: [topk-rate-0](candidates/topk-rate-0.json), [topk-rate-1](candidates/topk-rate-1.json), [topk-rate-2](candidates/topk-rate-2.json), [topk-rate-3](candidates/topk-rate-3.json), [topk-rate-5](candidates/topk-rate-5.json)
+Successfully compiled candidate plans: [topk-rate-0](candidates/topk-rate-0.json), [topk-rate-1](candidates/topk-rate-1.json), [topk-rate-2](candidates/topk-rate-2.json), [topk-rate-5](candidates/topk-rate-5.json)
 
 ## Persisted boundaries
 
