@@ -1077,7 +1077,9 @@ mod tests {
     #[test]
     fn compiled_window_schedules_execute_exact_ranges() {
         use crate::precompute_engine::window_manager::WindowManager;
-        use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
+        use control_plane::physical::compiler::{
+            BackendLocalPlanningInput, DeploymentPlanCompiler,
+        };
         for evaluation_secs in [20, 45, 60, 120, 90] {
             for phase_ms in [0, 5_000] {
                 for full in [false, true] {
@@ -1176,7 +1178,9 @@ mod tests {
     // Compile the two readouts, store one pane series, and execute the actual ratio.
     #[test]
     fn compiled_shared_sum_panes_preserve_each_lookback() {
-        use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
+        use control_plane::physical::compiler::{
+            BackendLocalPlanningInput, DeploymentPlanCompiler,
+        };
         let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../docs/examples/asapquery-planning-snapshot.json"
         ))

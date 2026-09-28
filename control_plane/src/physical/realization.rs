@@ -3,8 +3,8 @@
 //! Providers may validate and price physical implementations, never rewrite
 //! selected logical roots or infer a pane width from a query's slide.
 use super::compiler::{
-    CompileError, CompiledPhysicalPlan, PhysicalCompilationRequest, PhysicalDeploymentContext,
-    DeploymentPlanCompiler, QueryCompilationInput,
+    CompileError, CompiledPhysicalPlan, DeploymentPlanCompiler, PhysicalCompilationRequest,
+    PhysicalDeploymentContext, QueryCompilationInput,
 };
 use super::workload_cost::{PricedComponents, WorkloadCostEvidence, WorkloadCostManifest};
 use asap_aware_mapping::cost_model::Cost;
