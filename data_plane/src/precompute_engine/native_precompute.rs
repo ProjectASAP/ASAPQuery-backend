@@ -267,7 +267,7 @@ mod tests {
         let definition = asap_types::sds::StoredOutputId(1);
         let installed = InstalledPostAsapDag {
             document: OwnedPostAsapDag {
-                schema_version: asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION,
+                schema_version: asap_types::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION,
                 query_id: "shared".into(),
                 nodes: vec![],
                 edges: vec![],

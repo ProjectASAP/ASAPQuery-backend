@@ -3,7 +3,7 @@
 
 mod clickhouse_exact;
 pub mod physical_values;
-pub mod residual;
+pub mod query_time;
 
 pub use asap_types::query_plan::*;
 #[cfg(test)]

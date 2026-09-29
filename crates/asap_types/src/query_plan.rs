@@ -7,7 +7,7 @@
 
 pub mod current_series;
 mod native;
-pub mod residual;
+pub mod query_time;
 
 use std::collections::{BTreeMap, BTreeSet};
 

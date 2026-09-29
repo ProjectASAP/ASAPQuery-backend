@@ -194,8 +194,7 @@ impl InstalledPostAsapDag {
         if self.document.schema_version != PRECOMPUTE_DAG_SCHEMA_VERSION {
             return Err("unsupported maintenance DAG document version".into());
         }
-        self.binding
-            .validate_precompute(&self.document.decode()?)?;
+        self.binding.validate_precompute(&self.document.decode()?)?;
         for sink in self.native_programs.keys() {
             self.native_program(*sink)?;
         }
@@ -504,7 +503,7 @@ mod tests {
         let encoded: serde_json::Value =
             serde_json::from_slice(&program.encode().unwrap()).unwrap();
         let mut document = OwnedPostAsapDag::from_executable("shared".into(), &dag).unwrap();
-        document.schema_version = MAINTENANCE_DAG_SCHEMA_VERSION;
+        document.schema_version = PRECOMPUTE_DAG_SCHEMA_VERSION;
         let mut installed = InstalledPostAsapDag {
             document,
             native_programs: BTreeMap::from([

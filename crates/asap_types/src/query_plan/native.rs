@@ -11,7 +11,7 @@ impl QueryPlanEntry {
         match self.nodes.get(&self.root) {
             Some(QueryPlanNode::Logical {
                 operator:
-                    residual::ResidualQueryOperator::CurrentSeries {
+                    query_time::QueryTimeOperator::CurrentSeries {
                         population,
                         readout: current_series::SeriesReadout::Snapshot,
                     },
