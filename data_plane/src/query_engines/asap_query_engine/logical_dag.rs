@@ -333,7 +333,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     native_values::validate_pruning(
                         &dag,
                         &values,
-                        row_input,
+                        row_input.ok_or_else(|| miss("pruning requires preserved input rows"))?,
                         contract,
                         at,
                         context.clone(),
@@ -350,35 +350,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     context.clone(),
                 )?)
             }
-            QueryPlanNode::RelationalJoin {
-                join_kind: planner_types::pre_asap::JoinKind::Semi,
-                pred,
-                pruning,
-                left_schema,
-                right_schema,
-                output_schema,
-                ..
-            } => {
-                let [values, candidates] = inputs else {
-                    return Err(miss("semi-join requires two inputs"));
-                };
-                let selected = native_values::relation(
-                    vector((**values).clone())?,
-                    vector((**candidates).clone())?,
-                    serde_json::from_value(pred)
-                        .map_err(|error| physical::Error::Invalid(error.to_string()))?,
-                    std::sync::Arc::new(left_schema),
-                    std::sync::Arc::new(right_schema),
-                    std::sync::Arc::new(output_schema),
-                    pruning.clone(),
-                    at,
-                    context.clone(),
-                )?;
-                if let Some(warning) = pruning_warning(pruning.as_ref()) {
-                    self.warnings.push(warning);
-                }
-                Value::Vector(selected)
-            }
+
             _ => {
                 self.stats.summary_readout_evaluations += 1;
                 from_result((self.callback)(
@@ -601,9 +573,7 @@ fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i6
         QueryPlanNode::PhysicalFragment { inputs, .. } | QueryPlanNode::Logical { inputs, .. } => {
             Ok(inputs.iter().map(|&id| (id, at)).collect())
         }
-        QueryPlanNode::RelationalJoin { inputs, .. } => {
-            Ok(inputs.iter().map(|&id| (id, at)).collect())
-        }
+
         _ => Ok(vec![]),
     }
 }
@@ -1792,10 +1762,14 @@ mod topk_tests {
                         }],
                         time_index: None,
                     };
-                    QueryPlanNode::RelationalJoin {
-                        inputs: [value_id, candidate_id],
-                        join_kind: planner_types::pre_asap::JoinKind::Semi,
-                        pred: serde_json::to_value(planner_types::pre_asap::Predicate(
+                    {
+                        let schemas = vec![
+                            std::sync::Arc::new(schema.clone()),
+                            std::sync::Arc::new(schema.clone()),
+                        ];
+                        let node = planner_types::post_asap::ExecutableDagNode {
+                id: planner_types::post_asap::PostAsapNodeId(2),
+                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin { join_kind: planner_types::pre_asap::JoinKind::Semi, pred: serde_json::from_value(serde_json::to_value(planner_types::pre_asap::Predicate(
                             std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
                                 left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
                                     0,
@@ -1806,13 +1780,33 @@ mod topk_tests {
                                 ),
                             }),
                         ))
-                        .unwrap(),
-                        pruning: Some(CandidateCompleteness::Certified {
-                            guarantee: topk_membership_guarantee(),
-                        }),
-                        left_schema: schema.clone(),
-                        right_schema: schema.clone(),
-                        output_schema: schema,
+                        .unwrap()).unwrap(), pruning: None },
+                output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
+                output_schema: schema, guarantee: None,
+            };
+                        let operator = asap_physical_operators::physical_planner::compile_node(
+                            &node, &schemas,
+                        )
+                        .unwrap();
+                        let compiled = asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                schemas.into_iter().enumerate().map(|(id, schema)| (id as u64, asap_physical_operators::physical_planner::InputContract::bounded(schema))).collect(),
+                [(2, ((0..2).collect(), operator))].into(), vec![2],
+            ).unwrap();
+                        QueryPlanNode::PhysicalFragment {
+                            inputs: [value_id, candidate_id].to_vec(),
+                            dag: compiled.encode().unwrap(),
+                            row_input: Some(0),
+                            pruning: (Some(CandidateCompleteness::Certified {
+                                guarantee: topk_membership_guarantee(),
+                            }))
+                            .map(|completeness| {
+                                asap_types::query_plan::PruningInputContract {
+                                    candidate_input: 1,
+                                    keys: vec![(0, 0)],
+                                    completeness,
+                                }
+                            }),
+                        }
                     }
                 }),
                 (

@@ -436,15 +436,6 @@ impl QueryPlanEntry {
             ));
         }
         for (id, node) in &self.nodes {
-            if self.language == QueryLanguage::ClickHouseSql
-                && matches!(
-                    node,
-                    QueryPlanNode::Relational { .. } | QueryPlanNode::RelationalJoin { .. }
-                )
-            {
-                return Err(QueryPlanError::Invalid("SQL plan contains uncompiled relation semantics; recompile the deployment plan".into()));
-            }
-
             if let QueryPlanNode::PhysicalRelation { inputs, dag } = node {
                 if self.language != QueryLanguage::ClickHouseSql {
                     return Err(QueryPlanError::Invalid(
@@ -516,14 +507,53 @@ impl QueryPlanEntry {
                         ));
                     }
                 }
-                let source = compiled.input_contracts().nth(*row_input).map(|(id, _)| id);
-                if compiled.roots().len() != 1
-                    || source.is_none()
-                    || compiled.row_source(compiled.roots()[0]) != source
-                {
+                if compiled.roots().len() != 1 {
                     return Err(QueryPlanError::Invalid(
-                        "physical vector output must preserve its bound input rows".into(),
+                        "physical vector requires one root".into(),
                     ));
+                }
+                if let Some(row_input) = row_input {
+                    let source = compiled.input_contracts().nth(*row_input).map(|(id, _)| id);
+                    if source.is_none() || compiled.row_source(compiled.roots()[0]) != source {
+                        return Err(QueryPlanError::Invalid(
+                            "physical vector output must preserve its bound input rows".into(),
+                        ));
+                    }
+                } else {
+                    let output = compiled
+                        .output_contract(compiled.roots()[0])
+                        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                    let numeric = output
+                        .schema
+                        .fields
+                        .iter()
+                        .filter(|field| {
+                            matches!(
+                                field.dtype,
+                                planner_types::post_asap::SummaryFamilyType::Plain(
+                                    planner_types::pre_asap::DataType::Float64
+                                        | planner_types::pre_asap::DataType::Int64
+                                )
+                            )
+                        })
+                        .count();
+                    if numeric != 1
+                        || output.schema.fields.iter().any(|field| {
+                            !matches!(
+                                field.dtype,
+                                planner_types::post_asap::SummaryFamilyType::Plain(
+                                    planner_types::pre_asap::DataType::Float64
+                                        | planner_types::pre_asap::DataType::Int64
+                                        | planner_types::pre_asap::DataType::Utf8
+                                        | planner_types::pre_asap::DataType::Timestamp
+                                )
+                            )
+                        })
+                    {
+                        return Err(QueryPlanError::Invalid(
+                            "physical output cannot bind to a PromQL vector".into(),
+                        ));
+                    }
                 }
                 if let Some(pruning) = pruning {
                     if matches!(&pruning.completeness, CandidateCompleteness::Certified { guarantee }
@@ -535,7 +565,9 @@ impl QueryPlanEntry {
                     }
                     let contracts = compiled.input_contracts().collect::<Vec<_>>();
                     let left = contracts
-                        .get(*row_input)
+                        .get(row_input.ok_or_else(|| {
+                            QueryPlanError::Invalid("pruning requires preserved input rows".into())
+                        })?)
                         .ok_or_else(|| QueryPlanError::Invalid("invalid row input".into()))?
                         .1;
                     let right = contracts
@@ -551,7 +583,7 @@ impl QueryPlanEntry {
                 }
                 if compiled.input_contracts().count() != inputs.len()
                     || compiled.roots().len() != 1
-                    || *row_input >= inputs.len()
+                    || row_input.is_some_and(|index| index >= inputs.len())
                 {
                     return Err(QueryPlanError::Invalid(
                         "physical input/root binding mismatch".into(),
@@ -584,30 +616,7 @@ impl QueryPlanEntry {
                     ));
                 }
             }
-            if let QueryPlanNode::RelationalJoin {
-                pruning: Some(completeness),
-                join_kind,
-                ..
-            } = node
-            {
-                if *join_kind != planner_types::pre_asap::JoinKind::Semi {
-                    return Err(QueryPlanError::Invalid(
-                        "pruning evidence requires a semi-join".into(),
-                    ));
-                }
-                if matches!(
-                    completeness,
-                    CandidateCompleteness::Certified { guarantee }
-                        if guarantee.metric
-                            != planner_types::post_asap::ErrorMetric::TopKMembership
-                            || guarantee.bound.evaluate().is_none()
-                            || guarantee.failure_probability.evaluate().is_none()
-                ) {
-                    return Err(QueryPlanError::Invalid(
-                        "invalid semi-join pruning certificate".into(),
-                    ));
-                }
-            }
+
             for input in node.inputs() {
                 if !self.nodes.contains_key(input) {
                     return Err(QueryPlanError::Invalid(format!(
@@ -780,27 +789,10 @@ pub enum QueryPlanNode {
     PhysicalFragment {
         inputs: Vec<QueryNodeId>,
         dag: Vec<u8>,
-        row_input: usize,
+        row_input: Option<usize>,
         pruning: Option<PruningInputContract>,
     },
 
-    RelationalJoin {
-        inputs: [QueryNodeId; 2],
-        join_kind: planner_types::pre_asap::JoinKind,
-        pruning: Option<CandidateCompleteness>,
-        pred: serde_json::Value,
-        left_schema: planner_types::post_asap::SummarySchema,
-        right_schema: planner_types::post_asap::SummarySchema,
-        output_schema: planner_types::post_asap::SummarySchema,
-    },
-    Relational {
-        input: QueryNodeId,
-        /// Serialized planner-owned operation. Keeping the wire form here makes
-        /// the published catalog Send + Sync even though the planner AST uses Rc.
-        operation: serde_json::Value,
-        input_schema: planner_types::post_asap::SummarySchema,
-        output_schema: planner_types::post_asap::SummarySchema,
-    },
     Logical {
         operator: query_time::QueryTimeOperator,
         inputs: Vec<QueryNodeId>,
@@ -847,9 +839,8 @@ impl QueryPlanNode {
             Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
                 &[]
             }
-            Self::Binary { inputs, .. } | Self::RelationalJoin { inputs, .. } => inputs,
+            Self::Binary { inputs, .. } => inputs,
             Self::ReduceSum { input, .. }
-            | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::Physical { inputs, .. }
@@ -964,99 +955,15 @@ mod contract_tests {
     }
 }
 
-/// Bind portable relation semantics before an installed plan can access its sources.
 #[cfg(test)]
-fn validate_native_relation(id: QueryNodeId, node: &QueryPlanNode) -> Result<(), QueryPlanError> {
-    use planner_types::post_asap::{
-        ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState, PostAsapNodeId,
-    };
-    use std::sync::Arc;
-    let invalid = |error: String| QueryPlanError::Invalid(format!("query node {}: {error}", id.0));
-    let (payload, inputs, output) = match node {
-        QueryPlanNode::Relational {
-            operation,
-            input_schema,
-            output_schema,
-            ..
-        } => (
-            Payload::Value {
-                operation: serde_json::from_value(operation.clone())
-                    .map_err(|e| invalid(e.to_string()))?,
-            },
-            vec![Arc::new(input_schema.clone())],
-            output_schema,
-        ),
-        QueryPlanNode::RelationalJoin {
-            join_kind,
-            pred,
-            left_schema,
-            right_schema,
-            output_schema,
-            pruning,
-            ..
-        } => (
-            Payload::RelationalJoin {
-                join_kind: join_kind.clone(),
-                pred: serde_json::from_value(pred.clone()).map_err(|e| invalid(e.to_string()))?,
-                pruning: serde_json::from_value(
-                    serde_json::to_value(pruning).map_err(|e| invalid(e.to_string()))?,
-                )
-                .map_err(|e| invalid(e.to_string()))?,
-            },
-            vec![
-                Arc::new(left_schema.clone()),
-                Arc::new(right_schema.clone()),
-            ],
-            output_schema,
-        ),
-        _ => return Ok(()),
-    };
-    let node = ExecutableDagNode {
-        id: PostAsapNodeId(0),
-        payload,
-        output_state: ExecutionDataState::QUERY_ROWS,
-        output_schema: output.clone(),
-        guarantee: None,
-    };
-    asap_physical_operators::physical_planner::compile_node(&node, &inputs)
-        .map_err(|e| invalid(e.to_string()))?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod native_binding_tests {
-    use super::*;
-    use planner_types::{
-        post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
-        pre_asap::{DataType, Predicate, QueryExpr},
-    };
-
-    // Unsupported expressions fail installation without evaluating any source.
+mod retired_plan_tests {
     #[test]
-    fn rejects_unimplemented_relation_predicate_before_execution() {
-        let schema = SummarySchema {
-            fields: vec![SummaryField {
-                name: "value".into(),
-                dtype: SummaryFamilyType::Plain(DataType::Float64),
-                nullable: false,
-            }],
-            time_index: None,
-        };
-        let node = QueryPlanNode::Relational {
-            input: QueryNodeId(0),
-            operation: serde_json::to_value(ValueOperation::Filter {
-                pred: Predicate(
-                    QueryExpr::FunctionCall {
-                        name: "unimplemented_predicate".into(),
-                        args: vec![],
-                    }
-                    .into(),
-                ),
-            })
-            .unwrap(),
-            input_schema: schema.clone(),
-            output_schema: schema,
-        };
-        assert!(validate_native_relation(QueryNodeId(1), &node).is_err());
+    fn uncompiled_relation_variants_are_not_accepted() {
+        for kind in ["relational", "relational_join"] {
+            let error =
+                serde_json::from_value::<super::QueryPlanNode>(serde_json::json!({"op":kind}))
+                    .unwrap_err();
+            assert!(error.to_string().contains("unknown variant"), "{error}");
+        }
     }
 }

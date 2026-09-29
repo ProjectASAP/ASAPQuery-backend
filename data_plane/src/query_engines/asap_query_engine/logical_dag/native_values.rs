@@ -101,6 +101,7 @@ pub(super) fn limit(
     output(values, result)
 }
 /// Relational boundary used by explicit row plans. Planner owns predicate lowering.
+#[cfg(test)]
 pub(super) fn relation(
     values: Vector,
     candidates: Vector,
@@ -156,7 +157,7 @@ pub(super) fn relation(
     if let Some(pruning) = pruning {
         validate_pruning(&encoded, &inputs, 0, &pruning, at, context.clone())?;
     }
-    physical(&encoded, inputs, 0, at, context)
+    physical(&encoded, inputs, Some(0), at, context)
 }
 
 // Equality keys canonicalize signed zero and NaNs; row transport must preserve their bits.
@@ -174,7 +175,7 @@ fn identity_key(value: &Value) -> Result<Vec<u8>, asap_physical_operators::Error
 pub(super) fn physical(
     encoded: &[u8],
     inputs: Vec<Vector>,
-    row_input: usize,
+    row_input: Option<usize>,
     at: i64,
     context: dag::RunContext,
 ) -> Result<Vector, EngineError> {
@@ -183,7 +184,7 @@ pub(super) fn physical(
     use std::collections::{BTreeMap, VecDeque};
     let compiled = CompiledPhysicalDag::decode(encoded)?;
     let contracts = compiled.input_contracts().collect::<Vec<_>>();
-    if contracts.len() != inputs.len() || row_input >= inputs.len() {
+    if contracts.len() != inputs.len() || row_input.is_some_and(|index| index >= inputs.len()) {
         return Err(asap_physical_operators::Error::Invalid(
             "physical input arity mismatch".into(),
         )
@@ -236,7 +237,7 @@ pub(super) fn physical(
                     .collect::<Result<Vec<_>, EngineError>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if position == row_input {
+        if Some(position) == row_input {
             for (row, original) in rows.iter().zip(values) {
                 let key = row
                     .iter()
@@ -251,6 +252,7 @@ pub(super) fn physical(
             Box::new(Operator::source(contract.schema.clone(), vec![batch])?) as Source<'_>,
         );
     }
+    let output_schema = compiled.output_contract(compiled.roots()[0])?.schema;
     let graph = compiled.instantiate(sources)?;
     let mut streams = graph.execute(compiled.roots(), context)?;
     if streams.len() != 1 {
@@ -265,6 +267,31 @@ pub(super) fn physical(
         match stream.next().now_or_never() {
             Some(Some(batch)) => {
                 for row in batch?.rows() {
+                    if row_input.is_none() {
+                        let mut labels = Labels::new();
+                        let mut sample = None;
+                        for (field, cell) in output_schema.fields.iter().zip(row) {
+                            match cell {
+                                Value::Utf8(value) => {
+                                    labels.insert(field.name.clone(), value.to_string());
+                                }
+                                Value::Float64(value) => sample = Some(*value),
+                                Value::Int64(value) if value.unsigned_abs() <= (1u64 << 53) => {
+                                    sample = Some(*value as f64)
+                                }
+                                Value::Timestamp(_) | Value::Null => {}
+                                _ => return Err(miss(
+                                    "native output cannot be represented by the PromQL protocol",
+                                )),
+                            }
+                        }
+                        result.push((
+                            labels,
+                            sample
+                                .ok_or_else(|| miss("native vector output has no numeric value"))?,
+                        ));
+                        continue;
+                    }
                     let key = row
                         .iter()
                         .map(identity_key)
@@ -333,7 +360,7 @@ pub(super) fn validate_pruning(
     let matched = physical(
         &check.encode()?,
         vec![candidates.clone(), values.clone()],
-        0,
+        Some(0),
         at,
         context,
     )?;
@@ -493,7 +520,7 @@ mod tests {
             let error = physical(
                 &sorted(),
                 vec![vec![(Labels::new(), 2.), (Labels::new(), 1.)]],
-                0,
+                Some(0),
                 42,
                 run.clone(),
             )
@@ -552,7 +579,7 @@ mod tests {
             let result = physical(
                 &compiled,
                 vec![vec![(Labels::new(), sample)]],
-                0,
+                Some(0),
                 42,
                 context(4096),
             );
@@ -567,13 +594,75 @@ mod tests {
         }
     }
 
+    // Aggregation changes both rows and labels; decoding must use the declared
+    // output schema instead of looking up an unchanged input row.
+    #[test]
+    fn physical_aggregate_returns_grouped_values_and_labels() {
+        use asap_physical_operators::{
+            operators::Reduction,
+            physical_planner::{CompiledPhysicalDag, InputContract},
+        };
+        let input = schema(&[("job", DataType::Utf8), ("value", DataType::Float64)]);
+        let aggregate = Operator::aggregate(
+            input.clone(),
+            vec![0],
+            vec![("value".into(), Reduction::Sum(1))],
+        )
+        .unwrap();
+        let program = CompiledPhysicalDag::from_operators(
+            [(0, InputContract::bounded(input))].into(),
+            [(1, (vec![0], aggregate))].into(),
+            vec![1],
+        )
+        .unwrap();
+        let values = vec![
+            (
+                Labels::from([
+                    ("job".into(), "api".into()),
+                    ("instance".into(), "a".into()),
+                ]),
+                1.,
+            ),
+            (
+                Labels::from([
+                    ("job".into(), "api".into()),
+                    ("instance".into(), "b".into()),
+                ]),
+                2.,
+            ),
+            (
+                Labels::from([
+                    ("job".into(), "worker".into()),
+                    ("instance".into(), "a".into()),
+                ]),
+                4.,
+            ),
+        ];
+        let mut output = physical(
+            &program.encode().unwrap(),
+            vec![values],
+            None,
+            42,
+            context(1 << 20),
+        )
+        .unwrap();
+        output.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            output,
+            vec![
+                (Labels::from([("job".into(), "api".into())]), 3.),
+                (Labels::from([("job".into(), "worker".into())]), 4.),
+            ]
+        );
+    }
+
     // Transport identity preserves the exact value selected by native total-order sorting.
     #[test]
     fn native_sort_preserves_signed_zero_bits() {
         let rows = physical(
             &sorted(),
             vec![vec![(Labels::new(), 0.), (Labels::new(), -0.)]],
-            0,
+            Some(0),
             42,
             context(4096),
         )

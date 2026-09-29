@@ -197,11 +197,7 @@ fn query_node_label(node: &QueryPlanNode) -> String {
                 })
                 .unwrap_or_else(|_| "Invalid physical DAG".into())
         }
-        QueryPlanNode::RelationalJoin { .. } => "RelationalJoin".into(),
-        QueryPlanNode::Relational { .. } => "Relational".into(),
-        QueryPlanNode::Logical { operator, .. } => {
-            format!("Logical\n{}", query_time_label(operator))
-        }
+        QueryPlanNode::Logical { operator, .. } => format!("Logical\n{}", query_time_label(operator)),
         QueryPlanNode::Scalar { value } => format!("Scalar\n{value}"),
         QueryPlanNode::Binary { operator, .. } => format!("Binary\n{operator:?}"),
         QueryPlanNode::ReduceSum { .. } => "ReduceSum".into(),

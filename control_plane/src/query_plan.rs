@@ -177,9 +177,8 @@ fn compile_native_fragment(
     let physical =
         compile(&dag, contracts, &[u64::from(dag.root.0)]).map_err(|e| invalid(e.to_string()))?;
     let row_input = physical
-        .input_contracts()
-        .position(|(id, _)| bindings[&id] == query_inputs[0])
-        .unwrap();
+        .row_source(physical.roots()[0])
+        .and_then(|source| physical.input_contracts().position(|(id, _)| id == source));
     let pruning = if let SummaryExpr::RelationalJoin {
         left,
         right,
@@ -352,16 +351,14 @@ where
                         *input = remap[input];
                     }
                 }
-                QueryPlanNode::Binary { inputs, .. }
-                | QueryPlanNode::RelationalJoin { inputs, .. } => {
+                QueryPlanNode::Binary { inputs, .. } => {
                     for input in inputs {
                         *input = remap[input];
                     }
                 }
                 QueryPlanNode::SummaryEstimate { input, .. }
                 | QueryPlanNode::ExactReadout { input, .. }
-                | QueryPlanNode::ReduceSum { input, .. }
-                | QueryPlanNode::Relational { input, .. } => *input = remap[input],
+                | QueryPlanNode::ReduceSum { input, .. } => *input = remap[input],
                 QueryPlanNode::Scalar { .. }
                 | QueryPlanNode::ReadMaterialization { .. }
                 | QueryPlanNode::ExactFallback { .. } => {}
@@ -447,60 +444,13 @@ where
                 operation:
                     planner_types::post_asap::ValueOperation::Exact(
                         planner_types::post_asap::ExactOperation::Aggregate {
-                            reduction,
-                            measures,
-                            having: None,
-                            ..
+                            having: None, ..
                         },
                     ),
                 timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } if measures.len() == 1 => {
-                use planner_types::pre_asap::AggIntent;
-                let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => Some(query_time::Aggregation::Sum),
-                    AggIntent::Count { .. } => Some(query_time::Aggregation::Count),
-                    AggIntent::Min { .. } => Some(query_time::Aggregation::Min),
-                    AggIntent::Max { .. } => Some(query_time::Aggregation::Max),
-                    AggIntent::Avg { .. } => Some(query_time::Aggregation::Avg),
-                    _ => {
-                        return Err(QueryPlanError::Invalid(
-                            "unsupported exact value aggregation".into(),
-                        ))
-                    }
-                };
-                let keys = reduction.group_keys().ok_or_else(|| {
-                    QueryPlanError::Invalid(
-                        "per-entity exact value aggregation has no grouping".into(),
-                    )
-                })?;
-                let labels = keys
-                    .keys()
-                    .iter()
-                    .map(|&column| {
-                        child
-                            .schema
-                            .fields
-                            .get(column)
-                            .map(|field| field.name.clone())
-                            .ok_or_else(|| {
-                                QueryPlanError::Invalid(
-                                    "unresolved exact aggregation column".into(),
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let grouping = query_time::Grouping {
-                    labels,
-                    without: keys.is_without(),
-                };
-                let operator = query_time::QueryTimeOperator::Aggregate {
-                    operation: operation.expect("aggregate operation"),
-                    grouping,
-                };
-                QueryPlanNode::Logical {
-                    operator,
-                    inputs: vec![self.lower(child)?],
-                }
+            } => {
+                let input = self.lower(child)?;
+                compile_native_fragment(node, &[input])?
             }
             SummaryExpr::ValueOperation {
                 child,
@@ -1463,7 +1413,7 @@ mod tests {
                         QueryPlanNode::PhysicalFragment {
                             inputs: vec![QueryNodeId(0)],
                             dag: compiled.encode().unwrap(),
-                            row_input: 0,
+                            row_input: Some(0),
                             pruning: None,
                         },
                     ),
@@ -1544,10 +1494,14 @@ mod tests {
                         }],
                         time_index: None,
                     };
-                    QueryPlanNode::RelationalJoin {
-                        inputs: [QueryNodeId(1), QueryNodeId(0)],
-                        join_kind: planner_types::pre_asap::JoinKind::Semi,
-                        pred: serde_json::to_value(planner_types::pre_asap::Predicate(
+                    {
+                        let schemas = vec![
+                            std::sync::Arc::new(schema.clone()),
+                            std::sync::Arc::new(schema.clone()),
+                        ];
+                        let node = planner_types::post_asap::ExecutableDagNode {
+                id: planner_types::post_asap::PostAsapNodeId(2),
+                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin { join_kind: planner_types::pre_asap::JoinKind::Semi, pred: serde_json::from_value(serde_json::to_value(planner_types::pre_asap::Predicate(
                             std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
                                 left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
                                     0,
@@ -1558,23 +1512,43 @@ mod tests {
                                 ),
                             }),
                         ))
-                        .unwrap(),
-                        pruning: Some(CandidateCompleteness::Certified {
-                            guarantee: planner_types::post_asap::ResultGuarantee {
-                                metric: planner_types::post_asap::ErrorMetric::Frequency,
-                                bound: planner_types::post_asap::BoundExpr::Unknown {
-                                    statistic: "membership margin".into(),
-                                },
-                                failure_probability:
-                                    planner_types::post_asap::ProbabilityExpr::Unknown {
-                                        statistic: "membership confidence".into(),
+                        .unwrap()).unwrap(), pruning: None },
+                output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
+                output_schema: schema, guarantee: None,
+            };
+                        let operator = asap_physical_operators::physical_planner::compile_node(
+                            &node, &schemas,
+                        )
+                        .unwrap();
+                        let compiled = asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                schemas.into_iter().enumerate().map(|(id, schema)| (id as u64, asap_physical_operators::physical_planner::InputContract::bounded(schema))).collect(),
+                [(2, ((0..2).collect(), operator))].into(), vec![2],
+            ).unwrap();
+                        QueryPlanNode::PhysicalFragment {
+                            inputs: [QueryNodeId(1), QueryNodeId(0)].to_vec(),
+                            dag: compiled.encode().unwrap(),
+                            row_input: Some(0),
+                            pruning: (Some(CandidateCompleteness::Certified {
+                                guarantee: planner_types::post_asap::ResultGuarantee {
+                                    metric: planner_types::post_asap::ErrorMetric::Frequency,
+                                    bound: planner_types::post_asap::BoundExpr::Unknown {
+                                        statistic: "membership margin".into(),
                                     },
-                                provenance: vec![],
-                            },
-                        }),
-                        left_schema: schema.clone(),
-                        right_schema: schema.clone(),
-                        output_schema: schema,
+                                    failure_probability:
+                                        planner_types::post_asap::ProbabilityExpr::Unknown {
+                                            statistic: "membership confidence".into(),
+                                        },
+                                    provenance: vec![],
+                                },
+                            }))
+                            .map(|completeness| {
+                                asap_types::query_plan::PruningInputContract {
+                                    candidate_input: 1,
+                                    keys: vec![(0, 0)],
+                                    completeness,
+                                }
+                            }),
+                        }
                     }
                 }),
             ]),

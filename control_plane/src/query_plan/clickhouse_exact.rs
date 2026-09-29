@@ -346,12 +346,10 @@ mod original_tests {
                 )
                 .unwrap();
                 assert!(
-                    !entry.nodes.values().any(|node| matches!(
-                        node,
-                        QueryPlanNode::Logical { .. }
-                            | QueryPlanNode::Relational { .. }
-                            | QueryPlanNode::RelationalJoin { .. }
-                    )),
+                    !entry
+                        .nodes
+                        .values()
+                        .any(|node| matches!(node, QueryPlanNode::Logical { .. })),
                     "SQL installation must not persist logical or uncompiled relational operators"
                 );
                 let QueryPlanNode::PhysicalRelation { dag, .. } = &entry.nodes[&entry.root] else {
