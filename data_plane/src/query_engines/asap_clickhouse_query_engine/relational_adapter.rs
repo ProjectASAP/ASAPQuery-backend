@@ -27,6 +27,8 @@ use planner_types::pre_asap::{ArithmeticOpKind, CompareOpKind, QueryExpr, Scalar
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ClickHouseRelationalError {
+    #[error(transparent)]
+    Physical(#[from] asap_physical_operators::dag::Error),
     #[error("unsupported SQL relational operation: {0}")]
     Unsupported(String),
     #[error("SQL column index {0} is outside a {1}-column row")]
@@ -201,6 +203,30 @@ pub struct ClickHouseRelation {
 }
 
 impl ClickHouseRelation {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        fn cell(value: &Cell) -> usize {
+            std::mem::size_of::<Cell>()
+                + match value {
+                    Cell::Utf8(value) => value.capacity(),
+                    Cell::List(values) | Cell::Struct(values) => values.iter().map(cell).sum(),
+                    Cell::Map(values) => values
+                        .iter()
+                        .map(|(key, value)| cell(key) + cell(value))
+                        .sum(),
+                    _ => 0,
+                }
+        }
+        self.rows
+            .iter()
+            .map(|row| row.iter().map(cell).sum::<usize>() + 24)
+            .sum::<usize>()
+            + self
+                .fields
+                .iter()
+                .map(|(name, _, _)| name.capacity() + 128)
+                .sum::<usize>()
+    }
+
     pub fn from_json_compact(
         schema: &SummarySchema,
         body: &[u8],

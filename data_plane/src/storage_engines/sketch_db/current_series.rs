@@ -282,6 +282,18 @@ pub struct CurrentSeriesStore {
     history_bytes: BTreeMap<String, u64>,
 }
 impl CurrentSeriesStore {
+    pub(crate) fn approx_resident_bytes(&self) -> usize {
+        self.populations
+            .values()
+            .map(|population| population.bytes as usize + 1024)
+            .sum::<usize>()
+            + self
+                .history_bytes
+                .values()
+                .map(|bytes| *bytes as usize)
+                .sum::<usize>()
+    }
+
     /// Called only after the complete Remote Write batch was admitted successfully.
     pub fn ingest(&mut self, plan: &QueryPlan, samples: &[CanonicalSample]) {
         let generation = (plan.plan_id, plan.plan_version);

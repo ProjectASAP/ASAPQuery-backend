@@ -51,6 +51,54 @@ batches; common arithmetic, aggregation, sorting, limiting and temporal
 computation execute in the library. Metric-name presentation and protocol
 matching remain deployment bindings.
 
+## Request consistency and resource contracts
+
+One installed query request owns one budget and cancellation signal. Range
+steps and nested physical DAGs have separate execution state but share that
+control. Tracked memory includes the pinned SDS/current-series view, prepared
+inputs, native workspace, and retained results. JSON decoding and SQL encoding
+use conservative workspace estimates; this is not a process-wide RSS limit.
+Releasing an allocation returns its budget. Resource exhaustion or cancellation
+terminates the request and must not trigger exact fallback, even if a revision
+changes concurrently.
+
+```text
+range request
+  ├─ pin one eligible input snapshot
+  ├─ prepare inputs                 ┐
+  ├─ execute t1 → retain result      ├─ one request budget
+  ├─ execute t2 → retain result      │  and cancellation signal
+  └─ return accumulated result      ┘
+```
+
+For continuous local input, PromQL and SQL pin a common eligible revision across
+all required outputs. Partial publication of r2 does not invalidate a complete
+r1 that still satisfies freshness and coverage. The selected QueryPlan's
+catalog generation remains mandatory.
+
+External exact adapters currently provide evaluation time, not a source
+snapshot token. Consequently a candidate combining local SDS/current-series
+state with external exact data is rejected during installation and checked
+again before source access. This includes summary-derived candidate pruning.
+Equal timestamps cannot establish equal input revisions:
+
+```text
+local SDS at r1       external exact after a late correction
+       └──────── division ────────┘
+                 rejected: no common snapshot proof
+```
+
+A deployment may instead select whole-query exact execution. Resource failure
+in an already executing physical DAG is not permission to make that switch.
+No cross-system snapshot protocol is introduced here.
+
+The native context is thread-local to one dedicated request-worker invocation
+because Planner's context is not Send. Async callers signal cancellation to
+that worker; remote waits and nested native polling observe it. The worker
+clears its context when the request exits, so reused threads cannot share
+budgets or cancellation between requests. Cancellation is cooperative at
+polling boundaries, not preemption inside an individual synchronous kernel.
+
 ## Physical operator coverage and acceptance contract
 
 An accepted local plan must have an implementation for every reachable

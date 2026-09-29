@@ -382,8 +382,40 @@ impl QueryPlanEntry {
         topological_order(root, &self.nodes)
     }
 
+    /// The current external adapters provide evaluation time, not a snapshot
+    /// token compatible with local SDS or current-series revisions.
+    pub fn validate_snapshot_sources(&self) -> Result<(), QueryPlanError> {
+        use residual::ResidualQueryOperator;
+        let mut local = false;
+        let mut external = false;
+        for id in self.topological_order()? {
+            match &self.nodes[&id] {
+                QueryPlanNode::ReadMaterialization { .. }
+                | QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::CurrentSeries { .. },
+                    ..
+                } => local = true,
+                QueryPlanNode::ExternalExact { .. }
+                | QueryPlanNode::Logical {
+                    operator:
+                        ResidualQueryOperator::ExactSubquery { .. }
+                        | ResidualQueryOperator::CandidateExactSubquery { .. },
+                    ..
+                } => external = true,
+                _ => {}
+            }
+        }
+        if local && external {
+            return Err(QueryPlanError::UnsupportedNode(
+                "local state and external exact input have no common snapshot proof".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate references, bindings, reachability, and cycles before activation.
     pub fn validate(&self, available: &BTreeSet<PolicyFingerprint>) -> Result<(), QueryPlanError> {
+        self.validate_snapshot_sources()?;
         if !self.nodes.contains_key(&self.root) {
             return Err(QueryPlanError::Invalid(format!(
                 "query `{}` has missing root {}",

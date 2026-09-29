@@ -18,3 +18,6 @@ pub mod tests;
 
 #[cfg(test)]
 mod test_plan;
+
+#[cfg(test)]
+mod request_tests;

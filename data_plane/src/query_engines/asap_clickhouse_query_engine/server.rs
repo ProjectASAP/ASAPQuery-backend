@@ -28,7 +28,7 @@ struct ServerState {
 ///
 /// Implementations own plan-catalog lookup, planning/binding, DAG execution,
 /// coverage validation, and ClickHouse result encoding. Every fail-closed
-/// outcome is routed to the exact ClickHouse backend by this HTTP adapter.
+/// availability miss may route to the exact backend; execution failures terminate.
 #[async_trait]
 pub trait ClickHouseAccelerator: Send + Sync {
     async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome;
@@ -69,6 +69,7 @@ impl ClickHouseAccelerationFallback {
 pub enum ClickHouseAccelerationOutcome {
     Accelerated(ClickHouseRawResponse),
     Fallback(ClickHouseAccelerationFallback),
+    Failed(crate::query_engines::EngineError),
 }
 
 struct DisabledAccelerator;
@@ -187,6 +188,9 @@ async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryReque
                 .or_insert(axum::http::HeaderValue::from_static("asap"));
             response
         }
+        ClickHouseAccelerationOutcome::Failed(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
         ClickHouseAccelerationOutcome::Fallback(reason) => {
             tracing::info!(
                 failure_stage = reason.stage(),
@@ -235,6 +239,32 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Mutex;
     use tower::ServiceExt;
+
+    // Resource exhaustion and cancellation must never launch an exact request.
+    #[tokio::test]
+    async fn physical_failure_does_not_call_exact_fallback() {
+        for failure in [
+            asap_physical_operators::dag::Error::MemoryLimit,
+            asap_physical_operators::dag::Error::Cancelled,
+        ] {
+            let fallback = Arc::new(RecordingFallback::default());
+            let accelerator = Arc::new(FixedAccelerator {
+                outcome: Mutex::new(Some(ClickHouseAccelerationOutcome::Failed(failure.into()))),
+            });
+            let response =
+                ClickHouseHttpServer::router_with_accelerator(fallback.clone(), accelerator)
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/?query=SELECT%201")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(fallback.sql.lock().unwrap().is_empty());
+        }
+    }
 
     #[derive(Default)]
     struct RecordingFallback {

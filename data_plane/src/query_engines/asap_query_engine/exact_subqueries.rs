@@ -296,6 +296,11 @@ pub(super) async fn prepare_external(
     client: &reqwest::Client,
     mut prepared: PreparedLeaves,
 ) -> Result<PreparedLeaves, EngineError> {
+    entry
+        .validate_snapshot_sources()
+        .map_err(|error| miss(error.to_string()))?;
+    let mut retained =
+        crate::query_engines::request::reserve(super::logical_dag::prepared_bytes(&prepared))?;
     // Equivalent exact cuts at the same time share one actual remote request.
     let mut remote_cache = HashMap::<(QueryLanguage, String, i64), Value>::new();
     for ((id, at), leaf) in leaves(entry, times)? {
@@ -416,16 +421,34 @@ pub(super) async fn prepare_external(
                     .get(url)
                     .query(&[("query", query.as_str()), ("time", time.as_str())])
             };
-            let response = request
-                .send()
-                .await
+            let response = crate::query_engines::request::wait(request.send())
+                .await?
                 .map_err(|e| miss(format!("exact request failed: {e}")))?;
             if !response.status().is_success() {
                 return Err(miss(format!("exact endpoint HTTP {}", response.status())));
             }
-            let body: serde_json::Value = response
-                .json()
-                .await
+            let mut response = response;
+            let mut bytes = Vec::new();
+            let mut wire = crate::query_engines::request::reserve(0)?;
+            while let Some(chunk) = crate::query_engines::request::wait(response.chunk())
+                .await?
+                .map_err(|e| miss(format!("invalid exact response: {e}")))?
+            {
+                let next = bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(asap_physical_operators::dag::Error::MemoryLimit)?;
+                wire.resize(next)?;
+                bytes.extend_from_slice(&chunk);
+            }
+            // Include JSON decoding workspace as well as the retained wire body.
+            let _decode = crate::query_engines::request::reserve(
+                bytes
+                    .len()
+                    .checked_mul(64)
+                    .ok_or(asap_physical_operators::dag::Error::MemoryLimit)?,
+            )?;
+            let body: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|e| miss(format!("invalid exact response: {e}")))?;
             let value = parse_result(&body, at)?;
             remote_cache.insert(key, value.clone());
@@ -440,6 +463,13 @@ pub(super) async fn prepare_external(
                 remote_rpcs: usize::from(!cached),
             },
         );
+        retained.resize(
+            super::logical_dag::prepared_bytes(&prepared)
+                + remote_cache
+                    .iter()
+                    .map(|((_, query, _), value)| query.capacity() + value.retained_bytes() + 128)
+                    .sum::<usize>(),
+        )?;
     }
     Ok(prepared)
 }
@@ -912,13 +942,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_minute_error_ratio_combines_prometheus_cut_with_summary_store() {
-        use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
+    async fn five_minute_error_ratio_rejects_external_and_local_revision_mix() {
         use crate::storage_engines::sketch_db::{
             data::AggKind,
             index::{Capability, SummarySeriesMetadata},
         };
-        use crate::storage_engines::types::{KeyByLabelValues, Measurement};
+        use crate::storage_engines::types::Measurement;
         use asap_physical_operators::summary_kernels::IncreaseAccumulator;
         use asap_types::query_plan::{
             residual::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
@@ -1034,58 +1063,17 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let prepared = prepare(
+        let result = prepare(
             &entry,
             &[AT],
             Some(&format!("http://{address}")),
             &reqwest::Client::new(),
         )
-        .await
-        .unwrap();
-        let (result, stats) =
-            super::super::logical_dag::execute_installed(&entry, &prepared, AT, |root, at| {
-                assert_eq!(root, QueryNodeId(2));
-                let mut summary = entry.clone();
-                summary.root = root;
-                summary.nodes.retain(|id, _| matches!(id.0, 2 | 3));
-                let (outcome, _) = super::super::post_asap_readout::execute_query_plan_instant(
-                    &store, &summary, at,
-                )
-                .map_err(|error| miss(format!("summary readout failed: {error:?}")))?;
-                let rows = outcome
-                    .series
-                    .into_iter()
-                    .map(|(labels, samples)| {
-                        let (keys, values): (Vec<_>, Vec<_>) = labels.into_iter().unzip();
-                        Ok(InstantVectorElement::new(
-                            KeyByLabelValues::new_with_labels(values),
-                            samples
-                                .last()
-                                .ok_or_else(|| miss("summary returned no point"))?
-                                .1,
-                        )
-                        .with_label_keys_override(keys))
-                    })
-                    .collect::<Result<Vec<_>, EngineError>>()?;
-                Ok(QueryResult::vector(rows, at))
-            })
-            .unwrap();
-        let QueryResult::Vector(result) = result else {
-            panic!("instant vector expected")
-        };
-        assert_eq!(result.timestamp, AT);
-        assert_eq!(result.values.len(), 1);
-        assert_eq!(
-            result.values[0].label_keys_override.as_deref(),
-            Some(&["job".into()][..])
+        .await;
+        assert!(
+            matches!(result, Err(EngineError::CapabilityMiss { detail, .. }) if detail.contains("common snapshot proof"))
         );
-        assert_eq!(result.values[0].labels.labels, vec!["user-service"]);
-        assert!((result.values[0].value - 0.1).abs() < 1e-12);
-        assert_eq!(stats.raw_scan_evaluations, 0);
-        assert_eq!(stats.remote_evaluations, 1);
-        assert_eq!(stats.remote_rpcs, 1);
-        assert_eq!(stats.summary_readout_evaluations, 1);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
     }
     #[test]

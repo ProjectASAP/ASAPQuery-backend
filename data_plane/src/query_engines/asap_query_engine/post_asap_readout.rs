@@ -746,15 +746,15 @@ fn execute_bound_queries(
         &roots.iter().map(|root| root.0).collect::<Vec<_>>(),
         context,
     )?;
-    futures::executor::block_on(futures::future::try_join_all(outputs.into_iter().map(
+    crate::query_engines::request::drive(futures::future::try_join_all(outputs.into_iter().map(
         |mut output| async move {
             output
                 .next()
                 .await
                 .ok_or_else(|| dag::Error::Operator("query root produced no value".into()))?
-                .map(|output| output.value().clone())
+                .map(|value| value.value().clone())
         },
-    )))
+    )))?
 }
 fn execute_bound_query(
     entry: &asap_types::query_plan::QueryPlanEntry,
@@ -762,14 +762,11 @@ fn execute_bound_query(
     runtime: &PhysicalQueryRuntime<'_>,
     revision: u64,
 ) -> Result<PhysicalQueryOutput, dag::Error> {
-    let context = dag::RunContext::new(
-        dag::Scope::Query {
-            evaluation_time_ms: i64::try_from(runtime.context.t1_ms)
-                .map_err(|_| dag::Error::Invalid("query time exceeds i64".into()))?,
-            revision,
-        },
-        dag::Limits::default(),
-    )?;
+    let context = crate::query_engines::request::context(dag::Scope::Query {
+        evaluation_time_ms: i64::try_from(runtime.context.t1_ms)
+            .map_err(|_| dag::Error::Invalid("query time exceeds i64".into()))?,
+        revision,
+    })?;
     Ok(execute_bound_queries(entry, &[root], runtime, context)?.remove(0))
 }
 

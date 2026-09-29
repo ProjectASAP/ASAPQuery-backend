@@ -4,6 +4,20 @@ use tracing::debug;
 use asap_types::query_requirements::QueryRequirements;
 use asap_types::KeyByLabelNames;
 
+pub(super) fn finish_query<T>(
+    result: Result<T, crate::query_engines::EngineError>,
+    unchanged: bool,
+) -> Result<T, crate::query_engines::EngineError> {
+    let result = result?;
+    if !unchanged {
+        return Err(crate::query_engines::EngineError::capability_miss(
+            "installed_logical_dag",
+            "summary input changed during query DAG evaluation",
+        ));
+    }
+    Ok(result)
+}
+
 #[derive(Clone)]
 struct QueryReadinessRequirement {
     materializations: Vec<asap_types::PolicyFingerprint>,
@@ -182,6 +196,7 @@ pub struct ASAPQueryEngine {
     metricsql_exact_subquery_endpoint: Option<String>,
     query_forwarding_policy: crate::query_engines::QueryForwardingPolicy,
     exact_subquery_client: reqwest::Client,
+    execution_limits: asap_physical_operators::dag::Limits,
 }
 
 impl ASAPQueryEngine {
@@ -228,17 +243,8 @@ impl ASAPQueryEngine {
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
-        let pinned = self.pinned_for(&physical, planned, &[now_ms])?;
-        let engine = pinned.as_ref().unwrap_or(self);
-        let leaves = engine
-            .prepare_query_inputs(&physical, planned, &[now_ms])
-            .await?;
-        let (mut result, mut stats) =
-            engine.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
-        stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
-        stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
-        annotate_logical_execution(&mut result, &stats);
-        Ok(result)
+        self.execute_installed_instant(&physical, planned, now_ms)
+            .await
     }
 
     pub async fn execute_metricsql_range(
@@ -270,6 +276,7 @@ impl ASAPQueryEngine {
     pub fn new(prometheus_scrape_interval: u64) -> Self {
         Self {
             prometheus_scrape_interval,
+            execution_limits: Default::default(),
             summary_store: None,
             active_physical_plan: None,
             exact_subquery_endpoint: None,
@@ -299,12 +306,62 @@ impl ASAPQueryEngine {
         self.query_forwarding_policy = policy;
         self
     }
+    pub fn with_execution_limits(mut self, limits: asap_physical_operators::dag::Limits) -> Self {
+        self.execution_limits = limits;
+        self
+    }
+
+    async fn execute_installed_instant(
+        &self,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
+        entry: &asap_types::query_plan::QueryPlanEntry,
+        at: u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
+        let engine = self.clone();
+        let physical = physical.clone();
+        let entry = entry.clone();
+        crate::query_engines::request::run(self.execution_limits.clone(), move |handle| {
+            handle.block_on(async {
+                entry.validate_snapshot_sources().map_err(|e| {
+                    crate::query_engines::EngineError::capability_miss("query_plan", e.to_string())
+                })?;
+                let pinned = engine.pinned_for(&physical, &entry, &[at])?;
+                let _snapshot = crate::query_engines::request::reserve(
+                    pinned
+                        .as_ref()
+                        .and_then(|engine| engine.summary_store.as_ref())
+                        .map_or(0, |index| index.approx_resident_bytes()),
+                )?;
+                let engine = pinned.as_ref().unwrap_or(&engine);
+                let leaves = engine
+                    .prepare_query_inputs(&physical, &entry, &[at])
+                    .await?;
+                let _inputs = crate::query_engines::request::reserve(
+                    super::logical_dag::prepared_bytes(&leaves),
+                )?;
+                let (mut result, mut stats) =
+                    engine.execute_logical_entry(&physical, &entry, &leaves, at)?;
+                let _result = crate::query_engines::request::reserve(result.retained_bytes())?;
+                stats.remote_evaluations =
+                    leaves.values().map(|leaf| leaf.remote_evaluations).sum();
+                stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
+                annotate_logical_execution(&mut result, &stats);
+                Ok(result)
+            })
+        })
+        .await
+    }
+
     async fn prepare_query_inputs(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
+        entry.validate_snapshot_sources().map_err(|e| {
+            crate::query_engines::EngineError::capability_miss("query_plan", e.to_string())
+        })?;
         super::catalog_resolver::validate_entry(
             physical.summary_catalog.as_deref(),
             entry,
@@ -557,20 +614,35 @@ impl ASAPQueryEngine {
             },
         );
         let current = index.map(|index| index.summary_update_revision());
-        if match (revision, current) {
-            (Some(before), Some(after)) => !before.matches(after),
-            (None, None) => false,
-            _ => true,
-        } {
-            return Err(EngineError::capability_miss(
-                "installed_logical_dag",
-                "summary input changed during query DAG evaluation",
-            ));
-        }
-        result
+        finish_query(
+            result,
+            match (revision, current) {
+                (Some(before), Some(after)) => before.matches(after),
+                (None, None) => true,
+                _ => false,
+            },
+        )
     }
 
     async fn execute_logical_range(
+        &self,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
+        entry: &asap_types::query_plan::QueryPlanEntry,
+        start: u64,
+        end: u64,
+        step: u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
+        let engine = self.clone();
+        let physical = physical.clone();
+        let entry = entry.clone();
+        crate::query_engines::request::run(self.execution_limits.clone(), move |handle| {
+            handle.block_on(engine.execute_logical_range_inner(&physical, &entry, start, end, step))
+        })
+        .await
+    }
+
+    async fn execute_logical_range_inner(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
         entry: &asap_types::query_plan::QueryPlanEntry,
@@ -589,12 +661,27 @@ impl ASAPQueryEngine {
                 "invalid range or more than 11000 evaluations",
             ));
         }
+        entry
+            .validate_snapshot_sources()
+            .map_err(|e| EngineError::capability_miss("query_plan", e.to_string()))?;
+        let _grid =
+            crate::query_engines::request::reserve(((end - start) / step + 1) as usize * 8)?;
         let times: Vec<u64> = (0..=(end - start) / step)
             .map(|n| start + n * step)
             .collect();
         let pinned = self.pinned_for(physical, entry, &times)?;
+        let _snapshot = crate::query_engines::request::reserve(
+            pinned
+                .as_ref()
+                .and_then(|engine| engine.summary_store.as_ref())
+                .map_or(0, |index| index.approx_resident_bytes()),
+        )?;
         let engine = pinned.as_ref().unwrap_or(self);
         let leaves = engine.prepare_query_inputs(physical, entry, &times).await?;
+        let _inputs =
+            crate::query_engines::request::reserve(super::logical_dag::prepared_bytes(&leaves))?;
+        let mut retained = crate::query_engines::request::reserve(0)?;
+        let mut retained_bytes = 0usize;
         let mut series =
             std::collections::BTreeMap::<Vec<(String, String)>, RangeVectorElement>::new();
         let mut total = super::logical_dag::ExecutionStats::default();
@@ -607,6 +694,7 @@ impl ASAPQueryEngine {
             total.remote_evaluations += stats.remote_evaluations;
             total.remote_rpcs += stats.remote_rpcs;
             total.remote_branch_evaluations += stats.remote_branch_evaluations;
+            let _step_result = crate::query_engines::request::reserve(result.retained_bytes())?;
             let QueryResult::Vector(result) = result else {
                 return Err(EngineError::capability_miss(
                     "installed_logical_dag",
@@ -614,6 +702,11 @@ impl ASAPQueryEngine {
                 ));
             };
             for point in result.values {
+                // Reserve before retaining the next point and its series identity.
+                retained_bytes = retained_bytes
+                    .checked_add(point.retained_bytes() + 128)
+                    .ok_or(asap_physical_operators::dag::Error::MemoryLimit)?;
+                retained.resize(retained_bytes)?;
                 let keys = point.label_keys_override.ok_or_else(|| {
                     EngineError::capability_miss(
                         "installed_logical_dag",
@@ -1027,26 +1120,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                let pinned = self.pinned_for(&physical, entry, &[now_ms])?;
-                let engine = pinned.as_ref().unwrap_or(self);
-                let leaves = engine
-                    .prepare_query_inputs(&physical, entry, &[now_ms])
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(query, error = %error, "installed query DAG preparation failed");
-                        error
-                    })?;
-                let (mut result, mut stats) = engine
-                    .execute_logical_entry(&physical, entry, &leaves, now_ms)
-                    .map_err(|error| {
-                        tracing::warn!(query, error = %error, "installed query DAG execution failed");
-                        error
-                    })?;
-                stats.remote_evaluations =
-                    leaves.values().map(|leaf| leaf.remote_evaluations).sum();
-                stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
-                annotate_logical_execution(&mut result, &stats);
-                return Ok(result);
+                return self
+                    .execute_installed_instant(&physical, entry, now_ms)
+                    .await;
             }
         }
         // One authoritative warm path: ASAPPlanner post-ASAP DAG →

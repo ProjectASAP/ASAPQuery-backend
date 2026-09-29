@@ -32,6 +32,37 @@ thread_local! {
     static AFTER_BRANCH: std::cell::Cell<Option<fn(&SketchStore)>> = const { std::cell::Cell::new(None) };
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SqlExecutionError {
+    #[error("{0}")]
+    Binding(String),
+    #[error(transparent)]
+    Physical(#[from] asap_physical_operators::dag::Error),
+}
+impl From<String> for SqlExecutionError {
+    fn from(value: String) -> Self {
+        Self::Binding(value)
+    }
+}
+impl From<&str> for SqlExecutionError {
+    fn from(value: &str) -> Self {
+        Self::Binding(value.into())
+    }
+}
+impl From<crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip>
+    for SqlExecutionError
+{
+    fn from(
+        error: crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip,
+    ) -> Self {
+        use crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip;
+        match error {
+            LoweringSkip::Execution(error) => Self::Physical(error),
+            error => Self::Binding(format!("incomplete leaf coverage: {error:?}")),
+        }
+    }
+}
+
 struct RelationDagExecutor<'a> {
     index: &'a SketchStore,
     entry: &'a QueryPlanEntry,
@@ -50,13 +81,14 @@ impl RelationDagExecutor<'_> {
         &mut self,
         root: QueryNodeId,
         expected_schema: &planner_types::post_asap::SummarySchema,
-    ) -> Result<ClickHouseRelation, String> {
+    ) -> Result<ClickHouseRelation, SqlExecutionError> {
         if let Some(schema) = self.schemas.get(&root) {
             if schema != expected_schema {
                 return Err(format!(
                     "query `{}` node {} is consumed with inconsistent relation schemas",
                     self.entry.query_id, root.0
-                ));
+                )
+                .into());
             }
         }
         if let Some(relation) = self.memo.get(&root) {
@@ -84,7 +116,7 @@ impl RelationDagExecutor<'_> {
         &mut self,
         root: QueryNodeId,
         expected: &planner_types::post_asap::SummarySchema,
-    ) -> Result<ClickHouseRelation, String> {
+    ) -> Result<ClickHouseRelation, SqlExecutionError> {
         use super::relational_adapter::native;
         use asap_physical_operators::dag::{self, operators::Operator};
         use futures::{FutureExt, StreamExt};
@@ -200,15 +232,11 @@ impl RelationDagExecutor<'_> {
             )
             .map_err(|e| e.to_string())?;
         let mut resolved_inputs = BTreeMap::new();
-        let context = dag::RunContext::new(
-            dag::Scope::Query {
-                evaluation_time_ms: i64::try_from(self.t1_ms)
-                    .map_err(|_| "evaluation time overflow")?,
-                revision: self.index.summary_update_revision().mutation_sequence(),
-            },
-            dag::Limits::default(),
-        )
-        .map_err(|e| e.to_string())?;
+        let context = crate::query_engines::request::context(dag::Scope::Query {
+            evaluation_time_ms: i64::try_from(self.t1_ms)
+                .map_err(|_| "evaluation time overflow")?,
+            revision: self.index.summary_update_revision().mutation_sequence(),
+        })?;
         let mut storage_roots = BTreeSet::new();
         for source in &sources {
             if !matches!(
@@ -232,7 +260,7 @@ impl RelationDagExecutor<'_> {
         }
         let stored = crate::query_engines::asap_query_engine::post_asap_readout::execute_query_plan_readouts(
             self.index,self.entry,&storage_roots.into_iter().collect::<Vec<_>>(),self.t0_ms,self.t1_ms,self.is_cumulative,context.clone(),
-        ).map_err(|e|format!("incomplete leaf coverage: {e:?}"))?;
+        ).map_err(SqlExecutionError::from)?;
         let mut coverage = None;
         let mut first = true;
         for id in sources {
@@ -260,20 +288,19 @@ impl RelationDagExecutor<'_> {
         let graph = compiled
             .instantiate(resolved_inputs)
             .map_err(|e| e.to_string())?;
-        let mut output = graph
-            .execute(&[root.0], context)
-            .map_err(|e| e.to_string())?
-            .remove(0);
+        let mut output = graph.execute(&[root.0], context)?.remove(0);
         let mut batches = Vec::new();
         loop {
+            crate::query_engines::request::check()?;
             match output.next().now_or_never() {
                 Some(Some(Ok(batch))) => batches.push(batch),
-                Some(Some(Err(error))) => return Err(error.to_string()),
+                Some(Some(Err(error))) => return Err(error.into()),
                 Some(None) => break,
                 None => continue,
             }
         }
-        native::relation(&batches, expected, coverage).map_err(|e| e.to_string())
+        native::relation(&batches, expected, coverage)
+            .map_err(|e| SqlExecutionError::Binding(e.to_string()))
     }
 
     fn execute_source(
@@ -284,7 +311,7 @@ impl RelationDagExecutor<'_> {
             QueryNodeId,
             crate::query_engines::asap_query_engine::post_asap_readout::PostAsapReadoutOutcome,
         >,
-    ) -> Result<ClickHouseRelation, String> {
+    ) -> Result<ClickHouseRelation, SqlExecutionError> {
         match self.entry.nodes.get(&root) {
             Some(QueryPlanNode::ExternalExact { request, .. }) => {
                 if request.language != asap_types::QueryLanguage::ClickHouseSql {
@@ -338,7 +365,7 @@ impl RelationDagExecutor<'_> {
                         self.t0_ms,
                         self.t1_ms,
                         leaf_outcome.coverage, binding.window_ms, binding.pane_origin_ms.unwrap_or(0)
-                    ));
+                    ).into());
                     }
                 }
                 ClickHouseRelation::from_series_rows(
@@ -346,15 +373,16 @@ impl RelationDagExecutor<'_> {
                     outcome.series.clone(),
                     outcome.coverage,
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| SqlExecutionError::Binding(error.to_string()))
             }
-            None => Err(format!("published DAG references missing node {}", root.0)),
+            None => Err(format!("published DAG references missing node {}", root.0).into()),
         }
     }
 }
 pub enum ClickHouseDagOutcome {
     Accelerated(ClickHouseQueryResult),
     Fallback(ClickHouseDagFallback),
+    Failed(asap_physical_operators::dag::Error),
 }
 
 fn complete_pane_coverage(
@@ -377,6 +405,11 @@ pub fn execute_sql_dag_with_external(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> ClickHouseDagOutcome {
+    if let Err(error) = entry.validate_snapshot_sources() {
+        return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+            error.to_string(),
+        ));
+    }
     let revision = index.summary_update_revision();
     let result = execute_sql_dag_with_external_unfenced(
         index,
@@ -387,6 +420,9 @@ pub fn execute_sql_dag_with_external(
         t1_ms,
         is_cumulative,
     );
+    if matches!(result, ClickHouseDagOutcome::Failed(_)) {
+        return result;
+    }
     if !revision.matches(index.summary_update_revision()) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             "summary input changed during SQL DAG evaluation".into(),
@@ -463,7 +499,10 @@ fn execute_sql_dag_with_external_unfenced(
         .execute(entry.root, &root_schema)
         {
             Ok(relation) => relation,
-            Err(error) if error.contains("incomplete leaf coverage") => {
+            Err(SqlExecutionError::Physical(error)) => return ClickHouseDagOutcome::Failed(error),
+            Err(SqlExecutionError::Binding(error))
+                if error.contains("incomplete leaf coverage") =>
+            {
                 return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
                     requested: (t0_ms, t1_ms),
                     observed: None,
@@ -471,7 +510,7 @@ fn execute_sql_dag_with_external_unfenced(
             }
             Err(error) => {
                 return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                    error,
+                    error.to_string(),
                 ));
             }
         };
@@ -506,6 +545,11 @@ fn execute_sql_dag_with_external_unfenced(
         match execute_query_plan_from_readout(index, entry, base_root, t0_ms, t1_ms, is_cumulative)
         {
             Ok(outcome) => outcome,
+            Err(
+                crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::Execution(
+                    error,
+                ),
+            ) => return ClickHouseDagOutcome::Failed(error),
             Err(error) => {
                 let detail = format!("{error:?}");
                 if detail.contains("missing materialized pane")
@@ -615,6 +659,66 @@ mod tests {
         }
     }
 
+    // SQL's native runtime must preserve exhausted/cancelled errors at its boundary.
+    #[tokio::test]
+    async fn sql_native_resource_failure_is_terminal() {
+        for cancelled in [false, true] {
+            crate::query_engines::request::run(
+                asap_physical_operators::dag::Limits {
+                    max_bytes: if cancelled { 4096 } else { 1 },
+                    ..Default::default()
+                },
+                move |_| {
+                    if cancelled {
+                        crate::query_engines::request::context(
+                            asap_physical_operators::dag::Scope::Query {
+                                evaluation_time_ms: 1000,
+                                revision: 0,
+                            },
+                        )?
+                        .cancel();
+                    }
+                    let schema = relation_schema("x");
+                    let entry = external_entry(&schema);
+                    let mut relation = ClickHouseRelation::from_json_compact(
+                        &schema,
+                        br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1]]}"#,
+                    )
+                    .unwrap();
+                    relation.coverage = Some((0, 1000));
+                    let result = execute_sql_dag_with_external(
+                        &SketchStore::new(),
+                        &entry,
+                        &SummaryCatalog::from_materializations(1, 1, &[]).unwrap(),
+                        &[(QueryNodeId(0), relation)].into(),
+                        0,
+                        1000,
+                        true,
+                    );
+                    let ClickHouseDagOutcome::Failed(error) = result else {
+                        panic!("native failure became fallback");
+                    };
+                    fn is_resource(
+                        error: &asap_physical_operators::dag::Error,
+                        cancelled: bool,
+                    ) -> bool {
+                        use asap_physical_operators::dag::Error;
+                        match error {
+                            Error::Cancelled => cancelled,
+                            Error::MemoryLimit => !cancelled,
+                            Error::AtNode { source, .. } => is_resource(source, cancelled),
+                            _ => false,
+                        }
+                    }
+                    assert!(is_resource(&error, cancelled), "{error:?}");
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
     #[test]
     fn relation_dag_memoizes_a_shared_node_and_enforces_one_edge_schema() {
         let schema = relation_schema("x");
@@ -645,8 +749,8 @@ mod tests {
         let error = executor
             .execute(QueryNodeId(0), &relation_schema("different"))
             .unwrap_err();
-        assert!(error.contains("query `shared-external` node 0"));
-        assert!(error.contains("inconsistent relation schemas"));
+        assert!(error.to_string().contains("query `shared-external` node 0"));
+        assert!(error.to_string().contains("inconsistent relation schemas"));
     }
 
     // A SQL diamond binds one source to both join inputs in the shared DAG.

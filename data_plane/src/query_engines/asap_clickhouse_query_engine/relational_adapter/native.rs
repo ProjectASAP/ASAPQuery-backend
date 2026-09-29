@@ -104,16 +104,13 @@ pub(crate) fn execute(
             .collect::<Vec<_>>(),
     )
     .map_err(|error| ClickHouseRelationalError::Unsupported(error.to_string()))?;
-    let context = dag::RunContext::new(
-        dag::Scope::Query {
-            evaluation_time_ms: coverage.map_or(0, |(_, end)| end as i64),
-            revision: 0,
-        },
-        dag::Limits::default(),
-    )
-    .map_err(error)?;
-    let batches =
-        dag::batch_execution::evaluate_inputs(batches, operator, context).map_err(error)?;
+    let context = crate::query_engines::request::context(dag::Scope::Query {
+        evaluation_time_ms: coverage.map_or(0, |(_, end)| end as i64),
+        revision: 0,
+    })
+    .map_err(ClickHouseRelationalError::Physical)?;
+    let batches = dag::batch_execution::evaluate_inputs(batches, operator, context)
+        .map_err(ClickHouseRelationalError::Physical)?;
     let rows = batches
         .iter()
         .flat_map(|batch| batch.rows())

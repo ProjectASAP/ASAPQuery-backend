@@ -2788,6 +2788,9 @@ impl SketchStore {
         // resident memory even though they are not part of the durable
         // payload/flush accounting.
         total += self.rollups.approx_bytes();
+        if let Ok(current) = self.current_series.lock() {
+            total += current.approx_resident_bytes();
+        }
 
         total
     }

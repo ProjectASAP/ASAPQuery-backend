@@ -15,6 +15,8 @@ pub struct ClickHouseRawResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClickHouseFallbackError {
+    #[error(transparent)]
+    Physical(#[from] asap_physical_operators::dag::Error),
     #[error("ClickHouse request failed: {0}")]
     Request(String),
     #[error("ClickHouse returned an invalid response: {0}")]
@@ -73,10 +75,22 @@ impl ClickHouseHttpFallback {
                 headers.append(name, value);
             }
         }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| ClickHouseFallbackError::Response(e.to_string()))?;
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = crate::query_engines::request::wait(response.chunk())
+            .await?
+            .map_err(|e| ClickHouseFallbackError::Response(e.to_string()))?
+        {
+            let size = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(asap_physical_operators::dag::Error::MemoryLimit)?;
+            // No parallel operator work runs while this source is being fetched.
+            // Check the whole buffered response against the remaining request budget.
+            let _check = crate::query_engines::request::reserve(size)?;
+            body.extend_from_slice(&chunk);
+        }
+        let body = Bytes::from(body);
         Ok(ClickHouseRawResponse {
             status,
             headers,

@@ -23,6 +23,30 @@ pub(crate) enum Value {
     Vector(Vector),
     Matrix(Matrix, i64, i64),
 }
+impl Value {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        fn labels(labels: &Labels) -> usize {
+            labels
+                .iter()
+                .map(|(key, value)| key.capacity() + value.capacity() + 96)
+                .sum()
+        }
+        match self {
+            Self::Scalar(_) => 8,
+            Self::Vector(rows) => {
+                rows.capacity() * std::mem::size_of::<(Labels, f64)>()
+                    + rows.iter().map(|(keys, _)| labels(keys)).sum::<usize>()
+            }
+            Self::Matrix(rows, ..) => {
+                rows.capacity() * std::mem::size_of::<(Labels, Vec<(i64, f64)>)>()
+                    + rows
+                        .iter()
+                        .map(|(keys, points)| labels(keys) + points.capacity() * 16)
+                        .sum::<usize>()
+            }
+        }
+    }
+}
 #[derive(Debug, Default, Clone)]
 pub struct ExecutionStats {
     /// Kept in execution provenance for compatibility; deployed DAGs cannot
@@ -86,6 +110,13 @@ pub(crate) struct PreparedLeaf {
     pub remote_rpcs: usize,
 }
 pub(crate) type PreparedLeaves = BTreeMap<(QueryNodeId, i64), PreparedLeaf>;
+
+pub(crate) fn prepared_bytes(leaves: &PreparedLeaves) -> usize {
+    leaves
+        .values()
+        .map(|leaf| leaf.value.retained_bytes() + 128)
+        .sum()
+}
 
 pub(crate) fn execute_installed<F>(
     entry: &QueryPlanEntry,
@@ -172,13 +203,10 @@ where
             )
             .map_err(EngineError::from)?;
     }
-    let context = physical::RunContext::new(
-        physical::Scope::Query {
-            evaluation_time_ms: at_signed,
-            revision: 0,
-        },
-        physical::Limits::default(),
-    )
+    let context = crate::query_engines::request::context(physical::Scope::Query {
+        evaluation_time_ms: at_signed,
+        revision: 0,
+    })
     .map_err(EngineError::from)?;
     let mut output = graph
         .execute(&[0], context)
@@ -186,6 +214,7 @@ where
         .remove(0);
     // I/O is prepared before this synchronous adapter; Pending is a cooperative yield.
     let evaluated = loop {
+        crate::query_engines::request::check()?;
         match output.next().now_or_never() {
             Some(Some(Ok(value))) => break value.value().clone(),
             Some(Some(Err(failure))) => {
