@@ -326,7 +326,7 @@ mod tests {
         for (i, c) in configs.into_iter().enumerate() {
             map.insert(i as u64 + 1, c);
         }
-        InstalledPrecomputePlan::new(map)
+        InstalledPrecomputePlan::from_raw_ids(map)
     }
 
     #[test]

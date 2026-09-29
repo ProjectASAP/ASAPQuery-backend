@@ -415,7 +415,7 @@ mod tests {
         let agg_id = cfg.policy_fp_u64();
         let mut configs = HashMap::new();
         configs.insert(agg_id, cfg);
-        let streaming = InstalledPrecomputePlan::new(configs);
+        let streaming = InstalledPrecomputePlan::from_raw_ids(configs);
         let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
 
         let summary_store = Arc::new(SketchStore::new());
@@ -484,10 +484,9 @@ mod tests {
             Arc::new(SeriesIdResolver::open(temporary.path().join("resolver.wal")).unwrap());
         let sink = SketchStoreSink::new(
             store.clone(),
-            InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new(HashMap::from([(
-                fingerprint.0,
-                cfg,
-            )]))),
+            InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::from_raw_ids(
+                HashMap::from([(fingerprint.0, cfg)]),
+            )),
             resolver,
         );
         let original_generation = Arc::new(catalog.reference().unwrap());
@@ -566,7 +565,7 @@ mod tests {
         cfg.parameters
             .insert("alpha".into(), serde_json::json!(0.01));
         let policy_fp = cfg.policy_fp_u64();
-        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new(
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::from_raw_ids(
             HashMap::from([(policy_fp, cfg)]),
         ));
         let summary_store = Arc::new(SketchStore::new());

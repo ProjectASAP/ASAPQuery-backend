@@ -336,7 +336,7 @@ mod tests {
 
         let mut map = std::collections::HashMap::new();
         map.insert(agg_id, make_config(agg_id, metric));
-        let streaming = InstalledPrecomputePlan::new(map);
+        let streaming = InstalledPrecomputePlan::from_raw_ids(map);
         let hot_reload =
             crate::storage_engines::types::InstalledPrecomputePlanHandle::new(streaming.clone());
 

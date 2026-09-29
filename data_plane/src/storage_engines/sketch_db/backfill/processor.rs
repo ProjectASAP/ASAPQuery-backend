@@ -212,7 +212,7 @@ impl WindowProcessor for BackfillWindowProcessor {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let snapshot = self.config.snapshot();
         let config = snapshot
-            .get_aggregation_config(agg_id)
+            .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
             .cloned()
             .ok_or_else(|| format!("agg_id {agg_id} not in current InstalledPrecomputePlan"))?;
         let program = snapshot.raw_programs.get(&agg_id).cloned();
@@ -444,7 +444,7 @@ mod tests {
     fn streaming_config_with(config: PrecomputeMaterialization) -> Arc<InstalledPrecomputePlan> {
         let mut map = std::collections::HashMap::new();
         map.insert(config.policy_fp_u64(), config);
-        Arc::new(InstalledPrecomputePlan::new(map))
+        Arc::new(InstalledPrecomputePlan::from_raw_ids(map))
     }
 
     #[tokio::test]

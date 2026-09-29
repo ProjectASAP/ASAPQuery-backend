@@ -513,7 +513,7 @@ impl Worker {
     ) -> Result<Option<&mut GroupState>, String> {
         if !self.group_states.contains_key(&sid) {
             let snap = self.hot_reload.snapshot();
-            let Some(cfg) = snap.get_aggregation_config(policy_fp.as_u64()) else {
+            let Some(cfg) = snap.get_aggregation_config(policy_fp.into()) else {
                 return Ok(None);
             };
             let program = snap.raw_programs.get(&policy_fp.as_u64()).cloned();
@@ -1081,7 +1081,7 @@ impl Worker {
         let snap = self.hot_reload.snapshot();
         let before = self.group_states.len();
         self.group_states.retain(|&sid, gs| {
-            if snap.contains(gs.policy_fp.as_u64()) {
+            if snap.contains(gs.policy_fp.into()) {
                 return true; // policy still in config, keep
             }
             // Policy retired — keep only if there's residual data
@@ -1976,6 +1976,7 @@ mod tests {
     use asap_physical_operators::summary_kernels::sum::SumAccumulator;
     use asap_sketchlib::KllSketch;
     use asap_types::enums::WindowKind;
+    use asap_types::sds::StoredOutputId;
     use asap_types::AggregationType;
 
     fn make_agg_config(
@@ -2086,7 +2087,7 @@ mod tests {
         configs: HashMap<u64, PrecomputeMaterialization>,
     ) -> crate::storage_engines::types::InstalledPrecomputePlanHandle {
         crate::storage_engines::types::InstalledPrecomputePlanHandle::new(
-            crate::storage_engines::types::InstalledPrecomputePlan::new(configs),
+            crate::storage_engines::types::InstalledPrecomputePlan::from_raw_ids(configs),
         )
     }
 

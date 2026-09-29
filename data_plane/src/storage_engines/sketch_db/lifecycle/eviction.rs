@@ -244,7 +244,10 @@ mod tests {
             id_to_fp.insert(id, fp);
             map.insert(fp, cfg);
         }
-        (Arc::new(InstalledPrecomputePlan::new(map)), id_to_fp)
+        (
+            Arc::new(InstalledPrecomputePlan::from_raw_ids(map)),
+            id_to_fp,
+        )
     }
 
     fn write_one(
@@ -263,7 +266,7 @@ mod tests {
             asap_types::PolicyFingerprint(agg_id),
         );
         let agg_cfg = installed_precompute_plan
-            .get_aggregation_config(agg_id)
+            .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
             .unwrap();
         // Test-scoped resolver — each call mints fresh. Production
         // shares one resolver across all sinks; tests don't need that

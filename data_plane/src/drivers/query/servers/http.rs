@@ -3274,7 +3274,7 @@ mod tests {
             marker_to_fp.insert(*marker, fp);
             agg_map.insert(fp, cfg);
         }
-        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::new(agg_map));
+        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::from_raw_ids(agg_map));
         let hot_reload = InstalledPrecomputePlanHandle::from_arc(installed_precompute_plan.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let summary_store = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
@@ -5418,10 +5418,10 @@ pub fn validate_and_build_runtime_plan(
         )
         .map_err(|error| format!("DAG execution installation failed: {error}"))?;
     let typed_fps: BTreeSet<_> = installed_precompute_plan
-        .materializations_by_policy_fingerprint
+        .materializations_by_output
         .keys()
         .copied()
-        .map(asap_types::PolicyFingerprint)
+        .map(asap_types::sds::StoredOutputId::fingerprint)
         .collect();
     request
         .query_plan
@@ -6245,7 +6245,8 @@ async fn handle_post_backfill_job(
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
     let snapshot = handle.snapshot();
-    let agg_cfg = match snapshot.get_aggregation_config(req.agg_id) {
+    let agg_cfg = match snapshot.get_aggregation_config(asap_types::sds::StoredOutputId(req.agg_id))
+    {
         Some(c) => c.clone(),
         None => {
             let body = serde_json::json!({

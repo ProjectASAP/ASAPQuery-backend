@@ -1046,10 +1046,9 @@ mod tests {
             name: "value".into(),
         });
         let hot = crate::storage_engines::types::InstalledPrecomputePlanHandle::from_arc(Arc::new(
-            crate::storage_engines::types::InstalledPrecomputePlan::new(HashMap::from([(
-                cfg.policy_fp_u64(),
-                cfg.clone(),
-            )])),
+            crate::storage_engines::types::InstalledPrecomputePlan::from_raw_ids(HashMap::from([
+                (cfg.policy_fp_u64(), cfg.clone()),
+            ])),
         ));
         let registry =
             Arc::new(crate::storage_engines::sketch_db::backfill::BackfillRegistry::new());
