@@ -163,6 +163,7 @@ use asap_types::Statistic;
 use std::collections::HashMap;
 
 /// Simple query engine for processing PromQL-like queries against precomputed data
+#[derive(Clone)]
 pub struct ASAPQueryEngine {
     #[allow(dead_code)]
     prometheus_scrape_interval: u64,
@@ -184,6 +185,31 @@ pub struct ASAPQueryEngine {
 }
 
 impl ASAPQueryEngine {
+    /// Pin before external-input preparation and retain the view for the entire
+    /// request, including all branches and all range evaluation timestamps.
+    fn pinned_for(
+        &self,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
+        entry: &asap_types::query_plan::QueryPlanEntry,
+        times: &[u64],
+    ) -> Result<Option<Self>, crate::query_engines::EngineError> {
+        let Some(index) = &self.summary_store else {
+            return Ok(None);
+        };
+        let Some(view) = crate::precompute_engine::revisions::pin_query(
+            index,
+            entry,
+            times,
+            physical.precompute_plan.summary_catalog.as_ref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut engine = self.clone();
+        engine.summary_store = Some(std::sync::Arc::new(view));
+        Ok(Some(engine))
+    }
+
     pub async fn execute_metricsql_at(
         &self,
         identity: &str,
@@ -202,11 +228,13 @@ impl ASAPQueryEngine {
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
-        let leaves = self
+        let pinned = self.pinned_for(&physical, planned, &[now_ms])?;
+        let engine = pinned.as_ref().unwrap_or(self);
+        let leaves = engine
             .prepare_query_inputs(&physical, planned, &[now_ms])
             .await?;
         let (mut result, mut stats) =
-            self.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
+            engine.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
         stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
         stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
         annotate_logical_execution(&mut result, &stats);
@@ -379,10 +407,21 @@ impl ASAPQueryEngine {
         crate::query_engines::EngineError,
     > {
         use crate::query_engines::EngineError;
-        let revision = self
+        let pinned = self
             .summary_store
             .as_ref()
-            .map(|index| index.summary_update_revision());
+            .map(|index| {
+                crate::precompute_engine::revisions::pin_query(
+                    index,
+                    entry,
+                    &[at],
+                    physical.precompute_plan.summary_catalog.as_ref(),
+                )
+            })
+            .transpose()?
+            .flatten();
+        let index = pinned.as_ref().or(self.summary_store.as_deref());
+        let revision = index.map(|index| index.summary_update_revision());
         let result = super::logical_dag::execute_installed(
             entry,
             leaves,
@@ -397,7 +436,7 @@ impl ASAPQueryEngine {
                     ..
                 }) = entry.nodes.get(&root)
                 {
-                    let index = self.summary_store.as_ref().ok_or_else(|| {
+                    let index = index.ok_or_else(|| {
                         EngineError::capability_miss("current_series", "summary store unavailable")
                     })?;
                     let values = index
@@ -447,7 +486,7 @@ impl ASAPQueryEngine {
                 subtree.instant.full_history = false;
                 subtree.instant.cumulative_readout = true;
                 let requirement = readiness_requirement(&subtree);
-                let index = self.summary_store.as_ref().ok_or_else(|| {
+                let index = index.ok_or_else(|| {
                     EngineError::capability_miss(
                         "installed_logical_dag",
                         "summary store unavailable",
@@ -528,10 +567,7 @@ impl ASAPQueryEngine {
                 ))
             },
         );
-        let current = self
-            .summary_store
-            .as_ref()
-            .map(|index| index.summary_update_revision());
+        let current = index.map(|index| index.summary_update_revision());
         if match (revision, current) {
             (Some(before), Some(after)) => !before.matches(after),
             (None, None) => false,
@@ -567,13 +603,15 @@ impl ASAPQueryEngine {
         let times: Vec<u64> = (0..=(end - start) / step)
             .map(|n| start + n * step)
             .collect();
-        let leaves = self.prepare_query_inputs(physical, entry, &times).await?;
+        let pinned = self.pinned_for(physical, entry, &times)?;
+        let engine = pinned.as_ref().unwrap_or(self);
+        let leaves = engine.prepare_query_inputs(physical, entry, &times).await?;
         let mut series =
             std::collections::BTreeMap::<Vec<(String, String)>, RangeVectorElement>::new();
         let mut total = super::logical_dag::ExecutionStats::default();
         let mut at = start;
         loop {
-            let (result, stats) = self.execute_logical_entry(physical, entry, &leaves, at)?;
+            let (result, stats) = engine.execute_logical_entry(physical, entry, &leaves, at)?;
             total.raw_scan_evaluations += stats.raw_scan_evaluations;
             total.summary_readout_evaluations += stats.summary_readout_evaluations;
             total.memo_hits += stats.memo_hits;
@@ -1005,14 +1043,16 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                let leaves = self
+                let pinned = self.pinned_for(&physical, entry, &[now_ms])?;
+                let engine = pinned.as_ref().unwrap_or(self);
+                let leaves = engine
                     .prepare_query_inputs(&physical, entry, &[now_ms])
                     .await
                     .map_err(|error| {
                         tracing::warn!(query, error = %error, "installed query DAG preparation failed");
                         error
                     })?;
-                let (mut result, mut stats) = self
+                let (mut result, mut stats) = engine
                     .execute_logical_entry(&physical, entry, &leaves, now_ms)
                     .map_err(|error| {
                         tracing::warn!(query, error = %error, "installed query DAG execution failed");
@@ -1154,7 +1194,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
 
 #[cfg(test)]
 mod sketch_query_tests {
-    // use crate::storage_engines::types::{CleanupPolicy, StreamingConfig};
+    // use crate::storage_engines::types::{CleanupPolicy, InstalledPrecomputePlan};
     // use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     // use crate::storage_engines::promsketch_store::PromSketchStore;
     // use crate::storage_engines::TimestampedBucketsMap;
@@ -1220,13 +1260,13 @@ mod sketch_query_tests {
 
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
 
     //     ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         Some(ps),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     )
@@ -1296,11 +1336,11 @@ mod sketch_query_tests {
     //     // Engine with promsketch_store = None
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     //     let engine = ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     );
@@ -1367,11 +1407,11 @@ mod sketch_query_tests {
     // fn test_sketch_range_returns_none_without_store() {
     //     let inference_config =
     //         InferenceConfig::new(::promql, CleanupPolicy::NoCleanup);
-    //     let streaming_config = Arc::new(StreamingConfig::default());
+    //     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::default());
     //     let engine = ASAPQueryEngine::new(
     //         Arc::new(NoOpStore),
     //         inference_config,
-    //         streaming_config,
+    //         installed_precompute_plan,
     //         15,
     //         ::promql,
     //     );
@@ -1470,11 +1510,11 @@ mod aux_pushdown_tests {
 
     fn make_engine() -> ASAPQueryEngine {
         use crate::storage_engines::types::{
-            CleanupPolicy, StreamingConfig, StreamingConfigHandle,
+            CleanupPolicy, InstalledPrecomputePlan, InstalledPrecomputePlanHandle,
         };
 
-        let sc = Arc::new(StreamingConfig::new(HashMap::new()));
-        let hr = StreamingConfigHandle::from_arc(sc.clone());
+        let sc = Arc::new(InstalledPrecomputePlan::new(HashMap::new()));
+        let hr = InstalledPrecomputePlanHandle::from_arc(sc.clone());
         let _ = sc;
         ASAPQueryEngine::new(60)
     }
@@ -1602,7 +1642,7 @@ mod asap_tier_classify_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchSampleState, SketchStore,
         SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{CleanupPolicy, StreamingConfigHandle};
+    use crate::storage_engines::types::{CleanupPolicy, InstalledPrecomputePlanHandle};
     use std::collections::{BTreeMap, BTreeSet};
 
     /// `sum by (zone) (http_requests_total)` end-to-end via the
@@ -1634,7 +1674,7 @@ mod asap_tier_classify_tests {
         for (i, zone) in zones.iter().enumerate() {
             let sid = 9000 + i as u64;
             idx.register(SummarySeriesMetadata {
-                sid,
+                storage_handle: sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -1725,7 +1765,7 @@ mod asap_tier_classify_tests {
         // Latest ASAPPlanner sizes an epsilon=0.01 KLL at k=269.
         let cfg = SketchConfig::Kll { k: 269 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
@@ -1763,7 +1803,7 @@ mod asap_tier_classify_tests {
         // Latest ASAPPlanner requires p=14 for a 1% HLL error target.
         let cfg = SketchConfig::Hll { precision: 14 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::CardinalityApprox),
@@ -2150,7 +2190,11 @@ mod asap_tier_classify_tests {
                 query: QueryReadout::Quantile { q: 0.99 },
             },
         );
-        let sids = idx.snapshot_instances().iter().map(|m| m.sid).collect();
+        let sids = idx
+            .snapshot_instances()
+            .iter()
+            .map(|m| m.storage_handle)
+            .collect();
         let engine = test_plan::engine(idx, config, sids, entry);
         engine.execute_at(query, now_ms).await.expect(
             "quantile_over_time over a Hit KLL sid must NOT capability-miss \
@@ -2280,7 +2324,7 @@ mod asap_tier_classify_tests {
         for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 14_000 + i as u64;
             idx.register(SummarySeriesMetadata {
-                sid,
+                storage_handle: sid,
                 metric_name: "http_requests_total".to_string(),
                 group_by_keys: ["zone".to_string()].into_iter().collect(),
                 capability: Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -2376,7 +2420,7 @@ mod asap_tier_classify_tests {
         // Matches ControlPlaneCostModel's epsilon=0.01 CMS sizing.
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         idx.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -2491,7 +2535,7 @@ mod outer_agg_integration_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
         SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::StreamingConfigHandle;
+    use crate::storage_engines::types::InstalledPrecomputePlanHandle;
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::MessagePackCodec;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2512,7 +2556,7 @@ mod outer_agg_integration_tests {
             relative_accuracy: 0.01,
         };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: group_by
                 .iter()
@@ -2619,7 +2663,7 @@ mod range_stitch_tests {
         AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
         SketchSampleState, SketchStore, SummarySeriesMetadata,
     };
-    use crate::storage_engines::types::{KeyByLabelValues, StreamingConfigHandle};
+    use crate::storage_engines::types::{InstalledPrecomputePlanHandle, KeyByLabelValues};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2653,7 +2697,7 @@ mod range_stitch_tests {
     fn cms_meta(sid: u64, metric: &str) -> SummarySeriesMetadata {
         let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
@@ -2778,7 +2822,7 @@ mod range_stitch_tests {
         .unwrap();
         active.envelope.expiry_unix_ms = None;
         let active = crate::storage_engines::types::ActivePhysicalPlanHandle::new(active);
-        let hot = StreamingConfigHandle::from_active_physical_plan(active.clone());
+        let hot = InstalledPrecomputePlanHandle::from_active_physical_plan(active.clone());
         let engine = ASAPQueryEngine::new(15).with_active_physical_plan(active);
         let error = engine
             .execute_metricsql_at(&identity, 1_000)

@@ -32,7 +32,7 @@ pub mod recovery;
 
 pub use config::SketchStorePersistenceConfig;
 pub use manifest::{Manifest, PartEntry};
-pub use metadata::{SidMetaRecord, SidMetadataStore};
+pub use metadata::{StoredOutputMetadataFile, StoredOutputMetadataRecord};
 pub use part::{PartId, PartReader, PartWriter, SnapshotEntry};
 pub use source::{EpochSource, SealedEpochRef};
 

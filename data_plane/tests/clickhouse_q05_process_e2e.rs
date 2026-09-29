@@ -1,6 +1,9 @@
 //! Optional OS-process E2E for a q05-class bounded SQL max query.
 //! Run with `CLICKHOUSE_URL=http://127.0.0.1:8123 cargo test -p data_plane --test clickhouse_q05_process_e2e`.
 
+#[path = "support/empty_physical_plan.rs"]
+mod empty_physical_plan;
+
 use control_plane::physical::compiler::{PlanEnvelope, BACKEND_COMPAT, PLANNER_REVISION};
 use planner_types::pre_asap::{Column, DataType, Schema};
 use std::io::Read;
@@ -196,18 +199,17 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
     while sql_port == http_port {
         sql_port = free_port();
     }
-    let streaming_config = format!(
-        "{}/examples/promql/streaming_config.yaml",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let mut physical = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut physical, &empty_physical_plan::empty()).unwrap();
+    let physical_path = physical.path().to_str().unwrap();
     let output_dir = tempfile::tempdir().unwrap();
     let output_dir_arg = output_dir.path().to_str().unwrap().to_owned();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command.args([
         "--http-port",
         &http_port.to_string(),
-        "--streaming-config",
-        &streaming_config,
+        "--physical-plan",
+        physical_path,
         "--clickhouse-http-port",
         &sql_port.to_string(),
         "--clickhouse-url",

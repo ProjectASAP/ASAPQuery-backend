@@ -1,8 +1,11 @@
+use asap_physical_operators::dag as execution;
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
+use futures::StreamExt;
 use planner_types::post_asap::PostAsapNodeId;
 use planner_types::post_asap::{
     EdgeRole, ExecutableDag, ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState,
 };
+use std::{cell::RefCell, rc::Rc};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -28,7 +31,15 @@ pub trait PrecomputeOperatorRegistry<V> {
     fn materialized_input(&self, _node: &ExecutableDagNode) -> Result<Option<V>, Self::Error> {
         Ok(None)
     }
-    fn execute(&self, node: &ExecutableDagNode, inputs: &[Arc<V>]) -> Result<V, Self::Error>;
+    fn output_bytes(&self, _value: &V) -> usize {
+        std::mem::size_of::<V>().max(1)
+    }
+    fn execute(
+        &self,
+        node: &ExecutableDagNode,
+        inputs: &[Arc<V>],
+        context: execution::RunContext,
+    ) -> Result<V, Self::Error>;
 }
 
 /// Atomic persistence boundary. Implementations must return the already
@@ -49,6 +60,7 @@ pub enum ScheduleError<OperatorError, SinkError> {
     Invalid(String),
     Operator(OperatorError),
     Sink(SinkError),
+    Execution(execution::Error),
 }
 
 /// Execute one precompute sink and its transitive dependencies in topological
@@ -62,34 +74,64 @@ pub fn execute_precompute_sink<V, R, S>(
     key: MaterializationCommitKey,
     registry: &R,
     sink: &S,
+    context: execution::RunContext,
 ) -> Result<Arc<V>, ScheduleError<R::Error, S::Error>>
 where
     R: PrecomputeOperatorRegistry<V>,
     S: IdempotentCommitSink<V>,
 {
-    if !matches!(binding.node(sink_node), Some(BackendNodeBinding::Materialization { stored_output }) if *stored_output == key.stored_output)
-    {
-        return Err(ScheduleError::Invalid(format!(
-            "commit key materialization {:?} does not match sink {}",
-            key.stored_output, sink_node.0
-        )));
+    let mut outputs =
+        execute_precompute_sinks(dag, binding, &[(sink_node, key)], registry, sink, context)?;
+    Ok(outputs.remove(0))
+}
+
+/// Evaluate all selected stored outputs with one dependency cache. Keys must
+/// describe the same input revision and window; only their output identity may
+/// differ. Validation finishes before executing or committing any output.
+pub fn execute_precompute_sinks<V, R, S>(
+    dag: &ExecutableDag,
+    binding: &BackendExecutableBinding,
+    outputs: &[(PostAsapNodeId, MaterializationCommitKey)],
+    registry: &R,
+    sink: &S,
+    context: execution::RunContext,
+) -> Result<Vec<Arc<V>>, ScheduleError<R::Error, S::Error>>
+where
+    R: PrecomputeOperatorRegistry<V>,
+    S: IdempotentCommitSink<V>,
+{
+    let mut unique = BTreeSet::new();
+    for (node, key) in outputs {
+        if !unique.insert(node.0)
+            || !binding.precompute_sinks.contains(node)
+            || !matches!(binding.node(*node), Some(BackendNodeBinding::Materialization { stored_output }) if *stored_output == key.stored_output)
+        {
+            return Err(ScheduleError::Invalid(
+                "commit key does not match a unique stored output binding".into(),
+            ));
+        }
+        let first = &outputs[0].1;
+        if (
+            key.plan_id,
+            key.plan_version,
+            key.window_start_ms,
+            key.window_end_ms,
+            &key.input_lineage,
+        ) != (
+            first.plan_id,
+            first.plan_version,
+            first.window_start_ms,
+            first.window_end_ms,
+            &first.input_lineage,
+        ) {
+            return Err(ScheduleError::Invalid(
+                "stored outputs require one evaluation window and input revision".into(),
+            ));
+        }
     }
     binding
         .validate_maintenance(dag)
         .map_err(ScheduleError::Invalid)?;
-    if !binding.precompute_sinks.contains(&sink_node)
-        || !matches!(
-            binding.node(sink_node),
-            Some(BackendNodeBinding::Materialization { .. })
-        )
-    {
-        return Err(ScheduleError::Invalid(
-            "node is not a precompute sink".into(),
-        ));
-    }
-    if let Some(committed) = sink.get(&key).map_err(ScheduleError::Sink)? {
-        return Ok(committed);
-    }
     let nodes = dag
         .nodes
         .iter()
@@ -131,66 +173,160 @@ where
         };
         inputs.insert(consumer, ordered);
     }
-    let mut active = BTreeSet::new();
-    let mut values = BTreeMap::<u32, Arc<V>>::new();
-    fn visit<V, R, OE, SE>(
-        id: u32,
-        nodes: &BTreeMap<u32, &ExecutableDagNode>,
-        inputs: &BTreeMap<u32, Vec<u32>>,
-        active: &mut BTreeSet<u32>,
-        values: &mut BTreeMap<u32, Arc<V>>,
-        registry: &R,
-    ) -> Result<(), ScheduleError<OE, SE>>
-    where
-        R: PrecomputeOperatorRegistry<V, Error = OE>,
-    {
-        if values.contains_key(&id) {
-            return Ok(());
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let error = Rc::new(RefCell::new(None));
+    let mut sources = BTreeMap::new();
+    for (node, key) in outputs {
+        if let Some(value) = sink.get(key).map_err(ScheduleError::Sink)? {
+            sources.insert(node.0, value);
         }
-        if !active.insert(id) {
-            return Err(ScheduleError::Invalid("precompute subDAG cycle".into()));
+    }
+    let committed = sources.keys().copied().collect::<BTreeSet<_>>();
+    let mut graph = execution::PhysicalDag::default();
+    let mut pending = outputs.iter().map(|(id, _)| id.0).collect::<Vec<_>>();
+    let mut added = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !added.insert(id) {
+            continue;
         }
-        let node = nodes
+        let node = *nodes
             .get(&id)
             .ok_or_else(|| ScheduleError::Invalid(format!("missing node {id}")))?;
-        if node.output_state == ExecutionDataState::QUERY_ROWS {
+        if node.output_state.timing == planner_types::post_asap::ExecutionTiming::QueryTime {
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
             )));
         }
-        if let Some(value) = registry
-            .materialized_input(node)
-            .map_err(ScheduleError::Operator)?
-        {
-            values.insert(id, Arc::new(value));
-            active.remove(&id);
-            return Ok(());
-        }
-        let child_ids = inputs.get(&id).cloned().unwrap_or_default();
-        for child in &child_ids {
-            visit(*child, nodes, inputs, active, values, registry)?;
-        }
-        let child_values = child_ids
+        let source = if let Some(value) = sources.remove(&id) {
+            Some(value)
+        } else {
+            registry
+                .materialized_input(node)
+                .map_err(ScheduleError::Operator)?
+                .map(Arc::new)
+        };
+        let children = if source.is_some() {
+            vec![]
+        } else {
+            inputs.get(&id).cloned().unwrap_or_default()
+        };
+        let schemas = children
             .iter()
-            .map(|child| Arc::clone(&values[child]))
-            .collect::<Vec<_>>();
-        let value = registry
-            .execute(node, &child_values)
-            .map_err(ScheduleError::Operator)?;
-        values.insert(id, Arc::new(value));
-        active.remove(&id);
-        Ok(())
+            .map(|child| {
+                nodes
+                    .get(child)
+                    .map(|n| n.output_schema.clone())
+                    .ok_or_else(|| ScheduleError::Invalid(format!("missing node {child}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        pending.extend(children.iter().copied());
+        graph
+            .add(
+                u64::from(id),
+                children.into_iter().map(u64::from).collect(),
+                IngestionOperator {
+                    node,
+                    registry,
+                    source,
+                    schemas,
+                    error: error.clone(),
+                },
+            )
+            .map_err(ScheduleError::Execution)?;
     }
-    visit(
-        sink_node.0,
-        &nodes,
-        &inputs,
-        &mut active,
-        &mut values,
-        registry,
-    )?;
-    sink.commit_if_absent(key, values.remove(&sink_node.0).unwrap())
-        .map_err(ScheduleError::Sink)
+    let roots = outputs
+        .iter()
+        .map(|(id, _)| u64::from(id.0))
+        .collect::<Vec<_>>();
+    let streams = graph
+        .execute(&roots, context)
+        .map_err(ScheduleError::Execution)?;
+    futures::executor::block_on(futures::future::try_join_all(
+        streams
+            .into_iter()
+            .zip(outputs)
+            .map(|(mut stream, (node, key))| {
+                let error = &error;
+                let committed = &committed;
+                async move {
+                    let result = stream.next().await.ok_or_else(|| {
+                        ScheduleError::Invalid("ingestion root produced no value".into())
+                    })?;
+                    let value = match result {
+                        Ok(value) => Arc::clone(value.value()),
+                        Err(failure) => {
+                            return Err(match error.borrow_mut().take() {
+                                Some(error) => ScheduleError::Operator(error),
+                                None => ScheduleError::Execution(failure),
+                            })
+                        }
+                    };
+                    if committed.contains(&node.0) {
+                        Ok(value)
+                    } else {
+                        sink.commit_if_absent(key.clone(), value)
+                            .map_err(ScheduleError::Sink)
+                    }
+                }
+            }),
+    ))
+}
+
+struct IngestionOperator<'a, V, R: PrecomputeOperatorRegistry<V>> {
+    node: &'a ExecutableDagNode,
+    registry: &'a R,
+    source: Option<Arc<V>>,
+    schemas: Vec<planner_types::post_asap::SummarySchema>,
+    error: Rc<RefCell<Option<R::Error>>>,
+}
+impl<V, R: PrecomputeOperatorRegistry<V>>
+    execution::PhysicalOperator<Arc<V>, planner_types::post_asap::SummarySchema>
+    for IngestionOperator<'_, V, R>
+{
+    fn name(&self) -> &str {
+        "InstalledIngestionOperator"
+    }
+    fn input_schemas(&self) -> Vec<planner_types::post_asap::SummarySchema> {
+        self.schemas.clone()
+    }
+    fn output_schema(&self) -> planner_types::post_asap::SummarySchema {
+        self.node.output_schema.clone()
+    }
+    fn output_bytes(&self, value: &Arc<V>) -> usize {
+        self.registry.output_bytes(value)
+    }
+    fn start<'a>(
+        &'a self,
+        inputs: Vec<execution::Input<'a, Arc<V>>>,
+        context: execution::RunContext,
+    ) -> Result<execution::OutputStream<'a, Arc<V>>, execution::Error> {
+        Ok(futures::stream::once(async move {
+            if let Some(source) = &self.source {
+                return Ok(Arc::clone(source));
+            }
+            let inputs =
+                futures::future::try_join_all(inputs.into_iter().map(|mut input| async move {
+                    input.next().await.ok_or_else(|| {
+                        execution::Error::Operator("ingestion input produced no value".into())
+                    })?
+                }))
+                .await?;
+            let values = inputs
+                .iter()
+                .map(|value| Arc::clone(value.value()))
+                .collect::<Vec<_>>();
+            self.registry
+                .execute(self.node, &values, context)
+                .map(Arc::new)
+                .map_err(|e| {
+                    *self.error.borrow_mut() = Some(e);
+                    execution::Error::Operator(format!("ingestion node {} failed", self.node.id.0))
+                })
+        })
+        .boxed_local())
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +338,78 @@ mod tests {
         WindowEdgeCompatibility,
     };
     use std::sync::Mutex;
+
+    fn test_context() -> execution::RunContext {
+        execution::RunContext::new(
+            execution::Scope::Ingestion {
+                window_start_ms: 10,
+                window_end_ms: 20,
+                revision: 1,
+            },
+            execution::Limits::default(),
+        )
+        .unwrap()
+    }
+
+    // Caller cancellation or exhaustion must terminate without committing state.
+    #[test]
+    fn caller_control_terminates_before_publication() {
+        for cancelled in [true, false] {
+            let context = execution::RunContext::new(
+                execution::Scope::Ingestion {
+                    window_start_ms: 10,
+                    window_end_ms: 20,
+                    revision: 1,
+                },
+                execution::Limits {
+                    max_bytes: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            if cancelled {
+                context.cancel();
+            }
+            let dag = ExecutableDag {
+                nodes: (0..4).map(node).collect(),
+                edges: vec![edge(0, 1), edge(1, 3)],
+                root: PostAsapNodeId(3),
+            };
+            let (dag, binding) = maintenance_only(dag, binding(), PostAsapNodeId(3));
+            let registry = Registry::default();
+            let sink = Sink::default();
+            let result = execute_precompute_sink(
+                &dag,
+                &binding,
+                PostAsapNodeId(3),
+                key(3),
+                &registry,
+                &sink,
+                context,
+            );
+            fn cause(error: &execution::Error) -> &execution::Error {
+                match error {
+                    execution::Error::AtNode { source, .. } => cause(source),
+                    error => error,
+                }
+            }
+            let Err(ScheduleError::Execution(error)) = result else {
+                panic!("expected a typed execution error, got {result:?}");
+            };
+            assert_eq!(
+                cause(&error),
+                if cancelled {
+                    &execution::Error::Cancelled
+                } else {
+                    &execution::Error::MemoryLimit
+                }
+            );
+            assert!(sink.0.lock().unwrap().is_empty());
+            if cancelled {
+                assert!(registry.0.lock().unwrap().is_empty());
+            }
+        }
+    }
 
     fn binding() -> BackendExecutableBinding {
         BackendExecutableBinding {
@@ -286,6 +494,7 @@ mod tests {
             &self,
             node: &ExecutableDagNode,
             inputs: &[Arc<u32>],
+            _context: execution::RunContext,
         ) -> Result<u32, Self::Error> {
             *self.0.lock().unwrap().entry(node.id.0).or_default() += 1;
             Ok(node.id.0 + inputs.iter().map(|v| **v).sum::<u32>())
@@ -324,6 +533,36 @@ mod tests {
         }
     }
 
+    // Two stored sinks in one evaluation reuse their shared upstream work.
+    #[test]
+    fn stored_sinks_share_one_evaluation() {
+        let mut query = node(4);
+        query.output_state = ExecutionDataState::QUERY_ROWS;
+        let dag = ExecutableDag {
+            nodes: vec![node(0), node(1), node(2), node(3), query],
+            edges: vec![edge(0, 1), edge(1, 2), edge(1, 3)],
+            root: PostAsapNodeId(4),
+        };
+        let mut bindings = binding();
+        bindings.precompute_sinks = vec![PostAsapNodeId(2), PostAsapNodeId(3)];
+        let (dag, bindings) = maintenance_only(dag, bindings, PostAsapNodeId(3));
+        let registry = Registry::default();
+        let sink = Sink::default();
+        execute_precompute_sinks(
+            &dag,
+            &bindings,
+            &[(PostAsapNodeId(2), key(2)), (PostAsapNodeId(3), key(3))],
+            &registry,
+            &sink,
+            test_context(),
+        )
+        .unwrap();
+        assert_eq!(
+            *registry.0.lock().unwrap(),
+            BTreeMap::from([(0, 1), (1, 1), (2, 1), (3, 1)])
+        );
+    }
+
     #[test]
     fn binary_operand_roles_survive_edge_reordering_and_reject_duplicates() {
         use planner_types::post_asap::BinaryOperator;
@@ -335,6 +574,7 @@ mod tests {
                 &self,
                 node: &ExecutableDagNode,
                 inputs: &[Arc<u32>],
+                _context: execution::RunContext,
             ) -> Result<u32, String> {
                 match node.id.0 {
                     0 => Ok(10),
@@ -375,6 +615,7 @@ mod tests {
                 key(3),
                 &Subtract,
                 &Sink::default(),
+                test_context(),
             )
         };
         assert_eq!(*execute(&dag).unwrap(), 7);
@@ -406,15 +647,29 @@ mod tests {
         let registry = Registry::default();
         let sink = Sink::default();
         let (dag, binding) = maintenance_only(dag, binding(), PostAsapNodeId(3));
-        let first =
-            execute_precompute_sink(&dag, &binding, PostAsapNodeId(3), key(3), &registry, &sink)
-                .unwrap();
+        let first = execute_precompute_sink(
+            &dag,
+            &binding,
+            PostAsapNodeId(3),
+            key(3),
+            &registry,
+            &sink,
+            test_context(),
+        )
+        .unwrap();
         assert_eq!(*first, 6);
         assert_eq!(registry.0.lock().unwrap().values().sum::<usize>(), 4);
 
-        let replay =
-            execute_precompute_sink(&dag, &binding, PostAsapNodeId(3), key(3), &registry, &sink)
-                .unwrap();
+        let replay = execute_precompute_sink(
+            &dag,
+            &binding,
+            PostAsapNodeId(3),
+            key(3),
+            &registry,
+            &sink,
+            test_context(),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&first, &replay));
         assert_eq!(registry.0.lock().unwrap().values().sum::<usize>(), 4);
     }
@@ -431,13 +686,14 @@ mod tests {
                 &self,
                 node: &ExecutableDagNode,
                 inputs: &[Arc<u32>],
+                context: execution::RunContext,
             ) -> Result<u32, String> {
                 assert_ne!(
                     node.id,
                     PostAsapNodeId(0),
                     "absorbed source subtree must not execute"
                 );
-                self.0.execute(node, inputs)
+                self.0.execute(node, inputs, context)
             }
         }
         let mut raw = node(0);
@@ -456,9 +712,16 @@ mod tests {
         let (dag, bindings) = maintenance_only(dag, bindings, PostAsapNodeId(3));
         let registry = FrontierRegistry(Registry::default());
         let sink = Sink::default();
-        let result =
-            execute_precompute_sink(&dag, &bindings, PostAsapNodeId(3), key(3), &registry, &sink)
-                .unwrap();
+        let result = execute_precompute_sink(
+            &dag,
+            &bindings,
+            PostAsapNodeId(3),
+            key(3),
+            &registry,
+            &sink,
+            test_context(),
+        )
+        .unwrap();
         assert_eq!(*result, 25);
         assert_eq!(
             *registry.0 .0.lock().unwrap(),
@@ -499,11 +762,18 @@ mod tests {
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
         assert!(matches!(
-            execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(1), &registry, &sink),
+            execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(1), &registry, &sink, test_context()),
+            Err(ScheduleError::Invalid(message)) if message.contains("query-owned node")
+        ));
+        let mut summary_dag = dag.clone();
+        summary_dag.nodes[0].output_state.primitive =
+            planner_types::post_asap::DataPrimitive::SummaryState;
+        assert!(matches!(
+            execute_precompute_sink(&summary_dag, &invalid_path_binding, PostAsapNodeId(1), key(1), &registry, &sink, test_context()),
             Err(ScheduleError::Invalid(message)) if message.contains("query-owned node")
         ));
         assert!(matches!(
-            execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(0), &registry, &sink),
+            execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(0), &registry, &sink, test_context()),
             Err(ScheduleError::Invalid(message)) if message.contains("does not match")
         ));
     }

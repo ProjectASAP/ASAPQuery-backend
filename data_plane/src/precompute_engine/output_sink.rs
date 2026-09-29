@@ -1,7 +1,7 @@
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::ingest_handler::IngestObservability;
 use crate::storage_engines::sketch_db::index::SketchStore;
-use crate::storage_engines::types::hot_reload_config::StreamingConfigHandle;
+use crate::storage_engines::types::hot_reload_config::InstalledPrecomputePlanHandle;
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,20 +45,14 @@ fn consume_in_order<T>(items: Vec<T>, mut persist: impl FnMut(&T) -> bool) -> us
     failed
 }
 
-/// Write completed precompute windows to the sid-keyed sketch store.
-///
-/// Read one streaming-config snapshot per batch and resolve each policy through
-/// its fingerprint. Consume accumulators in order so catch-up batches release
-/// each pane as soon as it is serialized.
+/// Publish completed windows using their selected output reference and complete
+/// plan/population/window address. Local row handles are checked against this
+/// address and cannot redirect a queued output to another stored summary.
 pub struct SketchStoreSink {
     summary_store: Arc<SketchStore>,
-    hot_reload: StreamingConfigHandle,
-    /// Single shared resolver across the ingest + precompute paths. Under
-    /// the registry-allocated sid model (PR-1..3), this is the canonical
-    /// mint authority — precompute sids share the same `next_sid` counter
-    /// as OTel-sketch sids, so the two paths can never collide on identity
-    /// even when the same `(metric, attrs)` carries both a sketch and an
-    /// exact precompute.
+    hot_reload: InstalledPrecomputePlanHandle,
+    /// Durable local-handle allocation keyed by the complete output population
+    /// identity. Shared with ingest and backfill so they address the same rows.
     series_resolver: Arc<SeriesIdResolver>,
     /// CQ-6 — optional handle to the shared `IngestObservability` so
     /// policy-miss drops land in the same counter the OTLP ingest path
@@ -73,7 +67,7 @@ pub struct SketchStoreSink {
 impl SketchStoreSink {
     pub fn new(
         summary_store: Arc<SketchStore>,
-        hot_reload: StreamingConfigHandle,
+        hot_reload: InstalledPrecomputePlanHandle,
         series_resolver: Arc<SeriesIdResolver>,
     ) -> Self {
         Self {
@@ -145,47 +139,41 @@ impl SketchStoreSink {
             }
         };
         let agg_cfg = &agg_cfg;
-        let resolver = self.series_resolver.clone();
+        let Some(reference) = cfg.stored_output_reference(output.policy_fp.into()) else {
+            return false;
+        };
+        let Some(start_ms) = i64::try_from(output.start_timestamp).ok() else {
+            return false;
+        };
+        let Some(end_ms) = i64::try_from(output.end_timestamp).ok() else {
+            return false;
+        };
+        let population = output.population_labels.clone().unwrap_or_else(|| {
+            agg_cfg
+                .grouping_labels
+                .iter()
+                .cloned()
+                .zip(output.key.clone().unwrap_or_default().labels)
+                .collect()
+        });
+        let (plan_id, plan_version) = output
+            .catalog_generation
+            .as_deref()
+            .map(|generation| (generation.plan_id, generation.plan_version))
+            .unwrap_or((0, 0));
+        let address = asap_types::sds::StoredSummaryKey {
+            plan_id,
+            plan_version,
+            stored_output_id: reference.stored_output_id,
+            population,
+            window: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
+        };
         let persist =
             |writer: &crate::storage_engines::sketch_db::index::SummaryPublicationWriter<'_>| {
-                if let Some(sid) = output.series_id {
-                    return writer
-                        .ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
-                        .inspect(|_| {
-                            crate::precompute_engine::metrics::record_materialized_outputs(1)
-                        });
-                }
-                self.summary_store
-                    .validate_routed_catalog_generation(output.catalog_generation.as_deref())
-                    .ok()?;
                 writer
-                    .ingest_precompute_for_agg_config(
-                        |metric, fp, ak| {
-                            resolver
-                                .resolve_with_reactivation(metric, fp, ak, |sid| {
-                                    self.summary_store.validate_routed_catalog_generation(
-                                        output.catalog_generation.as_deref(),
-                                    )?;
-                                    let activation =
-                                        self.summary_store.authorize_series_reactivation(
-                                            sid,
-                                            output.policy_fp.into(),
-                                        )?;
-                                    if let Some(generation) = &activation {
-                                        if output.catalog_generation.as_deref()
-                                            != Some(generation.as_ref())
-                                        {
-                                            return Err(
-                                            "unbound or stale output cannot reactivate a series"
-                                                .into(),
-                                        );
-                                        }
-                                    }
-                                    Ok(activation)
-                                })
-                                .map_err(|error| warn!(%error, "series reactivation rejected"))
-                                .ok()
-                        },
+                    .write_stored_summary(
+                        &address,
+                        &self.series_resolver,
                         agg_cfg,
                         output,
                         accumulator,
@@ -336,7 +324,7 @@ impl OutputSink for NoopOutputSink {
 mod tests {
     use super::*;
     use crate::storage_engines::sketch_db::index::{AggKind, SeriesLookup};
-    use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
+    use crate::storage_engines::types::{InstalledPrecomputePlan, KeyByLabelValues};
     use asap_physical_operators::summary_kernels::{DDSketchAccumulator, SumAccumulator};
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
@@ -427,8 +415,8 @@ mod tests {
         let agg_id = cfg.policy_fp_u64();
         let mut configs = HashMap::new();
         configs.insert(agg_id, cfg);
-        let streaming = StreamingConfig::new(configs);
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(configs);
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
 
         let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
@@ -453,7 +441,7 @@ mod tests {
             .list_by_status(crate::storage_engines::sketch_db::lifecycle::AggStatus::Active);
         assert_eq!(instances.len(), 1);
         let meta = instances[0].clone();
-        let sid = meta.sid;
+        let sid = meta.storage_handle;
         assert_eq!(summary_store.classify(sid), SeriesLookup::Hit);
         assert!(
             matches!(
@@ -496,7 +484,10 @@ mod tests {
             Arc::new(SeriesIdResolver::open(temporary.path().join("resolver.wal")).unwrap());
         let sink = SketchStoreSink::new(
             store.clone(),
-            StreamingConfigHandle::new(StreamingConfig::new(HashMap::from([(fingerprint.0, cfg)]))),
+            InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new(HashMap::from([(
+                fingerprint.0,
+                cfg,
+            )]))),
             resolver,
         );
         let original_generation = Arc::new(catalog.reference().unwrap());
@@ -513,7 +504,7 @@ mod tests {
             .emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(11.0)))])
             .is_err());
         let mut stale_output = output();
-        stale_output.series_id = Some(old_sid);
+        stale_output.storage_handle = Some(old_sid);
         stale_output.catalog_generation = Some(Arc::new(catalog.reference().unwrap()));
         let mut next = catalog;
         next.plan_version += 1;
@@ -544,7 +535,7 @@ mod tests {
             .emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(101.0)))])
             .is_err());
         let mut stale_routed_output = output();
-        stale_routed_output.series_id = Some(new_sid);
+        stale_routed_output.storage_handle = Some(new_sid);
         assert!(sink
             .emit_batch(vec![(
                 stale_routed_output,
@@ -552,7 +543,7 @@ mod tests {
             )])
             .is_err());
         let mut missing_generation = PrecomputedOutput::new(1000, 2000, None, fingerprint);
-        missing_generation.series_id = Some(new_sid);
+        missing_generation.storage_handle = Some(new_sid);
         assert!(sink
             .emit_batch(vec![(
                 missing_generation,
@@ -575,8 +566,9 @@ mod tests {
         cfg.parameters
             .insert("alpha".into(), serde_json::json!(0.01));
         let policy_fp = cfg.policy_fp_u64();
-        let hot_reload =
-            StreamingConfigHandle::new(StreamingConfig::new(HashMap::from([(policy_fp, cfg)])));
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new(
+            HashMap::from([(policy_fp, cfg)]),
+        ));
         let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
             summary_store.clone(),
@@ -604,9 +596,14 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(summary_store.query_range(meta.sid, 1_000, 2_000).len(), 1);
+        assert_eq!(
+            summary_store
+                .query_range(meta.storage_handle, 1_000, 2_000)
+                .len(),
+            1
+        );
         assert!(summary_store
-            .query_exact_agg_range(meta.sid, 1_000, 2_000)
+            .query_exact_agg_range(meta.storage_handle, 1_000, 2_000)
             .is_empty());
     }
 
@@ -614,8 +611,8 @@ mod tests {
     fn sketch_index_sink_reports_unknown_policy_as_failure() {
         // Streaming config does NOT contain agg_id=99 — the sink
         // reports a recoverable error rather than acknowledging a lost write.
-        let streaming = StreamingConfig::new(HashMap::new());
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(HashMap::new());
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
         let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
             summary_store.clone(),
@@ -635,8 +632,8 @@ mod tests {
     /// handle wired in, the `dropped_policy_miss` counter must tick.
     #[test]
     fn sink_increments_policy_miss_counter_on_registry_miss() {
-        let streaming = StreamingConfig::new(HashMap::new());
-        let hot_reload = StreamingConfigHandle::new(streaming.clone());
+        let streaming = InstalledPrecomputePlan::new(HashMap::new());
+        let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
         let summary_store = Arc::new(SketchStore::new());
         let obs = Arc::new(IngestObservability::new());
         let sink = SketchStoreSink::new(

@@ -541,6 +541,48 @@ fn execute_physical_query_payload(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    // Pin once for every branch; publication cannot switch a later read to r2.
+    let revisions = index
+        .revisions
+        .read()
+        .map_err(|_| LoweringSkip::ExecuteFailed("revision installation poisoned".into()))?
+        .clone();
+    let view = if let Some(revisions) = revisions {
+        let required = entry
+            .materialization_bindings()
+            .into_iter()
+            .map(|b| b.stored_output_reference.stored_output_id)
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| LoweringSkip::ExecuteFailed(e.to_string()))?
+            .as_millis() as u64;
+        let ranges: Vec<_> = entry
+            .materialization_bindings()
+            .into_iter()
+            .map(|b| (b.materialization, t0_ms, t1_ms))
+            .collect();
+        Some(
+            revisions
+                .query_view(
+                    &required,
+                    now,
+                    &ranges,
+                    index
+                        .active_catalog_generation()
+                        .as_deref()
+                        .ok_or_else(|| {
+                            LoweringSkip::ExecuteFailed(
+                                "query revision requires a catalog generation".into(),
+                            )
+                        })?,
+                )
+                .map_err(|e| LoweringSkip::ExecuteFailed(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let index = view.as_ref().unwrap_or(index);
     let revision = index.summary_update_revision();
     let result = (|| {
         let runtime = PhysicalQueryRuntime {
@@ -758,7 +800,7 @@ mod tests {
         let mut group_by_keys = std::collections::BTreeSet::new();
         group_by_keys.insert("service".to_string());
         idx.register(SummarySeriesMetadata {
-            sid,
+            storage_handle: sid,
             metric_name: "unique_users".to_string(),
             group_by_keys,
             capability: Some(Capability::CardinalityApprox),
@@ -800,7 +842,7 @@ mod tests {
             relative_accuracy: 0.01,
         };
         idx.register(SummarySeriesMetadata {
-            sid: 1,
+            storage_handle: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
@@ -1030,7 +1072,7 @@ mod tests {
         let idx = SketchStore::new();
         idx.register(
             crate::storage_engines::sketch_db::index::SummarySeriesMetadata {
-                sid: 1,
+                storage_handle: 1,
                 metric_name: "bytes_total".to_string(),
                 group_by_keys: std::collections::BTreeSet::new(),
                 capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1129,7 +1171,7 @@ mod tests {
                     idx.install_summary_catalog(std::sync::Arc::new(plan.summary_catalog.clone()))
                         .unwrap();
                     idx.register(SummarySeriesMetadata {
-                        sid: 7,
+                        storage_handle: 7,
                         metric_name: "a".into(),
                         group_by_keys: Default::default(),
                         capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1201,7 +1243,7 @@ mod tests {
         idx.install_summary_catalog(std::sync::Arc::new(plan.summary_catalog.clone()))
             .unwrap();
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "a".into(),
             group_by_keys: Default::default(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1271,7 +1313,7 @@ mod tests {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
@@ -1374,7 +1416,7 @@ mod tests {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(777);
         idx.register(SummarySeriesMetadata {
-            sid: 7,
+            storage_handle: 7,
             metric_name: "requests_total".into(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Rate)),

@@ -4,7 +4,7 @@
 //!
 //! Split out of `asap_types`'s former `capability_matching` module (see
 //! `scratchpad/artifacts/enum-unification-plan.md`). `StorageBackend` and
-//! the `StreamingConfig` wire format it's a field of both turned out to
+//! the `InstalledPrecomputePlan` wire format it's a field of both turned out to
 //! have zero real `control_plane` dependency either — see
 //! [`crate::storage_engines::types::storage_backend`]'s module doc — so
 //! both moved into this crate; only the routing *decision* below was ever

@@ -124,38 +124,18 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create log directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    let materialization = asap_types::PrecomputeMaterialization::new(
-        asap_types::AggregationType::DDSketch,
-        String::new(),
-        std::collections::HashMap::from([("relative_accuracy".into(), serde_json::json!(0.01))]),
-        asap_types::KeyByLabelNames::new(vec!["service".into()]),
-        asap_types::KeyByLabelNames::empty(),
-        asap_types::KeyByLabelNames::empty(),
-        String::new(),
-        1,
-        1,
-        asap_types::WindowKind::Tumbling,
-        String::new(),
-        "component_process_e2e_latency_ms".into(),
-        None,
-        None,
-        None,
-    );
-    let install = physical_fixture::artifact_from_materializations(vec![materialization]);
-    serde_yaml::to_writer(
-        &mut config,
-        &serde_json::json!({"precompute_plan": install.precompute_plan}),
-    )
-    .unwrap();
+    let install =
+        physical_fixture::artifact_from_materializations(vec![physical_fixture::materialization(
+            "component_process_e2e_latency_ms",
+            asap_types::AggregationType::DDSketch,
+            [("relative_accuracy".into(), serde_json::json!(0.01))].into(),
+        )]);
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--physical-plan")
         .arg(physical.path())
-        .arg("--streaming-config")
-        .arg(config.path())
         .arg("--http-port")
         .arg(query_port.to_string())
         .arg("--output-dir")

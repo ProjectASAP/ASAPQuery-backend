@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use super::flusher::{FlusherHandle, FlusherShared};
 use super::manifest::PartEntry;
-use super::metadata::SidMetaRecord;
+use super::metadata::StoredOutputMetadataRecord;
 use super::part::{part_dir_path, PartReader, PartWriter};
 use super::source::{EpochSnapshot, EpochSnapshotEntry};
 use super::{PersistError, PersistResult};
@@ -29,12 +29,15 @@ fn invalid(message: &str) -> PersistError {
     PersistError::Format(message.into())
 }
 
-fn validate_identity(current: &SidMetaRecord, record: &SidMetaRecord) -> PersistResult<()> {
-    if current.sid != record.sid
+fn validate_identity(
+    current: &StoredOutputMetadataRecord,
+    record: &StoredOutputMetadataRecord,
+) -> PersistResult<()> {
+    if current.storage_handle != record.storage_handle
         || current.removed
         || current.retired_at_ms.is_some()
         || current.expires_at_ms.is_some()
-        || current.stored_output_id != record.stored_output_id
+        || current.stored_output_reference != record.stored_output_reference
         || current.summary_definition_id != record.summary_definition_id
         || current.catalog_generation != record.catalog_generation
         || current.metric_name != record.metric_name
@@ -101,7 +104,7 @@ impl FlusherHandle {
     }
     pub fn publish_immutable_window(
         &self,
-        record: &SidMetaRecord,
+        record: &StoredOutputMetadataRecord,
         input_digest: [u8; 32],
         snapshot: &EpochSnapshot,
     ) -> PersistResult<ImmutableWindowPublication> {
@@ -121,13 +124,13 @@ impl FlusherShared {
     /// randomized sketch again. This never creates or replaces a payload.
     pub fn lookup_immutable_window(
         &self,
-        record: &SidMetaRecord,
+        record: &StoredOutputMetadataRecord,
         input_digest: [u8; 32],
         start_ms: u64,
         end_ms: u64,
     ) -> PersistResult<Option<ImmutableWindowPublication>> {
         self.sid_metadata.transaction(|records, _| {
-            let Some(current) = records.get(&record.sid.to_string()) else {
+            let Some(current) = records.get(&record.storage_handle.to_string()) else {
                 return Ok(None);
             };
             validate_identity(current, record)?;
@@ -140,7 +143,7 @@ impl FlusherShared {
             if previous.input_digest != input_digest {
                 return Err(invalid("immutable lookup input lineage differs"));
             }
-            self.validate_reserved_part(record.sid, previous)?;
+            self.validate_reserved_part(record.storage_handle, previous)?;
             if !self
                 .manifest
                 .live_parts()
@@ -160,16 +163,16 @@ impl FlusherShared {
     /// input and payload. This does not guarantee source availability after GC.
     pub fn publish_immutable_window(
         &self,
-        record: &SidMetaRecord,
+        record: &StoredOutputMetadataRecord,
         input_digest: [u8; 32],
         snapshot: &EpochSnapshot,
     ) -> PersistResult<ImmutableWindowPublication> {
-        if snapshot.agg_id != record.sid || record.removed {
+        if snapshot.agg_id != record.storage_handle || record.removed {
             return Err(invalid("immutable publication SID is invalid or removed"));
         }
         let payload_digest = fingerprint(snapshot)?;
         self.sid_metadata.transaction(|records, metadata| {
-            let key = record.sid.to_string();
+            let key = record.storage_handle.to_string();
             let mut current = records.get(&key).cloned().unwrap_or_else(|| record.clone());
             validate_identity(&current, record)?;
             // Completion fences window ends. An advancing overlapping full
@@ -192,7 +195,7 @@ impl FlusherShared {
                         "completed immutable retry differs from latest publication",
                     ));
                 }
-                self.validate_reserved_part(record.sid, previous)?;
+                self.validate_reserved_part(record.storage_handle, previous)?;
                 if !self
                     .manifest
                     .live_parts()
@@ -237,7 +240,7 @@ impl FlusherShared {
             if path.exists() {
                 // Never overwrite a reserved part silently: callers can recover a
                 // durable part without sources; damaged/partial parts fail closed.
-                self.validate_reserved_part(record.sid, &reservation)?;
+                self.validate_reserved_part(record.storage_handle, &reservation)?;
             } else {
                 PartWriter::write_part(&path, reservation.part_id, std::slice::from_ref(snapshot))?;
                 std::fs::File::open(
@@ -245,7 +248,7 @@ impl FlusherShared {
                         .ok_or_else(|| invalid("missing parts parent"))?,
                 )?
                 .sync_all()?;
-                self.validate_reserved_part(record.sid, &reservation)?;
+                self.validate_reserved_part(record.storage_handle, &reservation)?;
             }
             self.finish_reserved_part(&mut current, &reservation)?;
             records.insert(key, current);
@@ -261,12 +264,15 @@ impl FlusherShared {
     /// validation. A different pending input cannot be acknowledged by this call.
     pub fn resume_matching_immutable_window(
         &self,
-        record: &SidMetaRecord,
+        record: &StoredOutputMetadataRecord,
         input_digest: [u8; 32],
         start_ms: u64,
         end_ms: u64,
     ) -> PersistResult<Option<ImmutableWindowPublication>> {
-        self.resume_immutable_window(record.sid, Some((record, input_digest, start_ms, end_ms)))
+        self.resume_immutable_window(
+            record.storage_handle,
+            Some((record, input_digest, start_ms, end_ms)),
+        )
     }
 
     /// Complete a pending durable part without reconstructing its source input.
@@ -282,7 +288,7 @@ impl FlusherShared {
     fn resume_immutable_window(
         &self,
         sid: u64,
-        expected: Option<(&SidMetaRecord, [u8; 32], u64, u64)>,
+        expected: Option<(&StoredOutputMetadataRecord, [u8; 32], u64, u64)>,
     ) -> PersistResult<Option<ImmutableWindowPublication>> {
         self.sid_metadata.transaction(|records, metadata| {
             let key = sid.to_string();
@@ -359,7 +365,7 @@ impl FlusherShared {
 
     fn finish_reserved_part(
         &self,
-        current: &mut SidMetaRecord,
+        current: &mut StoredOutputMetadataRecord,
         pending: &ImmutableOutputReservation,
     ) -> PersistResult<()> {
         let path = part_dir_path(&self.cfg.disk_path.join("parts"), pending.part_id);
@@ -435,8 +441,8 @@ mod tests {
         )
         .unwrap()
     }
-    fn record() -> SidMetaRecord {
-        SidMetaRecord::new(
+    fn record() -> StoredOutputMetadataRecord {
+        StoredOutputMetadataRecord::new(
             1,
             "derived".into(),
             vec![],

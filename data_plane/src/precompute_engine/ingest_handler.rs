@@ -1,6 +1,6 @@
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::types::StreamingConfigHandle;
+use crate::storage_engines::types::InstalledPrecomputePlanHandle;
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,7 +121,7 @@ pub struct IngestState {
     /// Hot-reloadable streaming config. On each ingest batch, the
     /// router snapshots the latest config to derive agg_configs.
     /// This replaces the old frozen `Vec<Arc<PrecomputeMaterialization>>`.
-    pub hot_reload_config: StreamingConfigHandle,
+    pub hot_reload_config: InstalledPrecomputePlanHandle,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
     /// Per-series reconstructed sketch bases, keyed by series identity. Full frames
@@ -156,10 +156,10 @@ impl IngestState {
     /// configs from a `POST /api/v1/streaming-config` swap are
     /// visible immediately without restart.
     ///
-    /// Returns the shared `Arc<StreamingConfig>` — no cloning of
+    /// Returns the shared `Arc<InstalledPrecomputePlan>` — no cloning of
     /// individual PrecomputeMaterialization objects, just an atomic refcount
     /// increment (~5ns).
-    pub fn config_snapshot(&self) -> Arc<crate::storage_engines::types::StreamingConfig> {
+    pub fn config_snapshot(&self) -> Arc<crate::storage_engines::types::InstalledPrecomputePlan> {
         self.hot_reload_config.snapshot()
     }
 
@@ -293,7 +293,7 @@ fn extract_group_key(
 mod tests {
     use super::*;
     use crate::precompute_engine::series_router::SeriesRouter;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -336,9 +336,9 @@ mod tests {
 
         let mut map = std::collections::HashMap::new();
         map.insert(agg_id, make_config(agg_id, metric));
-        let streaming = StreamingConfig::new(map);
+        let streaming = InstalledPrecomputePlan::new(map);
         let hot_reload =
-            crate::storage_engines::types::StreamingConfigHandle::new(streaming.clone());
+            crate::storage_engines::types::InstalledPrecomputePlanHandle::new(streaming.clone());
 
         let state = Arc::new(IngestState {
             router,

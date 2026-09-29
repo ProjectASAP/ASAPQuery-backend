@@ -59,8 +59,6 @@ pub use precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
 pub use precompute_engine::output_sink::SketchStoreSink;
 pub use precompute_engine::PrecomputeEngine;
 
-pub use utils::read_streaming_config;
-
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[cfg(test)]

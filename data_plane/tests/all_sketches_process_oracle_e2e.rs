@@ -6,7 +6,6 @@
 //! answers are independently computed from those raw fixtures.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,7 +59,6 @@ struct Backend {
     client: reqwest::Client,
     query_base: String,
     otlp_url: String,
-    _config: tempfile::NamedTempFile,
     _output_dir: tempfile::TempDir,
 }
 
@@ -114,18 +112,9 @@ async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) 
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
+    let mut physical = tempfile::NamedTempFile::new().unwrap();
     let mut install =
         physical_fixture::artifact_from_materializations(vec![materialization.clone()]);
-    serde_yaml::to_writer(
-        &mut config,
-        &serde_json::json!({
-            "precompute_plan": install.precompute_plan,
-        }),
-    )
-    .unwrap();
-    config.flush().unwrap();
-    let mut physical = tempfile::NamedTempFile::new().unwrap();
     for rule in &mut install.transmission_plan.rules {
         if matches!(
             install
@@ -148,8 +137,6 @@ async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) 
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command
-        .arg("--streaming-config")
-        .arg(config.path())
         .arg("--physical-plan")
         .arg(physical.path())
         .arg("--http-port")
@@ -189,7 +176,6 @@ async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) 
                 client,
                 query_base,
                 otlp_url: format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"),
-                _config: config,
                 _output_dir: output_dir,
             };
         }
@@ -296,23 +282,10 @@ fn scalar_values(response: &Value) -> Vec<(HashMap<String, String>, f64)> {
 }
 
 fn config(metric: &str, kind: &str, parameters: &str) -> asap_types::PrecomputeMaterialization {
-    use asap_types::{KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-    PrecomputeMaterialization::new(
+    physical_fixture::materialization(
+        metric,
         kind.parse().unwrap(),
-        String::new(),
         serde_yaml::from_str(parameters).unwrap(),
-        KeyByLabelNames::new(vec!["service".into()]),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        String::new(),
-        1,
-        1,
-        WindowKind::Tumbling,
-        String::new(),
-        metric.into(),
-        None,
-        None,
-        None,
     )
 }
 

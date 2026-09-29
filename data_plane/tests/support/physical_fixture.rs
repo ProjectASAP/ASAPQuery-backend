@@ -4,22 +4,42 @@
 use control_plane::{physical::compiler::*, query_plan::*};
 use data_plane::{
     drivers::query::servers::http::PhysicalPlanInstallRequest,
-    storage_engines::types::{ActivePhysicalPlan, BackendStorageRouting, StreamingConfig},
+    storage_engines::types::{ActivePhysicalPlan, BackendStorageRouting, InstalledPrecomputePlan},
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
-    artifact_from_materializations(
-        config
-            .materializations_by_policy_fingerprint
-            .values()
-            .cloned()
-            .collect(),
+/// Imported-state fixtures bind explicit storage metadata, never a flat runtime config.
+#[allow(dead_code)]
+pub fn materialization(
+    metric: &str,
+    family: asap_types::AggregationType,
+    parameters: std::collections::HashMap<String, serde_json::Value>,
+) -> asap_types::PrecomputeMaterialization {
+    asap_types::PrecomputeMaterialization::new(
+        family,
+        String::new(),
+        parameters,
+        asap_types::KeyByLabelNames::new(vec!["service".into()]),
+        asap_types::KeyByLabelNames::empty(),
+        asap_types::KeyByLabelNames::empty(),
+        String::new(),
+        1,
+        1,
+        asap_types::enums::WindowKind::Tumbling,
+        String::new(),
+        metric.into(),
+        None,
+        None,
+        None,
     )
 }
 
+pub fn artifact(config: &InstalledPrecomputePlan) -> PhysicalPlanInstallRequest {
+    artifact_from_materializations(config.materializations().values().cloned().collect())
+}
+
 /// Same as [`artifact`], but from materializations the planner produced
-/// directly — no legacy `StreamingConfig` document in between.
+/// directly — no legacy `InstalledPrecomputePlan` document in between.
 pub fn artifact_from_materializations(
     mut configs: Vec<asap_types::PrecomputeMaterialization>,
 ) -> PhysicalPlanInstallRequest {
@@ -184,7 +204,7 @@ pub fn artifact_from_materializations(
 #[allow(dead_code)]
 pub fn bootstrap() -> ActivePhysicalPlan {
     let mut plan = data_plane::drivers::query::servers::http::build_active_physical_plan(
-        artifact(&StreamingConfig::default()),
+        artifact(&InstalledPrecomputePlan::default()),
         Arc::new(BackendStorageRouting::empty()),
     )
     .unwrap();

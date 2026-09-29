@@ -501,7 +501,7 @@ impl WorkloadRegistry {
     /// Inject (or replace, keyed by `metric_name`) a runtime workload entry.
     /// Used by the autonomous-allocation apply path to register a synthesized
     /// monitor so the next replan/repost emits it into the backend
-    /// `StreamingConfig` (the coordinator then derives the ε-floor `p`). Shared
+    /// `InstalledPrecomputePlan` (the coordinator then derives the ε-floor `p`). Shared
     /// across registry clones via the `Arc<RwLock<…>>` overlay.
     pub fn insert_runtime(&self, entry: WorkloadEntry) {
         let mut rt = self

@@ -59,7 +59,7 @@ pub enum PhysicalExpr {
     /// Phase ε.1 Mode 2: no sketch processor at the edge — raw OTLP
     /// forwards to the backend, which builds the sketch at ingest. The
     /// `family` and `params` are the sketch the backend will build, so
-    /// the backend's `StreamingConfig` `aggregation_input` is `raw` for
+    /// the backend's `InstalledPrecomputePlan` `aggregation_input` is `raw` for
     /// this metric.
     RawAtEdgeSketchAtBackend {
         /// Sketch family the backend will build at ingest.

@@ -42,7 +42,7 @@ pub(crate) struct FlusherShared {
     /// Per-sid metadata sidecar — upserted on every flush so recovery can
     /// re-register disk-resident sids as queryable instances. See
     /// [`super::metadata`].
-    pub sid_metadata: Arc<super::metadata::SidMetadataStore>,
+    pub sid_metadata: Arc<super::metadata::StoredOutputMetadataFile>,
     pub next_part_id: AtomicU64,
     pub shutdown: AtomicBool,
     /// Woken by the insert path when it hits `hard_cap_bytes` and by
@@ -77,7 +77,9 @@ impl FlusherHandle {
     where
         S: EpochSource + 'static,
     {
-        let metadata = Arc::new(super::metadata::SidMetadataStore::new(&cfg.disk_path));
+        let metadata = Arc::new(super::metadata::StoredOutputMetadataFile::new(
+            &cfg.disk_path,
+        ));
         Self::start_with_metadata(cfg, manifest, source, metadata)
     }
 
@@ -85,7 +87,7 @@ impl FlusherHandle {
         cfg: SketchStorePersistenceConfig,
         manifest: Arc<Manifest>,
         source: Arc<S>,
-        sid_metadata: Arc<super::metadata::SidMetadataStore>,
+        sid_metadata: Arc<super::metadata::StoredOutputMetadataFile>,
     ) -> PersistResult<Self>
     where
         S: EpochSource + 'static,
@@ -134,7 +136,7 @@ impl FlusherHandle {
         })
     }
 
-    pub(crate) fn metadata_store(&self) -> Arc<super::metadata::SidMetadataStore> {
+    pub(crate) fn metadata_store(&self) -> Arc<super::metadata::StoredOutputMetadataFile> {
         Arc::clone(&self.inner.sid_metadata)
     }
 
@@ -345,7 +347,7 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
             // is durable whenever the part it describes is. A sidecar write
             // failure must NOT abort the flush (the part is already durable)
             // — log and continue; recovery degrades to live-ingest re-register.
-            let sid_meta: Vec<super::metadata::SidMetaRecord> = {
+            let sid_meta: Vec<super::metadata::StoredOutputMetadataRecord> = {
                 let mut seen = std::collections::HashSet::new();
                 snapshots
                     .iter()

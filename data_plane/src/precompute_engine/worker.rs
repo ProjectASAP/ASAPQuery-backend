@@ -5,7 +5,7 @@ use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::storage_engines::types::{
-    AggregateCore, KeyByLabelValues, PrecomputedOutput, StreamingConfigHandle,
+    AggregateCore, InstalledPrecomputePlanHandle, KeyByLabelValues, PrecomputedOutput,
 };
 #[cfg(test)]
 use crate::tests::accumulator_fixture::create_fixture_accumulator;
@@ -39,6 +39,7 @@ use tracing::{debug, debug_span, info, warn};
 struct GroupState {
     program: Option<Arc<super::raw_dag::RawDagProgram>>,
     series_id: u64,
+    stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
     catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     input_revisions: BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     config: Arc<PrecomputeMaterialization>,
@@ -151,6 +152,10 @@ pub struct WorkerRuntimeConfig {
 /// `(metric, attrs_fingerprint, agg_kind_canonical)` identity contract on
 /// `SeriesIdResolver`, so one sid uniquely names one bucket.
 pub struct Worker {
+    maintenance_storage: Option<(
+        Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    )>,
     erp_observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
     current_input_revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
     current_catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
@@ -163,7 +168,7 @@ pub struct Worker {
     /// Hot-reload handle — workers read config directly from ArcSwap
     /// instead of holding a local copy. All components see the same
     /// config at the same time.
-    hot_reload: StreamingConfigHandle,
+    hot_reload: InstalledPrecomputePlanHandle,
     /// Allowed lateness in ms.
     allowed_lateness_ms: i64,
     /// When true, skip aggregation and pass raw samples through.
@@ -189,6 +194,48 @@ pub struct Worker {
 }
 
 impl Worker {
+    pub fn set_maintenance_storage(
+        &mut self,
+        store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+        resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    ) {
+        self.maintenance_storage = Some((store, resolver));
+    }
+
+    fn complete_dag(
+        &self,
+        plan: &crate::storage_engines::types::RuntimePhysicalPlan,
+    ) -> Result<(), String> {
+        if !plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .any(|output| output.derived_input.is_some())
+        {
+            return Ok(());
+        }
+        // The installed locality proof assigns derived graphs to one owner.
+        // Every raw input of this graph was routed to that same worker.
+        if plan.installed_precompute_plan.partitioning
+            != super::partitioning::DagPartitioning::SingleWorker
+        {
+            return Err("derived DAG has no validated local partitioning rule".into());
+        }
+        if self.id != 0 {
+            return Ok(());
+        }
+        let (store, resolver) = self
+            .maintenance_storage
+            .as_ref()
+            .ok_or("worker has no maintenance storage bindings")?;
+        super::maintenance_runtime::execute_finite_maintenance(
+            store,
+            resolver,
+            &plan.precompute_plan,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn set_erp_observer(
         &mut self,
         observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
@@ -200,7 +247,7 @@ impl Worker {
         id: usize,
         receiver: mpsc::Receiver<WorkerMessage>,
         output_sink: Arc<dyn OutputSink>,
-        hot_reload: StreamingConfigHandle,
+        hot_reload: InstalledPrecomputePlanHandle,
         runtime_config: WorkerRuntimeConfig,
         group_count: Arc<AtomicUsize>,
         worker_watermark: Arc<AtomicI64>,
@@ -215,6 +262,7 @@ impl Worker {
             wall_clock_max_open_grace_period_ms,
         } = runtime_config;
         Self {
+            maintenance_storage: None,
             erp_observer: None,
             current_input_revision: None,
             current_catalog_generation: None,
@@ -251,6 +299,18 @@ impl Worker {
 
         let mut processing_error: Option<String> = None;
         while let Some(msg) = self.receiver.recv().await {
+            // A failed execution cannot publish a later batch or hide failure
+            // behind a successful drain. The engine must be restarted explicitly.
+            if let Some(error) = &processing_error {
+                match msg {
+                    WorkerMessage::Drain(reply) | WorkerMessage::CompleteDag { reply, .. } => {
+                        let _ = reply.send(Err(error.clone()));
+                    }
+                    WorkerMessage::Shutdown => break,
+                    _ => {}
+                }
+                continue;
+            }
             let msg = match msg {
                 WorkerMessage::BoundInput {
                     input,
@@ -263,6 +323,7 @@ impl Worker {
                     {
                         processing_error =
                             Some("input receipt differs from captured generation".into());
+                        self.receiver.close();
                         continue;
                     }
                     self.current_catalog_generation = Some(generation);
@@ -382,12 +443,30 @@ impl Worker {
                     if let Err(error) = &result {
                         processing_error = Some(error.clone());
                     }
+                    if processing_error.is_some() {
+                        self.receiver.close();
+                    }
                     let _ = reply.send(processing_error.clone().map_or(Ok(()), Err));
+                }
+                WorkerMessage::CompleteDag { plan, reply } => {
+                    let result = match &processing_error {
+                        Some(error) => Err(error.clone()),
+                        None => self.complete_dag(&plan),
+                    };
+                    if let Err(error) = &result {
+                        processing_error = Some(error.clone());
+                    }
+                    if processing_error.is_some() {
+                        self.receiver.close();
+                    }
+                    let _ = reply.send(result);
                 }
                 WorkerMessage::Shutdown => {
                     info!("Worker {} shutting down", self.id);
                     if let Err(e) = self.flush_all() {
                         warn!("Worker {} final flush error: {}", self.id, e);
+                        self.receiver.close();
+                        break;
                     }
                     // Force-close any windows still open after the final flush.
                     // The wall-clock fallback may not yet be due for a one-shot
@@ -398,6 +477,11 @@ impl Worker {
                     }
                     break;
                 }
+            }
+            if processing_error.is_some() {
+                // Reject new queue reservations; otherwise ingestion could
+                // acknowledge data that this failed worker will never execute.
+                self.receiver.close();
             }
         }
 
@@ -416,7 +500,7 @@ impl Worker {
     /// hot-reload snapshot the first time we see this sid; `group_key` is
     /// remembered on the `GroupState` for emit-time label rendering.
     ///
-    /// Reads config directly from the `StreamingConfigHandle`
+    /// Reads config directly from the `InstalledPrecomputePlanHandle`
     /// ArcSwap handle, so new policies from a config swap are visible
     /// immediately — no message passing, no delay.
     /// Returns None if `policy_fp` has no matching config (e.g. arrived
@@ -437,6 +521,7 @@ impl Worker {
             let gs = GroupState {
                 program,
                 series_id: sid,
+                stored_output_reference: snap.stored_output_reference(policy_fp.into()),
                 catalog_generation: self.current_catalog_generation.clone(),
                 input_revisions: BTreeMap::new(),
                 window_manager: WindowManager::with_layout(
@@ -643,6 +728,7 @@ impl Worker {
                                 &state.input_revisions,
                                 state.series_id,
                                 state.catalog_generation.as_ref(),
+                                state.stored_output_reference.clone(),
                             );
                             emit_batch.push((output, updater.take_accumulator()));
                             debug!(
@@ -719,6 +805,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference.clone(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -850,6 +937,7 @@ impl Worker {
                             &state.input_revisions,
                             state.series_id,
                             state.catalog_generation.as_ref(),
+                            state.stored_output_reference.clone(),
                         );
                         emit_batch.push((output, incoming.clone_boxed_core()));
                     }
@@ -898,6 +986,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference.clone(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -916,6 +1005,7 @@ impl Worker {
                     &state.input_revisions,
                     state.series_id,
                     state.catalog_generation.as_ref(),
+                    state.stored_output_reference.clone(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -1101,6 +1191,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1118,6 +1209,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1207,6 +1299,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1224,6 +1317,7 @@ impl Worker {
                         &state.input_revisions,
                         state.series_id,
                         state.catalog_generation.as_ref(),
+                        state.stored_output_reference.clone(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1346,10 +1440,12 @@ fn precomputed_output_for_group(
     input_revisions: &BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     series_id: u64,
     catalog_generation: Option<&Arc<asap_types::sds::CatalogGeneration>>,
+    stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
 ) -> PrecomputedOutput {
     let mut output = PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
         .with_population_labels(population_labels_from_group_key(group_key));
-    output.series_id = Some(series_id);
+    output.storage_handle = Some(series_id);
+    output.stored_output_reference = stored_output_reference;
     output.catalog_generation = catalog_generation.cloned();
     output.input_revision = i64::try_from(start_timestamp)
         .ok()
@@ -1874,7 +1970,7 @@ mod tests {
 
     use crate::precompute_engine::config::LateDataPolicy;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_physical_operators::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
     use asap_physical_operators::summary_kernels::keyed_sum_count::KeyedSumCountAccumulator;
     use asap_physical_operators::summary_kernels::sum::SumAccumulator;
@@ -1981,16 +2077,16 @@ mod tests {
         )
     }
 
-    /// Build a fresh `StreamingConfigHandle` from a map of agg_id
+    /// Build a fresh `InstalledPrecomputePlanHandle` from a map of agg_id
     /// → PrecomputeMaterialization. Worker::new takes this handle instead of
     /// the old `HashMap<u64, Arc<PrecomputeMaterialization>>`. Tests use this
     /// helper instead of constructing the handle inline at every
     /// callsite.
     fn make_hot_reload(
         configs: HashMap<u64, PrecomputeMaterialization>,
-    ) -> crate::storage_engines::types::StreamingConfigHandle {
-        crate::storage_engines::types::StreamingConfigHandle::new(
-            crate::storage_engines::types::StreamingConfig::new(configs),
+    ) -> crate::storage_engines::types::InstalledPrecomputePlanHandle {
+        crate::storage_engines::types::InstalledPrecomputePlanHandle::new(
+            crate::storage_engines::types::InstalledPrecomputePlan::new(configs),
         )
     }
 
@@ -2758,14 +2854,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: worker from streaming_config YAML
+    // Test: worker from installed_precompute_plan YAML
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_worker_rejects_flat_streaming_config_yaml() {
         let data =
             serde_yaml::from_str("aggregations: [{aggregationType: Sum, metric: m}]").unwrap();
-        assert!(StreamingConfig::from_yaml_data(&data).is_err());
+        assert!(
+            serde_yaml::from_value::<asap_types::precompute_plan::PrecomputePlan>(data).is_err()
+        );
     }
 
     #[test]
@@ -2827,6 +2925,7 @@ mod tests {
             &group,
             &BTreeMap::new(),
             1,
+            None,
             None,
         );
         assert_eq!(
@@ -4085,15 +4184,16 @@ mod tests {
         task.await.unwrap();
     }
 
-    // A sink failure remains visible on repeated barriers after panes were consumed.
+    // A failed publication must close admission and never publish later input.
     #[tokio::test]
-    async fn finite_input_drain_does_not_hide_sink_failure_on_retry() {
-        struct FailedSink;
+    async fn failed_worker_rejects_admission_and_never_retries_publication() {
+        struct FailedSink(AtomicUsize);
         impl OutputSink for FailedSink {
             fn emit_batch(
                 &self,
                 _: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
             ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
                 Err("deliberate sink failure".into())
             }
         }
@@ -4113,7 +4213,8 @@ mod tests {
             0,
             LateDataPolicy::Drop,
         );
-        worker.output_sink = Arc::new(FailedSink);
+        let failed = Arc::new(FailedSink(AtomicUsize::new(0)));
+        worker.output_sink = failed.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         worker.receiver = rx;
         let task = tokio::spawn(worker.run());
@@ -4126,17 +4227,85 @@ mod tests {
         })
         .await
         .unwrap();
-        for _ in 0..2 {
-            let (ack, completed) = tokio::sync::oneshot::channel();
-            tx.send(WorkerMessage::Drain(ack)).await.unwrap();
-            assert!(completed
-                .await
-                .unwrap()
-                .unwrap_err()
-                .contains("deliberate sink failure"));
-        }
-        tx.send(WorkerMessage::Shutdown).await.unwrap();
+        let (ack, completed) = tokio::sync::oneshot::channel();
+        tx.send(WorkerMessage::Drain(ack)).await.unwrap();
+        assert!(completed
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("deliberate sink failure"));
+        assert!(
+            tx.send(WorkerMessage::GroupSamples {
+                sid: 1,
+                policy_fp: PolicyFingerprint(1),
+                group_key: test_group_key(""),
+                samples: group_samples("cpu", vec![(21000, 4.0)]),
+                ingest_received_at: std::time::Instant::now(),
+            })
+            .await
+            .is_err(),
+            "failed workers must reject new admission"
+        );
         task.await.unwrap();
+        assert_eq!(
+            failed.0.load(Ordering::SeqCst),
+            1,
+            "a failed worker must not process later input or publish during shutdown"
+        );
+    }
+
+    // A failed final flush must not be followed by publishing newer open panes.
+    #[tokio::test]
+    async fn shutdown_stops_after_its_first_publication_failure() {
+        struct FailedSink(AtomicUsize);
+        impl OutputSink for FailedSink {
+            fn emit_batch(
+                &self,
+                _: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(Box::new(asap_physical_operators::dag::Error::MemoryLimit))
+            }
+        }
+        let config = make_agg_config(
+            1,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            10,
+            0,
+            vec![],
+        );
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            Arc::new(CapturingOutputSink::new()),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        let clock = Arc::new(AtomicI64::new(0));
+        let read_clock = clock.clone();
+        worker.set_now_ms_fn(Box::new(move || read_clock.load(Ordering::SeqCst)));
+        worker.wall_clock_idle_grace_period_ms = 1;
+        for (sid, now) in [(1, 0), (2, 10000)] {
+            clock.store(now, Ordering::SeqCst);
+            worker
+                .process_group_samples(
+                    sid,
+                    PolicyFingerprint(1),
+                    &test_group_key(""),
+                    group_samples("cpu", vec![(1000, 2.0)]),
+                )
+                .unwrap();
+        }
+        clock.store(15000, Ordering::SeqCst);
+        let sink = Arc::new(FailedSink(AtomicUsize::new(0)));
+        worker.output_sink = sink.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        worker.receiver = rx;
+        tx.send(WorkerMessage::Shutdown).await.unwrap();
+        worker.run().await;
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4280,7 +4449,7 @@ mod tests {
 mod dag_execution_tests {
     use super::*;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
-    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::types::InstalledPrecomputePlan;
     use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
     use asap_types::query_plan::ExactReadout;
 
@@ -4296,6 +4465,110 @@ mod dag_execution_tests {
         crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap()
+    }
+
+    // Real router/engine queues preserve every partition's result as concurrency changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn installed_dag_results_match_with_one_and_four_workers() {
+        use crate::precompute_engine::{config::PrecomputeEngineConfig, engine::PrecomputeEngine};
+        async fn execute(query: &str, workers: usize) -> BTreeMap<(Vec<u8>, u64, u64), Vec<u8>> {
+            let physical = plan(query);
+            assert_eq!(
+                physical.precompute_plan.materializations.len(),
+                1,
+                "{query}"
+            );
+            let config = physical.precompute_plan.materializations[0].clone();
+            let runtime =
+                InstalledPrecomputePlan::from_precompute_plan(physical.precompute_plan).unwrap();
+            let rule = runtime.partitioning.clone();
+            let sink = Arc::new(CapturingOutputSink::new());
+            let engine = PrecomputeEngine::new(
+                PrecomputeEngineConfig {
+                    num_workers: workers,
+                    allowed_lateness_ms: 10_000,
+                    wall_clock_idle_grace_period_ms: 0,
+                    wall_clock_max_open_grace_period_ms: 0,
+                    ..Default::default()
+                },
+                InstalledPrecomputePlanHandle::new(runtime),
+                sink.clone(),
+                Arc::new(crate::drivers::ingest::series_resolver::SeriesIdResolver::new()),
+                Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            );
+            let ingest = engine.ingest_state();
+            let diagnostics = engine.diagnostics();
+            let running = tokio::spawn(engine.run());
+            let mut messages = Vec::new();
+            for population in 0..64 {
+                let label = format!("service-{population}");
+                messages.push(WorkerMessage::GroupSamples {
+                    sid: population + 1,
+                    policy_fp: config.policy_fingerprint(),
+                    group_key: Arc::new(GroupKey::new([("service", label.as_str())])),
+                    samples: [
+                        (1000, 10.0),
+                        (2000, 20.0),
+                        (3000, 3.0),
+                        (4000, 9.0),
+                        (5000, 12.0),
+                    ]
+                    .into_iter()
+                    .map(|(t, value)| {
+                        (
+                            format!("{}{{service=\"{}\"}}", config.metric, label),
+                            t,
+                            value,
+                        )
+                    })
+                    .collect(),
+                    ingest_received_at: std::time::Instant::now(),
+                });
+            }
+            ingest
+                .router
+                .route_group_batch(messages, std::time::Instant::now(), None)
+                .await
+                .unwrap();
+            ingest.router.drain().await.unwrap();
+            if workers > 1 && rule != super::super::partitioning::DagPartitioning::SingleWorker {
+                assert!(
+                    diagnostics
+                        .worker_group_counts
+                        .iter()
+                        .filter(|n| n.load(Ordering::Relaxed) > 0)
+                        .count()
+                        > 1,
+                    "the test must exercise multiple workers"
+                );
+            }
+            ingest.router.shutdown().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let mut records = BTreeMap::new();
+            for (output, state) in sink.drain() {
+                let key = (
+                    output.key.unwrap().serialize_to_bytes(),
+                    output.start_timestamp,
+                    output.end_timestamp,
+                );
+                assert!(
+                    records.insert(key, state.serialize_to_bytes()).is_none(),
+                    "duplicate output"
+                );
+            }
+            assert!(!records.is_empty());
+            records
+        }
+        for query in [
+            "sum_over_time(asap_demo_gauge[5s])",
+            "rate(asap_demo_counter_total[5s])",
+        ] {
+            assert_eq!(execute(query, 1).await, execute(query, 4).await, "{query}");
+        }
     }
 
     // A selected producer must govern updates, persisted family, and query readout.
@@ -4333,17 +4606,15 @@ mod dag_execution_tests {
                 .expect("ASAP producer required")
                 .clone();
             let fp = config.policy_fingerprint();
-            let streaming = StreamingConfig::from_precompute_plan(plan.precompute_plan).unwrap();
-            let doc = serde_json::to_value(&streaming).unwrap();
-            assert!(doc.get("aggregation_configs").is_none());
-            let streaming: StreamingConfig = serde_json::from_value(doc).unwrap();
+            let streaming =
+                InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan).unwrap();
             let sink = Arc::new(CapturingOutputSink::new());
             let (_tx, rx) = mpsc::channel(8);
             let mut worker = Worker::new(
                 0,
                 rx,
                 sink.clone(),
-                StreamingConfigHandle::new(streaming),
+                InstalledPrecomputePlanHandle::new(streaming),
                 WorkerRuntimeConfig {
                     max_buffer_per_series: 100,
                     allowed_lateness_ms: 10_000,
@@ -4415,13 +4686,15 @@ mod dag_execution_tests {
     // A flat config and a DAG whose producer no longer matches its binding cannot install.
     #[test]
     fn execution_requires_matching_dag_producer() {
-        assert!(serde_json::from_value::<StreamingConfig>(
-            serde_json::json!({"aggregation_configs":{}})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<asap_types::precompute_plan::PrecomputePlan>(
+                serde_json::json!({"aggregation_configs":{}})
+            )
+            .is_err()
+        );
         let mut plan = plan("rate(asap_demo_counter_total[5s])").precompute_plan;
         plan.executable_dags.clear();
-        assert!(StreamingConfig::from_precompute_plan(plan)
+        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
             .to_string()
             .contains("DAG producer"));
@@ -4447,9 +4720,9 @@ mod dag_execution_tests {
         .unwrap();
         installed.document.schema_version =
             asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
-        let error = StreamingConfig::from_precompute_plan(plan)
+        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
             .unwrap_err()
-            .to_string();
-        assert!(error.contains("update"), "{error}");
+            .to_string()
+            .contains("update"));
     }
 }

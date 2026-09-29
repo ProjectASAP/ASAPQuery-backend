@@ -112,7 +112,7 @@ fn sketch_meta(
     config: SketchConfig,
 ) -> SummarySeriesMetadata {
     SummarySeriesMetadata {
-        sid,
+        storage_handle: sid,
         metric_name: "bench_metric".into(),
         group_by_keys: BTreeSet::new(),
         capability: Some(match algorithm {
@@ -134,7 +134,7 @@ fn sketch_meta(
 
 fn precompute_meta(sid: u64, metric: &str, agg_type: AggregationType) -> SummarySeriesMetadata {
     SummarySeriesMetadata {
-        sid,
+        storage_handle: sid,
         metric_name: metric.to_string(),
         group_by_keys: BTreeSet::new(),
         capability: None,
@@ -390,12 +390,14 @@ fn bench_query_precomputes_by_agg(c: &mut Criterion) {
     g.finish();
 }
 
-/// Build a `StreamingConfig` whose single agg-config's content
+/// Build a `InstalledPrecomputePlan` whose single agg-config's content
 /// signature matches every sid registered by `build_precompute_store`
 /// (metric / `Sum` / no grouping / empty params+filter). With this
 /// config the reconciler retires nothing — the steady-state ingest
 /// case, where the per-batch reconcile is pure scan overhead.
-fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types::StreamingConfig {
+fn matching_streaming_config(
+    metric: &str,
+) -> data_plane::storage_engines::types::InstalledPrecomputePlan {
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType as AT;
@@ -419,9 +421,14 @@ fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types
         None,
         None,
     );
-    let mut map = HashMap::new();
-    map.insert(1u64, cfg);
-    data_plane::storage_engines::types::StreamingConfig::new(map)
+    let runtime = data_plane::storage_engines::types::InstalledPrecomputePlan::default();
+    let plan = control_plane::physical::compiler::PrecomputePlan::build(
+        runtime.plan().envelope.clone(),
+        vec![cfg],
+        &[],
+    )
+    .unwrap();
+    data_plane::storage_engines::types::InstalledPrecomputePlan::from_precompute_plan(plan).unwrap()
 }
 
 /// `reconcile_from_streaming_config` ran on EVERY ingest batch and, in

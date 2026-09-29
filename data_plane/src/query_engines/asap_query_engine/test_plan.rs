@@ -178,7 +178,7 @@ pub(super) fn bound_reference(
         .iter()
         .filter(|m| !m.policy_fp.is_unset())
         .map(|m| {
-            let (summary, data) = index.descriptors_for_series_id(m.sid).unwrap();
+            let (summary, data) = index.descriptors_for_series_id(m.storage_handle).unwrap();
             (m.policy_fp, (*summary).clone(), (*data).clone())
         })
         .collect::<Vec<_>>();

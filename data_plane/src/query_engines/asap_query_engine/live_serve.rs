@@ -150,7 +150,7 @@ mod tests {
         let idx = SketchStore::new();
         let policy = asap_types::PolicyFingerprint(901);
         idx.register(SummarySeriesMetadata {
-            sid: 9,
+            storage_handle: 9,
             metric_name: "bytes".into(),
             group_by_keys: std::collections::BTreeSet::new(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),

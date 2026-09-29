@@ -9,7 +9,7 @@
 //!      by `asapedgeprocessor.ThresholdConfig`). The edge derives the agg_id
 //!      from the metric name itself, so this block carries no agg_id.
 //!   2. [`streaming_config_monitor_entry`] — the `monitors[]` JSON object for the
-//!      backend `StreamingConfig` (consumed by `asap_types::MonitorSpec`), where
+//!      backend `InstalledPrecomputePlan` (consumed by `asap_types::MonitorSpec`), where
 //!      `agg_id` IS carried and MUST equal [`agg_id_for_metric`].
 //!
 //! The functions are pure so they can be unit-tested and called from whichever
@@ -88,7 +88,7 @@ pub fn edge_threshold_block(intent: &MonitorIntent) -> Value {
     Value::Mapping(m)
 }
 
-/// Render the backend `StreamingConfig.monitors[]` JSON entry for this intent,
+/// Render the backend `InstalledPrecomputePlan.monitors[]` JSON entry for this intent,
 /// stamping the cross-language `agg_id`.
 pub fn streaming_config_monitor_entry(intent: &MonitorIntent) -> serde_json::Value {
     serde_json::json!({

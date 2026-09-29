@@ -61,6 +61,10 @@ pub struct PrometheusRemoteWriteConfig {
     pub max_samples: usize,
     pub dedup_horizon: Duration,
     pub max_dedup_entries: usize,
+    pub revisions: Option<(
+        std::path::PathBuf,
+        crate::precompute_engine::revisions::RevisionPolicy,
+    )>,
 }
 
 impl Default for PrometheusRemoteWriteConfig {
@@ -72,6 +76,7 @@ impl Default for PrometheusRemoteWriteConfig {
             max_samples: 1_000_000,
             dedup_horizon: Duration::from_secs(10 * 60),
             max_dedup_entries: 2_000_000,
+            revisions: None,
         }
     }
 }
@@ -144,6 +149,8 @@ pub enum RemoteWriteError {
     InactivePhysicalPlan,
     #[error("series identity admission failed: {0}")]
     SeriesIdentity(String),
+    #[error("continuous revision execution failed: {0}")]
+    Revision(#[source] crate::precompute_engine::revisions::RevisionError),
     #[error(transparent)]
     Backpressure(#[from] TryRouteError),
 }
@@ -161,6 +168,19 @@ pub struct CanonicalSample {
 
 impl PrometheusRemoteWriteReceiver {
     pub fn new(config: PrometheusRemoteWriteConfig, ingest: Arc<IngestState>) -> Self {
+        if let Some((directory, policy)) = &config.revisions {
+            *ingest
+                .summary_store
+                .revisions
+                .write()
+                .expect("revision installation poisoned") = Some(Arc::new(
+                crate::precompute_engine::revisions::RevisionRuntime::new(
+                    directory.clone(),
+                    policy.clone(),
+                    ingest.hot_reload_config.clone(),
+                ),
+            ));
+        }
         Self {
             inner: Arc::new(ReceiverInner {
                 config,
@@ -190,6 +210,12 @@ impl PrometheusRemoteWriteReceiver {
 
     /// Permanently seal this finite source before queuing worker barriers.
     pub async fn drain(&self) -> Result<(), String> {
+        if self.inner.config.revisions.is_some() {
+            return Err(
+                "continuous input uses revisable snapshots; it cannot be sealed by a finite drain"
+                    .into(),
+            );
+        }
         {
             let mut state = self.inner.dedup.lock().map_err(|e| e.to_string())?;
             state.input_closed = true;
@@ -233,11 +259,7 @@ impl PrometheusRemoteWriteReceiver {
         if plan.precompute_plan.summary_catalog.as_ref() != Some(&generation) {
             return Err("finite maintenance generation changed during drain".into());
         }
-        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
-            &self.inner.ingest.summary_store,
-            &self.inner.ingest.series_resolver,
-            &plan.precompute_plan,
-        )?;
+        self.inner.ingest.router.complete_dag(plan).await?;
         if let Some(observer) = self.inner.ingest.router.erp_observer() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -314,6 +336,23 @@ impl PrometheusRemoteWriteReceiver {
             .expect("remote write dedup poisoned");
         if dedup.input_closed {
             return Err(RemoteWriteError::InputClosed);
+        }
+        if let Some(runtime) = self
+            .inner
+            .ingest
+            .summary_store
+            .revisions
+            .read()
+            .map_err(|_| RemoteWriteError::Revision("revision installation poisoned".into()))?
+            .clone()
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| RemoteWriteError::Revision(e.into()))?
+                .as_millis() as u64;
+            self.accept_revision(&runtime, samples, now_ms)
+                .map_err(RemoteWriteError::Revision)?;
+            return Ok(());
         }
         let batch_max_timestamp_ms = samples.iter().map(|sample| sample.timestamp_ms).max();
         let max_event_timestamp_ms = match (dedup.max_event_timestamp_ms, batch_max_timestamp_ms) {
@@ -676,7 +715,7 @@ fn route_messages(
         Arc<crate::precompute_engine::group_key::GroupKey>,
     );
     type RoutedSample = (String, i64, f64);
-    let snapshot = physical_plan.streaming_config.clone();
+    let snapshot = physical_plan.installed_precompute_plan.clone();
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest.summary_store.as_ref(),
         &snapshot,
@@ -766,30 +805,14 @@ fn route_messages(
                 &computed_attrs_fp
             };
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
-            // A sketch family is not a complete physical identity. Two
-            // materializations may use the same family and grouping while
-            // differing in update semantics (for example count- versus
-            // value-weighted Top-K). Keep those states on distinct SIDs.
-            let materialization_kind =
-                crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
             let sid = ingest
-                .series_resolver
-                .resolve_with_reactivation(&config.metric, attrs_fp, &materialization_kind, |sid| {
-                    ingest.summary_store.validate_routed_catalog_generation(
-                        physical_plan.precompute_plan.summary_catalog.as_ref(),
-                    )?;
-                    let activation = ingest
-                        .summary_store
-                        .authorize_series_reactivation(sid, policy_fp.into())?;
-                    if let Some(generation) = &activation {
-                        if physical_plan.precompute_plan.summary_catalog.as_ref()
-                            != Some(generation.as_ref())
-                        {
-                            return Err("stale routed generation cannot reactivate series".into());
-                        }
-                    }
-                    Ok(activation)
-                })
+                .summary_store
+                .resolve_output_storage_handle(
+                    &ingest.series_resolver,
+                    policy_fp.into(),
+                    attrs_fp,
+                    physical_plan.precompute_plan.summary_catalog.as_ref(),
+                )
                 .map_err(RemoteWriteError::SeriesIdentity)?;
             buckets
                 .entry(sid)
@@ -936,8 +959,8 @@ mod tests {
     use crate::precompute_engine::ingest_handler::IngestObservability;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::types::{
-        ActivePhysicalPlanHandle, BackendStorageRouting, RuntimePhysicalPlan, StreamingConfig,
-        StreamingConfigHandle,
+        ActivePhysicalPlanHandle, BackendStorageRouting, InstalledPrecomputePlan,
+        InstalledPrecomputePlanHandle, RuntimePhysicalPlan,
     };
     use tokio::sync::mpsc;
 
@@ -947,7 +970,7 @@ mod tests {
             .unwrap()
     }
 
-    fn physical_config(streaming: StreamingConfig) -> StreamingConfigHandle {
+    fn physical_config(streaming: InstalledPrecomputePlan) -> InstalledPrecomputePlanHandle {
         use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
             IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
@@ -1014,11 +1037,13 @@ mod tests {
                 },
                 rules: Vec::new(),
             },
-            streaming_config: Arc::new(streaming),
+            installed_precompute_plan: Arc::new(streaming),
             query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
-        StreamingConfigHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(active))
+        InstalledPrecomputePlanHandle::from_active_physical_plan(ActivePhysicalPlanHandle::new(
+            active,
+        ))
     }
 
     fn receiver(config: PrometheusRemoteWriteConfig) -> PrometheusRemoteWriteReceiver {
@@ -1027,7 +1052,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: physical_config(StreamingConfig::default()),
+            hot_reload_config: physical_config(InstalledPrecomputePlan::default()),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -1069,7 +1094,7 @@ mod tests {
             value_source_column: None,
         };
         let policy_fp = aggregation.policy_fp_u64();
-        let streaming = StreamingConfig::new(HashMap::from([(policy_fp, aggregation)]));
+        let streaming = InstalledPrecomputePlan::new(HashMap::from([(policy_fp, aggregation)]));
         let (sender, receiver) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -1107,7 +1132,7 @@ mod tests {
         let mut config = snapshot.precompute_plan.materializations[0].clone();
         config.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
         config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
-        let hot = physical_config(StreamingConfig::new(HashMap::from([(
+        let hot = physical_config(InstalledPrecomputePlan::new(HashMap::from([(
             config.policy_fp_u64(),
             config.clone(),
         )])));
@@ -1223,7 +1248,7 @@ mod tests {
         assert_ne!(kll_fp, pooled_kll_fp);
         let cms_fp = cms.policy_fingerprint();
         let counter_fp = counter.policy_fingerprint();
-        let streaming = StreamingConfig::new(HashMap::from([
+        let streaming = InstalledPrecomputePlan::new(HashMap::from([
             (cms_fp.0, cms),
             (counter_fp.0, counter),
             (kll_fp.0, kll),
@@ -1389,7 +1414,9 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: StreamingConfigHandle::new(StreamingConfig::default()),
+            hot_reload_config: InstalledPrecomputePlanHandle::new(
+                InstalledPrecomputePlan::default(),
+            ),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -1697,4 +1724,258 @@ mod tests {
             vec![("requests_total{job=\"api\"}".into(), 100, 4.0)]
         );
     }
+}
+
+impl PrometheusRemoteWriteReceiver {
+    fn accept_revision(
+        &self,
+        runtime: &crate::precompute_engine::revisions::RevisionRuntime,
+        samples: Vec<CanonicalSample>,
+        now_ms: u64,
+    ) -> Result<u64, crate::precompute_engine::revisions::RevisionError> {
+        use crate::precompute_engine::revisions::{encode_state, InputSample, RevisionRecord};
+        use crate::precompute_engine::{raw_dag::RawDagProgram, window_manager::WindowManager};
+        use asap_types::sds::StoredOutputId;
+        let (plan, store) = runtime.installed()?;
+        let generation = plan
+            .precompute_plan
+            .summary_catalog
+            .as_ref()
+            .ok_or("revision catalog missing")?;
+        let max_window = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .map(|c| c.window_size.saturating_mul(1000))
+            .max()
+            .unwrap_or(0);
+        let query_history = plan
+            .query_plan
+            .entries
+            .values()
+            .map(|entry| entry.instant.lookback_ms)
+            .max()
+            .unwrap_or(0);
+        let planned_retention = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .filter_map(|c| {
+                c.num_aggregates_to_retain
+                    .map(|n| n.saturating_mul(c.slide_interval).saturating_mul(1000))
+            })
+            .max()
+            .unwrap_or(0);
+        let current_series_history = plan
+            .query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.nodes.values())
+            .filter_map(|node| match node {
+                asap_types::query_plan::QueryPlanNode::Logical {
+                    operator:
+                        asap_types::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                            population,
+                            ..
+                        },
+                    ..
+                } => Some(population.lookback_ms),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let required_history = runtime
+            .policy
+            .correction_horizon_ms
+            .max(query_history)
+            .max(current_series_history)
+            .max(planned_retention);
+        let retain = max_window
+            .checked_add(required_history)
+            .and_then(|v| v.checked_add(runtime.policy.max_query_staleness_ms))
+            .ok_or("revision retention overflow")?;
+        let inputs: Vec<_> = samples
+            .into_iter()
+            .map(|s| InputSample {
+                metric: s.metric.to_string(),
+                labels: s
+                    .labels
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                series: s.series_key.to_string(),
+                timestamp_ms: s.timestamp_ms,
+                first_revision: 0,
+                value: s.value,
+            })
+            .collect();
+        let outputs = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .map(|c| StoredOutputId(c.policy_fp_u64()))
+            .collect();
+        store.apply(generation, inputs, now_ms, retain, &outputs, |samples, horizon| {
+            // Event-time maxima and flush timers cannot admit an expired correction.
+            // Use the backend admission clock, and reject the entire request first.
+            if samples.iter().any(|s| s.timestamp_ms < 0 || s.timestamp_ms as u64 > now_ms || (s.timestamp_ms as u64) < now_ms.saturating_sub(horizon)) {
+                return Err(crate::precompute_engine::revisions::AdmissionRejected("Remote Write request exceeds the correction horizon or contains future input").into());
+            }
+            for config in plan.precompute_plan.materializations.iter().filter(|c| c.derived_input.is_none()) {
+                let filter = compile_spatial_filter(&config.spatial_filter_normalized)?;
+                let program = RawDagProgram::from_plan(&plan.precompute_plan, config)?;
+                let updater = program.updater()?;
+                for sample in samples {
+                    let labels = sample.labels.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
+                    if sample.metric == config.metric && filter.matches(&labels) {
+                        if let Some(value) = sample.value {
+                            program.validate_sample(updater.as_ref(), value).map_err(|_| crate::precompute_engine::revisions::AdmissionRejected("sample is outside the bound summary kernel's input domain"))?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }, |inputs, revision, captured_at_ms, admitted, publish| {
+            if admitted {
+                let new = inputs.iter().filter(|s| s.first_revision == revision);
+                let numeric = new.clone().filter(|s|s.value.is_some()).count() as u64;
+                let stale = new.filter(|s|s.value.is_none()).count() as u64;
+                self.inner.stats.samples.fetch_add(numeric, Ordering::Relaxed);
+                self.inner.stats.stale_markers.fetch_add(stale, Ordering::Relaxed);
+                self.inner.ingest.samples_ingested.fetch_add(numeric, Ordering::Relaxed);
+                crate::precompute_engine::metrics::record_accepted_samples(numeric);
+            }
+            let canonical = revision_samples(inputs)?;
+            let committed = store.committed_outputs(revision)?;
+            let routed = route_messages(&canonical, &self.inner.ingest, &plan)?;
+            let mut frozen = Vec::new();
+            let mut records: BTreeMap<StoredOutputId, Vec<RevisionRecord>> = plan.precompute_plan.materializations.iter().filter(|c| c.derived_input.is_none()).map(|c|(StoredOutputId(c.policy_fp_u64()), Vec::new())).collect();
+            for message in routed {
+                let WorkerMessage::GroupSamples { sid, policy_fp, group_key, mut samples, .. } = message else { return Err("revision routing returned non-sample input".into()); };
+                let config = plan.precompute_plan.materializations.iter().find(|c| c.policy_fingerprint() == policy_fp).ok_or("revision raw configuration missing")?;
+                if committed.contains_key(&policy_fp.0) { continue; }
+                let program = RawDagProgram::from_plan(&plan.precompute_plan, config)?;
+                let manager = WindowManager::with_layout(config.window_size, config.slide_interval, config.pane_origin_ms, &config.window_layout);
+                let mut windows: BTreeMap<(u64,u64), Box<dyn asap_physical_operators::summary_kernels::factory::AccumulatorUpdater>> = BTreeMap::new();
+                samples.sort_by(|a,b| (&a.0,a.1).cmp(&(&b.0,b.1)));
+                for (series,time,value) in samples {
+                    for start in manager.stored_bucket_starts(time) {
+                        let (start,end) = manager.stored_bucket_bounds(start);
+                        if start < 0 || end < 0 || end as u64 > captured_at_ms || (start as u64) < captured_at_ms.saturating_sub(retain.saturating_sub(max_window)) { continue; }
+                        let key = (start as u64,end as u64);
+                        if let std::collections::btree_map::Entry::Vacant(entry) = windows.entry(key) { entry.insert(program.updater()?); }
+                        program.apply(windows.get_mut(&key).unwrap().as_mut(), &series, value, time)?;
+                        let bytes = windows.values().map(|u|u.memory_usage_bytes()).sum::<usize>();
+                        if bytes > runtime.policy.max_checkpoint_bytes { return Err(Box::new(asap_physical_operators::Error::MemoryLimit)); }
+                    }
+                }
+                let reference = plan.installed_precompute_plan.stored_output_reference(policy_fp.into()).ok_or("revision raw binding missing")?;
+                let group = group_key.as_population_labels();
+                let states: BTreeMap<_, Arc<dyn crate::storage_engines::types::AggregateCore>> = windows.into_iter().map(|(w,updater)|(w,Arc::from(updater.into_accumulator()))).collect();
+                for ((start,end),state) in &states {
+                    records.get_mut(&policy_fp.into()).unwrap().push(RevisionRecord { reference: reference.clone(), group: group.clone(), start_ms:*start, end_ms:*end, payload:encode_state(Arc::clone(state),program.family.clone())? });
+                }
+                frozen.push(crate::storage_engines::sketch_db::index::FrozenExactWindows { stored_output_reference: reference, storage_handle: sid, definition:policy_fp.into(), generation: Arc::new(generation.clone()), group, windows:states, singleton_population_complete:true });
+                if frozen.iter().flat_map(|f| f.windows.values()).map(|s|s.approx_memory_bytes()).sum::<usize>() > runtime.policy.max_checkpoint_bytes { return Err(Box::new(asap_physical_operators::Error::MemoryLimit)); }
+            }
+            // Recovery must consume the exact committed raw bytes, not another
+            // randomized sketch realization from replaying identical input.
+            for (output, result) in records {
+                if let Some(previous) = committed.get(&output.0) {
+                    let config = plan.precompute_plan.materializations.iter().find(|c| c.policy_fp_u64() == output.0).ok_or("committed raw output missing")?;
+                    let mut groups: BTreeMap<BTreeMap<String,String>, BTreeMap<(u64,u64),Arc<dyn crate::storage_engines::types::AggregateCore>>> = BTreeMap::new();
+                    for record in previous { groups.entry(record.group.clone()).or_default().insert((record.start_ms,record.end_ms),crate::precompute_engine::revisions::decode_state(record,config)?); }
+                    for (group,windows) in groups {
+                        frozen.push(crate::storage_engines::sketch_db::index::FrozenExactWindows {
+                            stored_output_reference: plan.installed_precompute_plan.stored_output_reference(output).ok_or("committed raw binding missing")?, storage_handle: output.0, definition: output, generation:Arc::new(generation.clone()), group, windows, singleton_population_complete:true,
+                        });
+                    }
+                } else { publish(output,result)?; }
+            }
+            crate::precompute_engine::maintenance_runtime::execute_revision_outputs(&plan, &frozen, revision, runtime.policy.max_checkpoint_bytes, publish)
+        })
+    }
+}
+
+impl PrometheusRemoteWriteReceiver {
+    /// Validate and restore the active generation before opening request serving.
+    pub fn recover_revisions(&self) -> Result<(), RemoteWriteError> {
+        if let Some(runtime) = self
+            .inner
+            .ingest
+            .summary_store
+            .revisions
+            .read()
+            .map_err(|_| RemoteWriteError::Revision("revision installation poisoned".into()))?
+            .clone()
+        {
+            if self.inner.ingest.active_physical_plan_snapshot().is_some() {
+                runtime.installed().map_err(RemoteWriteError::Revision)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture newly closed windows even when no later event arrives. This is
+    /// a revisable snapshot of locally accepted input, not an event-time watermark.
+    pub fn refresh_revisions(&self) -> Result<(), RemoteWriteError> {
+        let _admission = self
+            .inner
+            .dedup
+            .lock()
+            .map_err(|_| RemoteWriteError::Revision("revision admission poisoned".into()))?;
+        let runtime = self
+            .inner
+            .ingest
+            .summary_store
+            .revisions
+            .read()
+            .map_err(|_| RemoteWriteError::Revision("revision installation poisoned".into()))?
+            .clone();
+        if let Some(runtime) = runtime {
+            if self.inner.ingest.active_physical_plan_snapshot().is_none() {
+                return Ok(());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| RemoteWriteError::Revision(e.into()))?
+                .as_millis() as u64;
+            self.accept_revision(&runtime, Vec::new(), now)
+                .map_err(RemoteWriteError::Revision)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn revision_samples(
+    inputs: &[crate::precompute_engine::revisions::InputSample],
+) -> Result<Vec<CanonicalSample>, crate::precompute_engine::revisions::RevisionError> {
+    let canonical: Vec<_> = inputs
+        .iter()
+        .map(|s| {
+            let attrs: Vec<_> = s
+                .labels
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            Ok(CanonicalSample {
+                metric: Arc::from(s.metric.as_str()),
+                labels: Arc::new(
+                    s.labels
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+                series_key: Arc::from(s.series.as_str()),
+                population_key: Arc::from(format!(
+                    "__asap_population__{}",
+                    serde_json::to_string(&s.labels)?
+                )),
+                all_attrs_fingerprint: Arc::from(super::canonical_attrs_fingerprint(&attrs)),
+                timestamp_ms: s.timestamp_ms,
+                value: s.value,
+            })
+        })
+        .collect::<Result<_, crate::precompute_engine::revisions::RevisionError>>()?;
+    Ok(canonical)
 }

@@ -1,6 +1,6 @@
 //! `RoutingIndex` — a metric-bucketed structural index over a
 //! [`PolicyRegistry`]. It is sourced from the content-addressed view over a
-//! `StreamingConfig`'s `PrecomputeMaterialization`s, so it represents planned policy
+//! `InstalledPrecomputePlan`'s `PrecomputeMaterialization`s, so it represents planned policy
 //! rather than a reconstruction from ingest side effects.
 //!
 //! **Tier 1** (exact `PolicyFingerprint` → config) is [`PolicyRegistry::get`]
@@ -23,11 +23,11 @@
 //! `streaming_snap.policy_registry()` call) still get the Tier-2 win for
 //! any query with more than one candidate sharing the same snapshot
 //! (composed PromQL shapes routinely do). Building it once per
-//! `StreamingConfig` hot-reload swap instead of once per query — the same
+//! `InstalledPrecomputePlan` hot-reload swap instead of once per query — the same
 //! "cheap, but call at swap time not per query, if it shows up in
-//! profiles" note `StreamingConfig::policy_registry`'s own doc comment
+//! profiles" note `InstalledPrecomputePlan::policy_registry`'s own doc comment
 //! already flags — is a further, larger change (it means threading a
-//! cached derived value through `StreamingConfigHandle`'s swap path)
+//! cached derived value through `InstalledPrecomputePlanHandle`'s swap path)
 //! and is not done by this type on its own.
 
 use std::collections::{BTreeSet, HashMap};

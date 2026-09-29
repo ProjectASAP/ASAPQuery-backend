@@ -191,13 +191,9 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();
 
-    let bootstrap = output_dir.path().join("bootstrap.json");
-    std::fs::write(&bootstrap, b"{\"aggregations\":[]}").unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--physical-plan")
         .arg(physical.path())
-        .arg("--streaming-config")
-        .arg(&bootstrap)
         .arg("--http-port")
         .arg(query_port.to_string())
         .arg("--output-dir")
@@ -393,14 +389,10 @@ async fn bound_sds_keeps_hot_and_rebuild_outputs_and_groups_isolated() {
     let directory = tempfile::tempdir().unwrap();
     let plan = directory.path().join("plan.json");
     std::fs::write(&plan, serde_json::to_vec(&install).unwrap()).unwrap();
-    let bootstrap = directory.path().join("bootstrap.json");
-    std::fs::write(&bootstrap, b"{\"aggregations\":[]}").unwrap();
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_data_plane"))
             .arg("--physical-plan")
             .arg(&plan)
-            .arg("--streaming-config")
-            .arg(&bootstrap)
             .arg("--http-port")
             .arg(query_port.to_string())
             .arg("--output-dir")

@@ -18,7 +18,7 @@
 //! * [`capability_matching`] — the storage-backend routing policy itself
 //!   (`AccuracyTarget`, `compatible_storage_backends`). Split out of
 //!   `asap_types`'s former `capability_matching` module. `StorageBackend`
-//!   itself later moved into this crate too, alongside `StreamingConfig`
+//!   itself later moved into this crate too, alongside `InstalledPrecomputePlan`
 //!   (see `crate::storage_engines::types::storage_backend`'s module doc) —
 //!   `control_plane` turned out to have zero real dependency on either.
 //!

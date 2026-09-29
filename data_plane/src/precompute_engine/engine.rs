@@ -3,7 +3,7 @@ use crate::precompute_engine::ingest_handler::IngestState;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
 use crate::precompute_engine::worker::{Worker, WorkerRuntimeConfig};
-use crate::storage_engines::types::StreamingConfigHandle;
+use crate::storage_engines::types::InstalledPrecomputePlanHandle;
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -27,7 +27,7 @@ pub struct PrecomputeEngine {
     output_sink: Arc<dyn OutputSink>,
     diagnostics: Arc<PrecomputeWorkerDiagnostics>,
     ingest_state: Arc<IngestState>,
-    hot_reload_config: StreamingConfigHandle,
+    hot_reload_config: InstalledPrecomputePlanHandle,
     /// Worker receivers, one per worker. Taken by `run()` when spawning workers.
     receivers: Vec<mpsc::Receiver<WorkerMessage>>,
 }
@@ -35,7 +35,7 @@ pub struct PrecomputeEngine {
 impl PrecomputeEngine {
     pub fn new(
         config: PrecomputeEngineConfig,
-        hot_reload_config: StreamingConfigHandle,
+        hot_reload_config: InstalledPrecomputePlanHandle,
         output_sink: Arc<dyn OutputSink>,
         series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
         summary_store: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
@@ -63,7 +63,7 @@ impl PrecomputeEngine {
         }
 
         // Build the router that owns the senders; it will be shared via IngestState.
-        let router = SeriesRouter::new(senders);
+        let router = SeriesRouter::new(senders).with_plan(hot_reload_config.clone());
 
         // Snapshot the hot-reload configuration on each ingest batch so policy
         // changes are visible immediately. Sid lifecycle reconciliation uses
@@ -107,13 +107,6 @@ impl PrecomputeEngine {
     /// submit through the shared `IngestState` returned by `ingest_state()`.
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let num_workers = self.config.num_workers;
-        let output_sink: Arc<dyn crate::precompute_engine::output_sink::OutputSink> = Arc::new(
-            crate::precompute_engine::maintenance_runtime::MaintenanceDagSink::new(
-                Arc::clone(&self.output_sink),
-                self.hot_reload_config.clone(),
-            ),
-        );
-
         // Take ownership of receivers (they can only be used once).
         let receivers = std::mem::take(&mut self.receivers);
 
@@ -122,6 +115,13 @@ impl PrecomputeEngine {
         // ConfigReload messages needed.
         let mut worker_handles = Vec::with_capacity(num_workers);
         for (id, rx) in receivers.into_iter().enumerate() {
+            let output_sink: Arc<dyn crate::precompute_engine::output_sink::OutputSink> = Arc::new(
+                crate::precompute_engine::maintenance_runtime::MaintenanceDagSink::new(
+                    Arc::clone(&self.output_sink),
+                    self.hot_reload_config.clone(),
+                ),
+            );
+
             let mut worker = Worker::new(
                 id,
                 rx,
@@ -141,6 +141,10 @@ impl PrecomputeEngine {
                 self.diagnostics.worker_group_counts[id].clone(),
                 self.diagnostics.worker_watermarks[id].clone(),
             );
+            worker.set_maintenance_storage(
+                Arc::clone(&self.ingest_state.summary_store),
+                Arc::clone(&self.ingest_state.series_resolver),
+            );
             worker.set_erp_observer(self.ingest_state.router.erp_observer());
             let handle = tokio::spawn(async move {
                 worker.run().await;
@@ -155,7 +159,7 @@ impl PrecomputeEngine {
         // Start flush timer — pure flush, no config polling.
         let flush_state = ingest_state.clone();
         let flush_interval_ms = self.config.flush_interval_ms;
-        tokio::spawn(async move {
+        let flush_task = tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(flush_interval_ms));
             loop {
@@ -168,10 +172,16 @@ impl PrecomputeEngine {
         });
 
         // Wait for workers to finish (this only happens on shutdown).
+        let mut worker_error = None;
         for handle in worker_handles {
-            let _ = handle.await;
+            if let Err(error) = handle.await {
+                worker_error = Some(error);
+            }
         }
-
+        flush_task.abort();
+        if let Some(error) = worker_error {
+            return Err(Box::new(error));
+        }
         Ok(())
     }
 }
