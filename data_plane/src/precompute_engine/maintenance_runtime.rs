@@ -2886,7 +2886,7 @@ mod tests {
 }
 
 /// Captured local input provides fixed population membership for this revision.
-/// All compatible sinks share one native execution cache for each output window.
+/// Each retained producer graph executes against the frozen inputs for its output window.
 pub(crate) fn execute_revision_outputs(
     plan: &crate::storage_engines::types::RuntimePhysicalPlan,
     raw: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],

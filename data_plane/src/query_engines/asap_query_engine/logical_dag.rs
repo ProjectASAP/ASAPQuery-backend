@@ -296,7 +296,14 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             return Ok(value);
         }
         let value = match node.clone() {
-            QueryPlanNode::Scalar { value } => Value::Scalar(native_scalar(value, context)?),
+            QueryPlanNode::Scalar { .. }
+            | QueryPlanNode::Binary { .. }
+            | QueryPlanNode::ReduceSum { .. } => {
+                return Err(physical::Error::Invalid(
+                    "installed computation requires a retained Planner physical graph".into(),
+                )
+                .into());
+            }
             QueryPlanNode::Logical {
                 operator: QueryTimeOperator::CurrentSeries { .. },
                 ..
@@ -613,27 +620,6 @@ fn semi_join(
         context.clone(),
     )?;
     Ok((rows, pruning_warning(completeness)))
-}
-
-pub(super) fn native_scalar(
-    value: f64,
-    context: &physical::RunContext,
-) -> Result<f64, EngineError> {
-    use physical::{batch_execution::evaluate_source, operators::Operator, values::Value as Cell};
-    let source = Operator::scalar(
-        Cell::Float64(value),
-        planner_types::pre_asap::DataType::Float64,
-    )
-    .map_err(EngineError::from)?;
-    let batches = evaluate_source(source, context.clone()).map_err(EngineError::from)?;
-    match batches
-        .first()
-        .and_then(|b| b.rows().first())
-        .and_then(|r| r.first())
-    {
-        Some(Cell::Float64(value)) => Ok(*value),
-        _ => Err(miss("native scalar source returned invalid output")),
-    }
 }
 
 fn native_labels(labels: &Labels) -> physical::values::Value {
@@ -1864,7 +1850,14 @@ mod shared_runtime_tests {
     #[test]
     fn native_scalar_and_aggregation_share_parent_resource_control() {
         let context = test_native_context();
-        assert_eq!(native_scalar(7., &context).unwrap(), 7.);
+        let graph = asap_physical_operators::physical_planner::promql_values::compile_scalar(7.)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert!(matches!(
+            native_values::complete_values(&graph, &[], context.clone()).unwrap(),
+            Some(Value::Scalar(7.))
+        ));
         let output = aggregate(
             Aggregation::Sum,
             &Grouping {
@@ -1878,7 +1871,7 @@ mod shared_runtime_tests {
         assert_eq!(output, vec![(Labels::new(), 7.)]);
         assert!(context.peak_bytes() > 0);
         context.cancel();
-        assert!(native_scalar(7., &context).is_err());
+        assert!(native_values::complete_values(&graph, &[], context.clone()).is_err());
         assert!(negate(Value::Scalar(1.), &context).is_err());
     }
 

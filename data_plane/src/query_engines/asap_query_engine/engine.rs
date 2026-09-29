@@ -2916,6 +2916,12 @@ mod range_stitch_tests {
                 fallback: FallbackPolicy::ExactBackend,
             },
         );
+        let key =
+            asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity);
+        control_plane::query_plan::physical_values::compile(
+            plan.query_plan.entries.get_mut(&key).unwrap(),
+        )
+        .unwrap();
         let mut active = crate::drivers::query::servers::http::validate_and_build_runtime_plan(
             crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 summary_catalog: plan.summary_catalog,
@@ -2940,7 +2946,7 @@ mod range_stitch_tests {
         assert!(
             error
                 .to_string()
-                .contains("bound subtree requires one explicit positive window"),
+                .contains("scalar root requires native response adapter"),
             "{error}"
         );
     }
