@@ -590,6 +590,7 @@ fn compile_physical_plan_request(
             query_id: query.query_id,
             query_string: query.query_string,
             selected_plan_root: post_asap,
+            physical_candidate: None,
             legacy_query_source: planner_types::pre_asap::Source::TimeSeries {
                 metric: query.metric,
             },

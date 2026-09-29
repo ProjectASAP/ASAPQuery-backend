@@ -292,6 +292,37 @@ impl SketchStore {
         if !address.population.is_empty() {
             return Err("native batch binding requires the complete stored output".into());
         }
+        if let Some(batches) = &self.native_revision_batches {
+            address.validate().map_err(|e| e.to_string())?;
+            let generation = self
+                .active_catalog_generation()
+                .ok_or("native revision has no generation")?;
+            if (address.plan_id, address.plan_version)
+                != (generation.plan_id, generation.plan_version)
+                || address.stored_output_id != reference.stored_output_id
+                || self
+                    .descriptors
+                    .stored_output_reference(address.stored_output_id)
+                    .as_ref()
+                    != Some(reference)
+            {
+                return Err("native revision differs from installed binding".into());
+            }
+            let batch = batches
+                .get(&(
+                    address.stored_output_id,
+                    address.window.start_ms,
+                    address.window.end_ms,
+                ))
+                .ok_or("native output is absent from pinned revision")?;
+            if batch.schema() != &expected_schema {
+                return Err("native revision schema differs from installed contract".into());
+            }
+            if batch.bytes() > max_bytes {
+                return Err(asap_physical_operators::Error::MemoryLimit.into());
+            }
+            return Ok(batch.clone());
+        }
         let handles = self.storage_handles_for_output(reference);
         let [sid] = handles.as_slice() else {
             return Err("native stored output is absent or ambiguous".into());

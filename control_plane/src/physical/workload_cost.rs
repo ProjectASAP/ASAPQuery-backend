@@ -882,6 +882,11 @@ fn enumerate_frontier_candidates(
             }
         }
     }
+    for candidate in &mut candidates {
+        for query in &mut candidate.queries {
+            query.retain_physical_candidate()?;
+        }
+    }
     Ok(candidates)
 }
 

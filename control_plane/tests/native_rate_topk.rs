@@ -276,3 +276,51 @@ fn grouped_rate_has_native_query_and_maintenance_candidates() {
         "{errors:#?}"
     );
 }
+
+// Deployment must install the exact retained Planner graphs, including roots,
+// typed inputs and materialization frontiers, rather than compiling replacements.
+#[test]
+fn selected_native_graphs_survive_deployment_unchanged() {
+    use asap_physical_operators::physical_planner::PhysicalCandidate;
+    let (request, environment) = fixture(true).into_physical_compilation_request().unwrap();
+    let mut checked = 0;
+    let mut checked_precompute = 0;
+    for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
+        let expected = candidate
+            .queries
+            .iter()
+            .filter_map(|query| {
+                query.physical_candidate.as_ref().map(|bytes| {
+                    (
+                        query.query_id.clone(),
+                        PhysicalCandidate::decode(bytes).unwrap(),
+                    )
+                })
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) else {
+            continue;
+        };
+        for entry in plan.query_plan.entries.values() {
+            let Some(expected) = expected.get(&entry.query_id) else {
+                continue;
+            };
+            let actual = entry
+                .physical_dag
+                .as_ref()
+                .expect("retained candidate must be installed");
+            let encoded: Value = serde_json::from_slice(&expected.query.encode().unwrap()).unwrap();
+            assert_eq!(*actual, encoded);
+            if let Some(precompute) = &expected.precompute {
+                let encoded: Value = serde_json::from_slice(&precompute.encode().unwrap()).unwrap();
+                assert!(plan.precompute_plan.executable_dags[&entry.query_id]
+                    .native_programs
+                    .values()
+                    .any(|actual| actual == &encoded));
+                checked_precompute += 1;
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 0 && checked_precompute > 0);
+}

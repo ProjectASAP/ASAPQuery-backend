@@ -20,7 +20,8 @@ pub(super) fn execute(
     inputs: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],
     window: (u64, u64),
     max_bytes: usize,
-) -> Result<Batch, String> {
+    revision: u64,
+) -> Result<Batch, Box<dyn std::error::Error + Send + Sync>> {
     let mut sources = BTreeMap::new();
     let mut input_bytes = 0usize;
     for (id, contract) in program.input_contracts() {
@@ -76,59 +77,49 @@ pub(super) fn execute(
                 .collect::<Result<Vec<_>, String>>()?;
             rows.push(row);
         }
-        let batch = Batch::try_new(contract.schema.clone(), rows).map_err(|e| e.to_string())?;
+        let batch = Batch::try_new(contract.schema.clone(), rows)?;
         input_bytes = input_bytes
             .checked_add(batch.bytes())
             .ok_or("native input size overflow")?;
         if input_bytes > max_bytes {
-            return Err("native precompute input exceeds run budget".into());
+            return Err(asap_physical_operators::Error::MemoryLimit.into());
         }
         sources.insert(
             id,
-            Box::new(
-                Operator::source(contract.schema.clone(), vec![batch])
-                    .map_err(|e| e.to_string())?,
-            ) as Source<'_>,
+            Box::new(Operator::source(contract.schema.clone(), vec![batch])?) as Source<'_>,
         );
     }
-    let graph = program.instantiate(sources).map_err(|e| e.to_string())?;
+    let graph = program.instantiate(sources)?;
     let context = RunContext::new(
         Scope::Ingestion {
             window_start_ms: i64::try_from(window.0).map_err(|_| "native window overflow")?,
             window_end_ms: i64::try_from(window.1).map_err(|_| "native window overflow")?,
-            revision: 0,
+            revision,
         },
         Limits {
             max_bytes,
             ..Limits::default()
         },
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
     // Source buffers and retained publication output share the operator budget.
-    let _inputs = context.reserve(input_bytes).map_err(|e| e.to_string())?;
-    let mut retained = context.reserve(0).map_err(|e| e.to_string())?;
-    let schema = program
-        .output_contract(program.roots()[0])
-        .map_err(|e| e.to_string())?
-        .schema;
-    let mut stream = graph
-        .execute(program.roots(), context)
-        .map_err(|e| e.to_string())?
-        .remove(0);
+    let _inputs = context.reserve(input_bytes)?;
+    let mut retained = context.reserve(0)?;
+    let schema = program.output_contract(program.roots()[0])?.schema;
+    let mut stream = graph.execute(program.roots(), context)?.remove(0);
     block_on(async {
         let mut rows = Vec::new();
         let mut bytes = 0usize;
         while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| e.to_string())?;
+            let batch = batch?;
             bytes = bytes
                 .checked_add(batch.bytes())
                 .ok_or("native output size overflow")?;
             if bytes > max_bytes {
-                return Err("native precompute output exceeds publication budget".into());
+                return Err(asap_physical_operators::Error::MemoryLimit.into());
             }
-            retained.resize(bytes).map_err(|e| e.to_string())?;
+            retained.resize(bytes)?;
             rows.extend(batch.rows().iter().cloned());
         }
-        Batch::try_new(schema, rows).map_err(|e| e.to_string())
+        Batch::try_new(schema, rows).map_err(Into::into)
     })
 }
