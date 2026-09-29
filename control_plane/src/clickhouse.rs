@@ -1413,7 +1413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compiles_summary_joined_with_exact_table_into_mixed_dag() {
+    async fn rejects_mixed_snapshots_and_preserves_local_sql_contracts() {
         let config = materialization(
             AggregationType::Sum,
             "value",
@@ -1475,6 +1475,16 @@ mod tests {
                 cumulative: true,
             }],
         };
+        let Err(error) = compile_clickhouse_workload(&request).await else {
+            panic!("local summary joined to an external table needs a common snapshot proof");
+        };
+        assert!(
+            error.to_string().contains("common snapshot proof"),
+            "{error}"
+        );
+        request.queries[0].sql =
+            "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000"
+                .into();
         let publication = compile_clickhouse_workload(&request).await.unwrap();
         // A simple installed aggregate publishes the same key as a refresh.
         let simple_sql =
@@ -1678,31 +1688,11 @@ mod tests {
                 > installed.document.nodes.len()
         );
         let entry = publication.query_plan.entries.values().next().unwrap();
-        // External SQL retains its literal time range until it can be bound.
-        assert!(!entry.canonical_query.starts_with("moving-window-v1:"));
-        assert!(entry
+        assert!(!entry
             .nodes
             .values()
             .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExternalExact { .. })));
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
-        )));
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            crate::query_plan::QueryPlanNode::RelationalJoin { .. }
-        )));
-        assert!(entry.nodes.values().any(|node| {
-            let crate::query_plan::QueryPlanNode::Relational { operation, .. } = node else {
-                return false;
-            };
-            matches!(
-                serde_json::from_value::<planner_types::post_asap::ValueOperation>(
-                    operation.clone()
-                ),
-                Ok(planner_types::post_asap::ValueOperation::Project { .. })
-            )
-        }));
+        assert!(!entry.materialization_bindings().is_empty());
         let original = request.queries[0].sql.clone();
         let schema = request.tables.get_mut("telemetry").unwrap();
         schema.columns[schema.time_index.unwrap()].name = "other_timestamp".into();
