@@ -223,11 +223,6 @@ impl RawDagProgram {
         self.updater().map(|_| ())
     }
 
-    pub fn uses_counter_delta(&self) -> bool {
-        // Counter derivatives are explicit upstream computations in Planner.
-        false
-    }
-
     /// Validate admission with the same weight semantics used during execution,
     /// without mutating an accumulator or accepting part of a request.
     pub fn validate_sample(
