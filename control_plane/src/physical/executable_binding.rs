@@ -98,6 +98,7 @@ pub(super) fn compile_precompute_programs(
 ) -> Result<(), String> {
     use asap_types::executable_plan::BackendNodeBinding;
     let dag = installed.document.decode()?;
+    let mut groups = std::collections::BTreeMap::<_, Vec<u64>>::new();
     for sink in &installed.binding.precompute_sinks {
         if installed.native_programs.contains_key(sink) {
             continue;
@@ -117,17 +118,36 @@ pub(super) fn compile_precompute_programs(
         let frontiers = installed.binding.nodes.iter().filter_map(|(id, binding)| {
             matches!(binding, BackendNodeBinding::Materialization { stored_output } if derived.inputs.contains(stored_output)).then_some(u64::from(id.0))
         }).collect::<Vec<_>>();
+        // Only co-schedule outputs with identical immutable input and window
+        // contracts. Legacy population bindings are kept as individual runs.
+        let separate = config.population_key_encoding.is_legacy().then_some(sink.0);
+        groups
+            .entry((
+                frontiers,
+                config.stored_window_ms(),
+                config.slide_interval,
+                config.pane_origin_ms,
+                separate,
+            ))
+            .or_default()
+            .push(u64::from(sink.0));
+    }
+    for ((frontiers, _, _, _, _), roots) in groups {
         let program = asap_physical_operators::physical_planner::precompute::compile(
-            &dag,
-            &frontiers,
-            &[u64::from(sink.0)],
+            &dag, &frontiers, &roots,
         )
         .map_err(|e| e.to_string())?;
-        installed.native_programs.insert(
-            *sink,
+        let encoded: serde_json::Value =
             serde_json::from_slice(&program.encode().map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?,
-        );
+                .map_err(|e| e.to_string())?;
+        for root in roots {
+            installed.native_programs.insert(
+                planner_types::post_asap::PostAsapNodeId(
+                    u32::try_from(root).map_err(|_| "physical output id overflow")?,
+                ),
+                encoded.clone(),
+            );
+        }
     }
     Ok(())
 }

@@ -113,6 +113,14 @@ Installation performs four steps:
 4. Build node and source-routing indexes, register the validated definition
    rows, and activate the coherent plan version for routing and execution.
 
+A retained graph may have several stored-output roots. Outputs with the same
+input frontiers, window extent, cadence and phase execute together against one
+immutable input snapshot. The runtime consumes every root concurrently under
+one memory budget, so a shared producer executes once. Both finite-input
+publication and continuous revision publication use these results. Outputs
+with different window contracts require separate runs. Recovery validates all
+roots and their bindings; it must not silently select only the first root.
+
 Unsupported operators, incompatible bindings, cycles and unsatisfied deployment
 requirements fail installation before the plan becomes active.
 

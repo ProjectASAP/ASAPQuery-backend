@@ -7088,6 +7088,119 @@ pub(crate) mod tests {
         assert!(full.weighted_cost >= lifecycle.horizon_seconds * 11.0);
     }
 
+    // One selected semantic diamond must survive physical compilation; outputs
+    // with a different deployment window cannot share the same execution run.
+    #[test]
+    fn precompute_compilation_preserves_shared_roots_and_window_boundaries() {
+        use asap_types::executable_plan::*;
+        use planner_types::post_asap::*;
+        let bundle = DeploymentPlanCompiler
+            .compile_promql(request("q", "sum_over_time(m[1m])"), environment(10_000))
+            .unwrap();
+        let mut source = bundle.precompute_plan.materializations[0].clone();
+        source.stored_output_id = Some(asap_types::sds::StoredOutputId(1));
+        source.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
+        let mut configs = vec![source.clone()];
+        for id in [3, 4] {
+            let mut output = source.clone();
+            output.stored_output_id = Some(asap_types::sds::StoredOutputId(id));
+            output.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
+                inputs: BTreeSet::from([asap_types::sds::StoredOutputId(1)]),
+                program_sha256: "0".repeat(64),
+            });
+            configs.push(output);
+        }
+        let schema = SummarySchema {
+            fields: vec![SummaryField {
+                name: "state".into(),
+                dtype: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let dag = ExecutableDag {
+            nodes: (1..=5)
+                .map(|id| ExecutableDagNode {
+                    id: PostAsapNodeId(id),
+                    payload: ExecutableOperatorPayload::SummaryMerge,
+                    output_state: ExecutionDataState::INGESTION_SUMMARY,
+                    output_schema: schema.clone(),
+                    guarantee: None,
+                })
+                .collect(),
+            edges: [(1, 2), (2, 3), (2, 4), (3, 5), (4, 5)]
+                .into_iter()
+                .map(|(a, b)| ExecutableDagEdge {
+                    producer: PostAsapNodeId(a),
+                    consumer: PostAsapNodeId(b),
+                    role: EdgeRole::Input,
+                    intermediate_schema: schema.clone(),
+                    data_state: ExecutionDataState::INGESTION_SUMMARY,
+                    grouping: GroupingEdgeCompatibility::Identical,
+                    window: WindowEdgeCompatibility::NotApplicable,
+                })
+                .collect(),
+            root: PostAsapNodeId(5),
+        };
+        let mut installed = InstalledPostAsapDag {
+            document: OwnedPostAsapDag::from_executable("shared".into(), &dag).unwrap(),
+            native_programs: BTreeMap::new(),
+            binding: BackendExecutableBinding {
+                nodes: (1..=5)
+                    .map(|id| {
+                        (
+                            PostAsapNodeId(id),
+                            if id == 2 || id == 5 {
+                                BackendNodeBinding::MaintenanceInput
+                            } else {
+                                BackendNodeBinding::Materialization {
+                                    stored_output: asap_types::sds::StoredOutputId(id as u64),
+                                }
+                            },
+                        )
+                    })
+                    .collect(),
+                precompute_sinks: vec![PostAsapNodeId(3), PostAsapNodeId(4)],
+                query_sink: PostAsapNodeId(5),
+                query_plan_sink: QueryNodeId(5),
+            },
+        };
+        super::super::executable_binding::compile_precompute_programs(&mut installed, &configs)
+            .unwrap();
+        assert_eq!(
+            installed
+                .native_program(PostAsapNodeId(3))
+                .unwrap()
+                .unwrap()
+                .roots(),
+            &[3, 4]
+        );
+        assert_eq!(
+            installed.native_programs[&PostAsapNodeId(3)],
+            installed.native_programs[&PostAsapNodeId(4)]
+        );
+        configs[2].pane_origin_ms = Some(configs[1].pane_origin_ms.unwrap_or(0) + 1_000);
+        installed.native_programs.clear();
+        super::super::executable_binding::compile_precompute_programs(&mut installed, &configs)
+            .unwrap();
+        assert_eq!(
+            installed
+                .native_program(PostAsapNodeId(3))
+                .unwrap()
+                .unwrap()
+                .roots(),
+            &[3]
+        );
+        assert_eq!(
+            installed
+                .native_program(PostAsapNodeId(4))
+                .unwrap()
+                .unwrap()
+                .roots(),
+            &[4]
+        );
+    }
+
     // Temporal SUM readouts share raw state only for identical source populations.
     #[test]
     fn derived_window_regression_shared_sum_panes() {
