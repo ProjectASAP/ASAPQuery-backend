@@ -41,6 +41,7 @@ where
     };
     let root = compiler.lower(root)?;
     Ok(QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::PromQl,
         query_id,
         canonical_query,
@@ -80,7 +81,8 @@ where
         lowered: Some(&mut lowered),
     };
     let root = compiler.lower(root)?;
-    Ok(QueryPlanEntry {
+    let mut entry = QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::ClickHouseSql,
         query_id,
         canonical_query,
@@ -89,7 +91,9 @@ where
         nodes: compiler.nodes,
         instant,
         fallback,
-    })
+    };
+    entry.compile_relational_physical_dag()?;
+    Ok(entry)
 }
 
 /// Compile a composable query while exposing the stable mapping from
@@ -123,6 +127,7 @@ where
     };
     let root = compiler.lower(root)?;
     let mut entry = QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::PromQl,
         query_id,
         canonical_query,
@@ -248,8 +253,9 @@ where
         }
         for (local, mut physical) in nodes {
             match &mut physical {
-                QueryPlanNode::PhysicalFragment { inputs, .. }
-                | QueryPlanNode::Logical { inputs, .. }
+                QueryPlanNode::Logical { inputs, .. }
+                | QueryPlanNode::Physical { inputs, .. }
+                | QueryPlanNode::PhysicalFragment { inputs, .. }
                 | QueryPlanNode::SummaryMerge { inputs }
                 | QueryPlanNode::ExternalExact { inputs, .. } => {
                     for input in inputs {
@@ -994,6 +1000,7 @@ mod catalog_binding_tests {
         config.pane_origin_ms = Some(0);
         let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "sum_over_time(m[1m])".into(),
@@ -1249,6 +1256,7 @@ mod tests {
     #[test]
     fn language_tag_preserves_query_entry_serde() {
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: canonical_promql("up").unwrap(),
@@ -1276,6 +1284,7 @@ mod tests {
     #[test]
     fn language_catalog_keys_keep_equal_query_text_distinct() {
         let base = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::PromQl,
             query_id: "prom".into(),
             canonical_query: "shared".into(),
@@ -1371,6 +1380,7 @@ mod tests {
             )
             .unwrap();
             let entry = QueryPlanEntry {
+                physical_dag: None,
                 language: QueryLanguage::PromQl,
                 query_id: "q".into(),
                 canonical_query: "topk(1, m)".into(),
@@ -1422,6 +1432,7 @@ mod tests {
             },
         );
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "up".into(),
@@ -1448,6 +1459,7 @@ mod tests {
             reason: "prepared".into(),
         };
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "topk(2, rate(m[5m]))".into(),

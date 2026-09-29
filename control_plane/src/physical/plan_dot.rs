@@ -66,6 +66,14 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
                 edge.role
             ));
         }
+        for (sink, program) in &installed.native_programs {
+            render_native(
+                &mut dot,
+                &format!("maintenance_{dag_index}_{}", sink.0),
+                "Planner maintenance operators",
+                program,
+            );
+        }
         dot.push_str("    }\n");
     }
     dot.push_str("  }\n");
@@ -104,10 +112,46 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
                 ));
             }
         }
+        if let Some(program) = &entry.physical_dag {
+            render_native(
+                &mut dot,
+                &format!("native_query_{query_index}"),
+                "Planner query operators",
+                program,
+            );
+        }
         dot.push_str("  }\n");
     }
     dot.push_str("}\n");
     dot
+}
+
+fn render_native(dot: &mut String, prefix: &str, label: &str, program: &serde_json::Value) {
+    let Some(nodes) = program["nodes"].as_object() else {
+        return;
+    };
+    dot.push_str(&format!(
+        "    subgraph cluster_{prefix} {{\n      label=\"{}\";\n",
+        escape(label)
+    ));
+    for (id, node) in nodes {
+        let operator = node.get("Operator");
+        let label = operator
+            .map(|op| op["operator"]["kind"].to_string())
+            .unwrap_or_else(|| "Bound physical input".into());
+        emit_node(
+            dot,
+            &format!("{prefix}_{id}"),
+            &format!("#{id}\n{label}"),
+            "",
+        );
+        if let Some(inputs) = operator.and_then(|op| op["inputs"].as_array()) {
+            for input in inputs {
+                dot.push_str(&format!("      {prefix}_{input} -> {prefix}_{id};\n"));
+            }
+        }
+    }
+    dot.push_str("    }\n");
 }
 
 fn materialization_node(id: u64) -> String {
@@ -139,6 +183,9 @@ fn escape(value: &str) -> String {
 
 fn query_node_label(node: &QueryPlanNode) -> String {
     match node {
+        QueryPlanNode::Physical { source_nodes, .. } => {
+            format!("Planner Physical DAG\nbound sources {source_nodes:?}")
+        }
         QueryPlanNode::PhysicalFragment { dag, .. } => {
             asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                 .map(|plan| {

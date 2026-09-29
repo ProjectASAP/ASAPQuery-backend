@@ -194,6 +194,14 @@ impl Population {
         }
     }
     fn read(&mut self, readout: &SeriesReadout) -> Vector {
+        if matches!(readout, SeriesReadout::Snapshot) {
+            return self
+                .groups
+                .values()
+                .flat_map(|group| group.ordered.iter())
+                .map(|member| (member.labels.clone(), member.value))
+                .collect();
+        }
         let mut result = vec![];
         for (labels, group) in &mut self.groups {
             if group.cached.is_none() {
@@ -221,6 +229,7 @@ impl Population {
             }
             let (values, top, sum, average) = group.cached.as_ref().unwrap();
             match readout {
+                SeriesReadout::Snapshot => unreachable!("snapshot returned above"),
                 SeriesReadout::Quantile { q } => {
                     // `values` is only populated for a quantile-carrying population.
                     // `ResidualQueryOperator::validate` rejects the mismatched pairing at
@@ -586,6 +595,7 @@ mod tests {
         plan.entries.insert(
             "test".into(),
             QueryPlanEntry {
+                physical_dag: None,
                 language: QueryLanguage::PromQl,
                 query_id: "test".into(),
                 canonical_query: "quantile by (job) (0.5, a)".into(),

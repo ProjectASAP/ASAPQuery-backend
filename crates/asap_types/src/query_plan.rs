@@ -6,6 +6,7 @@
 //! searching for compatible materializations.
 
 pub mod current_series;
+mod native;
 pub mod residual;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,6 +296,9 @@ pub use crate::executable_plan::QueryNodeId;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct QueryPlanEntry {
+    /// Planner-selected native computation, persisted before activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_dag: Option<serde_json::Value>,
     #[serde(default)]
     pub language: QueryLanguage,
     pub query_id: String,
@@ -390,8 +394,14 @@ impl QueryPlanEntry {
                 self.query_id, self.root.0
             )));
         }
+        if self.physical_vector_binding().is_some() {
+            self.recover_vector_physical_dag()?;
+        } else if self.population_snapshot().is_some() {
+            self.recover_population_physical_dag()?;
+        } else if self.relation_output_schema()?.is_some() || self.physical_dag.is_some() {
+            self.recover_relational_physical_dag()?;
+        }
         for (id, node) in &self.nodes {
-            validate_native_relation(*id, node)?;
             if let QueryPlanNode::PhysicalFragment {
                 inputs,
                 dag,
@@ -676,6 +686,14 @@ pub struct PruningInputContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    /// Bind deployment-provided vectors or stored batches to the compiled physical DAG.
+    /// Input positions correspond to `source_nodes`; operators live only in
+    /// QueryPlanEntry.physical_dag, never in this binding.
+    Physical {
+        inputs: Vec<QueryNodeId>,
+        source_nodes: Vec<u64>,
+        max_bytes: u64,
+    },
     /// Planner-compiled computation. Input order follows the physical input contracts.
     PhysicalFragment {
         inputs: Vec<QueryNodeId>,
@@ -752,8 +770,9 @@ impl QueryPlanNode {
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
-            Self::PhysicalFragment { inputs, .. }
-            | Self::SummaryMerge { inputs }
+            Self::SummaryMerge { inputs }
+            | Self::Physical { inputs, .. }
+            | Self::PhysicalFragment { inputs, .. }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,
         }
@@ -863,6 +882,7 @@ mod contract_tests {
 }
 
 /// Bind portable relation semantics before an installed plan can access its sources.
+#[cfg(test)]
 fn validate_native_relation(id: QueryNodeId, node: &QueryPlanNode) -> Result<(), QueryPlanError> {
     use planner_types::post_asap::{
         ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState, PostAsapNodeId,

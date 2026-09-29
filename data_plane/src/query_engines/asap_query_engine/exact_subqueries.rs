@@ -87,7 +87,8 @@ fn leaves(
             },
             // A join is a typed composition node rather than a Logical
             // wrapper, but its value input can still be a Prometheus leaf.
-            QueryPlanNode::PhysicalFragment { inputs, .. } => {
+            QueryPlanNode::PhysicalFragment { inputs, .. }
+            | QueryPlanNode::Physical { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
             QueryPlanNode::RelationalJoin { inputs, .. } => {
@@ -450,6 +451,7 @@ mod tests {
     use asap_types::query_plan::{FallbackPolicy, InstantExecution};
     fn entry(nodes: BTreeMap<QueryNodeId, QueryPlanNode>) -> QueryPlanEntry {
         QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "remote-cut".into(),
             canonical_query: "a / b".into(),

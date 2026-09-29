@@ -298,6 +298,7 @@ pub fn compile_logical(
     };
     let root = lower.lower(&expr)?;
     let entry = QueryPlanEntry {
+        physical_dag: None,
         language: super::QueryLanguage::PromQl,
         query_id,
         canonical_query,
@@ -513,7 +514,7 @@ pub(super) fn residual_nodes(
         }
     }
     Err(invalid(
-        "Planner residual does not match any original query subtree",
+        "Planner logical fragment does not match any original query subtree",
     ))
 }
 
@@ -542,7 +543,7 @@ pub(super) fn binary_operator(
         });
     }
     if operator.vector_match.is_some() {
-        return Err(invalid("explicit residual vector matching unsupported"));
+        return Err(invalid("explicit logical vector matching unsupported"));
     }
     let operation = match operator.kind.to_string().as_str() {
         "+" => BinaryOperation::Add,
@@ -592,7 +593,7 @@ pub(super) fn selected_native_expression(
 ) -> Result<Expr, QueryPlanError> {
     if !selected.guarantee.as_ref().is_some_and(|g| g.is_exact()) {
         return Err(invalid(
-            "native residual substitution requires an exact selected value",
+            "native subtree substitution requires an exact selected value",
         ));
     }
     let selected = match &selected.expr {

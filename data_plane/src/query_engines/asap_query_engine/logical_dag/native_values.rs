@@ -1,4 +1,4 @@
-//! Bind protocol vectors to native batch operators; computation stays in Planner.
+//! Bind deployment inputs to retained native programs and decode PromQL results.
 use super::{grouping_key, miss, EngineError, Grouping, Labels, Vector};
 use asap_physical_operators::dag::{
     self, batch_execution,
@@ -512,6 +512,23 @@ mod tests {
         }
     }
 
+    // The complete selected-candidate adapter must not classify a byte budget as capability.
+    #[test]
+    fn selected_candidate_input_budget_is_a_terminal_error() {
+        let plan = CompiledPhysicalDag::decode(&sorted()).unwrap();
+        let error = execute_batches(&plan, 1, 1, 42, |_, schema| {
+            Ok(Batch::try_new(
+                schema.clone(),
+                vec![vec![Value::Float64(1.)]],
+            )?)
+        })
+        .expect_err("input must exceed the byte budget");
+        assert!(
+            matches!(error, EngineError::Physical(Error::MemoryLimit)),
+            "{error}"
+        );
+    }
+
     // Count-like values are bound as integers only when the protocol sample is exact.
     #[test]
     fn integer_input_binding_preserves_type_and_rejects_rounding() {
@@ -565,4 +582,237 @@ mod tests {
             vec![0.0_f64.to_bits(), (-0.0_f64).to_bits()]
         );
     }
+}
+
+pub(super) fn execute_vectors<F>(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    at: u64,
+    mut callback: F,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+>
+where
+    F: FnMut(
+        asap_types::query_plan::QueryNodeId,
+        u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, EngineError>,
+{
+    use asap_physical_operators::physical_planner::promql_rows::series_row;
+    use std::collections::BTreeMap;
+    let (program, bindings, max_bytes) =
+        if let Some((inputs, source_nodes, budget)) = entry.physical_vector_binding() {
+            (
+                entry
+                    .recover_vector_physical_dag()
+                    .map_err(|e| miss(e.to_string()))?,
+                source_nodes
+                    .iter()
+                    .copied()
+                    .zip(inputs.iter().copied())
+                    .collect::<BTreeMap<_, _>>(),
+                budget,
+            )
+        } else {
+            let program = entry
+                .recover_population_physical_dag()
+                .map_err(|e| miss(e.to_string()))?;
+            let source = program.input_contracts().next().unwrap().0;
+            (
+                program,
+                BTreeMap::from([(source, entry.root)]),
+                entry.population_snapshot().unwrap().max_bytes,
+            )
+        };
+    execute_batches(
+        &program,
+        max_bytes,
+        bindings.len(),
+        at,
+        |input_id, schema| {
+            let values = super::vector(super::from_result(callback(bindings[&input_id], at)?)?)?;
+            let rows = values
+                .into_iter()
+                .map(|(labels, value)| {
+                    series_row(
+                        schema,
+                        &labels,
+                        i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?,
+                        value,
+                    )
+                    .map_err(|e| miss(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Batch::try_new(schema.clone(), rows).map_err(EngineError::from)
+        },
+    )
+}
+
+pub(in crate::query_engines::asap_query_engine) fn execute_stored(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    plan_id: u64,
+    plan_version: u64,
+    store: &crate::storage_engines::sketch_db::index::SketchStore,
+    at: u64,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+> {
+    let (inputs, sources, max_bytes) = entry
+        .physical_vector_binding()
+        .ok_or_else(|| miss("missing native stored binding"))?;
+    let program = entry
+        .recover_vector_physical_dag()
+        .map_err(|e| miss(e.to_string()))?;
+    execute_batches(&program, max_bytes, inputs.len(), at, |id, schema| {
+        let index = sources
+            .iter()
+            .position(|source| *source == id)
+            .ok_or_else(|| miss("native source is unbound"))?;
+        let Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding }) =
+            entry.nodes.get(&inputs[index])
+        else {
+            return Err(miss("native stored source has no deployed summary binding"));
+        };
+        let end = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
+        let start = at
+            .checked_sub(binding.window_ms)
+            .ok_or_else(|| miss("native window underflow"))?;
+        let address = asap_types::sds::StoredSummaryKey {
+            plan_id,
+            plan_version,
+            stored_output_id: binding.stored_output_reference.stored_output_id,
+            population: std::collections::BTreeMap::new(),
+            window: asap_types::sds::HalfOpenTimeRange {
+                start_ms: start as i64,
+                end_ms: end,
+            },
+        };
+        store
+            .read_bound_native_summary(
+                &address,
+                &binding.stored_output_reference,
+                schema.clone(),
+                max_bytes as usize,
+            )
+            .map_err(miss)
+    })
+}
+
+fn execute_batches(
+    program: &asap_physical_operators::physical_planner::CompiledPhysicalDag,
+    max_bytes: u64,
+    input_count: usize,
+    at: u64,
+    mut input_batch: impl FnMut(u64, &Schema) -> Result<Batch, EngineError>,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+> {
+    use crate::{
+        query_engines::query_result::{InstantVectorElement, QueryResult},
+        storage_engines::types::KeyByLabelValues,
+    };
+    use asap_physical_operators::physical_planner::{
+        promql_rows::{decode_series_identity, SERIES_IDENTITY_COLUMN},
+        Source,
+    };
+    use futures::{executor::block_on, StreamExt};
+    use std::collections::BTreeMap;
+    let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
+    let mut sources = BTreeMap::new();
+    let mut input_bytes = 0usize;
+    for (input_id, input) in program.input_contracts() {
+        let batch = input_batch(input_id, &input.schema)?;
+        input_bytes = input_bytes
+            .checked_add(batch.bytes())
+            .ok_or(asap_physical_operators::Error::MemoryLimit)?;
+        if input_bytes > max_bytes as usize {
+            return Err(asap_physical_operators::Error::MemoryLimit.into());
+        }
+        let source =
+            Operator::source(input.schema.clone(), vec![batch]).map_err(EngineError::from)?;
+        sources.insert(input_id, Box::new(source) as Source<'_>);
+    }
+    let graph = program.instantiate(sources).map_err(EngineError::from)?;
+    let context = dag::RunContext::new(
+        dag::Scope::Query {
+            evaluation_time_ms: at_signed,
+            revision: 0,
+        },
+        dag::Limits {
+            max_bytes: max_bytes as usize,
+            ..dag::Limits::default()
+        },
+    )
+    .map_err(EngineError::from)?;
+    let mut stream = graph
+        .execute(program.roots(), context)
+        .map_err(EngineError::from)?
+        .remove(0);
+    let values = block_on(async {
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(EngineError::from)?;
+            let identity = batch
+                .schema()
+                .fields
+                .iter()
+                .position(|field| field.name == SERIES_IDENTITY_COLUMN);
+            let value = batch
+                .schema()
+                .fields
+                .iter()
+                .position(|field| field.dtype == SummaryFamilyType::Plain(DataType::Float64))
+                .ok_or_else(|| miss("physical output loses sample value"))?;
+            for row in batch.rows() {
+                let Value::Float64(sample) = &row[value] else {
+                    return Err(miss("invalid physical result value"));
+                };
+                let labels = if let Some(identity) = identity {
+                    let Value::Utf8(encoded) = &row[identity] else {
+                        return Err(miss("invalid physical series identity"));
+                    };
+                    decode_series_identity(encoded).map_err(EngineError::from)?
+                } else {
+                    batch
+                        .schema()
+                        .fields
+                        .iter()
+                        .zip(row)
+                        .filter_map(|(field, value)| match value {
+                            Value::Utf8(label) if !label.is_empty() => {
+                                Some((field.name.clone(), label.to_string()))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
+                values.push(
+                    InstantVectorElement::new(
+                        KeyByLabelValues::new_with_labels(labels.values().cloned().collect()),
+                        *sample,
+                    )
+                    .with_label_keys_override(labels.into_keys().collect()),
+                );
+            }
+        }
+        Ok(values)
+    })?;
+    Ok((
+        QueryResult::vector(values, at),
+        super::ExecutionStats {
+            summary_readout_evaluations: input_count,
+            ..Default::default()
+        },
+    ))
 }

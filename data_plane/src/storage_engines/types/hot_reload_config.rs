@@ -80,6 +80,9 @@ impl RuntimePhysicalPlan {
             .map_err(|error| error.to_string())?;
         let mut program = entry.clone();
         program.root = root;
+        // A bound readout is an input to the physical graph, not a second
+        // invocation of that graph. Keep only its storage/readout contract.
+        program.physical_dag = None;
         program.nodes = reachable
             .into_iter()
             .map(|id| (id, entry.nodes[&id].clone()))
@@ -764,6 +767,7 @@ mod tests {
     fn readout_programs_follow_replaced_query_plan_bindings() {
         use asap_types::query_plan::*;
         let entry = |id: u64| QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::QueryLanguage::PromQl,
             query_id: "sum_over_time(m[1m])".into(),
             canonical_query: "sum_over_time(m[1m])".into(),

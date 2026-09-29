@@ -1443,15 +1443,17 @@ fn execute_finite_complete_populations(
         .collect::<Result<Vec<_>, _>>()?;
     asap_types::precompute_plan::validated_source_window_cohort(config, &sources)
         .map_err(|error| error.to_string())?;
+    let native_program = installed.native_program(sink)?;
     if std::iter::once(config)
         .chain(sources.iter().copied())
         .any(|config| {
             config.population_key_encoding != asap_types::PopulationKeyEncoding::CanonicalLabelsV1
-                || config.slide_interval.checked_mul(1000) != Some(config.stored_window_ms())
+                || (native_program.is_none()
+                    && config.slide_interval.checked_mul(1000) != Some(config.stored_window_ms()))
         })
     {
         return Err(
-            "complete population execution requires canonical nonoverlapping full windows".into(),
+            "complete population execution requires canonical windows supported by the bound program".into(),
         );
     }
     let dag = installed.document.decode()?;
@@ -1460,8 +1462,11 @@ fn execute_finite_complete_populations(
         .iter()
         .find(|node| node.id == sink)
         .ok_or("complete target node is absent")?;
-    asap_types::precompute_plan::validate_maintenance_reduction(config, target_node)?;
-    if !matches!(&target_node.payload, ExecutableOperatorPayload::SummaryAgg {
+    if native_program.is_none() {
+        asap_types::precompute_plan::validate_maintenance_reduction(config, target_node)?;
+    }
+    if native_program.is_none()
+        && !matches!(&target_node.payload, ExecutableOperatorPayload::SummaryAgg {
         reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
     } if keys.is_empty())
     {
@@ -1482,11 +1487,16 @@ fn execute_finite_complete_populations(
                 }
                 for (start, end) in windows {
                     let width = source.stored_window_ms();
+                    let stride = source
+                        .slide_interval
+                        .checked_mul(1000)
+                        .ok_or("source cadence overflow")?;
                     if width == 0
+                        || stride == 0
                         || end.checked_sub(*start) != Some(width)
                         || *end > i64::MAX as u64
                         || (*start as i128 - source.pane_origin_ms.unwrap_or(0) as i128)
-                            .rem_euclid(width as i128)
+                            .rem_euclid(stride as i128)
                             != 0
                     {
                         return Err(
@@ -1511,6 +1521,26 @@ fn execute_finite_complete_populations(
     for window in common_windows.unwrap_or_default() {
         let cohort =
             store.read_complete_raw_maintenance_cohort(generation, &derived.inputs, window)?;
+        if let Some(program) = &native_program {
+            let max_bytes = asap_physical_operators::runtime::Limits::default().max_bytes;
+            let batch = super::native_maintenance::execute(
+                installed,
+                program,
+                cohort.inputs(),
+                window,
+                max_bytes,
+            )?;
+            let mut output = crate::storage_engines::types::PrecomputedOutput::new(
+                window.0,
+                window.1,
+                None,
+                target.fingerprint(),
+            );
+            output.population_labels = Some(Population::new());
+            output.catalog_generation = Some(Arc::clone(generation));
+            store.publish_native_summary_output(resolver, config, &output, batch, max_bytes)?;
+            continue;
+        }
         let (dag, key) = prepare_frozen_maintenance_sink(
             installed,
             &plan.materializations,
@@ -2797,6 +2827,7 @@ mod tests {
             },
         );
         let installed = InstalledPostAsapDag {
+            native_programs: std::collections::BTreeMap::new(),
             document,
             binding: durable_binding,
         };
@@ -3181,7 +3212,11 @@ mod tests {
         binding
             .nodes
             .insert(PostAsapNodeId(6), BackendNodeBinding::MaintenanceInput);
-        let installed = InstalledPostAsapDag { document, binding };
+        let installed = InstalledPostAsapDag {
+            native_programs: BTreeMap::new(),
+            document,
+            binding,
+        };
         let configs = [first, second, target];
         let catalog = Arc::new(
             asap_types::summary_catalog::SummaryCatalog::from_materializations(2, 1, &configs)
@@ -4142,6 +4177,7 @@ mod tests {
         bundle.precompute_plan.executable_dags = BTreeMap::from([(
             "retry".into(),
             InstalledPostAsapDag {
+                native_programs: BTreeMap::new(),
                 document: {
                     let mut document =
                         OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap();

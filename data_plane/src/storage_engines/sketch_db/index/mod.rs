@@ -3865,6 +3865,7 @@ pub use SummarySeriesMetadata as SketchInstanceMetadata;
 // alongside the store that uses it.
 mod admission;
 mod maintenance;
+mod native;
 pub(crate) use maintenance::{CompleteRawMaintenanceCohort, FrozenExactWindows};
 pub mod epoch_columnar;
 
