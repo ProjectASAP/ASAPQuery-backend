@@ -620,49 +620,111 @@ mod tests {
             },
             inputs: vec![],
         });
-        entry.nodes.insert(
-            join,
-            QueryPlanNode::RelationalJoin {
-                inputs: [left, external],
-                join_kind: planner_types::pre_asap::JoinKind::Inner,
-                pruning: None,
-                pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
-                    left: Rc::new(QueryExpr::Column(0)),
-                    op: CompareOpKind::Eq,
-                    right: Rc::new(QueryExpr::Column(2)),
-                })))
-                .unwrap(),
-                left_schema,
-                right_schema,
+        entry.nodes.insert(join, {
+            let schemas = vec![
+                std::sync::Arc::new(left_schema),
+                std::sync::Arc::new(right_schema),
+            ];
+            let node = planner_types::post_asap::ExecutableDagNode {
+                id: planner_types::post_asap::PostAsapNodeId(2),
+                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin {
+                    join_kind: planner_types::pre_asap::JoinKind::Inner,
+                    pred: serde_json::from_value(
+                        serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
+                            left: Rc::new(QueryExpr::Column(0)),
+                            op: CompareOpKind::Eq,
+                            right: Rc::new(QueryExpr::Column(2)),
+                        })))
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                    pruning: None,
+                },
+                output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
                 output_schema: joined_schema.clone(),
-            },
-        );
-        entry.nodes.insert(
-            project,
-            QueryPlanNode::Relational {
-                input: join,
-                operation: serde_json::to_value(ValueOperation::Project {
-                    cols: vec![
-                        ProjectItem {
-                            alias: Some("timestamp".into()),
-                            expr: QueryExpr::Column(0),
-                        },
-                        ProjectItem {
-                            alias: Some("ratio".into()),
-                            expr: QueryExpr::Arithmetic {
-                                op: ArithmeticOpKind::Div,
-                                left: Rc::new(QueryExpr::Column(1)),
-                                right: Rc::new(QueryExpr::Column(3)),
-                            },
-                        },
-                    ],
-                    qualifier: None,
-                })
-                .unwrap(),
-                input_schema: joined_schema,
-                output_schema,
-            },
-        );
+                guarantee: None,
+            };
+            let operator =
+                asap_physical_operators::physical_planner::compile_node(&node, &schemas).unwrap();
+            let compiled =
+                asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                    schemas
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, schema)| {
+                            (
+                                id as u64,
+                                asap_physical_operators::physical_planner::InputContract::bounded(
+                                    schema,
+                                ),
+                            )
+                        })
+                        .collect(),
+                    [(2, ((0..2).collect(), operator))].into(),
+                    vec![2],
+                )
+                .unwrap();
+            QueryPlanNode::PhysicalRelation {
+                inputs: [left, external].to_vec(),
+                dag: compiled.encode().unwrap(),
+            }
+        });
+        entry.nodes.insert(project, {
+            let schemas = vec![std::sync::Arc::new(joined_schema)];
+            let node = planner_types::post_asap::ExecutableDagNode {
+                id: planner_types::post_asap::PostAsapNodeId(2),
+                payload: planner_types::post_asap::ExecutableOperatorPayload::Value {
+                    operation: serde_json::from_value(
+                        serde_json::to_value(ValueOperation::Project {
+                            cols: vec![
+                                ProjectItem {
+                                    alias: Some("timestamp".into()),
+                                    expr: QueryExpr::Column(0),
+                                },
+                                ProjectItem {
+                                    alias: Some("ratio".into()),
+                                    expr: QueryExpr::Arithmetic {
+                                        op: ArithmeticOpKind::Div,
+                                        left: Rc::new(QueryExpr::Column(1)),
+                                        right: Rc::new(QueryExpr::Column(3)),
+                                    },
+                                },
+                            ],
+                            qualifier: None,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                },
+                output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
+                output_schema: output_schema,
+                guarantee: None,
+            };
+            let operator =
+                asap_physical_operators::physical_planner::compile_node(&node, &schemas).unwrap();
+            let compiled =
+                asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                    schemas
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, schema)| {
+                            (
+                                id as u64,
+                                asap_physical_operators::physical_planner::InputContract::bounded(
+                                    schema,
+                                ),
+                            )
+                        })
+                        .collect(),
+                    [(2, ((0..1).collect(), operator))].into(),
+                    vec![2],
+                )
+                .unwrap();
+            QueryPlanNode::PhysicalRelation {
+                inputs: vec![join],
+                dag: compiled.encode().unwrap(),
+            }
+        });
         entry.root = project;
 
         entry

@@ -634,10 +634,7 @@ async fn moving_windows_match_clickhouse_after_automatic_publication() {
 #[tokio::test]
 async fn collection_sql_executes_local_elements_after_typed_exact_leaf() {
     use asap_types::query_plan::QueryPlanNode;
-    use planner_types::{
-        post_asap::ValueOperation,
-        pre_asap::{Column, DataType, QueryExpr, Schema},
-    };
+    use planner_types::pre_asap::{Column, DataType, Schema};
     let Ok(clickhouse_url) = std::env::var("CLICKHOUSE_URL") else {
         eprintln!("skipping collection process E2E because CLICKHOUSE_URL is unset");
         return;
@@ -711,11 +708,19 @@ async fn collection_sql_executes_local_elements_after_typed_exact_leaf() {
         .values()
         .any(|node| matches!(node, QueryPlanNode::ExternalExact { .. })));
     for function in ["asap_element_access", "asap_struct_field"] {
-        assert!(entry.nodes.values().any(|node| {
-            let QueryPlanNode::Relational { operation, .. } = node else { return false; };
-            let ValueOperation::Project { cols, .. } = serde_json::from_value(operation.clone()).unwrap() else { return false; };
-            cols.iter().any(|column| matches!(&column.expr, QueryExpr::FunctionCall { name, .. } if name == function))
-        }), "Planner-selected DAG must preserve local {function} evaluation");
+        assert!(
+            entry.nodes.values().any(|node| {
+                let QueryPlanNode::PhysicalRelation { dag, .. } = node else {
+                    return false;
+                };
+                let graph =
+                    asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                        .unwrap();
+                assert_eq!(graph.roots().len(), 1);
+                String::from_utf8(dag.clone()).unwrap().contains(function)
+            }),
+            "Planner physical DAG must preserve local {function} evaluation"
+        );
     }
     eprintln!(
         "collection Planner selection: {}",

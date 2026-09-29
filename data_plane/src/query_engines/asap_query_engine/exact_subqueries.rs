@@ -91,9 +91,7 @@ fn leaves(
             | QueryPlanNode::Physical { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
-            QueryPlanNode::RelationalJoin { inputs, .. } => {
-                pending.extend(inputs.iter().map(|input| (*input, at)));
-            }
+
             QueryPlanNode::ExternalExact { request, inputs } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
                 result.insert((id, at), ExactLeaf::External(request.clone()));
@@ -696,22 +694,28 @@ mod tests {
                 }],
                 time_index: None,
             };
-            QueryPlanNode::RelationalJoin {
-                inputs: [QueryNodeId(0), QueryNodeId(1)],
-                join_kind: planner_types::pre_asap::JoinKind::Semi,
-                pred: serde_json::to_value(planner_types::pre_asap::Predicate(std::rc::Rc::new(
+            {
+            let schemas = vec![std::sync::Arc::new(schema.clone()), std::sync::Arc::new(schema.clone())];
+            let node = planner_types::post_asap::ExecutableDagNode {
+                id: planner_types::post_asap::PostAsapNodeId(2),
+                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin { join_kind: planner_types::pre_asap::JoinKind::Semi, pred: serde_json::from_value(serde_json::to_value(planner_types::pre_asap::Predicate(std::rc::Rc::new(
                     planner_types::pre_asap::QueryExpr::Compare {
                         left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(0)),
                         op: planner_types::pre_asap::CompareOpKind::Eq,
                         right: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(1)),
                     },
                 )))
-                .unwrap(),
-                pruning: Some(CandidateCompleteness::BestEffort { guarantee: None }),
-                left_schema: schema.clone(),
-                right_schema: schema.clone(),
-                output_schema: schema,
-            }
+                .unwrap()).unwrap(), pruning: None },
+                output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
+                output_schema: schema, guarantee: None,
+            };
+            let operator = asap_physical_operators::physical_planner::compile_node(&node, &schemas).unwrap();
+            let compiled = asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                schemas.into_iter().enumerate().map(|(id, schema)| (id as u64, asap_physical_operators::physical_planner::InputContract::bounded(schema))).collect(),
+                [(2, ((0..2).collect(), operator))].into(), vec![2],
+            ).unwrap();
+            QueryPlanNode::PhysicalFragment { inputs: [QueryNodeId(0), QueryNodeId(1)].to_vec(), dag: compiled.encode().unwrap(), row_input: Some(0), pruning: (Some(CandidateCompleteness::BestEffort { guarantee: None })).map(|completeness| asap_types::query_plan::PruningInputContract { candidate_input: 1, keys: vec![(0,0)], completeness }) }
+        }
         });
         entry.nodes.insert(
             QueryNodeId(3),
