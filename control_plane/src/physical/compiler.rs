@@ -228,6 +228,8 @@ pub struct ScopedAccuracyEvidence {
     #[serde(default)]
     pub quantile_operand_domains: Vec<QuantileOperandDomainEvidence>,
     #[serde(default)]
+    pub hll: Option<super::erp::HllConfidenceContract>,
+    #[serde(default)]
     pub values_non_negative: Option<bool>,
     #[serde(default)]
     pub input_row_count: Option<u64>,
@@ -284,6 +286,10 @@ impl ScopedAccuracyEvidence {
             && self
                 .topk_max_distinct_items
                 .is_none_or(|n| n > 0 && n <= (1_u64 << 53))
+            && self
+                .hll
+                .as_ref()
+                .is_none_or(super::erp::HllConfidenceContract::valid)
             && self.input_row_count != Some(0)
             && self
                 .hydra_shared_grid_collision_bound
@@ -364,6 +370,7 @@ pub enum PhysicalDeploymentTarget {
 pub struct BackendLocalPlanningInput {
     #[serde(rename = "snapshot_version")]
     pub schema_version: u32,
+    /// Optional complete provider override; absent evidence uses backend ERP/analytical workload costing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     #[serde(deserialize_with = "deserialize_snapshot_query_workload")]
@@ -745,23 +752,16 @@ impl BackendLocalPlanningInput {
         self,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
-        let evidence = self.workload_cost_evidence.clone().ok_or_else(|| {
-            CompileError::Snapshot(
-                "deployment requires complete workload cost evidence; export candidates and price them before compiling".into(),
-            )
-        })?;
+        let evidence = self.workload_cost_evidence.clone();
         let (request, environment) = self.into_physical_compilation_request()?;
         let candidates =
             super::workload_cost::enumerate_exact_and_materialized_candidates(request)?;
-        if frontend == QueryFrontend::MetricsQl {
-            super::workload_cost::select_lowest_cost_metricsql_candidate(
-                candidates,
-                environment,
-                &evidence,
-            )
-        } else {
-            super::workload_cost::select_lowest_cost_candidate(candidates, environment, &evidence)
-        }
+        super::workload_cost::select_candidates(
+            candidates,
+            environment,
+            evidence.as_ref(),
+            frontend,
+        )
     }
 
     /// Build Planner-authorized candidates for evidence collection without publishing.
@@ -1441,7 +1441,12 @@ impl DeploymentPlanCompiler {
                 validate_evidence(&query.query_id, e, &environment)?;
             }
             let node = query.selected_plan_root.clone();
-            reject_uncertified_readouts(&query.query_id, &node, &query.accuracy_target)?;
+            reject_uncertified_readouts(
+                &query.query_id,
+                &node,
+                &query.accuracy_target,
+                environment.target,
+            )?;
             let selected = if super::maintained_population::supported_node(&node) {
                 Vec::new()
             } else {
@@ -1455,7 +1460,12 @@ impl DeploymentPlanCompiler {
                 })?
             };
             if !selected.is_empty() {
-                reject_uncertified_readouts(&query.query_id, &node, &query.accuracy_target)?;
+                reject_uncertified_readouts(
+                    &query.query_id,
+                    &node,
+                    &query.accuracy_target,
+                    environment.target,
+                )?;
             }
             let selected = selected
                 .into_iter()
@@ -2794,13 +2804,8 @@ fn logical_roots_and_candidates(
         }
     }
     for (accuracy, scope, roots) in cohorts {
-        // ERP v1 has no calibrated failure probability. Preserve explicit
-        // confidence requirements through theoretical/exact fallback.
         let scoped_erp = erp.map(|policy| {
             let mut policy = policy.clone();
-            if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
-                policy.artifact.records.clear();
-            }
             if policy.observed_populations.is_some()
                 && !roots
                     .iter()
@@ -2823,7 +2828,15 @@ fn logical_roots_and_candidates(
             });
             policy
         });
-        let erp = scoped_erp.as_ref();
+        // Confidence limitations invalidate an empirical accuracy decision,
+        // not the independently matched resource measurements.
+        let accuracy_erp = scoped_erp.clone().map(|mut policy| {
+            if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
+                policy.artifact.records.clear();
+            }
+            policy
+        });
+        let erp = accuracy_erp.as_ref();
         let mut model = ControlPlaneCostModel::new(accuracy.clone()).with_exact_composition_costs(
             scope
                 .as_ref()
@@ -2834,9 +2847,17 @@ fn logical_roots_and_candidates(
         if let Some(erp) = erp {
             model = model.with_erp(erp.clone());
         }
+        if let Some(costs) = &scoped_erp {
+            model = model.with_erp_costs(costs.clone());
+        }
         let certificate = scope.as_ref().and_then(|id| evidence.get(id));
         let scoped_certificate = scope.as_ref().and_then(|id| scoped_evidence.get(id));
+        let hll = scoped_certificate.and_then(|evidence| evidence.hll.as_ref());
+        if let Some(contract) = hll {
+            model = model.with_hll_confidence(contract.clone());
+        }
         let accuracy_model = super::erp::ErpAccuracyModel {
+            hll,
             policy: erp,
             max_error: match accuracy {
                 AccuracyTarget::Epsilon(e) | AccuracyTarget::EpsilonDelta { epsilon: e, .. } => e,
@@ -2891,6 +2912,7 @@ fn logical_roots_and_candidates(
                 "source": evidence.source,
                 "data_snapshot_id": evidence.data_snapshot_id,
                 "observed_at_unix_ms": evidence.observed_at_unix_ms,
+                "hll": evidence.hll,
             });
         }
         trace["deployment_overrides"] = serde_json::json!([]);
@@ -2921,7 +2943,7 @@ fn logical_roots_and_candidates(
     Ok(traces)
 }
 
-fn requires_exact_erp_fallback(
+pub(super) fn requires_exact_erp_fallback(
     node: &SummaryNode,
     accuracy: &AccuracyTarget,
     erp: &super::erp::ErpPlanningInput,
@@ -3984,6 +4006,7 @@ fn reject_uncertified_readouts(
     query_id: &str,
     root: &Rc<SummaryNode>,
     accuracy: &AccuracyTarget,
+    target: PhysicalDeploymentTarget,
 ) -> Result<(), CompileError> {
     let dag = planner_types::post_asap::compile_executable_dag(root).map_err(|error| {
         CompileError::Query {
@@ -3992,6 +4015,21 @@ fn reject_uncertified_readouts(
         }
     })?;
     for node in &dag.nodes {
+        if target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
+            && node.guarantee.as_ref().is_some_and(|guarantee| {
+                guarantee.provenance.iter().any(|source| {
+                    matches!(source,
+                planner_types::post_asap::GuaranteeSource::SketchReadout { contract, .. }
+                    if contract == "classic_hll_linear_counting_collision_bound_v1")
+                })
+            })
+        {
+            return Err(CompileError::Query {
+                query_id: query_id.into(),
+                reason: "classic HLL confidence is bound to the backend-local Regular estimator"
+                    .into(),
+            });
+        }
         if matches!(
             node.payload,
             planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
@@ -5789,6 +5827,97 @@ pub(crate) mod tests {
         assert!(result.unwrap().precompute_plan.materializations.is_empty());
     }
 
+    fn bounded_hll_snapshot_wire() -> serde_json::Value {
+        let mut wire = serde_json::to_value(planning_snapshot()).unwrap();
+        let query = "distinct_over_time(data[5s])";
+        wire["query_workload"]["repeating_queries"][0]["query"] = query.into();
+        wire["query_workload"]["repeating_queries"][0]["requirements"]["accuracy"] =
+            serde_json::json!({"explicit":{"EpsilonDelta":{"epsilon":0.05,"delta":0.01}}});
+        wire["implementation"]["data_snapshot_id"] = "hll-bounded-population".into();
+        let now = wire["environment"]["observed_at_unix_ms"].clone();
+        wire["implementation"]["accuracy_evidence"] = serde_json::json!({query: {
+            "query_string": query, "data_snapshot_id": "hll-bounded-population",
+            "data_workload": wire["data_workload"], "source": "enforced-distinct-domain-v1",
+            "observed_at_unix_ms": now, "valid_for_ms": 60000,
+            "hll": {"model":"asap-classic64-uniform-hash-linear-counting-v1",
+                "max_distinct_per_readout": 128}
+        }});
+        wire
+    }
+
+    /// An applicable classic-HLL confidence contract restores normal selection.
+    #[test]
+    fn bounded_hll_confidence_selects_and_binds_a_materialization() {
+        let wire = bounded_hll_snapshot_wire();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1, "{plan:#?}");
+        assert_eq!(
+            plan.precompute_plan.materializations[0].aggregation_type,
+            asap_types::AggregationType::HLL
+        );
+    }
+
+    /// A backend-local estimator proof cannot certify an unverified collector implementation.
+    #[test]
+    fn hll_confidence_cannot_be_rebound_to_collectors() {
+        let snapshot: BackendLocalPlanningInput =
+            serde_json::from_value(bounded_hll_snapshot_wire()).unwrap();
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        let error = reject_uncertified_readouts(
+            "q",
+            &request.queries[0].selected_plan_root,
+            &request.queries[0].accuracy_target,
+            PhysicalDeploymentTarget::DistributedCollectors,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("backend-local Regular estimator"));
+    }
+
+    /// Missing contracts and unattainable targets cannot acquire a confidence proof.
+    #[test]
+    fn hll_confidence_keeps_exact_when_absent_or_insufficient() {
+        for missing in [true, false] {
+            let mut wire = bounded_hll_snapshot_wire();
+            if missing {
+                wire["implementation"]["accuracy_evidence"] = serde_json::json!({});
+            } else {
+                wire["query_workload"]["repeating_queries"][0]["requirements"]["accuracy"] =
+                    serde_json::json!({"explicit":{"EpsilonDelta":{"epsilon":0.05,"delta":1e-12}}});
+            }
+            let snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+            let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+            let plan = DeploymentPlanCompiler
+                .compile_promql(request, environment)
+                .unwrap();
+            assert!(
+                plan.precompute_plan.materializations.is_empty(),
+                "{plan:#?}"
+            );
+        }
+    }
+
+    /// An estimator mismatch or unsupported population must be rejected at admission.
+    #[test]
+    fn hll_confidence_rejects_invalid_source_contracts() {
+        for contract in [
+            serde_json::json!({"model":"asap-classic64-uniform-hash-linear-counting-v1","max_distinct_per_readout":0}),
+            serde_json::json!({"model":"asap-classic64-uniform-hash-linear-counting-v1","max_distinct_per_readout":4097}),
+            serde_json::json!({"model":"hip-rse","max_distinct_per_readout":128}),
+        ] {
+            let mut wire = bounded_hll_snapshot_wire();
+            wire["implementation"]["accuracy_evidence"]["distinct_over_time(data[5s])"]["hll"] =
+                contract;
+            let snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+            assert!(snapshot.into_physical_compilation_request().is_err());
+        }
+    }
+
     /// Accuracy facts must belong to the same query, workload, snapshot and
     /// evidence window before they enter Planner.
     #[test]
@@ -5804,6 +5933,7 @@ pub(crate) mod tests {
             source: "enforced-source-contract".into(),
             observed_at_unix_ms: 9_000,
             valid_for_ms: 2_000,
+            hll: None,
             quantile_operand_domains: vec![],
             values_non_negative: Some(true),
             input_row_count: Some(10),
@@ -5888,6 +6018,7 @@ pub(crate) mod tests {
             source: "enforced-source-contract".into(),
             observed_at_unix_ms: 9_000,
             valid_for_ms: 2_000,
+            hll: None,
             quantile_operand_domains: vec![QuantileOperandDomainEvidence {
                 operand: serde_json::to_value(lhs.as_ref()).unwrap(),
                 lower: 1.0,
@@ -7114,6 +7245,29 @@ pub(crate) mod tests {
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
         .unwrap()
+    }
+
+    /// ERP memory remains usable under an explicit confidence target, even
+    /// though ERP v1 error observations cannot certify that target.
+    #[test]
+    fn erp_resource_costs_survive_confidence_target() {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("quantile_over_time(0.9,m[1m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::EpsilonDelta {
+            epsilon: 0.1,
+            delta: 0.01,
+        });
+        snapshot.physical_inputs.erp =
+            Some(crate::physical::post_asap::cost_model::tests::erp_cost_fixture());
+        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
+        assert!(request
+            .planner_selection_trace
+            .iter()
+            .flat_map(|trace| trace["groups"].as_array().unwrap())
+            .flat_map(|group| group["candidates"].as_array().unwrap())
+            .any(|candidate| candidate["cost_estimate"]["source"] == "erp"
+                && candidate["estimated_cost"] == 7777.0));
     }
 
     fn derived_query_window_secs(query: &str) -> u64 {
@@ -8448,8 +8602,13 @@ pub(crate) mod tests {
         assert_eq!(encoded, fixture);
 
         assert!(
-            snapshot.clone().compile_promql().is_err(),
-            "discovery fixtures must be priced before deployment"
+            snapshot
+                .clone()
+                .compile_promql()
+                .unwrap()
+                .cost_comparison
+                .is_some(),
+            "deployment computes complete workload costs automatically"
         );
         let (local, env) = snapshot
             .clone()
@@ -8488,8 +8647,13 @@ pub(crate) mod tests {
         let snapshot: BackendLocalPlanningInput =
             serde_json::from_str(source).expect("strict compatibility demo fixture");
         assert!(
-            snapshot.clone().compile_promql().is_err(),
-            "discovery fixtures must be priced before deployment"
+            snapshot
+                .clone()
+                .compile_promql()
+                .unwrap()
+                .cost_comparison
+                .is_some(),
+            "deployment computes complete workload costs automatically"
         );
         let (local, env) = snapshot
             .clone()

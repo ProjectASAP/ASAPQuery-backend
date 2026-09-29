@@ -232,6 +232,57 @@ fn fixed_window_rate_heap_candidates_install_both_physical_graphs() {
     );
 }
 
+// Candidate costs include the persisted maintenance graph, not just its cheap readout.
+#[test]
+fn fixed_window_heap_costs_include_native_maintenance() {
+    let mut wire = serde_json::to_value(fixture(true)).unwrap();
+    wire["query_workload"]["repeating_queries"][0]["demand"]["fixed_interval_at"]["interval"] =
+        60_000.into();
+    wire["query_workload"]["repeating_queries"][0]["demand"]["fixed_interval_at"]
+        ["evaluation_phase"] = 0.into();
+    let input: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+    let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+    let ids = enumerate_exact_and_materialized_candidates(request)
+        .unwrap()
+        .into_iter()
+        .filter_map(|candidate| {
+            DeploymentPlanCompiler
+                .compile_promql(candidate, environment.clone())
+                .ok()
+        })
+        .filter(|plan| {
+            plan.precompute_plan
+                .executable_dags
+                .values()
+                .any(|dag| !dag.native_programs.is_empty())
+        })
+        .map(|plan| plan.envelope.plan_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!ids.is_empty());
+    let report = input.compile_promql().unwrap().cost_comparison.unwrap();
+    let candidates = report
+        .candidate_evaluations
+        .iter()
+        .filter(|candidate| candidate.plan_id.is_some_and(|id| ids.contains(&id)))
+        .collect::<Vec<_>>();
+    assert!(!candidates.is_empty());
+    for candidate in candidates {
+        assert!(
+            candidate.total_cost.is_some(),
+            "{:?}",
+            candidate.unavailable_reason
+        );
+        let resources = candidate.automatic_cost.as_ref().unwrap();
+        assert!(resources
+            .components
+            .iter()
+            .any(|(id, resource)| id.starts_with("maintenance:")
+                && resource.cpu_seconds > 0.
+                && resource.memory_byte_seconds > 0.
+                && resource.calculation.get("physical_program").is_some()));
+    }
+}
+
 // Rate must precede grouped Sum in both placements; deployment chooses ownership.
 #[test]
 fn grouped_rate_has_native_query_and_maintenance_candidates() {
@@ -243,9 +294,10 @@ fn grouped_rate_has_native_query_and_maintenance_candidates() {
     entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
     wire["implementation"]["accuracy_evidence"] = json!({});
     let input: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
-    let (request, environment) = input.into_physical_compilation_request().unwrap();
+    let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
     let mut placements = std::collections::BTreeSet::new();
     let mut errors = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
     for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
         let plan = match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
             Ok(plan) => plan,
@@ -269,10 +321,23 @@ fn grouped_rate_has_native_query_and_maintenance_candidates() {
             .any(|dag| !dag.native_programs.is_empty());
         assert_eq!(program.to_string().contains("SummaryBuild"), !stored);
         placements.insert(stored);
+        ids.insert(plan.envelope.plan_id);
     }
     assert_eq!(
         placements,
         std::collections::BTreeSet::from([false, true]),
         "{errors:#?}"
     );
+    let report = input.compile_promql().unwrap().cost_comparison.unwrap();
+    for candidate in report
+        .candidate_evaluations
+        .iter()
+        .filter(|candidate| candidate.plan_id.is_some_and(|id| ids.contains(&id)))
+    {
+        assert!(
+            candidate.total_cost.is_some(),
+            "{:?}",
+            candidate.unavailable_reason
+        );
+    }
 }

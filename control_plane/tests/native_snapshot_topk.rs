@@ -133,3 +133,48 @@ fn unknown_snapshot_heap_guarantee_cannot_be_installed() {
         }
     }
 }
+
+// Analytical costing must account for transient heap state and operator work,
+// rather than pricing every population program as the same Sort/Limit pair.
+#[test]
+fn automatic_costs_include_installed_heap_workspace() {
+    let input = fixture(true);
+    let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+    let heap_ids = enumerate_exact_and_materialized_candidates(request)
+        .unwrap()
+        .into_iter()
+        .filter_map(|candidate| {
+            DeploymentPlanCompiler
+                .compile_promql(candidate, environment.clone())
+                .ok()
+        })
+        .filter(heap)
+        .map(|plan| plan.envelope.plan_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!heap_ids.is_empty());
+    let plan = input.compile_promql().unwrap();
+    let report = plan.cost_comparison.unwrap();
+    let evaluated = report
+        .candidate_evaluations
+        .iter()
+        .filter(|candidate| candidate.plan_id.is_some_and(|id| heap_ids.contains(&id)))
+        .collect::<Vec<_>>();
+    assert!(!evaluated.is_empty());
+    for candidate in evaluated {
+        assert!(
+            candidate.total_cost.is_some(),
+            "{:?}",
+            candidate.unavailable_reason
+        );
+        let resources = candidate.automatic_cost.as_ref().unwrap();
+        assert_eq!(resources.model_version, "backend-workload-resources-v2");
+        assert!(resources.components.values().any(|component| {
+            component.calculation.get("physical_program").is_some()
+                && component.calculation["workspace_bytes_bound"]
+                    .as_f64()
+                    .unwrap_or(0.)
+                    > 0.
+                && component.memory_byte_seconds > 0.
+        }));
+    }
+}
