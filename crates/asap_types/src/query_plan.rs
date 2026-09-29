@@ -520,6 +520,12 @@ impl QueryPlanEntry {
                         ));
                     }
                 } else {
+                    if compiled.row_source(compiled.roots()[0]).is_some() {
+                        return Err(QueryPlanError::Invalid(
+                            "row-preserving physical output requires its input identity binding"
+                                .into(),
+                        ));
+                    }
                     let output = compiled
                         .output_contract(compiled.roots()[0])
                         .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
@@ -957,6 +963,77 @@ mod contract_tests {
 
 #[cfg(test)]
 mod retired_plan_tests {
+    // Row-preserving operators cannot opt out of the original vector identity.
+    #[test]
+    fn row_preserving_graph_requires_its_identity_binding() {
+        use super::*;
+        use asap_physical_operators::{
+            operators::Operator,
+            physical_planner::{CompiledPhysicalDag, InputContract},
+        };
+        use planner_types::{
+            post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+            pre_asap::DataType,
+        };
+        let schema = std::sync::Arc::new(SummarySchema {
+            fields: vec![SummaryField {
+                name: "value".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Float64),
+                nullable: false,
+            }],
+            time_index: None,
+        });
+        let program = CompiledPhysicalDag::from_operators(
+            [(0, InputContract::bounded(schema.clone()))].into(),
+            [(1, (vec![0], Operator::limit(schema, 1, 0, vec![]).unwrap()))].into(),
+            vec![1],
+        )
+        .unwrap();
+        let mut entry = QueryPlanEntry {
+            language: QueryLanguage::PromQl,
+            query_id: "identity".into(),
+            canonical_query: "m".into(),
+            fixed_evaluation: None,
+            physical_dag: None,
+            root: QueryNodeId(1),
+            nodes: [
+                (
+                    QueryNodeId(0),
+                    QueryPlanNode::ExactFallback {
+                        reason: "bound vector".into(),
+                    },
+                ),
+                (
+                    QueryNodeId(1),
+                    QueryPlanNode::PhysicalFragment {
+                        inputs: vec![QueryNodeId(0)],
+                        dag: program.encode().unwrap(),
+                        row_input: None,
+                        pruning: None,
+                    },
+                ),
+            ]
+            .into(),
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::Reject,
+        };
+        assert!(entry
+            .validate(&BTreeSet::new())
+            .unwrap_err()
+            .to_string()
+            .contains("identity binding"));
+        if let QueryPlanNode::PhysicalFragment { row_input, .. } =
+            entry.nodes.get_mut(&QueryNodeId(1)).unwrap()
+        {
+            *row_input = Some(0);
+        }
+        entry.validate(&BTreeSet::new()).unwrap();
+    }
+
     #[test]
     fn uncompiled_relation_variants_are_not_accepted() {
         for kind in ["relational", "relational_join"] {
