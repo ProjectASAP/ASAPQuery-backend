@@ -346,24 +346,29 @@ mod original_tests {
                 )
                 .unwrap();
                 assert!(
-                    !entry
-                        .nodes
-                        .values()
-                        .any(|node| matches!(node, QueryPlanNode::Logical { .. })),
-                    "SQL must not acquire PromQL operators"
+                    !entry.nodes.values().any(|node| matches!(
+                        node,
+                        QueryPlanNode::Logical { .. }
+                            | QueryPlanNode::Relational { .. }
+                            | QueryPlanNode::RelationalJoin { .. }
+                    )),
+                    "SQL installation must not persist logical or uncompiled relational operators"
                 );
-                assert!(entry.nodes.values().any(|node| match node {
-                    QueryPlanNode::Relational { operation, .. } => matches!(
-                        serde_json::from_value::<planner_types::post_asap::ValueOperation>(
-                            operation.clone()
-                        )
-                        .unwrap(),
-                        planner_types::post_asap::ValueOperation::Exact(
-                            planner_types::post_asap::ExactOperation::Aggregate { .. }
-                        )
-                    ),
-                    _ => false,
-                }));
+                let QueryPlanNode::PhysicalRelation { dag, .. } = &entry.nodes[&entry.root] else {
+                    panic!("SQL computation must be installed as a complete physical DAG");
+                };
+                let physical =
+                    asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                        .unwrap();
+                assert_eq!(physical.roots().len(), 1);
+                assert!(!physical.input_contracts().collect::<Vec<_>>().is_empty());
+                let encoded: serde_json::Value = serde_json::from_slice(dag).unwrap();
+                assert!(
+                    encoded["nodes"].as_object().unwrap().keys().any(|id| {
+                        physical.operator_name(id.parse().unwrap()) == Some("Aggregate")
+                    }),
+                    "native aggregate must remain inside the compiled physical DAG"
+                );
             }
         }
     }

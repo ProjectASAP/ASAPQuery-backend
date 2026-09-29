@@ -79,7 +79,7 @@ where
         preserve_relational: true,
         lowered: Some(&mut lowered),
     };
-    let root = compiler.lower(root)?;
+    let root = compiler.lower_relation(root)?;
     Ok(QueryPlanEntry {
         language: QueryLanguage::ClickHouseSql,
         query_id,
@@ -229,6 +229,97 @@ where
         &SummaryFamilyType,
     ) -> Result<MaterializationBinding, QueryPlanError>,
 {
+    fn lower_relation(&mut self, root: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {
+        use asap_physical_operators::physical_planner::{compile, InputContract};
+        use planner_types::post_asap::{
+            compile_executable_dag_with_node_ids, ExecutableOperatorPayload as Payload,
+        };
+        let compilation = compile_executable_dag_with_node_ids(root)
+            .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+        let mut pending = vec![compilation.dag.root];
+        let mut visited = std::collections::BTreeSet::new();
+        let mut contracts = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
+        let mut computed = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let node = compilation
+                .dag
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .ok_or_else(|| QueryPlanError::Invalid("missing Planner physical node".into()))?;
+            let relation = matches!(
+                &node.payload,
+                Payload::RelationalJoin { .. }
+                    | Payload::Value {
+                        operation: planner_types::post_asap::ValueOperation::Project { .. }
+                            | planner_types::post_asap::ValueOperation::Filter { .. }
+                            | planner_types::post_asap::ValueOperation::Sort { .. }
+                            | planner_types::post_asap::ValueOperation::Limit { .. }
+                            | planner_types::post_asap::ValueOperation::Exact(
+                                planner_types::post_asap::ExactOperation::Aggregate { .. }
+                            )
+                    }
+            );
+            if relation {
+                computed.push(id);
+                pending.extend(
+                    compilation
+                        .dag
+                        .edges
+                        .iter()
+                        .filter(|e| e.consumer == id)
+                        .map(|e| e.producer),
+                );
+            } else {
+                let semantic = compilation.node_ids.summary_node(id).ok_or_else(|| {
+                    QueryPlanError::Invalid("missing Planner source identity".into())
+                })?;
+                let source = self.lower(semantic)?;
+                bindings.insert(u64::from(id.0), source);
+                contracts.insert(
+                    u64::from(id.0),
+                    InputContract::bounded(std::sync::Arc::new(node.output_schema.clone())),
+                );
+            }
+        }
+        if computed.is_empty() {
+            return self.lower(root);
+        }
+        let physical = compile(
+            &compilation.dag,
+            contracts,
+            &[u64::from(compilation.dag.root.0)],
+        )
+        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+        let id = QueryNodeId(self.next_id);
+        self.next_id += 1;
+        self.nodes.insert(
+            id,
+            QueryPlanNode::PhysicalRelation {
+                inputs: physical
+                    .input_contracts()
+                    .map(|(id, _)| bindings[&id])
+                    .collect(),
+                dag: physical
+                    .encode()
+                    .map_err(|e| QueryPlanError::Invalid(e.to_string()))?,
+            },
+        );
+        for node in computed {
+            if let Some(semantic) = compilation.node_ids.summary_node(node) {
+                self.seen.insert(Rc::as_ptr(semantic) as usize, id);
+                if let Some(lowered) = &mut self.lowered {
+                    lowered(semantic, id);
+                }
+            }
+        }
+        Ok(id)
+    }
+
     fn graft(
         &mut self,
         id: QueryNodeId,
@@ -248,7 +339,8 @@ where
         }
         for (local, mut physical) in nodes {
             match &mut physical {
-                QueryPlanNode::PhysicalFragment { inputs, .. }
+                QueryPlanNode::PhysicalRelation { inputs, .. }
+                | QueryPlanNode::PhysicalFragment { inputs, .. }
                 | QueryPlanNode::Logical { inputs, .. }
                 | QueryPlanNode::SummaryMerge { inputs }
                 | QueryPlanNode::ExternalExact { inputs, .. } => {
@@ -328,49 +420,23 @@ where
         }
 
         let physical = match &node.expr {
-            SummaryExpr::RelationalJoin {
-                left,
-                right,
-                kind,
-                pred,
-                pruning,
-            } if self.preserve_relational => QueryPlanNode::RelationalJoin {
-                inputs: [self.lower(left)?, self.lower(right)?],
-                join_kind: kind.clone(),
-                pruning: pruning.clone(),
-                pred: serde_json::to_value(pred).map_err(|error| {
-                    QueryPlanError::Invalid(format!(
-                        "cannot serialize relational join predicate: {error}"
-                    ))
-                })?,
-                left_schema: left.schema.clone(),
-                right_schema: right.schema.clone(),
-                output_schema: node.schema.clone(),
-            },
-            SummaryExpr::ValueOperation {
-                child, operation, ..
-            } if self.preserve_relational
-                && matches!(
-                    operation,
-                    planner_types::post_asap::ValueOperation::Project { .. }
-                        | planner_types::post_asap::ValueOperation::Filter { .. }
-                        | planner_types::post_asap::ValueOperation::Sort { .. }
-                        | planner_types::post_asap::ValueOperation::Limit { .. }
-                        | planner_types::post_asap::ValueOperation::Exact(
-                            planner_types::post_asap::ExactOperation::Aggregate { .. }
-                        )
-                ) =>
+            SummaryExpr::RelationalJoin { .. } if self.preserve_relational => {
+                return self.lower_relation(node);
+            }
+            SummaryExpr::ValueOperation { operation, .. }
+                if self.preserve_relational
+                    && matches!(
+                        operation,
+                        planner_types::post_asap::ValueOperation::Project { .. }
+                            | planner_types::post_asap::ValueOperation::Filter { .. }
+                            | planner_types::post_asap::ValueOperation::Sort { .. }
+                            | planner_types::post_asap::ValueOperation::Limit { .. }
+                            | planner_types::post_asap::ValueOperation::Exact(
+                                planner_types::post_asap::ExactOperation::Aggregate { .. }
+                            )
+                    ) =>
             {
-                QueryPlanNode::Relational {
-                    input: self.lower(child)?,
-                    operation: serde_json::to_value(operation).map_err(|error| {
-                        QueryPlanError::UnsupportedNode(format!(
-                            "cannot serialize relational operation: {error}"
-                        ))
-                    })?,
-                    input_schema: child.schema.clone(),
-                    output_schema: node.schema.clone(),
-                }
+                return self.lower_relation(node);
             }
             SummaryExpr::ValueOperation {
                 child,

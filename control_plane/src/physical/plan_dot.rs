@@ -139,7 +139,8 @@ fn escape(value: &str) -> String {
 
 fn query_node_label(node: &QueryPlanNode) -> String {
     match node {
-        QueryPlanNode::PhysicalFragment { dag, .. } => {
+        QueryPlanNode::PhysicalRelation { dag, .. }
+        | QueryPlanNode::PhysicalFragment { dag, .. } => {
             asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                 .map(|plan| {
                     format!(
