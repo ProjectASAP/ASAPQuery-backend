@@ -591,7 +591,12 @@ impl PrecomputePlan {
                         .ok_or_else(invalid)?;
                     let native = installed
                         .native_program(*sink)
-                        .map_err(PrecomputePlanError::CatalogContract)?;
+                        .map_err(PrecomputePlanError::CatalogContract)?
+                        .ok_or_else(invalid)?;
+                    let native = native.output_contract(u64::from(sink.0))
+                        .map_err(|e| PrecomputePlanError::CatalogContract(e.to_string()))
+                        .map(|contract| !asap_physical_operators::physical_planner::precompute::is_population_schema(&contract.schema))?
+                        .then_some(native);
                     if sources.iter().any(|source| {
                         !matches!(source.aggregation_type, crate::AggregationType::Sum)
                             && !(native.is_some()

@@ -2514,6 +2514,14 @@ impl DeploymentPlanCompiler {
                     .map_err(|e| CompileError::Snapshot(e.to_string()))?,
                 );
             }
+            super::executable_binding::compile_precompute_programs(
+                &mut installed,
+                &materializations,
+            )
+            .map_err(|reason| CompileError::Query {
+                query_id: query_id.clone(),
+                reason,
+            })?;
             query_plan
                 .selected_dags
                 .insert(query_id.clone(), installed.document.clone());

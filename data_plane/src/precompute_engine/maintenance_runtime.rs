@@ -96,7 +96,6 @@ enum MaintenanceInputs<'a> {
     },
     Frozen(&'a [crate::storage_engines::sketch_db::index::FrozenExactWindows]),
     Complete(&'a crate::storage_engines::sketch_db::index::CompleteRawMaintenanceCohort),
-    Captured(&'a [crate::storage_engines::sketch_db::index::FrozenExactWindows]),
 }
 
 impl MaintenanceInputs<'_> {
@@ -105,7 +104,7 @@ impl MaintenanceInputs<'_> {
     ) -> Option<&[crate::storage_engines::sketch_db::index::FrozenExactWindows]> {
         match self {
             Self::Live { .. } => None,
-            Self::Frozen(inputs) | Self::Captured(inputs) => Some(inputs),
+            Self::Frozen(inputs) => Some(inputs),
             Self::Complete(cohort) => Some(cohort.inputs()),
         }
     }
@@ -176,9 +175,6 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
             MaintenanceInputs::Live { .. } => Ok(None),
             MaintenanceInputs::Frozen(inputs) => {
                 frozen_population_value(inputs, definition, family, false)
-            }
-            MaintenanceInputs::Captured(inputs) => {
-                frozen_population_value(inputs, definition, family, true)
             }
             MaintenanceInputs::Complete(cohort) => {
                 frozen_population_value(cohort.inputs(), definition, family, true)
@@ -996,29 +992,31 @@ fn execute_prepared_frozen_sink(
     dag: &planner_types::post_asap::ExecutableDag,
     key: MaterializationCommitKey,
 ) -> Result<(SummaryState, Population), MaintenanceError> {
-    let adapter = OperatorAdapter {
-        binding: &installed.binding,
+    let _ = (configs, dag);
+    let program = installed
+        .native_program(sink)?
+        .ok_or("installed precompute sink lacks its Planner physical graph")?;
+    let inputs = inputs
+        .frozen_inputs()
+        .ok_or("compiled precompute requires immutable inputs")?;
+    let batch = super::native_precompute::execute(
+        installed,
+        &program,
         inputs,
-        configs,
-    };
-    let value = execute_precompute_sink(
-        dag,
-        &installed.binding,
-        sink,
-        key.clone(),
-        &adapter,
-        &CommitRegistry::default(),
-        maintenance_context(key.window_start_ms, key.window_end_ms, key.plan_version)?,
-    )
-    .map_err(schedule_error)?;
-    let group = match value.as_ref() {
-        MaintenanceValue::SummaryWindows { states, .. } if states.len() == 1 => {
-            states.keys().next().unwrap().clone()
-        }
-        MaintenanceValue::Summary { .. } => Population::new(),
-        _ => return Err("maintenance sink has multiple or missing output populations".into()),
-    };
-    Ok((Arc::clone(value.state()?), group))
+        (
+            u64::try_from(key.window_start_ms)?,
+            u64::try_from(key.window_end_ms)?,
+        ),
+        asap_physical_operators::runtime::Limits::default().max_bytes,
+        key.plan_version,
+    )?;
+    let mut populations =
+        super::native_precompute::population_states(&batch, u64::try_from(key.window_end_ms)?)?;
+    if populations.len() != 1 {
+        return Err("precompute sink must explicitly reduce to one output population".into());
+    }
+    let (group, state) = populations.pop().unwrap();
+    Ok((state, group))
 }
 
 #[cfg(test)]
@@ -1464,7 +1462,15 @@ fn execute_finite_complete_populations(
         .collect::<Result<Vec<_>, _>>()?;
     asap_types::precompute_plan::validated_source_window_cohort(config, &sources)
         .map_err(|error| error.to_string())?;
-    let native_program = installed.native_program(sink)?;
+    let native_program = installed.native_program(sink)?.filter(|program| {
+        program
+            .output_contract(u64::from(sink.0))
+            .is_ok_and(|contract| {
+                !asap_physical_operators::physical_planner::precompute::is_population_schema(
+                    &contract.schema,
+                )
+            })
+    });
     if std::iter::once(config)
         .chain(sources.iter().copied())
         .any(|config| {
@@ -2869,8 +2875,14 @@ mod tests {
                 stored_output: durable_configs[1].policy_fingerprint().into(),
             },
         );
+        let program =
+            asap_physical_operators::physical_planner::precompute::compile(&dag, &[1], &[3])
+                .unwrap();
         let installed = InstalledPostAsapDag {
-            native_programs: std::collections::BTreeMap::new(),
+            native_programs: BTreeMap::from([(
+                PostAsapNodeId(3),
+                serde_json::from_slice(&program.encode().unwrap()).unwrap(),
+            )]),
             document,
             binding: durable_binding,
         };
@@ -3255,8 +3267,17 @@ mod tests {
         binding
             .nodes
             .insert(PostAsapNodeId(6), BackendNodeBinding::MaintenanceInput);
+        let program = asap_physical_operators::physical_planner::precompute::compile(
+            &document.decode().unwrap(),
+            &[1, 5],
+            &[3],
+        )
+        .unwrap();
         let installed = InstalledPostAsapDag {
-            native_programs: BTreeMap::new(),
+            native_programs: BTreeMap::from([(
+                PostAsapNodeId(3),
+                serde_json::from_slice(&program.encode().unwrap()).unwrap(),
+            )]),
             document,
             binding,
         };
@@ -4483,8 +4504,6 @@ pub(crate) fn execute_revision_outputs(
         .as_ref()
         .ok_or("revision generation missing")?;
     for installed in plan.precompute_plan.executable_dags.values() {
-        let mut windows: BTreeMap<(u64, u64), Vec<(PostAsapNodeId, MaterializationCommitKey)>> =
-            BTreeMap::new();
         let mut result: BTreeMap<asap_types::sds::StoredOutputId, Vec<RevisionRecord>> =
             BTreeMap::new();
         for sink in &installed.binding.precompute_sinks {
@@ -4562,6 +4581,29 @@ pub(crate) fn execute_revision_outputs(
                     let batch = super::native_precompute::execute(
                         installed, &program, &selected, window, limit, revision,
                     )?;
+                    if asap_physical_operators::physical_planner::precompute::is_population_schema(
+                        batch.schema(),
+                    ) {
+                        for (group, state) in
+                            super::native_precompute::population_states(&batch, window.1)?
+                        {
+                            let payload = encode_state(state, config.accumulator_spec()?.family)?;
+                            if payload.len() > limit {
+                                return Err(asap_physical_operators::Error::MemoryLimit.into());
+                            }
+                            result.get_mut(target).unwrap().push(RevisionRecord {
+                                reference: plan
+                                    .installed_precompute_plan
+                                    .stored_output_reference(*target)
+                                    .ok_or("precompute output binding missing")?,
+                                group,
+                                start_ms: window.0,
+                                end_ms: window.1,
+                                payload,
+                            });
+                        }
+                        continue;
+                    }
                     let payload =
                         asap_physical_operators::stored_state::native::encode_batch(&batch)?;
                     if payload.len() > limit {
@@ -4579,102 +4621,7 @@ pub(crate) fn execute_revision_outputs(
                     });
                     continue;
                 }
-                let (_, mut key) = prepare_frozen_maintenance_sink(
-                    installed,
-                    &plan.precompute_plan.materializations,
-                    *sink,
-                    &selected,
-                    window,
-                )?;
-                // The captured input revision, rather than a sink-specific digest,
-                // identifies the common evaluation frontier for shared producers.
-                key.input_lineage = revision.to_be_bytes().to_vec();
-                windows.entry(window).or_default().push((*sink, key));
-            }
-        }
-        let dag = installed.document.decode()?;
-        for (window, sinks) in windows {
-            let inputs: Vec<_> = raw
-                .iter()
-                .filter_map(|input| {
-                    let windows: BTreeMap<_, _> = input
-                        .windows
-                        .iter()
-                        .filter(|((s, e), _)| *s >= window.0 && *e <= window.1)
-                        .map(|(w, s)| (*w, Arc::clone(s)))
-                        .collect();
-                    (!windows.is_empty()).then(|| {
-                        crate::storage_engines::sketch_db::index::FrozenExactWindows {
-                            stored_output_reference: input.stored_output_reference.clone(),
-                            storage_handle: input.storage_handle,
-                            definition: input.definition,
-                            generation: Arc::clone(&input.generation),
-                            group: input.group.clone(),
-                            windows,
-                            singleton_population_complete: true,
-                        }
-                    })
-                })
-                .collect();
-            let adapter = OperatorAdapter {
-                binding: &installed.binding,
-                inputs: MaintenanceInputs::Captured(&inputs),
-                configs: &plan.precompute_plan.materializations,
-            };
-            let context = RunContext::new(
-                asap_physical_operators::dag::Scope::Ingestion {
-                    window_start_ms: window.0 as i64,
-                    window_end_ms: window.1 as i64,
-                    revision,
-                },
-                asap_physical_operators::dag::Limits {
-                    max_bytes: limit,
-                    ..Default::default()
-                },
-            )?;
-            let values = execute_precompute_sinks(
-                &dag,
-                &installed.binding,
-                &sinks,
-                &adapter,
-                &CommitRegistry::default(),
-                context,
-            )
-            .map_err(schedule_error)?;
-            for ((_, key), value) in sinks.iter().zip(values) {
-                let group = match value.as_ref() {
-                    MaintenanceValue::SummaryWindows { states, .. } if states.len() == 1 => {
-                        states.keys().next().unwrap().clone()
-                    }
-                    MaintenanceValue::Summary { .. } => BTreeMap::new(),
-                    _ => {
-                        return Err(
-                            "revision sink must explicitly reduce its output population".into()
-                        )
-                    }
-                };
-                let config = plan
-                    .precompute_plan
-                    .materializations
-                    .iter()
-                    .find(|c| c.policy_fingerprint() == key.stored_output.fingerprint())
-                    .ok_or("revision output configuration missing")?;
-                result
-                    .get_mut(&key.stored_output)
-                    .unwrap()
-                    .push(RevisionRecord {
-                        reference: plan
-                            .installed_precompute_plan
-                            .stored_output_reference(key.stored_output)
-                            .ok_or("revision output binding missing")?,
-                        group,
-                        start_ms: window.0,
-                        end_ms: window.1,
-                        payload: encode_state(
-                            Arc::clone(value.state()?),
-                            config.accumulator_spec()?.family,
-                        )?,
-                    });
+                return Err("installed revision producer lacks its Planner physical graph".into());
             }
         }
         for (output, records) in result {
