@@ -139,7 +139,7 @@ pub enum TimestampUnit {
 #[serde(deny_unknown_fields)]
 pub struct IngestContract {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dataset_identity: Option<planner_types::post_asap::LogicalDatasetIdentity>,
+    pub dataset_identity: Option<crate::semantic_fragment::LogicalDatasetIdentity>,
     pub protocol: IngestProtocol,
     pub endpoint_path: String,
     pub timestamp_unit: TimestampUnit,
@@ -366,7 +366,7 @@ impl PrecomputePlan {
             .collect();
         let dataset_identity = materializations
             .iter()
-            .filter_map(|m| m.semantic_fragment.as_ref()?.dataset_identity.clone())
+            .filter_map(|m| m.dataset_identity.clone())
             .next();
         let plan = Self {
             summary_catalog: None,
@@ -484,7 +484,7 @@ impl PrecomputePlan {
                 fragment
                     .validate()
                     .map_err(PrecomputePlanError::CatalogContract)?;
-                if fragment.dataset_identity != self.ingest.dataset_identity {
+                if materialization.dataset_identity != self.ingest.dataset_identity {
                     return Err(PrecomputePlanError::CatalogContract(
                         "semantic dataset differs from installed input binding".into(),
                     ));

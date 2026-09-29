@@ -1069,6 +1069,7 @@ mod tests {
         let aggregation = PrecomputeMaterialization {
             stored_output_id: None,
             semantic_fragment: None,
+            dataset_identity: None,
             population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
@@ -1199,6 +1200,7 @@ mod tests {
             PrecomputeMaterialization {
                 stored_output_id: None,
                 semantic_fragment: None,
+                dataset_identity: None,
                 population_key_encoding: Default::default(),
                 aggregation_type,
                 aggregation_sub_type: String::new(),

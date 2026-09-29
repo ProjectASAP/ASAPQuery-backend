@@ -6,6 +6,7 @@
 pub mod asap_tier_result;
 pub mod decoders;
 pub mod delta_apply;
+pub mod sketch_readout;
 pub mod timeline;
 pub mod timeline_dispatch;
 pub mod window_merger;

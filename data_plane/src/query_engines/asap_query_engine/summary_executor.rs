@@ -757,15 +757,16 @@ fn sketch_query_value(
     state: &SummaryState,
     query: &SketchQuery,
 ) -> Result<f64, SummaryExecutorError> {
-    asap_physical_operators::stored_state::readout::sketch_query_value(state, query).map_err(
-        |asap_physical_operators::stored_state::readout::Error::Unsupported(reason)| {
-            SummaryExecutorError::Unsupported(reason)
-        },
-    )
+    crate::storage_engines::sketch_db::query::sketch_readout::sketch_query_value(state, query)
+        .map_err(
+            |crate::storage_engines::sketch_db::query::sketch_readout::Error::Unsupported(
+                reason,
+            )| { SummaryExecutorError::Unsupported(reason) },
+        )
 }
 fn topk_ranked(state: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, SummaryExecutorError> {
-    asap_physical_operators::stored_state::readout::topk_ranked(state, k).map_err(
-        |asap_physical_operators::stored_state::readout::Error::Unsupported(reason)| {
+    crate::storage_engines::sketch_db::query::sketch_readout::topk_ranked(state, k).map_err(
+        |crate::storage_engines::sketch_db::query::sketch_readout::Error::Unsupported(reason)| {
             SummaryExecutorError::Unsupported(reason)
         },
     )

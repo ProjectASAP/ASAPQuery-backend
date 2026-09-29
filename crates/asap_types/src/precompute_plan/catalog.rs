@@ -70,10 +70,11 @@ impl PrecomputePlan {
                             if stored_output.fingerprint() == config.policy_fingerprint())
                         {
                             found = true;
-                            let actual = match &self.ingest.dataset_identity {
-                                Some(dataset) => crate::semantic_fragment::SemanticFragment::from_stored_output_in_dataset(&dag, *id, dataset.clone()),
-                                None => crate::semantic_fragment::SemanticFragment::from_stored_output(&dag, *id),
-                            }.map_err(invalid)?;
+                            let actual =
+                                crate::semantic_fragment::SemanticFragment::from_stored_output(
+                                    &dag, *id,
+                                )
+                                .map_err(invalid)?;
                             if &actual != expected {
                                 return Err(invalid(
                                     "semantic definition differs from Planner-selected producer",
