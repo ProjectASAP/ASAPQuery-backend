@@ -302,6 +302,7 @@ pub fn compile_logical(
     };
     let root = lower.lower(&expr)?;
     let entry = QueryPlanEntry {
+        physical_dag: None,
         language: super::QueryLanguage::PromQl,
         query_id,
         canonical_query,
@@ -517,7 +518,7 @@ pub(super) fn query_time_nodes(
         }
     }
     Err(invalid(
-        "Planner fragment does not match any original query subtree",
+        "Planner logical fragment does not match any original query subtree",
     ))
 }
 
@@ -546,7 +547,7 @@ pub(super) fn binary_operator(
         });
     }
     if operator.vector_match.is_some() {
-        return Err(invalid("explicit fragment vector matching unsupported"));
+        return Err(invalid("explicit logical vector matching unsupported"));
     }
     let operation = match operator.kind.to_string().as_str() {
         "+" => BinaryOperation::Add,
@@ -596,7 +597,7 @@ pub(super) fn selected_native_expression(
 ) -> Result<Expr, QueryPlanError> {
     if !selected.guarantee.as_ref().is_some_and(|g| g.is_exact()) {
         return Err(invalid(
-            "native fragment substitution requires an exact selected value",
+            "native subtree substitution requires an exact selected value",
         ));
     }
     let selected = match &selected.expr {
@@ -870,7 +871,11 @@ mod planner_workload_tests {
                 let plan =
                     asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                         .unwrap();
-                assert_eq!(plan.operator_name(plan.roots()[0]), Some("Limit"));
+                assert!(
+                    plan.operator_name(plan.roots()[0]) == Some("Limit")
+                        || super::super::physical_values::operator_parameters(node, "Limit").len()
+                            == 1
+                );
             }
             QueryPlanNode::Logical {
                 operator: QueryTimeOperator::Limit { .. },

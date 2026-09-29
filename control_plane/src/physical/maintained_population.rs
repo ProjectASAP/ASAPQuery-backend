@@ -1,5 +1,7 @@
 //! Lower typed population operators according to executor membership capabilities.
-use super::compiler::{CompileError, PhysicalCompilationRequest, QueryCompilationInput};
+#[cfg(test)]
+use super::compiler::QueryCompilationInput;
+use super::compiler::{CompileError, PhysicalCompilationRequest};
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
     query_time::{Grouping, LabelMatch, LabelMatcher, QueryTimeOperator},
@@ -8,23 +10,50 @@ use planner_types::post_asap::{
     maintained_population::*, SummaryExpr, SummaryNode, ValueOperation,
 };
 
-fn selected(node: &SummaryNode) -> Option<(&MaintainedPopulation, &PopulationReadout)> {
-    let SummaryExpr::ValueOperation {
+fn selected(node: &SummaryNode) -> Option<(MaintainedPopulation, PopulationReadout)> {
+    if let SummaryExpr::ValueOperation {
         child,
         operation: ValueOperation::ReadPopulation { readout },
+        ..
+    } = &node.expr
+    {
+        if let SummaryExpr::ValueOperation {
+            operation: ValueOperation::MaintainPopulation { population },
+            ..
+        } = &child.expr
+        {
+            return Some((population.clone(), readout.clone()));
+        }
+    }
+    // The source remains a maintained population when Planner places a heap,
+    // projection and ranking above it. Backend binds that source only.
+    let SummaryExpr::ValueOperation {
+        operation: ValueOperation::Limit { n, offset: 0, .. },
         ..
     } = &node.expr
     else {
         return None;
     };
-    let SummaryExpr::ValueOperation {
-        operation: ValueOperation::MaintainPopulation { population },
-        ..
-    } = &child.expr
-    else {
+    let dag =
+        planner_types::post_asap::compile_post_asap_dag(&std::rc::Rc::new(node.clone())).ok()?;
+    let populations = dag
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.payload {
+            planner_types::post_asap::PostAsapOperatorPayload::Value {
+                operation: ValueOperation::MaintainPopulation { population },
+            } => Some(population),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [population] = populations.as_slice() else {
         return None;
     };
-    Some((population, readout))
+    asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(
+        &std::rc::Rc::new(node.clone()),
+    )
+    .ok()?;
+    Some(((*population).clone(), PopulationReadout::TopK { k: *n }))
 }
 
 pub(super) fn supported_node(node: &SummaryNode) -> bool {
@@ -40,22 +69,21 @@ pub(super) fn supported(request: &PhysicalCompilationRequest) -> bool {
         .any(|q| supported_node(&q.selected_plan_root))
 }
 
-pub(super) fn operator(
+/// Resolve population bindings once per candidate. Scanning every workload
+/// root for each consumer recompiles the same native ranking graphs quadratically.
+pub(super) fn operators(
     request: &PhysicalCompilationRequest,
-    query: &QueryCompilationInput,
-) -> Result<Option<QueryTimeOperator>, CompileError> {
-    let Some((spec, readout)) = selected(&query.selected_plan_root) else {
-        return Ok(None);
-    };
-    let PopulationInput::CurrentSeries(input) = &spec.input else {
-        return Err(CompileError::Query { query_id: query.query_id.clone(), reason: "maintained table-row populations require a row-update executor; remote-write current-series state is incompatible".into() });
-    };
-    let populations: std::collections::BTreeSet<_> = request
+) -> Result<Vec<Option<QueryTimeOperator>>, CompileError> {
+    let selected = request
         .queries
         .iter()
-        .filter_map(|q| {
-            selected(&q.selected_plan_root)
-                .map(|(p, _)| serde_json::to_string(p).expect("typed population serializes"))
+        .map(|query| selected(&query.selected_plan_root))
+        .collect::<Vec<_>>();
+    let populations: std::collections::BTreeSet<_> = selected
+        .iter()
+        .flatten()
+        .map(|(population, _)| {
+            serde_json::to_string(population).expect("typed population serializes")
         })
         .collect();
     let max_bytes = request
@@ -63,6 +91,11 @@ pub(super) fn operator(
         .unwrap_or(64 * 1024 * 1024)
         .min(1_073_741_824)
         / populations.len().max(1) as u64;
+    selected.into_iter().zip(&request.queries).map(|(selected, query)| {
+        let Some((spec, readout)) = selected else { return Ok(None); };
+    let PopulationInput::CurrentSeries(input) = &spec.input else {
+        return Err(CompileError::Query { query_id: query.query_id.clone(), reason: "maintained table-row populations require a row-update executor; remote-write current-series state is incompatible".into() });
+    };
     let population = SeriesPopulation {
         metric: input.metric.clone(),
         matchers: input
@@ -97,7 +130,7 @@ pub(super) fn operator(
             .min(input.lookback_ms),
     };
     population.validate()?;
-    let readout = match readout {
+    let readout = match &readout {
         PopulationReadout::Quantile { q } => SeriesReadout::Quantile { q: *q },
         PopulationReadout::TopK { k } => SeriesReadout::TopK { k: *k as u64 },
         PopulationReadout::Sum => SeriesReadout::Sum,
@@ -108,4 +141,63 @@ pub(super) fn operator(
         population,
         readout,
     }))
+    }).collect()
+}
+
+#[cfg(test)]
+pub(super) fn operator(
+    request: &PhysicalCompilationRequest,
+    query: &QueryCompilationInput,
+) -> Result<Option<QueryTimeOperator>, CompileError> {
+    let index = request
+        .queries
+        .iter()
+        .position(|q| q.query_id == query.query_id)
+        .expect("query belongs to the compilation request");
+    Ok(operators(request)?.remove(index))
+}
+
+/// The maintained population is a deployment source; ranking is compiled by
+/// Planner before this candidate is priced or installed.
+pub(super) fn install_native_topk(
+    entry: &mut asap_types::query_plan::QueryPlanEntry,
+    compiled: Option<&asap_physical_operators::physical_planner::CompiledPhysicalDag>,
+) -> Result<(), CompileError> {
+    use asap_types::query_plan::QueryPlanNode;
+    let Some(QueryPlanNode::Logical {
+        operator:
+            QueryTimeOperator::CurrentSeries {
+                population,
+                readout: SeriesReadout::TopK { .. },
+            },
+        ..
+    }) = entry.nodes.get(&entry.root)
+    else {
+        return Ok(());
+    };
+    if population.grouping.without {
+        return Ok(());
+    }
+    let compiled = compiled.ok_or_else(|| CompileError::Query {
+        query_id: entry.query_id.clone(),
+        reason: "selected TopK candidate has no retained physical DAG".into(),
+    })?;
+    let encoded = compiled.encode().map_err(|error| CompileError::Query {
+        query_id: entry.query_id.clone(),
+        reason: error.to_string(),
+    })?;
+    entry.physical_dag = Some(
+        serde_json::from_slice(&encoded)
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?,
+    );
+    let Some(QueryPlanNode::Logical {
+        operator: QueryTimeOperator::CurrentSeries { readout, .. },
+        ..
+    }) = entry.nodes.get_mut(&entry.root)
+    else {
+        unreachable!()
+    };
+    *readout = SeriesReadout::Snapshot;
+    entry.recover_population_physical_dag()?;
+    Ok(())
 }

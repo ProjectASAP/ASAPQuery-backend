@@ -17,7 +17,7 @@ use arrow::{
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone};
 use planner_types::{
-    post_asap::{SummaryFamilyType, SummarySchema, ValueOperation},
+    post_asap::{SummaryFamilyType, SummarySchema},
     pre_asap::DataType,
 };
 
@@ -398,8 +398,13 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
     }
 }
 
+#[cfg(test)]
+use planner_types::post_asap::ValueOperation;
+
+#[cfg(test)]
 pub struct ClickHouseRelationalAdapter;
 
+#[cfg(test)]
 impl ClickHouseRelationalAdapter {
     pub fn apply_join(
         &self,
@@ -410,7 +415,7 @@ impl ClickHouseRelationalAdapter {
         right: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
         native::execute(
-            planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin {
+            planner_types::post_asap::PostAsapOperatorPayload::RelationalJoin {
                 join_kind: kind.clone(),
                 pred: pred.clone(),
                 pruning: None,
@@ -440,7 +445,7 @@ impl ClickHouseRelationalAdapter {
         input: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
         native::execute(
-            planner_types::post_asap::ExecutableOperatorPayload::Value {
+            planner_types::post_asap::PostAsapOperatorPayload::Value {
                 operation: operation.clone(),
             },
             output_schema,

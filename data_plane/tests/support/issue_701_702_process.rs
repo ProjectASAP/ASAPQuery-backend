@@ -346,10 +346,15 @@ fn issue_701_702_uncertified_ratios_require_exact_fallback() {
         let candidates =
             workload_cost::enumerate_exact_and_materialized_candidates(request).unwrap();
         assert!(!candidates.is_empty());
+        let mut exact_count = 0;
         for candidate in candidates {
-            let plan = DeploymentPlanCompiler
-                .compile_promql(candidate, environment.clone())
-                .unwrap();
+            let plan = match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
+                Ok(plan) => plan,
+                Err(control_plane::physical::compiler::CompileError::Query { reason, .. })
+                    if reason == "selected query result has no certified accuracy guarantee satisfying the requested accuracy" => continue,
+                Err(error) => panic!("unexpected candidate rejection for {query}: {error}"),
+            };
+            exact_count += 1;
             assert!(plan.precompute_plan.materializations.is_empty(), "{query}");
             assert!(
                 plan.query_plan.entries.values().all(|entry| matches!(
@@ -359,6 +364,7 @@ fn issue_701_702_uncertified_ratios_require_exact_fallback() {
                 "{query}"
             );
         }
+        assert!(exact_count > 0, "no executable exact candidate for {query}");
     }
 }
 
@@ -392,21 +398,27 @@ async fn temporal_average_overflow_falls_back_after_state_is_warm() {
         .into();
     let snapshot = quote_snapshot_for_test(serde_json::from_value(fixture).unwrap());
     let plan = snapshot.clone().compile_promql().unwrap();
-    assert!(plan
-        .query_plan
-        .entries
-        .values()
-        .flat_map(|entry| entry.nodes.values())
-        .any(|node| matches!(
-            node,
-            control_plane::query_plan::QueryPlanNode::Logical {
-                operator: control_plane::query_plan::query_time::QueryTimeOperator::Binary {
-                    operation: control_plane::query_plan::query_time::BinaryOperation::FiniteDiv,
-                    ..
-                },
-                ..
-            }
-        )));
+    assert!(
+        plan.query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.nodes.values())
+            .any(|node| {
+                let control_plane::query_plan::QueryPlanNode::PhysicalFragment { dag, .. } = node
+                else {
+                    return false;
+                };
+                asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                    .unwrap();
+                let document: serde_json::Value = serde_json::from_slice(dag).unwrap();
+                document["nodes"].as_object().unwrap().values().any(|node| {
+                    node["Operator"]["operator"]["kind"]["VectorBinary"]["operator"]
+                        ["checked_finite_division"]
+                        == true
+                })
+            }),
+        "average must retain its native finite-division contract"
+    );
     let output = tempfile::tempdir().unwrap();
     let path = output.path().join("snapshot.json");
     std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();

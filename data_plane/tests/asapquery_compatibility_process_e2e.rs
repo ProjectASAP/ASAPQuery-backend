@@ -27,6 +27,8 @@ mod distinct_planning_process;
 mod durable_summary_process;
 #[path = "support/immutable_maintenance_process.rs"]
 mod immutable_maintenance_process;
+#[path = "support/native_revision_process.rs"]
+mod native_revision_process;
 #[path = "support/revisable_maintenance_process.rs"]
 mod revisable_maintenance_process;
 
@@ -212,7 +214,13 @@ fn unused_port() -> u16 {
 }
 
 async fn wait_until_ready(client: &reqwest::Client, url: &str, child: &mut Child) {
-    for _ in 0..120 {
+    let scale = std::env::var("ASAP_TEST_TIMEOUT_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * scale);
+    while tokio::time::Instant::now() < deadline {
         if let Some(status) = child.try_wait().expect("inspect backend process") {
             panic!("backend exited before readiness: {status}");
         }
@@ -688,12 +696,11 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
             ) {
                 return Some(false);
             }
-            let dag = planner_types::post_asap::compile_executable_dag(&std::rc::Rc::new(
-                summary.clone(),
-            ))
-            .ok()?;
+            let dag =
+                planner_types::post_asap::compile_post_asap_dag(&std::rc::Rc::new(summary.clone()))
+                    .ok()?;
             if dag.nodes.iter().any(|node| matches!(&node.payload,
-                planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. } if kind.algorithm() != &self.1)) {
+                planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. } if kind.algorithm() != &self.1)) {
                 return Some(false);
             }
             self.0.summary_support_evidence(summary)

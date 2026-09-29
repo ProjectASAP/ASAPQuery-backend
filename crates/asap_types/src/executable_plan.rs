@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sds::StoredOutputId;
 use planner_types::post_asap::{
-    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutionDataState,
-    ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId, WindowEdgeCompatibility,
+    EdgeRole, ExecutionDataState, ExecutionTiming, GroupingEdgeCompatibility, PostAsapDag,
+    PostAsapDagEdge, PostAsapDagNode, PostAsapNodeId, WindowEdgeCompatibility,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +62,7 @@ pub struct OwnedPostAsapEdge {
 }
 
 impl OwnedPostAsapDag {
-    pub fn from_executable(query_id: String, dag: &ExecutableDag) -> Result<Self, String> {
+    pub fn from_post_asap_dag(query_id: String, dag: &PostAsapDag) -> Result<Self, String> {
         let nodes = dag
             .nodes
             .iter()
@@ -107,7 +107,7 @@ impl OwnedPostAsapDag {
         })
     }
 
-    pub fn decode(&self) -> Result<ExecutableDag, String> {
+    pub fn decode(&self) -> Result<PostAsapDag, String> {
         let node_ids = self
             .nodes
             .iter()
@@ -134,9 +134,9 @@ impl OwnedPostAsapDag {
             .nodes
             .iter()
             .map(|node| {
-                let payload: planner_types::post_asap::ExecutableOperatorPayload =
+                let payload: planner_types::post_asap::PostAsapOperatorPayload =
                     serde_json::from_value(node.payload.clone()).map_err(|e| e.to_string())?;
-                Ok(ExecutableDagNode {
+                Ok(PostAsapDagNode {
                     id: node.id,
                     payload,
                     output_state: node.output_state,
@@ -155,7 +155,7 @@ impl OwnedPostAsapDag {
             .edges
             .iter()
             .map(|edge| {
-                Ok(ExecutableDagEdge {
+                Ok(PostAsapDagEdge {
                     producer: edge.producer,
                     consumer: edge.consumer,
                     role: edge.role,
@@ -167,7 +167,7 @@ impl OwnedPostAsapDag {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(ExecutableDag {
+        Ok(PostAsapDag {
             nodes,
             edges,
             root: self.root,
@@ -178,6 +178,10 @@ impl OwnedPostAsapDag {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledPostAsapDag {
+    /// Planner-compiled bounded programs keyed by persisted output node.
+    /// Deployment bindings below identify their stored input/output instances.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub native_programs: BTreeMap<PostAsapNodeId, serde_json::Value>,
     pub document: OwnedPostAsapDag,
     pub binding: BackendExecutableBinding,
 }
@@ -190,7 +194,87 @@ impl InstalledPostAsapDag {
         if self.document.schema_version != PRECOMPUTE_DAG_SCHEMA_VERSION {
             return Err("unsupported maintenance DAG document version".into());
         }
-        self.binding.validate_precompute(&self.document.decode()?)
+        self.binding.validate_precompute(&self.document.decode()?)?;
+        for sink in self.native_programs.keys() {
+            self.native_program(*sink)?;
+        }
+        Ok(())
+    }
+
+    /// Recovery validates the physical producer's typed storage boundaries;
+    /// it never lowers the semantic provenance document again.
+    pub fn native_program(
+        &self,
+        sink: PostAsapNodeId,
+    ) -> Result<Option<asap_physical_operators::physical_planner::CompiledPhysicalDag>, String>
+    {
+        let Some(value) = self.native_programs.get(&sink) else {
+            return Ok(None);
+        };
+        let program = asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(
+            &serde_json::to_vec(value).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if !program.roots().contains(&u64::from(sink.0)) {
+            return Err("native precompute program omits its installed output".into());
+        }
+        for root in program.roots() {
+            let root =
+                PostAsapNodeId(u32::try_from(*root).map_err(|_| "physical output id overflow")?);
+            if !self.binding.precompute_sinks.contains(&root)
+                || !matches!(
+                    self.binding.node(root),
+                    Some(BackendNodeBinding::Materialization { .. })
+                )
+                || self.native_programs.get(&root) != Some(value)
+            {
+                return Err(
+                    "native precompute program differs across its installed outputs".into(),
+                );
+            }
+        }
+        let dag = self.document.decode()?;
+        for (id, contract) in program.input_contracts() {
+            let id = PostAsapNodeId(u32::try_from(id).map_err(|_| "physical source id overflow")?);
+            if program.roots().contains(&u64::from(id.0))
+                || !matches!(
+                    self.binding.node(id),
+                    Some(BackendNodeBinding::Materialization { .. })
+                )
+                || dag.nodes.iter().find(|n| n.id == id).is_none_or(|n| {
+                    n.output_schema != *contract.schema
+                        && asap_physical_operators::physical_planner::precompute::source_schema(
+                            &n.output_schema,
+                        )
+                        .map_or(true, |schema| schema != contract.schema)
+                })
+            {
+                return Err(
+                    "native maintenance source differs from installed state boundary".into(),
+                );
+            }
+        }
+        if program.input_contracts().count() == 0 {
+            return Err("native precompute program has no bound inputs".into());
+        }
+        for root in program.roots() {
+            let output = program.output_contract(*root).map_err(|e| e.to_string())?;
+            if dag
+                .nodes
+                .iter()
+                .find(|n| u64::from(n.id.0) == *root)
+                .is_none_or(|n| {
+                    n.output_schema != *output.schema
+                        && asap_physical_operators::physical_planner::precompute::source_schema(
+                            &n.output_schema,
+                        )
+                        .map_or(true, |schema| schema != output.schema)
+                })
+            {
+                return Err("native precompute output differs from semantic schema".into());
+            }
+        }
+        Ok(Some(program))
     }
 
     /// Project the selected semantic DAG onto the maintenance ancestors of its
@@ -268,7 +352,7 @@ impl BackendExecutableBinding {
         self.nodes.get(&id)
     }
 
-    pub fn validate_precompute(&self, dag: &ExecutableDag) -> Result<(), String> {
+    pub fn validate_precompute(&self, dag: &PostAsapDag) -> Result<(), String> {
         let ids = dag
             .nodes
             .iter()
@@ -317,7 +401,7 @@ impl BackendExecutableBinding {
         Ok(())
     }
 
-    pub fn validate(&self, dag: &ExecutableDag) -> Result<(), String> {
+    pub fn validate(&self, dag: &PostAsapDag) -> Result<(), String> {
         let semantic = dag
             .nodes
             .iter()
@@ -376,9 +460,96 @@ mod tests {
         assert_eq!(serde_json::to_value(QueryNodeId(9)).unwrap(), 9);
     }
 
+    // Recovery must retain every output of a shared producer graph and reject
+    // a missing or replaced output binding, rather than discard another root.
+    #[test]
+    fn shared_precompute_graph_recovers_all_output_bindings() {
+        use planner_types::post_asap::*;
+        let schema = SummarySchema {
+            fields: vec![SummaryField {
+                name: "state".into(),
+                dtype: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let dag = PostAsapDag {
+            nodes: (1..=5)
+                .map(|id| PostAsapDagNode {
+                    id: PostAsapNodeId(id),
+                    payload: PostAsapOperatorPayload::SummaryMerge,
+                    output_state: ExecutionDataState::INGESTION_SUMMARY,
+                    output_schema: schema.clone(),
+                    guarantee: None,
+                })
+                .collect(),
+            edges: [(1, 2), (2, 3), (2, 4), (3, 5), (4, 5)]
+                .into_iter()
+                .map(|(a, b)| PostAsapDagEdge {
+                    producer: PostAsapNodeId(a),
+                    consumer: PostAsapNodeId(b),
+                    role: EdgeRole::Input,
+                    intermediate_schema: schema.clone(),
+                    data_state: ExecutionDataState::INGESTION_SUMMARY,
+                    grouping: GroupingEdgeCompatibility::Identical,
+                    window: WindowEdgeCompatibility::NotApplicable,
+                })
+                .collect(),
+            root: PostAsapNodeId(5),
+        };
+        let program =
+            asap_physical_operators::physical_planner::precompute::compile(&dag, &[1], &[3, 4])
+                .unwrap();
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&program.encode().unwrap()).unwrap();
+        let mut document = OwnedPostAsapDag::from_post_asap_dag("shared".into(), &dag).unwrap();
+        document.schema_version = PRECOMPUTE_DAG_SCHEMA_VERSION;
+        let mut installed = InstalledPostAsapDag {
+            document,
+            native_programs: BTreeMap::from([
+                (PostAsapNodeId(3), encoded.clone()),
+                (PostAsapNodeId(4), encoded),
+            ]),
+            binding: BackendExecutableBinding {
+                nodes: (1..=5)
+                    .map(|id| {
+                        (
+                            PostAsapNodeId(id),
+                            if id == 2 || id == 5 {
+                                BackendNodeBinding::MaintenanceInput
+                            } else {
+                                BackendNodeBinding::Materialization {
+                                    stored_output: crate::policy_fingerprint::PolicyFingerprint(
+                                        id as u64,
+                                    )
+                                    .into(),
+                                }
+                            },
+                        )
+                    })
+                    .collect(),
+                precompute_sinks: vec![PostAsapNodeId(3), PostAsapNodeId(4)],
+                query_sink: PostAsapNodeId(3),
+                query_plan_sink: QueryNodeId(3),
+            },
+        };
+        installed.validate().unwrap();
+        assert_eq!(
+            installed
+                .native_program(PostAsapNodeId(4))
+                .unwrap()
+                .unwrap()
+                .roots(),
+            &[3, 4]
+        );
+        installed.native_programs.remove(&PostAsapNodeId(4));
+        assert!(installed.validate().is_err());
+    }
+
     #[test]
     fn installed_maintenance_dag_rejects_complete_dag_version() {
         let installed = InstalledPostAsapDag {
+            native_programs: std::collections::BTreeMap::new(),
             document: OwnedPostAsapDag {
                 schema_version: OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
                 query_id: "q".into(),

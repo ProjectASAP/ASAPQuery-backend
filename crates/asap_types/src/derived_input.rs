@@ -52,7 +52,7 @@ impl DerivedInputIdentity {
             .filter_map(|node| {
                 matches!(
                     &node.payload,
-                    planner_types::post_asap::ExecutableOperatorPayload::Fallback {
+                    planner_types::post_asap::PostAsapOperatorPayload::Fallback {
                         expression: planner_types::pre_asap::QueryExpr::Literal(_),
                     }
                 )
@@ -355,13 +355,13 @@ mod tests {
     #[test]
     fn literal_leaves_are_hashed_without_inventing_materialization_references() {
         use planner_types::{
-            post_asap::ExecutableOperatorPayload,
+            post_asap::PostAsapOperatorPayload,
             pre_asap::{QueryExpr, ScalarValue},
         };
         let mut dag = program(1, 2);
         let mut literal = dag.nodes[0].clone();
         literal.id = PostAsapNodeId(3);
-        literal.payload = serde_json::to_value(ExecutableOperatorPayload::Fallback {
+        literal.payload = serde_json::to_value(PostAsapOperatorPayload::Fallback {
             expression: QueryExpr::Literal(ScalarValue::Int64(2)),
         })
         .unwrap();
@@ -373,7 +373,7 @@ mod tests {
         let frontiers = BTreeMap::from([(PostAsapNodeId(1), source)]);
         let first = DerivedInputIdentity::from_dag(&dag, dag.root, &frontiers).unwrap();
         assert_eq!(first.inputs, BTreeSet::from([source]));
-        dag.nodes[2].payload = serde_json::to_value(ExecutableOperatorPayload::Fallback {
+        dag.nodes[2].payload = serde_json::to_value(PostAsapOperatorPayload::Fallback {
             expression: QueryExpr::Literal(ScalarValue::Int64(3)),
         })
         .unwrap();

@@ -4707,14 +4707,13 @@ mod dag_execution_tests {
         let installed = plan.executable_dags.values_mut().next().unwrap();
         let mut dag = installed.document.decode().unwrap();
         for node in &mut dag.nodes {
-            if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
-                input, ..
-            } = &mut node.payload
+            if let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { input, .. } =
+                &mut node.payload
             {
                 input.weight = planner_types::post_asap::SummaryInputExpr::Constant(99.0);
             }
         }
-        installed.document = asap_types::executable_plan::OwnedPostAsapDag::from_executable(
+        installed.document = asap_types::executable_plan::OwnedPostAsapDag::from_post_asap_dag(
             installed.document.query_id.clone(),
             &dag,
         )

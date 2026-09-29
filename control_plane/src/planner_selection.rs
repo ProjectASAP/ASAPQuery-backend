@@ -1,8 +1,8 @@
-//! Deployment-owned selection at the latest ASAPPlanner boundary.
+//! Supplies deployment capabilities and cost/accuracy evidence to ASAPPlanner.
 //!
-//! ASAPPlanner enumerates a ranked candidate space and deliberately does not
-//! commit to one deployment plan.  The backend owns that decision because it
-//! also owns placement, runtime capabilities, and the physical wire contract.
+//! Planner constructs, evaluates, and selects computation candidates. This
+//! adapter registers the supported strategies and retains selection evidence;
+//! DeploymentPlanCompiler binds the resulting computation and lifecycle.
 
 use std::rc::Rc;
 
@@ -77,10 +77,10 @@ fn target_identity(target: &QueryExpr, accuracy: &AccuracyTarget) -> Option<Stri
 fn summary_identity(node: &SummaryNode) -> Option<String> {
     // Canonical exporter owns operator payloads and edge semantics. Hash its
     // structure, not assigned node IDs or the incidental sharing of Rc values.
-    let dag = planner_types::post_asap::compile_executable_dag(&Rc::new(node.clone())).ok()?;
+    let dag = planner_types::post_asap::compile_post_asap_dag(&Rc::new(node.clone())).ok()?;
     lossless_json(&dag)?;
     fn visit(
-        dag: &planner_types::post_asap::ExecutableDag,
+        dag: &planner_types::post_asap::PostAsapDag,
         id: planner_types::post_asap::PostAsapNodeId,
         memo: &mut std::collections::HashMap<planner_types::post_asap::PostAsapNodeId, String>,
     ) -> String {
@@ -329,6 +329,44 @@ pub fn select_workload_with_accuracy_model_and_trace(
         Some(cost_model),
     )?;
     Ok((selected, trace))
+}
+
+/// Preserve Planner candidates for deployment admission and pricing. This
+/// does not select a winner or interpret an absent runtime quote as illegality.
+/// Each returned forest has one root; independent roots remain factored rather
+/// than materializing the workload's Cartesian product.
+pub fn enumerate_workload_candidates(
+    roots: Vec<(usize, Rc<QueryExpr>)>,
+    accuracy: AccuracyTarget,
+    cost_model: &ControlPlaneCostModel,
+    evidence: &dyn AccuracyEvidenceProvider,
+    accuracy_model: &dyn AccuracyModel,
+) -> Result<asap_aware_mapping::replacement::CandidateDagInventory<usize>, SelectionError> {
+    let strategies = replacement_strategies(cost_model, evidence, accuracy_model);
+    let space = asap_aware_mapping::search_workload_with_targets(
+        roots
+            .into_iter()
+            .map(|(id, root)| (id, root, Some(accuracy.clone())))
+            .collect(),
+        &strategies,
+        accuracy_model,
+    );
+    let mut inventory = asap_aware_mapping::replacement::CandidateDagInventory {
+        candidates: Vec::new(),
+        rejected_assemblies: Vec::new(),
+    };
+    for (id, _) in &space.roots {
+        let root = space
+            .enumerate_candidate_dags_for_root(id, 65_536)
+            .map_err(|error| SelectionError::Workload(error.to_string()))?;
+        inventory.candidates.extend(root.candidates);
+        inventory.rejected_assemblies.extend(
+            root.rejected_assemblies
+                .into_iter()
+                .map(|reason| format!("query {id}: {reason}")),
+        );
+    }
+    Ok(inventory)
 }
 
 /// The [`ReplacementStrategy`] set this deployment registers, carrying its own

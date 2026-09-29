@@ -1,15 +1,113 @@
-//! Bind protocol vectors to native batch operators; computation stays in Planner.
-use super::{grouping_key, miss, EngineError, Grouping, Labels, Vector};
+//! Bind deployment inputs to retained native programs and decode PromQL results.
+use super::{miss, EngineError, Labels, Vector};
 use asap_physical_operators::dag::{
-    self, batch_execution,
-    operators::{Operator, SortKey},
+    self,
+    operators::Operator,
     values::{Batch, Schema, Value},
 };
-use planner_types::{
-    post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
-    pre_asap::DataType,
-};
+#[cfg(test)]
+use planner_types::post_asap::{SummaryField, SummarySchema};
+use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+#[cfg(test)]
 use std::sync::Arc;
+
+/// Bind protocol values without choosing matching, grouping or arithmetic behavior.
+pub(in crate::query_engines::asap_query_engine) fn complete_values(
+    encoded: &[u8],
+    inputs: &[&super::Value],
+    context: dag::RunContext,
+) -> Result<Option<super::Value>, EngineError> {
+    use asap_physical_operators::physical_planner::{promql_values, CompiledPhysicalDag, Source};
+    use futures::StreamExt;
+    let program = CompiledPhysicalDag::decode(encoded)?;
+    let scalar = promql_values::scalar_schema();
+    let vector = promql_values::vector_schema();
+    let matrix = promql_values::matrix_schema();
+    let compatible = |schema: &Schema| schema == &scalar || schema == &vector || schema == &matrix;
+    if program.roots().len() != 1
+        || !program
+            .input_contracts()
+            .all(|(_, input)| compatible(&input.schema))
+        || !compatible(&program.output_contract(program.roots()[0])?.schema)
+    {
+        return Ok(None);
+    }
+    if program.input_contracts().count() != inputs.len() {
+        return Err(miss("physical value input arity mismatch"));
+    }
+    let mut sources = std::collections::BTreeMap::new();
+    let mut retained_inputs = context.reserve(0)?;
+    let mut input_bytes = 0usize;
+    for ((id, contract), input) in program.input_contracts().zip(inputs) {
+        let rows = match input {
+            super::Value::Scalar(value) if contract.schema == scalar => {
+                vec![vec![Value::Float64(*value)]]
+            }
+            super::Value::Vector(values) if contract.schema == vector => values
+                .iter()
+                .map(|(labels, value)| vec![super::native_labels(labels), Value::Float64(*value)])
+                .collect(),
+            super::Value::Matrix(values, start, end) if contract.schema == matrix => values
+                .iter()
+                .flat_map(|(labels, points)| {
+                    points.iter().map(move |(time, value)| {
+                        vec![
+                            super::native_labels(labels),
+                            Value::Timestamp(*time),
+                            Value::Float64(*value),
+                            Value::Timestamp(*start),
+                            Value::Timestamp(*end),
+                        ]
+                    })
+                })
+                .collect(),
+            _ => {
+                return Err(miss(
+                    "protocol input differs from compiled scalar/vector contract",
+                ))
+            }
+        };
+        let batch = Batch::try_new(contract.schema.clone(), rows)?;
+        input_bytes = input_bytes
+            .checked_add(batch.bytes())
+            .ok_or(dag::Error::MemoryLimit)?;
+        retained_inputs.resize(input_bytes)?;
+        sources.insert(
+            id,
+            Box::new(Operator::source(contract.schema.clone(), vec![batch])?) as Source<'_>,
+        );
+    }
+    let output_schema = program.output_contract(program.roots()[0])?.schema;
+    let graph = program.instantiate(sources)?;
+    let mut retained = context.reserve(0)?;
+    let mut stream = graph.execute(program.roots(), context)?.remove(0);
+    let rows = crate::query_engines::request::drive(async {
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            bytes = bytes
+                .checked_add(batch.bytes())
+                .ok_or(dag::Error::MemoryLimit)?;
+            retained.resize(bytes)?;
+            rows.extend(batch.rows().iter().cloned());
+        }
+        Ok::<_, EngineError>(rows)
+    })??;
+    if output_schema == scalar {
+        let [row] = rows.as_slice() else {
+            return Err(miss("physical scalar output must have exactly one row"));
+        };
+        let [Value::Float64(value)] = row.as_slice() else {
+            return Err(miss("invalid scalar output"));
+        };
+        Ok(Some(super::Value::Scalar(*value)))
+    } else {
+        super::native_vector_output(rows, 0, 1).map(|values| Some(super::Value::Vector(values)))
+    }
+}
+
+#[cfg(test)]
 fn schema(fields: &[(&str, DataType)]) -> Schema {
     Arc::new(SummarySchema {
         fields: fields
@@ -23,84 +121,7 @@ fn schema(fields: &[(&str, DataType)]) -> Schema {
         time_index: None,
     })
 }
-fn key<T: serde::Serialize>(value: &T) -> Value {
-    Value::Utf8(
-        serde_json::to_string(value)
-            .expect("string keys serialize")
-            .into(),
-    )
-}
-fn ranked_batch(values: &Vector, grouping: &Grouping) -> Result<Batch, EngineError> {
-    let schema = schema(&[
-        ("index", DataType::Int64),
-        ("group", DataType::Utf8),
-        ("value", DataType::Float64),
-    ]);
-    Batch::try_new(
-        schema,
-        values
-            .iter()
-            .enumerate()
-            .map(|(i, (labels, v))| {
-                vec![
-                    Value::Int64(i as i64),
-                    key(&grouping_key(labels, grouping)),
-                    Value::Float64(*v),
-                ]
-            })
-            .collect(),
-    )
-    .map_err(EngineError::from)
-}
-fn output(values: Vector, batches: Vec<dag::SharedValue<Batch>>) -> Result<Vector, EngineError> {
-    batches
-        .iter()
-        .flat_map(|b| b.rows())
-        .map(|row| match row.first() {
-            Some(Value::Int64(index)) => values
-                .get(*index as usize)
-                .cloned()
-                .ok_or_else(|| miss("native result index outside input")),
-            _ => Err(miss("native result has no row identity")),
-        })
-        .collect()
-}
-pub(super) fn sort(
-    values: Vector,
-    grouping: &Grouping,
-    descending: bool,
-    context: dag::RunContext,
-) -> Result<Vector, EngineError> {
-    let batch = ranked_batch(&values, grouping)?;
-    let op = Operator::sort(
-        batch.schema().clone(),
-        vec![SortKey {
-            column: 2,
-            descending,
-            nulls_first: false,
-        }],
-        vec![1],
-    )
-    .map_err(EngineError::from)?;
-    let result =
-        batch_execution::evaluate_batch(batch, vec![op], context).map_err(EngineError::from)?;
-    output(values, result)
-}
-pub(super) fn limit(
-    values: Vector,
-    grouping: &Grouping,
-    n: u64,
-    offset: u64,
-    context: dag::RunContext,
-) -> Result<Vector, EngineError> {
-    let batch = ranked_batch(&values, grouping)?;
-    let op =
-        Operator::limit(batch.schema().clone(), n, offset, vec![1]).map_err(EngineError::from)?;
-    let result =
-        batch_execution::evaluate_batch(batch, vec![op], context).map_err(EngineError::from)?;
-    output(values, result)
-}
-/// Relational boundary used by explicit row plans. Planner owns predicate lowering.
+#[cfg(test)]
 pub(super) fn relation(
     values: Vector,
     candidates: Vector,
@@ -116,26 +137,14 @@ pub(super) fn relation(
         compile_node, CompiledPhysicalDag, InputContract,
     };
     use planner_types::post_asap::{
-        ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+        ExecutionDataState, PostAsapDagNode, PostAsapNodeId, PostAsapOperatorPayload,
     };
-    let pruning = completeness
-        .as_ref()
-        .map(|completeness| {
-            Ok::<_, EngineError>(asap_types::query_plan::PruningInputContract {
-                candidate_input: 1,
-                keys: asap_physical_operators::physical_planner::equijoin_keys(
-                    &predicate, &left, &right,
-                )?,
-                completeness: completeness.clone(),
-            })
-        })
-        .transpose()?;
-    let node = ExecutableDagNode {
+    let node = PostAsapDagNode {
         id: PostAsapNodeId(2),
         output_state: ExecutionDataState::QUERY_ROWS,
         output_schema: (*output_schema).clone(),
         guarantee: None,
-        payload: ExecutableOperatorPayload::RelationalJoin {
+        payload: PostAsapOperatorPayload::RelationalJoin {
             join_kind: planner_types::pre_asap::JoinKind::Semi,
             pred: predicate,
             pruning: completeness,
@@ -153,10 +162,7 @@ pub(super) fn relation(
     )?;
     let encoded = compiled.encode()?;
     let inputs = vec![values, candidates];
-    if let Some(pruning) = pruning {
-        validate_pruning(&encoded, &inputs, 0, &pruning, at, context.clone())?;
-    }
-    physical(&encoded, inputs, 0, at, context)
+    physical(&encoded, inputs, Some(0), at, context)
 }
 
 // Equality keys canonicalize signed zero and NaNs; row transport must preserve their bits.
@@ -174,7 +180,7 @@ fn identity_key(value: &Value) -> Result<Vec<u8>, asap_physical_operators::Error
 pub(super) fn physical(
     encoded: &[u8],
     inputs: Vec<Vector>,
-    row_input: usize,
+    row_input: Option<usize>,
     at: i64,
     context: dag::RunContext,
 ) -> Result<Vector, EngineError> {
@@ -183,7 +189,7 @@ pub(super) fn physical(
     use std::collections::{BTreeMap, VecDeque};
     let compiled = CompiledPhysicalDag::decode(encoded)?;
     let contracts = compiled.input_contracts().collect::<Vec<_>>();
-    if contracts.len() != inputs.len() || row_input >= inputs.len() {
+    if contracts.len() != inputs.len() || row_input.is_some_and(|index| index >= inputs.len()) {
         return Err(asap_physical_operators::Error::Invalid(
             "physical input arity mismatch".into(),
         )
@@ -236,7 +242,7 @@ pub(super) fn physical(
                     .collect::<Result<Vec<_>, EngineError>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if position == row_input {
+        if Some(position) == row_input {
             for (row, original) in rows.iter().zip(values) {
                 let key = row
                     .iter()
@@ -251,6 +257,7 @@ pub(super) fn physical(
             Box::new(Operator::source(contract.schema.clone(), vec![batch])?) as Source<'_>,
         );
     }
+    let output_schema = compiled.output_contract(compiled.roots()[0])?.schema;
     let graph = compiled.instantiate(sources)?;
     let mut streams = graph.execute(compiled.roots(), context)?;
     if streams.len() != 1 {
@@ -265,6 +272,33 @@ pub(super) fn physical(
         match stream.next().now_or_never() {
             Some(Some(batch)) => {
                 for row in batch?.rows() {
+                    if row_input.is_none() {
+                        let mut labels = Labels::new();
+                        let mut sample = None;
+                        for (field, cell) in output_schema.fields.iter().zip(row) {
+                            match cell {
+                                Value::Utf8(value) => {
+                                    if !value.is_empty() {
+                                        labels.insert(field.name.clone(), value.to_string());
+                                    }
+                                }
+                                Value::Float64(value) => sample = Some(*value),
+                                Value::Int64(value) if value.unsigned_abs() <= (1u64 << 53) => {
+                                    sample = Some(*value as f64)
+                                }
+                                Value::Timestamp(_) | Value::Null => {}
+                                _ => return Err(miss(
+                                    "native output cannot be represented by the PromQL protocol",
+                                )),
+                            }
+                        }
+                        result.push((
+                            labels,
+                            sample
+                                .ok_or_else(|| miss("native vector output has no numeric value"))?,
+                        ));
+                        continue;
+                    }
                     let key = row
                         .iter()
                         .map(identity_key)
@@ -286,70 +320,106 @@ pub(super) fn physical(
     }
 }
 
-pub(super) fn validate_pruning(
-    encoded: &[u8],
-    inputs: &[Vector],
-    row_input: usize,
-    contract: &asap_types::query_plan::PruningInputContract,
-    at: i64,
-    context: dag::RunContext,
-) -> Result<(), EngineError> {
-    use asap_physical_operators::physical_planner::{CompiledPhysicalDag, InputContract};
-    use planner_types::post_asap::CandidateCompleteness;
-    if !matches!(
-        contract.completeness,
-        CandidateCompleteness::Certified { .. }
-    ) {
-        return Ok(());
-    }
-    let compiled = CompiledPhysicalDag::decode(encoded)?;
-    let schemas = compiled
-        .input_contracts()
-        .map(|(_, c)| c.schema.clone())
-        .collect::<Vec<_>>();
-    let candidates = inputs
-        .get(contract.candidate_input)
-        .ok_or_else(|| miss("missing candidate input"))?;
-    let values = inputs
-        .get(row_input)
-        .ok_or_else(|| miss("missing authoritative input"))?;
-    let coverage = Operator::semi_join(
-        schemas[contract.candidate_input].clone(),
-        schemas[row_input].clone(),
-        contract.keys.iter().map(|&(l, r)| (r, l)).collect(),
-    )?;
-    let check = CompiledPhysicalDag::from_operators(
-        [
-            (
-                0,
-                InputContract::bounded(schemas[contract.candidate_input].clone()),
-            ),
-            (1, InputContract::bounded(schemas[row_input].clone())),
-        ]
-        .into(),
-        [(2, (vec![0, 1], coverage))].into(),
-        vec![2],
-    )?;
-    let matched = physical(
-        &check.encode()?,
-        vec![candidates.clone(), values.clone()],
-        0,
-        at,
-        context,
-    )?;
-    if matched.len() != candidates.len() {
-        return Err(miss("certified pruning key has no authoritative value"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asap_physical_operators::operators::SortKey;
     use asap_physical_operators::{
         physical_planner::{CompiledPhysicalDag, InputContract},
         Error,
     };
+
+    // An installed computation binds complete label maps; ranking and division are native.
+    #[test]
+    fn compiled_vector_composition_preserves_grouping_and_runs_independently() {
+        use super::super::{
+            execute_installed, PreparedLeaf, PreparedLeaves, Value as ProtocolValue,
+        };
+        use asap_types::query_plan::{
+            query_time::QueryTimeOperator, FallbackPolicy, InstantExecution, QueryPlanNode,
+        };
+        let query = "topk by (job) (1, sum without(instance) (left_metric) / sum without(instance) (right_metric))";
+        let mut entry = control_plane::query_plan::query_time::compile_logical(
+            "compiled-values".into(),
+            query.into(),
+            InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            FallbackPolicy::Reject,
+        )
+        .unwrap();
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
+        entry.validate(&Default::default()).unwrap();
+        assert!(entry.nodes.values().all(|node| matches!(
+            node,
+            QueryPlanNode::PhysicalFragment { .. }
+                | QueryPlanNode::Logical {
+                    operator: QueryTimeOperator::Scan { .. },
+                    ..
+                }
+        )));
+        for scale in [1., 2.] {
+            let mut leaves = PreparedLeaves::new();
+            for (id, node) in &entry.nodes {
+                if let QueryPlanNode::Logical {
+                    operator: QueryTimeOperator::Scan { metric, .. },
+                    ..
+                } = node
+                {
+                    let left = metric.as_deref() == Some("left_metric");
+                    let values = [
+                        ("api", "a", if left { 4. * scale } else { 2. }),
+                        ("api", "b", if left { 2. * scale } else { 1. }),
+                        ("worker", "c", if left { 8. * scale } else { 2. }),
+                    ];
+                    leaves.insert(
+                        (*id, 1000),
+                        PreparedLeaf {
+                            value: ProtocolValue::Vector(
+                                values
+                                    .into_iter()
+                                    .map(|(job, instance, value)| {
+                                        (
+                                            Labels::from([
+                                                ("__name__".into(), metric.clone().unwrap()),
+                                                ("job".into(), job.into()),
+                                                ("instance".into(), instance.into()),
+                                            ]),
+                                            value,
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                            remote: true,
+                            remote_evaluations: 1,
+                            remote_rpcs: 1,
+                        },
+                    );
+                }
+            }
+            let (result, _) = execute_installed(&entry, &leaves, 1000, |_, _| {
+                panic!("all inputs were bound")
+            })
+            .unwrap();
+            let crate::query_engines::query_result::QueryResult::Vector(result) = result else {
+                panic!("expected vector")
+            };
+            let actual = result
+                .values
+                .into_iter()
+                .map(|point| (point.labels.labels[0].clone(), point.value))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(
+                actual,
+                std::collections::BTreeMap::from([
+                    ("api".into(), 2. * scale),
+                    ("worker".into(), 4. * scale)
+                ])
+            );
+        }
+    }
 
     // An available label is bound by Backend; Planner evaluates its predicate.
     #[test]
@@ -493,7 +563,7 @@ mod tests {
             let error = physical(
                 &sorted(),
                 vec![vec![(Labels::new(), 2.), (Labels::new(), 1.)]],
-                0,
+                Some(0),
                 42,
                 run.clone(),
             )
@@ -511,6 +581,23 @@ mod tests {
             );
             assert_eq!(run.retained_bytes(), 0);
         }
+    }
+
+    // The complete selected-candidate adapter must not classify a byte budget as capability.
+    #[test]
+    fn selected_candidate_input_budget_is_a_terminal_error() {
+        let plan = CompiledPhysicalDag::decode(&sorted()).unwrap();
+        let error = execute_batches(&plan, 1, 1, 42, |_, schema| {
+            Ok(Batch::try_new(
+                schema.clone(),
+                vec![vec![Value::Float64(1.)]],
+            )?)
+        })
+        .expect_err("input must exceed the byte budget");
+        assert!(
+            matches!(error, EngineError::Physical(Error::MemoryLimit)),
+            "{error}"
+        );
     }
 
     // Count-like values are bound as integers only when the protocol sample is exact.
@@ -535,7 +622,7 @@ mod tests {
             let result = physical(
                 &compiled,
                 vec![vec![(Labels::new(), sample)]],
-                0,
+                Some(0),
                 42,
                 context(4096),
             );
@@ -550,13 +637,77 @@ mod tests {
         }
     }
 
+    // Aggregation changes both rows and labels; decoding must use the declared
+    // output schema instead of looking up an unchanged input row.
+    #[test]
+    fn physical_aggregate_returns_grouped_values_and_labels() {
+        use asap_physical_operators::{
+            operators::Reduction,
+            physical_planner::{CompiledPhysicalDag, InputContract},
+        };
+        let input = schema(&[("job", DataType::Utf8), ("value", DataType::Float64)]);
+        let aggregate = Operator::aggregate(
+            input.clone(),
+            vec![0],
+            vec![("value".into(), Reduction::Sum(1))],
+        )
+        .unwrap();
+        let program = CompiledPhysicalDag::from_operators(
+            [(0, InputContract::bounded(input))].into(),
+            [(1, (vec![0], aggregate))].into(),
+            vec![1],
+        )
+        .unwrap();
+        let values = vec![
+            (Labels::from([("instance".into(), "c".into())]), 5.),
+            (
+                Labels::from([
+                    ("job".into(), "api".into()),
+                    ("instance".into(), "a".into()),
+                ]),
+                1.,
+            ),
+            (
+                Labels::from([
+                    ("job".into(), "api".into()),
+                    ("instance".into(), "b".into()),
+                ]),
+                2.,
+            ),
+            (
+                Labels::from([
+                    ("job".into(), "worker".into()),
+                    ("instance".into(), "a".into()),
+                ]),
+                4.,
+            ),
+        ];
+        let mut output = physical(
+            &program.encode().unwrap(),
+            vec![values],
+            None,
+            42,
+            context(1 << 20),
+        )
+        .unwrap();
+        output.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            output,
+            vec![
+                (Labels::new(), 5.),
+                (Labels::from([("job".into(), "api".into())]), 3.),
+                (Labels::from([("job".into(), "worker".into())]), 4.),
+            ]
+        );
+    }
+
     // Transport identity preserves the exact value selected by native total-order sorting.
     #[test]
     fn native_sort_preserves_signed_zero_bits() {
         let rows = physical(
             &sorted(),
             vec![vec![(Labels::new(), 0.), (Labels::new(), -0.)]],
-            0,
+            Some(0),
             42,
             context(4096),
         )
@@ -565,5 +716,294 @@ mod tests {
             rows.iter().map(|row| row.1.to_bits()).collect::<Vec<_>>(),
             vec![0.0_f64.to_bits(), (-0.0_f64).to_bits()]
         );
+    }
+}
+
+pub(super) fn execute_vectors<F>(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    at: u64,
+    mut callback: F,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+>
+where
+    F: FnMut(
+        asap_types::query_plan::QueryNodeId,
+        u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, EngineError>,
+{
+    use asap_physical_operators::physical_planner::promql_rows::series_row;
+    use std::collections::BTreeMap;
+    let (program, bindings, max_bytes) =
+        if let Some((inputs, source_nodes, budget)) = entry.physical_vector_binding() {
+            (
+                entry
+                    .recover_vector_physical_dag()
+                    .map_err(|e| miss(e.to_string()))?,
+                source_nodes
+                    .iter()
+                    .copied()
+                    .zip(inputs.iter().copied())
+                    .collect::<BTreeMap<_, _>>(),
+                budget,
+            )
+        } else {
+            let program = entry
+                .recover_population_physical_dag()
+                .map_err(|e| miss(e.to_string()))?;
+            let source = program.input_contracts().next().unwrap().0;
+            (
+                program,
+                BTreeMap::from([(source, entry.root)]),
+                entry.population_snapshot().unwrap().max_bytes,
+            )
+        };
+    execute_batches(
+        &program,
+        max_bytes,
+        bindings.len(),
+        at,
+        |input_id, schema| {
+            let values = super::vector(super::from_result(callback(bindings[&input_id], at)?)?)?;
+            let rows = values
+                .into_iter()
+                .map(|(labels, value)| {
+                    series_row(
+                        schema,
+                        &labels,
+                        i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?,
+                        value,
+                    )
+                    .map_err(|e| miss(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Batch::try_new(schema.clone(), rows).map_err(EngineError::from)
+        },
+    )
+}
+
+pub(in crate::query_engines::asap_query_engine) fn execute_stored(
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    plan_id: u64,
+    plan_version: u64,
+    store: &crate::storage_engines::sketch_db::index::SketchStore,
+    at: u64,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+> {
+    let (inputs, sources, max_bytes) = entry
+        .physical_vector_binding()
+        .ok_or_else(|| miss("missing native stored binding"))?;
+    let program = entry
+        .recover_vector_physical_dag()
+        .map_err(|e| miss(e.to_string()))?;
+    execute_batches(&program, max_bytes, inputs.len(), at, |id, schema| {
+        let index = sources
+            .iter()
+            .position(|source| *source == id)
+            .ok_or_else(|| miss("native source is unbound"))?;
+        let Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding }) =
+            entry.nodes.get(&inputs[index])
+        else {
+            return Err(miss("native stored source has no deployed summary binding"));
+        };
+        let end = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
+        let start = at
+            .checked_sub(binding.window_ms)
+            .ok_or_else(|| miss("native window underflow"))?;
+        let address = asap_types::sds::StoredSummaryKey {
+            plan_id,
+            plan_version,
+            stored_output_id: binding.stored_output_reference.stored_output_id,
+            population: std::collections::BTreeMap::new(),
+            window: asap_types::sds::HalfOpenTimeRange {
+                start_ms: start as i64,
+                end_ms: end,
+            },
+        };
+        store
+            .read_bound_native_summary(
+                &address,
+                &binding.stored_output_reference,
+                schema.clone(),
+                max_bytes as usize,
+            )
+            .map_err(|error| match error {
+                crate::storage_engines::sketch_db::index::NativeReadError::Unavailable(message) => {
+                    miss(message)
+                }
+                crate::storage_engines::sketch_db::index::NativeReadError::Physical(error) => {
+                    EngineError::from(error)
+                }
+            })
+    })
+}
+
+fn execute_batches(
+    program: &asap_physical_operators::physical_planner::CompiledPhysicalDag,
+    max_bytes: u64,
+    input_count: usize,
+    at: u64,
+    mut input_batch: impl FnMut(u64, &Schema) -> Result<Batch, EngineError>,
+) -> Result<
+    (
+        crate::query_engines::query_result::QueryResult,
+        super::ExecutionStats,
+    ),
+    EngineError,
+> {
+    use crate::{
+        query_engines::query_result::{InstantVectorElement, QueryResult},
+        storage_engines::types::KeyByLabelValues,
+    };
+    use asap_physical_operators::physical_planner::{
+        promql_rows::{decode_series_identity, SERIES_IDENTITY_COLUMN},
+        Source,
+    };
+    use futures::StreamExt;
+    use std::collections::BTreeMap;
+    let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
+    let context = crate::query_engines::request::context_with_limits(
+        dag::Scope::Query {
+            evaluation_time_ms: at_signed,
+            revision: 0,
+        },
+        dag::Limits {
+            max_bytes: max_bytes as usize,
+            ..dag::Limits::default()
+        },
+    )
+    .map_err(EngineError::from)?;
+    let mut sources = BTreeMap::new();
+    let mut prepared = context.reserve(0)?;
+    let mut input_bytes = 0usize;
+    for (input_id, input) in program.input_contracts() {
+        crate::query_engines::request::check()?;
+        let batch = input_batch(input_id, &input.schema)?;
+        input_bytes = input_bytes
+            .checked_add(batch.bytes())
+            .ok_or(asap_physical_operators::Error::MemoryLimit)?;
+        if input_bytes > max_bytes as usize {
+            return Err(asap_physical_operators::Error::MemoryLimit.into());
+        }
+        prepared.resize(input_bytes)?;
+        let source =
+            Operator::source(input.schema.clone(), vec![batch]).map_err(EngineError::from)?;
+        sources.insert(input_id, Box::new(source) as Source<'_>);
+    }
+    let graph = program.instantiate(sources).map_err(EngineError::from)?;
+    let mut retained = context.reserve(0)?;
+    let mut result_bytes = 0usize;
+    let mut stream = graph
+        .execute(program.roots(), context)
+        .map_err(EngineError::from)?
+        .remove(0);
+    let values = crate::query_engines::request::drive(async {
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(EngineError::from)?;
+            let identity = batch
+                .schema()
+                .fields
+                .iter()
+                .position(|field| field.name == SERIES_IDENTITY_COLUMN);
+            let value = batch
+                .schema()
+                .fields
+                .iter()
+                .position(|field| field.dtype == SummaryFamilyType::Plain(DataType::Float64))
+                .ok_or_else(|| miss("physical output loses sample value"))?;
+            for row in batch.rows() {
+                let Value::Float64(sample) = &row[value] else {
+                    return Err(miss("invalid physical result value"));
+                };
+                let labels = if let Some(identity) = identity {
+                    let Value::Utf8(encoded) = &row[identity] else {
+                        return Err(miss("invalid physical series identity"));
+                    };
+                    decode_series_identity(encoded).map_err(EngineError::from)?
+                } else {
+                    batch
+                        .schema()
+                        .fields
+                        .iter()
+                        .zip(row)
+                        .filter_map(|(field, value)| match value {
+                            Value::Utf8(label) if !label.is_empty() => {
+                                Some((field.name.clone(), label.to_string()))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let point = InstantVectorElement::new(
+                    KeyByLabelValues::new_with_labels(labels.values().cloned().collect()),
+                    *sample,
+                )
+                .with_label_keys_override(labels.into_keys().collect());
+                result_bytes = result_bytes
+                    .checked_add(point.retained_bytes())
+                    .ok_or(dag::Error::MemoryLimit)?;
+                retained.resize(result_bytes)?;
+                values.push(point);
+            }
+        }
+        Ok(values)
+    })??;
+    Ok((
+        QueryResult::vector(values, at),
+        super::ExecutionStats {
+            summary_readout_evaluations: input_count,
+            ..Default::default()
+        },
+    ))
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use super::*;
+
+    // A native candidate must use the enclosing request budget, even if its
+    // deployment binding permits a larger standalone execution.
+    #[tokio::test]
+    async fn native_candidate_cannot_escape_request_memory_limit() {
+        let result = crate::query_engines::request::run(
+            dag::Limits {
+                max_bytes: 1,
+                ..dag::Limits::default()
+            },
+            |_| {
+                let schema = schema(&[("value", DataType::Float64)]);
+                let program =
+                    asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                        [(
+                            0,
+                            asap_physical_operators::physical_planner::InputContract::bounded(
+                                schema.clone(),
+                            ),
+                        )]
+                        .into(),
+                        Default::default(),
+                        vec![0],
+                    )?;
+                execute_batches(&program, 64 * 1024, 1, 0, |_, _| {
+                    Batch::try_new(schema.clone(), vec![vec![Value::Float64(1.0)]])
+                        .map_err(EngineError::from)
+                })
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::Physical(dag::Error::MemoryLimit))
+        ));
     }
 }

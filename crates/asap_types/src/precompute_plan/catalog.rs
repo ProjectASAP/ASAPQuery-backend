@@ -55,6 +55,12 @@ impl PrecomputePlan {
                 "stored output semantics differ from installed writer computation",
             ));
         }
+        // Decode each DAG at most once; errors still surface only where used.
+        let dags = self
+            .executable_dags
+            .values()
+            .map(|installed| (installed, std::cell::OnceCell::new()))
+            .collect::<Vec<_>>();
         for config in &self.materializations {
             if config.derived_input.is_some() && config.semantic_fragment.is_none() {
                 return Err(invalid(
@@ -63,16 +69,19 @@ impl PrecomputePlan {
             }
             if let Some(expected) = &config.semantic_fragment {
                 let mut found = false;
-                for installed in self.executable_dags.values() {
-                    let dag = installed.document.decode().map_err(invalid)?;
+                for (installed, dag) in &dags {
+                    let dag = dag
+                        .get_or_init(|| installed.document.decode())
+                        .as_ref()
+                        .map_err(|error| invalid(error.clone()))?;
                     for (id, binding) in &installed.binding.nodes {
                         if matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { stored_output }
                             if stored_output.fingerprint() == config.policy_fingerprint())
                         {
                             found = true;
                             let actual = match &self.ingest.dataset_identity {
-                                Some(dataset) => crate::semantic_fragment::SemanticFragment::from_stored_output_in_dataset(&dag, *id, dataset.clone()),
-                                None => crate::semantic_fragment::SemanticFragment::from_stored_output(&dag, *id),
+                                Some(dataset) => crate::semantic_fragment::SemanticFragment::from_stored_output_in_dataset(dag, *id, dataset.clone()),
+                                None => crate::semantic_fragment::SemanticFragment::from_stored_output(dag, *id),
                             }.map_err(invalid)?;
                             if &actual != expected {
                                 return Err(invalid(
@@ -206,7 +215,7 @@ impl PrecomputePlan {
                     schema_id: schema.schema_id.clone(),
                 });
             }
-            if schema.encodings != state_encodings(&family) {
+            if !state_encodings_match(&family, &schema.encodings) {
                 return Err(invalid("encoding does not match state family"));
             }
             if config.num_aggregates_to_retain == Some(0) {

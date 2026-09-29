@@ -2,6 +2,7 @@
 //! Serving consumes asap_types::query_plan; compilation stays in this component.
 
 mod clickhouse_exact;
+pub mod physical_values;
 pub mod query_time;
 
 pub use asap_types::query_plan::*;
@@ -41,6 +42,7 @@ where
     };
     let root = compiler.lower(root)?;
     Ok(QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::PromQl,
         query_id,
         canonical_query,
@@ -79,8 +81,9 @@ where
         preserve_relational: true,
         lowered: Some(&mut lowered),
     };
-    let root = compiler.lower(root)?;
+    let root = compiler.lower_relation(root)?;
     Ok(QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::ClickHouseSql,
         query_id,
         canonical_query,
@@ -123,6 +126,7 @@ where
     };
     let root = compiler.lower(root)?;
     let mut entry = QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::PromQl,
         query_id,
         canonical_query,
@@ -141,9 +145,9 @@ fn compile_native_fragment(
     query_inputs: &[QueryNodeId],
 ) -> Result<QueryPlanNode, QueryPlanError> {
     use asap_physical_operators::physical_planner::{compile, InputContract};
-    use planner_types::post_asap::{compile_executable_dag, EdgeRole};
+    use planner_types::post_asap::{compile_post_asap_dag, EdgeRole};
     let invalid = |e: String| QueryPlanError::Invalid(e);
-    let dag = compile_executable_dag(root).map_err(|e| invalid(e.to_string()))?;
+    let dag = compile_post_asap_dag(root).map_err(|e| invalid(e.to_string()))?;
     let mut edges = dag
         .edges
         .iter()
@@ -174,9 +178,8 @@ fn compile_native_fragment(
     let physical =
         compile(&dag, contracts, &[u64::from(dag.root.0)]).map_err(|e| invalid(e.to_string()))?;
     let row_input = physical
-        .input_contracts()
-        .position(|(id, _)| bindings[&id] == query_inputs[0])
-        .unwrap();
+        .row_source(physical.roots()[0])
+        .and_then(|source| physical.input_contracts().position(|(id, _)| id == source));
     let pruning = if let SummaryExpr::RelationalJoin {
         left,
         right,
@@ -229,6 +232,97 @@ where
         &SummaryFamilyType,
     ) -> Result<MaterializationBinding, QueryPlanError>,
 {
+    fn lower_relation(&mut self, root: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {
+        use asap_physical_operators::physical_planner::{compile, InputContract};
+        use planner_types::post_asap::{
+            compile_post_asap_dag_with_node_ids, PostAsapOperatorPayload as Payload,
+        };
+        let compilation = compile_post_asap_dag_with_node_ids(root)
+            .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+        let mut pending = vec![compilation.dag.root];
+        let mut visited = std::collections::BTreeSet::new();
+        let mut contracts = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
+        let mut computed = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let node = compilation
+                .dag
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .ok_or_else(|| QueryPlanError::Invalid("missing Planner physical node".into()))?;
+            let relation = matches!(
+                &node.payload,
+                Payload::RelationalJoin { .. }
+                    | Payload::Value {
+                        operation: planner_types::post_asap::ValueOperation::Project { .. }
+                            | planner_types::post_asap::ValueOperation::Filter { .. }
+                            | planner_types::post_asap::ValueOperation::Sort { .. }
+                            | planner_types::post_asap::ValueOperation::Limit { .. }
+                            | planner_types::post_asap::ValueOperation::Exact(
+                                planner_types::post_asap::ExactOperation::Aggregate { .. }
+                            )
+                    }
+            );
+            if relation {
+                computed.push(id);
+                pending.extend(
+                    compilation
+                        .dag
+                        .edges
+                        .iter()
+                        .filter(|e| e.consumer == id)
+                        .map(|e| e.producer),
+                );
+            } else {
+                let semantic = compilation.node_ids.summary_node(id).ok_or_else(|| {
+                    QueryPlanError::Invalid("missing Planner source identity".into())
+                })?;
+                let source = self.lower(semantic)?;
+                bindings.insert(u64::from(id.0), source);
+                contracts.insert(
+                    u64::from(id.0),
+                    InputContract::bounded(std::sync::Arc::new(node.output_schema.clone())),
+                );
+            }
+        }
+        if computed.is_empty() {
+            return self.lower(root);
+        }
+        let physical = compile(
+            &compilation.dag,
+            contracts,
+            &[u64::from(compilation.dag.root.0)],
+        )
+        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+        let id = QueryNodeId(self.next_id);
+        self.next_id += 1;
+        self.nodes.insert(
+            id,
+            QueryPlanNode::PhysicalRelation {
+                inputs: physical
+                    .input_contracts()
+                    .map(|(id, _)| bindings[&id])
+                    .collect(),
+                dag: physical
+                    .encode()
+                    .map_err(|e| QueryPlanError::Invalid(e.to_string()))?,
+            },
+        );
+        for node in computed {
+            if let Some(semantic) = compilation.node_ids.summary_node(node) {
+                self.seen.insert(Rc::as_ptr(semantic) as usize, id);
+                if let Some(lowered) = &mut self.lowered {
+                    lowered(semantic, id);
+                }
+            }
+        }
+        Ok(id)
+    }
+
     fn graft(
         &mut self,
         id: QueryNodeId,
@@ -248,7 +342,9 @@ where
         }
         for (local, mut physical) in nodes {
             match &mut physical {
-                QueryPlanNode::PhysicalFragment { inputs, .. }
+                QueryPlanNode::Physical { inputs, .. }
+                | QueryPlanNode::PhysicalRelation { inputs, .. }
+                | QueryPlanNode::PhysicalFragment { inputs, .. }
                 | QueryPlanNode::Logical { inputs, .. }
                 | QueryPlanNode::SummaryMerge { inputs }
                 | QueryPlanNode::ExternalExact { inputs, .. } => {
@@ -256,16 +352,14 @@ where
                         *input = remap[input];
                     }
                 }
-                QueryPlanNode::Binary { inputs, .. }
-                | QueryPlanNode::RelationalJoin { inputs, .. } => {
+                QueryPlanNode::Binary { inputs, .. } => {
                     for input in inputs {
                         *input = remap[input];
                     }
                 }
                 QueryPlanNode::SummaryEstimate { input, .. }
                 | QueryPlanNode::ExactReadout { input, .. }
-                | QueryPlanNode::ReduceSum { input, .. }
-                | QueryPlanNode::Relational { input, .. } => *input = remap[input],
+                | QueryPlanNode::ReduceSum { input, .. } => *input = remap[input],
                 QueryPlanNode::Scalar { .. }
                 | QueryPlanNode::ReadMaterialization { .. }
                 | QueryPlanNode::ExactFallback { .. } => {}
@@ -328,109 +422,36 @@ where
         }
 
         let physical = match &node.expr {
-            SummaryExpr::RelationalJoin {
-                left,
-                right,
-                kind,
-                pred,
-                pruning,
-            } if self.preserve_relational => QueryPlanNode::RelationalJoin {
-                inputs: [self.lower(left)?, self.lower(right)?],
-                join_kind: kind.clone(),
-                pruning: pruning.clone(),
-                pred: serde_json::to_value(pred).map_err(|error| {
-                    QueryPlanError::Invalid(format!(
-                        "cannot serialize relational join predicate: {error}"
-                    ))
-                })?,
-                left_schema: left.schema.clone(),
-                right_schema: right.schema.clone(),
-                output_schema: node.schema.clone(),
-            },
-            SummaryExpr::ValueOperation {
-                child, operation, ..
-            } if self.preserve_relational
-                && matches!(
-                    operation,
-                    planner_types::post_asap::ValueOperation::Project { .. }
-                        | planner_types::post_asap::ValueOperation::Filter { .. }
-                        | planner_types::post_asap::ValueOperation::Sort { .. }
-                        | planner_types::post_asap::ValueOperation::Limit { .. }
-                        | planner_types::post_asap::ValueOperation::Exact(
-                            planner_types::post_asap::ExactOperation::Aggregate { .. }
-                        )
-                ) =>
+            SummaryExpr::RelationalJoin { .. } if self.preserve_relational => {
+                return self.lower_relation(node);
+            }
+            SummaryExpr::ValueOperation { operation, .. }
+                if self.preserve_relational
+                    && matches!(
+                        operation,
+                        planner_types::post_asap::ValueOperation::Project { .. }
+                            | planner_types::post_asap::ValueOperation::Filter { .. }
+                            | planner_types::post_asap::ValueOperation::Sort { .. }
+                            | planner_types::post_asap::ValueOperation::Limit { .. }
+                            | planner_types::post_asap::ValueOperation::Exact(
+                                planner_types::post_asap::ExactOperation::Aggregate { .. }
+                            )
+                    ) =>
             {
-                QueryPlanNode::Relational {
-                    input: self.lower(child)?,
-                    operation: serde_json::to_value(operation).map_err(|error| {
-                        QueryPlanError::UnsupportedNode(format!(
-                            "cannot serialize relational operation: {error}"
-                        ))
-                    })?,
-                    input_schema: child.schema.clone(),
-                    output_schema: node.schema.clone(),
-                }
+                return self.lower_relation(node);
             }
             SummaryExpr::ValueOperation {
                 child,
                 operation:
                     planner_types::post_asap::ValueOperation::Exact(
                         planner_types::post_asap::ExactOperation::Aggregate {
-                            reduction,
-                            measures,
-                            having: None,
-                            ..
+                            having: None, ..
                         },
                     ),
                 timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } if measures.len() == 1 => {
-                use planner_types::pre_asap::AggIntent;
-                let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => Some(query_time::Aggregation::Sum),
-                    AggIntent::Count { .. } => Some(query_time::Aggregation::Count),
-                    AggIntent::Min { .. } => Some(query_time::Aggregation::Min),
-                    AggIntent::Max { .. } => Some(query_time::Aggregation::Max),
-                    AggIntent::Avg { .. } => Some(query_time::Aggregation::Avg),
-                    _ => {
-                        return Err(QueryPlanError::Invalid(
-                            "unsupported exact value aggregation".into(),
-                        ))
-                    }
-                };
-                let keys = reduction.group_keys().ok_or_else(|| {
-                    QueryPlanError::Invalid(
-                        "per-entity exact value aggregation has no grouping".into(),
-                    )
-                })?;
-                let labels = keys
-                    .keys()
-                    .iter()
-                    .map(|&column| {
-                        child
-                            .schema
-                            .fields
-                            .get(column)
-                            .map(|field| field.name.clone())
-                            .ok_or_else(|| {
-                                QueryPlanError::Invalid(
-                                    "unresolved exact aggregation column".into(),
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let grouping = query_time::Grouping {
-                    labels,
-                    without: keys.is_without(),
-                };
-                let operator = query_time::QueryTimeOperator::Aggregate {
-                    operation: operation.expect("aggregate operation"),
-                    grouping,
-                };
-                QueryPlanNode::Logical {
-                    operator,
-                    inputs: vec![self.lower(child)?],
-                }
+            } => {
+                let input = self.lower(child)?;
+                compile_native_fragment(node, &[input])?
             }
             SummaryExpr::ValueOperation {
                 child,
@@ -995,6 +1016,7 @@ mod catalog_binding_tests {
         config.pane_origin_ms = Some(0);
         let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "sum_over_time(m[1m])".into(),
@@ -1250,6 +1272,7 @@ mod tests {
     #[test]
     fn language_tag_preserves_query_entry_serde() {
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: canonical_promql("up").unwrap(),
@@ -1277,6 +1300,7 @@ mod tests {
     #[test]
     fn language_catalog_keys_keep_equal_query_text_distinct() {
         let base = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::PromQl,
             query_id: "prom".into(),
             canonical_query: "shared".into(),
@@ -1372,6 +1396,7 @@ mod tests {
             )
             .unwrap();
             let entry = QueryPlanEntry {
+                physical_dag: None,
                 language: QueryLanguage::PromQl,
                 query_id: "q".into(),
                 canonical_query: "topk(1, m)".into(),
@@ -1389,7 +1414,7 @@ mod tests {
                         QueryPlanNode::PhysicalFragment {
                             inputs: vec![QueryNodeId(0)],
                             dag: compiled.encode().unwrap(),
-                            row_input: 0,
+                            row_input: Some(0),
                             pruning: None,
                         },
                     ),
@@ -1423,6 +1448,7 @@ mod tests {
             },
         );
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "up".into(),
@@ -1449,6 +1475,7 @@ mod tests {
             reason: "prepared".into(),
         };
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "topk(2, rate(m[5m]))".into(),
@@ -1468,37 +1495,76 @@ mod tests {
                         }],
                         time_index: None,
                     };
-                    QueryPlanNode::RelationalJoin {
-                        inputs: [QueryNodeId(1), QueryNodeId(0)],
-                        join_kind: planner_types::pre_asap::JoinKind::Semi,
-                        pred: serde_json::to_value(planner_types::pre_asap::Predicate(
-                            std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
-                                left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
-                                    0,
-                                )),
-                                op: planner_types::pre_asap::CompareOpKind::Eq,
-                                right: std::rc::Rc::new(
-                                    planner_types::pre_asap::QueryExpr::Column(1),
-                                ),
-                            }),
-                        ))
-                        .unwrap(),
-                        pruning: Some(CandidateCompleteness::Certified {
-                            guarantee: planner_types::post_asap::ResultGuarantee {
-                                metric: planner_types::post_asap::ErrorMetric::Frequency,
-                                bound: planner_types::post_asap::BoundExpr::Unknown {
-                                    statistic: "membership margin".into(),
+                    {
+                        let schemas = vec![
+                            std::sync::Arc::new(schema.clone()),
+                            std::sync::Arc::new(schema.clone()),
+                        ];
+                        let node = planner_types::post_asap::PostAsapDagNode {
+                            id: planner_types::post_asap::PostAsapNodeId(2),
+                            payload:
+                                planner_types::post_asap::PostAsapOperatorPayload::RelationalJoin {
+                                    join_kind: planner_types::pre_asap::JoinKind::Semi,
+                                    pred: serde_json::from_value(
+                                        serde_json::to_value(planner_types::pre_asap::Predicate(
+                                            std::rc::Rc::new(
+                                                planner_types::pre_asap::QueryExpr::Compare {
+                                                    left: std::rc::Rc::new(
+                                                        planner_types::pre_asap::QueryExpr::Column(
+                                                            0,
+                                                        ),
+                                                    ),
+                                                    op: planner_types::pre_asap::CompareOpKind::Eq,
+                                                    right: std::rc::Rc::new(
+                                                        planner_types::pre_asap::QueryExpr::Column(
+                                                            1,
+                                                        ),
+                                                    ),
+                                                },
+                                            ),
+                                        ))
+                                        .unwrap(),
+                                    )
+                                    .unwrap(),
+                                    pruning: None,
                                 },
-                                failure_probability:
-                                    planner_types::post_asap::ProbabilityExpr::Unknown {
-                                        statistic: "membership confidence".into(),
+                            output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
+                            output_schema: schema,
+                            guarantee: None,
+                        };
+                        let operator = asap_physical_operators::physical_planner::compile_node(
+                            &node, &schemas,
+                        )
+                        .unwrap();
+                        let compiled = asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                schemas.into_iter().enumerate().map(|(id, schema)| (id as u64, asap_physical_operators::physical_planner::InputContract::bounded(schema))).collect(),
+                [(2, ((0..2).collect(), operator))].into(), vec![2],
+            ).unwrap();
+                        QueryPlanNode::PhysicalFragment {
+                            inputs: [QueryNodeId(1), QueryNodeId(0)].to_vec(),
+                            dag: compiled.encode().unwrap(),
+                            row_input: Some(0),
+                            pruning: (Some(CandidateCompleteness::Certified {
+                                guarantee: planner_types::post_asap::ResultGuarantee {
+                                    metric: planner_types::post_asap::ErrorMetric::Frequency,
+                                    bound: planner_types::post_asap::BoundExpr::Unknown {
+                                        statistic: "membership margin".into(),
                                     },
-                                provenance: vec![],
-                            },
-                        }),
-                        left_schema: schema.clone(),
-                        right_schema: schema.clone(),
-                        output_schema: schema,
+                                    failure_probability:
+                                        planner_types::post_asap::ProbabilityExpr::Unknown {
+                                            statistic: "membership confidence".into(),
+                                        },
+                                    provenance: vec![],
+                                },
+                            }))
+                            .map(|completeness| {
+                                asap_types::query_plan::PruningInputContract {
+                                    candidate_input: 1,
+                                    keys: vec![(0, 0)],
+                                    completeness,
+                                }
+                            }),
+                        }
                     }
                 }),
             ]),

@@ -119,6 +119,7 @@ mod forwarding_policy_tests {
         let query = "sum(rate(m[5m]))";
         let canonical = asap_types::query_plan::canonical_promql(query).unwrap();
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::PromQl,
             query_id: canonical.clone(),
             canonical_query: canonical,
@@ -311,6 +312,23 @@ impl ASAPQueryEngine {
         self
     }
 
+    fn request_limits(
+        &self,
+        entry: &asap_types::query_plan::QueryPlanEntry,
+    ) -> asap_physical_operators::dag::Limits {
+        let mut limits = self.execution_limits.clone();
+        if let Some(bytes) = entry
+            .physical_vector_binding()
+            .map(|(_, _, bytes)| bytes)
+            .or_else(|| entry.population_snapshot().map(|p| p.max_bytes))
+        {
+            limits.max_bytes = limits
+                .max_bytes
+                .min(usize::try_from(bytes).unwrap_or(usize::MAX));
+        }
+        limits
+    }
+
     async fn execute_installed_instant(
         &self,
         physical: &crate::storage_engines::types::RuntimePhysicalPlan,
@@ -321,7 +339,7 @@ impl ASAPQueryEngine {
         let engine = self.clone();
         let physical = physical.clone();
         let entry = entry.clone();
-        crate::query_engines::request::run(self.execution_limits.clone(), move |handle| {
+        crate::query_engines::request::run(self.request_limits(&entry), move |handle| {
             handle.block_on(async {
                 entry.validate_snapshot_sources().map_err(|e| {
                     crate::query_engines::EngineError::capability_miss("query_plan", e.to_string())
@@ -495,11 +513,29 @@ impl ASAPQueryEngine {
             .flatten();
         let index = pinned.as_ref().or(self.summary_store.as_deref());
         let revision = index.map(|index| index.summary_update_revision());
-        let result = super::logical_dag::execute_installed(
-            entry,
-            leaves,
-            at,
-            |root, evaluation_ms| {
+        let native_stored = entry
+            .physical_vector_binding()
+            .is_some_and(|(inputs, _, _)| {
+                inputs.iter().all(|id| {
+                    matches!(
+                        entry.nodes.get(id),
+                        Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { .. })
+                    )
+                })
+            });
+        let result = if native_stored {
+            let store = index.ok_or_else(|| {
+                EngineError::capability_miss("native_stored", "summary store unavailable")
+            })?;
+            super::logical_dag::native_values::execute_stored(
+                entry,
+                physical.query_plan.plan_id,
+                physical.query_plan.plan_version,
+                store,
+                at,
+            )
+        } else {
+            super::logical_dag::execute_installed(entry, leaves, at, |root, evaluation_ms| {
                 if let Some(asap_types::query_plan::QueryPlanNode::Logical {
                     operator:
                         asap_types::query_plan::query_time::QueryTimeOperator::CurrentSeries {
@@ -611,8 +647,8 @@ impl ASAPQueryEngine {
                     evaluation_ms,
                     false,
                 ))
-            },
-        );
+            })
+        };
         let current = index.map(|index| index.summary_update_revision());
         finish_query(
             result,
@@ -636,7 +672,7 @@ impl ASAPQueryEngine {
         let engine = self.clone();
         let physical = physical.clone();
         let entry = entry.clone();
-        crate::query_engines::request::run(self.execution_limits.clone(), move |handle| {
+        crate::query_engines::request::run(self.request_limits(&entry), move |handle| {
             handle.block_on(engine.execute_logical_range_inner(&physical, &entry, start, end, step))
         })
         .await
@@ -2855,6 +2891,7 @@ mod range_stitch_tests {
         plan.query_plan.entries.insert(
             asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
             QueryPlanEntry {
+                physical_dag: None,
                 language: QueryLanguage::MetricsQl,
                 query_id: "vm-scalar".into(),
                 canonical_query: identity.clone(),
@@ -2879,6 +2916,12 @@ mod range_stitch_tests {
                 fallback: FallbackPolicy::ExactBackend,
             },
         );
+        let key =
+            asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity);
+        control_plane::query_plan::physical_values::compile(
+            plan.query_plan.entries.get_mut(&key).unwrap(),
+        )
+        .unwrap();
         let mut active = crate::drivers::query::servers::http::validate_and_build_runtime_plan(
             crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 summary_catalog: plan.summary_catalog,
@@ -2903,7 +2946,7 @@ mod range_stitch_tests {
         assert!(
             error
                 .to_string()
-                .contains("bound subtree requires one explicit positive window"),
+                .contains("scalar root requires native response adapter"),
             "{error}"
         );
     }

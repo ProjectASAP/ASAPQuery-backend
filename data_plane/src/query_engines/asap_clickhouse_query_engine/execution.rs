@@ -119,118 +119,48 @@ impl RelationDagExecutor<'_> {
     ) -> Result<ClickHouseRelation, SqlExecutionError> {
         use super::relational_adapter::native;
         use asap_physical_operators::dag::{self, operators::Operator};
+        use asap_physical_operators::physical_planner::{CompiledPhysicalDag, InputContract};
         use futures::{FutureExt, StreamExt};
-        use planner_types::post_asap::{
-            ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState,
-            PostAsapNodeId, SummarySchema,
-        };
         use std::sync::Arc;
-        let mut pending = vec![(root, expected.clone())];
-        let mut schemas = BTreeMap::<QueryNodeId, SummarySchema>::new();
-        let mut operations = BTreeMap::new();
-        let mut sources = Vec::new();
-        // Bind the entire computation before reading any storage source.
-        while let Some((id, expected)) = pending.pop() {
-            if let Some(previous) = schemas.get(&id) {
-                if previous != &expected {
-                    return Err("inconsistent relation schemas".into());
+        let (compiled, source_bindings) = match self.entry.nodes.get(&root) {
+            Some(QueryPlanNode::PhysicalRelation { inputs, dag }) => {
+                let compiled = CompiledPhysicalDag::decode(dag)?;
+                if compiled.roots().len() != 1 || compiled.input_contracts().count() != inputs.len()
+                {
+                    return Err("physical relation boundary arity mismatch".into());
                 }
-                continue;
+                if compiled
+                    .output_contract(compiled.roots()[0])?
+                    .schema
+                    .as_ref()
+                    != expected
+                {
+                    return Err("physical relation output schema mismatch".into());
+                }
+                let bindings = compiled
+                    .input_contracts()
+                    .zip(inputs)
+                    .map(|((slot, contract), id)| (slot, *id, contract.schema.clone()))
+                    .collect::<Vec<_>>();
+                (compiled, bindings)
             }
-            schemas.insert(id, expected.clone());
-            let (payload, inputs) = match self.entry.nodes.get(&id) {
-                Some(QueryPlanNode::Relational {
-                    input,
-                    operation,
-                    input_schema,
-                    output_schema,
-                }) => {
-                    if output_schema != &expected {
-                        return Err("relational output schema mismatch".into());
-                    }
-                    let operation =
-                        serde_json::from_value(operation.clone()).map_err(|e| e.to_string())?;
-                    (
-                        Payload::Value { operation },
-                        vec![(*input, input_schema.clone())],
-                    )
-                }
-                Some(QueryPlanNode::RelationalJoin {
-                    inputs,
-                    join_kind,
-                    pred,
-                    left_schema,
-                    right_schema,
-                    output_schema,
-                    pruning,
-                }) => {
-                    if output_schema != &expected {
-                        return Err("join output schema mismatch".into());
-                    }
-                    if pruning.is_some() {
-                        return Err(
-                            "candidate pruning is not bound for this relation source".into()
-                        );
-                    }
-                    (
-                        Payload::RelationalJoin {
-                            join_kind: join_kind.clone(),
-                            pred: serde_json::from_value(pred.clone())
-                                .map_err(|e| e.to_string())?,
-                            pruning: None,
-                        },
-                        vec![
-                            (inputs[0], left_schema.clone()),
-                            (inputs[1], right_schema.clone()),
-                        ],
-                    )
-                }
-                Some(_) => {
-                    sources.push(id);
-                    continue;
-                }
-                None => return Err("missing relation node".into()),
-            };
-            let node = ExecutableDagNode {
-                id: PostAsapNodeId(
-                    u32::try_from(id.0).map_err(|_| "relation node ID exceeds Planner range")?,
-                ),
-                payload,
-                output_state: ExecutionDataState::QUERY_ROWS,
-                output_schema: expected,
-                guarantee: None,
-            };
-            let op = dag::planner::compile_node(
-                &node,
-                &inputs
-                    .iter()
-                    .map(|(_, schema)| Arc::new(schema.clone()))
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|e| e.to_string())?;
-            operations.insert(
-                id,
-                (inputs.iter().map(|(id, _)| id.0).collect::<Vec<_>>(), op),
-            );
-            pending.extend(inputs);
-        }
-        let compiled =
-            asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
-                sources
-                    .iter()
-                    .map(|id| {
-                        (
-                            id.0,
-                            asap_physical_operators::physical_planner::InputContract::bounded(
-                                Arc::new(schemas[id].clone()),
-                            ),
-                        )
-                    })
-                    .collect(),
-                operations.into_iter().map(|(id, op)| (id.0, op)).collect(),
-                vec![root.0],
-            )
-            .map_err(|e| e.to_string())?;
+            Some(QueryPlanNode::ExternalExact { .. }) => {
+                let schema = Arc::new(expected.clone());
+                (
+                    CompiledPhysicalDag::from_operators(
+                        [(root.0, InputContract::bounded(schema.clone()))].into(),
+                        BTreeMap::new(),
+                        vec![root.0],
+                    )?,
+                    vec![(root.0, root, schema)],
+                )
+            }
+            _ => return Err("SQL execution requires a Planner-compiled physical relation".into()),
+        };
+        let sources = source_bindings
+            .iter()
+            .map(|(_, id, _)| *id)
+            .collect::<BTreeSet<_>>();
         let mut resolved_inputs = BTreeMap::new();
         let context = crate::query_engines::request::context(dag::Scope::Query {
             evaluation_time_ms: i64::try_from(self.t1_ms)
@@ -263,8 +193,8 @@ impl RelationDagExecutor<'_> {
         ).map_err(SqlExecutionError::from)?;
         let mut coverage = None;
         let mut first = true;
-        for id in sources {
-            let relation = self.execute_source(id, &schemas[&id], &stored)?;
+        for (slot, id, schema) in source_bindings {
+            let relation = self.execute_source(id, &schema, &stored)?;
             coverage = if first {
                 first = false;
                 relation.coverage
@@ -276,9 +206,9 @@ impl RelationDagExecutor<'_> {
                     _ => None,
                 }
             };
-            let batch = native::batch(&relation, &schemas[&id]).map_err(|e| e.to_string())?;
+            let batch = native::batch(&relation, &schema).map_err(|e| e.to_string())?;
             resolved_inputs.insert(
-                id.0,
+                slot,
                 Box::new(
                     Operator::source(batch.schema().clone(), vec![batch])
                         .map_err(|e| e.to_string())?,
@@ -288,7 +218,7 @@ impl RelationDagExecutor<'_> {
         let graph = compiled
             .instantiate(resolved_inputs)
             .map_err(|e| e.to_string())?;
-        let mut output = graph.execute(&[root.0], context)?.remove(0);
+        let mut output = graph.execute(compiled.roots(), context)?.remove(0);
         let mut batches = Vec::new();
         loop {
             crate::query_engines::request::check()?;
@@ -449,18 +379,26 @@ fn execute_sql_dag_with_external_unfenced(
         ids.iter().any(|id| {
             matches!(
                 entry.nodes.get(id),
-                Some(
-                    QueryPlanNode::Relational { .. }
-                        | QueryPlanNode::RelationalJoin { .. }
-                        | QueryPlanNode::ExternalExact { .. }
-                )
+                Some(QueryPlanNode::PhysicalRelation { .. } | QueryPlanNode::ExternalExact { .. })
             )
         })
     });
     if has_relational_join {
         let root_schema = match entry.nodes.get(&entry.root) {
-            Some(QueryPlanNode::Relational { output_schema, .. })
-            | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => output_schema.clone(),
+            Some(QueryPlanNode::PhysicalRelation { dag, .. }) => {
+                match asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                    .and_then(|compiled| {
+                        let root = compiled.roots().first().ok_or_else(|| {
+                            asap_physical_operators::dag::Error::Invalid(
+                                "physical relation has no root".into(),
+                            )
+                        })?;
+                        compiled.output_contract(*root)
+                    }) {
+                    Ok(contract) => contract.schema.as_ref().clone(),
+                    Err(error) => return ClickHouseDagOutcome::Failed(error),
+                }
+            }
             Some(QueryPlanNode::ExternalExact { request, .. }) => {
                 let asap_types::query_plan::ExternalExactOutput::Relation { schema } =
                     &request.output
@@ -628,6 +566,7 @@ mod tests {
 
     fn external_entry(schema: &SummarySchema) -> QueryPlanEntry {
         QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::ClickHouseSql,
             query_id: "shared-external".into(),
             canonical_query: "SELECT x".into(),
@@ -753,30 +692,76 @@ mod tests {
         assert!(error.to_string().contains("inconsistent relation schemas"));
     }
 
+    fn physical_cross_join(
+        inputs: [QueryNodeId; 2],
+        schema: &planner_types::post_asap::SummarySchema,
+        output: &planner_types::post_asap::SummarySchema,
+    ) -> QueryPlanNode {
+        use asap_physical_operators::physical_planner::{
+            compile_node, CompiledPhysicalDag, InputContract,
+        };
+        use planner_types::post_asap::{
+            ExecutionDataState, PostAsapDagNode, PostAsapNodeId, PostAsapOperatorPayload,
+        };
+        use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
+        let schema = std::sync::Arc::new(schema.clone());
+        let op = compile_node(
+            &PostAsapDagNode {
+                id: PostAsapNodeId(100),
+                payload: PostAsapOperatorPayload::RelationalJoin {
+                    join_kind: JoinKind::Cross,
+                    pred: Predicate(QueryExpr::Literal(ScalarValue::Boolean(true)).into()),
+                    pruning: None,
+                },
+                output_state: ExecutionDataState::QUERY_ROWS,
+                output_schema: output.clone(),
+                guarantee: None,
+            },
+            &[schema.clone(), schema.clone()],
+        )
+        .unwrap();
+        let physical = CompiledPhysicalDag::from_operators(
+            inputs
+                .iter()
+                .map(|id| (id.0, InputContract::bounded(schema.clone())))
+                .collect(),
+            [(100, (inputs.iter().map(|id| id.0).collect(), op))].into(),
+            vec![100],
+        )
+        .unwrap();
+        QueryPlanNode::PhysicalRelation {
+            inputs: physical
+                .input_contracts()
+                .map(|(id, _)| QueryNodeId(id))
+                .collect(),
+            dag: physical.encode().unwrap(),
+        }
+    }
+
     // A SQL diamond binds one source to both join inputs in the shared DAG.
     #[test]
     fn relation_dag_executes_a_shared_source_join() {
-        use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
         let schema = relation_schema("x");
         let mut entry = external_entry(&schema);
         let mut output = schema.clone();
         output.fields.push(schema.fields[0].clone());
         entry.nodes.insert(
             QueryNodeId(1),
-            QueryPlanNode::RelationalJoin {
-                inputs: [QueryNodeId(0), QueryNodeId(0)],
-                join_kind: JoinKind::Cross,
-                pred: serde_json::to_value(Predicate::<usize>(
-                    QueryExpr::Literal(ScalarValue::Boolean(true)).into(),
-                ))
-                .unwrap(),
-                left_schema: schema.clone(),
-                right_schema: schema.clone(),
-                output_schema: output.clone(),
-                pruning: None,
-            },
+            physical_cross_join([QueryNodeId(0), QueryNodeId(0)], &schema, &output),
         );
         entry.root = QueryNodeId(1);
+        entry.validate(&BTreeSet::new()).unwrap();
+        let entry: QueryPlanEntry =
+            serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
+        let QueryPlanNode::PhysicalRelation { inputs, .. } = &entry.nodes[&entry.root] else {
+            unreachable!()
+        };
+        assert_eq!(
+            inputs,
+            &[QueryNodeId(0)],
+            "both join edges share one physical input slot"
+        );
+
         let relation = ClickHouseRelation::from_json_compact(
             &schema,
             br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1],[2]]}"#,
@@ -813,7 +798,6 @@ mod tests {
     /// A publication between query branches invalidates the entire result.
     #[test]
     fn query_wide_fence_rejects_publication_between_join_branches() {
-        use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
         let schema = relation_schema("x");
         let mut entry = external_entry(&schema);
         entry
@@ -823,18 +807,7 @@ mod tests {
         output.fields.push(schema.fields[0].clone());
         entry.nodes.insert(
             QueryNodeId(1),
-            QueryPlanNode::RelationalJoin {
-                inputs: [QueryNodeId(0), QueryNodeId(2)],
-                join_kind: JoinKind::Cross,
-                pred: serde_json::to_value(Predicate::<usize>(
-                    QueryExpr::Literal(ScalarValue::Boolean(true)).into(),
-                ))
-                .unwrap(),
-                left_schema: schema.clone(),
-                right_schema: schema.clone(),
-                output_schema: output,
-                pruning: None,
-            },
+            physical_cross_join([QueryNodeId(0), QueryNodeId(2)], &schema, &output),
         );
         entry.root = QueryNodeId(1);
         let relation = ClickHouseRelation::from_json_compact(

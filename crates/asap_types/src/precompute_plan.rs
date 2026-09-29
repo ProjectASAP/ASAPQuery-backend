@@ -14,16 +14,16 @@ use thiserror::Error;
 /// and are not admitted by this bounded capability check.
 pub fn validate_maintenance_reduction(
     config: &crate::PrecomputeMaterialization,
-    node: &planner_types::post_asap::ExecutableDagNode,
+    node: &planner_types::post_asap::PostAsapDagNode,
 ) -> Result<(), String> {
     use crate::sds::PopulationPartitioning;
-    use planner_types::{post_asap::ExecutableOperatorPayload, pre_asap::Reduction};
+    use planner_types::{post_asap::PostAsapOperatorPayload, pre_asap::Reduction};
     match &node.payload {
-        ExecutableOperatorPayload::SummaryAgg {
+        PostAsapOperatorPayload::SummaryAgg {
             reduction: Reduction::PerEntity,
             ..
         } if config.partitioning == Some(PopulationPartitioning::PerEntity) => Ok(()),
-        ExecutableOperatorPayload::SummaryAgg {
+        PostAsapOperatorPayload::SummaryAgg {
             reduction: Reduction::Reduce(keys),
             ..
         } if keys.is_empty()
@@ -153,6 +153,8 @@ pub struct IngestContract {
 pub enum StateEncoding {
     SketchlibProtobufV1,
     SketchCoreMsgpackV1,
+    /// Backend-produced typed physical output, distinct from legacy sketch frames.
+    NativeBatchV1,
     ExactAccumulatorV1,
     /// Persisted backend state with explicit Planner family and population layout.
     PlannerExactAccumulatorV1,
@@ -520,6 +522,12 @@ impl PrecomputePlan {
                     .chain(input.inputs.iter().copied())
             })
             .collect();
+        // Decode each DAG at most once; errors still surface only where used.
+        let dags = self
+            .executable_dags
+            .values()
+            .map(|installed| (installed, std::cell::OnceCell::new()))
+            .collect::<Vec<_>>();
         for config in &self.materializations {
             if !config.population_key_encoding.is_legacy()
                 && (self.ingest.protocol != IngestProtocol::PrometheusRemoteWriteV1
@@ -569,21 +577,12 @@ impl PrecomputePlan {
                 return Err(invalid());
             }
             validated_source_window_cohort(config, &sources)?;
-            if sources
-                .iter()
-                .any(|source| !matches!(source.aggregation_type, crate::AggregationType::Sum))
-            {
-                return Err(invalid());
-            }
-            if config.window_size != config.slide_interval {
-                return Err(invalid());
-            }
             let mut matched = false;
-            for installed in self.executable_dags.values() {
-                let dag = installed
-                    .document
-                    .decode()
-                    .map_err(PrecomputePlanError::CatalogContract)?;
+            for (installed, dag) in &dags {
+                let dag = dag
+                    .get_or_init(|| installed.document.decode())
+                    .as_ref()
+                    .map_err(|error| PrecomputePlanError::CatalogContract(error.clone()))?;
                 for sink in &installed.binding.precompute_sinks {
                     if !matches!(installed.binding.node(*sink),
                         Some(crate::executable_plan::BackendNodeBinding::Materialization { stored_output })
@@ -596,8 +595,62 @@ impl PrecomputePlan {
                         .iter()
                         .find(|node| node.id == *sink)
                         .ok_or_else(invalid)?;
-                    validate_maintenance_reduction(config, target_node)
-                        .map_err(PrecomputePlanError::CatalogContract)?;
+                    let native = installed
+                        .native_program(*sink)
+                        .map_err(PrecomputePlanError::CatalogContract)?
+                        .ok_or_else(invalid)?;
+                    for root in native.roots() {
+                        let root = planner_types::post_asap::PostAsapNodeId(
+                            u32::try_from(*root).map_err(|_| invalid())?,
+                        );
+                        let Some(crate::executable_plan::BackendNodeBinding::Materialization {
+                            stored_output,
+                        }) = installed.binding.node(root)
+                        else {
+                            return Err(invalid());
+                        };
+                        let other = self
+                            .materializations
+                            .iter()
+                            .find(|c| c.policy_fingerprint() == stored_output.fingerprint())
+                            .ok_or_else(invalid)?;
+                        if other.stored_window_ms() != config.stored_window_ms()
+                            || other.slide_interval != config.slide_interval
+                            || other.pane_origin_ms != config.pane_origin_ms
+                            || other.population_key_encoding != config.population_key_encoding
+                            || other.derived_input.as_ref().map(|d| &d.inputs)
+                                != Some(&derived.inputs)
+                            || (native.roots().len() > 1
+                                && config.population_key_encoding.is_legacy())
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                    let native = native.output_contract(u64::from(sink.0))
+                        .map_err(|e| PrecomputePlanError::CatalogContract(e.to_string()))
+                        .map(|contract| !asap_physical_operators::physical_planner::precompute::is_population_schema(&contract.schema))?
+                        .then_some(native);
+                    if sources.iter().any(|source| {
+                        !matches!(source.aggregation_type, crate::AggregationType::Sum)
+                            && !(native.is_some()
+                                && matches!(source.aggregation_type, crate::AggregationType::Rate))
+                    }) {
+                        return Err(invalid());
+                    }
+                    if native.is_none() {
+                        if config.window_size != config.slide_interval {
+                            return Err(invalid());
+                        }
+                        validate_maintenance_reduction(config, target_node)
+                            .map_err(PrecomputePlanError::CatalogContract)?;
+                    } else if !matches!(
+                        config.aggregation_type,
+                        crate::AggregationType::CountMinSketchWithHeap
+                            | crate::AggregationType::CountSketchWithHeap
+                            | crate::AggregationType::Sum
+                    ) {
+                        return Err(invalid());
+                    }
                     let inputs: Vec<_> = dag
                         .edges
                         .iter()
@@ -645,7 +698,7 @@ impl PrecomputePlan {
                             .filter(|edge| edge.consumer == id)
                             .collect();
                         use planner_types::post_asap::{
-                            ExecutableOperatorPayload as Payload, ValueOperation,
+                            PostAsapOperatorPayload as Payload, ValueOperation,
                         };
                         if node.output_state
                             != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
@@ -726,7 +779,7 @@ impl PrecomputePlan {
                         crate::AggregationType::HLL | crate::AggregationType::UnivMon
                     )
                 {
-                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                    if let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg {
                         input,
                         ..
                     } = &node.payload
@@ -749,7 +802,7 @@ impl PrecomputePlan {
                     }
                 }
                 if let Some(partitioning) = config.partitioning {
-                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                    if let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg {
                         reduction,
                         ..
                     } = &node.payload
@@ -877,7 +930,7 @@ impl PrecomputePlan {
                         crate::WindowKind::Session => None,
                     }
                 || schema.window.pane_origin_ms != materialization.pane_origin_ms
-                || schema.encodings != state_encodings(&accumulator.family)
+                || !state_encodings_match(&accumulator.family, &schema.encodings)
             {
                 return Err(PrecomputePlanError::InvalidSchema {
                     schema_id: schema.schema_id.clone(),
@@ -925,8 +978,22 @@ pub(crate) fn state_schema_id(fingerprint: crate::PolicyFingerprint) -> String {
     format!("{}:summary-state:v1:{}", BACKEND_COMPAT, fingerprint.0)
 }
 
+// Persisted schemas may declare a subset of formats. Adding a decoder must
+// not invalidate existing installed plans that use only older supported codecs.
+pub(crate) fn state_encodings_match(
+    family: &SummaryFamilyType,
+    encodings: &[StateEncoding],
+) -> bool {
+    let supported = state_encodings(family);
+    !encodings.is_empty()
+        && encodings.iter().collect::<BTreeSet<_>>().len() == encodings.len()
+        && encodings
+            .iter()
+            .all(|encoding| supported.contains(encoding))
+}
+
 pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
-    match family {
+    let mut encodings = match family {
         SummaryFamilyType::ExactAggregate(
             planner_types::post_asap::ExactKind::Increase
             | planner_types::post_asap::ExactKind::Rate,
@@ -954,7 +1021,25 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
             StateEncoding::SketchCoreMsgpackV1,
         ],
         _ => Vec::new(),
+    };
+    if matches!(
+        family,
+        SummaryFamilyType::ExactAggregate(
+            planner_types::post_asap::ExactKind::Sum
+                | planner_types::post_asap::ExactKind::Count
+                | planner_types::post_asap::ExactKind::Min
+                | planner_types::post_asap::ExactKind::Max
+                | planner_types::post_asap::ExactKind::Rate
+                | planner_types::post_asap::ExactKind::Increase,
+            _
+        )
+    ) || matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(),
+            SketchAlgorithm::Kll | SketchAlgorithm::DDSketch | SketchAlgorithm::Hll |
+            SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
+    {
+        encodings.push(StateEncoding::NativeBatchV1);
     }
+    encodings
 }
 
 #[cfg(test)]
@@ -972,6 +1057,36 @@ mod source_window_cohort_tests {
         }))
         .unwrap()
     }
+    // New native-format support must not invalidate persisted older codec subsets.
+    #[test]
+    fn older_encoding_subsets_remain_valid_and_unknown_codecs_fail() {
+        use planner_types::post_asap::{SketchKind, SketchParams};
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+            Default::default(),
+        );
+        assert!(state_encodings_match(
+            &family,
+            &[
+                StateEncoding::SketchlibProtobufV1,
+                StateEncoding::SketchCoreMsgpackV1
+            ]
+        ));
+        assert!(state_encodings_match(
+            &family,
+            &[StateEncoding::NativeBatchV1]
+        ));
+        assert!(!state_encodings_match(&family, &[]));
+        assert!(!state_encodings_match(
+            &family,
+            &[StateEncoding::ExactAccumulatorV1]
+        ));
+        assert!(!state_encodings_match(
+            &family,
+            &[StateEncoding::NativeBatchV1, StateEncoding::NativeBatchV1]
+        ));
+    }
+
     #[test]
     fn producer_roster_roundtrip_and_watermark_scope() {
         let envelope = PlanEnvelope {
@@ -1064,9 +1179,9 @@ mod source_window_cohort_tests {
         use planner_types::pre_asap::Reduction;
         let mut config = full_window();
         config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
-        let mut node = ExecutableDagNode {
+        let mut node = PostAsapDagNode {
             id: PostAsapNodeId(1),
-            payload: ExecutableOperatorPayload::SummaryAgg {
+            payload: PostAsapOperatorPayload::SummaryAgg {
                 family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 input: SummaryUpdate {
                     item: None,
@@ -1086,18 +1201,18 @@ mod source_window_cohort_tests {
         assert!(validate_maintenance_reduction(&config, &node).is_ok());
         config.partitioning = Some(crate::sds::PopulationPartitioning::PerEntity);
         assert!(validate_maintenance_reduction(&config, &node).is_err());
-        if let ExecutableOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
+        if let PostAsapOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
             *reduction = Reduction::PerEntity;
         }
         assert!(validate_maintenance_reduction(&config, &node).is_ok());
         config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
-        if let ExecutableOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
+        if let PostAsapOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
             *reduction = Reduction::by(vec![0]);
         }
         assert!(validate_maintenance_reduction(&config, &node).is_err());
         config.partitioning = None;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
-        node.payload = ExecutableOperatorPayload::SummaryMerge;
+        node.payload = PostAsapOperatorPayload::SummaryMerge;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
     }
 

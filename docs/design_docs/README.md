@@ -13,6 +13,8 @@ integration.
 - [Summary definitions table and SDS](summary-catalog-sds-architecture.md) owns definition
   and instance identity, version-scoped state references, read eligibility and
   committed-state metadata.
+- [Physical candidate handoff](physical-candidate-handoff.md) defines removal of
+  Backend operator lowering while preserving deployment and SDS contracts.
 - [QueryPlan DAG execution](query-dag-execution.md) explains how the query
   engine evaluates installed query sub-DAGs and reads bound stored summaries.
 - [Architecture migration delivery plan](asapplanner-migration-plan.md) defines

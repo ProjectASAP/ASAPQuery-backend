@@ -11,9 +11,12 @@ pub use status::{CandidateEvaluationStatus, CandidateSearchScope};
 #[cfg(test)]
 use super::compiler::DeploymentPlanCompiler;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
+use crate::types::AccuracyTarget;
 use asap_aware_mapping::cost_model::Cost;
+use planner_types::post_asap::SummaryNode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -38,6 +41,7 @@ pub struct CostComponentDemand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadCostManifest {
+    pub dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
     pub plan_id: u64,
     pub plan_version: u64,
     pub planner_revision: String,
@@ -108,7 +112,7 @@ pub struct MaterializationSearchCoverage {
 pub struct CandidatePlanSelectionReport {
     #[serde(default)]
     #[serde(rename = "logical_selection")]
-    pub planner_selection_trace: Vec<Value>,
+    pub planner_selection_trace: std::sync::Arc<Vec<Value>>,
     #[serde(default)]
     pub materialization_search_coverage: Option<MaterializationSearchCoverage>,
     pub data_snapshot_id: String,
@@ -211,6 +215,28 @@ pub fn manifest(
             }
         }
     }
+    for installed in plan.precompute_plan.executable_dags.values() {
+        for (sink, program) in &installed.native_programs {
+            let Some(asap_types::executable_plan::BackendNodeBinding::Materialization {
+                stored_output,
+            }) = installed.binding.node(*sink)
+            else {
+                return Err(invalid("native maintenance sink is unbound"));
+            };
+            let config = plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|m| m.policy_fingerprint() == stored_output.fingerprint())
+                .ok_or_else(|| invalid("native maintenance config is absent"))?;
+            add(
+                format!("maintenance:{}", stored_output.0),
+                json!({"physical_program":program,"stored_output":stored_output,"window_ms":config.stored_window_ms(),"interval_ms":config.slide_interval.saturating_mul(1000)}),
+                "horizon",
+                1.0,
+            );
+        }
+    }
     for rule in &plan.transmission_plan.rules {
         add(
             format!("transport:{}:{}", rule.producer_id, rule.materialization.0),
@@ -305,7 +331,7 @@ pub fn manifest(
         for node_id in entry.topological_order()? {
             add(
                 format!("query:{}:{}", entry.query_id, node_id.0),
-                json!({"node": entry.nodes[&node_id], "query": entry.canonical_query, "instant": entry.instant}),
+                json!({"node": entry.nodes[&node_id], "query": entry.canonical_query, "instant": entry.instant, "physical_dag": entry.physical_dag}),
                 "query_evaluation",
                 evaluations,
             );
@@ -318,6 +344,12 @@ pub fn manifest(
         );
     }
     Ok(WorkloadCostManifest {
+        dataset_identity: plan
+            .precompute_plan
+            .ingest
+            .dataset_identity
+            .clone()
+            .ok_or_else(|| CompileError::Snapshot("cost manifest lacks dataset identity".into()))?,
         plan_id: plan.envelope.plan_id,
         plan_version: plan.envelope.plan_version,
         planner_revision: plan.envelope.planner_revision.clone(),
@@ -467,17 +499,41 @@ impl WorkloadCostEvidence {
     }
 }
 
-fn candidate_description(candidate: &PhysicalCompilationRequest) -> CandidatePlanEvaluation {
-    let root_ids = candidate
-        .queries
+/// Planner forests clone query inputs, so candidates share root `Rc`s. The
+/// memo borrows every candidate, which keeps each keyed address alive.
+fn candidate_descriptions(
+    candidates: &[PhysicalCompilationRequest],
+) -> Vec<CandidatePlanEvaluation> {
+    let mut root_ids = HashMap::<*const SummaryNode, Vec<(&AccuracyTarget, Option<String>)>>::new();
+    candidates
         .iter()
-        .map(|query| {
-            crate::planner_selection::explained_root_id(
-                &query.selected_plan_root,
-                &query.accuracy_target,
-            )
+        .map(|candidate| {
+            candidate_description(candidate, |query| {
+                let known = root_ids
+                    .entry(Rc::as_ptr(&query.selected_plan_root))
+                    .or_default();
+                if let Some((_, id)) = known
+                    .iter()
+                    .find(|(accuracy, _)| *accuracy == &query.accuracy_target)
+                {
+                    return id.clone();
+                }
+                let id = crate::planner_selection::explained_root_id(
+                    &query.selected_plan_root,
+                    &query.accuracy_target,
+                );
+                known.push((&query.accuracy_target, id.clone()));
+                id
+            })
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn candidate_description<'a>(
+    candidate: &'a PhysicalCompilationRequest,
+    root_id: impl FnMut(&'a QueryCompilationInput) -> Option<String>,
+) -> CandidatePlanEvaluation {
+    let root_ids = candidate.queries.iter().map(root_id).collect::<Vec<_>>();
     let complete = root_ids.iter().all(Option::is_some);
     let mut logical_root_ids = root_ids.into_iter().flatten().collect::<Vec<_>>();
     logical_root_ids.sort();
@@ -485,7 +541,7 @@ fn candidate_description(candidate: &PhysicalCompilationRequest) -> CandidatePla
     CandidatePlanEvaluation {
         candidate_id: complete.then(|| {
             crate::planner_selection::explain_identity(
-                "alternative",
+                "candidate",
                 &(
                     &logical_root_ids,
                     candidate.allow_mixed_summary_and_exact_execution,
@@ -506,6 +562,7 @@ fn candidate_description(candidate: &PhysicalCompilationRequest) -> CandidatePla
 
 fn compile_candidate_for_pricing(
     candidate: PhysicalCompilationRequest,
+    mut description: CandidatePlanEvaluation,
     env: PhysicalDeploymentContext,
     frontend: super::compiler::QueryFrontend,
 ) -> Result<
@@ -516,7 +573,6 @@ fn compile_candidate_for_pricing(
     ),
     Box<CandidatePlanEvaluation>,
 > {
-    let mut description = candidate_description(&candidate);
     let queries = candidate.queries.clone();
     let compiled = super::realization::RealizationProvider::compile(
         &super::realization::ExistingRealizations,
@@ -554,6 +610,12 @@ fn compile_candidate_for_pricing(
         })
         .collect::<Vec<_>>();
     placement.sort();
+    let native_programs = plan
+        .query_plan
+        .entries
+        .values()
+        .map(|entry| (&entry.query_id, &entry.physical_dag))
+        .collect::<std::collections::BTreeMap<_, _>>();
     description.physical_candidate_id =
         description
             .candidate_id
@@ -566,6 +628,7 @@ fn compile_candidate_for_pricing(
                         bindings,
                         placement,
                         &plan.precompute_plan.ingest,
+                        native_programs,
                     ),
                 )
             });
@@ -590,8 +653,9 @@ pub fn compile_candidates_for_pricing(
 ) -> (Vec<WorkloadCostManifest>, Vec<CandidatePlanEvaluation>) {
     let mut manifests = Vec::new();
     let mut candidate_evaluations = Vec::new();
-    for candidate in candidates {
-        match compile_candidate_for_pricing(candidate, env.clone(), frontend) {
+    let descriptions = candidate_descriptions(&candidates);
+    for (candidate, description) in candidates.into_iter().zip(descriptions) {
+        match compile_candidate_for_pricing(candidate, description, env.clone(), frontend) {
             Ok((_, manifest, description)) => {
                 manifests.push(manifest);
                 candidate_evaluations.push(description);
@@ -637,9 +701,9 @@ fn select_candidates(
     frontend: super::compiler::QueryFrontend,
 ) -> Result<CompiledPhysicalPlan, CompileError> {
     evidence.validate(&env)?;
-    if candidates.is_empty() || candidates.len() > 64 {
+    if candidates.is_empty() || candidates.len() > 4096 {
         return Err(invalid(
-            "candidate inventory must contain 1..=64 candidates",
+            "candidate inventory must contain 1..=4096 candidates",
         ));
     }
     let candidate_key_sets: BTreeSet<_> = candidates
@@ -662,16 +726,11 @@ fn select_candidates(
     let planner_selection_trace = candidates[0].planner_selection_trace.clone();
     let mut comparison_workload = None;
     let mut candidate_evaluations = Vec::new();
-    let mut best_index = 0;
-    let mut best: Option<(
-        Cost,
-        CompiledPhysicalPlan,
-        WorkloadCostManifest,
-        BTreeMap<String, f64>,
-    )> = None;
-    for candidate in candidates {
+    let mut priced_candidates = Vec::new();
+    let descriptions = candidate_descriptions(&candidates);
+    for (candidate, description) in candidates.into_iter().zip(descriptions) {
         let (plan, manifest, mut description) =
-            match compile_candidate_for_pricing(candidate, env.clone(), frontend) {
+            match compile_candidate_for_pricing(candidate, description, env.clone(), frontend) {
                 Ok(bound) => bound,
                 Err(description) => {
                     candidate_evaluations.push(*description);
@@ -695,10 +754,13 @@ fn select_candidates(
                 description.status = CandidateEvaluationStatus::Unselected;
                 description.total_cost = Some(cost.0);
                 candidate_evaluations.push(description);
-                if best.as_ref().is_none_or(|(previous, ..)| cost < *previous) {
-                    best_index = candidate_evaluations.len() - 1;
-                    best = Some((cost, plan, manifest, components));
-                }
+                priced_candidates.push(Ok((
+                    cost,
+                    plan,
+                    manifest,
+                    components,
+                    candidate_evaluations.len() - 1,
+                )));
             }
             Err((status, reason)) => {
                 description.status = status;
@@ -707,13 +769,27 @@ fn select_candidates(
             }
         }
     }
-    let (_, mut plan, selected_manifest, component_costs) = best.ok_or_else(|| {
+    let selected = asap_physical_operators::physical_planner::select_candidate(
+        priced_candidates,
+        |(cost, _, manifest, _, _)| {
+            Ok(Some(
+                asap_physical_operators::physical_planner::CandidateCost {
+                    workload_scope: serde_json::to_string(&manifest.workload).map_err(|error| {
+                        asap_physical_operators::Error::Invalid(error.to_string())
+                    })?,
+                    horizon_seconds: manifest.horizon_seconds,
+                    total_cost: cost.0,
+                },
+            ))
+        },
+    )
+    .map_err(|error| {
         CompileError::Candidates(
             json!({"status": "all_infeasible", "logical_selection": planner_selection_trace,
-            "candidates": candidate_evaluations}),
+            "candidates": candidate_evaluations, "selection_error": error.to_string()}),
         )
     })?;
-    // Exactly the winner retained by the existing strict-less-than selector.
+    let (_, mut plan, selected_manifest, component_costs, best_index) = selected.candidate;
     candidate_evaluations[best_index].status = CandidateEvaluationStatus::Selected;
     plan.cost_comparison = Some(CandidatePlanSelectionReport {
         planner_selection_trace,
@@ -731,21 +807,58 @@ fn select_candidates(
 /// The current executor exposes continuously maintained state and the native
 /// exact backend. Additional Planner-produced forests can use `select_lowest_cost_candidate` directly.
 pub fn enumerate_exact_and_materialized_candidates(
-    request: PhysicalCompilationRequest,
+    mut request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
-    let already_selected = super::maintained_population::supported(&request);
-    let mut candidates = materialization_candidates(request)?;
-    if already_selected {
-        return Ok(candidates);
+    let forests = std::mem::take(&mut request.planner_candidate_forests);
+    if forests.is_empty() {
+        return enumerate_frontier_candidates(request);
     }
+    // Keep the existing deterministic ordering for equal-cost candidates;
+    // every discovered forest still reaches deployment admission and pricing.
+    let mut candidates: Vec<PhysicalCompilationRequest> = Vec::new();
+    for forest in std::iter::once(request.queries.clone()).chain(forests) {
+        let mut candidate = request.clone();
+        candidate.queries = forest;
+        for candidate in enumerate_frontier_candidates(candidate)? {
+            if !candidates.iter().any(|existing| {
+                existing.allow_mixed_summary_and_exact_execution
+                    == candidate.allow_mixed_summary_and_exact_execution
+                    && existing.enabled_materialization_keys
+                        == candidate.enabled_materialization_keys
+                    && existing
+                        .queries
+                        .iter()
+                        .map(|query| &query.selected_plan_root)
+                        .eq(candidate
+                            .queries
+                            .iter()
+                            .map(|query| &query.selected_plan_root))
+            }) {
+                candidates.push(candidate);
+            }
+            if candidates.len() > 4096 {
+                return Err(invalid(
+                    "deployment candidate inventory exceeds budget; no partial inventory selected",
+                ));
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn enumerate_frontier_candidates(
+    mut request: PhysicalCompilationRequest,
+) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
+    request.planner_candidate_forests.clear();
+    let mut candidates = materialization_candidates(request)?;
     let roots: Vec<_> = candidates
         .last()
-        .expect("exact alternative")
+        .expect("exact candidate")
         .queries
         .iter()
         .map(|q| match &q.selected_plan_root.expr {
             planner_types::post_asap::SummaryExpr::KeepPreAsap(root) => std::rc::Rc::clone(root),
-            _ => unreachable!("native alternative retains canonical roots"),
+            _ => unreachable!("native candidate retains canonical roots"),
         })
         .collect();
     let strategy =
@@ -760,21 +873,29 @@ pub fn enumerate_exact_and_materialized_candidates(
         .collect();
     if maintained_roots.iter().any(Option::is_some) {
         // Current-series rules are compatible with window summaries in other
-        // workload roots. Preserve each priced temporal alternative and mask.
+        // workload roots. Preserve each priced temporal candidate and mask.
         let maintained: Vec<_> = candidates
             .iter()
-            .map(|alternative| {
-                let mut candidate = alternative.clone();
+            .filter_map(|candidate| {
+                let mut candidate = candidate.clone();
+                let mut changed = false;
                 for (query, selected) in candidate.queries.iter_mut().zip(&maintained_roots) {
                     if let Some(selected) = selected {
-                        query.selected_plan_root = std::rc::Rc::clone(selected);
+                        if !super::maintained_population::supported_node(&query.selected_plan_root)
+                        {
+                            query.selected_plan_root = std::rc::Rc::clone(selected);
+                            changed = true;
+                        }
                     }
+                }
+                if !changed {
+                    return None;
                 }
                 if maintained_roots.iter().all(Option::is_some) {
                     candidate.allow_mixed_summary_and_exact_execution = false;
                     candidate.enabled_materialization_keys = None;
                 }
-                candidate
+                Some(candidate)
             })
             .collect();
         for candidate in maintained {
@@ -786,10 +907,27 @@ pub fn enumerate_exact_and_materialized_candidates(
                     && existing
                         .queries
                         .iter()
-                        .zip(&candidate.queries)
-                        .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
+                        .map(|query| &query.selected_plan_root)
+                        .eq(candidate
+                            .queries
+                            .iter()
+                            .map(|query| &query.selected_plan_root))
             }) {
                 candidates.push(candidate);
+            }
+        }
+    }
+    // A retained physical candidate depends only on its root, and candidates
+    // share root `Rc`s. `candidates` keeps every keyed address alive.
+    let mut physical = HashMap::<*const SummaryNode, Option<Vec<u8>>>::new();
+    for candidate in &mut candidates {
+        for query in &mut candidate.queries {
+            let root = Rc::as_ptr(&query.selected_plan_root);
+            if let Some(bytes) = physical.get(&root) {
+                query.physical_candidate = bytes.clone();
+            } else {
+                query.retain_physical_candidate()?;
+                physical.insert(root, query.physical_candidate.clone());
             }
         }
     }
@@ -819,8 +957,8 @@ fn materialization_candidates(
         && request
             .queries
             .iter()
-            .zip(&exact.queries)
-            .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
+            .map(|query| &query.selected_plan_root)
+            .eq(exact.queries.iter().map(|query| &query.selected_plan_root))
     {
         Ok(vec![request])
     } else {
@@ -836,7 +974,7 @@ fn materialization_candidates(
                 &query.selected_plan_root,
             ) {
                 Ok(found) => keys.extend(found),
-                // A failed local projection must not make the native alternative
+                // A failed local projection must not make the native candidate
                 // disappear. Compile/select_lowest_cost_candidate retains its concrete unavailability.
                 Err(_) => return Ok(vec![request, exact]),
             }
@@ -867,6 +1005,138 @@ fn materialization_candidates(
 mod tests {
     use super::super::compiler::BackendLocalPlanningInput;
     use super::*;
+
+    /// Deployment pricing must see candidate sketch families, not only an
+    /// upstream winner chosen before runtime resource evidence is applied.
+    #[test]
+    fn planner_quantile_inventory_reaches_backend_before_family_selection() {
+        let mut input = fixture();
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        queries.truncate(1);
+        queries[0].query = planner_types::workload::Query("quantile_over_time(0.9,m[1m])".into());
+        queries[0].requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
+            crate::types::AccuracyTarget::Epsilon(0.05),
+        );
+        let (request, _) = input.into_physical_compilation_request().unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let roots = candidates
+            .iter()
+            .flat_map(|c| &c.queries)
+            .map(|q| format!("{:?}", q.selected_plan_root))
+            .collect::<Vec<_>>();
+        assert!(
+            roots.iter().any(|r| r.contains("Kll")),
+            "KLL disappeared before backend pricing"
+        );
+        assert!(
+            roots.iter().any(|r| r.contains("DDSketch")),
+            "DDSketch disappeared before backend pricing"
+        );
+    }
+
+    /// A deployment without external execution rejects native candidates before pricing.
+    #[test]
+    fn local_only_deployment_rejects_external_candidate_before_pricing() {
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["implementation"]["require_backend_local_execution"] = json!(true);
+        let input: BackendLocalPlanningInput = serde_json::from_value(value).unwrap();
+        let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let native = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.queries.iter().all(|query| {
+                    matches!(
+                        query.selected_plan_root.expr,
+                        planner_types::post_asap::SummaryExpr::KeepPreAsap(_)
+                    )
+                })
+            })
+            .expect("native candidate remains inspectable")
+            .clone();
+        let error = DeploymentPlanCompiler
+            .compile_promql(native, environment)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external execution is unavailable"),
+            "{error}"
+        );
+        let selected = with_unit_quotes(input).compile_promql().unwrap();
+        assert!(selected.query_plan.entries.values().all(|entry| entry
+            .nodes
+            .values()
+            .all(|node| !matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. }))));
+        let report = selected.cost_comparison.unwrap();
+        assert!(report
+            .candidate_evaluations
+            .iter()
+            .any(|candidate| candidate
+                .unavailable_reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("external execution is unavailable"))
+                && candidate.total_cost.is_none()));
+    }
+
+    /// Selecting one population must not suppress candidates for other roots.
+    #[test]
+    fn existing_population_does_not_suppress_other_population_candidates() {
+        let mut input = fixture();
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        let template = queries[0].clone();
+        *queries = ["quantile by(job)(0.9,m)", "count by(job)(m)"]
+            .into_iter()
+            .map(|q| {
+                let mut entry = template.clone();
+                entry.query = planner_types::workload::Query(q.into());
+                entry
+            })
+            .collect();
+        let (mut request, _) = input.into_physical_compilation_request().unwrap();
+        let strategy = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+            &request.canonical_roots,
+        );
+        request.queries[0].selected_plan_root =
+            strategy.candidate(&request.canonical_roots[0]).unwrap();
+        request.queries[1].selected_plan_root =
+            crate::planner_selection::keep_pre_asap(&request.canonical_roots[1]).unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.queries.iter().all(|query| {
+                super::super::maintained_population::supported_node(&query.selected_plan_root)
+            })));
+    }
+
+    /// Instant counts select current membership, never accumulated observations.
+    #[test]
+    fn local_grouped_count_has_a_bindable_candidate() {
+        let mut input = fixture();
+        input.workload_cost_evidence = None;
+        input.physical_inputs.require_backend_local_execution = true;
+        input.data_workload.data_ingestion_interval.value =
+            Some(planner_types::workload::DurationMs(60_000));
+        input.physical_inputs.scrape_interval_ms = 60_000;
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        queries.truncate(1);
+        queries[0].query = planner_types::workload::Query("count by(job)(m)".into());
+        let plan = with_unit_quotes(input).compile_promql().unwrap();
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .all(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::Logical {
+                    operator: crate::query_plan::query_time::QueryTimeOperator::CurrentSeries {
+                        readout: asap_types::query_plan::current_series::SeriesReadout::Count,
+                        ..
+                    },
+                    ..
+                }
+            ))));
+    }
 
     fn fixture() -> BackendLocalPlanningInput {
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
@@ -952,7 +1222,7 @@ mod tests {
         let (mut request, env) = fixture().into_physical_compilation_request().unwrap();
         request.allow_mixed_summary_and_exact_execution = false;
         request.queries[0].window_realization_candidates.clear();
-        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let candidates = enumerate_frontier_candidates(request).unwrap();
         let (manifests, explanations) = compile_candidates_for_pricing(
             candidates,
             env,
@@ -985,6 +1255,93 @@ mod tests {
             .iter()
             .all(|item| item["status"] == "evidence_missing"));
         assert!(!report["logical_selection"].as_array().unwrap().is_empty());
+    }
+
+    /// Memoized root identities and retained physical candidates select the
+    /// same plan, manifest and candidate identities as independent compiles.
+    #[test]
+    fn shared_root_memoization_preserves_selected_plan_and_manifest() {
+        use planner_types::workload::{AccuracyRequirement, Query};
+        let mut input = fixture();
+        let queries = input.query_workload.repeating_queries.as_mut().unwrap();
+        let template = queries[0].clone();
+        *queries = [
+            ("sum(sum_over_time(m[1m]))", AccuracyTarget::Exact),
+            (
+                "quantile_over_time(0.9, m[1m])",
+                AccuracyTarget::Epsilon(0.05),
+            ),
+            ("count_over_time(m[1m])", AccuracyTarget::Exact),
+        ]
+        .into_iter()
+        .map(|(query, accuracy)| {
+            let mut entry = template.clone();
+            entry.query = Query(query.into());
+            entry.requirements.accuracy = AccuracyRequirement::Explicit(accuracy);
+            entry
+        })
+        .collect();
+        let input = with_unit_quotes(input);
+        let evidence = input.workload_cost_evidence.clone().unwrap();
+        let (request, env) = input.into_physical_compilation_request().unwrap();
+        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        assert!(candidates.len() > 2);
+        assert!(candidates[1..].iter().any(|candidate| candidate
+            .queries
+            .iter()
+            .zip(&candidates[0].queries)
+            .any(|(a, b)| Rc::ptr_eq(&a.selected_plan_root, &b.selected_plan_root))));
+
+        let reference = candidates
+            .iter()
+            .map(|candidate| {
+                for query in &candidate.queries {
+                    let mut fresh = query.clone();
+                    fresh.retain_physical_candidate().unwrap();
+                    assert_eq!(fresh.physical_candidate, query.physical_candidate);
+                }
+                let description = candidate_description(candidate, |query| {
+                    crate::planner_selection::explained_root_id(
+                        &query.selected_plan_root,
+                        &query.accuracy_target,
+                    )
+                });
+                let plan = DeploymentPlanCompiler
+                    .compile_promql(candidate.clone(), env.clone())
+                    .ok();
+                (description, plan)
+            })
+            .collect::<Vec<_>>();
+        let selected = select_lowest_cost_candidate(candidates.clone(), env, &evidence).unwrap();
+        let mut selected_json = serde_json::to_value(&selected).unwrap();
+        selected_json["cost_comparison"] = Value::Null;
+        let report = selected.cost_comparison.unwrap();
+        assert_eq!(report.candidate_evaluations.len(), reference.len());
+        for (index, (actual, (expected, plan))) in report
+            .candidate_evaluations
+            .iter()
+            .zip(&reference)
+            .enumerate()
+        {
+            assert_eq!(actual.candidate_id, expected.candidate_id);
+            assert_eq!(actual.logical_root_ids, expected.logical_root_ids);
+            assert_eq!(
+                actual.identity_unavailable_reason,
+                expected.identity_unavailable_reason
+            );
+            assert_eq!(
+                actual.plan_id,
+                plan.as_ref().map(|plan| plan.envelope.plan_id)
+            );
+            if actual.status == CandidateEvaluationStatus::Selected {
+                let plan = plan.as_ref().unwrap();
+                assert_eq!(selected_json, serde_json::to_value(plan).unwrap());
+                assert_eq!(
+                    report.selected_manifest,
+                    manifest(plan, &candidates[index].queries).unwrap()
+                );
+            }
+        }
     }
 
     // Explanation records the same minimum quote selected by the existing algorithm.
@@ -1078,7 +1435,7 @@ mod tests {
             crate::types::AccuracyTarget::Exact,
         );
         let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let candidates = enumerate_frontier_candidates(request).unwrap();
         assert_eq!(
             candidates.len(),
             5,
@@ -1156,7 +1513,7 @@ mod tests {
         WorkloadCostEvidence,
     ) {
         let (request, env) = fixture().into_physical_compilation_request().unwrap();
-        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
+        let candidates = enumerate_frontier_candidates(request).unwrap();
         let quotes = candidates
             .iter()
             .map(|candidate| {
@@ -1188,9 +1545,48 @@ mod tests {
         (candidates, env, evidence)
     }
 
+    /// Quote every bindable candidate at unit cost, leaving admission to decide.
+    fn with_unit_quotes(mut input: BackendLocalPlanningInput) -> BackendLocalPlanningInput {
+        let (request, env) = input.clone().into_physical_compilation_request().unwrap();
+        let quotes = enumerate_exact_and_materialized_candidates(request)
+            .unwrap()
+            .into_iter()
+            .filter_map(|candidate| {
+                let plan = DeploymentPlanCompiler
+                    .compile_promql(candidate.clone(), env.clone())
+                    .ok()?;
+                let manifest = manifest(&plan, &candidate.queries).unwrap();
+                let unit_costs = manifest
+                    .components
+                    .keys()
+                    .map(|id| (id.clone(), 1.0))
+                    .collect();
+                Some(WorkloadQuote {
+                    manifest,
+                    executable: true,
+                    unit_costs,
+                })
+            })
+            .collect();
+        input.workload_cost_evidence = Some(WorkloadCostEvidence {
+            backend_revision: crate::physical::compiler::BACKEND_REVISION.into(),
+            planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
+            data_snapshot_id: input
+                .physical_inputs
+                .data_snapshot_id
+                .clone()
+                .unwrap_or_else(|| "fixture-data-v1".into()),
+            model_version: "test-only-unit-costs".into(),
+            observed_at_unix_ms: env.observed_at_unix_ms,
+            valid_for_ms: env.max_evidence_age_ms,
+            quotes,
+        });
+        input
+    }
+
     // Retained local input is priced once per metric, separate from the native service.
     #[test]
-    fn counter_materialization_manifest_prices_owned_state_and_distinct_native_alternative() {
+    fn counter_materialization_manifest_prices_owned_state_and_distinct_native_candidate() {
         use planner_types::workload::{AccuracyRequirement, Query};
         let mut snapshot = fixture();
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
@@ -1245,19 +1641,14 @@ mod tests {
             ),
             ("sum_over_time(m[1m]) + count_over_time(m[1m])", vec!["m"]),
         ] {
-            let (mut request, env) = fixture().into_physical_compilation_request().unwrap();
-            request.queries[0].query_string = query.into();
-            request
-                .query_workload
-                .as_mut()
-                .unwrap()
-                .repeating_queries
-                .as_mut()
-                .unwrap()[0]
-                .query = planner_types::workload::Query(query.into());
+            let mut input = fixture();
+            input.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+                planner_types::workload::Query(query.into());
+            let (request, env) = input.into_physical_compilation_request().unwrap();
             let exact = enumerate_exact_and_materialized_candidates(request)
                 .unwrap()
-                .pop()
+                .into_iter()
+                .find(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
                 .unwrap();
             let plan = DeploymentPlanCompiler
                 .compile_promql(exact.clone(), env.clone())
@@ -1373,7 +1764,9 @@ mod tests {
         assert!(plan.cost_comparison.unwrap().candidate_evaluations[0]
             .unavailable_reason
             .is_some());
-        evidence.quotes[1].executable = false;
+        for quote in &mut evidence.quotes[1..] {
+            quote.executable = false;
+        }
         assert!(select_lowest_cost_candidate(candidates.clone(), env.clone(), &evidence).is_err());
         let (_, _, mut evidence) = quoted();
         evidence
@@ -1469,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_alternative_does_not_require_unused_state_implementation_evidence() {
+    fn exact_candidate_does_not_require_unused_state_implementation_evidence() {
         let (candidates, env, evidence) = quoted();
         let mut exact = candidates[1].clone();
         assert_eq!(
