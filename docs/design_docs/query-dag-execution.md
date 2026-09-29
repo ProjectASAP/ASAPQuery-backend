@@ -37,8 +37,8 @@ flowchart LR
   Entry --> Bind[Bind shared physical DAG]
   Bind --> Run[Execute dependencies and physical operators]
   Run --> Result[Convert root output to query response]
-  Store[SummaryStore] -->|StoredOutputReference| Bind
-  Exact[Declared external exact source] --> Bind
+  Store[SummaryStore] -->|local snapshot candidate| Bind
+  Exact[Declared external exact source] -->|external-only candidate| Bind
   Planner[post-ASAP physical DAG contract] --> Bind
 ```
 
@@ -157,7 +157,9 @@ There is no dedicated MembershipFilter or grouped TopK physical operator.
 A global Limit is not a grouped Limit. Candidate completeness belongs to the
 pruning certificate; exact scoring and sorting cannot prove that an omitted key
 would not have won. Missing authoritative values fail certified pruning.
-Best-effort pruning remains explicitly approximate.
+Best-effort pruning remains explicitly approximate. Authoritative local values must
+come from the same pinned input snapshot as the candidate summary. An external
+scoring source is not admitted without a common snapshot proof.
 
 ## Precomputation boundary
 
