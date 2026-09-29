@@ -85,9 +85,18 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           # Give background flusher/sealer waits headroom on hosted runners.
           ASAP_TEST_TIMEOUT_SCALE: "4"
+          ASAP_LEVEL1_ARTIFACT_DIR: ${{ github.workspace }}/artifacts/issue754-level1
         working-directory: ASAPQuery-backend
         # Persistence tests wait on background flushers with bounded deadlines.
         # Match scripts/e2e.sh to avoid competing flushers exhausting those waits.
         run: |
           export ASAP_E2E_CONTROL_PLANE_BIN="$PWD/target/debug/control_plane"
           cargo test --workspace --locked -- --test-threads=1
+
+      - name: Upload issue 754 level-1 plans
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue754-level1-plans
+          path: artifacts/issue754-level1
+          if-no-files-found: ignore
