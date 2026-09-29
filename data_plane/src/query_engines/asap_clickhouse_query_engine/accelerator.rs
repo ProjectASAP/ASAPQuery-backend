@@ -625,9 +625,9 @@ mod tests {
                 std::sync::Arc::new(left_schema),
                 std::sync::Arc::new(right_schema),
             ];
-            let node = planner_types::post_asap::ExecutableDagNode {
+            let node = planner_types::post_asap::PostAsapDagNode {
                 id: planner_types::post_asap::PostAsapNodeId(2),
-                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin {
+                payload: planner_types::post_asap::PostAsapOperatorPayload::RelationalJoin {
                     join_kind: planner_types::pre_asap::JoinKind::Inner,
                     pred: serde_json::from_value(
                         serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
@@ -671,9 +671,9 @@ mod tests {
         });
         entry.nodes.insert(project, {
             let schemas = vec![std::sync::Arc::new(joined_schema)];
-            let node = planner_types::post_asap::ExecutableDagNode {
+            let node = planner_types::post_asap::PostAsapDagNode {
                 id: planner_types::post_asap::PostAsapNodeId(2),
-                payload: planner_types::post_asap::ExecutableOperatorPayload::Value {
+                payload: planner_types::post_asap::PostAsapOperatorPayload::Value {
                     operation: serde_json::from_value(
                         serde_json::to_value(ValueOperation::Project {
                             cols: vec![
@@ -755,7 +755,7 @@ mod tests {
             compile_node, CompiledPhysicalDag, InputContract,
         };
         use planner_types::post_asap::{
-            ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+            ExecutionDataState, PostAsapDagNode, PostAsapNodeId, PostAsapOperatorPayload,
         };
         let input = std::sync::Arc::new(schema);
         let mut previous_schema = input.clone();
@@ -763,9 +763,9 @@ mod tests {
         let mut nodes = BTreeMap::new();
         for (index, (operation, output_schema)) in operations.into_iter().enumerate() {
             let id = index as u64 + 1;
-            let node = ExecutableDagNode {
+            let node = PostAsapDagNode {
                 id: PostAsapNodeId(id as u32),
-                payload: ExecutableOperatorPayload::Value { operation },
+                payload: PostAsapOperatorPayload::Value { operation },
                 output_state: ExecutionDataState::QUERY_ROWS,
                 output_schema: output_schema.clone(),
                 guarantee: None,

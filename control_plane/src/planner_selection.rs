@@ -77,10 +77,10 @@ fn target_identity(target: &QueryExpr, accuracy: &AccuracyTarget) -> Option<Stri
 fn summary_identity(node: &SummaryNode) -> Option<String> {
     // Canonical exporter owns operator payloads and edge semantics. Hash its
     // structure, not assigned node IDs or the incidental sharing of Rc values.
-    let dag = planner_types::post_asap::compile_executable_dag(&Rc::new(node.clone())).ok()?;
+    let dag = planner_types::post_asap::compile_post_asap_dag(&Rc::new(node.clone())).ok()?;
     lossless_json(&dag)?;
     fn visit(
-        dag: &planner_types::post_asap::ExecutableDag,
+        dag: &planner_types::post_asap::PostAsapDag,
         id: planner_types::post_asap::PostAsapNodeId,
         memo: &mut std::collections::HashMap<planner_types::post_asap::PostAsapNodeId, String>,
     ) -> String {

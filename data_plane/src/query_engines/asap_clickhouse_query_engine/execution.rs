@@ -701,14 +701,14 @@ mod tests {
             compile_node, CompiledPhysicalDag, InputContract,
         };
         use planner_types::post_asap::{
-            ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+            ExecutionDataState, PostAsapDagNode, PostAsapNodeId, PostAsapOperatorPayload,
         };
         use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
         let schema = std::sync::Arc::new(schema.clone());
         let op = compile_node(
-            &ExecutableDagNode {
+            &PostAsapDagNode {
                 id: PostAsapNodeId(100),
-                payload: ExecutableOperatorPayload::RelationalJoin {
+                payload: PostAsapOperatorPayload::RelationalJoin {
                     join_kind: JoinKind::Cross,
                     pred: Predicate(QueryExpr::Literal(ScalarValue::Boolean(true)).into()),
                     pruning: None,

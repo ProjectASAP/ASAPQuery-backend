@@ -1588,23 +1588,38 @@ mod topk_tests {
                             std::sync::Arc::new(schema.clone()),
                             std::sync::Arc::new(schema.clone()),
                         ];
-                        let node = planner_types::post_asap::ExecutableDagNode {
-                id: planner_types::post_asap::PostAsapNodeId(2),
-                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin { join_kind: planner_types::pre_asap::JoinKind::Semi, pred: serde_json::from_value(serde_json::to_value(planner_types::pre_asap::Predicate(
-                            std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
-                                left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
-                                    0,
-                                )),
-                                op: planner_types::pre_asap::CompareOpKind::Eq,
-                                right: std::rc::Rc::new(
-                                    planner_types::pre_asap::QueryExpr::Column(1),
-                                ),
-                            }),
-                        ))
-                        .unwrap()).unwrap(), pruning: None },
-                output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
-                output_schema: schema, guarantee: None,
-            };
+                        let node = planner_types::post_asap::PostAsapDagNode {
+                            id: planner_types::post_asap::PostAsapNodeId(2),
+                            payload:
+                                planner_types::post_asap::PostAsapOperatorPayload::RelationalJoin {
+                                    join_kind: planner_types::pre_asap::JoinKind::Semi,
+                                    pred: serde_json::from_value(
+                                        serde_json::to_value(planner_types::pre_asap::Predicate(
+                                            std::rc::Rc::new(
+                                                planner_types::pre_asap::QueryExpr::Compare {
+                                                    left: std::rc::Rc::new(
+                                                        planner_types::pre_asap::QueryExpr::Column(
+                                                            0,
+                                                        ),
+                                                    ),
+                                                    op: planner_types::pre_asap::CompareOpKind::Eq,
+                                                    right: std::rc::Rc::new(
+                                                        planner_types::pre_asap::QueryExpr::Column(
+                                                            1,
+                                                        ),
+                                                    ),
+                                                },
+                                            ),
+                                        ))
+                                        .unwrap(),
+                                    )
+                                    .unwrap(),
+                                    pruning: None,
+                                },
+                            output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
+                            output_schema: schema,
+                            guarantee: None,
+                        };
                         let operator = asap_physical_operators::physical_planner::compile_node(
                             &node, &schemas,
                         )

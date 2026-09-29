@@ -33,7 +33,7 @@ it must not select algorithms, rebuild operators, or move work between phases.
 | Planner handoff | Consume complete executable physical candidates and their typed boundaries; report missing Planner implementations explicitly |
 | Deployment compiler | Price feasible candidates, select one, and install source/SDS bindings without logical lowering |
 | Installed query | Store the selected physical computation and deployment metadata, removing the parallel Backend computation node representation |
-| SQL execution | Remove request-time `ExecutableDagNode`, `compile_node` and physical graph reconstruction |
+| SQL execution | Remove request-time `PostAsapDagNode`, `compile_node` and physical graph reconstruction |
 | PromQL execution | Move computation currently lowered by `residual.rs` and `logical_dag/native_values.rs` to Planner; retain protocol and input conversion |
 | Precomputation | Bind the candidate's precompute graph and stored outputs without reclassifying operators by kind |
 | Persistence | Update the installed-plan schema; reject incompatible stored plans explicitly rather than retaining a legacy execution path |

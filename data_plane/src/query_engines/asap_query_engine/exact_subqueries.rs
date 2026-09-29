@@ -696,9 +696,9 @@ mod tests {
             };
             {
             let schemas = vec![std::sync::Arc::new(schema.clone()), std::sync::Arc::new(schema.clone())];
-            let node = planner_types::post_asap::ExecutableDagNode {
+            let node = planner_types::post_asap::PostAsapDagNode {
                 id: planner_types::post_asap::PostAsapNodeId(2),
-                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin { join_kind: planner_types::pre_asap::JoinKind::Semi, pred: serde_json::from_value(serde_json::to_value(planner_types::pre_asap::Predicate(std::rc::Rc::new(
+                payload: planner_types::post_asap::PostAsapOperatorPayload::RelationalJoin { join_kind: planner_types::pre_asap::JoinKind::Semi, pred: serde_json::from_value(serde_json::to_value(planner_types::pre_asap::Predicate(std::rc::Rc::new(
                     planner_types::pre_asap::QueryExpr::Compare {
                         left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(0)),
                         op: planner_types::pre_asap::CompareOpKind::Eq,

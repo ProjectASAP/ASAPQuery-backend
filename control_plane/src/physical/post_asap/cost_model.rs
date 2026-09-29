@@ -20,7 +20,7 @@ use asap_aware_mapping::{
     SummaryMaintenanceLifecycleCostInputs, TargetSubDAG, ValueOperationCapabilities,
 };
 use planner_types::post_asap::{
-    ExecutableOperatorPayload, GroupingStrategy, SketchAlgorithm, SketchParams, SketchQuery,
+    GroupingStrategy, PostAsapOperatorPayload, SketchAlgorithm, SketchParams, SketchQuery,
     SummaryFamilyType, SummaryWindowFramework,
 };
 use planner_types::pre_asap::expr_ir::ColumnRef;
@@ -190,13 +190,13 @@ impl ControlPlaneCostModel {
             // Exact compositions have a separate measured rate model.
             return None;
         };
-        let dag = planner_types::post_asap::compile_executable_dag(root).ok()?;
+        let dag = planner_types::post_asap::compile_post_asap_dag(root).ok()?;
         let mut value = 0.0;
         let mut states = 0;
         for node in &dag.nodes {
             let family = match &node.payload {
-                ExecutableOperatorPayload::SummaryAgg { family, .. }
-                | ExecutableOperatorPayload::SummaryJoin { family, .. } => family,
+                PostAsapOperatorPayload::SummaryAgg { family, .. }
+                | PostAsapOperatorPayload::SummaryJoin { family, .. } => family,
                 _ => continue,
             };
             states += 1;
@@ -527,12 +527,12 @@ impl CostModel for ControlPlaneCostModel {
     ) -> Option<bool> {
         use planner_types::post_asap::{NonNegativeWeightProof, WeightDomain};
         let dag =
-            planner_types::post_asap::compile_executable_dag(&std::rc::Rc::new(summary.clone()))
+            planner_types::post_asap::compile_post_asap_dag(&std::rc::Rc::new(summary.clone()))
                 .ok()?;
         // Counter-weighted heaps now consume explicit rate values. The raw
         // ingestion adapter cannot bind that frontier as counter deltas.
         let requires_rate_values = dag.nodes.iter().any(|node| matches!(&node.payload,
-            ExecutableOperatorPayload::SummaryAgg { input, family: SummaryFamilyType::Sketch(kind, _), .. }
+            PostAsapOperatorPayload::SummaryAgg { input, family: SummaryFamilyType::Sketch(kind, _), .. }
                 if matches!(kind.algorithm(), SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap)
                 && matches!(input.weight_domain, WeightDomain::NonNegative { proof: NonNegativeWeightProof::ResetAwareCounterDerivative })));
         requires_rate_values.then_some(false)

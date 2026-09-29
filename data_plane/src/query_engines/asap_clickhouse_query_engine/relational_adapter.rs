@@ -415,7 +415,7 @@ impl ClickHouseRelationalAdapter {
         right: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
         native::execute(
-            planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin {
+            planner_types::post_asap::PostAsapOperatorPayload::RelationalJoin {
                 join_kind: kind.clone(),
                 pred: pred.clone(),
                 pruning: None,
@@ -445,7 +445,7 @@ impl ClickHouseRelationalAdapter {
         input: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
         native::execute(
-            planner_types::post_asap::ExecutableOperatorPayload::Value {
+            planner_types::post_asap::PostAsapOperatorPayload::Value {
                 operation: operation.clone(),
             },
             output_schema,

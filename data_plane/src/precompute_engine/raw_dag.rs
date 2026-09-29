@@ -3,7 +3,7 @@ use crate::storage_engines::types::KeyByLabelValues;
 use asap_physical_operators::factory::{create_planner_accumulator, AccumulatorUpdater};
 use asap_types::{executable_plan::BackendNodeBinding, PrecomputeMaterialization};
 use planner_types::post_asap::{
-    EdgeRole, ExecutableOperatorPayload, GroupingStrategy, PostAsapNodeId, SummaryFamilyType,
+    EdgeRole, GroupingStrategy, PostAsapNodeId, PostAsapOperatorPayload, SummaryFamilyType,
     SummaryInputExpr, SummaryUpdate,
 };
 use planner_types::pre_asap::{ColumnRef, QueryExpr, Source};
@@ -35,7 +35,7 @@ impl RawDagProgram {
                 {
                     continue;
                 }
-                let ExecutableOperatorPayload::SummaryAgg {
+                let PostAsapOperatorPayload::SummaryAgg {
                     family,
                     input,
                     grouping,
@@ -61,7 +61,7 @@ impl RawDagProgram {
                     .iter()
                     .find(|n| n.id == edge.producer)
                     .ok_or("missing raw DAG input")?;
-                let ExecutableOperatorPayload::Fallback { expression } = &source.payload else {
+                let PostAsapOperatorPayload::Fallback { expression } = &source.payload else {
                     return Err("raw producer requires an executable source input; maintenance edges cannot be bypassed".into());
                 };
                 let scan = match expression {

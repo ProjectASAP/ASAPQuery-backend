@@ -35,12 +35,12 @@ fn selected(node: &SummaryNode) -> Option<(MaintainedPopulation, PopulationReado
         return None;
     };
     let dag =
-        planner_types::post_asap::compile_executable_dag(&std::rc::Rc::new(node.clone())).ok()?;
+        planner_types::post_asap::compile_post_asap_dag(&std::rc::Rc::new(node.clone())).ok()?;
     let populations = dag
         .nodes
         .iter()
         .filter_map(|node| match &node.payload {
-            planner_types::post_asap::ExecutableOperatorPayload::Value {
+            planner_types::post_asap::PostAsapOperatorPayload::Value {
                 operation: ValueOperation::MaintainPopulation { population },
             } => Some(population),
             _ => None,

@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sds::StoredOutputId;
 use planner_types::post_asap::{
-    EdgeRole, ExecutableDag, ExecutableDagEdge, ExecutableDagNode, ExecutionDataState,
-    ExecutionTiming, GroupingEdgeCompatibility, PostAsapNodeId, WindowEdgeCompatibility,
+    EdgeRole, ExecutionDataState, ExecutionTiming, GroupingEdgeCompatibility, PostAsapDag,
+    PostAsapDagEdge, PostAsapDagNode, PostAsapNodeId, WindowEdgeCompatibility,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +62,7 @@ pub struct OwnedPostAsapEdge {
 }
 
 impl OwnedPostAsapDag {
-    pub fn from_executable(query_id: String, dag: &ExecutableDag) -> Result<Self, String> {
+    pub fn from_post_asap_dag(query_id: String, dag: &PostAsapDag) -> Result<Self, String> {
         let nodes = dag
             .nodes
             .iter()
@@ -107,7 +107,7 @@ impl OwnedPostAsapDag {
         })
     }
 
-    pub fn decode(&self) -> Result<ExecutableDag, String> {
+    pub fn decode(&self) -> Result<PostAsapDag, String> {
         let node_ids = self
             .nodes
             .iter()
@@ -134,9 +134,9 @@ impl OwnedPostAsapDag {
             .nodes
             .iter()
             .map(|node| {
-                let payload: planner_types::post_asap::ExecutableOperatorPayload =
+                let payload: planner_types::post_asap::PostAsapOperatorPayload =
                     serde_json::from_value(node.payload.clone()).map_err(|e| e.to_string())?;
-                Ok(ExecutableDagNode {
+                Ok(PostAsapDagNode {
                     id: node.id,
                     payload,
                     output_state: node.output_state,
@@ -155,7 +155,7 @@ impl OwnedPostAsapDag {
             .edges
             .iter()
             .map(|edge| {
-                Ok(ExecutableDagEdge {
+                Ok(PostAsapDagEdge {
                     producer: edge.producer,
                     consumer: edge.consumer,
                     role: edge.role,
@@ -167,7 +167,7 @@ impl OwnedPostAsapDag {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(ExecutableDag {
+        Ok(PostAsapDag {
             nodes,
             edges,
             root: self.root,
@@ -352,7 +352,7 @@ impl BackendExecutableBinding {
         self.nodes.get(&id)
     }
 
-    pub fn validate_precompute(&self, dag: &ExecutableDag) -> Result<(), String> {
+    pub fn validate_precompute(&self, dag: &PostAsapDag) -> Result<(), String> {
         let ids = dag
             .nodes
             .iter()
@@ -401,7 +401,7 @@ impl BackendExecutableBinding {
         Ok(())
     }
 
-    pub fn validate(&self, dag: &ExecutableDag) -> Result<(), String> {
+    pub fn validate(&self, dag: &PostAsapDag) -> Result<(), String> {
         let semantic = dag
             .nodes
             .iter()
@@ -473,11 +473,11 @@ mod tests {
             }],
             time_index: None,
         };
-        let dag = ExecutableDag {
+        let dag = PostAsapDag {
             nodes: (1..=5)
-                .map(|id| ExecutableDagNode {
+                .map(|id| PostAsapDagNode {
                     id: PostAsapNodeId(id),
-                    payload: ExecutableOperatorPayload::SummaryMerge,
+                    payload: PostAsapOperatorPayload::SummaryMerge,
                     output_state: ExecutionDataState::INGESTION_SUMMARY,
                     output_schema: schema.clone(),
                     guarantee: None,
@@ -485,7 +485,7 @@ mod tests {
                 .collect(),
             edges: [(1, 2), (2, 3), (2, 4), (3, 5), (4, 5)]
                 .into_iter()
-                .map(|(a, b)| ExecutableDagEdge {
+                .map(|(a, b)| PostAsapDagEdge {
                     producer: PostAsapNodeId(a),
                     consumer: PostAsapNodeId(b),
                     role: EdgeRole::Input,
@@ -502,7 +502,7 @@ mod tests {
                 .unwrap();
         let encoded: serde_json::Value =
             serde_json::from_slice(&program.encode().unwrap()).unwrap();
-        let mut document = OwnedPostAsapDag::from_executable("shared".into(), &dag).unwrap();
+        let mut document = OwnedPostAsapDag::from_post_asap_dag("shared".into(), &dag).unwrap();
         document.schema_version = PRECOMPUTE_DAG_SCHEMA_VERSION;
         let mut installed = InstalledPostAsapDag {
             document,

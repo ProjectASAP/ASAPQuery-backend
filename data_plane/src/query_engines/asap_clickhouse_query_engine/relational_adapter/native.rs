@@ -61,12 +61,12 @@ pub(super) fn cell(value: &Value) -> Result<Cell, ClickHouseRelationalError> {
 }
 #[cfg(test)]
 use planner_types::post_asap::{
-    ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+    ExecutionDataState, PostAsapDagNode, PostAsapNodeId, PostAsapOperatorPayload,
 };
 
 #[cfg(test)]
 pub(crate) fn execute(
-    payload: ExecutableOperatorPayload,
+    payload: PostAsapOperatorPayload,
     output: &SummarySchema,
     inputs: Vec<ClickHouseRelation>,
 ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
@@ -92,7 +92,7 @@ pub(crate) fn execute(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(error)?;
-    let node = ExecutableDagNode {
+    let node = PostAsapDagNode {
         id: PostAsapNodeId(0),
         payload,
         output_state: ExecutionDataState::QUERY_ROWS,

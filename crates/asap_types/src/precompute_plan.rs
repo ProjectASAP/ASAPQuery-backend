@@ -14,16 +14,16 @@ use thiserror::Error;
 /// and are not admitted by this bounded capability check.
 pub fn validate_maintenance_reduction(
     config: &crate::PrecomputeMaterialization,
-    node: &planner_types::post_asap::ExecutableDagNode,
+    node: &planner_types::post_asap::PostAsapDagNode,
 ) -> Result<(), String> {
     use crate::sds::PopulationPartitioning;
-    use planner_types::{post_asap::ExecutableOperatorPayload, pre_asap::Reduction};
+    use planner_types::{post_asap::PostAsapOperatorPayload, pre_asap::Reduction};
     match &node.payload {
-        ExecutableOperatorPayload::SummaryAgg {
+        PostAsapOperatorPayload::SummaryAgg {
             reduction: Reduction::PerEntity,
             ..
         } if config.partitioning == Some(PopulationPartitioning::PerEntity) => Ok(()),
-        ExecutableOperatorPayload::SummaryAgg {
+        PostAsapOperatorPayload::SummaryAgg {
             reduction: Reduction::Reduce(keys),
             ..
         } if keys.is_empty()
@@ -692,7 +692,7 @@ impl PrecomputePlan {
                             .filter(|edge| edge.consumer == id)
                             .collect();
                         use planner_types::post_asap::{
-                            ExecutableOperatorPayload as Payload, ValueOperation,
+                            PostAsapOperatorPayload as Payload, ValueOperation,
                         };
                         if node.output_state
                             != planner_types::post_asap::ExecutionDataState::INGESTION_ROWS
@@ -773,7 +773,7 @@ impl PrecomputePlan {
                         crate::AggregationType::HLL | crate::AggregationType::UnivMon
                     )
                 {
-                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                    if let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg {
                         input,
                         ..
                     } = &node.payload
@@ -796,7 +796,7 @@ impl PrecomputePlan {
                     }
                 }
                 if let Some(partitioning) = config.partitioning {
-                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                    if let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg {
                         reduction,
                         ..
                     } = &node.payload
@@ -1173,9 +1173,9 @@ mod source_window_cohort_tests {
         use planner_types::pre_asap::Reduction;
         let mut config = full_window();
         config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
-        let mut node = ExecutableDagNode {
+        let mut node = PostAsapDagNode {
             id: PostAsapNodeId(1),
-            payload: ExecutableOperatorPayload::SummaryAgg {
+            payload: PostAsapOperatorPayload::SummaryAgg {
                 family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 input: SummaryUpdate {
                     item: None,
@@ -1195,18 +1195,18 @@ mod source_window_cohort_tests {
         assert!(validate_maintenance_reduction(&config, &node).is_ok());
         config.partitioning = Some(crate::sds::PopulationPartitioning::PerEntity);
         assert!(validate_maintenance_reduction(&config, &node).is_err());
-        if let ExecutableOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
+        if let PostAsapOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
             *reduction = Reduction::PerEntity;
         }
         assert!(validate_maintenance_reduction(&config, &node).is_ok());
         config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
-        if let ExecutableOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
+        if let PostAsapOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
             *reduction = Reduction::by(vec![0]);
         }
         assert!(validate_maintenance_reduction(&config, &node).is_err());
         config.partitioning = None;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
-        node.payload = ExecutableOperatorPayload::SummaryMerge;
+        node.payload = PostAsapOperatorPayload::SummaryMerge;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
     }
 

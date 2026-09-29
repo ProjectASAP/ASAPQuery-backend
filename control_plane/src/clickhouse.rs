@@ -534,7 +534,7 @@ where
             "SQL did not produce a summary DAG".into(),
         ));
     };
-    let semantic = planner_types::post_asap::compile_executable_dag_with_node_ids(&root)
+    let semantic = planner_types::post_asap::compile_post_asap_dag_with_node_ids(&root)
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut materialization_nodes = std::collections::BTreeMap::new();
     let mut query_nodes = std::collections::BTreeMap::new();

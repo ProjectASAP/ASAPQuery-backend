@@ -10,7 +10,7 @@ enum OperatorExecution {
 
 /// Every physical operator uses its node's placement; payload kind does not
 /// restrict execution phase. Runtime capability is checked separately.
-fn operator_execution(node: &planner_types::post_asap::ExecutableDagNode) -> OperatorExecution {
+fn operator_execution(node: &planner_types::post_asap::PostAsapDagNode) -> OperatorExecution {
     match node.output_state.timing {
         planner_types::post_asap::ExecutionTiming::IngestionTime => OperatorExecution::Ingestion,
         planner_types::post_asap::ExecutionTiming::QueryTime => OperatorExecution::Query,
@@ -20,7 +20,7 @@ fn operator_execution(node: &planner_types::post_asap::ExecutableDagNode) -> Ope
 /// Assign backend phases to a selected semantic DAG without changing its nodes.
 pub fn install_selected_dag(
     query_id: String,
-    dag: &planner_types::post_asap::ExecutableDag,
+    dag: &planner_types::post_asap::PostAsapDag,
     query_plan_sink: QueryNodeId,
     materialization: impl Fn(
         planner_types::post_asap::PostAsapNodeId,
@@ -30,7 +30,7 @@ pub fn install_selected_dag(
     let mut nodes = std::collections::BTreeMap::new();
     let mut precompute_sinks = Vec::new();
     for node in &dag.nodes {
-        if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+        if let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg {
             family,
             input,
             grouping,
@@ -56,7 +56,7 @@ pub fn install_selected_dag(
     precompute_sinks.sort();
     let installed = InstalledPostAsapDag {
         native_programs: std::collections::BTreeMap::new(),
-        document: OwnedPostAsapDag::from_executable(query_id, dag)?,
+        document: OwnedPostAsapDag::from_post_asap_dag(query_id, dag)?,
         binding: BackendExecutableBinding {
             nodes,
             query_sink: dag.root,
