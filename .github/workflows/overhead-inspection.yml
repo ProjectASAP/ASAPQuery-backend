@@ -1,0 +1,30 @@
+name: Runtime overhead contracts
+on:
+  pull_request:
+    paths:
+      - 'data_plane/**'
+      - 'crates/asap_types/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/overhead-inspection.yml'
+  workflow_dispatch:
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo test --locked -p data_plane --lib runtime_config::tests
+      - run: cargo test --locked -p data_plane --example overhead_inspect
+      - run: >-
+          cargo run --locked -p data_plane --example overhead_inspect --
+          --workers 1,2 --concurrency 1,2 --requests 20 --warmup 2 --repeats 1
+          --log-level off --disable-console-log --disable-file-log
+          --output target/overhead-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: overhead-smoke
+          path: target/overhead-smoke
