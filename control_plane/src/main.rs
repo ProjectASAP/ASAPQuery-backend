@@ -199,7 +199,7 @@ struct CompileAndPublishPhysicalPlanRequest {
     workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
     data_workload: planner_types::workload::DataWorkload,
-    dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
+    dataset_identity: asap_types::semantic_fragment::LogicalDatasetIdentity,
     #[serde(rename = "collector_ids")]
     target_collector_ids: Vec<String>,
     capability_snapshot_id: String,

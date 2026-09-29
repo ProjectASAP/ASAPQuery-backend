@@ -17,6 +17,9 @@ pub struct SummaryDefinition {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SummarySemantics {
     Planner {
+        /// Equal fragments over different datasets are different definitions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dataset: Option<crate::semantic_fragment::LogicalDatasetIdentity>,
         fragment: crate::semantic_fragment::SemanticFragment,
     },
     /// Restricted raw-input adapter for explicit native summary configurations.
@@ -76,6 +79,7 @@ impl SummaryDefinition {
         let fragment = config.semantic_fragment.as_ref();
         if let Some(fragment) = fragment {
             self.semantics = SummarySemantics::Planner {
+                dataset: config.dataset_identity.clone(),
                 fragment: fragment.clone(),
             };
         } else if let SummarySemantics::Configured {
@@ -98,10 +102,15 @@ impl SummaryDefinition {
                 "unsupported semantic format version".into(),
             ));
         }
-        if let SummarySemantics::Planner { fragment } = &self.semantics {
+        if let SummarySemantics::Planner { dataset, fragment } = &self.semantics {
             fragment
                 .validate()
                 .map_err(SummaryCatalogError::Descriptor)?;
+            if let Some(dataset) = dataset {
+                dataset
+                    .validate()
+                    .map_err(SummaryCatalogError::Descriptor)?;
+            }
         }
         // Object keys are recursively sorted, independent of serde_json features.
         fn canonical(value: serde_json::Value) -> serde_json::Value {
@@ -125,5 +134,41 @@ impl SummaryDefinition {
         let bytes = serde_json::to_vec(&canonical(value))
             .map_err(|e| SummaryCatalogError::Descriptor(e.to_string()))?;
         Ok(crate::sds::SummaryDefinitionId::from_semantics(&bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantic_fragment::{LogicalDatasetIdentity, SemanticFragment};
+
+    fn definition(dataset: Option<LogicalDatasetIdentity>) -> SummaryDefinition {
+        let dag = crate::semantic_fragment::tests::fixture("m");
+        SummaryDefinition {
+            semantic_format_version: 1,
+            semantics: SummarySemantics::Planner {
+                dataset,
+                fragment: SemanticFragment::from_dag(&dag, dag.root).unwrap(),
+            },
+        }
+    }
+
+    fn dataset(name: &str) -> Option<LogicalDatasetIdentity> {
+        Some(LogicalDatasetIdentity {
+            namespace: "ns".into(),
+            dataset: name.into(),
+        })
+    }
+
+    // Equal fragments over different datasets (or no dataset) get different definition IDs.
+    #[test]
+    fn dataset_identity_is_part_of_definition_id() {
+        let a = definition(dataset("a")).id().unwrap();
+        let b = definition(dataset("b")).id().unwrap();
+        let none = definition(None).id().unwrap();
+        assert_eq!(a, definition(dataset("a")).id().unwrap());
+        assert_ne!(a, b);
+        assert_ne!(none, a);
+        assert_ne!(none, b);
     }
 }

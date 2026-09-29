@@ -98,6 +98,9 @@ pub struct PrecomputeMaterialization {
     /// Planner-selected dependency closure ending at the persisted output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_fragment: Option<crate::semantic_fragment::SemanticFragment>,
+    /// Logical dataset that the fragment's source names resolve in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_identity: Option<crate::semantic_fragment::LogicalDatasetIdentity>,
     pub aggregation_type: AggregationType,
     pub aggregation_sub_type: String,
     pub parameters: HashMap<String, Value>,
@@ -279,6 +282,7 @@ impl PrecomputeMaterialization {
         Self {
             stored_output_id: None,
             semantic_fragment: None,
+            dataset_identity: None,
             aggregation_type,
             aggregation_sub_type,
             parameters,

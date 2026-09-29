@@ -428,13 +428,11 @@ fn validate_records(output: u64, records: &[RevisionRecord]) -> Result<(), Revis
     Ok(())
 }
 
+use crate::storage_engines::sketch_db::data::native_batch as native;
 use crate::storage_engines::types::{
     AggregateCore, InstalledPrecomputePlanHandle, RuntimePhysicalPlan,
 };
-use asap_physical_operators::{
-    stored_state::native,
-    values::{Batch, Schema, Value},
-};
+use asap_physical_operators::values::{Batch, Schema, Value};
 use planner_types::post_asap::{SummaryFamilyType, SummaryField, SummarySchema};
 
 fn state_schema(family: SummaryFamilyType) -> Schema {

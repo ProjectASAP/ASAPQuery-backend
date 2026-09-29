@@ -92,6 +92,7 @@ pub fn create_engine_single_pop_with_aggregated(
     let agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
+        dataset_identity: None,
         population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
@@ -185,6 +186,7 @@ pub fn create_engine_dual_input(
     let value_agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
+        dataset_identity: None,
         population_key_encoding: Default::default(),
         aggregation_type: value_agg_type,
         aggregation_sub_type: String::new(),
@@ -217,6 +219,7 @@ pub fn create_engine_dual_input(
     let keys_agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
+        dataset_identity: None,
         population_key_encoding: Default::default(),
         aggregation_type: key_agg_type,
         aggregation_sub_type: String::new(),
@@ -319,6 +322,7 @@ pub fn create_engine_two_metrics(
     let agg_config_a = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
+        dataset_identity: None,
         population_key_encoding: Default::default(),
         aggregation_type: aggregation_type_a,
         aggregation_sub_type: String::new(),
@@ -350,6 +354,7 @@ pub fn create_engine_two_metrics(
     let agg_config_b = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
+        dataset_identity: None,
         population_key_encoding: Default::default(),
         aggregation_type: aggregation_type_b,
         aggregation_sub_type: String::new(),
@@ -462,6 +467,7 @@ pub fn create_engine_three_metrics(
         let cfg = PrecomputeMaterialization {
             stored_output_id: None,
             semantic_fragment: None,
+            dataset_identity: None,
             population_key_encoding: Default::default(),
             aggregation_type: agg_type,
             aggregation_sub_type: String::new(),
@@ -551,6 +557,7 @@ pub fn create_engine_multi_timestamp(
     let agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
+        dataset_identity: None,
         population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
@@ -632,6 +639,7 @@ pub fn create_engine_multi_timestamp_with_window(
     let agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
+        dataset_identity: None,
         population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),

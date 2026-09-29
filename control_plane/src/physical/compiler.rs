@@ -200,7 +200,7 @@ pub struct TopKMembershipEvidence {
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDeploymentContext {
     /// Semantic dataset served by this deployment's input channel; never an endpoint.
-    pub dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
+    pub dataset_identity: asap_types::semantic_fragment::LogicalDatasetIdentity,
     pub target: PhysicalDeploymentTarget,
     #[serde(rename = "collector_ids")]
     pub target_collector_ids: Vec<String>,
@@ -1493,11 +1493,12 @@ impl DeploymentPlanCompiler {
                             query_id: query.query_id.clone(),
                             reason: "persisted semantic root is absent".into(),
                         })?;
+                runtime_materialization.dataset_identity =
+                    Some(environment.dataset_identity.clone());
                 runtime_materialization.semantic_fragment = Some(
-                    asap_types::semantic_fragment::SemanticFragment::from_stored_output_in_dataset(
+                    asap_types::semantic_fragment::SemanticFragment::from_stored_output(
                         &compiled_dag.dag,
                         semantic_root,
-                        environment.dataset_identity.clone(),
                     )
                     .map_err(|reason| CompileError::Query {
                         query_id: query.query_id.clone(),
@@ -4690,6 +4691,7 @@ pub(crate) mod tests {
             first.summary_catalog.definitions,
             relocated.summary_catalog.definitions
         );
+        // An ingest binding forged to another dataset is rejected, as is a missing one.
         let mut forged = first.precompute_plan.clone();
         forged.ingest.dataset_identity.as_mut().unwrap().namespace = "other-tenant".into();
         assert!(forged
@@ -4699,11 +4701,28 @@ pub(crate) mod tests {
             .contains("dataset"));
         forged.ingest.dataset_identity = None;
         assert!(forged.validate().is_err());
+        // A materialization whose recorded dataset differs from the installed ingest binding is rejected.
+        let mut forged = first.precompute_plan.clone();
+        let materialization = forged
+            .materializations
+            .iter_mut()
+            .find(|m| m.semantic_fragment.is_some())
+            .expect("planner materialization");
+        assert_eq!(
+            materialization.dataset_identity,
+            forged.ingest.dataset_identity
+        );
+        materialization.dataset_identity.as_mut().unwrap().dataset = "other-metrics".into();
+        assert!(forged
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("dataset"));
     }
 
     fn environment(now: u64) -> PhysicalDeploymentContext {
         PhysicalDeploymentContext {
-            dataset_identity: planner_types::post_asap::LogicalDatasetIdentity {
+            dataset_identity: asap_types::semantic_fragment::LogicalDatasetIdentity {
                 namespace: "test".into(),
                 dataset: "metrics".into(),
             },
