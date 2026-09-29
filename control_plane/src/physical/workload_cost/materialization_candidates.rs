@@ -9,10 +9,10 @@ pub(super) struct MaterializationCandidateSets {
     pub eligible_materialization_count: usize,
 }
 
-/// Enumerate every enabled_keys for up to four leaves. Larger forests retain all-materialized,
-/// all-exact, then singleton/complement pairs in stable key order. The caller must
-/// disclose bounded coverage; no unenumerated optimum is claimed. Reserve one
-/// of the selector's 64 candidate slots for native execution.
+/// Enumerate every subset for up to four optional materialization keys. Larger
+/// forests retain all-materialized, all-exact, then every singleton/complement
+/// pair in stable key order: 2 + 2N candidates instead of exponential search.
+/// The caller must disclose non-exhaustive coverage; native execution is separate.
 pub(super) fn enumerate(keys: BTreeSet<String>) -> MaterializationCandidateSets {
     let eligible_materialization_count = keys.len();
     let ordered: Vec<_> = keys.iter().cloned().collect();
@@ -37,12 +37,8 @@ pub(super) fn enumerate(keys: BTreeSet<String>) -> MaterializationCandidateSets 
                 BTreeSet::from([key.clone()]),
                 keys.difference(&BTreeSet::from([key])).cloned().collect(),
             ] {
-                if candidate_key_sets.len() >= 63 {
-                    break;
-                }
-                if !candidate_key_sets.contains(&enabled_keys) {
-                    candidate_key_sets.push(enabled_keys);
-                }
+                // With more than four keys, these sets are all distinct.
+                candidate_key_sets.push(enabled_keys);
             }
         }
     }
@@ -78,11 +74,23 @@ mod tests {
             .contains(&BTreeSet::from(["b".into()])));
     }
     #[test]
-    fn large_inventory_reserves_native_slot_and_discloses_truncation() {
+    fn large_inventory_covers_every_singleton_and_complement() {
         let keys = (0..100).map(|i| format!("{i:03}")).collect();
         let result = enumerate(keys);
         assert!(!result.exhaustive);
-        assert_eq!(result.candidate_key_sets.len(), 63);
+        assert_eq!(result.candidate_key_sets.len(), 202);
+        // Every leaf, including those beyond the old cutoff, gets both choices.
+        for key in &result.candidate_key_sets[0] {
+            assert!(result
+                .candidate_key_sets
+                .contains(&BTreeSet::from([key.clone()])));
+            let complement = result.candidate_key_sets[0]
+                .iter()
+                .filter(|other| *other != key)
+                .cloned()
+                .collect();
+            assert!(result.candidate_key_sets.contains(&complement));
+        }
         assert_eq!(result.candidate_key_sets[0].len(), 100);
         assert!(result.candidate_key_sets[1].is_empty());
         assert_eq!(
@@ -91,7 +99,7 @@ mod tests {
                 .iter()
                 .collect::<BTreeSet<_>>()
                 .len(),
-            63
+            202
         );
     }
     #[test]
