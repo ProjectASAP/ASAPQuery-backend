@@ -4677,7 +4677,7 @@ mod dag_execution_tests {
                 };
             assert_eq!(
                 group.exact_value_for(readout, &None, 0, 5000),
-                Some(answer),
+                Ok(Some(answer)),
                 "{query}"
             );
         }

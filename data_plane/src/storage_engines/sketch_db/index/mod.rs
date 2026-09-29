@@ -568,6 +568,10 @@ pub(crate) struct SummaryReadRevision {
     in_flight: usize,
 }
 impl SummaryReadRevision {
+    pub(crate) fn mutation_sequence(self) -> u64 {
+        self.mutation
+    }
+
     fn capture(
         admission: u64,
         mutation: &std::sync::atomic::AtomicU64,
@@ -2784,6 +2788,9 @@ impl SketchStore {
         // resident memory even though they are not part of the durable
         // payload/flush accounting.
         total += self.rollups.approx_bytes();
+        if let Ok(current) = self.current_series.lock() {
+            total += current.approx_resident_bytes();
+        }
 
         total
     }

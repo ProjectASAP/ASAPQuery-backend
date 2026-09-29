@@ -261,6 +261,7 @@ pub(super) fn physical(
     let mut stream = streams.remove(0);
     let mut result = Vec::new();
     loop {
+        crate::query_engines::request::check()?;
         match stream.next().now_or_never() {
             Some(Some(batch)) => {
                 for row in batch?.rows() {

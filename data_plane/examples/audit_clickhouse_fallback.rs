@@ -172,6 +172,14 @@ async fn main() {
                 "clickhouse_exception_code": headers.get("x-clickhouse-exception-code").and_then(|v| v.to_str().ok()),
                 "result": body,
             }),
+            ClickHouseAccelerationOutcome::Failed(error) => json!({
+                "id": row.id,
+                "fallback_requested": false,
+                "exact_executed": false,
+                "exact_success": false,
+                "execution_error": error.to_string(),
+                "result": body,
+            }),
             ClickHouseAccelerationOutcome::Accelerated(_) => json!({
                 "id": row.id,
                 "fallback_requested": false,

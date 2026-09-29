@@ -31,6 +31,29 @@ pub enum QueryResult {
 }
 
 impl QueryResult {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Vector(rows) => rows
+                .values
+                .iter()
+                .map(InstantVectorElement::retained_bytes)
+                .sum(),
+            Self::Matrix(rows) => rows
+                .values
+                .iter()
+                .map(|row| {
+                    std::mem::size_of::<RangeVectorElement>()
+                        + string_bytes(&row.labels.labels)
+                        + row
+                            .label_keys_override
+                            .as_ref()
+                            .map_or(0, |keys| string_bytes(keys))
+                        + row.samples.capacity() * std::mem::size_of::<Sample>()
+                })
+                .sum(),
+        }
+    }
+
     pub fn result_type(&self) -> QueryResultType {
         match self {
             QueryResult::Vector(_) => QueryResultType::InstantVector,
@@ -174,7 +197,20 @@ pub struct InstantVectorElement {
     pub label_keys_override: Option<Vec<String>>,
 }
 
+fn string_bytes(values: &[String]) -> usize {
+    std::mem::size_of_val(values) + values.iter().map(String::capacity).sum::<usize>()
+}
+
 impl InstantVectorElement {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + string_bytes(&self.labels.labels)
+            + self
+                .label_keys_override
+                .as_ref()
+                .map_or(0, |keys| string_bytes(keys))
+    }
+
     pub fn new(labels: KeyByLabelValues, value: f64) -> Self {
         Self {
             labels,

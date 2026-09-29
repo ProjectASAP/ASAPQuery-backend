@@ -1,7 +1,7 @@
 //! SQL boundary around the shared, compiler-bound physical DAG executor.
 use super::{
     clickhouse_result_adapter::{from_series_rows, ClickHouseQueryResult},
-    relational_adapter::{ClickHouseRelation, ClickHouseRelationalAdapter},
+    relational_adapter::ClickHouseRelation,
 };
 use crate::{
     query_engines::asap_query_engine::{
@@ -11,7 +11,6 @@ use crate::{
 };
 use asap_types::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use asap_types::summary_catalog::SummaryCatalog;
-use planner_types::post_asap::ValueOperation;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type PreparedExternalLeaves = BTreeMap<QueryNodeId, ClickHouseRelation>;
@@ -27,159 +26,363 @@ pub enum ClickHouseDagFallback {
     ResultEncoding(String),
 }
 
-fn apply_relational_operation(
-    operation: serde_json::Value,
-    output_schema: &planner_types::post_asap::SummarySchema,
-    relation: ClickHouseRelation,
-) -> Result<ClickHouseRelation, String> {
-    let adapter = ClickHouseRelationalAdapter;
-    if let Some(filter) = operation.get("Filter") {
-        let predicate = filter
-            .get("pred")
-            .cloned()
-            .ok_or_else(|| "published Filter lacks pred".to_owned())
-            .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))?;
-        return adapter
-            .apply_filter(&predicate, relation)
-            .map_err(|error| error.to_string());
-    }
-    let operation: ValueOperation =
-        serde_json::from_value(operation).map_err(|error| error.to_string())?;
-    adapter
-        .apply_operation(&operation, output_schema, relation)
-        .map_err(|error| error.to_string())
+#[cfg(test)]
+thread_local! {
+    // Deterministically publish between branches without timing-dependent threads.
+    static AFTER_BRANCH: std::cell::Cell<Option<fn(&SketchStore)>> = const { std::cell::Cell::new(None) };
 }
 
-fn execute_relation_subtree(
-    index: &SketchStore,
-    entry: &QueryPlanEntry,
-    root: QueryNodeId,
-    expected_schema: &planner_types::post_asap::SummarySchema,
-    prepared: &PreparedExternalLeaves,
+#[derive(Debug, thiserror::Error)]
+enum SqlExecutionError {
+    #[error("{0}")]
+    Binding(String),
+    #[error(transparent)]
+    Physical(#[from] asap_physical_operators::dag::Error),
+}
+impl From<String> for SqlExecutionError {
+    fn from(value: String) -> Self {
+        Self::Binding(value)
+    }
+}
+impl From<&str> for SqlExecutionError {
+    fn from(value: &str) -> Self {
+        Self::Binding(value.into())
+    }
+}
+impl From<crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip>
+    for SqlExecutionError
+{
+    fn from(
+        error: crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip,
+    ) -> Self {
+        use crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip;
+        match error {
+            LoweringSkip::Execution(error) => Self::Physical(error),
+            error => Self::Binding(format!("incomplete leaf coverage: {error:?}")),
+        }
+    }
+}
+
+struct RelationDagExecutor<'a> {
+    index: &'a SketchStore,
+    entry: &'a QueryPlanEntry,
+    prepared: &'a PreparedExternalLeaves,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
-) -> Result<ClickHouseRelation, String> {
-    match entry.nodes.get(&root) {
-        Some(QueryPlanNode::ExternalExact { request, .. }) => {
-            if request.language != asap_types::QueryLanguage::ClickHouseSql {
-                return Err("ClickHouse DAG contains an external leaf for another language".into());
-            }
-            let asap_types::query_plan::ExternalExactOutput::Relation { schema } = &request.output
-            else {
-                return Err("ClickHouse external leaf must declare relation output".into());
-            };
-            let declared: planner_types::post_asap::SummarySchema =
-                serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?;
-            if &declared != expected_schema {
-                return Err("external exact leaf schema differs from its parent edge".into());
-            }
-            prepared
-                .get(&root)
-                .cloned()
-                .ok_or_else(|| "published external exact leaf was not prepared".into())
-        }
-        Some(QueryPlanNode::Relational {
-            input,
-            operation,
-            input_schema,
-            output_schema,
-        }) => {
-            let input = execute_relation_subtree(
-                index,
-                entry,
-                *input,
-                input_schema,
-                prepared,
-                t0_ms,
-                t1_ms,
-                is_cumulative,
-            )?;
-            apply_relational_operation(operation.clone(), output_schema, input)
-        }
-        Some(QueryPlanNode::RelationalJoin {
-            inputs,
-            join_kind,
-            pred,
-            left_schema,
-            right_schema,
-            output_schema,
-            pruning,
-        }) => {
-            if pruning.is_some() {
-                return Err("candidate pruning requires a certified semi-join binding".into());
-            }
-            if !matches!(join_kind, planner_types::pre_asap::JoinKind::Inner) {
-                return Err("only inner relational joins are executable".into());
-            }
-            let left = execute_relation_subtree(
-                index,
-                entry,
-                inputs[0],
-                left_schema,
-                prepared,
-                t0_ms,
-                t1_ms,
-                is_cumulative,
-            )?;
-            let right = execute_relation_subtree(
-                index,
-                entry,
-                inputs[1],
-                right_schema,
-                prepared,
-                t0_ms,
-                t1_ms,
-                is_cumulative,
-            )?;
-            let pred = serde_json::from_value(pred.clone()).map_err(|error| error.to_string())?;
-            ClickHouseRelationalAdapter
-                .apply_inner_equi_join(&pred, output_schema, left, right)
-                .map_err(|error| error.to_string())
-        }
-        Some(_) => {
-            validate_reachable(entry, root)?;
-            let outcome =
-                execute_query_plan_from_readout(index, entry, root, t0_ms, t1_ms, is_cumulative)
-                    .map_err(|error| format!("incomplete leaf coverage: {error:?}"))?;
-            let reachable = entry
-                .topological_order_from(root)
-                .map_err(|error| format!("invalid leaf DAG: {error}"))?;
-            for (leaf_id, binding) in reachable.iter().filter_map(|id| match entry.nodes.get(id) {
-                Some(QueryPlanNode::ReadMaterialization { binding }) => Some((*id, binding)),
-                _ => None,
-            }) {
-                let leaf_outcome = execute_query_plan_from_readout(
-                    index,
-                    entry,
-                    leaf_id,
-                    t0_ms,
-                    t1_ms,
-                    is_cumulative,
+    memo: BTreeMap<QueryNodeId, ClickHouseRelation>,
+    schemas: BTreeMap<QueryNodeId, planner_types::post_asap::SummarySchema>,
+    #[cfg(test)]
+    evaluations: BTreeMap<QueryNodeId, usize>,
+}
+
+impl RelationDagExecutor<'_> {
+    fn execute(
+        &mut self,
+        root: QueryNodeId,
+        expected_schema: &planner_types::post_asap::SummarySchema,
+    ) -> Result<ClickHouseRelation, SqlExecutionError> {
+        if let Some(schema) = self.schemas.get(&root) {
+            if schema != expected_schema {
+                return Err(format!(
+                    "query `{}` node {} is consumed with inconsistent relation schemas",
+                    self.entry.query_id, root.0
                 )
-                .map_err(|error| format!("incomplete leaf coverage: {error:?}"))?;
-                if !binding.covers_range(t0_ms, t1_ms)
-                    || !complete_pane_coverage(
-                        leaf_outcome.coverage,
-                        (t0_ms, t1_ms),
-                        binding.window_ms,
+                .into());
+            }
+        }
+        if let Some(relation) = self.memo.get(&root) {
+            return Ok(relation.clone());
+        }
+        self.schemas.insert(root, expected_schema.clone());
+        let relation = self.execute_graph(root, expected_schema)?;
+        self.record_evaluation(root);
+        self.memo.insert(root, relation.clone());
+        Ok(relation)
+    }
+
+    #[cfg(test)]
+    fn record_evaluation(&mut self, id: QueryNodeId) {
+        *self.evaluations.entry(id).or_default() += 1;
+        if let Some(publish) = AFTER_BRANCH.with(|hook| hook.take()) {
+            publish(self.index);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn record_evaluation(&mut self, _id: QueryNodeId) {}
+
+    fn execute_graph(
+        &mut self,
+        root: QueryNodeId,
+        expected: &planner_types::post_asap::SummarySchema,
+    ) -> Result<ClickHouseRelation, SqlExecutionError> {
+        use super::relational_adapter::native;
+        use asap_physical_operators::dag::{self, operators::Operator};
+        use futures::{FutureExt, StreamExt};
+        use planner_types::post_asap::{
+            ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState,
+            PostAsapNodeId, SummarySchema,
+        };
+        use std::sync::Arc;
+        let mut pending = vec![(root, expected.clone())];
+        let mut schemas = BTreeMap::<QueryNodeId, SummarySchema>::new();
+        let mut operations = BTreeMap::new();
+        let mut sources = Vec::new();
+        // Bind the entire computation before reading any storage source.
+        while let Some((id, expected)) = pending.pop() {
+            if let Some(previous) = schemas.get(&id) {
+                if previous != &expected {
+                    return Err("inconsistent relation schemas".into());
+                }
+                continue;
+            }
+            schemas.insert(id, expected.clone());
+            let (payload, inputs) = match self.entry.nodes.get(&id) {
+                Some(QueryPlanNode::Relational {
+                    input,
+                    operation,
+                    input_schema,
+                    output_schema,
+                }) => {
+                    if output_schema != &expected {
+                        return Err("relational output schema mismatch".into());
+                    }
+                    let operation =
+                        serde_json::from_value(operation.clone()).map_err(|e| e.to_string())?;
+                    (
+                        Payload::Value { operation },
+                        vec![(*input, input_schema.clone())],
                     )
+                }
+                Some(QueryPlanNode::RelationalJoin {
+                    inputs,
+                    join_kind,
+                    pred,
+                    left_schema,
+                    right_schema,
+                    output_schema,
+                    pruning,
+                }) => {
+                    if output_schema != &expected {
+                        return Err("join output schema mismatch".into());
+                    }
+                    if pruning.is_some() {
+                        return Err(
+                            "candidate pruning is not bound for this relation source".into()
+                        );
+                    }
+                    (
+                        Payload::RelationalJoin {
+                            join_kind: join_kind.clone(),
+                            pred: serde_json::from_value(pred.clone())
+                                .map_err(|e| e.to_string())?,
+                            pruning: None,
+                        },
+                        vec![
+                            (inputs[0], left_schema.clone()),
+                            (inputs[1], right_schema.clone()),
+                        ],
+                    )
+                }
+                Some(_) => {
+                    sources.push(id);
+                    continue;
+                }
+                None => return Err("missing relation node".into()),
+            };
+            let node = ExecutableDagNode {
+                id: PostAsapNodeId(
+                    u32::try_from(id.0).map_err(|_| "relation node ID exceeds Planner range")?,
+                ),
+                payload,
+                output_state: ExecutionDataState::QUERY_ROWS,
+                output_schema: expected,
+                guarantee: None,
+            };
+            let op = dag::planner::compile_node(
+                &node,
+                &inputs
+                    .iter()
+                    .map(|(_, schema)| Arc::new(schema.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| e.to_string())?;
+            operations.insert(
+                id,
+                (inputs.iter().map(|(id, _)| id.0).collect::<Vec<_>>(), op),
+            );
+            pending.extend(inputs);
+        }
+        let compiled =
+            asap_physical_operators::physical_planner::CompiledPhysicalDag::from_operators(
+                sources
+                    .iter()
+                    .map(|id| {
+                        (
+                            id.0,
+                            asap_physical_operators::physical_planner::InputContract::bounded(
+                                Arc::new(schemas[id].clone()),
+                            ),
+                        )
+                    })
+                    .collect(),
+                operations.into_iter().map(|(id, op)| (id.0, op)).collect(),
+                vec![root.0],
+            )
+            .map_err(|e| e.to_string())?;
+        let mut resolved_inputs = BTreeMap::new();
+        let context = crate::query_engines::request::context(dag::Scope::Query {
+            evaluation_time_ms: i64::try_from(self.t1_ms)
+                .map_err(|_| "evaluation time overflow")?,
+            revision: self.index.summary_update_revision().mutation_sequence(),
+        })?;
+        let mut storage_roots = BTreeSet::new();
+        for source in &sources {
+            if !matches!(
+                self.entry.nodes[source],
+                QueryPlanNode::ExternalExact { .. }
+            ) {
+                storage_roots.insert(*source);
+                for id in self
+                    .entry
+                    .topological_order_from(*source)
+                    .map_err(|e| e.to_string())?
                 {
-                    return Err(format!(
-                        "incomplete leaf coverage: requested ({t0_ms}, {t1_ms}), observed {:?}, pane {} origin {}",
-                        leaf_outcome.coverage, binding.window_ms, binding.pane_origin_ms.unwrap_or(0)
-                    ));
+                    if matches!(
+                        self.entry.nodes[&id],
+                        QueryPlanNode::ReadMaterialization { .. }
+                    ) {
+                        storage_roots.insert(id);
+                    }
                 }
             }
-            ClickHouseRelation::from_series_rows(expected_schema, outcome.series, outcome.coverage)
-                .map_err(|error| error.to_string())
         }
-        None => Err(format!("published DAG references missing node {}", root.0)),
+        let stored = crate::query_engines::asap_query_engine::post_asap_readout::execute_query_plan_readouts(
+            self.index,self.entry,&storage_roots.into_iter().collect::<Vec<_>>(),self.t0_ms,self.t1_ms,self.is_cumulative,context.clone(),
+        ).map_err(SqlExecutionError::from)?;
+        let mut coverage = None;
+        let mut first = true;
+        for id in sources {
+            let relation = self.execute_source(id, &schemas[&id], &stored)?;
+            coverage = if first {
+                first = false;
+                relation.coverage
+            } else {
+                match (coverage, relation.coverage) {
+                    (Some((a, b)), Some((c, d))) if a.max(c) <= b.min(d) => {
+                        Some((a.max(c), b.min(d)))
+                    }
+                    _ => None,
+                }
+            };
+            let batch = native::batch(&relation, &schemas[&id]).map_err(|e| e.to_string())?;
+            resolved_inputs.insert(
+                id.0,
+                Box::new(
+                    Operator::source(batch.schema().clone(), vec![batch])
+                        .map_err(|e| e.to_string())?,
+                ) as asap_physical_operators::physical_planner::Source<'_>,
+            );
+        }
+        let graph = compiled
+            .instantiate(resolved_inputs)
+            .map_err(|e| e.to_string())?;
+        let mut output = graph.execute(&[root.0], context)?.remove(0);
+        let mut batches = Vec::new();
+        loop {
+            crate::query_engines::request::check()?;
+            match output.next().now_or_never() {
+                Some(Some(Ok(batch))) => batches.push(batch),
+                Some(Some(Err(error))) => return Err(error.into()),
+                Some(None) => break,
+                None => continue,
+            }
+        }
+        native::relation(&batches, expected, coverage)
+            .map_err(|e| SqlExecutionError::Binding(e.to_string()))
+    }
+
+    fn execute_source(
+        &mut self,
+        root: QueryNodeId,
+        expected_schema: &planner_types::post_asap::SummarySchema,
+        stored: &BTreeMap<
+            QueryNodeId,
+            crate::query_engines::asap_query_engine::post_asap_readout::PostAsapReadoutOutcome,
+        >,
+    ) -> Result<ClickHouseRelation, SqlExecutionError> {
+        match self.entry.nodes.get(&root) {
+            Some(QueryPlanNode::ExternalExact { request, .. }) => {
+                if request.language != asap_types::QueryLanguage::ClickHouseSql {
+                    return Err(
+                        "ClickHouse DAG contains an external leaf for another language".into(),
+                    );
+                }
+                let asap_types::query_plan::ExternalExactOutput::Relation { schema } =
+                    &request.output
+                else {
+                    return Err("ClickHouse external leaf must declare relation output".into());
+                };
+                let declared: planner_types::post_asap::SummarySchema =
+                    serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?;
+                if &declared != expected_schema {
+                    return Err("external exact leaf schema differs from its parent edge".into());
+                }
+                self.prepared
+                    .get(&root)
+                    .cloned()
+                    .ok_or_else(|| "published external exact leaf was not prepared".into())
+            }
+            Some(_) => {
+                let outcome = stored.get(&root).ok_or("missing bound storage frontier")?;
+                let reachable = self
+                    .entry
+                    .topological_order_from(root)
+                    .map_err(|error| format!("invalid leaf DAG: {error}"))?;
+                for (leaf_id, binding) in
+                    reachable
+                        .iter()
+                        .filter_map(|id| match self.entry.nodes.get(id) {
+                            Some(QueryPlanNode::ReadMaterialization { binding }) => {
+                                Some((*id, binding))
+                            }
+                            _ => None,
+                        })
+                {
+                    let leaf_outcome = stored
+                        .get(&leaf_id)
+                        .ok_or("missing materialization coverage")?;
+                    if !binding.covers_range(self.t0_ms, self.t1_ms)
+                        || !complete_pane_coverage(
+                            leaf_outcome.coverage,
+                            (self.t0_ms, self.t1_ms),
+                            binding.window_ms,
+                        )
+                    {
+                        return Err(format!(
+                        "incomplete leaf coverage: requested ({}, {}), observed {:?}, pane {} origin {}",
+                        self.t0_ms,
+                        self.t1_ms,
+                        leaf_outcome.coverage, binding.window_ms, binding.pane_origin_ms.unwrap_or(0)
+                    ).into());
+                    }
+                }
+                ClickHouseRelation::from_series_rows(
+                    expected_schema,
+                    outcome.series.clone(),
+                    outcome.coverage,
+                )
+                .map_err(|error| SqlExecutionError::Binding(error.to_string()))
+            }
+            None => Err(format!("published DAG references missing node {}", root.0).into()),
+        }
     }
 }
 pub enum ClickHouseDagOutcome {
     Accelerated(ClickHouseQueryResult),
     Fallback(ClickHouseDagFallback),
+    Failed(asap_physical_operators::dag::Error),
 }
 
 fn complete_pane_coverage(
@@ -202,6 +405,11 @@ pub fn execute_sql_dag_with_external(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> ClickHouseDagOutcome {
+    if let Err(error) = entry.validate_snapshot_sources() {
+        return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+            error.to_string(),
+        ));
+    }
     let revision = index.summary_update_revision();
     let result = execute_sql_dag_with_external_unfenced(
         index,
@@ -212,6 +420,9 @@ pub fn execute_sql_dag_with_external(
         t1_ms,
         is_cumulative,
     );
+    if matches!(result, ClickHouseDagOutcome::Failed(_)) {
+        return result;
+    }
     if !revision.matches(index.summary_update_revision()) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             "summary input changed during SQL DAG evaluation".into(),
@@ -238,7 +449,11 @@ fn execute_sql_dag_with_external_unfenced(
         ids.iter().any(|id| {
             matches!(
                 entry.nodes.get(id),
-                Some(QueryPlanNode::RelationalJoin { .. } | QueryPlanNode::ExternalExact { .. })
+                Some(
+                    QueryPlanNode::Relational { .. }
+                        | QueryPlanNode::RelationalJoin { .. }
+                        | QueryPlanNode::ExternalExact { .. }
+                )
             )
         })
     });
@@ -269,18 +484,25 @@ fn execute_sql_dag_with_external_unfenced(
                 ))
             }
         };
-        let relation = match execute_relation_subtree(
+        let relation = match (RelationDagExecutor {
             index,
             entry,
-            entry.root,
-            &root_schema,
             prepared,
             t0_ms,
             t1_ms,
             is_cumulative,
-        ) {
+            memo: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            #[cfg(test)]
+            evaluations: BTreeMap::new(),
+        })
+        .execute(entry.root, &root_schema)
+        {
             Ok(relation) => relation,
-            Err(error) if error.contains("incomplete leaf coverage") => {
+            Err(SqlExecutionError::Physical(error)) => return ClickHouseDagOutcome::Failed(error),
+            Err(SqlExecutionError::Binding(error))
+                if error.contains("incomplete leaf coverage") =>
+            {
                 return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
                     requested: (t0_ms, t1_ms),
                     observed: None,
@@ -288,8 +510,8 @@ fn execute_sql_dag_with_external_unfenced(
             }
             Err(error) => {
                 return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                    error,
-                ))
+                    error.to_string(),
+                ));
             }
         };
         let bindings = entry.materialization_bindings();
@@ -315,26 +537,7 @@ fn execute_sql_dag_with_external_unfenced(
             )),
         };
     }
-    let mut base_root = entry.root;
-    let mut relational = Vec::new();
-    loop {
-        match entry.nodes.get(&base_root) {
-            Some(QueryPlanNode::Relational {
-                input,
-                operation,
-                input_schema,
-                output_schema,
-            }) => {
-                relational.push((
-                    operation.clone(),
-                    input_schema.clone(),
-                    output_schema.clone(),
-                ));
-                base_root = *input;
-            }
-            _ => break,
-        }
-    }
+    let base_root = entry.root;
     if let Err(detail) = validate_reachable(entry, base_root) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(detail));
     }
@@ -342,6 +545,11 @@ fn execute_sql_dag_with_external_unfenced(
         match execute_query_plan_from_readout(index, entry, base_root, t0_ms, t1_ms, is_cumulative)
         {
             Ok(outcome) => outcome,
+            Err(
+                crate::query_engines::asap_query_engine::post_asap_readout::LoweringSkip::Execution(
+                    error,
+                ),
+            ) => return ClickHouseDagOutcome::Failed(error),
             Err(error) => {
                 let detail = format!("{error:?}");
                 if detail.contains("missing materialized pane")
@@ -371,67 +579,7 @@ fn execute_sql_dag_with_external_unfenced(
             observed: outcome.coverage,
         });
     }
-    if relational.is_empty() {
-        return match from_series_rows(outcome.series) {
-            Ok(result) => ClickHouseDagOutcome::Accelerated(result),
-            Err(error) => ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(
-                error.to_string(),
-            )),
-        };
-    }
-    let input_schema = &relational.last().expect("non-empty").1;
-    let mut relation = match ClickHouseRelation::from_series_rows(
-        input_schema,
-        outcome.series,
-        outcome.coverage,
-    ) {
-        Ok(relation) => relation,
-        Err(error) => {
-            return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(
-                error.to_string(),
-            ))
-        }
-    };
-    let adapter = ClickHouseRelationalAdapter;
-    for (wire_operation, _, output_schema) in relational.into_iter().rev() {
-        if let Some(filter) = wire_operation.get("Filter") {
-            let predicate = filter
-                .get("pred")
-                .cloned()
-                .ok_or_else(|| "published Filter lacks pred".to_owned())
-                .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()));
-            relation = match predicate.and_then(|predicate| {
-                adapter
-                    .apply_filter(&predicate, relation)
-                    .map_err(|error| error.to_string())
-            }) {
-                Ok(relation) => relation,
-                Err(error) => {
-                    return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                        format!("invalid published Filter: {error}"),
-                    ))
-                }
-            };
-            continue;
-        }
-        let operation: ValueOperation = match serde_json::from_value(wire_operation) {
-            Ok(operation) => operation,
-            Err(error) => {
-                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                    format!("invalid published relational operation: {error}"),
-                ))
-            }
-        };
-        relation = match adapter.apply_operation(&operation, &output_schema, relation) {
-            Ok(relation) => relation,
-            Err(error) => {
-                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
-                    error.to_string(),
-                ))
-            }
-        };
-    }
-    match relation.into_result() {
+    match from_series_rows(outcome.series) {
         Ok(result) => ClickHouseDagOutcome::Accelerated(result),
         Err(error) => {
             ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(error.to_string()))
@@ -455,9 +603,275 @@ fn validate_reachable(entry: &QueryPlanEntry, root: QueryNodeId) -> Result<(), S
     Ok(())
 }
 
+// Validate schemas and graph shape before touching deployment sources.
 #[cfg(test)]
 mod tests {
-    use super::complete_pane_coverage;
+    use super::*;
+    use asap_types::query_plan::{
+        ExternalExactOutput, ExternalExactRequest, FallbackPolicy, InstantExecution, QueryLanguage,
+    };
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
+        pre_asap::DataType,
+    };
+
+    fn relation_schema(name: &str) -> SummarySchema {
+        SummarySchema {
+            fields: vec![SummaryField {
+                name: name.into(),
+                dtype: SummaryFamilyType::Plain(DataType::Int64),
+                nullable: false,
+            }],
+            time_index: None,
+        }
+    }
+
+    fn external_entry(schema: &SummarySchema) -> QueryPlanEntry {
+        QueryPlanEntry {
+            language: QueryLanguage::ClickHouseSql,
+            query_id: "shared-external".into(),
+            canonical_query: "SELECT x".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([(
+                QueryNodeId(0),
+                QueryPlanNode::ExternalExact {
+                    request: ExternalExactRequest {
+                        language: QueryLanguage::ClickHouseSql,
+                        expression: "SELECT 1 AS x".into(),
+                        output: ExternalExactOutput::Relation {
+                            schema: serde_json::to_value(schema).unwrap(),
+                        },
+                        parameters: BTreeMap::new(),
+                        start_parameter: None,
+                        end_parameter: None,
+                        input_contracts: Vec::new(),
+                    },
+                    inputs: Vec::new(),
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::Reject,
+        }
+    }
+
+    // SQL's native runtime must preserve exhausted/cancelled errors at its boundary.
+    #[tokio::test]
+    async fn sql_native_resource_failure_is_terminal() {
+        for cancelled in [false, true] {
+            crate::query_engines::request::run(
+                asap_physical_operators::dag::Limits {
+                    max_bytes: if cancelled { 4096 } else { 1 },
+                    ..Default::default()
+                },
+                move |_| {
+                    if cancelled {
+                        crate::query_engines::request::context(
+                            asap_physical_operators::dag::Scope::Query {
+                                evaluation_time_ms: 1000,
+                                revision: 0,
+                            },
+                        )?
+                        .cancel();
+                    }
+                    let schema = relation_schema("x");
+                    let entry = external_entry(&schema);
+                    let mut relation = ClickHouseRelation::from_json_compact(
+                        &schema,
+                        br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1]]}"#,
+                    )
+                    .unwrap();
+                    relation.coverage = Some((0, 1000));
+                    let result = execute_sql_dag_with_external(
+                        &SketchStore::new(),
+                        &entry,
+                        &SummaryCatalog::from_materializations(1, 1, &[]).unwrap(),
+                        &[(QueryNodeId(0), relation)].into(),
+                        0,
+                        1000,
+                        true,
+                    );
+                    let ClickHouseDagOutcome::Failed(error) = result else {
+                        panic!("native failure became fallback");
+                    };
+                    fn is_resource(
+                        error: &asap_physical_operators::dag::Error,
+                        cancelled: bool,
+                    ) -> bool {
+                        use asap_physical_operators::dag::Error;
+                        match error {
+                            Error::Cancelled => cancelled,
+                            Error::MemoryLimit => !cancelled,
+                            Error::AtNode { source, .. } => is_resource(source, cancelled),
+                            _ => false,
+                        }
+                    }
+                    assert!(is_resource(&error, cancelled), "{error:?}");
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn relation_dag_memoizes_a_shared_node_and_enforces_one_edge_schema() {
+        let schema = relation_schema("x");
+        let entry = external_entry(&schema);
+        let relation = ClickHouseRelation::from_json_compact(
+            &schema,
+            br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1]]}"#,
+        )
+        .unwrap();
+        let prepared = BTreeMap::from([(QueryNodeId(0), relation)]);
+        let index = SketchStore::new();
+        let mut executor = RelationDagExecutor {
+            index: &index,
+            entry: &entry,
+            prepared: &prepared,
+            t0_ms: 0,
+            t1_ms: 1,
+            is_cumulative: false,
+            memo: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            evaluations: BTreeMap::new(),
+        };
+
+        executor.execute(QueryNodeId(0), &schema).unwrap();
+        executor.execute(QueryNodeId(0), &schema).unwrap();
+        assert_eq!(executor.evaluations[&QueryNodeId(0)], 1);
+
+        let error = executor
+            .execute(QueryNodeId(0), &relation_schema("different"))
+            .unwrap_err();
+        assert!(error.to_string().contains("query `shared-external` node 0"));
+        assert!(error.to_string().contains("inconsistent relation schemas"));
+    }
+
+    // A SQL diamond binds one source to both join inputs in the shared DAG.
+    #[test]
+    fn relation_dag_executes_a_shared_source_join() {
+        use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
+        let schema = relation_schema("x");
+        let mut entry = external_entry(&schema);
+        let mut output = schema.clone();
+        output.fields.push(schema.fields[0].clone());
+        entry.nodes.insert(
+            QueryNodeId(1),
+            QueryPlanNode::RelationalJoin {
+                inputs: [QueryNodeId(0), QueryNodeId(0)],
+                join_kind: JoinKind::Cross,
+                pred: serde_json::to_value(Predicate::<usize>(
+                    QueryExpr::Literal(ScalarValue::Boolean(true)).into(),
+                ))
+                .unwrap(),
+                left_schema: schema.clone(),
+                right_schema: schema.clone(),
+                output_schema: output.clone(),
+                pruning: None,
+            },
+        );
+        entry.root = QueryNodeId(1);
+        let relation = ClickHouseRelation::from_json_compact(
+            &schema,
+            br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1],[2]]}"#,
+        )
+        .unwrap();
+        let prepared = BTreeMap::from([(QueryNodeId(0), relation)]);
+        let index = SketchStore::new();
+        let mut executor = RelationDagExecutor {
+            index: &index,
+            entry: &entry,
+            prepared: &prepared,
+            t0_ms: 0,
+            t1_ms: 1,
+            is_cumulative: false,
+            memo: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            evaluations: BTreeMap::new(),
+        };
+        let result = executor
+            .execute(entry.root, &output)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            result
+                .batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            4
+        );
+    }
+
+    /// A publication between query branches invalidates the entire result.
+    #[test]
+    fn query_wide_fence_rejects_publication_between_join_branches() {
+        use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue};
+        let schema = relation_schema("x");
+        let mut entry = external_entry(&schema);
+        entry
+            .nodes
+            .insert(QueryNodeId(2), entry.nodes[&QueryNodeId(0)].clone());
+        let mut output = schema.clone();
+        output.fields.push(schema.fields[0].clone());
+        entry.nodes.insert(
+            QueryNodeId(1),
+            QueryPlanNode::RelationalJoin {
+                inputs: [QueryNodeId(0), QueryNodeId(2)],
+                join_kind: JoinKind::Cross,
+                pred: serde_json::to_value(Predicate::<usize>(
+                    QueryExpr::Literal(ScalarValue::Boolean(true)).into(),
+                ))
+                .unwrap(),
+                left_schema: schema.clone(),
+                right_schema: schema.clone(),
+                output_schema: output,
+                pruning: None,
+            },
+        );
+        entry.root = QueryNodeId(1);
+        let relation = ClickHouseRelation::from_json_compact(
+            &schema,
+            br#"{"meta":[{"name":"x","type":"Int64"}],"data":[[1],[2]]}"#,
+        )
+        .unwrap();
+        let prepared = BTreeMap::from([
+            (QueryNodeId(0), relation.clone()),
+            (QueryNodeId(2), relation),
+        ]);
+        let index = SketchStore::new();
+        let catalog = SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
+        let run =
+            || execute_sql_dag_with_external(&index, &entry, &catalog, &prepared, 0, 1000, false);
+        assert!(matches!(run(), ClickHouseDagOutcome::Accelerated(_)));
+        AFTER_BRANCH.with(|hook| {
+            hook.set(Some(|index| {
+                use crate::storage_engines::sketch_db::index::{SketchEncoding, SketchSampleState};
+                index.append_sample(
+                    1,
+                    BTreeMap::new(),
+                    (0, 1000),
+                    SketchSampleState {
+                        bytes: vec![1],
+                        encoding: SketchEncoding::ProtoFull,
+                    },
+                );
+            }))
+        });
+        assert!(
+            matches!(run(), ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(reason))
+            if reason.contains("changed during SQL DAG"))
+        );
+        assert!(AFTER_BRANCH.with(|hook| hook.get().is_none()));
+    }
+
     #[test]
     fn exact_accumulator_window_end_coverage_includes_its_pane_start() {
         assert!(complete_pane_coverage(

@@ -62,6 +62,13 @@ impl QueryPlan {
     }
 
     pub fn lookup(&self, promql: &str) -> Result<&QueryPlanEntry, QueryPlanError> {
+        // Installed entries already carry validated canonical identities. The
+        // common exact spelling requires no serving-time parser invocation.
+        if let Some(entry) = self.entries.get(promql).filter(|entry| {
+            entry.language == QueryLanguage::PromQl && entry.canonical_query == promql
+        }) {
+            return Ok(entry);
+        }
         let identity = canonical_promql(promql)?;
         self.lookup_canonical(QueryLanguage::PromQl, &identity)
     }
@@ -375,8 +382,40 @@ impl QueryPlanEntry {
         topological_order(root, &self.nodes)
     }
 
+    /// The current external adapters provide evaluation time, not a snapshot
+    /// token compatible with local SDS or current-series revisions.
+    pub fn validate_snapshot_sources(&self) -> Result<(), QueryPlanError> {
+        use residual::ResidualQueryOperator;
+        let mut local = false;
+        let mut external = false;
+        for id in self.topological_order()? {
+            match &self.nodes[&id] {
+                QueryPlanNode::ReadMaterialization { .. }
+                | QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::CurrentSeries { .. },
+                    ..
+                } => local = true,
+                QueryPlanNode::ExternalExact { .. }
+                | QueryPlanNode::Logical {
+                    operator:
+                        ResidualQueryOperator::ExactSubquery { .. }
+                        | ResidualQueryOperator::CandidateExactSubquery { .. },
+                    ..
+                } => external = true,
+                _ => {}
+            }
+        }
+        if local && external {
+            return Err(QueryPlanError::UnsupportedNode(
+                "local state and external exact input have no common snapshot proof".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate references, bindings, reachability, and cycles before activation.
     pub fn validate(&self, available: &BTreeSet<PolicyFingerprint>) -> Result<(), QueryPlanError> {
+        self.validate_snapshot_sources()?;
         if !self.nodes.contains_key(&self.root) {
             return Err(QueryPlanError::Invalid(format!(
                 "query `{}` has missing root {}",
@@ -384,6 +423,7 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            validate_native_relation(*id, node)?;
             if let QueryPlanNode::PhysicalFragment {
                 inputs,
                 dag,
@@ -851,5 +891,101 @@ mod contract_tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<super::QueryPlan>();
         assert_send_sync::<super::QueryPlanEntry>();
+    }
+}
+
+/// Bind portable relation semantics before an installed plan can access its sources.
+fn validate_native_relation(id: QueryNodeId, node: &QueryPlanNode) -> Result<(), QueryPlanError> {
+    use planner_types::post_asap::{
+        ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState, PostAsapNodeId,
+    };
+    use std::sync::Arc;
+    let invalid = |error: String| QueryPlanError::Invalid(format!("query node {}: {error}", id.0));
+    let (payload, inputs, output) = match node {
+        QueryPlanNode::Relational {
+            operation,
+            input_schema,
+            output_schema,
+            ..
+        } => (
+            Payload::Value {
+                operation: serde_json::from_value(operation.clone())
+                    .map_err(|e| invalid(e.to_string()))?,
+            },
+            vec![Arc::new(input_schema.clone())],
+            output_schema,
+        ),
+        QueryPlanNode::RelationalJoin {
+            join_kind,
+            pred,
+            left_schema,
+            right_schema,
+            output_schema,
+            pruning,
+            ..
+        } => (
+            Payload::RelationalJoin {
+                join_kind: join_kind.clone(),
+                pred: serde_json::from_value(pred.clone()).map_err(|e| invalid(e.to_string()))?,
+                pruning: serde_json::from_value(
+                    serde_json::to_value(pruning).map_err(|e| invalid(e.to_string()))?,
+                )
+                .map_err(|e| invalid(e.to_string()))?,
+            },
+            vec![
+                Arc::new(left_schema.clone()),
+                Arc::new(right_schema.clone()),
+            ],
+            output_schema,
+        ),
+        _ => return Ok(()),
+    };
+    let node = ExecutableDagNode {
+        id: PostAsapNodeId(0),
+        payload,
+        output_state: ExecutionDataState::QUERY_ROWS,
+        output_schema: output.clone(),
+        guarantee: None,
+    };
+    asap_physical_operators::physical_planner::compile_node(&node, &inputs)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_binding_tests {
+    use super::*;
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
+        pre_asap::{DataType, Predicate, QueryExpr},
+    };
+
+    // Unsupported expressions fail installation without evaluating any source.
+    #[test]
+    fn rejects_unimplemented_relation_predicate_before_execution() {
+        let schema = SummarySchema {
+            fields: vec![SummaryField {
+                name: "value".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Float64),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let node = QueryPlanNode::Relational {
+            input: QueryNodeId(0),
+            operation: serde_json::to_value(ValueOperation::Filter {
+                pred: Predicate(
+                    QueryExpr::FunctionCall {
+                        name: "unimplemented_predicate".into(),
+                        args: vec![],
+                    }
+                    .into(),
+                ),
+            })
+            .unwrap(),
+            input_schema: schema.clone(),
+            output_schema: schema,
+        };
+        assert!(validate_native_relation(QueryNodeId(1), &node).is_err());
     }
 }

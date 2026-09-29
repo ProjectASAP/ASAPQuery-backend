@@ -157,7 +157,7 @@ jq '.precompute_plan | {materializations, executable_dags}' \
   target/physical-dag-inspection/selected.json
 ```
 
-Look for explicit maintenance-time operations and frontier bindings. Raw
+Look for explicit ingestion-time operations and frontier bindings. Raw
 materializations receive samples; a derived materialization consumes its
 bound immutable input program and must not receive raw backfill/collector jobs.
 The runtime supports only its validated operator, schema, grouping and window
@@ -172,7 +172,7 @@ curl -fsS -X POST http://127.0.0.1:9091/api/v1/precompute/drain | jq .
 This is a finite-input closure operation, not a timer or an ordinary flush for a
 live Prometheus deployment. It closes that receiver; later writes in the closed
 generation are rejected. Durable completion and retry/recovery are distinct
-from queue admission. See [maintenance and completion](../developer_docs/maintenance-replay.md).
+from queue admission. See [precomputation and completion](../developer_docs/precomputation-replay.md).
 
 Prometheus `WriteRequest` has no authoritative event-time watermark or
 producer/partition roster. Worker maximum timestamps and inactivity therefore

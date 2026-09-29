@@ -13,6 +13,9 @@ pub struct SeriesPopulation {
     pub grouping: Grouping,
     pub lookback_ms: u64,
     pub max_input_lag_ms: u64,
+    /// Admitted historical distance behind ingestion; zero retains current state only.
+    #[serde(default)]
+    pub history_retention_ms: u64,
     pub max_series: usize,
     pub max_bytes: u64,
     pub max_k: u64,
@@ -28,6 +31,7 @@ impl SeriesPopulation {
             || self.lookback_ms > i64::MAX as u64
             || self.max_input_lag_ms == 0
             || self.max_input_lag_ms > self.lookback_ms
+            || self.history_retention_ms > i64::MAX as u64
             || self.max_series == 0
             || self.max_series > 100_000
             || self.max_bytes == 0
@@ -67,6 +71,7 @@ mod tests {
             },
             lookback_ms: 1_000,
             max_input_lag_ms: 1_000,
+            history_retention_ms: 0,
             max_series: 100,
             max_bytes: 1_000_000,
             max_k: 3,

@@ -645,47 +645,67 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         query.accuracy_target.clone(),
     )
     .unwrap();
-    // Family ordering alone does not select a whole DAG. Price the desired
-    // legal heap candidate explicitly so this process test exercises its runtime.
-    struct HeapFixtureCost(planner_types::post_asap::SketchAlgorithm);
-    impl asap_aware_mapping::CostModel for HeapFixtureCost {
+    // This test installs collector heap state. Backend-only exact temporal
+    // readouts are legal in production but outside this fixture's input contract.
+    struct HeapFixtureModel(
+        control_plane::physical::post_asap::cost_model::ForcedFamilyCostModel,
+        planner_types::post_asap::SketchAlgorithm,
+    );
+    impl asap_aware_mapping::CostModel for HeapFixtureModel {
         fn rank_candidates(
             &self,
-            _: &planner_types::pre_asap::AggIntent,
+            intent: &planner_types::pre_asap::AggIntent,
             candidates: &[planner_types::post_asap::SketchAlgorithm],
         ) -> Vec<planner_types::post_asap::SketchAlgorithm> {
-            let mut ranked = candidates.to_vec();
-            ranked.sort_by_key(|kind| kind != &self.0);
-            ranked
+            self.0.rank_candidates(intent, candidates)
+        }
+        fn size_params(
+            &self,
+            kind: planner_types::post_asap::SketchAlgorithm,
+            intent: &planner_types::pre_asap::AggIntent,
+            eps: f64,
+            delta: f64,
+        ) -> planner_types::post_asap::SketchParams {
+            self.0.size_params(kind, intent, eps, delta)
         }
         fn candidate_cost(
             &self,
             candidate: &asap_aware_mapping::ReplacementSubDAG,
-            _: &asap_aware_mapping::TargetSubDAG<'_>,
+            target: &asap_aware_mapping::TargetSubDAG<'_>,
         ) -> Option<asap_aware_mapping::cost_model::Cost> {
-            let heap =
-                if let asap_aware_mapping::Replacement::Summary(root) = &candidate.replacement {
-                    planner_types::post_asap::compile_executable_dag(root)
-                        .unwrap()
-                        .nodes
-                        .iter()
-                        .any(|node| {
-                            matches!(&node.payload,
-                        planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
-                            family: SummaryFamilyType::Sketch(kind, _), ..
-                        } if kind.algorithm() == &self.0)
-                        })
-                } else {
-                    false
-                };
-            Some(asap_aware_mapping::cost_model::Cost(if heap {
-                1.0
-            } else {
-                1e12
-            }))
+            self.0.candidate_cost(candidate, target)
+        }
+        fn summary_support_evidence(
+            &self,
+            summary: &planner_types::post_asap::SummaryNode,
+        ) -> Option<bool> {
+            if matches!(
+                summary.expr,
+                planner_types::post_asap::SummaryExpr::ValueOperation {
+                    operation: planner_types::post_asap::ValueOperation::Limit { .. },
+                    ..
+                }
+            ) {
+                return Some(false);
+            }
+            let dag = planner_types::post_asap::compile_executable_dag(&std::rc::Rc::new(
+                summary.clone(),
+            ))
+            .ok()?;
+            if dag.nodes.iter().any(|node| matches!(&node.payload,
+                planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. } if kind.algorithm() != &self.1)) {
+                return Some(false);
+            }
+            self.0.summary_support_evidence(summary)
         }
     }
-    let model = HeapFixtureCost(algorithm.clone());
+    let model = HeapFixtureModel(
+        control_plane::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
+            query.accuracy_target.clone(),
+            algorithm.clone(),
+        ),
+        algorithm.clone(),
+    );
     query.selected_plan_root = control_plane::planner_selection::select_query_with_models(
         &expr,
         &model,
@@ -1577,12 +1597,12 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         Some(1)
     );
     assert_eq!(
-        topk_sum["data"]["result"][0]["metric"]["job"], "worker",
-        "TopK must preserve the selected series labels: {topk_sum}"
+        topk_sum["data"]["result"][0]["metric"],
+        serde_json::json!({"job": "worker"})
     );
     assert_eq!(
-        topk_count["data"]["result"][0]["metric"]["job"], "api",
-        "TopK must preserve the selected series labels: {topk_count}"
+        topk_count["data"]["result"][0]["metric"],
+        serde_json::json!({"job": "api"})
     );
     assert!((first_value(&sum, "value").expect("sum value") - 240.0).abs() < 1e-9);
 

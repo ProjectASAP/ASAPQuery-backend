@@ -1,5 +1,6 @@
 //! Catalog-backed ClickHouse acceleration boundary.
 
+use asap_physical_operators::summary_kernels::SumAccumulator;
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -21,6 +22,7 @@ use super::{
 };
 use crate::storage_engines::sketch_db::index::SketchStore;
 
+#[derive(Clone)]
 pub struct CatalogClickHouseAccelerator {
     pub store: Arc<SketchStore>,
     active_physical_plan: Option<crate::storage_engines::types::ActivePhysicalPlanHandle>,
@@ -68,7 +70,15 @@ impl CatalogClickHouseAccelerator {
         start_ms: u64,
         end_ms: u64,
         request_context: &ClickHouseQueryRequest,
-    ) -> Result<PreparedExternalLeaves, String> {
+    ) -> Result<PreparedExternalLeaves, crate::query_engines::EngineError> {
+        let miss = |detail: String| {
+            crate::query_engines::EngineError::capability_miss("clickhouse_input", detail)
+        };
+        entry
+            .validate_snapshot_sources()
+            .map_err(|error| miss(error.to_string()))?;
+        let mut held = crate::query_engines::request::reserve(0)?;
+        let mut held_bytes = 0usize;
         let mut prepared = PreparedExternalLeaves::new();
         let leaves = entry.nodes.iter().filter_map(|(id, node)| match node {
             asap_types::query_plan::QueryPlanNode::ExternalExact { request, inputs }
@@ -83,12 +93,17 @@ impl CatalogClickHouseAccelerator {
             let backend = self
                 .exact_backend
                 .as_ref()
-                .ok_or_else(|| "ClickHouse exact subtree endpoint unavailable".to_owned())?;
+                .ok_or_else(|| miss("ClickHouse exact subtree endpoint unavailable".to_owned()))?;
             let schema = match &bound.output {
                 asap_types::query_plan::ExternalExactOutput::Relation { schema } => {
-                    serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?
+                    serde_json::from_value(schema.clone())
+                        .map_err(|error| miss(error.to_string()))?
                 }
-                _ => return Err("ClickHouse exact subtree must produce a relation".into()),
+                _ => {
+                    return Err(miss(
+                        "ClickHouse exact subtree must produce a relation".into(),
+                    ))
+                }
             };
             let mut parameters = bound
                 .parameters
@@ -124,22 +139,36 @@ impl CatalogClickHouseAccelerator {
                 parameters,
                 headers: request_context.headers.clone(),
             };
-            let response = backend
-                .execute(&request)
-                .await
-                .map_err(|error| error.to_string())?;
+            let response = crate::query_engines::request::wait(backend.execute(&request))
+                .await?
+                .map_err(|error| match error {
+                    super::fallback::ClickHouseFallbackError::Physical(error) => {
+                        crate::query_engines::EngineError::Physical(error)
+                    }
+                    error => miss(error.to_string()),
+                })?;
             if !response.status.is_success() {
-                return Err(format!(
+                return Err(miss(format!(
                     "ClickHouse external subtree returned HTTP {}",
                     response.status
-                ));
+                )));
             }
+            let decode_bytes = response
+                .body
+                .len()
+                .checked_mul(64)
+                .ok_or(asap_physical_operators::dag::Error::MemoryLimit)?;
+            let _decode = crate::query_engines::request::reserve(decode_bytes)?;
             let mut relation = super::relational_adapter::ClickHouseRelation::from_json_compact(
                 &schema,
                 &response.body,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| miss(error.to_string()))?;
             relation.coverage = Some((start_ms, end_ms));
+            held_bytes = held_bytes
+                .checked_add(relation.retained_bytes())
+                .ok_or(asap_physical_operators::dag::Error::MemoryLimit)?;
+            held.resize(held_bytes)?;
             prepared.insert(id, relation);
         }
         Ok(prepared)
@@ -219,7 +248,11 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 outcome = self
                     .execute_bound(request, &physical, entry, runtime_range)
                     .await;
-                if matches!(outcome, ClickHouseAccelerationOutcome::Accelerated(_)) {
+                if matches!(
+                    outcome,
+                    ClickHouseAccelerationOutcome::Accelerated(_)
+                        | ClickHouseAccelerationOutcome::Failed(_)
+                ) {
                     return outcome;
                 }
             }
@@ -236,6 +269,37 @@ impl CatalogClickHouseAccelerator {
         entry: &asap_types::query_plan::QueryPlanEntry,
         runtime_range: Option<(u64, u64)>,
     ) -> ClickHouseAccelerationOutcome {
+        let engine = self.clone();
+        let request = request.clone();
+        let physical = physical.clone();
+        let entry = entry.clone();
+        match crate::query_engines::request::run(Default::default(), move |handle| {
+            Ok(handle.block_on(engine.execute_bound_inner(
+                &request,
+                &physical,
+                &entry,
+                runtime_range,
+            )))
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => ClickHouseAccelerationOutcome::Failed(error),
+        }
+    }
+
+    async fn execute_bound_inner(
+        &self,
+        request: &ClickHouseQueryRequest,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
+        entry: &asap_types::query_plan::QueryPlanEntry,
+        runtime_range: Option<(u64, u64)>,
+    ) -> ClickHouseAccelerationOutcome {
+        if let Err(error) = entry.validate_snapshot_sources() {
+            return ClickHouseAccelerationOutcome::Fallback(
+                ClickHouseAccelerationFallback::Planning(error.to_string()),
+            );
+        }
         let format = match requested_format(request) {
             Ok(format) => format,
             Err(format) => {
@@ -272,19 +336,100 @@ impl CatalogClickHouseAccelerator {
             range.start_ms = start_ms;
             range.end_ms = end_ms;
         }
+        let revisions = match self.store.revisions.read() {
+            Ok(runtime) => runtime.clone(),
+            Err(_) => {
+                return ClickHouseAccelerationOutcome::Failed(
+                    crate::query_engines::EngineError::Physical(
+                        asap_physical_operators::dag::Error::Invalid(
+                            "revision installation poisoned".into(),
+                        ),
+                    ),
+                )
+            }
+        };
+        let pinned = if let Some(revisions) = revisions {
+            let bindings = entry.materialization_bindings();
+            if bindings.is_empty() {
+                None
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let required = bindings
+                    .iter()
+                    .map(|binding| binding.stored_output_reference.stored_output_id)
+                    .collect();
+                let ranges = bindings
+                    .iter()
+                    .map(|binding| {
+                        (
+                            binding.stored_output_reference.stored_output_id,
+                            range.start_ms,
+                            range.end_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let Some(generation) = physical.precompute_plan.summary_catalog.as_ref() else {
+                    return ClickHouseAccelerationOutcome::Fallback(
+                        ClickHouseAccelerationFallback::CatalogMiss,
+                    );
+                };
+                match revisions.query_view(&required, now, &ranges, generation) {
+                    Ok(view) => Some(view),
+                    Err(error) => {
+                        if error.is::<crate::precompute_engine::revisions::SnapshotUnavailable>() {
+                            return ClickHouseAccelerationOutcome::Fallback(
+                                ClickHouseAccelerationFallback::IncompleteCoverage,
+                            );
+                        }
+                        return ClickHouseAccelerationOutcome::Failed(
+                            crate::query_engines::EngineError::Physical(
+                                match error.downcast::<asap_physical_operators::dag::Error>() {
+                                    Ok(error) => *error,
+                                    Err(error) => asap_physical_operators::dag::Error::Invalid(
+                                        error.to_string(),
+                                    ),
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let _snapshot = match crate::query_engines::request::reserve(
+            pinned
+                .as_ref()
+                .map_or(0, |view| view.approx_resident_bytes()),
+        ) {
+            Ok(guard) => guard,
+            Err(error) => return ClickHouseAccelerationOutcome::Failed(error.into()),
+        };
         let prepared = match self
             .prepare_external_exact(entry, range.start_ms, range.end_ms, request)
             .await
         {
             Ok(prepared) => prepared,
+            Err(error @ crate::query_engines::EngineError::Physical(_)) => {
+                return ClickHouseAccelerationOutcome::Failed(error)
+            }
             Err(error) => {
                 return ClickHouseAccelerationOutcome::Fallback(
-                    ClickHouseAccelerationFallback::Execution(error),
+                    ClickHouseAccelerationFallback::Execution(error.to_string()),
                 )
             }
         };
+        let _inputs = match crate::query_engines::request::reserve(
+            prepared.values().map(|v| v.retained_bytes()).sum(),
+        ) {
+            Ok(guard) => guard,
+            Err(error) => return ClickHouseAccelerationOutcome::Failed(error.into()),
+        };
         match execute_sql_dag_with_external(
-            self.store.as_ref(),
+            pinned.as_ref().unwrap_or(self.store.as_ref()),
             entry,
             catalog.as_ref(),
             &prepared,
@@ -292,39 +437,63 @@ impl CatalogClickHouseAccelerator {
             range.end_ms,
             range.cumulative,
         ) {
-            ClickHouseDagOutcome::Accelerated(result) => match result.encode(format) {
-                Ok(body) => {
-                    let mut headers = HeaderMap::new();
-                    headers.insert(
-                        "content-type",
-                        HeaderValue::from_static(match format {
-                            ClickHouseFormat::Json | ClickHouseFormat::JsonEachRow => {
-                                "application/json; charset=UTF-8"
+            ClickHouseDagOutcome::Failed(error) => {
+                ClickHouseAccelerationOutcome::Failed(error.into())
+            }
+            ClickHouseDagOutcome::Accelerated(result) => {
+                let retained = result
+                    .batches
+                    .iter()
+                    .map(|batch| batch.get_array_memory_size())
+                    .sum::<usize>();
+                let _output = match retained
+                    .checked_mul(16)
+                    .ok_or(asap_physical_operators::dag::Error::MemoryLimit)
+                    .and_then(crate::query_engines::request::reserve)
+                {
+                    Ok(guard) => guard,
+                    Err(error) => return ClickHouseAccelerationOutcome::Failed(error.into()),
+                };
+                match result.encode(format) {
+                    Ok(body) => {
+                        let _response = match crate::query_engines::request::reserve(body.len()) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                return ClickHouseAccelerationOutcome::Failed(error.into())
                             }
-                            ClickHouseFormat::TabSeparated => {
-                                "text/tab-separated-values; charset=UTF-8"
-                            }
-                        }),
-                    );
-                    let (execution, detail) = if entry.materialization_bindings().is_empty() {
-                        ("exact_fallback", "external_dag")
-                    } else if prepared.is_empty() {
-                        ("warm", "asap")
-                    } else {
-                        ("hybrid", "hybrid")
-                    };
-                    headers.insert("x-asap-execution", HeaderValue::from_static(execution));
-                    headers.insert("x-asap-execution-detail", HeaderValue::from_static(detail));
-                    ClickHouseAccelerationOutcome::Accelerated(ClickHouseRawResponse {
-                        status: StatusCode::OK,
-                        headers,
-                        body: Bytes::from(body),
-                    })
+                        };
+                        let mut headers = HeaderMap::new();
+                        headers.insert(
+                            "content-type",
+                            HeaderValue::from_static(match format {
+                                ClickHouseFormat::Json | ClickHouseFormat::JsonEachRow => {
+                                    "application/json; charset=UTF-8"
+                                }
+                                ClickHouseFormat::TabSeparated => {
+                                    "text/tab-separated-values; charset=UTF-8"
+                                }
+                            }),
+                        );
+                        let (execution, detail) = if entry.materialization_bindings().is_empty() {
+                            ("exact_fallback", "external_dag")
+                        } else if prepared.is_empty() {
+                            ("warm", "asap")
+                        } else {
+                            ("hybrid", "hybrid")
+                        };
+                        headers.insert("x-asap-execution", HeaderValue::from_static(execution));
+                        headers.insert("x-asap-execution-detail", HeaderValue::from_static(detail));
+                        ClickHouseAccelerationOutcome::Accelerated(ClickHouseRawResponse {
+                            status: StatusCode::OK,
+                            headers,
+                            body: Bytes::from(body),
+                        })
+                    }
+                    Err(error) => ClickHouseAccelerationOutcome::Fallback(
+                        ClickHouseAccelerationFallback::Execution(error.to_string()),
+                    ),
                 }
-                Err(error) => ClickHouseAccelerationOutcome::Fallback(
-                    ClickHouseAccelerationFallback::Execution(error.to_string()),
-                ),
-            },
+            }
             ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
                 ..
             }) => ClickHouseAccelerationOutcome::Fallback(
@@ -856,7 +1025,12 @@ mod tests {
             "SELECT sum(value) FROM requests WHERE timestamp >= 2000 AND timestamp < 3000".into();
         let uncovered = accelerator.execute(&request).await;
         assert!(
-            matches!(&uncovered, ClickHouseAccelerationOutcome::Fallback(ClickHouseAccelerationFallback::Execution(detail)) if detail.contains("NoCandidates")),
+            matches!(
+                &uncovered,
+                ClickHouseAccelerationOutcome::Fallback(
+                    ClickHouseAccelerationFallback::IncompleteCoverage
+                )
+            ),
             "{uncovered:?}"
         );
         request.sql =
@@ -1139,8 +1313,35 @@ mod tests {
         assert_eq!(accelerated_value, exact_value);
     }
 
+    // Rejecting mixed snapshots must preserve whole-query external execution.
     #[tokio::test]
-    async fn summary_and_external_exact_leaf_compose_in_one_query_dag() {
+    async fn external_only_sql_keeps_native_binding_and_result_encoding() {
+        let (accelerator, request) = fixture(2_000).await;
+        let physical = accelerator
+            .active_physical_plan
+            .as_ref()
+            .unwrap()
+            .active_snapshot();
+        let mut entry = mixed_summary_external_entry(
+            physical.query_plan.entries.values().next().unwrap().clone(),
+        );
+        entry.root = QueryNodeId(6);
+        entry.nodes.retain(|id, _| *id == entry.root);
+        let accelerator = accelerator.with_exact_backend(Arc::new(FixedExactSubtree));
+        let ClickHouseAccelerationOutcome::Accelerated(response) = accelerator
+            .execute_bound(&request, &physical, &entry, None)
+            .await
+        else {
+            panic!("external-only SQL should remain executable");
+        };
+        assert_eq!(
+            std::str::from_utf8(&response.body).unwrap(),
+            "1970-01-01T00:00:02\t10.0\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_and_external_exact_leaf_requires_snapshot_proof() {
         let (accelerator, request) = fixture(2_000).await;
         let physical = accelerator
             .active_physical_plan
@@ -1150,44 +1351,26 @@ mod tests {
         let entry = mixed_summary_external_entry(
             physical.query_plan.entries.values().next().unwrap().clone(),
         );
-        let accelerator = accelerator.with_exact_backend(Arc::new(FixedExactSubtree));
-        let prepared = accelerator
+        assert!(entry
+            .validate_snapshot_sources()
+            .unwrap_err()
+            .to_string()
+            .contains("common snapshot proof"));
+        // Deliberately omit an external backend: rejection must precede I/O.
+        let error = accelerator
             .prepare_external_exact(&entry, 0, 2_000, &request)
             .await
-            .unwrap();
-        let ClickHouseDagOutcome::Accelerated(result) = execute_sql_dag_with_external(
-            accelerator.store.as_ref(),
-            &entry,
-            physical.summary_catalog.as_ref().unwrap(),
-            &prepared,
-            0,
-            2_000,
-            true,
-        ) else {
-            panic!("mixed summary/external DAG should execute")
-        };
-        assert_eq!(
-            String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
-            "1970-01-01T00:00:02\t0.5\n"
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("common snapshot proof"),
+            "{error}"
         );
     }
 
+    // Even a malformed already-active plan fails before it can call an external source.
     #[tokio::test]
-    async fn real_clickhouse_runtime_differential_uses_production_mixed_constructor() {
-        let Ok(base_url) = std::env::var("CLICKHOUSE_URL") else {
-            return;
-        };
-        let (accelerator, mut request) = fixture(2_000).await;
-        if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
-            request
-                .headers
-                .insert("x-clickhouse-user", user.parse().unwrap());
-        }
-        if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
-            request
-                .headers
-                .insert("x-clickhouse-key", password.parse().unwrap());
-        }
+    async fn active_mixed_plan_is_rejected_before_external_execution() {
+        let (accelerator, request) = fixture(2_000).await;
         let physical = accelerator
             .active_physical_plan
             .as_ref()
@@ -1199,27 +1382,16 @@ mod tests {
         query_plan.entries.insert(key, entry);
         let mut active = physical.as_ref().clone();
         active.query_plan = Arc::new(query_plan);
-        let exact_backend = Arc::new(super::super::fallback::ClickHouseHttpFallback::new(
-            base_url,
-            "default".into(),
-        ));
         let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan_and_exact_backend(
             accelerator.store.clone(),
             crate::storage_engines::types::ActivePhysicalPlanHandle::new(active),
-            exact_backend.clone(),
+            Arc::new(super::super::fallback::ClickHouseHttpFallback::new(
+                "http://127.0.0.1:1".into(),
+                "default".into(),
+            )),
         );
-        let ClickHouseAccelerationOutcome::Accelerated(response) =
-            accelerator.execute(&request).await
-        else {
-            panic!("real ClickHouse mixed summary/external DAG should accelerate")
-        };
-        let mut exact_request = request;
-        exact_request.method = Method::POST;
-        exact_request.sql = "SELECT formatDateTime(toDateTime(2), '%Y-%m-%dT%H:%i:%S') AS timestamp, toFloat64(5) / toFloat64(10) AS ratio FORMAT TabSeparated".into();
-        exact_request.body = Bytes::from(exact_request.sql.clone());
-        exact_request.parameters.clear();
-        let exact = exact_backend.execute(&exact_request).await.unwrap();
-        assert_eq!(exact.status, StatusCode::OK);
-        assert_eq!(response.body, exact.body);
+        assert!(matches!(accelerator.execute(&request).await,
+            ClickHouseAccelerationOutcome::Fallback(ClickHouseAccelerationFallback::Planning(reason))
+            if reason.contains("common snapshot proof")));
     }
 }

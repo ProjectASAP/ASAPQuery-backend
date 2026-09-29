@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_materialization_masks_price_state_and_prometheus_subquery_sources() {
+    fn materialization_masks_reject_mixed_snapshots_before_costing() {
         let mut snapshot = fixture();
         let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         q.query =
@@ -1082,18 +1082,30 @@ mod tests {
         assert_eq!(
             candidates.len(),
             5,
-            "four legal candidate key sets plus native"
+            "four proposed candidate key sets plus native"
         );
         let mut identities = BTreeSet::new();
+        let mut rejected = 0;
         for candidate in &candidates[..4] {
             let enabled = candidate
                 .enabled_materialization_keys
                 .as_ref()
                 .unwrap()
                 .len();
-            let plan = DeploymentPlanCompiler
-                .compile_promql(candidate.clone(), environment.clone())
-                .unwrap();
+            let result =
+                DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone());
+            if enabled == 1 {
+                let Err(error) = result else {
+                    panic!("mixed snapshots must fail binding");
+                };
+                assert!(
+                    error.to_string().contains("common snapshot proof"),
+                    "{error}"
+                );
+                rejected += 1;
+                continue;
+            }
+            let plan = result.unwrap();
             assert!(identities.insert(plan.envelope.plan_id));
             let cost = manifest(&plan, &candidate.queries).unwrap();
             assert_eq!(
@@ -1128,6 +1140,8 @@ mod tests {
                     crate::query_plan::QueryPlanNode::ExactFallback { .. }
                 ))));
         }
+        assert_eq!(rejected, 2);
+        assert_eq!(identities.len(), 2);
         assert!(
             !candidates
                 .last()

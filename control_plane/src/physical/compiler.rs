@@ -5064,36 +5064,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn metricsql_counter_gate_preserves_an_independent_summary_sibling() {
+    fn metricsql_counter_gate_rejects_mixed_input_snapshots() {
         let mut workload = request("mixed", "max_over_time(m[1m]) + rate(m[1m])");
         workload.allow_mixed_summary_and_exact_execution = true;
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.target_collector_ids.clear();
-        let plan = DeploymentPlanCompiler
-            .compile_metricsql(workload, deployment)
-            .unwrap();
-        assert!(!plan.precompute_plan.materializations.is_empty());
-        assert!(plan
-            .precompute_plan
-            .materializations
-            .iter()
-            .all(|m| !matches!(
-                m.aggregation_type,
-                asap_types::AggregationType::Increase | asap_types::AggregationType::Rate
-            )));
-        let entry = plan.query_plan.entries.values().next().unwrap();
-        assert!(!entry.materialization_bindings().is_empty());
+        let Err(error) = DeploymentPlanCompiler.compile_metricsql(workload, deployment) else {
+            panic!("mixed local/external snapshots must fail deployment binding");
+        };
         assert!(
-            entry.nodes.values().any(|node| matches!(
-                node,
-                crate::query_plan::QueryPlanNode::ExternalExact { .. }
-                    | crate::query_plan::QueryPlanNode::Logical {
-                        operator:
-                            crate::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. },
-                        ..
-                    }
-            ))
+            error.to_string().contains("common snapshot proof"),
+            "{error}"
         );
     }
 
