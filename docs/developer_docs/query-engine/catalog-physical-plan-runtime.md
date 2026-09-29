@@ -94,7 +94,8 @@ For selected explicit-`by` current-series TopK, the population store now supplie
 all eligible members through a snapshot binding. Planner compiles the ranking
 above that boundary; the QueryPlan persists that physical program before
 candidate pricing and activation. Serving recovers its operators and supplies
-full-label native rows without parsing or lowering the query. Provider quote
+full-label native rows without parsing or lowering the query. Automatic cost
+estimates include native operator CPU and temporary workspace; provider quote
 manifests include the physical program itself. Other population readouts retain
 their existing paths.
 

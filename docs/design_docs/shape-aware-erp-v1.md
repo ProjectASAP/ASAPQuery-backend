@@ -22,8 +22,12 @@ than publishing a biased partial snapshot. Profiles with too few benchmark
 events, poor fit, ambiguous confidence, or excessive cardinality/parameter
 distance are misses.
 
-On a hit, empirical parameters and measured atomic costs are used. On a miss,
-malformed evidence, or drift, Hybrid mode retains the theoretical parameters;
+On a hit, empirical parameters and measured atomic costs inform planning.
+ERP resource precedence, analytical fallback, accuracy certification and
+deployment admission follow the
+[evidence-dependent candidate design](evidence-dependent-candidates.md#erp-and-analytical-cost-models).
+
+On a miss, malformed evidence, or drift, Hybrid mode retains the theoretical parameters;
 if the runtime cannot deploy them or they exceed its memory limit, compilation
 chooses exact execution. Empirical-only mode fails closed.
 
