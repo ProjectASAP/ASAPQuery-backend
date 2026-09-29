@@ -3799,6 +3799,13 @@ fn select_lifecycle(
         query_id: query.query_id.clone(),
         reason: error.to_string(),
     })?;
+    // Planner lists the passed SummaryAgg first. Nested source states are
+    // selected and priced by their own calls, and the backend cost model gives
+    // every deployment the same window framework, so later entries add nothing.
+    debug_assert!(plan
+        .deployments
+        .first()
+        .is_none_or(|deployment| Rc::ptr_eq(&deployment.summary, &plan.root)));
     let guarantee = plan
         .deployments
         .first()
