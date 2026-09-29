@@ -522,6 +522,12 @@ impl PrecomputePlan {
                     .chain(input.inputs.iter().copied())
             })
             .collect();
+        // Decode each DAG at most once; errors still surface only where used.
+        let dags = self
+            .executable_dags
+            .values()
+            .map(|installed| (installed, std::cell::OnceCell::new()))
+            .collect::<Vec<_>>();
         for config in &self.materializations {
             if !config.population_key_encoding.is_legacy()
                 && (self.ingest.protocol != IngestProtocol::PrometheusRemoteWriteV1
@@ -572,11 +578,11 @@ impl PrecomputePlan {
             }
             validated_source_window_cohort(config, &sources)?;
             let mut matched = false;
-            for installed in self.executable_dags.values() {
-                let dag = installed
-                    .document
-                    .decode()
-                    .map_err(PrecomputePlanError::CatalogContract)?;
+            for (installed, dag) in &dags {
+                let dag = dag
+                    .get_or_init(|| installed.document.decode())
+                    .as_ref()
+                    .map_err(|error| PrecomputePlanError::CatalogContract(error.clone()))?;
                 for sink in &installed.binding.precompute_sinks {
                     if !matches!(installed.binding.node(*sink),
                         Some(crate::executable_plan::BackendNodeBinding::Materialization { stored_output })
