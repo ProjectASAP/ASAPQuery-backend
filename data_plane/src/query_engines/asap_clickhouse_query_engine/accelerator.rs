@@ -1336,7 +1336,7 @@ mod tests {
         };
         assert_eq!(
             std::str::from_utf8(&response.body).unwrap(),
-            "1970-01-01T00:00:02\t10\n"
+            "1970-01-01T00:00:02\t10.0\n"
         );
     }
 
