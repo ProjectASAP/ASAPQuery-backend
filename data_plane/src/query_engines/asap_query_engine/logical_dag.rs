@@ -6,9 +6,9 @@ use crate::query_engines::{
 };
 use crate::storage_engines::types::KeyByLabelValues;
 use asap_physical_operators::dag as physical;
-use asap_types::query_plan::query_time::{
-    Aggregation, BinaryOperation, Grouping, QueryTimeOperator, TemporalOperation,
-};
+use asap_types::query_plan::query_time::QueryTimeOperator;
+#[cfg(test)]
+use asap_types::query_plan::query_time::{Aggregation, BinaryOperation, Grouping, TemporalOperation};
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use futures::{FutureExt, StreamExt};
 use std::cell::RefCell;
@@ -61,6 +61,7 @@ pub struct ExecutionStats {
 fn miss(detail: impl Into<String>) -> EngineError {
     EngineError::capability_miss("installed_logical_dag", detail)
 }
+#[cfg(test)]
 fn no_name(mut labels: Labels) -> Labels {
     labels.remove("__name__");
     labels
@@ -334,14 +335,6 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     .map(|value| vector((**value).clone()))
                     .collect::<Result<Vec<_>, _>>()?;
                 if let Some(contract) = &pruning {
-                    native_values::validate_pruning(
-                        &dag,
-                        &values,
-                        row_input.ok_or_else(|| miss("pruning requires preserved input rows"))?,
-                        contract,
-                        at,
-                        context.clone(),
-                    )?;
                     if let Some(warning) = pruning_warning(Some(&contract.completeness)) {
                         self.warnings.push(warning);
                     }
@@ -373,12 +366,6 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         at: i64,
         context: &physical::RunContext,
     ) -> Result<Value, EngineError> {
-        let input = |index: usize| {
-            inputs
-                .get(index)
-                .map(|value| (**value).clone())
-                .ok_or_else(|| miss("missing logical input"))
-        };
         match operator {
             QueryTimeOperator::ExactSubquery { .. }
             | QueryTimeOperator::CandidateExactSubquery { .. } => {
@@ -390,108 +377,17 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             QueryTimeOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
-            QueryTimeOperator::UnaryNegate => negate(input(0)?, context),
-            QueryTimeOperator::VectorToScalar => vector_to_scalar(vector(input(0)?)?, context),
-            QueryTimeOperator::Aggregate {
-                operation,
-                grouping,
-            } => {
-                let values = vector(input(0)?)?;
-                Ok(Value::Vector(aggregate(
-                    operation, &grouping, values, context,
-                )?))
-            }
-            QueryTimeOperator::Limit {
-                n,
-                offset,
-                grouping,
-            } => {
-                let values = vector(input(0)?)?;
-                Ok(Value::Vector(native_values::limit(
-                    values,
-                    &grouping,
-                    n,
-                    offset,
-                    context.clone(),
-                )?))
-            }
-            QueryTimeOperator::Binary {
-                operation,
-                return_bool,
-            } => {
-                let left = input(0)?;
-                let right = input(1)?;
-                binary_in_context(operation, return_bool, left, right, context)
-            }
-            QueryTimeOperator::Temporal { operation } => {
-                let Value::Matrix(values, start, end) = input(0)? else {
-                    return Err(miss("temporal operator requires range vector"));
-                };
-                let preserve_name = self.entry.language
-                    == control_plane::query_plan::QueryLanguage::MetricsQl
-                    && matches!(
-                        operation,
-                        TemporalOperation::Min | TemporalOperation::Max | TemporalOperation::Avg
-                    );
-                let result = native_temporal(values, operation, start, end, context)?;
-                Ok(Value::Vector(
-                    result
-                        .into_iter()
-                        .map(|(labels, value)| {
-                            (
-                                if preserve_name {
-                                    labels
-                                } else {
-                                    no_name(labels)
-                                },
-                                value,
-                            )
-                        })
-                        .collect(),
-                ))
-            }
-
-            QueryTimeOperator::Sort {
-                descending,
-                grouping,
-            } => {
-                let values = vector(input(0)?)?;
-                Ok(Value::Vector(native_values::sort(
-                    values,
-                    &grouping,
-                    descending,
-                    context.clone(),
-                )?))
-            }
-            QueryTimeOperator::HistogramQuantile => {
-                let Value::Scalar(quantile) = input(0)? else {
-                    return Err(miss("quantile requires scalar"));
-                };
-                let mut groups: BTreeMap<Labels, Vec<(f64, f64)>> = BTreeMap::new();
-                for (mut labels, value) in vector(input(1)?)? {
-                    if let Some(le) = labels.remove("le").and_then(|s| s.parse::<f64>().ok()) {
-                        groups.entry(no_name(labels)).or_default().push((le, value));
-                    }
-                }
-                let rows = groups
-                    .into_iter()
-                    .flat_map(|(labels, buckets)| {
-                        buckets.into_iter().map(move |(bound, count)| {
-                            vec![
-                                native_labels(&labels),
-                                physical::values::Value::Float64(bound),
-                                physical::values::Value::Float64(count),
-                            ]
-                        })
-                    })
-                    .collect();
-                Ok(Value::Vector(native_window(
-                    rows,
-                    planner_types::pre_asap::AggIntent::HistogramQuantile { q: quantile },
-                    None,
-                    context,
-                )?))
-            }
+            QueryTimeOperator::UnaryNegate
+            | QueryTimeOperator::VectorToScalar
+            | QueryTimeOperator::Aggregate { .. }
+            | QueryTimeOperator::Limit { .. }
+            | QueryTimeOperator::Binary { .. }
+            | QueryTimeOperator::Temporal { .. }
+            | QueryTimeOperator::Sort { .. }
+            | QueryTimeOperator::HistogramQuantile => Err(physical::Error::Invalid(
+                "installed computation must contain Planner physical operators".into(),
+            )
+            .into()),
             QueryTimeOperator::Subquery {
                 range_ms,
                 step_ms,
@@ -754,6 +650,7 @@ fn native_labels(labels: &Labels) -> physical::values::Value {
             .into(),
     )
 }
+#[cfg(test)]
 fn native_vector_batch(
     values: Vector,
     grouping: &Grouping,
@@ -795,6 +692,7 @@ fn native_vector_batch(
         .collect();
     Batch::try_new(schema, rows).map_err(EngineError::from)
 }
+#[cfg(test)]
 fn native_batch_rows(
     batch: physical::values::Batch,
     ops: Vec<physical::operators::Operator>,
@@ -840,6 +738,7 @@ fn native_vector_output(
         })
         .collect()
 }
+#[cfg(test)]
 fn aggregate(
     operation: Aggregation,
     grouping: &Grouping,
@@ -864,6 +763,7 @@ fn aggregate(
     native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
 }
 
+#[cfg(test)]
 fn negate(value: Value, context: &physical::RunContext) -> Result<Value, EngineError> {
     use physical::operators::{Expression, Operator};
     let scalar = matches!(value, Value::Scalar(_));
@@ -897,24 +797,7 @@ fn negate(value: Value, context: &physical::RunContext) -> Result<Value, EngineE
         Value::Vector(result)
     })
 }
-fn vector_to_scalar(values: Vector, context: &physical::RunContext) -> Result<Value, EngineError> {
-    use physical::{operators::Operator, values::Value as Cell};
-    let batch = native_vector_batch(
-        values,
-        &Grouping {
-            labels: vec![],
-            without: false,
-        },
-    )?;
-    let operator =
-        Operator::vector_to_scalar(batch.schema().clone(), 2).map_err(EngineError::from)?;
-    let rows = native_batch_rows(batch, vec![operator], context)?;
-    match rows.first().and_then(|row| row.first()) {
-        Some(Cell::Float64(value)) => Ok(Value::Scalar(*value)),
-        _ => Err(miss("native scalar conversion returned invalid output")),
-    }
-}
-
+#[cfg(test)]
 fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
     labels
         .iter()
@@ -969,6 +852,7 @@ fn binary(
 ) -> Result<Value, EngineError> {
     binary_in_context(operation, boolean, left, right, &test_native_context())
 }
+#[cfg(test)]
 fn binary_in_context(
     operation: BinaryOperation,
     boolean: bool,
@@ -1127,83 +1011,21 @@ fn binary_in_context(
     Ok(Value::Vector(vector(Value::Vector(output))?))
 }
 
-fn native_temporal(
-    values: Matrix,
-    operation: TemporalOperation,
-    start: i64,
-    end: i64,
-    context: &physical::RunContext,
-) -> Result<Vector, EngineError> {
-    use planner_types::pre_asap::AggIntent;
-    let intent = match operation {
-        TemporalOperation::Rate => AggIntent::Rate,
-        TemporalOperation::Increase => AggIntent::Increase,
-        TemporalOperation::Sum => AggIntent::Sum { col: None },
-        TemporalOperation::Avg => AggIntent::Avg { col: None },
-        TemporalOperation::Min => AggIntent::Min { col: None },
-        TemporalOperation::Max => AggIntent::Max { col: None },
-        TemporalOperation::Count => AggIntent::Count {
-            accuracy: planner_types::types::AccuracyTarget::Exact,
+#[cfg(test)]
+fn test_state_binding() -> QueryPlanNode {
+    let output = asap_types::sds::StoredOutputId(99);
+    QueryPlanNode::ReadMaterialization {
+        binding: asap_types::query_plan::MaterializationBinding {
+            stored_output_reference: asap_types::sds::StoredOutputReference::for_output(output),
+            materialization: output,
+            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
+            item_labels: vec![],
+            window_ms: 1000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: Some(300_000),
+            full_window_slide_ms: None,
         },
-    };
-    let rows = values
-        .into_iter()
-        .flat_map(|(labels, points)| {
-            points.into_iter().map(move |(time, value)| {
-                vec![
-                    native_labels(&labels),
-                    physical::values::Value::Timestamp(time),
-                    physical::values::Value::Float64(value),
-                ]
-            })
-        })
-        .collect();
-    native_window(rows, intent, Some((start, end)), context)
-}
-fn native_window(
-    rows: Vec<Vec<physical::values::Value>>,
-    intent: planner_types::pre_asap::AggIntent<planner_types::pre_asap::ColumnRef>,
-    window: Option<(i64, i64)>,
-    context: &physical::RunContext,
-) -> Result<Vector, EngineError> {
-    use planner_types::{
-        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
-        pre_asap::DataType,
-    };
-    let schema = std::sync::Arc::new(SummarySchema {
-        fields: vec![
-            (
-                "labels",
-                DataType::Map {
-                    key: Box::new(DataType::Utf8),
-                    value: Box::new(DataType::Utf8),
-                    value_nullable: false,
-                },
-            ),
-            (
-                "coordinate",
-                if window.is_some() {
-                    DataType::Timestamp
-                } else {
-                    DataType::Float64
-                },
-            ),
-            ("value", DataType::Float64),
-        ]
-        .into_iter()
-        .map(|(name, dtype)| SummaryField {
-            name: name.into(),
-            dtype: SummaryFamilyType::Plain(dtype),
-            nullable: false,
-        })
-        .collect(),
-        time_index: None,
-    });
-    let batch =
-        physical::values::Batch::try_new(schema.clone(), rows).map_err(EngineError::from)?;
-    let operator = physical::operators::Operator::window(schema, intent, 1, 2, vec![0], window)
-        .map_err(EngineError::from)?;
-    native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
+    }
 }
 
 #[cfg(test)]
@@ -1422,6 +1244,8 @@ mod topk_tests {
         )]
         .into_iter()
         .collect();
+        let mut entry = entry.clone();
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
         let (result, stats) = execute_installed(&entry, &leaves, at, |_, _| {
             panic!("summary callback must not run for an exact-child topk")
         })
@@ -1504,6 +1328,8 @@ mod topk_tests {
                         remote_rpcs: 1,
                     },
                 )]);
+                let mut entry = entry.clone();
+                control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
                 let (result, _) = execute_installed(&entry, &leaves, 1000, |_, _| {
                     panic!("external child supplied")
                 })
@@ -1542,6 +1368,7 @@ mod topk_tests {
             fixed_evaluation: None,
             root,
             nodes: BTreeMap::from([
+                (QueryNodeId(99), test_state_binding()),
                 (
                     summary,
                     QueryPlanNode::ExactReadout {
@@ -1584,6 +1411,8 @@ mod topk_tests {
             },
             fallback: FallbackPolicy::ExactBackend,
         };
+        let mut entry = entry.clone();
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
         let (result, stats) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
             assert_eq!(id, summary);
             assert_eq!(at, 300_000);
@@ -1876,6 +1705,8 @@ mod topk_tests {
                 },
             ),
         ]);
+        let mut entry = entry.clone();
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
         let (result, stats) = execute_installed(&entry, &leaves, at as u64, |_, _| {
             panic!("both inputs are prepared")
         })
@@ -1933,9 +1764,9 @@ mod shared_runtime_tests {
             canonical_query: "shared-grid".into(),
             fixed_evaluation: None,
             root: QueryNodeId(3),
-            // The callback owns the absorbed summary dependencies. Only its
-            // declared readout boundary participates in this value graph.
+            // The callback binds a readout boundary backed by the declared stored source.
             nodes: BTreeMap::from([
+                (QueryNodeId(99), test_state_binding()),
                 (
                     QueryNodeId(0),
                     QueryPlanNode::ExactReadout {
@@ -1986,7 +1817,25 @@ mod shared_runtime_tests {
     // A shared time-grid node runs once per query; distinct times and runs stay isolated.
     #[test]
     fn shared_subquery_scopes_do_not_duplicate_or_leak_values() {
-        let entry = entry();
+        let mut entry = entry();
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
+        let QueryPlanNode::PhysicalFragment { dag, .. } = &entry.nodes[&entry.root] else {
+            panic!("compiled root required")
+        };
+        let graph: serde_json::Value = serde_json::from_slice(dag).unwrap();
+        let shared = graph["nodes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find_map(|node| {
+                let operator = node.get("Operator")?;
+                operator["operator"]["kind"]
+                    .get("VectorBinary")
+                    .map(|_| operator["inputs"].as_array().unwrap())
+            })
+            .unwrap();
+        assert_eq!(shared.len(), 2);
+        assert_eq!(shared[0], shared[1]);
         let mut calls = Vec::new();
         for (at, expected) in [(3000, 10.), (4000, 14.)] {
             let (result, stats) = execute_installed(&entry, &BTreeMap::new(), at, |id, time| {
@@ -2007,7 +1856,6 @@ mod shared_runtime_tests {
             };
             assert_eq!(result.values[0].value, expected);
             assert_eq!(stats.summary_readout_evaluations, 2);
-            assert!(stats.memo_hits >= 1);
         }
         assert_eq!(calls, vec![2000, 3000, 3000, 4000]);
     }
@@ -2037,7 +1885,9 @@ mod shared_runtime_tests {
     // Source failures keep their routing classification across the shared runtime.
     #[test]
     fn source_error_classification_survives_execution() {
-        let error = execute_installed(&entry(), &BTreeMap::new(), 3000, |_, _| {
+        let mut entry = entry();
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
+        let error = execute_installed(&entry, &BTreeMap::new(), 3000, |_, _| {
             Err(EngineError::capability_miss("source", "failed"))
         })
         .unwrap_err();

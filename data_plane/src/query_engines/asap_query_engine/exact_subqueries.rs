@@ -854,7 +854,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let entry = entry(BTreeMap::from([
+        let mut entry = entry(BTreeMap::from([
             (
                 QueryNodeId(0),
                 QueryPlanNode::Logical {
@@ -877,6 +877,7 @@ mod tests {
                 },
             ),
         ]));
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
         let leaves = prepare(
             &entry,
             &[1000],

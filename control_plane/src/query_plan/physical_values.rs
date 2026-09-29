@@ -44,9 +44,11 @@ fn binary(operation: BinaryOperation) -> BinaryOperator {
     }
 }
 
-pub fn compile(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
+pub fn compile(
+    entry: &mut QueryPlanEntry,
+) -> Result<BTreeMap<QueryNodeId, QueryNodeId>, QueryPlanError> {
     if entry.language == QueryLanguage::ClickHouseSql || entry.physical_dag.is_some() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     let mut scalars = BTreeMap::new();
     for id in entry.topological_order()? {
@@ -63,7 +65,10 @@ pub fn compile(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
         let compiled = match node {
             QueryPlanNode::Scalar { .. } => {
                 scalar = true;
-                None
+                let QueryPlanNode::Scalar { value } = node else {
+                    unreachable!()
+                };
+                Some(physical::compile_scalar(*value).map_err(invalid)?)
             }
             QueryPlanNode::Logical {
                 operator:
@@ -126,6 +131,26 @@ pub fn compile(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
                 } => {
                     Some(physical::compile_limit(*n, *offset, &grouping(groups)).map_err(invalid)?)
                 }
+                Operation::Temporal { operation } => {
+                    use residual::TemporalOperation as T;
+                    let intent = match operation {
+                        T::Rate => AggIntent::Rate,
+                        T::Increase => AggIntent::Increase,
+                        T::Sum => AggIntent::Sum { col: None },
+                        T::Avg => AggIntent::Avg { col: None },
+                        T::Min => AggIntent::Min { col: None },
+                        T::Max => AggIntent::Max { col: None },
+                        T::Count => AggIntent::Count {
+                            accuracy: planner_types::types::AccuracyTarget::Exact,
+                        },
+                    };
+                    let preserve = entry.language == QueryLanguage::MetricsQl
+                        && matches!(operation, T::Min | T::Max | T::Avg);
+                    Some(physical::compile_temporal(&intent, preserve).map_err(invalid)?)
+                }
+                Operation::HistogramQuantile => {
+                    Some(physical::compile_histogram_quantile().map_err(invalid)?)
+                }
                 _ => None,
             },
             QueryPlanNode::Binary { operator, .. } => {
@@ -169,7 +194,131 @@ pub fn compile(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
             );
         }
     }
-    Ok(())
+    combine(entry)
+}
+
+fn combine(
+    entry: &mut QueryPlanEntry,
+) -> Result<BTreeMap<QueryNodeId, QueryNodeId>, QueryPlanError> {
+    use asap_physical_operators::physical_planner::InputContract;
+    use std::collections::BTreeSet;
+    let supported = |schema: &asap_physical_operators::values::Schema| {
+        schema == &physical::scalar_schema()
+            || schema == &physical::vector_schema()
+            || schema == &physical::matrix_schema()
+    };
+    let mut programs = BTreeMap::new();
+    for (&id, node) in &entry.nodes {
+        if let QueryPlanNode::PhysicalFragment {
+            dag,
+            row_input: None,
+            pruning: None,
+            ..
+        } = node
+        {
+            let graph = CompiledPhysicalDag::decode(dag).map_err(invalid)?;
+            if graph.roots().len() == 1
+                && graph
+                    .input_contracts()
+                    .all(|(_, input)| supported(&input.schema))
+                && supported(
+                    &graph
+                        .output_contract(graph.roots()[0])
+                        .map_err(invalid)?
+                        .schema,
+                )
+            {
+                programs.insert(id, graph);
+            }
+        }
+    }
+    let mut roots = BTreeSet::new();
+    if programs.contains_key(&entry.root) {
+        roots.insert(entry.root);
+    }
+    for (id, node) in &entry.nodes {
+        if !programs.contains_key(id) {
+            roots.extend(
+                node.inputs()
+                    .iter()
+                    .filter(|id| programs.contains_key(id))
+                    .copied(),
+            );
+        }
+    }
+    let reachable = |root: QueryNodeId, boundaries: &BTreeSet<QueryNodeId>| {
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !programs.contains_key(&id)
+                || (id != root && boundaries.contains(&id))
+                || !seen.insert(id)
+            {
+                continue;
+            }
+            pending.extend(entry.nodes[&id].inputs());
+        }
+        seen
+    };
+    // A producer consumed across an I/O boundary remains one separately scheduled
+    // physical output, rather than being duplicated into both downstream graphs.
+    let mut owners = BTreeMap::<QueryNodeId, usize>::new();
+    for &root in &roots {
+        for id in reachable(root, &BTreeSet::new()) {
+            *owners.entry(id).or_default() += 1;
+        }
+    }
+    roots.extend(
+        owners
+            .into_iter()
+            .filter_map(|(id, count)| (count > 1).then_some(id)),
+    );
+    let mut replacements = BTreeMap::new();
+    let mut remap = BTreeMap::new();
+    for &root in &roots {
+        let members = reachable(root, &roots);
+        let mut sources = BTreeMap::<u64, InputContract>::new();
+        let mut fragments = BTreeMap::new();
+        for &id in &members {
+            let graph = &programs[&id];
+            let inputs = entry.nodes[&id].inputs();
+            for ((_, contract), input) in graph.input_contracts().zip(inputs) {
+                if !members.contains(input)
+                    && sources
+                        .insert(input.0, contract.clone())
+                        .is_some_and(|previous| previous.schema != contract.schema)
+                {
+                    return Err(invalid("shared physical input has inconsistent schemas"));
+                }
+            }
+            fragments.insert(
+                id.0,
+                (inputs.iter().map(|id| id.0).collect(), graph.clone()),
+            );
+            if id != root {
+                remap.insert(id, root);
+            }
+        }
+        let graph =
+            CompiledPhysicalDag::compose(sources, fragments, vec![root.0]).map_err(invalid)?;
+        replacements.insert(
+            root,
+            QueryPlanNode::PhysicalFragment {
+                inputs: graph
+                    .input_contracts()
+                    .map(|(id, _)| QueryNodeId(id))
+                    .collect(),
+                dag: graph.encode().map_err(invalid)?,
+                row_input: None,
+                pruning: None,
+            },
+        );
+    }
+    for id in remap.keys() {
+        entry.nodes.remove(id);
+    }
+    entry.nodes.extend(replacements);
+    Ok(remap)
 }
 
 #[cfg(test)]
