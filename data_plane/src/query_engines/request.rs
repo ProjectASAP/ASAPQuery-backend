@@ -91,6 +91,11 @@ pub(crate) fn check() -> Result<(), Error> {
 }
 
 pub(crate) fn context(scope: Scope) -> Result<RunContext, Error> {
+    context_with_limits(scope, Limits::default())
+}
+
+/// A request always shares its active control; standalone callers supply their limit.
+pub(crate) fn context_with_limits(scope: Scope, limits: Limits) -> Result<RunContext, Error> {
     check()?;
     ACTIVE.with(|slot| match slot.borrow().as_ref() {
         Some(active) => {
@@ -98,7 +103,7 @@ pub(crate) fn context(scope: Scope) -> Result<RunContext, Error> {
             context.scope = scope;
             Ok(context)
         }
-        None => RunContext::new(scope, Limits::default()),
+        None => RunContext::new(scope, limits),
     })
 }
 

@@ -3869,7 +3869,9 @@ pub use SummarySeriesMetadata as SketchInstanceMetadata;
 // alongside the store that uses it.
 mod admission;
 mod maintenance;
+mod native;
 pub(crate) use maintenance::{CompleteRawMaintenanceCohort, FrozenExactWindows};
+pub use native::NativeReadError;
 pub mod epoch_columnar;
 
 // `persistence` moved up to `sketch_db::persistence`. Re-exported here

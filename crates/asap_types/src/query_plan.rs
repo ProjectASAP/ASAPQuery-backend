@@ -6,7 +6,8 @@
 //! searching for compatible materializations.
 
 pub mod current_series;
-pub mod query_time;
+mod native;
+pub mod residual;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -295,6 +296,9 @@ pub use crate::executable_plan::QueryNodeId;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct QueryPlanEntry {
+    /// Planner-selected native computation, persisted before activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_dag: Option<serde_json::Value>,
     #[serde(default)]
     pub language: QueryLanguage,
     pub query_id: String,
@@ -422,6 +426,15 @@ impl QueryPlanEntry {
                 self.query_id, self.root.0
             )));
         }
+        if self.physical_vector_binding().is_some() {
+            self.recover_vector_physical_dag()?;
+        } else if self.population_snapshot().is_some() {
+            self.recover_population_physical_dag()?;
+        } else if self.physical_dag.is_some() {
+            return Err(QueryPlanError::Invalid(
+                "physical program has no deployment input bindings".into(),
+            ));
+        }
         for (id, node) in &self.nodes {
             if self.language == QueryLanguage::ClickHouseSql
                 && matches!(
@@ -431,7 +444,7 @@ impl QueryPlanEntry {
             {
                 return Err(QueryPlanError::Invalid("SQL plan contains uncompiled relation semantics; recompile the deployment plan".into()));
             }
-            validate_native_relation(*id, node)?;
+
             if let QueryPlanNode::PhysicalRelation { inputs, dag } = node {
                 if self.language != QueryLanguage::ClickHouseSql {
                     return Err(QueryPlanError::Invalid(
@@ -441,6 +454,26 @@ impl QueryPlanEntry {
                 let compiled =
                     asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                         .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                for ((_, contract), input) in compiled.input_contracts().zip(inputs) {
+                    if let Some(QueryPlanNode::ExternalExact { request, .. }) =
+                        self.nodes.get(input)
+                    {
+                        let ExternalExactOutput::Relation { schema } = &request.output else {
+                            return Err(QueryPlanError::Invalid(
+                                "physical relation requires a relational external input".into(),
+                            ));
+                        };
+                        let schema: planner_types::post_asap::SummarySchema =
+                            serde_json::from_value(schema.clone())
+                                .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                        if &schema != contract.schema.as_ref() {
+                            return Err(QueryPlanError::Invalid(
+                                "physical relation input differs from its bound source schema"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
                 if compiled.roots().len() != 1 || compiled.input_contracts().count() != inputs.len()
                 {
                     return Err(QueryPlanError::Invalid(
@@ -732,6 +765,12 @@ pub struct PruningInputContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    /// Typed deployment inputs for the Planner-provided vector computation.
+    Physical {
+        inputs: Vec<QueryNodeId>,
+        source_nodes: Vec<u64>,
+        max_bytes: u64,
+    },
     /// Complete Planner-compiled relation computation; inputs follow its typed slots.
     PhysicalRelation {
         inputs: Vec<QueryNodeId>,
@@ -813,7 +852,8 @@ impl QueryPlanNode {
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
-            Self::PhysicalRelation { inputs, .. }
+            Self::Physical { inputs, .. }
+            | Self::PhysicalRelation { inputs, .. }
             | Self::PhysicalFragment { inputs, .. }
             | Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
@@ -925,6 +965,7 @@ mod contract_tests {
 }
 
 /// Bind portable relation semantics before an installed plan can access its sources.
+#[cfg(test)]
 fn validate_native_relation(id: QueryNodeId, node: &QueryPlanNode) -> Result<(), QueryPlanError> {
     use planner_types::post_asap::{
         ExecutableDagNode, ExecutableOperatorPayload as Payload, ExecutionDataState, PostAsapNodeId,

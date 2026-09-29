@@ -49,8 +49,14 @@ impl SeriesPopulation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SeriesReadout {
-    Quantile { q: f64 },
-    TopK { k: u64 },
+    /// All eligible members for a Planner-compiled physical readout.
+    Snapshot,
+    Quantile {
+        q: f64,
+    },
+    TopK {
+        k: u64,
+    },
     Sum,
     Count,
     Average,

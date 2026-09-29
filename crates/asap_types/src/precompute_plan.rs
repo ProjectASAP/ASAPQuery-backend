@@ -153,6 +153,8 @@ pub struct IngestContract {
 pub enum StateEncoding {
     SketchlibProtobufV1,
     SketchCoreMsgpackV1,
+    /// Backend-produced typed physical output, distinct from legacy sketch frames.
+    NativeBatchV1,
     ExactAccumulatorV1,
     /// Persisted backend state with explicit Planner family and population layout.
     PlannerExactAccumulatorV1,
@@ -569,15 +571,6 @@ impl PrecomputePlan {
                 return Err(invalid());
             }
             validated_source_window_cohort(config, &sources)?;
-            if sources
-                .iter()
-                .any(|source| !matches!(source.aggregation_type, crate::AggregationType::Sum))
-            {
-                return Err(invalid());
-            }
-            if config.window_size != config.slide_interval {
-                return Err(invalid());
-            }
             let mut matched = false;
             for installed in self.executable_dags.values() {
                 let dag = installed
@@ -596,8 +589,30 @@ impl PrecomputePlan {
                         .iter()
                         .find(|node| node.id == *sink)
                         .ok_or_else(invalid)?;
-                    validate_maintenance_reduction(config, target_node)
+                    let native = installed
+                        .native_program(*sink)
                         .map_err(PrecomputePlanError::CatalogContract)?;
+                    if sources.iter().any(|source| {
+                        !matches!(source.aggregation_type, crate::AggregationType::Sum)
+                            && !(native.is_some()
+                                && matches!(source.aggregation_type, crate::AggregationType::Rate))
+                    }) {
+                        return Err(invalid());
+                    }
+                    if native.is_none() {
+                        if config.window_size != config.slide_interval {
+                            return Err(invalid());
+                        }
+                        validate_maintenance_reduction(config, target_node)
+                            .map_err(PrecomputePlanError::CatalogContract)?;
+                    } else if !matches!(
+                        config.aggregation_type,
+                        crate::AggregationType::CountMinSketchWithHeap
+                            | crate::AggregationType::CountSketchWithHeap
+                            | crate::AggregationType::Sum
+                    ) {
+                        return Err(invalid());
+                    }
                     let inputs: Vec<_> = dag
                         .edges
                         .iter()
@@ -877,7 +892,7 @@ impl PrecomputePlan {
                         crate::WindowKind::Session => None,
                     }
                 || schema.window.pane_origin_ms != materialization.pane_origin_ms
-                || schema.encodings != state_encodings(&accumulator.family)
+                || !state_encodings_match(&accumulator.family, &schema.encodings)
             {
                 return Err(PrecomputePlanError::InvalidSchema {
                     schema_id: schema.schema_id.clone(),
@@ -925,8 +940,22 @@ pub(crate) fn state_schema_id(fingerprint: crate::PolicyFingerprint) -> String {
     format!("{}:summary-state:v1:{}", BACKEND_COMPAT, fingerprint.0)
 }
 
+// Persisted schemas may declare a subset of formats. Adding a decoder must
+// not invalidate existing installed plans that use only older supported codecs.
+pub(crate) fn state_encodings_match(
+    family: &SummaryFamilyType,
+    encodings: &[StateEncoding],
+) -> bool {
+    let supported = state_encodings(family);
+    !encodings.is_empty()
+        && encodings.iter().collect::<BTreeSet<_>>().len() == encodings.len()
+        && encodings
+            .iter()
+            .all(|encoding| supported.contains(encoding))
+}
+
 pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
-    match family {
+    let mut encodings = match family {
         SummaryFamilyType::ExactAggregate(
             planner_types::post_asap::ExactKind::Increase
             | planner_types::post_asap::ExactKind::Rate,
@@ -954,7 +983,25 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
             StateEncoding::SketchCoreMsgpackV1,
         ],
         _ => Vec::new(),
+    };
+    if matches!(
+        family,
+        SummaryFamilyType::ExactAggregate(
+            planner_types::post_asap::ExactKind::Sum
+                | planner_types::post_asap::ExactKind::Count
+                | planner_types::post_asap::ExactKind::Min
+                | planner_types::post_asap::ExactKind::Max
+                | planner_types::post_asap::ExactKind::Rate
+                | planner_types::post_asap::ExactKind::Increase,
+            _
+        )
+    ) || matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(),
+            SketchAlgorithm::Kll | SketchAlgorithm::DDSketch | SketchAlgorithm::Hll |
+            SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
+    {
+        encodings.push(StateEncoding::NativeBatchV1);
     }
+    encodings
 }
 
 #[cfg(test)]
@@ -972,6 +1019,36 @@ mod source_window_cohort_tests {
         }))
         .unwrap()
     }
+    // New native-format support must not invalidate persisted older codec subsets.
+    #[test]
+    fn older_encoding_subsets_remain_valid_and_unknown_codecs_fail() {
+        use planner_types::post_asap::{SketchKind, SketchParams};
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+            Default::default(),
+        );
+        assert!(state_encodings_match(
+            &family,
+            &[
+                StateEncoding::SketchlibProtobufV1,
+                StateEncoding::SketchCoreMsgpackV1
+            ]
+        ));
+        assert!(state_encodings_match(
+            &family,
+            &[StateEncoding::NativeBatchV1]
+        ));
+        assert!(!state_encodings_match(&family, &[]));
+        assert!(!state_encodings_match(
+            &family,
+            &[StateEncoding::ExactAccumulatorV1]
+        ));
+        assert!(!state_encodings_match(
+            &family,
+            &[StateEncoding::NativeBatchV1, StateEncoding::NativeBatchV1]
+        ));
+    }
+
     #[test]
     fn producer_roster_roundtrip_and_watermark_scope() {
         let envelope = PlanEnvelope {

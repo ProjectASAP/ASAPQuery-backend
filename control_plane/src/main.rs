@@ -204,7 +204,11 @@ struct CompileAndPublishPhysicalPlanRequest {
     target_collector_ids: Vec<String>,
     capability_snapshot_id: String,
     #[serde(default)]
+    data_snapshot_id: Option<String>,
+    #[serde(default)]
     evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
+    #[serde(default)]
+    accuracy_evidence: HashMap<String, physical::compiler::ScopedAccuracyEvidence>,
     #[serde(default)]
     exact_composition_costs:
         HashMap<String, Vec<physical::post_asap::cost_model::ExactCompositionCostEvidence>>,
@@ -378,7 +382,7 @@ async fn compile_and_publish_physical_plan(
 
     Json(CompileAndPublishPhysicalPlanResponse {
         cost_comparison: bundle.cost_comparison,
-        planner_selection_trace: bundle.planner_selection_trace,
+        planner_selection_trace: bundle.planner_selection_trace.as_ref().clone(),
         plan_id: bundle.envelope.plan_id,
         plan_version: bundle.envelope.plan_version,
         status: "active",
@@ -589,7 +593,7 @@ fn compile_physical_plan_request(
             legacy_query_source: planner_types::pre_asap::Source::TimeSeries {
                 metric: query.metric,
             },
-            query_lookback_seconds: query.window_secs,
+            query_lookback_ms: query.window_secs.saturating_mul(1_000),
             group_by_labels: query.group_by,
             accuracy_target: query.accuracy,
             summary_lifecycle_inputs: query.lifecycle,
@@ -598,29 +602,69 @@ fn compile_physical_plan_request(
         });
     }
 
-    let planner_selection_trace = match physical::compiler::select_logical_roots_with_trace(
-        &mut queries,
-        canonical_roots.clone(),
-        &request.evidence,
-        &request.exact_composition_costs,
-        request.erp.as_ref(),
-    ) {
-        Ok(trace) => trace,
-        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
-    };
+    let scoped_snapshot_id = request.data_snapshot_id.as_deref().or_else(|| {
+        request
+            .workload_cost_evidence
+            .as_ref()
+            .map(|evidence| evidence.data_snapshot_id.as_str())
+    });
+    if request.data_snapshot_id.as_ref().is_some_and(|id| {
+        request
+            .workload_cost_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.data_snapshot_id != *id)
+    }) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "accuracy evidence data snapshot differs from workload cost evidence".into(),
+        ));
+    }
+    for (query_id, evidence) in &request.accuracy_evidence {
+        let Some(query) = queries.iter().find(|query| &query.query_id == query_id) else {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("accuracy evidence names unknown query {query_id}").into(),
+            ));
+        };
+        evidence
+            .validate(
+                query_id,
+                &query.query_string,
+                &request.data_workload,
+                scoped_snapshot_id,
+                now,
+                request.max_evidence_age_ms,
+            )
+            .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
+    }
+    let planner_selection_trace =
+        match physical::compiler::select_logical_roots_with_scoped_evidence_and_trace(
+            &mut queries,
+            canonical_roots.clone(),
+            &request.evidence,
+            &request.accuracy_evidence,
+            &request.exact_composition_costs,
+            request.erp.as_ref(),
+            now,
+        ) {
+            Ok(trace) => trace,
+            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
+        };
 
     for (query, model) in queries.iter_mut().zip(window_models) {
         physical::compiler::prepare_window_implementations(query, &model, request.target, 0)
             .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
     }
     let compilation_request = physical::compiler::PhysicalCompilationRequest {
-        planner_selection_trace,
+        planner_candidate_forests: Vec::new(),
+        planner_selection_trace: planner_selection_trace.into(),
         query_workload: Some(query_workload),
         data_workload: Some(request.data_workload),
         canonical_roots,
         queries,
         allow_mixed_summary_and_exact_execution: request.target
             == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+        require_backend_local_execution: false,
         enabled_materialization_keys: None,
         topk_membership_evidence_by_query_id: request.evidence,
         exact_composition_costs: request.exact_composition_costs,
@@ -646,7 +690,7 @@ fn compile_physical_plan_request(
         compilation_request.clone(),
     )
     .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
-    let planner_selection_trace = compilation_request.planner_selection_trace.clone();
+    let planner_selection_trace = compilation_request.planner_selection_trace.as_ref().clone();
     let (manifests, candidate_evaluations) =
         physical::workload_cost::compile_candidates_for_pricing(
             candidates.clone(),
@@ -929,7 +973,7 @@ mod api_tests {
             "target": "backend_local_remote_write",
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
-                "metric": metric, "window_secs": query.query_lookback_seconds, "accuracy": query.accuracy_target,
+                "metric": metric, "window_secs": query.query_lookback_ms / 1_000, "accuracy": query.accuracy_target,
                 "lifecycle": query.summary_lifecycle_inputs, "evaluation_phase_ms": 0, "window_cost_model": { "implementation_id": "test", "cost": query.window_realization_candidates[0].cost }
             }],
             "dataset_identity": snapshot.environment.dataset_identity,

@@ -6,6 +6,7 @@ pub mod group_key;
 pub mod ingest_handler;
 pub mod maintenance_runtime;
 pub(crate) mod metrics;
+mod native_precompute;
 pub mod output_sink;
 pub mod raw_dag;
 pub mod series_router;

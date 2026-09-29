@@ -68,15 +68,15 @@ impl DagPartitioning {
             Self::Labels(names) => {
                 let pairs = names
                     .iter()
+                    // Missing and empty PromQL grouping labels denote the same
+                    // group. Ownership must colocate them without adding a label.
                     .map(|name| {
-                        population
-                            .get(name)
-                            .map(|value| (name.as_str(), value.as_str()))
-                            .ok_or_else(|| {
-                                format!("DAG partition label {name} is absent from population")
-                            })
+                        (
+                            name.as_str(),
+                            population.get(name).map(String::as_str).unwrap_or(""),
+                        )
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Vec<_>>();
                 let key = super::group_key::GroupKey::new(pairs);
                 Ok(xxh64(key.canonical_bytes(), 0) as usize % workers)
             }
@@ -99,7 +99,11 @@ mod tests {
             series.insert("instance".into(), instance.into());
             assert_eq!(rule.owner(&series, 4).unwrap(), expected);
         }
-        assert!(rule.owner(&BTreeMap::new(), 4).is_err());
+        assert_eq!(
+            rule.owner(&BTreeMap::new(), 4).unwrap(),
+            rule.owner(&BTreeMap::from([("service".into(), "".into())]), 4)
+                .unwrap()
+        );
         assert!(rule.owner(&group, 0).is_err());
         let owners = (0..64)
             .map(|i| {
