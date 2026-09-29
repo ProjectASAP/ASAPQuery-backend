@@ -1,14 +1,14 @@
 //! Bind deployment inputs to retained native programs and decode PromQL results.
-use super::{grouping_key, miss, EngineError, Grouping, Labels, Vector};
+use super::{miss, EngineError, Labels, Vector};
 use asap_physical_operators::dag::{
-    self, batch_execution,
-    operators::{Operator, SortKey},
+    self,
+    operators::Operator,
     values::{Batch, Schema, Value},
 };
-use planner_types::{
-    post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
-    pre_asap::DataType,
-};
+#[cfg(test)]
+use planner_types::post_asap::{SummaryField, SummarySchema};
+use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+#[cfg(test)]
 use std::sync::Arc;
 
 /// Bind protocol values without choosing matching, grouping or arithmetic behavior.
@@ -22,7 +22,8 @@ pub(super) fn complete_values(
     let program = CompiledPhysicalDag::decode(encoded)?;
     let scalar = promql_values::scalar_schema();
     let vector = promql_values::vector_schema();
-    let compatible = |schema: &Schema| schema == &scalar || schema == &vector;
+    let matrix = promql_values::matrix_schema();
+    let compatible = |schema: &Schema| schema == &scalar || schema == &vector || schema == &matrix;
     if program.roots().len() != 1
         || !program
             .input_contracts()
@@ -45,6 +46,20 @@ pub(super) fn complete_values(
             super::Value::Vector(values) if contract.schema == vector => values
                 .iter()
                 .map(|(labels, value)| vec![super::native_labels(labels), Value::Float64(*value)])
+                .collect(),
+            super::Value::Matrix(values, start, end) if contract.schema == matrix => values
+                .iter()
+                .flat_map(|(labels, points)| {
+                    points.iter().map(move |(time, value)| {
+                        vec![
+                            super::native_labels(labels),
+                            Value::Timestamp(*time),
+                            Value::Float64(*value),
+                            Value::Timestamp(*start),
+                            Value::Timestamp(*end),
+                        ]
+                    })
+                })
                 .collect(),
             _ => {
                 return Err(miss(
@@ -92,6 +107,7 @@ pub(super) fn complete_values(
     }
 }
 
+#[cfg(test)]
 fn schema(fields: &[(&str, DataType)]) -> Schema {
     Arc::new(SummarySchema {
         fields: fields
@@ -105,84 +121,6 @@ fn schema(fields: &[(&str, DataType)]) -> Schema {
         time_index: None,
     })
 }
-fn key<T: serde::Serialize>(value: &T) -> Value {
-    Value::Utf8(
-        serde_json::to_string(value)
-            .expect("string keys serialize")
-            .into(),
-    )
-}
-fn ranked_batch(values: &Vector, grouping: &Grouping) -> Result<Batch, EngineError> {
-    let schema = schema(&[
-        ("index", DataType::Int64),
-        ("group", DataType::Utf8),
-        ("value", DataType::Float64),
-    ]);
-    Batch::try_new(
-        schema,
-        values
-            .iter()
-            .enumerate()
-            .map(|(i, (labels, v))| {
-                vec![
-                    Value::Int64(i as i64),
-                    key(&grouping_key(labels, grouping)),
-                    Value::Float64(*v),
-                ]
-            })
-            .collect(),
-    )
-    .map_err(EngineError::from)
-}
-fn output(values: Vector, batches: Vec<dag::SharedValue<Batch>>) -> Result<Vector, EngineError> {
-    batches
-        .iter()
-        .flat_map(|b| b.rows())
-        .map(|row| match row.first() {
-            Some(Value::Int64(index)) => values
-                .get(*index as usize)
-                .cloned()
-                .ok_or_else(|| miss("native result index outside input")),
-            _ => Err(miss("native result has no row identity")),
-        })
-        .collect()
-}
-pub(super) fn sort(
-    values: Vector,
-    grouping: &Grouping,
-    descending: bool,
-    context: dag::RunContext,
-) -> Result<Vector, EngineError> {
-    let batch = ranked_batch(&values, grouping)?;
-    let op = Operator::sort(
-        batch.schema().clone(),
-        vec![SortKey {
-            column: 2,
-            descending,
-            nulls_first: false,
-        }],
-        vec![1],
-    )
-    .map_err(EngineError::from)?;
-    let result =
-        batch_execution::evaluate_batch(batch, vec![op], context).map_err(EngineError::from)?;
-    output(values, result)
-}
-pub(super) fn limit(
-    values: Vector,
-    grouping: &Grouping,
-    n: u64,
-    offset: u64,
-    context: dag::RunContext,
-) -> Result<Vector, EngineError> {
-    let batch = ranked_batch(&values, grouping)?;
-    let op =
-        Operator::limit(batch.schema().clone(), n, offset, vec![1]).map_err(EngineError::from)?;
-    let result =
-        batch_execution::evaluate_batch(batch, vec![op], context).map_err(EngineError::from)?;
-    output(values, result)
-}
-/// Relational boundary used by explicit row plans. Planner owns predicate lowering.
 #[cfg(test)]
 pub(super) fn relation(
     values: Vector,
@@ -201,18 +139,6 @@ pub(super) fn relation(
     use planner_types::post_asap::{
         ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
     };
-    let pruning = completeness
-        .as_ref()
-        .map(|completeness| {
-            Ok::<_, EngineError>(asap_types::query_plan::PruningInputContract {
-                candidate_input: 1,
-                keys: asap_physical_operators::physical_planner::equijoin_keys(
-                    &predicate, &left, &right,
-                )?,
-                completeness: completeness.clone(),
-            })
-        })
-        .transpose()?;
     let node = ExecutableDagNode {
         id: PostAsapNodeId(2),
         output_state: ExecutionDataState::QUERY_ROWS,
@@ -236,9 +162,6 @@ pub(super) fn relation(
     )?;
     let encoded = compiled.encode()?;
     let inputs = vec![values, candidates];
-    if let Some(pruning) = pruning {
-        validate_pruning(&encoded, &inputs, 0, &pruning, at, context.clone())?;
-    }
     physical(&encoded, inputs, Some(0), at, context)
 }
 
@@ -397,66 +320,10 @@ pub(super) fn physical(
     }
 }
 
-pub(super) fn validate_pruning(
-    encoded: &[u8],
-    inputs: &[Vector],
-    row_input: usize,
-    contract: &asap_types::query_plan::PruningInputContract,
-    at: i64,
-    context: dag::RunContext,
-) -> Result<(), EngineError> {
-    use asap_physical_operators::physical_planner::{CompiledPhysicalDag, InputContract};
-    use planner_types::post_asap::CandidateCompleteness;
-    if !matches!(
-        contract.completeness,
-        CandidateCompleteness::Certified { .. }
-    ) {
-        return Ok(());
-    }
-    let compiled = CompiledPhysicalDag::decode(encoded)?;
-    let schemas = compiled
-        .input_contracts()
-        .map(|(_, c)| c.schema.clone())
-        .collect::<Vec<_>>();
-    let candidates = inputs
-        .get(contract.candidate_input)
-        .ok_or_else(|| miss("missing candidate input"))?;
-    let values = inputs
-        .get(row_input)
-        .ok_or_else(|| miss("missing authoritative input"))?;
-    let coverage = Operator::semi_join(
-        schemas[contract.candidate_input].clone(),
-        schemas[row_input].clone(),
-        contract.keys.iter().map(|&(l, r)| (r, l)).collect(),
-    )?;
-    let check = CompiledPhysicalDag::from_operators(
-        [
-            (
-                0,
-                InputContract::bounded(schemas[contract.candidate_input].clone()),
-            ),
-            (1, InputContract::bounded(schemas[row_input].clone())),
-        ]
-        .into(),
-        [(2, (vec![0, 1], coverage))].into(),
-        vec![2],
-    )?;
-    let matched = physical(
-        &check.encode()?,
-        vec![candidates.clone(), values.clone()],
-        Some(0),
-        at,
-        context,
-    )?;
-    if matched.len() != candidates.len() {
-        return Err(miss("certified pruning key has no authoritative value"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asap_physical_operators::operators::SortKey;
     use asap_physical_operators::{
         physical_planner::{CompiledPhysicalDag, InputContract},
         Error,

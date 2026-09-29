@@ -486,6 +486,7 @@ impl QueryPlanEntry {
                 let value_schema = |schema: &asap_physical_operators::values::Schema| {
                     schema == &promql_values::scalar_schema()
                         || schema == &promql_values::vector_schema()
+                        || schema == &promql_values::matrix_schema()
                 };
                 let canonical_values = compiled
                     .input_contracts()
@@ -601,12 +602,29 @@ impl QueryPlanEntry {
                         .get(pruning.candidate_input)
                         .ok_or_else(|| QueryPlanError::Invalid("invalid candidate input".into()))?
                         .1;
-                    asap_physical_operators::operators::Operator::semi_join(
-                        left.schema.clone(),
-                        right.schema.clone(),
-                        pruning.keys.clone(),
-                    )
-                    .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                    if matches!(
+                        pruning.completeness,
+                        CandidateCompleteness::Certified { .. }
+                    ) && compiled.certified_pruning_keys(compiled.roots()[0])
+                        != Some(pruning.keys.as_slice())
+                    {
+                        return Err(QueryPlanError::Invalid(
+                            "certified pruning binding requires native coverage validation".into(),
+                        ));
+                    }
+                    for &(l, r) in &pruning.keys {
+                        if left
+                            .schema
+                            .fields
+                            .get(l)
+                            .zip(right.schema.fields.get(r))
+                            .is_none_or(|(l, r)| l.dtype != r.dtype)
+                        {
+                            return Err(QueryPlanError::Invalid(
+                                "invalid pruning key types".into(),
+                            ));
+                        }
+                    }
                 }
                 if compiled.input_contracts().count() != inputs.len()
                     || compiled.roots().len() != 1

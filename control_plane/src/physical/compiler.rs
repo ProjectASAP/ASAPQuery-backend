@@ -2447,7 +2447,14 @@ impl DeploymentPlanCompiler {
                     .as_ref()
                     .map(|candidate| &candidate.query),
             )?;
-            crate::query_plan::physical_values::compile(&mut entry)?;
+            let linked = crate::query_plan::physical_values::compile(&mut entry)?;
+            for ((index, _), node) in &mut query_node_bindings {
+                if *index == query_index {
+                    if let Some(root) = linked.get(node) {
+                        *node = *root;
+                    }
+                }
+            }
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
                 return Err(CompileError::Query {
