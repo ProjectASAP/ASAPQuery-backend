@@ -9,7 +9,7 @@ integration.
   by the following three designs.
 - [Binding Planner Physical DAGs to deployment plans](asapplanner-integration.md)
   defines how backend source/state bindings and operational policy instantiate
-  Planner-provided maintenance and query computation.
+  Planner-provided precomputation and query computation.
 - [Summary definitions table and SDS](summary-catalog-sds-architecture.md) owns definition
   and instance identity, version-scoped state references, read eligibility and
   committed-state metadata.

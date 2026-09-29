@@ -113,5 +113,5 @@ Planner/ERP inputs through shared SDS descriptors, PrecomputePlan, physical
 instances and QueryPlan. Remote-write queue admission is not durable raw-data
 commit. Finite drain and typed producer-watermark completion are different
 protocols; the sample stream does not supply an authoritative watermark.
-See [maintenance replay](../developer_docs/maintenance-replay.md) for the
+See [maintenance replay](../developer_docs/precomputation-replay.md) for the
 current durable and continuous boundaries.

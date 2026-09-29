@@ -42,7 +42,7 @@ for every target collector. Legacy
 they are not a second semantic planner.
 
 ASAPPlanner owns semantics and physical candidate construction, including summary
-families, maintenance lifecycles and physical boundaries. Backend evaluates
+families, precomputation update lifecycles and physical boundaries. Backend evaluates
 candidate feasibility and complete workload-scoped costs, then selects and binds
 the deployment without changing its computation.
 Missing or stale implementation evidence makes the candidate unavailable; the
@@ -117,7 +117,7 @@ Why this interface exists: it prevents adapters, protocols, and physical
 planning from each implementing their own query-to-summary mapping.
 
 Snapshot and HTTP adapters provide the same `WindowCostModel`. After logical
-selection, one generator enumerates layouts allowed by each state's maintenance
+selection, one generator enumerates layouts allowed by each state's precomputation
 requirements and deployment target, then derives or matches layout-specific costs.
 See [repeated window planning](../planning/repeated-dashboard-panes.md) for inputs,
 migration and cadence examples.
@@ -228,8 +228,9 @@ Graph traversal is separate from node definitions and store semantics.
 Activation validates roots, edges, bindings, reachability, and cycles.
 The shared physical DAG runtime creates one producer per reachable node and
 shares its outputs with bounded buffering within the request,
-so a shared node in a diamond DAG performs one store/operator execution. A
-typed node failure follows the entry's explicit fallback route.
+so a shared node in a diamond DAG performs one store/operator execution. Only an
+eligible availability failure follows the entry's explicit fallback route.
+Resource exhaustion and cancellation terminate execution without fallback.
 
 ### What the compiler puts in CollectorPlan
 

@@ -14,7 +14,7 @@ be changed and tested together in Planner.
 The query and precompute integration PRs both use the independent ASAP DAG runtime. Deployment code binds input
 sources, storage, ingestion windows, publication and protocol outputs. Execution
 phase belongs to the physical node's data state, not the operator payload.
-Computation has the same semantics at ingestion time and query time.
+Computation has the same semantics during precomputation and query execution.
 
 Candidate pruning uses a general semi-join with explicit matching keys, followed
 by grouped Sort and grouped Limit. The completeness certificate belongs to the
@@ -39,7 +39,7 @@ the backend can execute arbitrary raw-only installed plans.
 
 Planner PR #462 owns the library and depends on Planner #461, including its
 composed candidate-pruning API. Backend #774 consumes the pinned library;
-#763 integrates ingestion DAG execution and #765 integrates query DAG execution.
+#763 integrates precomputation DAG execution and #765 integrates query DAG execution.
 The remaining backend stack builds on those integrations. #728 checks candidate
 structure, #742 checks selection with synthetic costs, and #775 checks installed
 plans against data-plane results. Production evidence and performance validation
@@ -61,7 +61,8 @@ The backend `DeploymentPlanCompiler` binds declared historical query delay to
 retention; it does not change a logical selector's lookback. Current-series
 populations retain bounded versions only when the deployment requests historical
 coverage. Their current and retained versions share the population memory budget.
-Late revisions invalidate old coverage; missing or evicted state fails explicitly.
+Changed inputs require a new output revision; an older common snapshot remains
+eligible while it satisfies freshness. Missing or evicted state fails explicitly.
 Candidate costing includes version residency, copying and retirement.
 
 Every installed range evaluation uses the shared DAG execution path and reports
@@ -78,6 +79,7 @@ its labels from the candidate side. The native join performs the comparison.
 
 Physical execution errors retain their original cause. Memory exhaustion and
 cancellation terminate both instant and range requests; routing does not try a
-second engine or exact fallback. Physical fragments in one query evaluation share
-one run context. This does not yet account for every protocol-buffer allocation
-or provide an HTTP-disconnect cancellation mechanism.
+second engine or exact fallback. All range steps and nested physical executions share one request budget and
+cancellation signal, while retaining separate execution state. Tracked inputs,
+workspace and results count against that budget; estimates are not a hard RSS
+limit. See [query execution contracts](query-dag-execution.md#request-consistency-and-resource-contracts).
