@@ -1,169 +1,305 @@
-# Query DAG execution
+# Query DAG Execution
 
-## Decision and ownership
+## 1. Overview
 
-ASAPPlanner owns `asap-physical-operators`, its independent DAG runtime and the
-post-ASAP IR that defines its computation contract. The precomputation engine and query
-engine consume the same library. Changes to an IR operation and its execution
-implementation can be reviewed in one Planner PR.
-
-The backend owns source binding, window selection, catalog and storage access,
-publication, and protocol conversion. It does not maintain copies of the shared
-runtime or generic computation algorithms. JSON and Arrow conversion at the SQL
-boundary does not make Arrow the internal representation of every summary.
-
-The [shared library design](https://github.com/ProjectASAP/ASAPPlanner/blob/feat/shared-physical-operators/docs/design_docs/physical-planning-and-deployment.md)
-contains the architecture and DataFusion comparison. DataFusion provides mature
-Arrow operators; ASAP's independent runtime directly owns shared producers and
-custom summary state formats. Those states need not fit Arrow RecordBatch.
-
-## Execution model
-
-A plan is a DAG of typed operations. A producer can have multiple consumers and
-executes once per run. Each consumer sees its output independently. The runtime
-owns dependency scheduling, bounded buffering, cancellation and request-local
-caching of intermediate results. Separate query evaluation times and precomputation
-windows have separate execution state.
-
-Ingestion means accepting input data. Precomputation means executing a selected
-Physical DAG before a query request, including work triggered by ingestion or
-scheduled window processing. Query execution evaluates the selected request-time
-DAG. Build, merge and readout are reusable operators; their placement belongs to
-the selected plan, not the operator kind.
+ASAP uses one physical-operator library and one DAG runtime for both
+precomputation and query execution.
 
 ```mermaid
 flowchart LR
-  Request[Query request] --> Entry[Installed QueryPlanEntry]
-  Entry --> Bind[Bind shared physical DAG]
-  Bind --> Run[Execute dependencies and physical operators]
-  Run --> Result[Convert root output to query response]
-  Store[SummaryStore] -->|local snapshot candidate| Bind
-  Exact[Declared external exact source] -->|external-only candidate| Bind
-  Planner[post-ASAP physical DAG contract] --> Bind
+    IR["Post-ASAP IR"] --> Compile["Physical Planner"]
+    Compile --> DAG["CompiledPhysicalDag"]
+    DAG --> PreBind["Precomputation bindings"] --> PreRun["Precomputation"]
+    PreRun --> Store["SummaryStore"]
+    DAG --> QueryBind["Query bindings"] --> QueryRun["Query execution"]
+    Store --> QueryBind
+    QueryRun --> Result["Query result"]
 ```
 
-The installed plan carries deployment bindings and source references. Planner
-operations retain Planner types, parameters, expressions and grouping semantics.
-SQL relation nodes bind through the shared Planner binder and execute in one
-shared DAG. Their storage frontiers execute together as multiple roots, sharing
-upstream work and the enclosing cancellation and memory budget. PromQL bindings convert labeled vectors and windows to native
-batches; common arithmetic, aggregation, sorting, limiting and temporal
-computation execute in the library. Metric-name presentation and protocol
-matching remain deployment bindings.
+The key separation is:
 
-## Request consistency and resource contracts
+- ASAPPlanner defines computation: physical operators, DAG compilation, and DAG execution.
+- Backend defines deployment: where inputs come from, which revisions and windows
+  are valid, how summaries are stored, and how results are exposed through SQL or PromQL.
 
-One installed query request owns one budget and cancellation signal. Range
-steps and nested physical DAGs have separate execution state but share that
-control. Tracked memory includes the pinned SDS/current-series view, prepared
-inputs, native workspace, and retained results. JSON decoding and SQL encoding
-use conservative workspace estimates; this is not a process-wide RSS limit.
-Releasing an allocation returns its budget. Resource exhaustion or cancellation
-terminates the request and must not trigger exact fallback, even if a revision
-changes concurrently.
+The same `CompiledPhysicalDag` representation is reusable across precomputation
+and query execution. The selected plan may contain different DAGs for these phases.
+
+## 2. Ownership
+
+### ASAPPlanner
+
+ASAPPlanner owns the post-ASAP IR, logical and physical operator implementations,
+`asap-physical-operators`, `physical_planner`, `CompiledPhysicalDag`, and the
+independent DAG runtime. A change to an IR operation and its execution
+implementation can therefore be reviewed in one Planner PR.
+
+The runtime owns generic execution behavior:
+
+- dependency scheduling;
+- shared-producer execution;
+- bounded buffering;
+- cancellation;
+- per-run reuse of intermediate outputs;
+- operator workspace accounting.
+
+A producer with multiple consumers executes once per DAG run, while each
+consumer independently receives its output.
+
+### Backend
+
+Backend owns deployment-specific concerns:
+
+- source binding and window selection;
+- catalog and storage access;
+- revision and coverage admission;
+- summary publication;
+- protocol conversion;
+- query and precomputation bindings.
+
+It does not duplicate Planner operators or maintain a second DAG runtime.
+JSON, Arrow, SQL, and PromQL are boundary representations; they do not determine
+the internal representation of every ASAP summary.
+
+See the [shared library design](https://github.com/ProjectASAP/ASAPPlanner/blob/feat/shared-physical-operators/docs/design_docs/physical-planning-and-deployment.md)
+for the broader architecture and DataFusion comparison.
+
+## 3. Compilation and execution
+
+```text
+post-ASAP IR
+     │ physical_planner
+     ▼
+CompiledPhysicalDag
+     │ bind deployment inputs
+     ▼
+Executable DAG instance
+     │ shared DAG runtime
+     ▼
+outputs
+```
+
+### 3.1 Compile
+
+ASAPPlanner compiles the selected post-ASAP computation and physical contracts
+into a `CompiledPhysicalDag`. Compilation resolves operator semantics but does
+not require live storage readers.
+
+### 3.2 Bind
+
+Backend binds deployment inputs to the compiled DAG. Conceptually:
+
+```text
+Summary-state input → eligible SummaryStore records
+Vector input        → labeled values and a PromQL window
+Relation input      → typed SQL/storage relation
+```
+
+Admission and binding validate types, state formats, grouping, windows,
+revisions, and coverage. They do not repeat operator lowering.
+
+### 3.3 Execute
+
+The shared runtime executes the instantiated DAG.
+
+```mermaid
+flowchart LR
+    A["Input"] --> B["Shared producer"]
+    B --> C["Consumer A"] --> E["Root 1"]
+    B --> D["Consumer B"] --> F["Root 2"]
+```
+
+The shared producer executes once. Multiple roots share upstream computation,
+cancellation, and the enclosing memory budget.
+
+## 4. Precomputation and query execution
+
+Ingestion means accepting input data. Precomputation means executing a selected
+DAG before a query request, including work triggered by ingestion or scheduled
+window processing.
+
+Operator type does not determine execution phase. The selected plan determines
+whether an operation executes during precomputation or at query time.
+
+For example, partial precomputation can use:
+
+```text
+Precomputation: raw data → BuildKLL → SummaryStore
+Query:         SummaryStore → ReadKLL → Quantile(0.99) → result
+```
+
+The same operator library executes both DAGs.
+
+| Mode | Pre-request work | Request-time work |
+| --- | --- | --- |
+| No precomputation | None | All required computation |
+| Partial precomputation | Store intermediate values or states | Complete the remaining DAG |
+| Full precomputation | Complete all data-dependent computation | Retrieve the prepared result |
+
+These definitions are independent of the algorithm. Reading stored KLL state
+and computing its quantile at query time is partial precomputation.
+Build, merge, and readout are reusable operators rather than phase-specific operators.
+
+## 5. Query execution
+
+An installed query brings together these contracts:
+
+```text
+Installed query
+  ├── QueryPlanEntry: nodes, dependencies and root
+  ├── Planner-compiled physical computation
+  ├── deployment bindings and source references
+  ├── window contract
+  └── catalog generation
+```
+
+This is an architectural view, not the serialized field layout of
+`QueryPlanEntry`; some contracts live in its enclosing plan or bound runtime graph.
+
+At request time:
+
+```mermaid
+flowchart LR
+    Request["Query request"] --> Entry["Installed query"]
+    Entry --> Validate["Admit sources and pin eligible snapshot"]
+    Validate --> Bind["Bind inputs within request budget"]
+    Bind --> Execute["Execute DAG"]
+    Execute --> Convert["Protocol conversion"] --> Result["Query result"]
+```
+
+SQL relation nodes and PromQL vector operations use the same Planner physical
+DAG representation. SQL adapters bind relations and convert results at the
+protocol boundary. PromQL adapters bind labeled vectors and windows. Common
+arithmetic, aggregation, sorting, limiting, joins, and temporal computation
+belong in the shared physical-operator library.
+
+## 6. Request consistency
+
+One installed query request owns one cancellation signal and one resource
+budget. A request over continuous local inputs also pins one eligible input
+snapshot. Range steps have separate DAG execution state but share these controls.
 
 ```text
 range request
-  ├─ pin one eligible input snapshot
+  ├─ pin eligible snapshot
   ├─ prepare inputs                 ┐
-  ├─ execute t1 → retain result      ├─ one request budget
-  ├─ execute t2 → retain result      │  and cancellation signal
+  ├─ execute t1 → retain result      ├─ shared budget
+  ├─ execute t2 → retain result      │  and cancellation
   └─ return accumulated result      ┘
 ```
 
-For continuous local input, PromQL and SQL pin a common eligible revision across
-all required outputs. Partial publication of r2 does not invalidate a complete
-r1 that still satisfies freshness and coverage. The selected QueryPlan's
-catalog generation remains mandatory.
+Tracked memory includes pinned SDS/current-series state, prepared inputs,
+operator workspace, and retained results. JSON decoding and SQL encoding use
+conservative workspace estimates; accounting is not a hard process RSS limit.
 
-External exact adapters currently provide evaluation time, not a source
-snapshot token. Consequently a candidate combining local SDS/current-series
-state with external exact data is rejected during installation and checked
-again before source access. This includes summary-derived candidate pruning.
-Equal timestamps cannot establish equal input revisions:
+Resource exhaustion or cancellation terminates the request without exact
+fallback, even if a revision changes concurrently.
+
+### Snapshot compatibility
+
+All local inputs used by one query must admit a common eligible revision in the
+selected catalog generation. A newer partially published revision does not
+invalidate an older complete revision that still satisfies freshness and coverage.
+
+External exact adapters expose evaluation time but not a source snapshot token.
+The current admission rule therefore rejects a candidate combining local
+SDS/current-series inputs with external exact inputs, including candidate pruning.
+The rule is checked at installation and before source access.
 
 ```text
-local SDS at r1       external exact after a late correction
-       └──────── division ────────┘
-                 rejected: no common snapshot proof
+local SDS @ r1        external exact @ unknown revision
+      \                     /
+       \------ operation ---/
+                │
+                ▼
+             rejected
 ```
 
-A deployment may instead select whole-query exact execution. Resource failure
-in an already executing physical DAG is not permission to make that switch.
-No cross-system snapshot protocol is introduced here.
+Equal timestamps are insufficient to establish equal revisions. Whole-query
+external exact execution remains a separate deployment choice; a resource or
+cancellation failure in a local DAG cannot trigger that choice.
 
-The native context is thread-local to one dedicated request-worker invocation
-because Planner's context is not Send. Async callers signal cancellation to
-that worker; remote waits and nested native polling observe it. The worker
-clears its context when the request exits, so reused threads cannot share
-budgets or cancellation between requests. Cancellation is cooperative at
-polling boundaries, not preemption inside an individual synchronous kernel.
+## 7. Operator and plan acceptance
 
-## Physical operator coverage and acceptance contract
+A local DAG is accepted only if every reachable operation has a compatible
+implementation:
 
-An accepted local plan must have an implementation for every reachable
-operation, including its types, parameters, grouping and state requirements.
-Relation binding checks the same native implementations at installation and
-execution. Unsupported operations must be rejected explicitly. Declaring an
-external source is a separate deployment choice, not evidence of local support.
+```text
+operation
+  ├── implementation exists
+  ├── input/output types match
+  ├── parameters are supported
+  ├── grouping semantics are supported
+  └── required state format is available
+```
 
-Operator support belongs to the [Planner library contract](physical-operators.md),
-not a second backend operator matrix. Deployment acceptance additionally requires
-compatible typed inputs, stored-state formats, grouping, windows, and accuracy
-evidence. A library kernel alone does not establish deployment feasibility.
+Deployment additionally validates source bindings, stored-state formats,
+grouping, windows, revisions, coverage, and approximation evidence where required.
+An operator implementation establishes execution support, not deployment feasibility.
 
-## Candidate pruning and grouped ranking
+Unsupported operations are rejected explicitly. Routing them to an external
+source does not make them locally supported. The [Planner library contract](physical-operators.md)
+owns operator support; Backend does not maintain a second operator matrix.
 
-Candidate pruning is a composed subgraph:
+## 8. Candidate pruning
 
-1. Read candidate keys from a summary.
-2. Obtain authoritative values from a declared source.
-3. Apply a general semi-join on explicit matching keys.
-4. Sort by score and apply Limit independently within each group.
+Candidate pruning is ordinary DAG composition:
 
-There is no dedicated MembershipFilter or grouped TopK physical operator.
-A global Limit is not a grouped Limit. Candidate completeness belongs to the
-pruning certificate; exact scoring and sorting cannot prove that an omitted key
-would not have won. Missing authoritative values fail certified pruning.
-Best-effort pruning remains explicitly approximate. Authoritative local values must
-come from the same pinned input snapshot as the candidate summary. An external
-scoring source is not admitted without a common snapshot proof.
+```mermaid
+flowchart LR
+    Summary["Candidate summary"] --> Keys["Candidate keys"]
+    Keys --> Join["SemiJoin(keys)"]
+    Values["Authoritative values"] --> Join
+    Join --> Sort["Sort(score)"] --> Limit["Limit per group"]
+```
 
-## Precomputation boundary
+This path needs no dedicated `MembershipFilter` or grouped TopK operator.
+Its correctness rules are:
 
-| Precomputation mode | Definition | Backend acceptance |
-| --- | --- | --- |
-| No precomputation | Start from raw data and perform all required computation at query time | Deferred until local raw sources and query-time summary construction are bound |
-| Partial precomputation | Reuse stored results or states and compute the remaining query work at query time | Supported stored-state/value DAGs; plans requiring local raw input remain deferred |
-| Full precomputation | All data-dependent computation of the query result is completed before the request | Retrieve a prepared result matching the requested query and time scope |
+- grouped Limit is distinct from global Limit;
+- candidate completeness comes from the pruning certificate;
+- exact scoring cannot recover a candidate omitted by pruning;
+- missing authoritative values invalidate certified pruning;
+- local candidate and scoring inputs must use the same pinned snapshot.
 
-These definitions are algorithm-independent. KLL tests are examples, not the
-definition of any mode. Reading a prebuilt KLL state and estimating its quantile
-at query time is partial precomputation of the result.
+Best-effort pruning remains explicitly approximate.
 
-## Acceptance
+## 9. Runtime and cancellation
 
-Library tests exercise shared-producer diamonds, multiple consumers,
-backpressure, cancellation, memory accounting, both execution phases, typed
-expressions, joins, grouped Sort/Limit and window computations. Backend tests
-exercise installed source bindings, stored-state reconstruction, query results,
-and rejection of unsupported plans. Tests compare computations against exact
-results or declared approximation guarantees as appropriate.
+Planner's native context is not `Send`, so each request executes through one
+dedicated worker invocation. The worker owns thread-local execution context for
+that request. Async callers signal cancellation, which remote waits and native
+polling observe.
 
-Local raw Scan and a universal implementation of every Planner aggregate or
-extension are not part of this migration. They must not be presented as complete
-through fallback routing or by tests supplied with already decoded raw batches.
+When execution finishes, the worker clears the context before the thread is
+reused. Cancellation is cooperative at polling boundaries; it does not preempt
+an individual synchronous kernel.
 
-## Planner compilation and deployment binding
+## 10. Testing and acceptance
 
-The backend `DeploymentPlanCompiler` establishes state identities, window contracts
-and query and precomputation bindings. ASAPPlanner #462 owns `physical_planner`, native
-operators and DAG execution. Its compiler accepts typed input contracts without
-live readers and produces `CompiledPhysicalDag`; instantiation binds inputs and
-checks their properties without repeating operator lowering.
+| Layer | Required coverage |
+| --- | --- |
+| Planner library | Shared-producer diamonds, multiple consumers, bounded buffering/backpressure, cancellation, memory accounting, both execution phases, typed expressions, joins, grouped Sort/Limit, and window computation |
+| Backend | Installed source bindings, revision and coverage admission, stored-state reconstruction, end-to-end query results, and rejection of unsupported plans |
+| Request contracts | Shared budgets across range steps and nested execution, terminal resource/cancellation errors, snapshot pinning, and rejection of mixed local/external inputs before reads |
 
-The SQL relation adapter composes Planner-compiled operators into that reusable
-physical representation before reading storage, then resolves typed inputs and
-instantiates the selected graph. PromQL vector and precomputation adapters continue
-to supply protocol/window inputs to the same native library. Source coverage,
-revision admission, publication and serving remain deployment responsibilities.
+Results are compared against exact computation or the declared approximation
+guarantee. These acceptance requirements do not imply that every deployment or
+operator combination has been tested.
+
+## 11. Scope
+
+This design establishes the common execution path:
+
+```text
+post-ASAP IR → CompiledPhysicalDag → deployment binding
+            → shared DAG runtime → query/precomputation output
+```
+
+Local raw Scan and universal support for every Planner aggregate or extension
+remain outside this migration. Fallback routing does not establish local support;
+tests supplied with already-decoded batches do not prove raw-source integration.
+
+ASAPPlanner #462 owns `physical_planner`, native physical operators, and DAG
+execution. Backend's `DeploymentPlanCompiler` owns state identities, window
+contracts, source bindings, and deployment of the resulting DAG.

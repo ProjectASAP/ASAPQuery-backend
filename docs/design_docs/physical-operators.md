@@ -82,4 +82,4 @@ cancellation terminate both instant and range requests; routing does not try a
 second engine or exact fallback. All range steps and nested physical executions share one request budget and
 cancellation signal, while retaining separate execution state. Tracked inputs,
 workspace and results count against that budget; estimates are not a hard RSS
-limit. See [query execution contracts](query-dag-execution.md#request-consistency-and-resource-contracts).
+limit. See [query execution contracts](query-dag-execution.md#6-request-consistency).
