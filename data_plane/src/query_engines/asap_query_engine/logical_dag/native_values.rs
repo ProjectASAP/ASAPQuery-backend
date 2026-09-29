@@ -273,7 +273,9 @@ pub(super) fn physical(
                         for (field, cell) in output_schema.fields.iter().zip(row) {
                             match cell {
                                 Value::Utf8(value) => {
-                                    labels.insert(field.name.clone(), value.to_string());
+                                    if !value.is_empty() {
+                                        labels.insert(field.name.clone(), value.to_string());
+                                    }
                                 }
                                 Value::Float64(value) => sample = Some(*value),
                                 Value::Int64(value) if value.unsigned_abs() <= (1u64 << 53) => {
@@ -616,6 +618,7 @@ mod tests {
         )
         .unwrap();
         let values = vec![
+            (Labels::from([("instance".into(), "c".into())]), 5.),
             (
                 Labels::from([
                     ("job".into(), "api".into()),
@@ -650,6 +653,7 @@ mod tests {
         assert_eq!(
             output,
             vec![
+                (Labels::new(), 5.),
                 (Labels::from([("job".into(), "api".into())]), 3.),
                 (Labels::from([("job".into(), "worker".into())]), 4.),
             ]
