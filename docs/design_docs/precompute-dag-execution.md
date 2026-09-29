@@ -3,7 +3,8 @@
 Audience: backend designers and developers.
 
 This document specifies the precompute engine design: how it receives a
-Planner-selected computation, runs it across data partitions, and publishes the
+Planner-provided physical candidate selected by Backend, runs its DAGs over
+data partitions, and publishes the
 stored outputs consumed by query plans. The [plan split](asapplanner-integration.md)
 and [SDS contract](summary-catalog-sds-architecture.md) define the compiler and
 storage contracts used here.
@@ -230,8 +231,8 @@ Within one evaluation, the worker follows this workflow:
 
 ### Shared physical operator execution
 
-The shared library lives in ASAPPlanner alongside post-ASAP IR. Backend #770
-pins that library and IR to the same revision; this PR integrates ingestion.
+The shared library lives in ASAPPlanner alongside post-ASAP IR. Backend pins
+that library and IR to the same revision.
 Installed precompute DAGs execute through its `PhysicalDag` runtime. The backend supplies
 storage frontiers, declared edge order, window completeness and durable commit
 keys. It does not own a second dependency walker.
@@ -241,7 +242,13 @@ SummaryMerge uses the native state merge, finalization uses native typed readout
 and Binary lowers aligned rows to native Project using the Planner binary contract, including checked division. Batch conversion
 preserves the installed population and timestamp bindings. Native calls receive
 the surrounding execution context, so they share its memory budget and
-cancellation. Query execution uses the same library's operations.
+cancellation. The scheduler accepts the caller's run context rather than creating
+an independent budget. Physical cancellation and memory errors retain their
+error types through maintenance execution. A failed worker stops processing
+input and publishing outputs, and closes admission; the failing drain reports
+the original failure and shutdown
+does not flush more state. Recovery requires restarting the failed execution.
+Query execution uses the same library's operations.
 
 Raw ingestion retains per-window accumulator state through shared-library
 updaters; worker routing and window completion remain backend responsibilities.
@@ -280,10 +287,133 @@ checks their coverage before executing downstream operators. That read is a
 frontier: the worker does not repeat the source records' upstream computation.
 Derived work follows the same partition ownership and worker execution model.
 
-Nodes within a worker execute sequentially. Parallelism comes from independent
-workers, including when they construct derived summaries. Store commit
-coordination protects publication without requiring unrelated workers to hold
-one global lock while evaluating their DAGs.
+For the initial deployment, derived graphs use one owning worker and execute
+serially. Cross-worker shuffle and parallel grouped maintenance are outside this
+scope. Independent raw-input partitions may still execute on separate workers.
+
+### Continuous local input: revision snapshots
+
+The first continuous-input deployment receives Remote Write directly in Backend.
+A window may be revised under the maintenance lifecycle of the physical candidate
+selected by Backend from Planner-provided candidates. Each evaluation consumes a
+fixed input revision; its dependent outputs must describe
+compatible snapshots. Later input can produce a new revision of the same stored
+output without installing a new plan version.
+
+```text
+Window W, input revision r1: values [2, 3]     -> Sum(W, r1) = 5
+Late input creates revision r2: values [2, 3, 4] -> Sum(W, r2) = 9
+```
+
+Publishing r1 does not assert that no more events for W can arrive. A downstream
+recomputation must replace or version the previous result according to the
+selected contract; adding the complete r2 result to r1 would count old input
+twice. Queries cannot combine dependent outputs from incompatible revisions.
+An external producer/partition completion protocol is not required for this
+initial local-input design.
+
+The query selects the latest compatible input snapshot that satisfies its
+selected freshness requirement. Physical record versions need not have identical
+counters: an unchanged output may remain valid for a newer snapshot. An output
+whose dependencies changed cannot be carried forward until its replacement is
+ready. For two affected outputs:
+
+| Available records | Query needs A | Query needs A and B |
+| --- | --- | --- |
+| A:r1, B:r1 | Read r1 | Read r1 |
+| A:r1/r2, B:r1; B:r2 pending | Read r2 | Read r1 if fresh enough |
+| A:r1/r2, B:r1/r2 | Read r2 | Read r2 |
+| Only common r1 exceeds freshness | A may use r2 | No eligible snapshot |
+
+Independent publication is permitted. Query eligibility is checked for the
+whole required read set before execution, and that read set stays pinned for
+the query. Concurrent publication or retention cannot switch one branch to a
+different snapshot. An unavailable snapshot follows the installed QueryPlan's
+availability policy; cancellation and resource errors remain execution failures.
+
+### Bounded corrections and recovery
+
+Deployment requirements include a finite correction horizon. Planner enumerates
+legal summary maintenance lifecycle choices and compiles them into physical
+candidates. A candidate supporting corrections must retain enough input to
+recompute affected windows. Backend selects a feasible physical candidate, binds
+its inputs and stored outputs, and enforces its retention and correction
+requirements. Here, maintenance describes the lifecycle; the executable graph is
+the precompute Physical DAG, following Planner’s terminology. The deduplication cache lifetime,
+flush timer, and maximum observed event timestamp are not substitutes for this
+contract.
+
+Admission validates the complete Remote Write request against the retained
+correction range before enqueuing any of it. An out-of-range write is rejected
+explicitly, including an unseen series in an old window. A rejected batch must
+not advance the input revision, update deduplication state, or partially modify
+stored results. Keeping output bytes alone does not establish that the inputs
+needed for a correction remain available.
+
+A successful input snapshot identifies a durable, fixed set of accepted input.
+Source capture must exclude later admissions and retain dependency membership,
+including all contributing populations. Derived execution may overlap later
+admission, but must use the captured snapshot rather than rereading mutable live
+state. Every affected sink is evaluated against that same snapshot; shared
+ancestors execute once for the selected sinks.
+
+Recovery restores the installed generation, input revision, retained correction
+boundary, and committed result versions before accepting input or serving reads.
+A partially published newer revision does not invalidate an older compatible
+snapshot that remains fresh enough. Retrying the same input snapshot must not
+add a full recomputed result to its prior version or publish it twice. Starting
+a new plan version does not implicitly inherit this revision history.
+
+| Acceptance case | Required behavior |
+| --- | --- |
+| Late value 4 joins values 2 and 3 | r2 reads 9, never 14; r1 remains 5 while eligible |
+| A:r2 commits and B:r2 fails | A+B reads compatible r1 if fresh; never A:r2 with affected B:r1 |
+| A changes but B's dependency set does not | Unchanged B may serve the newer compatible snapshot |
+| Old common revision exceeds freshness | The query cannot serve it as an eligible summary hit |
+| One sample in a batch exceeds the correction range | Reject the complete batch before any admission |
+| Crash between sibling publications | Recover committed versions and resume without duplicate publication |
+| Restart with the same plan version | Preserve the correction boundary and revision eligibility |
+| Install a new plan version | Require its own input/history and warm-up |
+
+The local Remote Write implementation captures and checkpoints accepted input
+before execution. Installation first verifies that each selected raw producer has
+a supported native recovery codec; unsupported storage formats fail before input
+admission. It publishes each stored output independently, using Planner's native
+typed state codec. A query pins one compatible snapshot before preparing
+its inputs; the same snapshot supplies every branch and every range-query step.
+The store exposes committed records through an immutable read view, never through
+the additive producer-write path.
+
+This initial realization serially replays bounded retained input through the
+selected operators. It deliberately trades update cost for simple correction
+semantics; it is not an incremental-update optimization. Input retention covers
+the larger of the correction horizon, installed query lookback and configured
+output retention, plus overlapping windows and query freshness. The correction
+horizon bounds sample age against Backend's admission clock. Whole requests with
+an older or future-dated sample are rejected before durable admission.
+
+A periodic capture closes newly elapsed windows even without a later sample. It
+only describes locally accepted input as of that capture; it does not claim that
+all upstream events have arrived. A late event inside the horizon creates another
+revision. A failed capture stops execution; pending durable input can be retried
+or recovered without replacing already committed randomized sketch bytes.
+
+Enable this path with `--remote-write-revision-dir`. Deployment configuration sets
+`--remote-write-correction-horizon-ms`, `--remote-write-revision-freshness-ms` and
+`--remote-write-revision-max-bytes`. The last separately bounds serialized
+checkpoint size and operator workspace; exceeding it returns an explicit resource error. The checkpoint is
+one atomically replaced, fsynced file per plan version, protected by a single-writer
+lock. Both raw input history and eligible output history are bounded. The existing
+finite-input path remains available when continuous revisions are not configured;
+its drain barrier cannot seal a continuous input.
+
+Process E2E tests exercise one- and two-source Planner-generated DAGs through HTTP
+Remote Write, derived summary construction, bound queries, late corrections,
+retries, whole-batch rejection, same-version restart and new-version warm-up.
+Storage regression tests cover partial publication, fresh common-snapshot
+selection, pinned readers, recovery and explicit memory/cancellation failures.
+Cross-worker shuffle and cross-producer completion protocols remain outside this
+local-input realization.
 
 ## 6. Publish the selected DAG outputs
 
@@ -314,7 +444,7 @@ version. The writer supplies a `StoredSummaryKey` and the reader supplies the
 same selected `StoredOutputReference` within its installed plan version.
 Durable metadata retains this binding so recovery validates it before exposing
 payloads. V1 does not implicitly reuse records from another plan version.
-The durable binding format is version 4; earlier SID metadata is rejected rather
+The durable binding format is version 5; earlier SID metadata is rejected rather
 than inferred to refer to a selected output.
 
 Before publication, validate that the output matches its bound definition,
@@ -324,6 +454,11 @@ uncommitted payload. Repeating the publication of the same completed result must
 not add that result twice; conflicting writes must not silently overwrite a
 record under the same key. Any permitted replacement follows the selected
 update policy and preserves coherent reads.
+
+Sibling outputs may commit independently. A query needing several outputs must
+wait for the required set at compatible revisions; it cannot read a partially
+published evaluation during a quiet interval between commits. Publication
+receipts and the query-wide revision fence must cover all dependent branches.
 
 QueryPlan and derived precompute readers perform indexed lookup using the
 installed reference and requested population/window. They check definition,

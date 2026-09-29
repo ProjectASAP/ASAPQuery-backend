@@ -233,6 +233,7 @@ impl Worker {
             resolver,
             &plan.precompute_plan,
         )
+        .map_err(|error| error.to_string())
     }
 
     pub fn set_erp_observer(
@@ -298,6 +299,18 @@ impl Worker {
 
         let mut processing_error: Option<String> = None;
         while let Some(msg) = self.receiver.recv().await {
+            // A failed execution cannot publish a later batch or hide failure
+            // behind a successful drain. The engine must be restarted explicitly.
+            if let Some(error) = &processing_error {
+                match msg {
+                    WorkerMessage::Drain(reply) | WorkerMessage::CompleteDag { reply, .. } => {
+                        let _ = reply.send(Err(error.clone()));
+                    }
+                    WorkerMessage::Shutdown => break,
+                    _ => {}
+                }
+                continue;
+            }
             let msg = match msg {
                 WorkerMessage::BoundInput {
                     input,
@@ -310,6 +323,7 @@ impl Worker {
                     {
                         processing_error =
                             Some("input receipt differs from captured generation".into());
+                        self.receiver.close();
                         continue;
                     }
                     self.current_catalog_generation = Some(generation);
@@ -429,6 +443,9 @@ impl Worker {
                     if let Err(error) = &result {
                         processing_error = Some(error.clone());
                     }
+                    if processing_error.is_some() {
+                        self.receiver.close();
+                    }
                     let _ = reply.send(processing_error.clone().map_or(Ok(()), Err));
                 }
                 WorkerMessage::CompleteDag { plan, reply } => {
@@ -439,12 +456,17 @@ impl Worker {
                     if let Err(error) = &result {
                         processing_error = Some(error.clone());
                     }
+                    if processing_error.is_some() {
+                        self.receiver.close();
+                    }
                     let _ = reply.send(result);
                 }
                 WorkerMessage::Shutdown => {
                     info!("Worker {} shutting down", self.id);
                     if let Err(e) = self.flush_all() {
                         warn!("Worker {} final flush error: {}", self.id, e);
+                        self.receiver.close();
+                        break;
                     }
                     // Force-close any windows still open after the final flush.
                     // The wall-clock fallback may not yet be due for a one-shot
@@ -455,6 +477,11 @@ impl Worker {
                     }
                     break;
                 }
+            }
+            if processing_error.is_some() {
+                // Reject new queue reservations; otherwise ingestion could
+                // acknowledge data that this failed worker will never execute.
+                self.receiver.close();
             }
         }
 
@@ -604,15 +631,7 @@ impl Worker {
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let value = if state.program.as_deref().map_or_else(
-                || {
-                    matches!(
-                        state.config.sample_update_rule(),
-                        SampleUpdateRule::CounterDelta { .. }
-                    )
-                },
-                |p| p.uses_counter_delta(),
-            ) {
+            let value = if legacy_counter_delta(state) {
                 reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
             } else {
                 Some(*val)
@@ -663,15 +682,7 @@ impl Worker {
                             // Never feed the raw counter value into a membership
                             // heap; the authoritative ExactCounter branch remains
                             // responsible for the visible result.
-                            if state.program.as_deref().map_or_else(
-                                || {
-                                    matches!(
-                                        state.config.sample_update_rule(),
-                                        SampleUpdateRule::CounterDelta { .. }
-                                    )
-                                },
-                                |p| p.uses_counter_delta(),
-                            ) {
+                            if legacy_counter_delta(state) {
                                 if let Some(input) = state.input_revisions.get_mut(&bucket_start) {
                                     Arc::make_mut(input).first_revision = 0;
                                 }
@@ -1681,6 +1692,21 @@ pub(crate) fn apply_sample(
 /// Convert a cumulative counter sample into a non-negative, reset-aware
 /// increment. Only the immediately preceding sample per series is retained;
 /// pane rotation therefore cannot lose the boundary increment.
+/// Whether a sample must be converted to a counter delta before it reaches the
+/// accumulator.
+///
+/// Only the legacy configured update rule does this. A selected Planner program
+/// never does: rate is an explicit upstream operator in the DAG, so the sample
+/// reaches the accumulator unchanged. Both call sites used to ask the program
+/// and were always told `false`.
+fn legacy_counter_delta(state: &GroupState) -> bool {
+    state.program.is_none()
+        && matches!(
+            state.config.sample_update_rule(),
+            SampleUpdateRule::CounterDelta { .. }
+        )
+}
+
 pub(crate) fn reset_aware_counter_delta(
     previous: &mut HashMap<String, (i64, f64)>,
     series_key: &str,
@@ -4158,15 +4184,16 @@ mod tests {
         task.await.unwrap();
     }
 
-    // A sink failure remains visible on repeated barriers after panes were consumed.
+    // A failed publication must close admission and never publish later input.
     #[tokio::test]
-    async fn finite_input_drain_does_not_hide_sink_failure_on_retry() {
-        struct FailedSink;
+    async fn failed_worker_rejects_admission_and_never_retries_publication() {
+        struct FailedSink(AtomicUsize);
         impl OutputSink for FailedSink {
             fn emit_batch(
                 &self,
                 _: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
             ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
                 Err("deliberate sink failure".into())
             }
         }
@@ -4186,7 +4213,8 @@ mod tests {
             0,
             LateDataPolicy::Drop,
         );
-        worker.output_sink = Arc::new(FailedSink);
+        let failed = Arc::new(FailedSink(AtomicUsize::new(0)));
+        worker.output_sink = failed.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         worker.receiver = rx;
         let task = tokio::spawn(worker.run());
@@ -4199,17 +4227,85 @@ mod tests {
         })
         .await
         .unwrap();
-        for _ in 0..2 {
-            let (ack, completed) = tokio::sync::oneshot::channel();
-            tx.send(WorkerMessage::Drain(ack)).await.unwrap();
-            assert!(completed
-                .await
-                .unwrap()
-                .unwrap_err()
-                .contains("deliberate sink failure"));
-        }
-        tx.send(WorkerMessage::Shutdown).await.unwrap();
+        let (ack, completed) = tokio::sync::oneshot::channel();
+        tx.send(WorkerMessage::Drain(ack)).await.unwrap();
+        assert!(completed
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("deliberate sink failure"));
+        assert!(
+            tx.send(WorkerMessage::GroupSamples {
+                sid: 1,
+                policy_fp: PolicyFingerprint(1),
+                group_key: test_group_key(""),
+                samples: group_samples("cpu", vec![(21000, 4.0)]),
+                ingest_received_at: std::time::Instant::now(),
+            })
+            .await
+            .is_err(),
+            "failed workers must reject new admission"
+        );
         task.await.unwrap();
+        assert_eq!(
+            failed.0.load(Ordering::SeqCst),
+            1,
+            "a failed worker must not process later input or publish during shutdown"
+        );
+    }
+
+    // A failed final flush must not be followed by publishing newer open panes.
+    #[tokio::test]
+    async fn shutdown_stops_after_its_first_publication_failure() {
+        struct FailedSink(AtomicUsize);
+        impl OutputSink for FailedSink {
+            fn emit_batch(
+                &self,
+                _: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(Box::new(asap_physical_operators::dag::Error::MemoryLimit))
+            }
+        }
+        let config = make_agg_config(
+            1,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            10,
+            0,
+            vec![],
+        );
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            Arc::new(CapturingOutputSink::new()),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        let clock = Arc::new(AtomicI64::new(0));
+        let read_clock = clock.clone();
+        worker.set_now_ms_fn(Box::new(move || read_clock.load(Ordering::SeqCst)));
+        worker.wall_clock_idle_grace_period_ms = 1;
+        for (sid, now) in [(1, 0), (2, 10000)] {
+            clock.store(now, Ordering::SeqCst);
+            worker
+                .process_group_samples(
+                    sid,
+                    PolicyFingerprint(1),
+                    &test_group_key(""),
+                    group_samples("cpu", vec![(1000, 2.0)]),
+                )
+                .unwrap();
+        }
+        clock.store(15000, Ordering::SeqCst);
+        let sink = Arc::new(FailedSink(AtomicUsize::new(0)));
+        worker.output_sink = sink.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        worker.receiver = rx;
+        tx.send(WorkerMessage::Shutdown).await.unwrap();
+        worker.run().await;
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]

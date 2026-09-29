@@ -341,14 +341,19 @@ unavailability policy. Plan installation alone does not establish readiness.
 
 ### Consistent reads
 
-Per-record metadata/payload atomicity is necessary but insufficient. All inputs
-consumed by one QueryPlan DAG must pass the existing whole-query store-revision
-fence, including inputs on different branches. A concurrent publication that
-invalidates the fence prevents that result from being served; the installed
-failure policy applies. Preserve the
-[publication completeness contract](continuous-summary-completeness.md), including
-its conservative global fence and its distinction between accepted-input
-completeness and source event-time completeness.
+Per-record metadata/payload atomicity is necessary but insufficient. For continuous
+local Remote Write, the query pins the latest compatible input snapshot satisfying
+freshness and coverage for every required output. If A:r2 is published while B:r2
+is pending, A+B may still read fresh A:r1 and B:r1. Every branch and range-query
+step uses that pinned read view; concurrent publication cannot replace one input.
+Resource exhaustion, cancellation and corrupt recovery state are execution errors,
+not reasons to reinterpret state or choose an exact fallback.
+
+Other ingestion paths retain the conservative whole-query store-revision fence:
+a publication invalidating that fence prevents the result from being served.
+The [publication completeness contract](continuous-summary-completeness.md)
+distinguishes these mechanisms and keeps accepted-input snapshots separate from
+claims of source event-time completeness.
 
 ### Recovery and plan-version changes
 

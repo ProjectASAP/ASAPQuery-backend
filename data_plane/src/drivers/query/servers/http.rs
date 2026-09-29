@@ -5264,7 +5264,14 @@ async fn handle_prometheus_remote_write(
         }
     }
 
-    match receiver.accept(&body) {
+    let receiver = receiver.clone();
+    let accepted = match tokio::task::spawn_blocking(move || receiver.accept(&body)).await {
+        Ok(result) => result,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    match accepted {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::InputClosed) =>
             (StatusCode::CONFLICT, "finite input is closed").into_response(),
@@ -5290,6 +5297,10 @@ async fn handle_prometheus_remote_write(
             | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::DedupCapacity(_)
             | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::InactivePhysicalPlan),
         ) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+        Err(crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::Revision(error)) => {
+            let status = if error.is::<crate::precompute_engine::revisions::AdmissionRejected>() { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR };
+            (status, error.to_string()).into_response()
+        },
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }

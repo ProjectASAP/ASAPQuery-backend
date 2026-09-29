@@ -163,6 +163,7 @@ use asap_types::Statistic;
 use std::collections::HashMap;
 
 /// Simple query engine for processing PromQL-like queries against precomputed data
+#[derive(Clone)]
 pub struct ASAPQueryEngine {
     #[allow(dead_code)]
     prometheus_scrape_interval: u64,
@@ -184,6 +185,31 @@ pub struct ASAPQueryEngine {
 }
 
 impl ASAPQueryEngine {
+    /// Pin before external-input preparation and retain the view for the entire
+    /// request, including all branches and all range evaluation timestamps.
+    fn pinned_for(
+        &self,
+        physical: &crate::storage_engines::types::RuntimePhysicalPlan,
+        entry: &asap_types::query_plan::QueryPlanEntry,
+        times: &[u64],
+    ) -> Result<Option<Self>, crate::query_engines::EngineError> {
+        let Some(index) = &self.summary_store else {
+            return Ok(None);
+        };
+        let Some(view) = crate::precompute_engine::revisions::pin_query(
+            index,
+            entry,
+            times,
+            physical.precompute_plan.summary_catalog.as_ref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut engine = self.clone();
+        engine.summary_store = Some(std::sync::Arc::new(view));
+        Ok(Some(engine))
+    }
+
     pub async fn execute_metricsql_at(
         &self,
         identity: &str,
@@ -202,11 +228,13 @@ impl ASAPQueryEngine {
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
-        let leaves = self
+        let pinned = self.pinned_for(&physical, planned, &[now_ms])?;
+        let engine = pinned.as_ref().unwrap_or(self);
+        let leaves = engine
             .prepare_query_inputs(&physical, planned, &[now_ms])
             .await?;
         let (mut result, mut stats) =
-            self.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
+            engine.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
         stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
         stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
         annotate_logical_execution(&mut result, &stats);
@@ -395,10 +423,21 @@ impl ASAPQueryEngine {
         crate::query_engines::EngineError,
     > {
         use crate::query_engines::EngineError;
-        let revision = self
+        let pinned = self
             .summary_store
             .as_ref()
-            .map(|index| index.summary_update_revision());
+            .map(|index| {
+                crate::precompute_engine::revisions::pin_query(
+                    index,
+                    entry,
+                    &[at],
+                    physical.precompute_plan.summary_catalog.as_ref(),
+                )
+            })
+            .transpose()?
+            .flatten();
+        let index = pinned.as_ref().or(self.summary_store.as_deref());
+        let revision = index.map(|index| index.summary_update_revision());
         let result = super::logical_dag::execute_installed(
             entry,
             leaves,
@@ -413,7 +452,7 @@ impl ASAPQueryEngine {
                     ..
                 }) = entry.nodes.get(&root)
                 {
-                    let index = self.summary_store.as_ref().ok_or_else(|| {
+                    let index = index.ok_or_else(|| {
                         EngineError::capability_miss("current_series", "summary store unavailable")
                     })?;
                     let values = index
@@ -441,7 +480,7 @@ impl ASAPQueryEngine {
                 })?;
                 let bindings = subtree.materialization_bindings();
                 let requirement = readiness_requirement(&subtree);
-                let index = self.summary_store.as_ref().ok_or_else(|| {
+                let index = index.ok_or_else(|| {
                     EngineError::capability_miss(
                         "installed_logical_dag",
                         "summary store unavailable",
@@ -517,10 +556,7 @@ impl ASAPQueryEngine {
                 ))
             },
         );
-        let current = self
-            .summary_store
-            .as_ref()
-            .map(|index| index.summary_update_revision());
+        let current = index.map(|index| index.summary_update_revision());
         if match (revision, current) {
             (Some(before), Some(after)) => !before.matches(after),
             (None, None) => false,
@@ -556,13 +592,15 @@ impl ASAPQueryEngine {
         let times: Vec<u64> = (0..=(end - start) / step)
             .map(|n| start + n * step)
             .collect();
-        let leaves = self.prepare_query_inputs(physical, entry, &times).await?;
+        let pinned = self.pinned_for(physical, entry, &times)?;
+        let engine = pinned.as_ref().unwrap_or(self);
+        let leaves = engine.prepare_query_inputs(physical, entry, &times).await?;
         let mut series =
             std::collections::BTreeMap::<Vec<(String, String)>, RangeVectorElement>::new();
         let mut total = super::logical_dag::ExecutionStats::default();
         let mut at = start;
         loop {
-            let (result, stats) = self.execute_logical_entry(physical, entry, &leaves, at)?;
+            let (result, stats) = engine.execute_logical_entry(physical, entry, &leaves, at)?;
             total.raw_scan_evaluations += stats.raw_scan_evaluations;
             total.summary_readout_evaluations += stats.summary_readout_evaluations;
             total.memo_hits += stats.memo_hits;
@@ -989,14 +1027,16 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     {
         if let Some(physical) = self.active_physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                let leaves = self
+                let pinned = self.pinned_for(&physical, entry, &[now_ms])?;
+                let engine = pinned.as_ref().unwrap_or(self);
+                let leaves = engine
                     .prepare_query_inputs(&physical, entry, &[now_ms])
                     .await
                     .map_err(|error| {
                         tracing::warn!(query, error = %error, "installed query DAG preparation failed");
                         error
                     })?;
-                let (mut result, mut stats) = self
+                let (mut result, mut stats) = engine
                     .execute_logical_entry(&physical, entry, &leaves, now_ms)
                     .map_err(|error| {
                         tracing::warn!(query, error = %error, "installed query DAG execution failed");

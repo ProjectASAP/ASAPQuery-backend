@@ -225,6 +225,16 @@ struct Args {
     #[arg(long, default_value = "2000000")]
     remote_write_max_dedup_entries: usize,
 
+    /// Enable bounded, revisable local Remote Write snapshots in this directory.
+    #[arg(long)]
+    remote_write_revision_dir: Option<std::path::PathBuf>,
+    #[arg(long, default_value = "600000")]
+    remote_write_correction_horizon_ms: u64,
+    #[arg(long, default_value = "60000")]
+    remote_write_revision_freshness_ms: u64,
+    #[arg(long, default_value = "67108864")]
+    remote_write_revision_max_bytes: usize,
+
     /// OTLP gRPC listen port
     #[arg(long, default_value = "4317")]
     otel_grpc_port: u16,
@@ -420,6 +430,17 @@ fn validate_query_forwarding_configuration(
 
 fn validate_profile(args: &Args) -> Result<()> {
     validate_query_forwarding_configuration(args)?;
+    if args.remote_write_revision_dir.is_some() {
+        if !args.enable_remote_write && args.profile != RuntimeProfile::Asapquery {
+            return Err("--remote-write-revision-dir requires Remote Write ingestion".into());
+        }
+        if args.remote_write_correction_horizon_ms == 0
+            || args.remote_write_revision_freshness_ms == 0
+            || args.remote_write_revision_max_bytes == 0
+        {
+            return Err("continuous revision horizons and byte budget must be positive".into());
+        }
+    }
     if args.profile != RuntimeProfile::Asapquery {
         if args.physical_plan.is_none() {
             return Err("the distributed profile requires --physical-plan".into());
@@ -980,12 +1001,43 @@ async fn main() -> Result<()> {
                 max_samples: args.remote_write_max_samples,
                 dedup_horizon: std::time::Duration::from_millis(args.remote_write_dedup_horizon_ms),
                 max_dedup_entries: args.remote_write_max_dedup_entries,
+                revisions: args.remote_write_revision_dir.clone().map(|directory| {
+                    (
+                        directory,
+                        data_plane::precompute_engine::revisions::RevisionPolicy {
+                            correction_horizon_ms: args.remote_write_correction_horizon_ms,
+                            max_query_staleness_ms: args.remote_write_revision_freshness_ms,
+                            max_checkpoint_bytes: args.remote_write_revision_max_bytes,
+                        },
+                    )
+                }),
             },
             precompute_ingest_state
                 .clone()
                 .expect("precompute ingest state is always constructed"),
         );
         info!("Prometheus Remote Write v1 enabled at POST /api/v1/write");
+        if args.remote_write_revision_dir.is_some() {
+            receiver.recover_revisions()?;
+            let continuous = receiver.clone();
+            let capture_interval_ms = (args.remote_write_revision_freshness_ms / 2).clamp(1, 1000);
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_millis(capture_interval_ms));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let receiver = continuous.clone();
+                    match tokio::task::spawn_blocking(move || receiver.refresh_revisions()).await {
+                        Ok(Ok(())) => {}
+                        outcome => {
+                            tracing::error!(?outcome, "continuous revision execution stopped");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         server = server.with_remote_write(receiver);
     }
 

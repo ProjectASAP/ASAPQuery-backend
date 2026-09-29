@@ -167,21 +167,15 @@ pub fn build_dag_accumulator(
     samples: &[RawSample],
 ) -> Result<Box<dyn AggregateCore>, String> {
     let mut updater = program.updater()?;
-    let mut previous = std::collections::HashMap::new();
+    // A selected program never converts samples to counter deltas; rate is an
+    // explicit upstream operator, so each sample is applied as it arrives.
     for sample in samples {
-        let value = if program.uses_counter_delta() {
-            crate::precompute_engine::worker::reset_aware_counter_delta(
-                &mut previous,
-                &sample.labels,
-                sample.value,
-                sample.timestamp_ms,
-            )
-        } else {
-            Some(sample.value)
-        };
-        if let Some(value) = value {
-            program.apply(&mut *updater, &sample.labels, value, sample.timestamp_ms)?;
-        }
+        program.apply(
+            &mut *updater,
+            &sample.labels,
+            sample.value,
+            sample.timestamp_ms,
+        )?;
     }
     Ok(updater.take_accumulator())
 }
