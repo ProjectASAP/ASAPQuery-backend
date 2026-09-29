@@ -27,6 +27,7 @@ under [developer docs](../developer_docs/README.md).
 
 Other designs and profiles:
 
+- [Evidence-dependent candidate selection](evidence-dependent-candidates.md) defines evidence ownership, logical selection, physical admission, exact fallback, and current proof limits.
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md)
 - [Shape-aware ERP](shape-aware-erp-v1.md)
 - [Empirical observability execution plan](empirical-o11y-execution-plan.md)
