@@ -13,7 +13,6 @@ pub mod output_sink;
 pub mod raw_dag;
 pub mod series_buffer;
 pub mod series_router;
-pub mod subdag_scheduler;
 pub mod window_manager;
 pub mod worker;
 

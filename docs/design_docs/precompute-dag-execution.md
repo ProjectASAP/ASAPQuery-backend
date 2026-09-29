@@ -2,6 +2,9 @@
 
 Audience: backend designers and developers.
 
+Status: target design. The [physical handoff](physical-candidate-handoff.md)
+tracks the remaining migration from Backend computation representations.
+
 This document specifies the precompute engine design: how it receives a
 Planner-provided physical candidate selected by Backend, runs its DAGs over
 data partitions, and publishes the
@@ -33,7 +36,8 @@ Once the required output is ready, query latency excludes its construction work.
 “Compute once” refers to a particular output, population and window: subsequent
 windows still require construction or updates under the selected schedule.
 
-The physical compiler splits the selected DAG at its stored outputs:
+Planner compiles candidate Physical DAGs with explicit stored-output boundaries.
+Backend selects a feasible candidate and binds those boundaries:
 
 ```mermaid
 flowchart LR
@@ -56,9 +60,8 @@ the compiler adds concrete source and storage bindings.
 
 A worker runs the **whole precompute subgraph for its assigned data partition**.
 For this example, one worker handles `service=api` and another can handle
-`service=worker`. Both execute the same graph. Each worker runs its nodes
-sequentially in dependency order; workers process independent partitions
-concurrently. A worker is an execution task, not necessarily a dedicated OS
+`service=worker`. Both execute the same graph. The shared Planner runtime executes dependencies within a DAG run; Backend
+workers may process independent partitions concurrently. A worker is an execution task, not necessarily a dedicated OS
 thread.
 
 Only outputs selected for persistence become stored summaries. Intermediate
@@ -68,9 +71,11 @@ can read the same output.
 
 ## 2. Inputs and outputs
 
-The physical compiler receives the selected post-ASAP DAG and the selected
-deployment guarantee and schedule/retention. It emits one coherent plan version
-containing definition rows, a PrecomputePlan, and matching QueryPlans.
+The Backend deployment compiler receives Planner Physical DAG candidates and
+their lifecycle requirements. It selects a feasible candidate using workload
+costs and binds concrete inputs and stored outputs. The installed plan version
+contains definition rows, a PrecomputePlan and matching QueryPlans. Backend
+does not lower Post-ASAP operations or choose unpriced computation at installation.
 
 | Input to the precompute engine | Purpose |
 | --- | --- |
@@ -99,9 +104,9 @@ Installation performs four steps:
 1. Validate the graph and operator input/output types, including ordered edge
    roles for operators with multiple inputs. Validate source, definition and
    stored-output bindings together with the matching QueryPlans.
-2. Bind supported runtime operators and compile a dependency execution order.
-   Preserve Planner families and parameters: Rate and Increase remain distinct,
-   and grouping does not create a separate backend family.
+2. Decode and validate the retained Planner Physical DAG. Preserve its operators,
+   parameters, dependency edges, shared producers and roots. Bind typed input
+   contracts without recompiling operators or deriving another execution graph.
 3. Derive a partitioning rule that keeps all required dependencies and
    reductions local to a worker, as described below. Check that execution can
    satisfy the selected deployment guarantee and schedule/retention.
@@ -114,14 +119,14 @@ requirements fail installation before the plan becomes active.
 | Object | Lifetime and contents |
 | --- | --- |
 | `PrecomputePlan` | Compiler-supplied computation and bindings for one plan version. |
-| `InstalledPrecomputePlan` | Backend-derived execution order, immutable operator programs, bindings, routing indexes and validated partitioning rule. Shared by the router and workers. |
+| `InstalledPrecomputePlan` | Retained Planner Physical DAGs, deployment bindings, routing indexes and validated partitioning rule. Shared by the router and workers. |
 | Worker execution state | Mutable node state, input ordering buffers, windows and intermediate results for that worker's assigned partitions. |
 
 `InstalledPrecomputePlan` is internal runtime data, not another serialized
 configuration or independently installable plan. All execution lookup tables
 come from the validated DAG and its bindings. There is no separately maintained
-aggregation list. Operator fusion is permitted only when it preserves the DAG's
-semantics and physical-to-semantic provenance.
+aggregation list. Physical optimization belongs to Planner; Backend does not
+fuse, split or substitute operators after candidate pricing.
 
 ## 4. Route data so each worker can execute the whole subgraph
 
@@ -183,9 +188,9 @@ arrows denote shared immutable program access; solid arrows denote work or data.
 
 ```mermaid
 flowchart TB
-  D[Selected Planner DAG] --> C[Physical compiler: split at stored outputs]
-  C --> P[PrecomputePlan: Read -> Group -> KLL -> Write]
-  C --> QP[QueryPlans: Read stored KLL -> Estimate]
+  D[Planner Physical DAG candidate] --> C[Backend: price, select and bind]
+  C --> P[PrecomputePlan: retained precompute DAG + bindings]
+  C --> QP[QueryPlans: retained query DAG + bindings]
   P --> IP[InstalledPrecomputePlan: shared immutable program]
   T[Scheduled window and source partitions] --> R[Route by service]
 
@@ -237,18 +242,16 @@ Installed precompute DAGs execute through its `PhysicalDag` runtime. The backend
 storage frontiers, declared edge order, window completeness and durable commit
 keys. It does not own a second dependency walker.
 
-For completed-window DAGs, SummaryAgg uses the native summary builder,
-SummaryMerge uses the native state merge, finalization uses native typed readout,
-and Binary lowers aligned rows to native Project using the Planner binary contract, including checked division. Batch conversion
-preserves the installed population and timestamp bindings. Native calls receive
-the surrounding execution context, so they share its memory budget and
-cancellation. The scheduler accepts the caller's run context rather than creating
-an independent budget. Physical cancellation and memory errors retain their
-error types through maintenance execution. A failed worker stops processing
-input and publishing outputs, and closes admission; the failing drain reports
-the original failure and shutdown
-does not flush more state. Recovery requires restarting the failed execution.
-Query execution uses the same library's operations.
+Completed-window execution binds immutable population/window state to the
+retained graph. Native summary build, merge, finalization and aligned binary
+operators execute inside the shared runtime. Backend converts stored input and
+output representations without interpreting operator payloads.
+
+One run context supplies cancellation and a memory budget to sources, operators
+and retained outputs. Resource exhaustion and cancellation retain their error
+types. A failed worker closes admission and stops publishing; drain reports the
+original failure and shutdown does not flush additional state. Recovery requires
+restarting the failed execution.
 
 Raw ingestion retains per-window accumulator state through shared-library
 updaters; worker routing and window completion remain backend responsibilities.
@@ -256,17 +259,13 @@ Storage publication occurs only after successful DAG execution. It is separate
 from the library's request-local caching of intermediate results.
 
 ```text
-execute(partition, evaluation_window, bound_inputs):
-    check input identities and required completeness
-    create one intermediate-result map for this evaluation
-    for node in installed dependency order:
-        if this evaluation does not require node: continue
-        obtain inputs in their declared edge-role order
-        if a required input is incomplete: keep dependent work pending
-        otherwise:
-            execute node using this partition's node state
-            retain its result for every downstream consumer
-    publish completed selected outputs with their stored-output bindings
+execute(partition, evaluation_window, input_revision):
+    pin eligible input records for every required boundary
+    validate identities, coverage and revision compatibility
+    bind typed sources to the retained Planner Physical DAG
+    execute all selected roots in one shared-runtime run
+    validate output contracts
+    publish successful outputs through their installed stored-output bindings
 ```
 
 A shared upstream node is evaluated once for the same partition, window and
