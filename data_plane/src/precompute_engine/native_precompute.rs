@@ -236,13 +236,29 @@ mod tests {
             asap_physical_operators::physical_planner::precompute::population_schema(family);
         let merge = Operator::summary_merge(schema.clone(), 2, vec![0]).unwrap();
         let output = merge.output_schema();
-        let limit = || Operator::limit(output.clone(), 1, 0, vec![]).unwrap();
+        let project = || {
+            Operator::project(
+                output.clone(),
+                output
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        (
+                            field.name.clone(),
+                            asap_physical_operators::expressions::Expression::Column(index),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
         let program = CompiledPhysicalDag::from_operators(
             BTreeMap::from([(1, InputContract::bounded(schema))]),
             BTreeMap::from([
                 (2, (vec![1], merge)),
-                (3, (vec![2], limit())),
-                (4, (vec![2], limit())),
+                (3, (vec![2], project())),
+                (4, (vec![2], project())),
             ]),
             vec![3, 4],
         )
