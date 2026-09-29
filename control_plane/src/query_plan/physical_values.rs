@@ -153,6 +153,45 @@ pub fn compile(
                 }
                 _ => None,
             },
+            QueryPlanNode::ReduceSum {
+                grouping: groups, ..
+            } => Some(match groups {
+                PhysicalGrouping::Reduce(labels) => physical::compile_aggregate(
+                    &AggIntent::Sum { col: None },
+                    &GroupKeys::by(labels.iter().cloned().map(ColumnRef::Named).collect()),
+                )
+                .map_err(invalid)?,
+                PhysicalGrouping::PerEntity => CompiledPhysicalDag::from_operators(
+                    BTreeMap::from([(
+                        0,
+                        asap_physical_operators::physical_planner::InputContract::bounded(
+                            physical::vector_schema(),
+                        ),
+                    )]),
+                    BTreeMap::from([(
+                        1,
+                        (
+                            vec![0],
+                            asap_physical_operators::operators::Operator::project(
+                                physical::vector_schema(),
+                                vec![
+                                    (
+                                        "labels".into(),
+                                        asap_physical_operators::expressions::Expression::Column(0),
+                                    ),
+                                    (
+                                        "value".into(),
+                                        asap_physical_operators::expressions::Expression::Column(1),
+                                    ),
+                                ],
+                            )
+                            .map_err(invalid)?,
+                        ),
+                    )]),
+                    vec![1],
+                )
+                .map_err(invalid)?,
+            }),
             QueryPlanNode::Binary { operator, .. } => {
                 scalar = scalar_input(0) && scalar_input(1);
                 Some(
@@ -340,4 +379,66 @@ pub(crate) fn operator_parameters(node: &QueryPlanNode, kind: &str) -> Vec<serde
                 .cloned()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A sum over finalized summaries must be priced and installed as computation,
+    // never reconstructed by the query worker.
+    #[test]
+    fn finalized_summary_rollup_is_retained_as_a_physical_graph() {
+        for grouping in [
+            PhysicalGrouping::PerEntity,
+            PhysicalGrouping::Reduce(vec!["service".into()]),
+        ] {
+            let mut entry = QueryPlanEntry {
+                physical_dag: None,
+                language: QueryLanguage::PromQl,
+                query_id: "rollup".into(),
+                canonical_query: "sum by (service) (foo)".into(),
+                fixed_evaluation: None,
+                root: QueryNodeId(1),
+                nodes: BTreeMap::from([
+                    (
+                        QueryNodeId(0),
+                        QueryPlanNode::Logical {
+                            operator: Operation::ExactSubquery {
+                                query: "foo".into(),
+                            },
+                            inputs: vec![],
+                        },
+                    ),
+                    (
+                        QueryNodeId(1),
+                        QueryPlanNode::ReduceSum {
+                            input: QueryNodeId(0),
+                            grouping,
+                        },
+                    ),
+                ]),
+                instant: InstantExecution {
+                    lookback_ms: 1000,
+                    full_history: false,
+                    cumulative_readout: true,
+                },
+                fallback: FallbackPolicy::Reject,
+            };
+            compile(&mut entry).unwrap();
+            let QueryPlanNode::PhysicalFragment { dag, inputs, .. } = &entry.nodes[&entry.root]
+            else {
+                panic!("rollup was left for Backend execution");
+            };
+            let compiled = CompiledPhysicalDag::decode(dag).unwrap();
+            assert_eq!(inputs, &[QueryNodeId(0)]);
+            assert_eq!(
+                compiled
+                    .output_contract(compiled.roots()[0])
+                    .unwrap()
+                    .schema,
+                physical::vector_schema()
+            );
+        }
+    }
 }

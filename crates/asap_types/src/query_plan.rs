@@ -163,6 +163,17 @@ impl QueryPlan {
                 }
             }
             for node in entry.nodes.values() {
+                if matches!(
+                    node,
+                    QueryPlanNode::Scalar { .. }
+                        | QueryPlanNode::Binary { .. }
+                        | QueryPlanNode::ReduceSum { .. }
+                ) {
+                    return Err(QueryPlanError::Invalid(
+                        "installed value computation requires a retained Planner physical graph"
+                            .into(),
+                    ));
+                }
                 let QueryPlanNode::ExactReadout { input, readout } = node else {
                     continue;
                 };
@@ -1002,6 +1013,54 @@ mod contract_tests {
 
 #[cfg(test)]
 mod retired_plan_tests {
+    // Recovery cannot reactivate the removed request-time scalar compiler.
+    #[test]
+    fn catalog_rejects_uncompiled_value_computation() {
+        use super::*;
+        let catalog =
+            crate::summary_catalog::SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
+        let entry = QueryPlanEntry {
+            physical_dag: None,
+            language: QueryLanguage::PromQl,
+            query_id: "scalar".into(),
+            canonical_query: "1".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([(QueryNodeId(0), QueryPlanNode::Scalar { value: 1. })]),
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::Reject,
+        };
+        let mut plan = QueryPlan {
+            plan_id: 1,
+            plan_version: 1,
+            clickhouse_context: None,
+            selected_dags: BTreeMap::new(),
+            entries: BTreeMap::from([("1".into(), entry)]),
+        };
+        assert!(plan
+            .validate_against_catalog(&catalog)
+            .unwrap_err()
+            .to_string()
+            .contains("retained Planner physical graph"));
+        plan.entries.get_mut("1").unwrap().nodes.insert(
+            QueryNodeId(0),
+            QueryPlanNode::PhysicalFragment {
+                inputs: vec![],
+                dag: asap_physical_operators::physical_planner::promql_values::compile_scalar(1.)
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                row_input: None,
+                pruning: None,
+            },
+        );
+        plan.validate_against_catalog(&catalog).unwrap();
+    }
+
     // Row-preserving operators cannot opt out of the original vector identity.
     #[test]
     fn row_preserving_graph_requires_its_identity_binding() {

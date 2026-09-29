@@ -12,7 +12,7 @@ use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
 use std::sync::Arc;
 
 /// Bind protocol values without choosing matching, grouping or arithmetic behavior.
-pub(super) fn complete_values(
+pub(in crate::query_engines::asap_query_engine) fn complete_values(
     encoded: &[u8],
     inputs: &[&super::Value],
     context: dag::RunContext,
