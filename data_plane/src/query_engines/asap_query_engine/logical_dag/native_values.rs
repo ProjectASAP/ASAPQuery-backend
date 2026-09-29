@@ -10,6 +10,88 @@ use planner_types::{
     pre_asap::DataType,
 };
 use std::sync::Arc;
+
+/// Bind protocol values without choosing matching, grouping or arithmetic behavior.
+pub(super) fn complete_values(
+    encoded: &[u8],
+    inputs: &[&super::Value],
+    context: dag::RunContext,
+) -> Result<Option<super::Value>, EngineError> {
+    use asap_physical_operators::physical_planner::{promql_values, CompiledPhysicalDag, Source};
+    use futures::StreamExt;
+    let program = CompiledPhysicalDag::decode(encoded)?;
+    let scalar = promql_values::scalar_schema();
+    let vector = promql_values::vector_schema();
+    let compatible = |schema: &Schema| schema == &scalar || schema == &vector;
+    if program.roots().len() != 1
+        || !program
+            .input_contracts()
+            .all(|(_, input)| compatible(&input.schema))
+        || !compatible(&program.output_contract(program.roots()[0])?.schema)
+    {
+        return Ok(None);
+    }
+    if program.input_contracts().count() != inputs.len() {
+        return Err(miss("physical value input arity mismatch"));
+    }
+    let mut sources = std::collections::BTreeMap::new();
+    let mut retained_inputs = context.reserve(0)?;
+    let mut input_bytes = 0usize;
+    for ((id, contract), input) in program.input_contracts().zip(inputs) {
+        let rows = match input {
+            super::Value::Scalar(value) if contract.schema == scalar => {
+                vec![vec![Value::Float64(*value)]]
+            }
+            super::Value::Vector(values) if contract.schema == vector => values
+                .iter()
+                .map(|(labels, value)| vec![super::native_labels(labels), Value::Float64(*value)])
+                .collect(),
+            _ => {
+                return Err(miss(
+                    "protocol input differs from compiled scalar/vector contract",
+                ))
+            }
+        };
+        let batch = Batch::try_new(contract.schema.clone(), rows)?;
+        input_bytes = input_bytes
+            .checked_add(batch.bytes())
+            .ok_or(dag::Error::MemoryLimit)?;
+        retained_inputs.resize(input_bytes)?;
+        sources.insert(
+            id,
+            Box::new(Operator::source(contract.schema.clone(), vec![batch])?) as Source<'_>,
+        );
+    }
+    let output_schema = program.output_contract(program.roots()[0])?.schema;
+    let graph = program.instantiate(sources)?;
+    let mut retained = context.reserve(0)?;
+    let mut stream = graph.execute(program.roots(), context)?.remove(0);
+    let rows = crate::query_engines::request::drive(async {
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            bytes = bytes
+                .checked_add(batch.bytes())
+                .ok_or(dag::Error::MemoryLimit)?;
+            retained.resize(bytes)?;
+            rows.extend(batch.rows().iter().cloned());
+        }
+        Ok::<_, EngineError>(rows)
+    })??;
+    if output_schema == scalar {
+        let [row] = rows.as_slice() else {
+            return Err(miss("physical scalar output must have exactly one row"));
+        };
+        let [Value::Float64(value)] = row.as_slice() else {
+            return Err(miss("invalid scalar output"));
+        };
+        Ok(Some(super::Value::Scalar(*value)))
+    } else {
+        super::native_vector_output(rows, 0, 1).map(|values| Some(super::Value::Vector(values)))
+    }
+}
+
 fn schema(fields: &[(&str, DataType)]) -> Schema {
     Arc::new(SummarySchema {
         fields: fields
@@ -379,6 +461,98 @@ mod tests {
         physical_planner::{CompiledPhysicalDag, InputContract},
         Error,
     };
+
+    // An installed computation binds complete label maps; ranking and division are native.
+    #[test]
+    fn compiled_vector_composition_preserves_grouping_and_runs_independently() {
+        use super::super::{
+            execute_installed, PreparedLeaf, PreparedLeaves, Value as ProtocolValue,
+        };
+        use asap_types::query_plan::{
+            residual::ResidualQueryOperator, FallbackPolicy, InstantExecution, QueryPlanNode,
+        };
+        let query = "topk by (job) (1, sum without(instance) (left_metric) / sum without(instance) (right_metric))";
+        let mut entry = control_plane::query_plan::residual::compile_logical(
+            "compiled-values".into(),
+            query.into(),
+            InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            FallbackPolicy::Reject,
+        )
+        .unwrap();
+        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
+        entry.validate(&Default::default()).unwrap();
+        assert!(entry.nodes.values().all(|node| matches!(
+            node,
+            QueryPlanNode::PhysicalFragment { .. }
+                | QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::Scan { .. },
+                    ..
+                }
+        )));
+        for scale in [1., 2.] {
+            let mut leaves = PreparedLeaves::new();
+            for (id, node) in &entry.nodes {
+                if let QueryPlanNode::Logical {
+                    operator: ResidualQueryOperator::Scan { metric, .. },
+                    ..
+                } = node
+                {
+                    let left = metric.as_deref() == Some("left_metric");
+                    let values = [
+                        ("api", "a", if left { 4. * scale } else { 2. }),
+                        ("api", "b", if left { 2. * scale } else { 1. }),
+                        ("worker", "c", if left { 8. * scale } else { 2. }),
+                    ];
+                    leaves.insert(
+                        (*id, 1000),
+                        PreparedLeaf {
+                            value: ProtocolValue::Vector(
+                                values
+                                    .into_iter()
+                                    .map(|(job, instance, value)| {
+                                        (
+                                            Labels::from([
+                                                ("__name__".into(), metric.clone().unwrap()),
+                                                ("job".into(), job.into()),
+                                                ("instance".into(), instance.into()),
+                                            ]),
+                                            value,
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                            remote: true,
+                            remote_evaluations: 1,
+                            remote_rpcs: 1,
+                        },
+                    );
+                }
+            }
+            let (result, _) = execute_installed(&entry, &leaves, 1000, |_, _| {
+                panic!("all inputs were bound")
+            })
+            .unwrap();
+            let crate::query_engines::query_result::QueryResult::Vector(result) = result else {
+                panic!("expected vector")
+            };
+            let actual = result
+                .values
+                .into_iter()
+                .map(|point| (point.labels.labels[0].clone(), point.value))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(
+                actual,
+                std::collections::BTreeMap::from([
+                    ("api".into(), 2. * scale),
+                    ("worker".into(), 4. * scale)
+                ])
+            );
+        }
+    }
 
     // An available label is bound by Backend; Planner evaluates its predicate.
     #[test]

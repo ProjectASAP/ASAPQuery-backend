@@ -2,7 +2,8 @@
 //! Serving consumes asap_types::query_plan; compilation stays in this component.
 
 mod clickhouse_exact;
-pub mod query_time;
+pub mod physical_values;
+pub mod residual;
 
 pub use asap_types::query_plan::*;
 #[cfg(test)]
