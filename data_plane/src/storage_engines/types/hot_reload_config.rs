@@ -642,10 +642,7 @@ impl std::fmt::Debug for InstalledPrecomputePlanHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snap = self.snapshot();
         f.debug_struct("InstalledPrecomputePlanHandle")
-            .field(
-                "num_agg_configs",
-                &snap.materializations_by_policy_fingerprint.len(),
-            )
+            .field("num_agg_configs", &snap.materializations_by_output.len())
             .finish()
     }
 }
@@ -863,7 +860,7 @@ mod tests {
             id_to_fp.insert(id, fp);
             map.insert(fp, cfg);
         }
-        (InstalledPrecomputePlan::new(map), id_to_fp)
+        (InstalledPrecomputePlan::from_raw_ids(map), id_to_fp)
     }
 
     #[test]
@@ -871,10 +868,10 @@ mod tests {
         let (cfg, id_to_fp) = cfg_with_ids(&[1, 2, 3]);
         let hr = InstalledPrecomputePlanHandle::new(cfg);
         let snap = hr.snapshot();
-        assert_eq!(snap.materializations_by_policy_fingerprint.len(), 3);
+        assert_eq!(snap.materializations_by_output.len(), 3);
         assert!(snap
-            .materializations_by_policy_fingerprint
-            .contains_key(&id_to_fp[&2]));
+            .materializations_by_output
+            .contains_key(&asap_types::sds::StoredOutputId(id_to_fp[&2])));
     }
 
     #[test]
@@ -884,19 +881,19 @@ mod tests {
         let hr = InstalledPrecomputePlanHandle::new(cfg1);
         let old = hr.swap(cfg2);
         // Old snapshot still reflects pre-swap contents.
-        assert_eq!(old.materializations_by_policy_fingerprint.len(), 2);
+        assert_eq!(old.materializations_by_output.len(), 2);
         assert!(old
-            .materializations_by_policy_fingerprint
-            .contains_key(&id_to_fp1[&1]));
+            .materializations_by_output
+            .contains_key(&asap_types::sds::StoredOutputId(id_to_fp1[&1])));
         // New snapshot reflects post-swap contents.
         let new_snap = hr.snapshot();
-        assert_eq!(new_snap.materializations_by_policy_fingerprint.len(), 3);
+        assert_eq!(new_snap.materializations_by_output.len(), 3);
         assert!(new_snap
-            .materializations_by_policy_fingerprint
-            .contains_key(&id_to_fp2[&5]));
+            .materializations_by_output
+            .contains_key(&asap_types::sds::StoredOutputId(id_to_fp2[&5])));
         assert!(!new_snap
-            .materializations_by_policy_fingerprint
-            .contains_key(&id_to_fp1[&1]));
+            .materializations_by_output
+            .contains_key(&asap_types::sds::StoredOutputId(id_to_fp1[&1])));
     }
 
     #[test]
@@ -909,10 +906,10 @@ mod tests {
         // The clone sees the swap because both handles share the
         // same ArcSwap inside.
         let snap = hr_clone.snapshot();
-        assert_eq!(snap.materializations_by_policy_fingerprint.len(), 2);
+        assert_eq!(snap.materializations_by_output.len(), 2);
         assert!(snap
-            .materializations_by_policy_fingerprint
-            .contains_key(&id_to_fp2[&3]));
+            .materializations_by_output
+            .contains_key(&asap_types::sds::StoredOutputId(id_to_fp2[&3])));
     }
 
     #[test]
@@ -933,7 +930,7 @@ mod tests {
                 // Under race, the snapshot must be internally
                 // consistent — either 2 entries (original) or 3
                 // (post-swap). Never a torn state.
-                let n = snap.materializations_by_policy_fingerprint.len();
+                let n = snap.materializations_by_output.len();
                 assert!(n == 2 || n == 3, "torn snapshot: {n} entries");
             }
         });

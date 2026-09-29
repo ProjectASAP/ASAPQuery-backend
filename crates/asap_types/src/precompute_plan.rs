@@ -422,13 +422,21 @@ impl PrecomputePlan {
 
     pub fn runtime_materializations(
         &self,
-    ) -> Result<HashMap<u64, crate::PrecomputeMaterialization>, PrecomputePlanError> {
+    ) -> Result<
+        HashMap<crate::sds::StoredOutputId, crate::PrecomputeMaterialization>,
+        PrecomputePlanError,
+    > {
         self.validate()?;
         Ok(self
             .materializations
             .iter()
             .cloned()
-            .map(|materialization| (materialization.policy_fp_u64(), materialization))
+            .map(|materialization| {
+                (
+                    crate::sds::StoredOutputId(materialization.policy_fp_u64()),
+                    materialization,
+                )
+            })
             .collect())
     }
 

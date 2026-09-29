@@ -200,7 +200,9 @@ impl BackfillService {
             );
 
             let snapshot = self.config_source.snapshot();
-            let Some(materialization) = snapshot.get_aggregation_config(job.agg_id) else {
+            let Some(materialization) =
+                snapshot.get_aggregation_config(asap_types::sds::StoredOutputId(job.agg_id))
+            else {
                 self.registry
                     .mark_failed(job.job_id, "backfill materialization is not installed");
                 continue;
@@ -372,7 +374,7 @@ mod tests {
     fn streaming_with(cfg: PrecomputeMaterialization) -> Arc<InstalledPrecomputePlan> {
         let mut m = std::collections::HashMap::new();
         m.insert(cfg.policy_fp_u64(), cfg);
-        Arc::new(InstalledPrecomputePlan::new(m))
+        Arc::new(InstalledPrecomputePlan::from_raw_ids(m))
     }
 
     async fn wait_for_status(

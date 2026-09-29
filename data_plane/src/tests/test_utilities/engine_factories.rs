@@ -88,7 +88,7 @@ pub fn create_engine_single_pop_with_aggregated(
         .cloned()
         .collect();
 
-    let mut materializations_by_policy_fingerprint = HashMap::new();
+    let mut materializations_by_output = HashMap::new();
     let agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
@@ -118,13 +118,16 @@ pub fn create_engine_single_pop_with_aggregated(
         value_source_column: None,
     };
     let agg_id = agg_config.policy_fp_u64();
-    materializations_by_policy_fingerprint.insert(agg_id, agg_config);
+    materializations_by_output.insert(agg_id, agg_config);
 
     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
         partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
-        materializations_by_policy_fingerprint,
+        materializations_by_output: materializations_by_output
+            .into_iter()
+            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
+            .collect(),
         storage_backend: Default::default(),
     });
 
@@ -134,7 +137,7 @@ pub fn create_engine_single_pop_with_aggregated(
 
     // Insert data into SketchStore via the canonical helper (M2.3.6e).
     let agg_cfg = installed_precompute_plan
-        .get_aggregation_config(agg_id)
+        .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
         .cloned()
         .expect("agg config must be in installed_precompute_plan");
     let timestamp = 1_000_000_u64;
@@ -176,7 +179,7 @@ pub fn create_engine_dual_input(
         .cloned()
         .collect();
 
-    let mut materializations_by_policy_fingerprint = HashMap::new();
+    let mut materializations_by_output = HashMap::new();
 
     // Value aggregation
     let value_agg_config = PrecomputeMaterialization {
@@ -208,7 +211,7 @@ pub fn create_engine_dual_input(
         value_source_column: None,
     };
     let value_id = value_agg_config.policy_fp_u64();
-    materializations_by_policy_fingerprint.insert(value_id, value_agg_config);
+    materializations_by_output.insert(value_id, value_agg_config);
 
     // Keys aggregation
     let keys_agg_config = PrecomputeMaterialization {
@@ -240,13 +243,16 @@ pub fn create_engine_dual_input(
         value_source_column: None,
     };
     let keys_id = keys_agg_config.policy_fp_u64();
-    materializations_by_policy_fingerprint.insert(keys_id, keys_agg_config);
+    materializations_by_output.insert(keys_id, keys_agg_config);
 
     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
         partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
-        materializations_by_policy_fingerprint,
+        materializations_by_output: materializations_by_output
+            .into_iter()
+            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
+            .collect(),
         storage_backend: Default::default(),
     });
 
@@ -255,11 +261,11 @@ pub fn create_engine_dual_input(
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
 
     let agg_cfg_1 = installed_precompute_plan
-        .get_aggregation_config(value_id)
+        .get_aggregation_config(asap_types::sds::StoredOutputId(value_id))
         .cloned()
         .expect("value agg config");
     let agg_cfg_2 = installed_precompute_plan
-        .get_aggregation_config(keys_id)
+        .get_aggregation_config(asap_types::sds::StoredOutputId(keys_id))
         .cloned()
         .expect("keys agg config");
     let timestamp = 1_000_000_u64;
@@ -308,7 +314,7 @@ pub fn create_engine_two_metrics(
     let labels_a: Vec<String> = grouping_labels_a.iter().map(|s| s.to_string()).collect();
     let labels_b: Vec<String> = grouping_labels_b.iter().map(|s| s.to_string()).collect();
 
-    let mut materializations_by_policy_fingerprint = HashMap::new();
+    let mut materializations_by_output = HashMap::new();
 
     let agg_config_a = PrecomputeMaterialization {
         stored_output_id: None,
@@ -339,7 +345,7 @@ pub fn create_engine_two_metrics(
         value_source_column: None,
     };
     let id_a = agg_config_a.policy_fp_u64();
-    materializations_by_policy_fingerprint.insert(id_a, agg_config_a);
+    materializations_by_output.insert(id_a, agg_config_a);
 
     let agg_config_b = PrecomputeMaterialization {
         stored_output_id: None,
@@ -370,13 +376,16 @@ pub fn create_engine_two_metrics(
         value_source_column: None,
     };
     let id_b = agg_config_b.policy_fp_u64();
-    materializations_by_policy_fingerprint.insert(id_b, agg_config_b);
+    materializations_by_output.insert(id_b, agg_config_b);
 
     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
         partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
-        materializations_by_policy_fingerprint,
+        materializations_by_output: materializations_by_output
+            .into_iter()
+            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
+            .collect(),
         storage_backend: Default::default(),
     });
 
@@ -384,11 +393,11 @@ pub fn create_engine_two_metrics(
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg_1 = installed_precompute_plan
-        .get_aggregation_config(id_a)
+        .get_aggregation_config(asap_types::sds::StoredOutputId(id_a))
         .cloned()
         .expect("agg a");
     let agg_cfg_2 = installed_precompute_plan
-        .get_aggregation_config(id_b)
+        .get_aggregation_config(asap_types::sds::StoredOutputId(id_b))
         .cloned()
         .expect("agg b");
     let timestamp = 1_000_000_u64;
@@ -442,7 +451,7 @@ pub fn create_engine_three_metrics(
     let labels_b: Vec<String> = grouping_labels_b.iter().map(|s| s.to_string()).collect();
     let labels_c: Vec<String> = grouping_labels_c.iter().map(|s| s.to_string()).collect();
 
-    let mut materializations_by_policy_fingerprint = HashMap::new();
+    let mut materializations_by_output = HashMap::new();
     let mut ids: Vec<u64> = Vec::new();
 
     for (agg_type, labels, metric) in [
@@ -480,14 +489,17 @@ pub fn create_engine_three_metrics(
         };
         let id = cfg.policy_fp_u64();
         ids.push(id);
-        materializations_by_policy_fingerprint.insert(id, cfg);
+        materializations_by_output.insert(id, cfg);
     }
 
     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
         partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
-        materializations_by_policy_fingerprint,
+        materializations_by_output: materializations_by_output
+            .into_iter()
+            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
+            .collect(),
         storage_backend: Default::default(),
     });
 
@@ -498,7 +510,7 @@ pub fn create_engine_three_metrics(
         .iter()
         .map(|id| {
             installed_precompute_plan
-                .get_aggregation_config(*id)
+                .get_aggregation_config(asap_types::sds::StoredOutputId(*id))
                 .cloned()
                 .expect("agg present")
         })
@@ -535,7 +547,7 @@ pub fn create_engine_multi_timestamp(
     let grouping_label_strings: Vec<String> =
         grouping_labels.iter().map(|s| s.to_string()).collect();
 
-    let mut materializations_by_policy_fingerprint = HashMap::new();
+    let mut materializations_by_output = HashMap::new();
     let agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
@@ -565,13 +577,16 @@ pub fn create_engine_multi_timestamp(
         value_source_column: None,
     };
     let agg_id = agg_config.policy_fp_u64();
-    materializations_by_policy_fingerprint.insert(agg_id, agg_config);
+    materializations_by_output.insert(agg_id, agg_config);
 
     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
         partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
-        materializations_by_policy_fingerprint,
+        materializations_by_output: materializations_by_output
+            .into_iter()
+            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
+            .collect(),
         storage_backend: Default::default(),
     });
 
@@ -579,7 +594,7 @@ pub fn create_engine_multi_timestamp(
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg = installed_precompute_plan
-        .get_aggregation_config(agg_id)
+        .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
         .cloned()
         .expect("agg");
     for (timestamp, label_values_opt, acc) in data {
@@ -613,7 +628,7 @@ pub fn create_engine_multi_timestamp_with_window(
     let grouping_label_strings: Vec<String> =
         grouping_labels.iter().map(|s| s.to_string()).collect();
 
-    let mut materializations_by_policy_fingerprint = HashMap::new();
+    let mut materializations_by_output = HashMap::new();
     let agg_config = PrecomputeMaterialization {
         stored_output_id: None,
         semantic_fragment: None,
@@ -643,13 +658,16 @@ pub fn create_engine_multi_timestamp_with_window(
         value_source_column: None,
     };
     let agg_id = agg_config.policy_fp_u64();
-    materializations_by_policy_fingerprint.insert(agg_id, agg_config);
+    materializations_by_output.insert(agg_id, agg_config);
 
     let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
         partitioning: Default::default(),
         raw_programs: Default::default(),
         precompute_plan: None,
-        materializations_by_policy_fingerprint,
+        materializations_by_output: materializations_by_output
+            .into_iter()
+            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
+            .collect(),
         storage_backend: Default::default(),
     });
 
@@ -657,7 +675,7 @@ pub fn create_engine_multi_timestamp_with_window(
         std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg = installed_precompute_plan
-        .get_aggregation_config(agg_id)
+        .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
         .cloned()
         .expect("agg");
     for (timestamp, label_values_opt, acc) in data {

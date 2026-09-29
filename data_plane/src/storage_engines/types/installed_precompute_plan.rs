@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ops::Index;
 
 use super::storage_backend::StorageBackend;
+use asap_types::sds::StoredOutputId;
 use asap_types::{PolicyRegistry, PrecomputeMaterialization};
 
 #[derive(Debug, Clone)]
@@ -12,17 +13,17 @@ pub struct InstalledPrecomputePlan {
     pub(crate) raw_programs:
         HashMap<u64, std::sync::Arc<crate::precompute_engine::raw_dag::RawDagProgram>>,
     pub(crate) precompute_plan: Option<asap_types::precompute_plan::PrecomputePlan>,
-    pub(crate) materializations_by_policy_fingerprint: HashMap<u64, PrecomputeMaterialization>,
+    pub(crate) materializations_by_output: HashMap<StoredOutputId, PrecomputeMaterialization>,
     pub(crate) storage_backend: StorageBackend,
 }
 
 impl InstalledPrecomputePlan {
-    fn derived_view(materializations: HashMap<u64, PrecomputeMaterialization>) -> Self {
+    fn derived_view(materializations: HashMap<StoredOutputId, PrecomputeMaterialization>) -> Self {
         Self {
             partitioning: Default::default(),
             raw_programs: HashMap::new(),
             precompute_plan: None,
-            materializations_by_policy_fingerprint: materializations,
+            materializations_by_output: materializations,
             storage_backend: StorageBackend::default(),
         }
     }
@@ -52,13 +53,26 @@ impl InstalledPrecomputePlan {
     // Isolated kernel/storage fixtures can omit a physical installation. This
     // constructor is absent from the production library and binary.
     #[cfg(test)]
-    pub fn new(materializations: HashMap<u64, PrecomputeMaterialization>) -> Self {
+    pub fn new(materializations: HashMap<StoredOutputId, PrecomputeMaterialization>) -> Self {
         Self::derived_view(materializations)
+    }
+
+    /// Fixtures hold raw output ids, so say that once here rather than
+    /// wrapping every literal. Production construction goes through
+    /// `from_precompute_plan`, which takes the ids from the plan itself.
+    #[cfg(test)]
+    pub fn from_raw_ids(materializations: HashMap<u64, PrecomputeMaterialization>) -> Self {
+        Self::new(
+            materializations
+                .into_iter()
+                .map(|(id, value)| (StoredOutputId(id), value))
+                .collect(),
+        )
     }
 
     #[cfg(test)]
     pub fn with_storage_backend(
-        materializations: HashMap<u64, PrecomputeMaterialization>,
+        materializations: HashMap<StoredOutputId, PrecomputeMaterialization>,
         storage_backend: StorageBackend,
     ) -> Self {
         let mut view = Self::derived_view(materializations);
@@ -79,7 +93,7 @@ impl InstalledPrecomputePlan {
         #[cfg(test)]
         let selected = selected.or_else(|| {
             let materializations = self
-                .materializations_by_policy_fingerprint
+                .materializations_by_output
                 .values()
                 .cloned()
                 .collect::<Vec<_>>();
@@ -105,33 +119,30 @@ impl InstalledPrecomputePlan {
         self.storage_backend
     }
 
-    pub fn get_aggregation_config(&self, fingerprint: u64) -> Option<&PrecomputeMaterialization> {
-        self.materializations_by_policy_fingerprint
-            .get(&fingerprint)
+    pub fn get_aggregation_config(
+        &self,
+        output: StoredOutputId,
+    ) -> Option<&PrecomputeMaterialization> {
+        self.materializations_by_output.get(&output)
     }
 
-    pub fn materializations(&self) -> &HashMap<u64, PrecomputeMaterialization> {
-        &self.materializations_by_policy_fingerprint
+    pub fn materializations(&self) -> &HashMap<StoredOutputId, PrecomputeMaterialization> {
+        &self.materializations_by_output
     }
 
-    pub fn contains(&self, fingerprint: u64) -> bool {
-        self.materializations_by_policy_fingerprint
-            .contains_key(&fingerprint)
+    pub fn contains(&self, output: StoredOutputId) -> bool {
+        self.materializations_by_output.contains_key(&output)
     }
 
     pub fn policy_registry(&self) -> PolicyRegistry {
-        PolicyRegistry::from_configs(
-            self.materializations_by_policy_fingerprint
-                .values()
-                .cloned(),
-        )
+        PolicyRegistry::from_configs(self.materializations_by_output.values().cloned())
     }
 }
 
-impl Index<u64> for InstalledPrecomputePlan {
+impl Index<StoredOutputId> for InstalledPrecomputePlan {
     type Output = PrecomputeMaterialization;
-    fn index(&self, fingerprint: u64) -> &Self::Output {
-        &self.materializations_by_policy_fingerprint[&fingerprint]
+    fn index(&self, output: StoredOutputId) -> &Self::Output {
+        &self.materializations_by_output[&output]
     }
 }
 

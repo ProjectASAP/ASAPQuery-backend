@@ -40,7 +40,7 @@ pub enum WorkerMessage {
         sid: u64,
         /// Source `PrecomputeMaterialization` fingerprint. Worker looks up its
         /// `PrecomputeMaterialization` (window size, sketch kind/config, late
-        /// data policy, etc.) via `snap.get_aggregation_config(policy_fp.as_u64())`.
+        /// data policy, etc.) via `snap.get_aggregation_config(policy_fp.into())`.
         policy_fp: PolicyFingerprint,
         /// Grouping label values joined by semicolons (e.g. "constant").
         /// Empty string if the aggregation has no grouping labels. Used

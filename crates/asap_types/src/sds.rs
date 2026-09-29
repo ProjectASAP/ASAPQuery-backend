@@ -43,6 +43,11 @@ impl StoredOutputId {
         self.0
     }
 }
+impl From<u64> for StoredOutputId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
 impl From<crate::PolicyFingerprint> for StoredOutputId {
     fn from(value: crate::PolicyFingerprint) -> Self {
         Self(value.0)

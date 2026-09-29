@@ -435,7 +435,7 @@ impl PrometheusRemoteWriteReceiver {
                 continue;
             };
             let config = snapshot
-                .get_aggregation_config(policy_fp.as_u64())
+                .get_aggregation_config((*policy_fp).into())
                 .ok_or(RemoteWriteError::InactivePhysicalPlan)?;
             let manager = crate::precompute_engine::window_manager::WindowManager::with_layout(
                 config.window_size,
@@ -987,7 +987,7 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         let configs = streaming
-            .materializations_by_policy_fingerprint
+            .materializations_by_output
             .values()
             .cloned()
             .collect::<Vec<_>>();
@@ -1022,7 +1022,7 @@ mod tests {
                 producers: Vec::new(),
                 executable_dags: Default::default(),
                 materializations: streaming
-                    .materializations_by_policy_fingerprint
+                    .materializations_by_output
                     .values()
                     .cloned()
                     .collect(),
@@ -1095,7 +1095,8 @@ mod tests {
             value_source_column: None,
         };
         let policy_fp = aggregation.policy_fp_u64();
-        let streaming = InstalledPrecomputePlan::new(HashMap::from([(policy_fp, aggregation)]));
+        let streaming =
+            InstalledPrecomputePlan::from_raw_ids(HashMap::from([(policy_fp, aggregation)]));
         let (sender, receiver) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -1133,7 +1134,7 @@ mod tests {
         let mut config = snapshot.precompute_plan.materializations[0].clone();
         config.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
         config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
-        let hot = physical_config(InstalledPrecomputePlan::new(HashMap::from([(
+        let hot = physical_config(InstalledPrecomputePlan::from_raw_ids(HashMap::from([(
             config.policy_fp_u64(),
             config.clone(),
         )])));
@@ -1249,7 +1250,7 @@ mod tests {
         assert_ne!(kll_fp, pooled_kll_fp);
         let cms_fp = cms.policy_fingerprint();
         let counter_fp = counter.policy_fingerprint();
-        let streaming = InstalledPrecomputePlan::new(HashMap::from([
+        let streaming = InstalledPrecomputePlan::from_raw_ids(HashMap::from([
             (cms_fp.0, cms),
             (counter_fp.0, counter),
             (kll_fp.0, kll),
@@ -1653,18 +1654,18 @@ mod tests {
         let policy = *ingest
             .hot_reload_config
             .snapshot()
-            .materializations_by_policy_fingerprint
+            .materializations_by_output
             .keys()
             .next()
             .unwrap();
         let binding = asap_types::query_plan::MaterializationBinding {
             full_window_slide_ms: None,
-            materialization: asap_types::PolicyFingerprint(policy).into(),
+            materialization: policy,
             stored_output_reference: ingest
                 .summary_store
                 .summary_catalog_snapshot()
                 .unwrap()
-                .output_reference(asap_types::PolicyFingerprint(policy).into())
+                .output_reference(policy)
                 .unwrap(),
             output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
             item_labels: vec![],

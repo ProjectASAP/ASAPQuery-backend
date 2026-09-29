@@ -1405,7 +1405,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // below so the query engine can answer per-item estimate(key)
                             // (the CMS/CountSketch FrequencyEstimate gate consults it).
                             let item_label_for_sid: Option<String> = {
-                                snap.get_aggregation_config(policy_fp.as_u64())
+                                snap.get_aggregation_config(policy_fp.into())
                                     .or_else(|| {
                                         snap.materializations()
                                             .values()
@@ -4621,7 +4621,7 @@ mod sid_bucketing_tests {
         let policy_fp = asap_types::PolicyFingerprint(cfg.policy_fp_u64());
         let mut configs = HashMap::new();
         configs.insert(cfg.policy_fp_u64(), cfg.clone());
-        let streaming = InstalledPrecomputePlan::new(configs);
+        let streaming = InstalledPrecomputePlan::from_raw_ids(configs);
         let hot_reload = InstalledPrecomputePlanHandle::new(streaming);
 
         let resolver = Arc::new(SeriesIdResolver::new());
