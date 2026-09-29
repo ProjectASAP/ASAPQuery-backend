@@ -423,7 +423,31 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            if self.language == QueryLanguage::ClickHouseSql
+                && matches!(
+                    node,
+                    QueryPlanNode::Relational { .. } | QueryPlanNode::RelationalJoin { .. }
+                )
+            {
+                return Err(QueryPlanError::Invalid("SQL plan contains uncompiled relation semantics; recompile the deployment plan".into()));
+            }
             validate_native_relation(*id, node)?;
+            if let QueryPlanNode::PhysicalRelation { inputs, dag } = node {
+                if self.language != QueryLanguage::ClickHouseSql {
+                    return Err(QueryPlanError::Invalid(
+                        "physical relation requires a SQL result binding".into(),
+                    ));
+                }
+                let compiled =
+                    asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                if compiled.roots().len() != 1 || compiled.input_contracts().count() != inputs.len()
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "physical relation boundary arity mismatch".into(),
+                    ));
+                }
+            }
             if let QueryPlanNode::PhysicalFragment {
                 inputs,
                 dag,
@@ -708,6 +732,11 @@ pub struct PruningInputContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    /// Complete Planner-compiled relation computation; inputs follow its typed slots.
+    PhysicalRelation {
+        inputs: Vec<QueryNodeId>,
+        dag: Vec<u8>,
+    },
     /// Planner-compiled computation. Input order follows the physical input contracts.
     PhysicalFragment {
         inputs: Vec<QueryNodeId>,
@@ -784,7 +813,8 @@ impl QueryPlanNode {
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
-            Self::PhysicalFragment { inputs, .. }
+            Self::PhysicalRelation { inputs, .. }
+            | Self::PhysicalFragment { inputs, .. }
             | Self::SummaryMerge { inputs }
             | Self::Logical { inputs, .. }
             | Self::ExternalExact { inputs, .. } => inputs,

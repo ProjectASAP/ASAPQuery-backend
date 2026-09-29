@@ -4,10 +4,7 @@ use asap_physical_operators::dag::{
     self,
     values::{Batch, Value},
 };
-use planner_types::post_asap::{
-    ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
-    SummaryFamilyType, SummaryField, SummarySchema,
-};
+use planner_types::post_asap::{SummaryFamilyType, SummaryField, SummarySchema};
 use std::sync::Arc;
 fn error(error: impl std::fmt::Display) -> ClickHouseRelationalError {
     ClickHouseRelationalError::Invalid(error.to_string())
@@ -62,6 +59,12 @@ pub(super) fn cell(value: &Value) -> Result<Cell, ClickHouseRelationalError> {
         _ => return Err(error("native value has no ClickHouse result transport")),
     })
 }
+#[cfg(test)]
+use planner_types::post_asap::{
+    ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+};
+
+#[cfg(test)]
 pub(crate) fn execute(
     payload: ExecutableOperatorPayload,
     output: &SummarySchema,

@@ -683,6 +683,47 @@ mod tests {
         }
     }
 
+    fn physical_relation_chain(
+        source: QueryNodeId,
+        schema: SummarySchema,
+        operations: Vec<(ValueOperation, SummarySchema)>,
+    ) -> QueryPlanNode {
+        use asap_physical_operators::physical_planner::{
+            compile_node, CompiledPhysicalDag, InputContract,
+        };
+        use planner_types::post_asap::{
+            ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+        };
+        let input = std::sync::Arc::new(schema);
+        let mut previous_schema = input.clone();
+        let mut previous = 0;
+        let mut nodes = BTreeMap::new();
+        for (index, (operation, output_schema)) in operations.into_iter().enumerate() {
+            let id = index as u64 + 1;
+            let node = ExecutableDagNode {
+                id: PostAsapNodeId(id as u32),
+                payload: ExecutableOperatorPayload::Value { operation },
+                output_state: ExecutionDataState::QUERY_ROWS,
+                output_schema: output_schema.clone(),
+                guarantee: None,
+            };
+            let operator = compile_node(&node, &[previous_schema]).unwrap();
+            nodes.insert(id, (vec![previous], operator));
+            previous = id;
+            previous_schema = std::sync::Arc::new(output_schema);
+        }
+        let physical = CompiledPhysicalDag::from_operators(
+            [(0, InputContract::bounded(input))].into(),
+            nodes,
+            vec![previous],
+        )
+        .unwrap();
+        QueryPlanNode::PhysicalRelation {
+            inputs: vec![source],
+            dag: physical.encode().unwrap(),
+        }
+    }
+
     async fn fixture(end_ms: u64) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
         fixture_with_store(end_ms, Arc::new(SketchStore::new()), true).await
     }
@@ -737,9 +778,6 @@ mod tests {
             ("bucket", DataType::Timestamp),
             ("score", DataType::Float64),
         ]);
-        let filter = QueryNodeId(2);
-        let project = QueryNodeId(3);
-        let sort = QueryNodeId(4);
         let root = QueryNodeId(5);
         let executable = QueryPlanEntry {
             language: QueryLanguage::ClickHouseSql,
@@ -774,24 +812,13 @@ mod tests {
                         readout: ExactReadout::Sum,
                     },
                 ),
-                (
-                    filter,
-                    QueryPlanNode::Relational {
-                        input: readout,
-                    operation: serde_json::json!({"Filter": {"pred": Predicate(Rc::new(QueryExpr::Compare {
+                (root, physical_relation_chain(readout, input_schema.clone(), vec![
+                    (serde_json::from_value(serde_json::json!({"Filter": {"pred": Predicate(Rc::new(QueryExpr::Compare {
                             left: Rc::new(QueryExpr::Column(1)),
                             op: CompareOpKind::Gt,
                             right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(1.0))),
-                        }))}}),
-                        input_schema: input_schema.clone(),
-                        output_schema: input_schema.clone(),
-                    },
-                ),
-                (
-                    project,
-                    QueryPlanNode::Relational {
-                        input: filter,
-                        operation: serde_json::to_value(ValueOperation::Project {
+                        }))}})).unwrap(), input_schema.clone()),
+                    (serde_json::from_value(serde_json::to_value(ValueOperation::Project {
                             cols: vec![
                                 ProjectItem {
                                     alias: Some("bucket".into()),
@@ -810,16 +837,8 @@ mod tests {
                             ],
                             qualifier: None,
                         })
-                        .unwrap(),
-                        input_schema: input_schema,
-                        output_schema: projected_schema.clone(),
-                    },
-                ),
-                (
-                    sort,
-                    QueryPlanNode::Relational {
-                        input: project,
-                        operation: serde_json::to_value(ValueOperation::Sort {
+                        .unwrap()).unwrap(), projected_schema.clone()),
+                    (serde_json::from_value(serde_json::to_value(ValueOperation::Sort {
                             keys: vec![SortKey {
                                 expr: QueryExpr::Column(1),
                                 ascending: false,
@@ -827,21 +846,10 @@ mod tests {
                             }],
                             partition_by: GroupKeys::none(),
                         })
-                        .unwrap(),
-                        input_schema: projected_schema.clone(),
-                        output_schema: projected_schema.clone(),
-                    },
-                ),
-                (
-                    root,
-                    QueryPlanNode::Relational {
-                        input: sort,
-                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0, partition_by: planner_types::pre_asap::GroupKeys::none() })
-                            .unwrap(),
-                        input_schema: projected_schema.clone(),
-                        output_schema: projected_schema,
-                    },
-                ),
+                        .unwrap()).unwrap(), projected_schema.clone()),
+                    (serde_json::from_value(serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0, partition_by: planner_types::pre_asap::GroupKeys::none() })
+                            .unwrap()).unwrap(), projected_schema),
+                ])),
             ]
             .into_iter()
             .collect(),
@@ -1125,7 +1133,7 @@ mod tests {
 
     // A publication made before time templates keeps its fixed lookup semantics.
     #[tokio::test]
-    async fn legacy_bounded_sql_plan_still_executes() {
+    async fn fixed_window_physical_plan_executes_without_a_template() {
         let (accelerator, mut request) =
             fixture_with_sql(1_000, Arc::new(SketchStore::new()), true, true).await;
         let active = accelerator.active_physical_plan.as_ref().unwrap();
@@ -1156,7 +1164,7 @@ mod tests {
         let ClickHouseAccelerationOutcome::Accelerated(response) =
             accelerator.execute(&request).await
         else {
-            panic!("old fixed identity must remain executable");
+            panic!("fixed-window physical plan must execute without a template");
         };
         assert_eq!(response.body, "1970-01-01T00:00:01\t20.0\n");
         request.sql =
