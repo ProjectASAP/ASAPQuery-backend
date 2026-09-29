@@ -247,7 +247,6 @@ struct Worker {
 **Per-series state:**
 ```rust
 struct SeriesState {
-    buffer: SeriesBuffer,                      // sorted sample buffer
     previous_watermark_ms: i64,                // last-seen watermark
     aggregations: Vec<AggregationState>,       // one per matching config
 }
@@ -375,24 +374,7 @@ from `active_panes`. Remaining panes are read non-destructively via
 When `pass_raw_samples = true`, the entire aggregation pipeline is bypassed.
 Each sample is emitted as a `SumAccumulator::with_sum(value)` with point-window
 bounds `[ts, ts]` and the configured `raw_mode_aggregation_id`.
-### 3.5 SeriesBuffer (`series_buffer.rs`)
-
-Per-series in-memory buffer backed by `BTreeMap<i64, f64>`.
-
-```rust
-struct SeriesBuffer {
-    samples: BTreeMap<i64, f64>,   // timestamp_ms → value
-    watermark_ms: i64,              // max timestamp ever seen (monotonic)
-    max_buffer_size: usize,
-}
-```
-
-- Samples are automatically sorted by timestamp.
-- Watermark only advances forward (monotonic).
-- When the buffer exceeds `max_buffer_size`, the oldest samples are evicted.
-- Supports range reads (`read_range`) and destructive drains (`drain_up_to`).
-
-### 3.6 WindowManager (`window_manager.rs`)
+### 3.5 WindowManager (`window_manager.rs`)
 
 Handles both tumbling and sliding window semantics.
 
@@ -457,7 +439,7 @@ The worker calls `window_starts_containing(ts)` for each incoming sample and fee
 the value into the accumulator for every matching window. When
 `closed_windows()` fires, each closed window's accumulator is extracted and
 emitted independently.
-### 3.7 AccumulatorUpdater (`accumulator_factory.rs`)
+### 3.6 AccumulatorUpdater (`accumulator_factory.rs`)
 
 Trait-based interface for feeding samples into sketch accumulators:
 
@@ -492,7 +474,7 @@ The factory function `create_accumulator_updater(config)` dispatches on
 | MultipleSubpopulation | CMS | CmsAccumulatorUpdater |
 | MultipleSubpopulation | HydraKLL | HydraKllAccumulatorUpdater |
 
-### 3.8 OutputSink (`output_sink.rs`)
+### 3.7 OutputSink (`output_sink.rs`)
 
 ```rust
 trait OutputSink: Send + Sync {
@@ -1131,7 +1113,7 @@ store with the Kafka consumer path.
   | `test_late_data_drop` | Sample behind the event watermark with `Drop` policy -> 0 emits and records the action |
   | `test_late_data_forward_to_store` | Late sample for evicted pane with `ForwardToStore` -> 1 emit as mini-accumulator with correct window bounds and sum |
 
-- **Unit tests -- other modules**: `window_manager.rs` (tumbling/sliding arithmetic, pane enumeration, closure detection), `series_buffer.rs` (ordering, watermark), `accumulator_factory.rs` (updater creation and reset), `series_router.rs` (consistent hash routing), `config.rs` (defaults).
+- **Unit tests -- other modules**: `window_manager.rs` (tumbling/sliding arithmetic, pane enumeration, closure detection), `accumulator_factory.rs` (updater creation and reset), `series_router.rs` (consistent hash routing), `config.rs` (defaults).
 
 - **E2E coverage**: end-to-end paths now run through the OTLP receiver
   driving the same `IngestState` (`tests/component_process_e2e.rs`; the runnable multi-node demo
@@ -1184,7 +1166,6 @@ A lighter alternative: **periodic pane snapshots** written to disk at each flush
 | `precompute_engine/config.rs` | `PrecomputeEngineConfig`, `LateDataPolicy` |
 | `precompute_engine/worker.rs` | Per-shard processing, aggregation, window management |
 | `precompute_engine/series_router.rs` | Hash-based series → worker routing |
-| `precompute_engine/series_buffer.rs` | Per-series BTreeMap sample buffer |
 | `precompute_engine/window_manager.rs` | Tumbling/sliding window logic |
 | `precompute_engine/accumulator_factory.rs` | `AccumulatorUpdater` trait + factory |
 | `precompute_engine/output_sink.rs` | `OutputSink` trait + `StoreOutputSink`, `NoopOutputSink`, `CapturingOutputSink` (testing) |
