@@ -325,6 +325,10 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                 pruning,
                 ..
             } => {
+                if let Some(value) = native_values::complete_values(&dag, inputs, context.clone())?
+                {
+                    return Ok(value);
+                }
                 let values = inputs
                     .iter()
                     .map(|value| vector((**value).clone()))

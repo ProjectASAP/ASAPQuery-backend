@@ -2447,6 +2447,7 @@ impl DeploymentPlanCompiler {
                     .as_ref()
                     .map(|candidate| &candidate.query),
             )?;
+            crate::query_plan::physical_values::compile(&mut entry)?;
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
                 return Err(CompileError::Query {
@@ -4887,24 +4888,18 @@ pub(crate) mod tests {
         let plan = DeploymentPlanCompiler
             .compile_promql(request, environment)
             .unwrap();
-        assert!(
-            plan.query_plan
-                .entries
-                .values()
-                .flat_map(|e| e.nodes.values())
-                .any(|node| matches!(
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.nodes.values())
+            .flat_map(
+                |node| crate::query_plan::physical_values::operator_parameters(
                     node,
-                    crate::query_plan::QueryPlanNode::Logical {
-                        operator: asap_types::query_plan::query_time::QueryTimeOperator::Binary {
-                            operation:
-                                asap_types::query_plan::query_time::BinaryOperation::FiniteDiv,
-                            ..
-                        },
-                        ..
-                    }
-                )),
-            "{plan:#?}"
-        );
+                    "VectorBinary"
+                )
+            )
+            .any(|parameters| parameters["operator"]["checked_finite_division"] == true));
     }
 
     // The Planner's minimum state lowers without reconstructing direction from text.
@@ -5430,13 +5425,12 @@ pub(crate) mod tests {
             .unwrap();
         let entry = plan.query_plan.lookup(query).unwrap();
         use crate::query_plan::{query_time::QueryTimeOperator, QueryPlanNode};
-        assert!(matches!(
+        let limits = crate::query_plan::physical_values::operator_parameters(
             &entry.nodes[&entry.root],
-            QueryPlanNode::Logical {
-                operator: QueryTimeOperator::Limit { n: 2, .. },
-                ..
-            }
-        ));
+            "Limit",
+        );
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0]["n"], 2);
         assert_eq!(
             entry
                 .nodes
@@ -6757,13 +6751,14 @@ pub(crate) mod tests {
             .query_plan
             .entries
             .values()
-            .any(|entry| entry.nodes.values().any(|node| matches!(
-                node,
-                crate::query_plan::QueryPlanNode::Logical {
-                    operator: crate::query_plan::query_time::QueryTimeOperator::Binary { .. },
-                    ..
-                }
-            ))));
+            .flat_map(|entry| entry.nodes.values())
+            .any(
+                |node| !crate::query_plan::physical_values::operator_parameters(
+                    node,
+                    "VectorBinary"
+                )
+                .is_empty()
+            ));
     }
 
     #[test]

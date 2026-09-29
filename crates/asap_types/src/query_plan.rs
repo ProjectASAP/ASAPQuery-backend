@@ -482,83 +482,104 @@ impl QueryPlanEntry {
                 let compiled =
                     asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                         .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
-                for (_, contract) in compiled.input_contracts() {
-                    let mut samples = 0;
-                    for (index, field) in contract.schema.fields.iter().enumerate() {
-                        use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
-                        match &field.dtype {
-                            SummaryFamilyType::Plain(DataType::Float64 | DataType::Int64) => {
-                                samples += 1
-                            }
-                            SummaryFamilyType::Plain(DataType::Utf8) => {}
-                            SummaryFamilyType::Plain(DataType::Timestamp)
-                                if contract.schema.time_index == Some(index) => {}
-                            _ => {
-                                return Err(QueryPlanError::Invalid(format!(
-                                    "PromQL input binding cannot supply field {}",
-                                    field.name
-                                )))
-                            }
-                        }
-                    }
-                    if samples > 1 {
-                        return Err(QueryPlanError::Invalid(
-                            "PromQL vector input has only one numeric sample per row".into(),
-                        ));
-                    }
-                }
-                if compiled.roots().len() != 1 {
-                    return Err(QueryPlanError::Invalid(
-                        "physical vector requires one root".into(),
-                    ));
-                }
-                if let Some(row_input) = row_input {
-                    let source = compiled.input_contracts().nth(*row_input).map(|(id, _)| id);
-                    if source.is_none() || compiled.row_source(compiled.roots()[0]) != source {
-                        return Err(QueryPlanError::Invalid(
-                            "physical vector output must preserve its bound input rows".into(),
-                        ));
+                use asap_physical_operators::physical_planner::promql_values;
+                let value_schema = |schema: &asap_physical_operators::values::Schema| {
+                    schema == &promql_values::scalar_schema()
+                        || schema == &promql_values::vector_schema()
+                };
+                let canonical_values = compiled
+                    .input_contracts()
+                    .all(|(_, input)| value_schema(&input.schema))
+                    && compiled.roots().len() == 1
+                    && value_schema(
+                        &compiled
+                            .output_contract(compiled.roots()[0])
+                            .map_err(|e| QueryPlanError::Invalid(e.to_string()))?
+                            .schema,
+                    );
+                if canonical_values {
+                    if row_input.is_some() || pruning.is_some() {
+                        return Err(QueryPlanError::Invalid("complete label-map computation cannot carry an external row-identity adapter".into()));
                     }
                 } else {
-                    if compiled.row_source(compiled.roots()[0]).is_some() {
+                    for (_, contract) in compiled.input_contracts() {
+                        let mut samples = 0;
+                        for (index, field) in contract.schema.fields.iter().enumerate() {
+                            use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+                            match &field.dtype {
+                                SummaryFamilyType::Plain(DataType::Float64 | DataType::Int64) => {
+                                    samples += 1
+                                }
+                                SummaryFamilyType::Plain(DataType::Utf8) => {}
+                                SummaryFamilyType::Plain(DataType::Timestamp)
+                                    if contract.schema.time_index == Some(index) => {}
+                                _ => {
+                                    return Err(QueryPlanError::Invalid(format!(
+                                        "PromQL input binding cannot supply field {}",
+                                        field.name
+                                    )))
+                                }
+                            }
+                        }
+                        if samples > 1 {
+                            return Err(QueryPlanError::Invalid(
+                                "PromQL vector input has only one numeric sample per row".into(),
+                            ));
+                        }
+                    }
+                    if compiled.roots().len() != 1 {
                         return Err(QueryPlanError::Invalid(
+                            "physical vector requires one root".into(),
+                        ));
+                    }
+                    if let Some(row_input) = row_input {
+                        let source = compiled.input_contracts().nth(*row_input).map(|(id, _)| id);
+                        if source.is_none() || compiled.row_source(compiled.roots()[0]) != source {
+                            return Err(QueryPlanError::Invalid(
+                                "physical vector output must preserve its bound input rows".into(),
+                            ));
+                        }
+                    } else {
+                        if compiled.row_source(compiled.roots()[0]).is_some() {
+                            return Err(QueryPlanError::Invalid(
                             "row-preserving physical output requires its input identity binding"
                                 .into(),
                         ));
-                    }
-                    let output = compiled
-                        .output_contract(compiled.roots()[0])
-                        .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
-                    let numeric = output
-                        .schema
-                        .fields
-                        .iter()
-                        .filter(|field| {
-                            matches!(
-                                field.dtype,
-                                planner_types::post_asap::SummaryFamilyType::Plain(
-                                    planner_types::pre_asap::DataType::Float64
-                                        | planner_types::pre_asap::DataType::Int64
+                        }
+                        let output = compiled
+                            .output_contract(compiled.roots()[0])
+                            .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
+                        let numeric = output
+                            .schema
+                            .fields
+                            .iter()
+                            .filter(|field| {
+                                matches!(
+                                    field.dtype,
+                                    planner_types::post_asap::SummaryFamilyType::Plain(
+                                        planner_types::pre_asap::DataType::Float64
+                                            | planner_types::pre_asap::DataType::Int64
+                                    )
                                 )
-                            )
-                        })
-                        .count();
-                    if numeric != 1
-                        || output.schema.fields.iter().any(|field| {
-                            !matches!(
-                                field.dtype,
-                                planner_types::post_asap::SummaryFamilyType::Plain(
-                                    planner_types::pre_asap::DataType::Float64
-                                        | planner_types::pre_asap::DataType::Int64
-                                        | planner_types::pre_asap::DataType::Utf8
-                                        | planner_types::pre_asap::DataType::Timestamp
+                            })
+                            .count();
+                        if numeric != 1
+                            || output.schema.fields.iter().any(|field| {
+                                !matches!(
+                                    field.dtype,
+                                    planner_types::post_asap::SummaryFamilyType::Plain(
+                                        planner_types::pre_asap::DataType::Float64
+                                            | planner_types::pre_asap::DataType::Int64
+                                            | planner_types::pre_asap::DataType::Utf8
+                                            | planner_types::pre_asap::DataType::Timestamp
+                                    )
                                 )
-                            )
-                        })
-                    {
-                        return Err(QueryPlanError::Invalid(
-                            "physical output cannot bind to a PromQL vector".into(),
-                        ));
+                            })
+                        {
+                            return Err(QueryPlanError::Invalid(
+                                "physical output cannot bind to a PromQL vector".into(),
+                            ));
+                        }
                     }
                 }
                 if let Some(pruning) = pruning {

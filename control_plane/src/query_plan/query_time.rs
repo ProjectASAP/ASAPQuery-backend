@@ -871,7 +871,11 @@ mod planner_workload_tests {
                 let plan =
                     asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                         .unwrap();
-                assert_eq!(plan.operator_name(plan.roots()[0]), Some("Limit"));
+                assert!(
+                    plan.operator_name(plan.roots()[0]) == Some("Limit")
+                        || super::super::physical_values::operator_parameters(node, "Limit").len()
+                            == 1
+                );
             }
             QueryPlanNode::Logical {
                 operator: QueryTimeOperator::Limit { .. },
