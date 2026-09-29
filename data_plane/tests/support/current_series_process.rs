@@ -105,7 +105,7 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         for node in entry.nodes.values() {
             if let asap_types::query_plan::QueryPlanNode::Logical {
                 operator:
-                    asap_types::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                    asap_types::query_plan::query_time::QueryTimeOperator::CurrentSeries {
                         population,
                         ..
                     },

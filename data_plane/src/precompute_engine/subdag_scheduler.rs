@@ -130,7 +130,7 @@ where
         }
     }
     binding
-        .validate_maintenance(dag)
+        .validate_precompute(dag)
         .map_err(ScheduleError::Invalid)?;
     let nodes = dag
         .nodes

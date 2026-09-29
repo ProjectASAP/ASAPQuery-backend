@@ -6,7 +6,7 @@
 //! searching for compatible materializations.
 
 pub mod current_series;
-pub mod residual;
+pub mod query_time;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -385,21 +385,21 @@ impl QueryPlanEntry {
     /// The current external adapters provide evaluation time, not a snapshot
     /// token compatible with local SDS or current-series revisions.
     pub fn validate_snapshot_sources(&self) -> Result<(), QueryPlanError> {
-        use residual::ResidualQueryOperator;
+        use query_time::QueryTimeOperator;
         let mut local = false;
         let mut external = false;
         for id in self.topological_order()? {
             match &self.nodes[&id] {
                 QueryPlanNode::ReadMaterialization { .. }
                 | QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::CurrentSeries { .. },
+                    operator: QueryTimeOperator::CurrentSeries { .. },
                     ..
                 } => local = true,
                 QueryPlanNode::ExternalExact { .. }
                 | QueryPlanNode::Logical {
                     operator:
-                        ResidualQueryOperator::ExactSubquery { .. }
-                        | ResidualQueryOperator::CandidateExactSubquery { .. },
+                        QueryTimeOperator::ExactSubquery { .. }
+                        | QueryTimeOperator::CandidateExactSubquery { .. },
                     ..
                 } => external = true,
                 _ => {}
@@ -734,7 +734,7 @@ pub enum QueryPlanNode {
         output_schema: planner_types::post_asap::SummarySchema,
     },
     Logical {
-        operator: residual::ResidualQueryOperator,
+        operator: query_time::QueryTimeOperator,
         inputs: Vec<QueryNodeId>,
     },
     Scalar {

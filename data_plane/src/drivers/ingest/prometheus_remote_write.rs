@@ -1776,7 +1776,7 @@ impl PrometheusRemoteWriteReceiver {
             .filter_map(|node| match node {
                 asap_types::query_plan::QueryPlanNode::Logical {
                     operator:
-                        asap_types::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                        asap_types::query_plan::query_time::QueryTimeOperator::CurrentSeries {
                             population,
                             ..
                         },

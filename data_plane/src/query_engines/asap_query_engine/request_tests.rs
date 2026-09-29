@@ -110,11 +110,11 @@ fn mixed_bound_outputs_rejected_before_any_source_is_read() {
     entry.nodes.insert(
         QueryNodeId(1),
         QueryPlanNode::Logical {
-            operator: residual::ResidualQueryOperator::CurrentSeries {
+            operator: query_time::QueryTimeOperator::CurrentSeries {
                 population: current_series::SeriesPopulation {
                     metric: "m".into(),
                     matchers: vec![],
-                    grouping: residual::Grouping {
+                    grouping: query_time::Grouping {
                         labels: vec!["job".into()],
                         without: false,
                     },

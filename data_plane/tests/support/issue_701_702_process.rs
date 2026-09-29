@@ -142,8 +142,8 @@ async fn run_warm_workload(queries: Vec<(String, u64, u64)>) {
             control_plane::query_plan::QueryPlanNode::ExactFallback { .. }
             | control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
             | control_plane::query_plan::QueryPlanNode::Logical {
-                operator: control_plane::query_plan::residual::ResidualQueryOperator::ExactSubquery { .. }
-                    | control_plane::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery { .. }, ..
+                operator: control_plane::query_plan::query_time::QueryTimeOperator::ExactSubquery { .. }
+                    | control_plane::query_plan::query_time::QueryTimeOperator::CandidateExactSubquery { .. }, ..
             }
         )))
     };
@@ -400,8 +400,8 @@ async fn temporal_average_overflow_falls_back_after_state_is_warm() {
         .any(|node| matches!(
             node,
             control_plane::query_plan::QueryPlanNode::Logical {
-                operator: control_plane::query_plan::residual::ResidualQueryOperator::Binary {
-                    operation: control_plane::query_plan::residual::BinaryOperation::FiniteDiv,
+                operator: control_plane::query_plan::query_time::QueryTimeOperator::Binary {
+                    operation: control_plane::query_plan::query_time::BinaryOperation::FiniteDiv,
                     ..
                 },
                 ..

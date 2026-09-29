@@ -737,7 +737,7 @@ impl BackendLocalPlanningInput {
                 self.physical_inputs.query_retention_margin_ms,
             )?;
         }
-        // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
+        // Composable lowering defers unsafe leaves to query time individually; retain Planner siblings.
         Ok((
             PhysicalCompilationRequest {
                 planner_selection_trace,
@@ -915,7 +915,7 @@ fn preserve_invalid_exact_fallback_roots(
 /// A MetricsQL query whose only selected states are Prometheus-specific
 /// counter readouts has no backend materialization to bind. Keep the original
 /// query as one native exact root. Mixed queries retain their other selected
-/// summaries and let residual lowering cut only the counter branches.
+/// summaries and let query-time lowering cut only the counter branches.
 fn preserve_metricsql_counter_only_roots(
     queries: &mut [QueryCompilationInput],
     canonical_roots: &[Rc<QueryExpr>],
@@ -1133,7 +1133,7 @@ impl DeploymentPlanCompiler {
                                 planner_types::post_asap::ExactKind::Max,
                                 _
                             )
-                        ) || crate::query_plan::residual::selected_range_max_materialization(
+                        ) || crate::query_plan::query_time::selected_range_max_materialization(
                             &query.query_string,
                             &state.node,
                         )
@@ -1141,14 +1141,14 @@ impl DeploymentPlanCompiler {
                         .flatten()
                         .is_some())
                         && request.enabled_materialization_keys.as_ref().is_none_or(|policy| {
-                            let key = crate::query_plan::residual::selected_counter_materialization(
+                            let key = crate::query_plan::query_time::selected_counter_materialization(
                                 &query.query_string,
                                 &state.node,
                             )
                             .ok()
                             .flatten()
                             .or_else(|| {
-                                crate::query_plan::residual::selected_range_max_materialization(
+                                crate::query_plan::query_time::selected_range_max_materialization(
                                     &query.query_string,
                                     &state.node,
                                 )
@@ -1773,13 +1773,13 @@ impl DeploymentPlanCompiler {
                 cumulative_readout: true,
             };
             // A whole-query native fallback need not be expressible in the local
-            // residual algebra (for example an ERP-rejected entropy readout).
+            // query-time algebra (for example an ERP-rejected entropy readout).
             // Retain its native boundary without discarding other workload roots.
             let native_root = request.allow_mixed_summary_and_exact_execution
                 && if let SummaryExpr::KeepPreAsap(expr) = &query.selected_plan_root.expr {
                     let original = original_root(query, query_index, &request.canonical_roots)?;
                     expr.as_ref() == &original
-                        && crate::query_plan::residual::compile_logical(
+                        && crate::query_plan::query_time::compile_logical(
                             query.query_id.clone(),
                             canonical.clone(),
                             instant,
@@ -1883,7 +1883,7 @@ impl DeploymentPlanCompiler {
                 // Any Planner-selected leaf without a physical summary binding
                 // is an exact subtree boundary. Deployed plans never retain a
                 // backend-local range index leaf.
-                crate::query_plan::residual::finalize_residuals(&mut entry)?;
+                crate::query_plan::query_time::finalize_query_time_nodes(&mut entry)?;
             }
             if frontend == QueryFrontend::MetricsQl {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
@@ -1990,7 +1990,7 @@ impl DeploymentPlanCompiler {
             .filter(|(_, installed)| !installed.binding.precompute_sinks.is_empty())
             .map(|(query_id, installed)| {
                 installed
-                    .maintenance_projection()
+                    .precompute_projection()
                     .map(|projected| (query_id.clone(), projected))
                     .map_err(|reason| CompileError::Query { query_id, reason })
             })
@@ -3166,7 +3166,7 @@ fn select_lifecycle(
 }
 
 /// A warm producer may consume only a source whose semantics its precompute accumulator
-/// implements. Predicates and shifted ranges remain executable residual nodes.
+/// implements. Predicates and shifted ranges remain executable query-time nodes.
 pub(crate) fn raw_materialization_input_contract(
     node: &SummaryNode,
 ) -> Result<(String, Option<u64>, String), String> {
@@ -3901,16 +3901,24 @@ pub(crate) mod tests {
                         .ok()
                 })
                 .collect();
-        let plan = plans.iter().find(|plan| plan.query_plan.entries.values().all(|entry|
-            entry.nodes.values().any(|node| matches!(node, crate::query_plan::QueryPlanNode::Logical {
-                operator: crate::query_plan::residual::ResidualQueryOperator::CurrentSeries { .. }, ..
-            })))).expect("no shared current-series candidate");
+        let plan = plans
+            .iter()
+            .find(|plan| {
+                plan.query_plan.entries.values().all(|entry| {
+                    entry.nodes.values().any(|node| {
+                        matches!(node, crate::query_plan::QueryPlanNode::Logical {
+                operator: crate::query_plan::query_time::QueryTimeOperator::CurrentSeries { .. }, ..
+            })
+                    })
+                })
+            })
+            .expect("no shared current-series candidate");
         let mut populations = BTreeSet::new();
         for entry in plan.query_plan.entries.values() {
             for node in entry.nodes.values() {
                 if let crate::query_plan::QueryPlanNode::Logical {
                     operator:
-                        crate::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                        crate::query_plan::query_time::QueryTimeOperator::CurrentSeries {
                             population,
                             ..
                         },
@@ -4023,8 +4031,9 @@ pub(crate) mod tests {
                 .any(|node| matches!(
                     node,
                     crate::query_plan::QueryPlanNode::Logical {
-                        operator: asap_types::query_plan::residual::ResidualQueryOperator::Binary {
-                            operation: asap_types::query_plan::residual::BinaryOperation::FiniteDiv,
+                        operator: asap_types::query_plan::query_time::QueryTimeOperator::Binary {
+                            operation:
+                                asap_types::query_plan::query_time::BinaryOperation::FiniteDiv,
                             ..
                         },
                         ..
@@ -4318,7 +4327,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         installed.document.schema_version =
-            asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION;
+            asap_types::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION;
         assert!(plan
             .precompute_plan
             .validate()
@@ -4540,11 +4549,11 @@ pub(crate) mod tests {
             .compile_promql(request, environment)
             .unwrap();
         let entry = plan.query_plan.lookup(query).unwrap();
-        use crate::query_plan::{residual::ResidualQueryOperator, QueryPlanNode};
+        use crate::query_plan::{query_time::QueryTimeOperator, QueryPlanNode};
         assert!(matches!(
             &entry.nodes[&entry.root],
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Limit { n: 2, .. },
+                operator: QueryTimeOperator::Limit { n: 2, .. },
                 ..
             }
         ));
@@ -4553,7 +4562,7 @@ pub(crate) mod tests {
                 .nodes
                 .values()
                 .filter(|node| matches!(node, QueryPlanNode::Logical {
-            operator: ResidualQueryOperator::ExactSubquery { query }, ..
+            operator: QueryTimeOperator::ExactSubquery { query }, ..
         } if query == "sum by (job) (rate(m[1m]))"))
                 .count(),
             1
@@ -5691,7 +5700,7 @@ pub(crate) mod tests {
             .any(|entry| entry.nodes.values().any(|node| matches!(
                 node,
                 crate::query_plan::QueryPlanNode::Logical {
-                    operator: crate::query_plan::residual::ResidualQueryOperator::Binary { .. },
+                    operator: crate::query_plan::query_time::QueryTimeOperator::Binary { .. },
                     ..
                 }
             ))));
@@ -6760,7 +6769,7 @@ pub(crate) mod tests {
     // with each operand keeping its own range.
     #[test]
     fn composable_binary_summarizes_each_prometheus_filtered_operand() {
-        use crate::query_plan::{residual::ResidualQueryOperator, QueryPlanNode};
+        use crate::query_plan::{query_time::QueryTimeOperator, QueryPlanNode};
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -6774,9 +6783,9 @@ pub(crate) mod tests {
         let query = plan.query_plan.entries.values().next().unwrap();
         let bindings = query.materialization_bindings();
         // Both operands now hold a summary. The filtered denominator is no
-        // longer a typed residual: its 5m range has a candidate, so it gets
+        // longer query-time only: its 5m range has a candidate, so it gets
         // its own summary over the filtered population rather than exact
-        // execution. Nothing about the filter forced the residual -- the
+        // execution. Nothing about the filter forced query-time execution -- the
         // missing 5m window candidate did, and this test previously pinned
         // that artifact as intended behavior.
         let bound = bindings
@@ -6805,7 +6814,7 @@ pub(crate) mod tests {
         assert!(!query.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Scan { .. },
+                operator: QueryTimeOperator::Scan { .. },
                 ..
             }
         )));

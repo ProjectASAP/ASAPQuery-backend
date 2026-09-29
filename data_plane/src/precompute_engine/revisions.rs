@@ -922,7 +922,17 @@ pub(crate) fn pin_query(
         .into_iter()
         .map(|b| b.stored_output_reference.stored_output_id)
         .collect();
-    let current_series = entry.nodes.values().any(|node| matches!(node, asap_types::query_plan::QueryPlanNode::Logical { operator: asap_types::query_plan::residual::ResidualQueryOperator::CurrentSeries { .. }, .. }));
+    let current_series =
+        entry.nodes.values().any(|node| {
+            matches!(
+                node,
+                asap_types::query_plan::QueryPlanNode::Logical {
+                    operator:
+                        asap_types::query_plan::query_time::QueryTimeOperator::CurrentSeries { .. },
+                    ..
+                }
+            )
+        });
     if required.is_empty() && !current_series {
         return Ok(None);
     }

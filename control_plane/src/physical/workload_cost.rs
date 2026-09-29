@@ -250,7 +250,7 @@ pub fn manifest(
         for node in entry.nodes.values() {
             if let crate::query_plan::QueryPlanNode::Logical {
                 operator:
-                    crate::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                    crate::query_plan::query_time::QueryTimeOperator::CurrentSeries {
                         population, ..
                     },
                 ..
@@ -271,7 +271,7 @@ pub fn manifest(
             if matches!(
                 node,
                 crate::query_plan::QueryPlanNode::Logical {
-                    operator: crate::query_plan::residual::ResidualQueryOperator::Scan { .. },
+                    operator: crate::query_plan::query_time::QueryTimeOperator::Scan { .. },
                     ..
                 }
             ) {
@@ -281,8 +281,8 @@ pub fn manifest(
             }
             if let crate::query_plan::QueryPlanNode::Logical {
                 operator:
-                    crate::query_plan::residual::ResidualQueryOperator::ExactSubquery { query }
-                    | crate::query_plan::residual::ResidualQueryOperator::CandidateExactSubquery {
+                    crate::query_plan::query_time::QueryTimeOperator::ExactSubquery { query }
+                    | crate::query_plan::query_time::QueryTimeOperator::CandidateExactSubquery {
                         query,
                         ..
                     },
@@ -831,7 +831,7 @@ fn materialization_candidates(
         }
         let mut keys = BTreeSet::new();
         for query in &request.queries {
-            match crate::query_plan::residual::eligible_materialization_keys(
+            match crate::query_plan::query_time::eligible_materialization_keys(
                 &query.query_string,
                 &query.selected_plan_root,
             ) {

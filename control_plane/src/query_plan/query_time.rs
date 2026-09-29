@@ -1,4 +1,8 @@
-//! Typed residual operations compiled once by the control plane, never parsed at serving time.
+//! The query-time half of a plan: everything a summary did not replace.
+//!
+//! Typed operations compiled once by the control plane, never parsed at
+//! serving time. This is the counterpart to the precompute half, which runs
+//! ahead of the query and ends at stored outputs.
 use super::{
     FallbackPolicy, InstantExecution, QueryNodeId, QueryPlanEntry, QueryPlanError, QueryPlanNode,
 };
@@ -8,7 +12,7 @@ use promql_parser::{
 };
 use std::collections::BTreeMap;
 
-pub use asap_types::query_plan::residual::*;
+pub use asap_types::query_plan::query_time::*;
 
 /// Stable identity of a Planner-authorized materializable DAG leaf. This is a
 /// workload-selection key, not another physical materialization definition.
@@ -54,7 +58,7 @@ impl Lower {
     }
     fn operation(
         &mut self,
-        operator: ResidualQueryOperator,
+        operator: QueryTimeOperator,
         inputs: Vec<QueryNodeId>,
     ) -> Result<QueryNodeId, QueryPlanError> {
         operator.validate(inputs.len())?;
@@ -84,7 +88,7 @@ impl Lower {
             })
             .collect();
         self.operation(
-            ResidualQueryOperator::Scan {
+            QueryTimeOperator::Scan {
                 metric: s.name.clone(),
                 matchers,
                 range_ms,
@@ -101,7 +105,7 @@ impl Lower {
             Expr::Paren(p) => self.lower(&p.expr),
             Expr::Unary(u) => {
                 let input = self.lower(&u.expr)?;
-                self.operation(ResidualQueryOperator::UnaryNegate, vec![input])
+                self.operation(QueryTimeOperator::UnaryNegate, vec![input])
             }
             Expr::VectorSelector(s) => self.scan(s, None),
             Expr::MatrixSelector(s) => self.scan(&s.vs, Some(millis(s.range)?)),
@@ -111,7 +115,7 @@ impl Lower {
                 }
                 let input = self.lower(&s.expr)?;
                 self.operation(
-                    ResidualQueryOperator::Subquery {
+                    QueryTimeOperator::Subquery {
                         range_ms: millis(s.range)?,
                         // Prometheus uses its configured default evaluation
                         // interval when `[range:]` omits the resolution. The
@@ -163,7 +167,7 @@ impl Lower {
                             self.nodes = nodes_before;
                             self.seen = seen_before;
                             self.operation(
-                                ResidualQueryOperator::ExactSubquery {
+                                QueryTimeOperator::ExactSubquery {
                                     query: a.expr.to_string(),
                                 },
                                 vec![],
@@ -171,14 +175,14 @@ impl Lower {
                         }
                     };
                     let sorted = self.operation(
-                        ResidualQueryOperator::Sort {
+                        QueryTimeOperator::Sort {
                             descending: true,
                             grouping: grouping.clone(),
                         },
                         vec![input],
                     )?;
                     return self.operation(
-                        ResidualQueryOperator::Limit {
+                        QueryTimeOperator::Limit {
                             n: u64::try_from(k).unwrap_or(0),
                             offset: 0,
                             grouping,
@@ -199,7 +203,7 @@ impl Lower {
                 };
                 let input = self.lower(&a.expr)?;
                 self.operation(
-                    ResidualQueryOperator::Aggregate {
+                    QueryTimeOperator::Aggregate {
                         operation,
                         grouping,
                     },
@@ -208,23 +212,23 @@ impl Lower {
             }
             Expr::Call(c) => {
                 let operator = match c.func.name {
-                    "scalar" => ResidualQueryOperator::VectorToScalar,
-                    "histogram_quantile" => ResidualQueryOperator::HistogramQuantile,
-                    "sort" => ResidualQueryOperator::Sort {
+                    "scalar" => QueryTimeOperator::VectorToScalar,
+                    "histogram_quantile" => QueryTimeOperator::HistogramQuantile,
+                    "sort" => QueryTimeOperator::Sort {
                         descending: false,
                         grouping: Grouping {
                             labels: vec![],
                             without: false,
                         },
                     },
-                    "sort_desc" => ResidualQueryOperator::Sort {
+                    "sort_desc" => QueryTimeOperator::Sort {
                         descending: true,
                         grouping: Grouping {
                             labels: vec![],
                             without: false,
                         },
                     },
-                    name => ResidualQueryOperator::Temporal {
+                    name => QueryTimeOperator::Temporal {
                         operation: match name {
                             "rate" => TemporalOperation::Rate,
                             "increase" => TemporalOperation::Increase,
@@ -271,7 +275,7 @@ impl Lower {
                 };
                 let inputs = vec![self.lower(&b.lhs)?, self.lower(&b.rhs)?];
                 self.operation(
-                    ResidualQueryOperator::Binary {
+                    QueryTimeOperator::Binary {
                         operation,
                         return_bool: b.return_bool(),
                     },
@@ -283,7 +287,7 @@ impl Lower {
     }
 }
 
-/// Lower a Planner-authorized native residual into typed backend operations.
+/// Lower a Planner-authorized native fragment into typed backend operations.
 /// Callers retain a separate external-native alternative for cost comparison.
 pub fn compile_logical(
     query_id: String,
@@ -346,7 +350,7 @@ fn horizons(expr: &planner_types::pre_asap::QueryExpr, out: &mut Vec<u64>) {
     }
 }
 
-/// Match residuals by semantic IR equality, not display text or source names.
+/// Match fragments by semantic IR equality, not display text or source names.
 /// This ensures a subtree parsed for physical lowering is the subtree Planner kept.
 /// Does this re-parsed subtree denote the same computation as the Planner
 /// fragment?
@@ -358,7 +362,7 @@ fn horizons(expr: &planner_types::pre_asap::QueryExpr, out: &mut Vec<u64>) {
 /// label the *query* mentions, while the same fragment re-parsed on its own
 /// carries only the labels *it* mentions.
 ///
-/// So `sum by (label_0) (rate(data[1m]))` yields a residual whose leaf scan has
+/// So `sum by (label_0) (rate(data[1m]))` yields a fragment whose leaf scan has
 /// columns `[ts, value, label_0]`, while re-parsing the subtree `rate(data[1m])`
 /// yields `[ts, value]`. Identical source, predicates, range, measures and
 /// reduction; one extra column that the isolated parse had no way to know
@@ -374,44 +378,44 @@ fn horizons(expr: &planner_types::pre_asap::QueryExpr, out: &mut Vec<u64>) {
 /// equality.
 fn fragment_matches(
     candidate: &planner_types::pre_asap::QueryExpr,
-    residual: &planner_types::pre_asap::QueryExpr,
+    fragment: &planner_types::pre_asap::QueryExpr,
 ) -> bool {
     match (
         serde_json::to_value(candidate),
-        serde_json::to_value(residual),
+        serde_json::to_value(fragment),
     ) {
-        (Ok(candidate), Ok(residual)) => same_modulo_open_leaf_schema(&candidate, &residual),
+        (Ok(candidate), Ok(fragment)) => same_modulo_open_leaf_schema(&candidate, &fragment),
         // Fall back to the strict comparison rather than accepting anything we
         // could not inspect.
-        _ => candidate == residual,
+        _ => candidate == fragment,
     }
 }
 
 fn same_modulo_open_leaf_schema(
     candidate: &serde_json::Value,
-    residual: &serde_json::Value,
+    fragment: &serde_json::Value,
 ) -> bool {
     use serde_json::Value;
-    match (candidate, residual) {
-        (Value::Object(candidate), Value::Object(residual)) => {
-            if is_open_schema(candidate) && is_open_schema(residual) {
-                return open_schema_is_widened(candidate, residual);
+    match (candidate, fragment) {
+        (Value::Object(candidate), Value::Object(fragment)) => {
+            if is_open_schema(candidate) && is_open_schema(fragment) {
+                return open_schema_is_widened(candidate, fragment);
             }
-            candidate.len() == residual.len()
+            candidate.len() == fragment.len()
                 && candidate.iter().all(|(key, value)| {
-                    residual
+                    fragment
                         .get(key)
                         .is_some_and(|other| same_modulo_open_leaf_schema(value, other))
                 })
         }
-        (Value::Array(candidate), Value::Array(residual)) => {
-            candidate.len() == residual.len()
+        (Value::Array(candidate), Value::Array(fragment)) => {
+            candidate.len() == fragment.len()
                 && candidate
                     .iter()
-                    .zip(residual)
+                    .zip(fragment)
                     .all(|(a, b)| same_modulo_open_leaf_schema(a, b))
         }
-        _ => candidate == residual,
+        _ => candidate == fragment,
     }
 }
 
@@ -424,25 +428,25 @@ fn is_open_schema(value: &serde_json::Map<String, serde_json::Value>) -> bool {
 /// floor. Every other schema field still has to agree exactly.
 fn open_schema_is_widened(
     candidate: &serde_json::Map<String, serde_json::Value>,
-    residual: &serde_json::Map<String, serde_json::Value>,
+    fragment: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
     let (Some(narrow), Some(wide)) = (
         candidate.get("columns").and_then(|v| v.as_array()),
-        residual.get("columns").and_then(|v| v.as_array()),
+        fragment.get("columns").and_then(|v| v.as_array()),
     ) else {
         return false;
     };
     candidate
         .iter()
         .filter(|(key, _)| key.as_str() != "columns")
-        .all(|(key, value)| residual.get(key) == Some(value))
+        .all(|(key, value)| fragment.get(key) == Some(value))
         && narrow.len() <= wide.len()
         && narrow.iter().zip(wide).all(|(a, b)| a == b)
 }
 
-pub(super) fn residual_nodes(
+pub(super) fn query_time_nodes(
     original: &str,
-    residual: &planner_types::pre_asap::QueryExpr,
+    fragment: &planner_types::pre_asap::QueryExpr,
 ) -> Result<(QueryNodeId, BTreeMap<QueryNodeId, QueryPlanNode>), QueryPlanError> {
     fn visit<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
         out.push(expr);
@@ -470,13 +474,13 @@ pub(super) fn residual_nodes(
     // not the compatibility parser's default. Explicit matrix ranges remain
     // query-owned and equality still checks the complete tree.
     let mut intervals = vec![1_000];
-    horizons(residual, &mut intervals);
+    horizons(fragment, &mut intervals);
     intervals.sort_unstable();
     intervals.dedup();
     // Accuracy annotations select a candidate, but exact execution still
     // implements that candidate's computation. Reconstruct the same typed IR
     // before comparing it; do not erase operators or source predicates.
-    let accuracy = match residual {
+    let accuracy = match fragment {
         planner_types::pre_asap::QueryExpr::Aggregate { measures, .. } => measures
             .iter()
             .find_map(|intent| {
@@ -501,7 +505,7 @@ pub(super) fn residual_nodes(
                 accuracy.clone(),
                 *interval,
             ) {
-                if fragment_matches(&candidate, residual) {
+                if fragment_matches(&candidate, fragment) {
                     let mut lower = Lower {
                         nodes: BTreeMap::new(),
                         seen: BTreeMap::new(),
@@ -513,13 +517,13 @@ pub(super) fn residual_nodes(
         }
     }
     Err(invalid(
-        "Planner residual does not match any original query subtree",
+        "Planner fragment does not match any original query subtree",
     ))
 }
 
 pub(super) fn binary_operator(
     operator: &planner_types::post_asap::BinaryOperator,
-) -> Result<ResidualQueryOperator, QueryPlanError> {
+) -> Result<QueryTimeOperator, QueryPlanError> {
     if operator.checked_relative_division || operator.checked_finite_division {
         if (operator.checked_relative_division && operator.checked_finite_division)
             || operator.vector_match.is_some()
@@ -532,7 +536,7 @@ pub(super) fn binary_operator(
         {
             return Err(invalid("invalid Planner checked division contract"));
         }
-        return Ok(ResidualQueryOperator::Binary {
+        return Ok(QueryTimeOperator::Binary {
             operation: if operator.checked_finite_division {
                 BinaryOperation::FiniteDiv
             } else {
@@ -542,7 +546,7 @@ pub(super) fn binary_operator(
         });
     }
     if operator.vector_match.is_some() {
-        return Err(invalid("explicit residual vector matching unsupported"));
+        return Err(invalid("explicit fragment vector matching unsupported"));
     }
     let operation = match operator.kind.to_string().as_str() {
         "+" => BinaryOperation::Add,
@@ -563,7 +567,7 @@ pub(super) fn binary_operator(
             )))
         }
     };
-    Ok(ResidualQueryOperator::Binary {
+    Ok(QueryTimeOperator::Binary {
         operation,
         return_bool: false,
     })
@@ -571,7 +575,7 @@ pub(super) fn binary_operator(
 
 /// Prove a physical-native substitute represents exactly the selected summary leaf.
 /// A second Planner invocation is an equality witness, not a replacement selection.
-pub(crate) fn selected_residual_nodes(
+pub(crate) fn selected_query_time_nodes(
     original: &str,
     selected: &planner_types::post_asap::SummaryNode,
 ) -> Result<(QueryNodeId, BTreeMap<QueryNodeId, QueryPlanNode>), QueryPlanError> {
@@ -592,7 +596,7 @@ pub(super) fn selected_native_expression(
 ) -> Result<Expr, QueryPlanError> {
     if !selected.guarantee.as_ref().is_some_and(|g| g.is_exact()) {
         return Err(invalid(
-            "native residual substitution requires an exact selected value",
+            "native fragment substitution requires an exact selected value",
         ));
     }
     let selected = match &selected.expr {
@@ -704,11 +708,11 @@ pub(super) fn selected_native_expression(
 pub(super) fn selected_aggregate_operator(
     original: &str,
     selected: &planner_types::post_asap::SummaryNode,
-) -> Result<ResidualQueryOperator, QueryPlanError> {
-    let (root, nodes) = selected_residual_nodes(original, selected)?;
+) -> Result<QueryTimeOperator, QueryPlanError> {
+    let (root, nodes) = selected_query_time_nodes(original, selected)?;
     match nodes.get(&root) {
         Some(QueryPlanNode::Logical {
-            operator: operator @ ResidualQueryOperator::Aggregate { .. },
+            operator: operator @ QueryTimeOperator::Aggregate { .. },
             ..
         }) => Ok(operator.clone()),
         _ => Err(invalid(
@@ -792,21 +796,21 @@ mod hybrid_tests {
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::ExactSubquery { .. },
+                operator: QueryTimeOperator::ExactSubquery { .. },
                 ..
             }
         )));
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Scan { .. },
+                operator: QueryTimeOperator::Scan { .. },
                 ..
             }
         )));
         assert!(matches!(
             entry.nodes[&entry.root],
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Binary { .. },
+                operator: QueryTimeOperator::Binary { .. },
                 ..
             }
         ));
@@ -832,7 +836,7 @@ mod hybrid_tests {
         .unwrap();
         let selected = crate::planner_selection::plan_test_query(&canonical).unwrap();
         assert!(
-            selected_residual_nodes("sum_over_time(m{job=\"worker\"}[5m])", &selected).is_err()
+            selected_query_time_nodes("sum_over_time(m{job=\"worker\"}[5m])", &selected).is_err()
         );
     }
 }
@@ -869,7 +873,7 @@ mod planner_workload_tests {
                 assert_eq!(plan.operator_name(plan.roots()[0]), Some("Limit"));
             }
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Limit { .. },
+                operator: QueryTimeOperator::Limit { .. },
                 ..
             } => {}
             _ => panic!("expected local Limit, got {node:?}"),
@@ -975,7 +979,7 @@ mod planner_workload_tests {
         let operator = selected_aggregate_operator(query, selected).unwrap();
         assert!(matches!(
             operator,
-            ResidualQueryOperator::Aggregate {
+            QueryTimeOperator::Aggregate {
                 operation: Aggregation::Max,
                 ..
             }
@@ -997,7 +1001,7 @@ mod planner_workload_tests {
         )
         .unwrap();
         let maximum = crate::planner_selection::plan_test_query(&maximum).unwrap();
-        let result = selected_residual_nodes("min(m) + max(m)", &selected);
+        let result = selected_query_time_nodes("min(m) + max(m)", &selected);
         if selected == maximum {
             assert!(result.is_err());
         } else {
@@ -1005,7 +1009,7 @@ mod planner_workload_tests {
             assert!(matches!(
                 nodes[&root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Aggregate {
+                    operator: QueryTimeOperator::Aggregate {
                         operation: Aggregation::Min,
                         ..
                     },
@@ -1041,10 +1045,10 @@ pub(crate) fn selected_range_max_materialization(
     ) {
         return Ok(None);
     }
-    let (root, nodes) = selected_residual_nodes(original, node)?;
+    let (root, nodes) = selected_query_time_nodes(original, node)?;
     let Some(QueryPlanNode::Logical {
         operator:
-            ResidualQueryOperator::Temporal {
+            QueryTimeOperator::Temporal {
                 operation: TemporalOperation::Max,
             },
         inputs,
@@ -1057,7 +1061,7 @@ pub(crate) fn selected_range_max_materialization(
     }
     let Some(QueryPlanNode::Logical {
         operator:
-            ResidualQueryOperator::Scan {
+            QueryTimeOperator::Scan {
                 metric: Some(metric),
                 matchers,
                 range_ms: Some(range_ms),
@@ -1158,7 +1162,7 @@ fn counter_contract(
     nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
 ) -> Option<MaterializationCandidateIdentity> {
     let QueryPlanNode::Logical {
-        operator: ResidualQueryOperator::Temporal { operation },
+        operator: QueryTimeOperator::Temporal { operation },
         inputs,
     } = nodes.get(&root)?
     else {
@@ -1173,7 +1177,7 @@ fn counter_contract(
     }
     let QueryPlanNode::Logical {
         operator:
-            ResidualQueryOperator::Scan {
+            QueryTimeOperator::Scan {
                 metric: Some(metric),
                 matchers,
                 range_ms: Some(range_ms),
@@ -1208,7 +1212,7 @@ pub(crate) fn selected_counter_materialization(
     ) {
         return Ok(None);
     }
-    let (root, nodes) = selected_residual_nodes(original, node)?;
+    let (root, nodes) = selected_query_time_nodes(original, node)?;
     counter_contract(root, &nodes)
         .map(materialization_candidate_key)
         .transpose()
@@ -1227,9 +1231,9 @@ fn prune(entry: &mut QueryPlanEntry) {
     entry.nodes.retain(|id, _| seen.contains(id));
 }
 
-/// Finish the installed DAG by externalizing every residual raw subtree.
-pub fn finalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
-    externalize_residuals(entry)?;
+/// Finish the installed DAG by externalizing every fragment raw subtree.
+pub fn finalize_query_time_nodes(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
+    externalize_query_time_nodes(entry)?;
     assign_retention(entry)
 }
 
@@ -1294,7 +1298,7 @@ fn expression_shape(
         .get(&id)
         .ok_or_else(|| invalid("missing expression node"))?;
     if let QueryPlanNode::Logical {
-        operator: ResidualQueryOperator::ExactSubquery { query },
+        operator: QueryTimeOperator::ExactSubquery { query },
         ..
     } = node
     {
@@ -1321,9 +1325,9 @@ fn expression_shape(
     Ok(format!("{value}({})", children.join(";")))
 }
 
-/// Collapse only maximal exact residual subtrees whose full typed expression is
+/// Collapse only maximal exact fragment subtrees whose full typed expression is
 /// witnessed in the original query. Matrix boundaries remain inside Prometheus.
-pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
+pub fn externalize_query_time_nodes(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
     fn gather(expr: &Expr, out: &mut Vec<Expr>) {
         if !matches!(expr, Expr::MatrixSelector(_) | Expr::Subquery(_)) {
             out.push(expr.clone());
@@ -1371,7 +1375,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         ) || matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Limit { .. },
+                operator: QueryTimeOperator::Limit { .. },
                 ..
             }
         );
@@ -1379,9 +1383,9 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         if let QueryPlanNode::Logical { operator, .. } = node {
             exact = matches!(
                 operator,
-                ResidualQueryOperator::Scan { .. }
-                    | ResidualQueryOperator::ExactSubquery { .. }
-                    | ResidualQueryOperator::CandidateExactSubquery { .. }
+                QueryTimeOperator::Scan { .. }
+                    | QueryTimeOperator::ExactSubquery { .. }
+                    | QueryTimeOperator::CandidateExactSubquery { .. }
             );
         }
         for child in node.inputs() {
@@ -1396,8 +1400,8 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         if matches!(
             entry.nodes.get(&id),
             Some(QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::ExactSubquery { .. }
-                    | ResidualQueryOperator::CandidateExactSubquery { .. },
+                operator: QueryTimeOperator::ExactSubquery { .. }
+                    | QueryTimeOperator::CandidateExactSubquery { .. },
                 ..
             })
         ) {
@@ -1410,7 +1414,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
                     entry.nodes.insert(
                         id,
                         QueryPlanNode::Logical {
-                            operator: ResidualQueryOperator::ExactSubquery {
+                            operator: QueryTimeOperator::ExactSubquery {
                                 query: query.clone(),
                             },
                             inputs: vec![],
@@ -1427,7 +1431,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Scan { .. },
+                operator: QueryTimeOperator::Scan { .. },
                 ..
             }
         )
@@ -1453,7 +1457,7 @@ fn assign_retention(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
             .ok_or_else(|| invalid("missing index ancestor"))?;
         let mut child_depth = depth;
         if let QueryPlanNode::Logical { operator, .. } = node {
-            if let ResidualQueryOperator::Subquery {
+            if let QueryTimeOperator::Subquery {
                 range_ms,
                 offset_ms,
                 ..
@@ -1527,7 +1531,7 @@ mod remote_boundary_regressions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // A grouped query's residual carries the grouping label in its leaf scan
+    // A grouped query's fragment carries the grouping label in its leaf scan
     // schema, because Planner resolves that schema against the whole query.
     // Re-parsing the subtree alone cannot know the label, so requiring equal
     // column sets rejected a fragment that is the subtree.
@@ -1540,15 +1544,15 @@ mod tests {
                 "sum_over_time(data[1m])",
             ),
         ] {
-            let residual = crate::query_parser::parse_query_expr_with_interval(
+            let fragment = crate::query_parser::parse_query_expr_with_interval(
                 subtree,
                 planner_types::types::AccuracyTarget::Exact,
                 60_000,
             )
             .unwrap();
             assert!(
-                residual_nodes(query, &residual).is_ok(),
-                "{query}: residual {subtree} must resolve against its own query"
+                query_time_nodes(query, &fragment).is_ok(),
+                "{query}: fragment {subtree} must resolve against its own query"
             );
         }
     }
@@ -1557,18 +1561,18 @@ mod tests {
     // that actually identifies the computation still has to match exactly.
     #[test]
     fn widened_leaf_schema_does_not_excuse_a_different_computation() {
-        let residual = crate::query_parser::parse_query_expr_with_interval(
+        let fragment = crate::query_parser::parse_query_expr_with_interval(
             "rate(data[1m])",
             planner_types::types::AccuracyTarget::Exact,
             60_000,
         )
         .unwrap();
         // Different metric.
-        assert!(residual_nodes("sum by (label_0) (rate(other[1m]))", &residual).is_err());
+        assert!(query_time_nodes("sum by (label_0) (rate(other[1m]))", &fragment).is_err());
         // Different range.
-        assert!(residual_nodes("sum by (label_0) (rate(data[2m]))", &residual).is_err());
+        assert!(query_time_nodes("sum by (label_0) (rate(data[2m]))", &fragment).is_err());
         // Different function.
-        assert!(residual_nodes("sum by (label_0) (increase(data[1m]))", &residual).is_err());
+        assert!(query_time_nodes("sum by (label_0) (increase(data[1m]))", &fragment).is_err());
         // Different matcher.
         let filtered = crate::query_parser::parse_query_expr_with_interval(
             "rate(data{job=\"api\"}[1m])",
@@ -1576,7 +1580,7 @@ mod tests {
             60_000,
         )
         .unwrap();
-        assert!(residual_nodes(
+        assert!(query_time_nodes(
             "sum by (label_0) (rate(data{job=\"worker\"}[1m]))",
             &filtered
         )
@@ -1586,21 +1590,21 @@ mod tests {
     // A workload horizon changes the equality witness, never its filter or explicit range.
     #[test]
     fn workload_horizon_residual_keeps_semantic_equality() {
-        let residual = crate::query_parser::parse_query_expr_with_interval(
+        let fragment = crate::query_parser::parse_query_expr_with_interval(
             "sum(m{job=\"api\"})",
             planner_types::types::AccuracyTarget::Exact,
             5_000,
         )
         .unwrap();
-        assert!(residual_nodes("sum(m{job=\"api\"})", &residual).is_ok());
-        assert!(residual_nodes("sum(m{job=\"worker\"})", &residual).is_err());
+        assert!(query_time_nodes("sum(m{job=\"api\"})", &fragment).is_ok());
+        assert!(query_time_nodes("sum(m{job=\"worker\"})", &fragment).is_err());
         let range = crate::query_parser::parse_query_expr_with_interval(
             "sum_over_time(m[1m])",
             planner_types::types::AccuracyTarget::Exact,
             5_000,
         )
         .unwrap();
-        assert!(residual_nodes("sum_over_time(m[2m])", &range).is_err());
+        assert!(query_time_nodes("sum_over_time(m[2m])", &range).is_err());
     }
 
     fn instant() -> InstantExecution {
@@ -1618,7 +1622,7 @@ mod tests {
             serde_json::from_str(include_str!("../../tests/fixtures/o11y_queries.json")).unwrap();
         for row in corpus["queries"].as_array().unwrap() {
             let query = row["query"].as_str().unwrap();
-            let entry = crate::query_plan::residual::compile_logical(
+            let entry = crate::query_plan::query_time::compile_logical(
                 row["id"].as_str().unwrap().into(),
                 query.into(),
                 instant(),
@@ -1635,22 +1639,22 @@ mod tests {
         }
     }
     #[test]
-    fn residual_mapping_preserves_filters_and_rejects_different_sources() {
+    fn query_time_mapping_preserves_filters_and_rejects_different_sources() {
         // Physical lowering must prove correspondence with the Planner-kept semantic subtree.
         let query = "sum(rate(requests_total{job=\"api\"}[5m]))";
-        let residual = crate::query_parser::parse_query_expr_canonical(
+        let fragment = crate::query_parser::parse_query_expr_canonical(
             query,
             planner_types::types::AccuracyTarget::Exact,
         )
         .unwrap();
-        let (_, nodes) = residual_nodes(query, &residual).unwrap();
-        assert!(nodes.values().any(|node| matches!(node, QueryPlanNode::Logical { operator: ResidualQueryOperator::Scan { matchers, .. }, .. } if matchers.iter().any(|m| m.name == "job" && m.value == "api"))));
-        assert!(residual_nodes("sum(rate(other_total[5m]))", &residual).is_err());
+        let (_, nodes) = query_time_nodes(query, &fragment).unwrap();
+        assert!(nodes.values().any(|node| matches!(node, QueryPlanNode::Logical { operator: QueryTimeOperator::Scan { matchers, .. }, .. } if matchers.iter().any(|m| m.name == "job" && m.value == "api"))));
+        assert!(query_time_nodes("sum(rate(other_total[5m]))", &fragment).is_err());
     }
     #[test]
     fn repeated_subexpressions_share_node_identity() {
         // Serialized edges must retain CSE rather than duplicating raw work.
-        let entry = crate::query_plan::residual::compile_logical(
+        let entry = crate::query_plan::query_time::compile_logical(
             "q".into(),
             "sum(up) / sum(up)".into(),
             instant(),
@@ -1665,10 +1669,8 @@ mod tests {
     #[test]
     fn malformed_operator_arity_is_rejected_at_installation() {
         // A serialized graph cannot bypass the operation's input contract.
-        assert!(ResidualQueryOperator::HistogramQuantile
-            .validate(1)
-            .is_err());
-        assert!(ResidualQueryOperator::Subquery {
+        assert!(QueryTimeOperator::HistogramQuantile.validate(1).is_err());
+        assert!(QueryTimeOperator::Subquery {
             range_ms: 60_000,
             step_ms: 0,
             offset_ms: 0
@@ -1698,7 +1700,7 @@ mod tests {
                 3,
             ),
         ] {
-            let entry = crate::query_plan::residual::compile_logical(
+            let entry = crate::query_plan::query_time::compile_logical(
                 "topk".into(),
                 query.into(),
                 instant(),
@@ -1708,7 +1710,7 @@ mod tests {
             assert!(matches!(
                 entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Limit { n: actual, .. },
+                    operator: QueryTimeOperator::Limit { n: actual, .. },
                     ..
                 } if actual == k
             ));
@@ -1717,7 +1719,7 @@ mod tests {
 
     #[test]
     fn topk_keeps_unsupported_child_as_exact_leaf() {
-        let entry = crate::query_plan::residual::compile_logical(
+        let entry = crate::query_plan::query_time::compile_logical(
             "topk-subquery".into(),
             "topk(3, label_replace(memory_bytes, \"dst\", \"$1\", \"src\", \"(.*)\"))".into(),
             instant(),
@@ -1727,14 +1729,14 @@ mod tests {
         assert!(matches!(
             entry.nodes[&entry.root],
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::Limit { n: 3, .. },
+                operator: QueryTimeOperator::Limit { n: 3, .. },
                 ..
             }
         ));
         assert!(entry.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::ExactSubquery { .. },
+                operator: QueryTimeOperator::ExactSubquery { .. },
                 ..
             }
         )));
@@ -1746,7 +1748,7 @@ mod tests {
             ("topk by (cluster) (2, m)", vec!["cluster"], false),
             ("topk without (pod) (2, m)", vec!["pod"], true),
         ] {
-            let entry = crate::query_plan::residual::compile_logical(
+            let entry = crate::query_plan::query_time::compile_logical(
                 "topk-group".into(),
                 query.into(),
                 instant(),
@@ -1756,7 +1758,7 @@ mod tests {
             assert!(matches!(
                 &entry.nodes[&entry.root],
                 QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Limit { grouping, .. },
+                    operator: QueryTimeOperator::Limit { grouping, .. },
                     ..
                 } if grouping.labels == labels && grouping.without == without
             ));

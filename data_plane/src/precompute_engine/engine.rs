@@ -116,7 +116,7 @@ impl PrecomputeEngine {
         let mut worker_handles = Vec::with_capacity(num_workers);
         for (id, rx) in receivers.into_iter().enumerate() {
             let output_sink: Arc<dyn crate::precompute_engine::output_sink::OutputSink> = Arc::new(
-                crate::precompute_engine::maintenance_runtime::MaintenanceDagSink::new(
+                crate::precompute_engine::maintenance_runtime::PrecomputeDagSink::new(
                     Arc::clone(&self.output_sink),
                     self.hot_reload_config.clone(),
                 ),

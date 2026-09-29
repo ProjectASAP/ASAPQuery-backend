@@ -6,8 +6,8 @@ use crate::query_engines::{
 };
 use crate::storage_engines::types::KeyByLabelValues;
 use asap_physical_operators::dag as physical;
-use asap_types::query_plan::residual::{
-    Aggregation, BinaryOperation, Grouping, ResidualQueryOperator, TemporalOperation,
+use asap_types::query_plan::query_time::{
+    Aggregation, BinaryOperation, Grouping, QueryTimeOperator, TemporalOperation,
 };
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use futures::{FutureExt, StreamExt};
@@ -289,7 +289,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         let value = match node.clone() {
             QueryPlanNode::Scalar { value } => Value::Scalar(native_scalar(value, context)?),
             QueryPlanNode::Logical {
-                operator: ResidualQueryOperator::CurrentSeries { .. },
+                operator: QueryTimeOperator::CurrentSeries { .. },
                 ..
             } => {
                 self.stats.summary_readout_evaluations += 1;
@@ -301,9 +301,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             QueryPlanNode::Logical { operator, .. } => {
                 if matches!(
                     operator,
-                    ResidualQueryOperator::Scan { .. }
-                        | ResidualQueryOperator::ExactSubquery { .. }
-                        | ResidualQueryOperator::CandidateExactSubquery { .. }
+                    QueryTimeOperator::Scan { .. }
+                        | QueryTimeOperator::ExactSubquery { .. }
+                        | QueryTimeOperator::CandidateExactSubquery { .. }
                 ) {
                     return Err(miss(
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
@@ -383,7 +383,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
     }
     fn logical(
         &mut self,
-        operator: ResidualQueryOperator,
+        operator: QueryTimeOperator,
         inputs: &[&Value],
         dependencies: &[(QueryNodeId, i64)],
         at: i64,
@@ -396,19 +396,19 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
-            ResidualQueryOperator::ExactSubquery { .. }
-            | ResidualQueryOperator::CandidateExactSubquery { .. } => {
+            QueryTimeOperator::ExactSubquery { .. }
+            | QueryTimeOperator::CandidateExactSubquery { .. } => {
                 Err(miss("Prometheus exact leaf was not prepared"))
             }
-            ResidualQueryOperator::CurrentSeries { .. } => Err(miss(
+            QueryTimeOperator::CurrentSeries { .. } => Err(miss(
                 "current-series leaf must use its installed node identity",
             )),
-            ResidualQueryOperator::Scan { .. } => {
+            QueryTimeOperator::Scan { .. } => {
                 Err(miss("local raw Scan is forbidden in deployed plans"))
             }
-            ResidualQueryOperator::UnaryNegate => negate(input(0)?, context),
-            ResidualQueryOperator::VectorToScalar => vector_to_scalar(vector(input(0)?)?, context),
-            ResidualQueryOperator::Aggregate {
+            QueryTimeOperator::UnaryNegate => negate(input(0)?, context),
+            QueryTimeOperator::VectorToScalar => vector_to_scalar(vector(input(0)?)?, context),
+            QueryTimeOperator::Aggregate {
                 operation,
                 grouping,
             } => {
@@ -417,7 +417,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     operation, &grouping, values, context,
                 )?))
             }
-            ResidualQueryOperator::Limit {
+            QueryTimeOperator::Limit {
                 n,
                 offset,
                 grouping,
@@ -431,7 +431,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     context.clone(),
                 )?))
             }
-            ResidualQueryOperator::Binary {
+            QueryTimeOperator::Binary {
                 operation,
                 return_bool,
             } => {
@@ -439,7 +439,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                 let right = input(1)?;
                 binary_in_context(operation, return_bool, left, right, context)
             }
-            ResidualQueryOperator::Temporal { operation } => {
+            QueryTimeOperator::Temporal { operation } => {
                 let Value::Matrix(values, start, end) = input(0)? else {
                     return Err(miss("temporal operator requires range vector"));
                 };
@@ -467,7 +467,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                 ))
             }
 
-            ResidualQueryOperator::Sort {
+            QueryTimeOperator::Sort {
                 descending,
                 grouping,
             } => {
@@ -479,7 +479,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     context.clone(),
                 )?))
             }
-            ResidualQueryOperator::HistogramQuantile => {
+            QueryTimeOperator::HistogramQuantile => {
                 let Value::Scalar(quantile) = input(0)? else {
                     return Err(miss("quantile requires scalar"));
                 };
@@ -508,7 +508,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     context,
                 )?))
             }
-            ResidualQueryOperator::Subquery {
+            QueryTimeOperator::Subquery {
                 range_ms,
                 step_ms,
                 offset_ms,
@@ -564,16 +564,16 @@ fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i6
     match node {
         QueryPlanNode::Logical {
             operator:
-                ResidualQueryOperator::Scan { .. }
-                | ResidualQueryOperator::ExactSubquery { .. }
-                | ResidualQueryOperator::CandidateExactSubquery { .. },
+                QueryTimeOperator::Scan { .. }
+                | QueryTimeOperator::ExactSubquery { .. }
+                | QueryTimeOperator::CandidateExactSubquery { .. },
             ..
         } => Err(miss(
             "installed leaf was not prepared; local raw execution is forbidden",
         )),
         QueryPlanNode::Logical {
             operator:
-                ResidualQueryOperator::Subquery {
+                QueryTimeOperator::Subquery {
                     range_ms,
                     step_ms,
                     offset_ms,
@@ -587,7 +587,7 @@ fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i6
             Ok(times.into_iter().map(|time| (*input, time)).collect())
         }
         QueryPlanNode::Logical {
-            operator: ResidualQueryOperator::CurrentSeries { .. },
+            operator: QueryTimeOperator::CurrentSeries { .. },
             ..
         } => Ok(vec![]),
         QueryPlanNode::PhysicalFragment { inputs, .. } | QueryPlanNode::Logical { inputs, .. } => {
@@ -1398,7 +1398,7 @@ mod topk_tests {
 
     #[test]
     fn installed_topk_combines_with_prometheus_exact_child() {
-        let mut entry = control_plane::query_plan::residual::compile_logical(
+        let mut entry = control_plane::query_plan::query_time::compile_logical(
             "hybrid-topk".into(),
             "topk(2, m)".into(),
             InstantExecution {
@@ -1409,7 +1409,7 @@ mod topk_tests {
             FallbackPolicy::ExactBackend,
         )
         .unwrap();
-        control_plane::query_plan::residual::finalize_residuals(&mut entry).unwrap();
+        control_plane::query_plan::query_time::finalize_query_time_nodes(&mut entry).unwrap();
         let leaf = entry
             .nodes
             .iter()
@@ -1417,7 +1417,7 @@ mod topk_tests {
                 matches!(
                     node,
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::ExactSubquery { .. },
+                        operator: QueryTimeOperator::ExactSubquery { .. },
                         ..
                     }
                 )
@@ -1484,7 +1484,7 @@ mod topk_tests {
                         (
                             QueryNodeId(0),
                             QueryPlanNode::Logical {
-                                operator: ResidualQueryOperator::ExactSubquery {
+                                operator: QueryTimeOperator::ExactSubquery {
                                     query: "m[1s]".into(),
                                 },
                                 inputs: vec![],
@@ -1493,7 +1493,7 @@ mod topk_tests {
                         (
                             QueryNodeId(1),
                             QueryPlanNode::Logical {
-                                operator: ResidualQueryOperator::Temporal { operation },
+                                operator: QueryTimeOperator::Temporal { operation },
                                 inputs: vec![QueryNodeId(0)],
                             },
                         ),
@@ -1568,7 +1568,7 @@ mod topk_tests {
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Limit {
+                        operator: QueryTimeOperator::Limit {
                             offset: 0,
                             n: 2,
                             grouping: Grouping {
@@ -1582,7 +1582,7 @@ mod topk_tests {
                 (
                     QueryNodeId(98),
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Sort {
+                        operator: QueryTimeOperator::Sort {
                             descending: true,
                             grouping: Grouping {
                                 labels: vec![],
@@ -1807,7 +1807,7 @@ mod topk_tests {
                 (
                     root,
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Limit {
+                        operator: QueryTimeOperator::Limit {
                             offset: 0,
                             n: 1,
                             grouping: Grouping {
@@ -1821,7 +1821,7 @@ mod topk_tests {
                 (
                     QueryNodeId(98),
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Sort {
+                        operator: QueryTimeOperator::Sort {
                             descending: true,
                             grouping: Grouping {
                                 labels: vec![],
@@ -1936,7 +1936,7 @@ mod shared_runtime_tests {
                 (
                     QueryNodeId(1),
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Subquery {
+                        operator: QueryTimeOperator::Subquery {
                             range_ms: 2000,
                             step_ms: 1000,
                             offset_ms: 0,
@@ -1947,7 +1947,7 @@ mod shared_runtime_tests {
                 (
                     QueryNodeId(2),
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Temporal {
+                        operator: QueryTimeOperator::Temporal {
                             operation: TemporalOperation::Sum,
                         },
                         inputs: vec![QueryNodeId(1)],
@@ -1956,7 +1956,7 @@ mod shared_runtime_tests {
                 (
                     QueryNodeId(3),
                     QueryPlanNode::Logical {
-                        operator: ResidualQueryOperator::Binary {
+                        operator: QueryTimeOperator::Binary {
                             operation: BinaryOperation::Add,
                             return_bool: false,
                         },

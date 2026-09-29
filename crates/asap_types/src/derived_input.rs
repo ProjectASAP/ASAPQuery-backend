@@ -39,7 +39,7 @@ impl DerivedInputIdentity {
     ) -> Result<Self, String> {
         if ![
             crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION,
-            crate::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION,
+            crate::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION,
         ]
         .contains(&document.schema_version)
         {
