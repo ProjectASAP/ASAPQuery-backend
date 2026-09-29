@@ -35,7 +35,6 @@ The component suites can also be run separately:
 ./scripts/e2e.sh differential
 ./scripts/e2e.sh sketch-oracles
 ./scripts/e2e.sh monitor
-./scripts/e2e.sh whole
 ```
 
 `differential` starts the production data-plane process, derives a modified
@@ -87,8 +86,7 @@ ignored or converted into an expected pass.
 | Count-Min Sketch | `topk(3, metric)` | exact raw frequency map and item identities |
 | PromQL range validation | equal start/end and zero step | Prometheus-compatible explicit errors |
 
-`whole` is the stable representative DDSketch path. To exercise every
-currently checked-in sketch/query combination, including scenarios tracking
+To exercise every currently checked-in sketch/query combination, including scenarios tracking
 known product regressions, run:
 
 ```bash
@@ -128,6 +126,3 @@ behind `#[ignore]` with:
 ```bash
 ./scripts/e2e.sh list
 ```
-
-The final local whole-backend test is
-`data_plane/tests/backend_process_e2e.rs`.

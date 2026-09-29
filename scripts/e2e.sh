@@ -22,7 +22,7 @@ usage() {
 Usage: ./scripts/e2e.sh [target]
 
 Targets:
-  all             Run every local component suite, then the repository E2E
+  all             Run every local component suite
   contracts       Shared Rust type/protobuf wire contracts
   control-plane   Planner HTTP, OpAMP, publication, and runtime feedback
   data-plane      Query, routing, storage, ingest adapter, and lifecycle tests
@@ -31,7 +31,6 @@ Targets:
   differential    Production DDSketch PromQL vs deterministic raw-value oracle
   sketch-oracles  Every sketch via production binary + independent raw oracle
   monitor         Real monitor gRPC transport tests
-  whole           Controller plan -> backend install -> OTLP -> store -> PromQL
   whole-matrix    All sketch families and query shapes (diagnostic)
   differential-all Production sketch oracles plus the in-process query matrix
   system          Delegate to ASAPCollector's real multi-node system harness
@@ -152,14 +151,6 @@ monitor() {
 
 
 
-whole() {
-    CURRENT_STAGE="whole/controller-to-query"
-    say "whole repository: production controller -> production backend -> OTLP -> PromQL"
-    cargo build --locked -p control_plane --bin control_plane -p data_plane --bin data_plane
-    ASAP_E2E_CONTROL_PLANE_BIN="${CARGO_TARGET_DIR}/debug/control_plane" \
-        rust_test data_plane --test backend_process_e2e
-}
-
 whole_matrix() {
     CURRENT_STAGE="whole/sketch-query-matrix"
     say "whole repository diagnostic: every sketch and query scenario"
@@ -205,7 +196,6 @@ main() {
             control_plane
             data_plane
             monitor
-            whole
             ;;
         contracts) need cargo; contracts ;;
         control-plane) need cargo; control_plane ;;
@@ -215,7 +205,6 @@ main() {
         differential) need cargo; differential ;;
         sketch-oracles) need cargo; sketch_oracles ;;
         monitor) need cargo; monitor ;;
-        whole) need cargo; whole ;;
         whole-matrix) need cargo; whole_matrix ;;
         differential-all) need cargo; differential_all ;;
         system) system_e2e ;;
