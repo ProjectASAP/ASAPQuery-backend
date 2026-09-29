@@ -90,3 +90,44 @@ pub fn validate_query_plan(
     }
     Ok(())
 }
+
+/// Retain Planner's complete state-to-state graph before candidate pricing.
+pub(super) fn compile_precompute_programs(
+    installed: &mut asap_types::executable_plan::InstalledPostAsapDag,
+    configs: &[asap_types::PrecomputeMaterialization],
+) -> Result<(), String> {
+    use asap_types::executable_plan::BackendNodeBinding;
+    let dag = installed.document.decode()?;
+    for sink in &installed.binding.precompute_sinks {
+        if installed.native_programs.contains_key(sink) {
+            continue;
+        }
+        let Some(BackendNodeBinding::Materialization { stored_output }) =
+            installed.binding.node(*sink)
+        else {
+            continue;
+        };
+        let config = configs
+            .iter()
+            .find(|c| c.policy_fingerprint() == stored_output.fingerprint())
+            .ok_or("precompute output configuration missing")?;
+        let Some(derived) = &config.derived_input else {
+            continue;
+        };
+        let frontiers = installed.binding.nodes.iter().filter_map(|(id, binding)| {
+            matches!(binding, BackendNodeBinding::Materialization { stored_output } if derived.inputs.contains(stored_output)).then_some(u64::from(id.0))
+        }).collect::<Vec<_>>();
+        let program = asap_physical_operators::physical_planner::precompute::compile(
+            &dag,
+            &frontiers,
+            &[u64::from(sink.0)],
+        )
+        .map_err(|e| e.to_string())?;
+        installed.native_programs.insert(
+            *sink,
+            serde_json::from_slice(&program.encode().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(())
+}

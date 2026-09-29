@@ -228,11 +228,13 @@ impl InstalledPostAsapDag {
                     self.binding.node(id),
                     Some(BackendNodeBinding::Materialization { .. })
                 )
-                || dag
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == id)
-                    .is_none_or(|n| n.output_schema != *contract.schema)
+                || dag.nodes.iter().find(|n| n.id == id).is_none_or(|n| {
+                    n.output_schema != *contract.schema
+                        && asap_physical_operators::physical_planner::precompute::source_schema(
+                            &n.output_schema,
+                        )
+                        .map_or(true, |schema| schema != contract.schema)
+                })
             {
                 return Err(
                     "native maintenance source differs from installed state boundary".into(),
@@ -243,11 +245,13 @@ impl InstalledPostAsapDag {
             .output_contract(u64::from(sink.0))
             .map_err(|e| e.to_string())?;
         if program.input_contracts().count() == 0
-            || dag
-                .nodes
-                .iter()
-                .find(|n| n.id == sink)
-                .is_none_or(|n| n.output_schema != *output.schema)
+            || dag.nodes.iter().find(|n| n.id == sink).is_none_or(|n| {
+                n.output_schema != *output.schema
+                    && asap_physical_operators::physical_planner::precompute::source_schema(
+                        &n.output_schema,
+                    )
+                    .map_or(true, |schema| schema != output.schema)
+            })
         {
             return Err("native maintenance output differs from semantic schema".into());
         }

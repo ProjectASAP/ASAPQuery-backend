@@ -799,8 +799,11 @@ pub fn enumerate_exact_and_materialized_candidates(
                     && existing
                         .queries
                         .iter()
-                        .zip(&candidate.queries)
-                        .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
+                        .map(|query| &query.selected_plan_root)
+                        .eq(candidate
+                            .queries
+                            .iter()
+                            .map(|query| &query.selected_plan_root))
             }) {
                 candidates.push(candidate);
             }
@@ -875,8 +878,11 @@ fn enumerate_frontier_candidates(
                     && existing
                         .queries
                         .iter()
-                        .zip(&candidate.queries)
-                        .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
+                        .map(|query| &query.selected_plan_root)
+                        .eq(candidate
+                            .queries
+                            .iter()
+                            .map(|query| &query.selected_plan_root))
             }) {
                 candidates.push(candidate);
             }
@@ -913,8 +919,8 @@ fn materialization_candidates(
         && request
             .queries
             .iter()
-            .zip(&exact.queries)
-            .all(|(a, b)| a.selected_plan_root == b.selected_plan_root)
+            .map(|query| &query.selected_plan_root)
+            .eq(exact.queries.iter().map(|query| &query.selected_plan_root))
     {
         Ok(vec![request])
     } else {

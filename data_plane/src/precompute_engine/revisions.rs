@@ -492,6 +492,10 @@ pub(crate) fn decode_native_record(
                 .native_program(*sink)?
                 .ok_or("native output program missing")?;
             let schema = program.output_contract(u64::from(sink.0))?.schema;
+            if asap_physical_operators::physical_planner::precompute::is_population_schema(&schema)
+            {
+                continue;
+            }
             if expected
                 .as_ref()
                 .is_some_and(|previous| previous != &schema)

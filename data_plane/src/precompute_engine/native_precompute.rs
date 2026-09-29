@@ -32,10 +32,51 @@ pub(super) fn execute(
             return Err("native precompute input has no stored binding".into());
         };
         let mut rows = Vec::new();
-        for input in inputs
+        let bound_inputs = inputs
             .iter()
-            .filter(|input| input.stored_output_reference.stored_output_id == *stored_output)
-        {
+            .filter(|input| input.definition == *stored_output)
+            .collect::<Vec<_>>();
+        if bound_inputs.is_empty() {
+            return Err("native precompute input has no eligible stored population".into());
+        }
+        for input in bound_inputs {
+            if input.stored_output_reference.stored_output_id != *stored_output
+                || input.windows.is_empty()
+            {
+                return Err(
+                    "native precompute input differs from its stored-output binding".into(),
+                );
+            }
+            if asap_physical_operators::physical_planner::precompute::is_population_schema(
+                &contract.schema,
+            ) {
+                let family = contract.schema.fields[2].dtype.clone();
+                for (&(start, end), state) in &input.windows {
+                    if start < window.0 || end > window.1 || start >= end {
+                        return Err("native precompute pane is outside its bound window".into());
+                    }
+                    rows.push(vec![
+                        Value::Map(
+                            input
+                                .group
+                                .iter()
+                                .map(|(k, v)| {
+                                    (Value::Utf8(k.clone().into()), Value::Utf8(v.clone().into()))
+                                })
+                                .collect::<Vec<_>>()
+                                .into(),
+                        ),
+                        Value::Timestamp(
+                            i64::try_from(end).map_err(|_| "native pane timestamp overflow")?,
+                        ),
+                        Value::Summary {
+                            family: family.clone(),
+                            state: Arc::clone(state),
+                        },
+                    ]);
+                }
+                continue;
+            }
             let state = input
                 .windows
                 .get(&window)
@@ -122,4 +163,45 @@ pub(super) fn execute(
         }
         Batch::try_new(schema, rows).map_err(Into::into)
     })
+}
+
+/// Decode output identities without regrouping or evaluating their states.
+pub(super) fn population_states(
+    batch: &Batch,
+    window_end: u64,
+) -> Result<
+    Vec<(
+        BTreeMap<String, String>,
+        Arc<dyn crate::storage_engines::types::AggregateCore>,
+    )>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    if !asap_physical_operators::physical_planner::precompute::is_population_schema(batch.schema())
+    {
+        return Err("precompute output is not a population state batch".into());
+    }
+    let mut result = BTreeMap::new();
+    for row in batch.rows() {
+        let [Value::Map(labels), Value::Timestamp(end), Value::Summary { state, .. }] =
+            row.as_slice()
+        else {
+            return Err("invalid population output row".into());
+        };
+        if u64::try_from(*end).ok() != Some(window_end) {
+            return Err("precompute output window differs from publication".into());
+        }
+        let mut group = BTreeMap::new();
+        for (key, value) in labels.iter() {
+            let (Value::Utf8(key), Value::Utf8(value)) = (key, value) else {
+                return Err("invalid population labels".into());
+            };
+            if group.insert(key.to_string(), value.to_string()).is_some() {
+                return Err("duplicate population label".into());
+            }
+        }
+        if result.insert(group, Arc::clone(state)).is_some() {
+            return Err("repeated precompute output population".into());
+        }
+    }
+    Ok(result.into_iter().collect())
 }
