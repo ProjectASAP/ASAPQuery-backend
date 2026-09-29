@@ -121,6 +121,11 @@ publication and continuous revision publication use these results. Outputs
 with different window contracts require separate runs. Recovery validates all
 roots and their bindings; it must not silently select only the first root.
 
+Window extent and publication cadence are independent. A 60-second window
+published every 10 seconds includes the ranges 0–60, 10–70 and 20–80 seconds.
+Continuous revisions recompute each affected window on that cadence, preserving
+the selected phase; they must not publish only disjoint 60-second windows.
+
 Unsupported operators, incompatible bindings, cycles and unsatisfied deployment
 requirements fail installation before the plan becomes active.
 

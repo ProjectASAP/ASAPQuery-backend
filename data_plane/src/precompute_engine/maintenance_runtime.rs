@@ -1566,6 +1566,28 @@ mod tests {
         WindowEdgeCompatibility,
     };
 
+    // A sixty-second window updated every ten seconds must publish every
+    // scheduled overlap, including after a correction and with a phase offset.
+    #[test]
+    fn revised_sliding_windows_follow_cadence_not_extent() {
+        for origin in [0, 5_000] {
+            let starts = [0, 10_000, 20_000, 60_000].map(|t| t + origin);
+            assert_eq!(
+                revision_windows(60_000, 10_000, origin as i64, starts.into_iter()).unwrap(),
+                starts
+                    .into_iter()
+                    .map(|start| (start, start + 60_000))
+                    .collect()
+            );
+            assert!(
+                revision_windows(60_000, 10_000, origin as i64, [origin + 1].into_iter())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(revision_windows(60_000, 0, 0, [0].into_iter()).is_err());
+    }
+
     fn definition(value: u64) -> asap_types::sds::StoredOutputId {
         asap_types::PolicyFingerprint(value).into()
     }
@@ -2860,6 +2882,24 @@ mod tests {
     }
 }
 
+fn revision_windows(
+    width: u64,
+    cadence: u64,
+    origin: i64,
+    starts: impl Iterator<Item = u64>,
+) -> Result<BTreeSet<(u64, u64)>, MaintenanceError> {
+    if width == 0 || cadence == 0 {
+        return Err("revision output has zero window extent or cadence".into());
+    }
+    Ok(starts
+        .filter_map(|start| {
+            ((start as i128 - origin as i128).rem_euclid(cadence as i128) == 0)
+                .then(|| start.checked_add(width).map(|end| (start, end)))
+                .flatten()
+        })
+        .collect())
+}
+
 /// Captured local input provides fixed population membership for this revision.
 /// Each retained producer graph executes against the frozen inputs for its output window.
 pub(crate) fn execute_revision_outputs(
@@ -2915,21 +2955,17 @@ pub(crate) fn execute_revision_outputs(
                 .iter()
                 .filter(|r| derived.inputs.contains(&r.definition))
                 .collect();
-            let width = config.stored_window_ms();
-            if width == 0 {
-                return Err("revision output has zero window extent".into());
-            }
-            let possible: BTreeSet<_> = inputs
-                .iter()
-                .flat_map(|i| i.windows.keys())
-                .filter_map(|(start, _)| {
-                    ((*start as i128 - config.pane_origin_ms.unwrap_or(0) as i128)
-                        .rem_euclid(width as i128)
-                        == 0)
-                        .then(|| start.checked_add(width).map(|end| (*start, end)))
-                        .flatten()
-                })
-                .collect();
+            let possible = revision_windows(
+                config.stored_window_ms(),
+                config
+                    .slide_interval
+                    .checked_mul(1000)
+                    .ok_or("revision cadence overflow")?,
+                config.pane_origin_ms.unwrap_or(0),
+                inputs
+                    .iter()
+                    .flat_map(|input| input.windows.keys().map(|(start, _)| *start)),
+            )?;
             for window in possible {
                 let selected: Vec<_> = inputs
                     .iter()

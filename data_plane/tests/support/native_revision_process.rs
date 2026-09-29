@@ -5,20 +5,27 @@ use super::*;
 // after restart, without mixing snapshots or falling back to an external engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_rate_ensemble_revises_and_recovers() {
-    run_native_ensemble(None).await;
+    run_native_ensemble(None, 60_000, 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_cms_rate_ensemble_revises_and_recovers() {
-    run_native_ensemble(Some("CmsWithHeap")).await;
+    run_native_ensemble(Some("CmsWithHeap"), 60_000, 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_count_sketch_rate_ensemble_revises_and_recovers() {
-    run_native_ensemble(Some("CountSketchWithHeap")).await;
+    run_native_ensemble(Some("CountSketchWithHeap"), 60_000, 0).await;
 }
 
-async fn run_native_ensemble(family: Option<&str>) {
+// Overlapping sixty-second windows must publish at the selected ten-second
+// cadence, including a late series and same-version restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sliding_native_rate_ensemble_revises_and_recovers() {
+    run_native_ensemble(None, 10_000, 5_000).await;
+}
+
+async fn run_native_ensemble(family: Option<&str>, cadence_ms: u64, phase_ms: u64) {
     use control_plane::physical::{
         compiler::{
             BackendLocalPlanningInput, DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
@@ -43,7 +50,8 @@ async fn run_native_ensemble(family: Option<&str>) {
             .map(|query| {
                 let mut entry = template.clone();
                 entry["query"] = (*query).into();
-                entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
+                entry["demand"]["fixed_interval_at"]["interval"] = cadence_ms.into();
+                entry["demand"]["fixed_interval_at"]["evaluation_phase"] = phase_ms.into();
                 entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
                 entry
             })
@@ -125,6 +133,14 @@ async fn run_native_ensemble(family: Option<&str>) {
         "synthetic costs must select the native ensemble"
     );
     assert_eq!(plan.query_plan.entries.len(), 2);
+    assert!(
+        plan.precompute_plan.materializations.iter().any(|config| {
+            config.derived_input.is_some()
+                && config.stored_window_ms() == 60_000
+                && config.slide_interval * 1_000 == cadence_ms
+        }),
+        "the fixture must actually deploy the selected overlapping windows"
+    );
     let installed = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
         collector_plans: plan.collector_plans,
@@ -166,7 +182,12 @@ async fn run_native_ensemble(family: Option<&str>) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let start = (now / 60_000 - 1) * 60_000;
+    let start = if cadence_ms == 60_000 {
+        (now / 60_000 - 1) * 60_000
+    } else {
+        // An eligible cadence boundary that is not a window-extent boundary.
+        (now / 60_000 - 2) * 60_000 + phase_ms as i64 + cadence_ms as i64
+    };
     let end = start + 60_000;
     let request = |instance: &str, last: f64| WriteRequest {
         timeseries: vec![series_with_labels(

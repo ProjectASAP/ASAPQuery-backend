@@ -1871,6 +1871,31 @@ impl PrometheusRemoteWriteReceiver {
                         if bytes > runtime.policy.max_checkpoint_bytes { return Err(Box::new(asap_physical_operators::Error::MemoryLimit)); }
                     }
                 }
+                // This captured revision contains every accepted local input.
+                // Empty counter panes between observed panes are therefore known
+                // empty for this revision, not missing input. Preserve the native
+                // zero-sample state so counter readout can merge sparse histories;
+                // a later correction rebuilds these panes in a new revision.
+                if matches!(&program.family, planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                    planner_types::post_asap::ExactKind::Rate | planner_types::post_asap::ExactKind::Increase, _
+                )) && !matches!(config.window_layout, asap_types::WindowMaterializationLayout::FullWindow) {
+                    let bounds = windows.keys().next().zip(windows.keys().next_back())
+                        .map(|(first, last)| (first.0, last.0));
+                    if let Some((mut start, last)) = bounds {
+                        let width = config.stored_window_ms();
+                        if width == 0 { return Err("counter pane width is zero".into()); }
+                        while start < last {
+                            let end = start.checked_add(width).ok_or("counter pane timestamp overflow")?;
+                            if let std::collections::btree_map::Entry::Vacant(entry) = windows.entry((start, end)) {
+                                entry.insert(program.updater()?);
+                                if windows.values().map(|u| u.memory_usage_bytes()).sum::<usize>() > runtime.policy.max_checkpoint_bytes {
+                                    return Err(Box::new(asap_physical_operators::Error::MemoryLimit));
+                                }
+                            }
+                            start = end;
+                        }
+                    }
+                }
                 let reference = plan.installed_precompute_plan.stored_output_reference(policy_fp.into()).ok_or("revision raw binding missing")?;
                 let group = group_key.as_population_labels();
                 let states: BTreeMap<_, Arc<dyn crate::storage_engines::types::AggregateCore>> = windows.into_iter().map(|(w,updater)|(w,Arc::from(updater.into_accumulator()))).collect();
