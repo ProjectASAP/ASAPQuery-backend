@@ -161,7 +161,7 @@ pub(super) fn operator(
 /// Planner before this candidate is priced or installed.
 pub(super) fn install_native_topk(
     entry: &mut asap_types::query_plan::QueryPlanEntry,
-    selected: &std::rc::Rc<SummaryNode>,
+    compiled: Option<&asap_physical_operators::physical_planner::CompiledPhysicalDag>,
 ) -> Result<(), CompileError> {
     use asap_types::query_plan::QueryPlanNode;
     let Some(QueryPlanNode::Logical {
@@ -178,14 +178,10 @@ pub(super) fn install_native_topk(
     if population.grouping.without {
         return Ok(());
     }
-    let compiled =
-        asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(
-            selected,
-        )
-        .map_err(|error| CompileError::Query {
-            query_id: entry.query_id.clone(),
-            reason: error.to_string(),
-        })?;
+    let compiled = compiled.ok_or_else(|| CompileError::Query {
+        query_id: entry.query_id.clone(),
+        reason: "selected TopK candidate has no retained physical DAG".into(),
+    })?;
     let encoded = compiled.encode().map_err(|error| CompileError::Query {
         query_id: entry.query_id.clone(),
         reason: error.to_string(),

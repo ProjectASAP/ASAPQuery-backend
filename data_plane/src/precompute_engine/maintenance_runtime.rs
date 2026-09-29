@@ -1550,7 +1550,9 @@ fn execute_finite_complete_populations(
                 cohort.inputs(),
                 window,
                 max_bytes,
-            )?;
+                0,
+            )
+            .map_err(|e| e.to_string())?;
             let mut output = crate::storage_engines::types::PrecomputedOutput::new(
                 window.0,
                 window.1,
@@ -4554,6 +4556,27 @@ pub(crate) fn execute_revision_outputs(
                         cursor != window.1
                     })
                 {
+                    continue;
+                }
+                if let Some(program) = installed.native_program(*sink)? {
+                    let batch = super::native_precompute::execute(
+                        installed, &program, &selected, window, limit, revision,
+                    )?;
+                    let payload =
+                        asap_physical_operators::stored_state::native::encode_batch(&batch)?;
+                    if payload.len() > limit {
+                        return Err(asap_physical_operators::Error::MemoryLimit.into());
+                    }
+                    result.get_mut(target).unwrap().push(RevisionRecord {
+                        reference: plan
+                            .installed_precompute_plan
+                            .stored_output_reference(*target)
+                            .ok_or("native revision output has no installed binding")?,
+                        group: BTreeMap::new(),
+                        start_ms: window.0,
+                        end_ms: window.1,
+                        payload,
+                    });
                     continue;
                 }
                 let (_, mut key) = prepare_frozen_maintenance_sink(

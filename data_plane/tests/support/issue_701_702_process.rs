@@ -346,10 +346,15 @@ fn issue_701_702_uncertified_ratios_require_exact_fallback() {
         let candidates =
             workload_cost::enumerate_exact_and_materialized_candidates(request).unwrap();
         assert!(!candidates.is_empty());
+        let mut exact_count = 0;
         for candidate in candidates {
-            let plan = DeploymentPlanCompiler
-                .compile_promql(candidate, environment.clone())
-                .unwrap();
+            let plan = match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
+                Ok(plan) => plan,
+                Err(control_plane::physical::compiler::CompileError::Query { reason, .. })
+                    if reason == "selected query result has no certified accuracy guarantee satisfying the requested accuracy" => continue,
+                Err(error) => panic!("unexpected candidate rejection for {query}: {error}"),
+            };
+            exact_count += 1;
             assert!(plan.precompute_plan.materializations.is_empty(), "{query}");
             assert!(
                 plan.query_plan.entries.values().all(|entry| matches!(
@@ -359,6 +364,7 @@ fn issue_701_702_uncertified_ratios_require_exact_fallback() {
                 "{query}"
             );
         }
+        assert!(exact_count > 0, "no executable exact candidate for {query}");
     }
 }
 

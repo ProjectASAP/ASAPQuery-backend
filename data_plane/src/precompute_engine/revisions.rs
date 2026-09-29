@@ -473,6 +473,50 @@ pub(crate) fn decode_state(
     }
 }
 
+/// Decode the complete persisted output schema selected by Planner. A native
+/// batch may carry many groups; it is not a scalar accumulator record.
+pub(crate) fn decode_native_record(
+    plan: &RuntimePhysicalPlan,
+    record: &RevisionRecord,
+    max_bytes: usize,
+) -> Result<Option<Batch>, RevisionError> {
+    use asap_types::executable_plan::BackendNodeBinding;
+    let mut expected = None;
+    for installed in plan.precompute_plan.executable_dags.values() {
+        for sink in installed.native_programs.keys() {
+            if !matches!(installed.binding.node(*sink), Some(BackendNodeBinding::Materialization { stored_output }) if *stored_output == record.reference.stored_output_id)
+            {
+                continue;
+            }
+            let program = installed
+                .native_program(*sink)?
+                .ok_or("native output program missing")?;
+            let schema = program.output_contract(u64::from(sink.0))?.schema;
+            if expected
+                .as_ref()
+                .is_some_and(|previous| previous != &schema)
+            {
+                return Err("shared native output has conflicting schemas".into());
+            }
+            expected = Some(schema);
+        }
+    }
+    let Some(schema) = expected else {
+        return Ok(None);
+    };
+    if !record.group.is_empty() {
+        return Err("native revision must contain the whole grouped output".into());
+    }
+    if record.payload.len() > max_bytes {
+        return Err(asap_physical_operators::Error::MemoryLimit.into());
+    }
+    let batch = native::decode_batch(&record.payload, schema, max_bytes)?;
+    if batch.bytes() > max_bytes {
+        return Err(asap_physical_operators::Error::MemoryLimit.into());
+    }
+    Ok(Some(batch))
+}
+
 /// A single local owner serializes input revisions for the installed plan.
 /// Opening is lazy so activation/recovery does not depend on receiving new data.
 pub struct RevisionRuntime {
@@ -579,7 +623,11 @@ impl RevisionRuntime {
                                 .into(),
                         );
                     }
-                    decode_state(record, config)?;
+                    if decode_native_record(&plan, record, self.policy.max_checkpoint_bytes)?
+                        .is_none()
+                    {
+                        decode_state(record, config)?;
+                    }
                 }
             }
         }

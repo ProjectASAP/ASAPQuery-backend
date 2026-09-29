@@ -613,6 +613,9 @@ impl Drop for StateMutation<'_> {
 
 #[derive(Default)]
 pub struct SketchStore {
+    /// Only populated in an immutable, query-wide revision view.
+    native_revision_batches:
+        Option<BTreeMap<(StoredOutputId, i64, i64), asap_physical_operators::values::Batch>>,
     pub(crate) revisions: RwLock<Option<Arc<crate::precompute_engine::revisions::RevisionRuntime>>>,
     pub current_series: std::sync::Mutex<super::current_series::CurrentSeriesStore>,
     /// Held through each state append; completion takes the exclusive guard.
@@ -2750,7 +2753,9 @@ impl SketchStore {
     /// surface; it is O(N sids) and meant for the 30 s diagnostic tick, not
     /// the hot path.
     pub fn approx_resident_bytes(&self) -> usize {
-        let mut total = 0usize;
+        let mut total = self.native_revision_batches.as_ref().map_or(0, |batches| {
+            batches.values().map(|batch| batch.bytes()).sum::<usize>()
+        });
 
         // 1. SeriesId bindings, compatibility metadata, and shared SDS descriptors.
         if let Ok(insts) = self.instances.read() {
@@ -3843,7 +3848,9 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
         // over. The hot-window seal (`seal_aged_epochs`) handles the
         // common case; this keeps the memory-pressure backstop honest for
         // a burst that outruns the hot window.
-        let mut total = 0usize;
+        let mut total = self.native_revision_batches.as_ref().map_or(0, |batches| {
+            batches.values().map(|batch| batch.bytes()).sum()
+        });
         for entry in self.series.iter() {
             let Ok(data) = entry.value().read() else {
                 continue;
@@ -6835,7 +6842,8 @@ impl SketchStore {
         pinned: &crate::precompute_engine::revisions::PinnedRevision,
     ) -> Result<Self, crate::precompute_engine::revisions::RevisionError> {
         use crate::storage_engines::types::{KeyByLabelValues, PrecomputedOutput};
-        let view = Self::new();
+        let mut view = Self::new();
+        view.native_revision_batches = Some(BTreeMap::new());
         view.install_precompute_plan(
             plan.summary_catalog
                 .clone()
@@ -6857,6 +6865,25 @@ impl SketchStore {
                 .ok_or("revision view has unbound output")?;
             if expected != record.reference {
                 return Err("revision view semantic binding mismatch".into());
+            }
+            if let Some(batch) =
+                crate::precompute_engine::revisions::decode_native_record(plan, record, usize::MAX)?
+            {
+                let key = (
+                    definition,
+                    i64::try_from(record.start_ms)?,
+                    i64::try_from(record.end_ms)?,
+                );
+                if view
+                    .native_revision_batches
+                    .as_mut()
+                    .unwrap()
+                    .insert(key, batch)
+                    .is_some()
+                {
+                    return Err("duplicate native record in pinned revision".into());
+                }
+                continue;
             }
             let config = plan
                 .precompute_plan

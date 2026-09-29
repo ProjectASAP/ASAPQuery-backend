@@ -67,6 +67,9 @@ pub struct QueryCompilationInput {
     /// Planner-selected post-ASAP DAG. The physical compiler must not
     /// re-select a summary family from pre-ASAP input.
     pub selected_plan_root: Rc<SummaryNode>,
+    /// Encoded Planner PhysicalCandidate retained before deployment pricing.
+    /// Installation decodes this candidate; it must not compile another graph.
+    pub physical_candidate: Option<Vec<u8>>,
     /// Legacy catalog source retained for request compatibility. Physical
     /// materialization sources are derived from each post-ASAP SummaryAgg;
     /// it also remains part of the cost manifest workload identity.
@@ -86,6 +89,46 @@ pub struct QueryCompilationInput {
     /// It is validated against the selected summary family during physical
     /// compilation and becomes part of the immutable plan generation.
     pub materialization_runtime_policy: RuntimeRulePolicy,
+}
+
+impl QueryCompilationInput {
+    /// Physical planning precedes deployment feasibility and cost selection.
+    pub(crate) fn retain_physical_candidate(&mut self) -> Result<(), CompileError> {
+        use asap_physical_operators::physical_planner::{promql_rows, PhysicalCandidate};
+        let candidate =
+            promql_rows::compile_fixed_window_rate_aggregation(&self.selected_plan_root)
+                .or_else(|_| {
+                    promql_rows::compile_current_series_readout(&self.selected_plan_root)
+                        .or_else(|_| {
+                            promql_rows::compile_rate_ranking(&self.selected_plan_root)
+                                .map(|(_, dag)| dag)
+                        })
+                        .map(|query| PhysicalCandidate {
+                            precompute: None,
+                            query,
+                            materialized_outputs: BTreeMap::new(),
+                        })
+                })
+                .ok();
+        self.physical_candidate = candidate
+            .map(|candidate| candidate.encode())
+            .transpose()
+            .map_err(|e| CompileError::Snapshot(e.to_string()))?;
+        Ok(())
+    }
+
+    fn retained_physical(
+        &self,
+    ) -> Result<Option<asap_physical_operators::physical_planner::PhysicalCandidate>, CompileError>
+    {
+        self.physical_candidate
+            .as_ref()
+            .map(|bytes| {
+                asap_physical_operators::physical_planner::PhysicalCandidate::decode(bytes)
+                    .map_err(|e| CompileError::Snapshot(e.to_string()))
+            })
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -917,6 +960,7 @@ impl BackendLocalPlanningInput {
                 query_id,
                 query_string: query_string.clone(),
                 selected_plan_root: post_asap,
+                physical_candidate: None,
                 legacy_query_source: Source::TimeSeries {
                     metric: source_hint,
                 },
@@ -1083,6 +1127,12 @@ impl BackendLocalPlanningInput {
                 continue;
             }
             planner_candidate_forests.push(forest);
+        }
+        for query in queries
+            .iter_mut()
+            .chain(planner_candidate_forests.iter_mut().flatten())
+        {
+            query.retain_physical_candidate()?;
         }
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
@@ -1571,7 +1621,10 @@ impl DeploymentPlanCompiler {
                 for state in &selected {
                     if matches!(&state.node.expr, SummaryExpr::SummaryAgg {
                         reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
-                    } if keys.is_empty()) || asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).is_ok()
+                    } if keys.is_empty())
+                        || query
+                            .retained_physical()?
+                            .is_some_and(|candidate| candidate.precompute.is_some())
                     {
                         if let Some(sources) = immutable_materialization_sources(&state.node) {
                             canonical_nodes.insert(Rc::as_ptr(&state.node) as usize);
@@ -1582,7 +1635,9 @@ impl DeploymentPlanCompiler {
                 }
             }
             let cohort_nodes = windows::cohort_nodes(&selected);
-            let native_cohort = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).is_ok();
+            let native_cohort = query
+                .retained_physical()?
+                .is_some_and(|candidate| candidate.precompute.is_some());
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let mut branch_query = query.clone();
                 branch_query.query_lookback_ms = selected
@@ -2162,23 +2217,39 @@ impl DeploymentPlanCompiler {
                 } else {
                     false
                 };
-            let native_rate =
-                asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(
-                    &query.selected_plan_root,
-                )
-                .ok();
-            let native_rate = native_rate.or_else(|| {
-                let physical = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).ok()?;
-                fn heap(node: &Rc<SummaryNode>) -> Option<Rc<SummaryNode>> {
-                    match &node.expr {
-                        SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(..) | SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _), .. } => Some(node.clone()),
-                        SummaryExpr::ValueOperation { child, .. } => heap(child),
-                        SummaryExpr::SummaryEstimate { summary_input, .. } => heap(summary_input),
-                        _ => None,
-                    }
-                }
-                Some((heap(&query.selected_plan_root)?, physical.query))
-            });
+            let native_rate = if population_operators[query_index].is_none() {
+                query
+                    .retained_physical()?
+                    .map(|physical| {
+                        let program = physical.query;
+                        let sources = program
+                            .input_contracts()
+                            .map(|(id, _)| id)
+                            .collect::<Vec<_>>();
+                        let [source] = sources.as_slice() else {
+                            return Err(CompileError::Snapshot(
+                                "native candidate requires one bound input".into(),
+                            ));
+                        };
+                        let source = executable_dags[query_index]
+                            .as_ref()
+                            .and_then(|compiled| {
+                                u32::try_from(*source).ok().and_then(|id| {
+                                    compiled.node_ids.summary_node(PostAsapNodeId(id))
+                                })
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                CompileError::Snapshot(
+                                    "selected physical input has no semantic binding".into(),
+                                )
+                            })?;
+                        Ok((source, program))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             let mut entry = if let Some((source, program)) = native_rate {
                 let native_state_binding = if let SummaryExpr::SummaryAgg {
                     family:
@@ -2371,7 +2442,10 @@ impl DeploymentPlanCompiler {
             }
             super::maintained_population::install_native_topk(
                 &mut entry,
-                &query.selected_plan_root,
+                query
+                    .retained_physical()?
+                    .as_ref()
+                    .map(|candidate| &candidate.query),
             )?;
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
@@ -2414,10 +2488,23 @@ impl DeploymentPlanCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
-            if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&request.queries[query_index].selected_plan_root) {
-                let program = physical.precompute.ok_or_else(|| CompileError::Snapshot("fixed-window candidate has no maintenance program".into()))?;
-                let sink = PostAsapNodeId(u32::try_from(program.roots()[0]).map_err(|_| CompileError::Snapshot("maintenance sink overflow".into()))?);
-                installed.native_programs.insert(sink, serde_json::from_slice(&program.encode().map_err(|e| CompileError::Snapshot(e.to_string()))?).map_err(|e| CompileError::Snapshot(e.to_string()))?);
+            if let Some(program) = request.queries[query_index]
+                .retained_physical()?
+                .and_then(|physical| physical.precompute)
+            {
+                let sink = PostAsapNodeId(
+                    u32::try_from(program.roots()[0])
+                        .map_err(|_| CompileError::Snapshot("precompute sink overflow".into()))?,
+                );
+                installed.native_programs.insert(
+                    sink,
+                    serde_json::from_slice(
+                        &program
+                            .encode()
+                            .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                    )
+                    .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                );
             }
             query_plan
                 .selected_dags
@@ -5555,6 +5642,7 @@ pub(crate) mod tests {
                 query_id: query_id.into(),
                 query_string: promql.into(),
                 selected_plan_root: post_asap,
+                physical_candidate: None,
                 legacy_query_source: Source::TimeSeries { metric: "m".into() },
                 query_lookback_ms: 60_000,
                 group_by_labels: vec![],
