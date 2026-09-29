@@ -430,13 +430,15 @@ pub struct IndexRecord {
     pub data_offset: u64,
 }
 
-/// mmap-backed reader for a single part. Cheap to construct (three
-/// mmaps + one header parse), safe to share across threads via `Arc`.
+/// mmap-backed reader with a sorted output/window index built once on open.
+/// Safe to share across threads via `Arc`.
 pub struct PartReader {
     pub meta: PartMeta,
     pub part_dir: PathBuf,
     data_mmap: Arc<Mmap>,
     index_mmap: Arc<Mmap>,
+    // Older parts preserve flush order, so keep a separate sorted lookup.
+    window_index: Vec<usize>,
 }
 
 impl std::fmt::Debug for PartReader {
@@ -479,12 +481,25 @@ impl PartReader {
             )));
         }
 
-        Ok(Self {
+        let mut reader = Self {
             meta,
             part_dir: part_dir.to_path_buf(),
             data_mmap: Arc::new(data_mmap),
             index_mmap: Arc::new(index_mmap),
-        })
+            window_index: Vec::new(),
+        };
+        let mut positions: Vec<_> = (0..reader.meta.num_entries as usize).collect();
+        positions.sort_unstable_by_key(|&position| {
+            let record = reader.index_record(position);
+            (
+                record.agg_id,
+                record.start_ts,
+                record.end_ts,
+                record.data_offset,
+            )
+        });
+        reader.window_index = positions;
+        Ok(reader)
     }
 
     /// Read and verify just the meta.bin header (cheap — 64 bytes).
@@ -537,28 +552,51 @@ impl PartReader {
         })
     }
 
-    /// Return all index records. Small (32 B × num_entries) — cheap to
-    /// materialize.
-    pub fn index_records(&self) -> Vec<IndexRecord> {
-        let n = self.meta.num_entries as usize;
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let off = i * INDEX_ENTRY_SIZE;
-            let agg_id = u64::from_le_bytes(self.index_mmap[off..off + 8].try_into().unwrap());
-            let start_ts =
-                u64::from_le_bytes(self.index_mmap[off + 8..off + 16].try_into().unwrap());
-            let end_ts =
-                u64::from_le_bytes(self.index_mmap[off + 16..off + 24].try_into().unwrap());
-            let data_offset =
-                u64::from_le_bytes(self.index_mmap[off + 24..off + 32].try_into().unwrap());
-            out.push(IndexRecord {
-                agg_id,
-                start_ts,
-                end_ts,
-                data_offset,
-            });
+    fn index_record(&self, position: usize) -> IndexRecord {
+        let off = position * INDEX_ENTRY_SIZE;
+        let read =
+            |offset| u64::from_le_bytes(self.index_mmap[offset..offset + 8].try_into().unwrap());
+        IndexRecord {
+            agg_id: read(off),
+            start_ts: read(off + 8),
+            end_ts: read(off + 16),
+            data_offset: read(off + 24),
         }
-        out
+    }
+
+    /// Preserve disk order for callers that need to inspect the entire part.
+    pub fn index_records(&self) -> Vec<IndexRecord> {
+        (0..self.meta.num_entries as usize)
+            .map(|position| self.index_record(position))
+            .collect()
+    }
+
+    /// Find records contained in the requested window under one stored-output
+    /// prefix. Duplicate windows remain visible so callers can reject ambiguity.
+    pub fn window_records(
+        &self,
+        agg_id: u64,
+        start_ts: u64,
+        end_ts: u64,
+    ) -> impl Iterator<Item = IndexRecord> + '_ {
+        let first = self.window_index.partition_point(|&position| {
+            let record = self.index_record(position);
+            (record.agg_id, record.start_ts) < (agg_id, start_ts)
+        });
+        self.window_index[first..]
+            .iter()
+            .map(|&position| self.index_record(position))
+            .take_while(move |record| record.agg_id == agg_id && record.start_ts <= end_ts)
+            .filter(move |record| record.end_ts <= end_ts)
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        (self.data_mmap.len() as u64)
+            .saturating_add(self.index_mmap.len() as u64)
+            .saturating_add(
+                (self.window_index.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<usize>() as u64),
+            )
     }
 
     /// Resolve a single index record into a [`SnapshotEntry`] by reading
@@ -655,6 +693,40 @@ mod tests {
                     sketch_bytes: b"opaque-sketch-2-more-bytes".to_vec(),
                 },
             ],
+        }
+    }
+
+    // Old parts can be unsorted; lookup must isolate the prefix/range while
+    // preserving duplicate records for the immutable reader's ambiguity check.
+    #[test]
+    fn window_lookup_handles_unsorted_parts_duplicates_and_recovery() {
+        let tmp = TempDir::new().unwrap();
+        let part_dir = tmp.path().join("lookup");
+        let mut snapshots = Vec::new();
+        for id in [99, 42, 1] {
+            let mut snapshot = make_snapshot();
+            snapshot.agg_id = id;
+            snapshot.entries.reverse();
+            if id == 42 {
+                snapshot.entries.push(snapshot.entries[1].clone());
+            }
+            snapshots.push(snapshot);
+        }
+        PartWriter::write_part(&part_dir, 1, &snapshots).unwrap();
+        for _ in 0..2 {
+            let reader = PartReader::open(&part_dir).unwrap();
+            let records = reader.window_records(42, 1_000, 1_500).collect::<Vec<_>>();
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|record| record.agg_id == 42
+                && record.start_ts == 1_000
+                && record.end_ts == 1_500));
+            assert_ne!(records[0].data_offset, records[1].data_offset);
+            assert_eq!(reader.window_records(42, 1_500, 2_000).count(), 1);
+            assert_eq!(reader.window_records(43, 0, u64::MAX).count(), 0);
+            assert_eq!(reader.window_records(42, 1_001, 1_999).count(), 0);
+            assert_eq!(reader.window_records(42, 2_000, 1_000).count(), 0);
+            assert_eq!(reader.index_records()[0].agg_id, 99);
+            assert!(reader.resident_bytes() > reader.meta.data_len + reader.meta.index_len);
         }
     }
 

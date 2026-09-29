@@ -352,11 +352,12 @@ impl PhysicalQueryRuntime<'_> {
                         item_labels: merged_item_labels.unwrap_or_default(),
                     })
             }
-            QueryPlanNode::Logical { .. }
+            QueryPlanNode::PhysicalFragment { .. }
+            | QueryPlanNode::Physical { .. }
+            | QueryPlanNode::Logical { .. }
             | QueryPlanNode::Relational { .. }
             | QueryPlanNode::ExternalExact { .. }
             | QueryPlanNode::PhysicalRelation { .. }
-            | QueryPlanNode::PhysicalFragment { .. }
             | QueryPlanNode::RelationalJoin { .. } => Err(PhysicalNodeError::Fallback(
                 "logical node requires installed logical runtime".into(),
             )),
@@ -1004,6 +1005,7 @@ mod tests {
             },
         };
         let entry = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::PromQl,
             query_id: "resource-test".into(),
             canonical_query: "1".into(),
@@ -1284,6 +1286,7 @@ mod tests {
     #[test]
     fn multi_root_readout_uses_one_parent_context() {
         let entry = asap_types::query_plan::QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "shared".into(),
             canonical_query: "1+1".into(),
@@ -1568,6 +1571,7 @@ mod tests {
         .unwrap();
         idx.register(metadata);
         let mut entry = QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::MetricsQl,
             query_id: "quantile".into(),
             canonical_query: "quantile_over_time(0.9, latency_ms[1s])".into(),
@@ -2006,6 +2010,7 @@ mod tests {
         }
 
         let entry = asap_types::query_plan::QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
             canonical_query: "rate(requests_total[1m])".into(),
@@ -2107,6 +2112,7 @@ mod tests {
         idx.append_precompute(7, BTreeMap::new(), (0, 60_000), Box::new(accumulator));
 
         let entry = asap_types::query_plan::QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
             canonical_query: "rate(requests_total[1m])".into(),

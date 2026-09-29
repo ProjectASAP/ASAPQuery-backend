@@ -174,6 +174,7 @@ mod tests {
             );
         }
         let entry = asap_types::query_plan::QueryPlanEntry {
+            physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q-sum".into(),
             canonical_query: "sum_over_time(bytes[1s])".into(),

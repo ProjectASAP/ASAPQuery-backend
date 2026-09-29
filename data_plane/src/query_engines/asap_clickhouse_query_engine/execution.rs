@@ -566,6 +566,7 @@ mod tests {
 
     fn external_entry(schema: &SummarySchema) -> QueryPlanEntry {
         QueryPlanEntry {
+            physical_dag: None,
             language: QueryLanguage::ClickHouseSql,
             query_id: "shared-external".into(),
             canonical_query: "SELECT x".into(),

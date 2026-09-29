@@ -71,7 +71,7 @@ pub struct QueryCompilationInput {
     /// materialization sources are derived from each post-ASAP SummaryAgg;
     /// it also remains part of the cost manifest workload identity.
     pub legacy_query_source: Source,
-    pub query_lookback_seconds: u64,
+    pub query_lookback_ms: u64,
     /// Label names are deployment metadata because Planner's canonical IR
     /// currently carries positional column IDs at this boundary.
     pub group_by_labels: Vec<String>,
@@ -154,10 +154,15 @@ pub struct SummaryLifecyclePlanningInputs {
 
 #[derive(Debug, Clone, Default)]
 pub struct PhysicalCompilationRequest {
-    /// Diagnostic projections of the original Planner search; never consumed by selection.
-    pub planner_selection_trace: Vec<serde_json::Value>,
+    /// Complete Planner candidates retained until deployment admission/pricing.
+    /// Empty for callers that explicitly supply one already-selected forest.
+    pub planner_candidate_forests: Vec<Vec<QueryCompilationInput>>,
+    /// Immutable search diagnostics shared across candidates; never consumed by selection.
+    pub planner_selection_trace: std::sync::Arc<Vec<serde_json::Value>>,
     /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
     pub allow_mixed_summary_and_exact_execution: bool,
+    /// Deployment feasibility: external exact dependencies cannot be bound.
+    pub require_backend_local_execution: bool,
     /// Enabled optional candidate keys: None enables all eligible keys; an
     /// explicitly empty set enables none. These are not catalog definition IDs.
     pub enabled_materialization_keys: Option<BTreeSet<String>>,
@@ -165,7 +170,7 @@ pub struct PhysicalCompilationRequest {
     pub query_workload: Option<QueryWorkload>,
     /// Source evidence supplied independently from query demand.
     pub data_workload: Option<DataWorkload>,
-    /// Workload-lowered roots retained across physical alternative enumeration.
+    /// Workload-lowered roots retained across physical candidate enumeration.
     pub canonical_roots: Vec<Rc<QueryExpr>>,
     pub queries: Vec<QueryCompilationInput>,
     pub topk_membership_evidence_by_query_id: HashMap<String, TopKMembershipEvidence>,
@@ -194,6 +199,135 @@ pub struct TopKMembershipEvidence {
     pub interval_failure_probability: f64,
     pub observed_at_unix_ms: u64,
     pub source: String,
+}
+
+/// A proof for one exact Planner operand, including the enforced source
+/// domain rather than an observed sample minimum or maximum.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct QuantileOperandDomainEvidence {
+    pub operand: Value,
+    pub lower: f64,
+    pub upper: f64,
+    pub max_samples: u64,
+    pub contract: String,
+}
+
+/// Optional accuracy facts bound to one registered query and data snapshot.
+/// Missing fields stay unknown to Planner. The data workload and snapshot
+/// identity prevent reusing a proof for a different source population.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedAccuracyEvidence {
+    pub query_string: String,
+    pub data_snapshot_id: String,
+    pub data_workload: DataWorkload,
+    pub source: String,
+    pub observed_at_unix_ms: u64,
+    pub valid_for_ms: u64,
+    #[serde(default)]
+    pub quantile_operand_domains: Vec<QuantileOperandDomainEvidence>,
+    #[serde(default)]
+    pub values_non_negative: Option<bool>,
+    #[serde(default)]
+    pub input_row_count: Option<u64>,
+    #[serde(default)]
+    pub hydra_shared_grid_collision_bound: Option<f64>,
+    #[serde(default)]
+    pub hydra_shared_grid_failure_probability: Option<f64>,
+    /// Enforced upper bound across all partition/item identities for this query
+    /// snapshot. An observed cardinality estimate is not this contract.
+    #[serde(default)]
+    pub topk_max_distinct_items: Option<u64>,
+    #[serde(default)]
+    pub topk_selected_lower_bound: Option<f64>,
+    #[serde(default)]
+    pub topk_excluded_upper_bound: Option<f64>,
+    #[serde(default)]
+    pub topk_interval_failure_probability: Option<f64>,
+}
+
+impl ScopedAccuracyEvidence {
+    pub fn validate(
+        &self,
+        query_id: &str,
+        query_string: &str,
+        data: &DataWorkload,
+        snapshot_id: Option<&str>,
+        now_ms: u64,
+        max_age_ms: u64,
+    ) -> Result<(), CompileError> {
+        let valid_scope = self.query_string == query_string
+            && &self.data_workload == data
+            && snapshot_id.is_some_and(|id| id == self.data_snapshot_id)
+            && !self.data_snapshot_id.trim().is_empty()
+            && !self.source.trim().is_empty();
+        let valid_time = self.observed_at_unix_ms <= now_ms
+            && self.valid_for_ms > 0
+            && now_ms - self.observed_at_unix_ms <= self.valid_for_ms.min(max_age_ms);
+        let topk_bounds = (
+            self.topk_selected_lower_bound,
+            self.topk_excluded_upper_bound,
+            self.topk_interval_failure_probability,
+        );
+        let valid_topk = match topk_bounds {
+            (None, None, None) => true,
+            (Some(lower), Some(upper), Some(failure)) => {
+                lower.is_finite()
+                    && upper.is_finite()
+                    && lower > upper
+                    && (0.0..=1.0).contains(&failure)
+            }
+            _ => false,
+        };
+        let valid_stats = valid_topk
+            && self
+                .topk_max_distinct_items
+                .is_none_or(|n| n > 0 && n <= (1_u64 << 53))
+            && self.input_row_count != Some(0)
+            && self
+                .hydra_shared_grid_collision_bound
+                .is_none_or(|v| v.is_finite() && v >= 0.0)
+            && self
+                .hydra_shared_grid_failure_probability
+                .is_none_or(|v| (0.0..=1.0).contains(&v))
+            && self
+                .quantile_operand_domains
+                .iter()
+                .enumerate()
+                .all(|(index, domain)| {
+                    domain.lower.is_finite()
+                        && domain.upper.is_finite()
+                        && domain.lower <= domain.upper
+                        && (1..=(1u64 << 53)).contains(&domain.max_samples)
+                        && !domain.contract.trim().is_empty()
+                        && !self.quantile_operand_domains[..index]
+                            .iter()
+                            .any(|earlier| earlier.operand == domain.operand)
+                });
+        if valid_scope && valid_time && valid_stats {
+            return Ok(());
+        }
+        let reason = if self.query_string != query_string {
+            "accuracy evidence belongs to a different query"
+        } else if &self.data_workload != data {
+            "accuracy evidence belongs to a different data workload"
+        } else if !snapshot_id.is_some_and(|id| id == self.data_snapshot_id)
+            || self.data_snapshot_id.trim().is_empty()
+        {
+            "accuracy evidence belongs to a different or unspecified data snapshot"
+        } else if self.source.trim().is_empty() {
+            "accuracy evidence has no provenance source"
+        } else if !valid_time {
+            "accuracy evidence is expired, future-dated, or has no validity window"
+        } else {
+            "accuracy evidence contains invalid or ambiguous bounds"
+        };
+        Err(CompileError::InvalidEvidence {
+            query_id: query_id.into(),
+            reason: reason.into(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,7 +375,6 @@ pub struct BackendLocalPlanningInput {
     /// Must equal [`WORKLOAD_SNAPSHOT_VERSION`].
     #[serde(rename = "snapshot_version")]
     pub schema_version: u32,
-    /// May be absent during candidate discovery, never during deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     #[serde(deserialize_with = "deserialize_snapshot_query_workload")]
@@ -255,6 +388,9 @@ pub struct BackendLocalPlanningInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPhysicalInputs {
+    /// Constrain selection to local execution when no exact upstream is available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_backend_local_execution: bool,
     pub lifecycle_costs: LifecycleUnitCosts,
     pub evidence_observed_at_unix_ms: u64,
     pub evidence_valid_for_ms: u64,
@@ -279,6 +415,12 @@ pub struct BackendLocalPhysicalInputs {
     /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
+    /// Data generation used by scoped accuracy certificates during candidate
+    /// discovery, before complete workload quotes are available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accuracy_evidence: HashMap<String, ScopedAccuracyEvidence>,
     /// Measured exact/summary composition profiles keyed by registered
     /// PromQL. Missing rows keep the corresponding Planner site opaque.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -480,7 +622,7 @@ pub struct CompiledPhysicalPlan {
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
     pub cost_comparison: Option<super::workload_cost::CandidatePlanSelectionReport>,
-    pub planner_selection_trace: Vec<serde_json::Value>,
+    pub planner_selection_trace: std::sync::Arc<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -499,7 +641,7 @@ pub struct MaterializationLifecycleEstimate {
 pub enum CompileError {
     #[error("invalid backend-local workload snapshot: {0}")]
     Snapshot(String),
-    #[error("no feasible completely costed alternative: {0}")]
+    #[error("no feasible completely costed candidate: {0}")]
     Candidates(serde_json::Value),
     #[error("planner revision mismatch: request={request}, compiler={compiler}")]
     PlannerRevision {
@@ -518,24 +660,79 @@ pub enum CompileError {
     QueryPlan(#[from] crate::query_plan::QueryPlanError),
 }
 
-struct QueryEvidence<'a>(Option<&'a TopKMembershipEvidence>);
+struct QueryEvidence<'a> {
+    topk: Option<&'a TopKMembershipEvidence>,
+    scoped: Option<&'a ScopedAccuracyEvidence>,
+    now_ms: u64,
+}
 
 impl AccuracyEvidenceProvider for QueryEvidence<'_> {
+    fn topk_max_distinct_items(&self, _: &QueryExpr) -> Option<u64> {
+        self.scoped
+            .and_then(|evidence| evidence.topk_max_distinct_items)
+    }
+    fn quantile_input_domain(
+        &self,
+        operand: &QueryExpr,
+    ) -> Option<asap_aware_mapping::accuracy::QuantileInputDomain> {
+        let operand = serde_json::to_value(operand).ok()?;
+        let domain = self
+            .scoped?
+            .quantile_operand_domains
+            .iter()
+            .find(|entry| entry.operand == operand)?;
+        Some(asap_aware_mapping::accuracy::QuantileInputDomain {
+            lower: domain.lower,
+            upper: domain.upper,
+            max_samples: domain.max_samples,
+            contract: domain.contract.clone(),
+        })
+    }
+
     fn propagation_stats(
         &self,
         op: &CompositionOperator,
         _family: &SummaryFamilyType,
         _query: Option<&SketchQuery>,
     ) -> PropagationStats {
-        match (op, self.0) {
-            (CompositionOperator::TopKSelection, Some(e)) => PropagationStats {
-                topk_selected_lower_bound: Some(e.selected_lower_bound),
-                topk_excluded_upper_bound: Some(e.excluded_upper_bound),
-                topk_interval_failure_probability: Some(e.interval_failure_probability),
+        let mut stats = self
+            .scoped
+            .map_or_else(PropagationStats::default, |evidence| PropagationStats {
+                values_non_negative: evidence.values_non_negative,
+                input_row_count: evidence.input_row_count.or_else(|| {
+                    evidence
+                        .data_workload
+                        .input_cardinality
+                        .value_at(self.now_ms)
+                        .copied()
+                }),
+                data_distribution: evidence
+                    .data_workload
+                    .distribution
+                    .value_at(self.now_ms)
+                    .cloned(),
+                hydra_shared_grid_collision_bound: evidence.hydra_shared_grid_collision_bound,
+                hydra_shared_grid_failure_probability: evidence
+                    .hydra_shared_grid_failure_probability,
                 ..Default::default()
-            },
-            _ => PropagationStats::default(),
+            });
+        if matches!(op, CompositionOperator::TopKSelection) {
+            if let Some(evidence) = self
+                .scoped
+                .filter(|e| e.topk_selected_lower_bound.is_some())
+            {
+                stats.topk_selected_lower_bound = evidence.topk_selected_lower_bound;
+                stats.topk_excluded_upper_bound = evidence.topk_excluded_upper_bound;
+                stats.topk_interval_failure_probability =
+                    evidence.topk_interval_failure_probability;
+            } else if let Some(evidence) = self.topk {
+                stats.topk_selected_lower_bound = Some(evidence.selected_lower_bound);
+                stats.topk_excluded_upper_bound = Some(evidence.excluded_upper_bound);
+                stats.topk_interval_failure_probability =
+                    Some(evidence.interval_failure_probability);
+            }
         }
+        stats
     }
 }
 
@@ -595,6 +792,29 @@ impl BackendLocalPlanningInput {
         }
         let workload = self.query_workload;
         let mut data_workload = self.data_workload.clone();
+        let scoped_snapshot_id = self
+            .physical_inputs
+            .data_snapshot_id
+            .as_deref()
+            .or_else(|| {
+                self.workload_cost_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.data_snapshot_id.as_str())
+            });
+        if self
+            .physical_inputs
+            .data_snapshot_id
+            .as_ref()
+            .is_some_and(|id| {
+                self.workload_cost_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.data_snapshot_id != *id)
+            })
+        {
+            return Err(CompileError::Snapshot(
+                "accuracy evidence data snapshot differs from workload cost evidence".into(),
+            ));
+        }
         if data_workload.data_ingestion_interval.value.is_none()
             && self.physical_inputs.scrape_interval_ms > 0
         {
@@ -640,6 +860,7 @@ impl BackendLocalPlanningInput {
         let mut queries = Vec::with_capacity(entries.len());
         let mut canonical_roots = Vec::with_capacity(entries.len());
         let mut topk_evidence_by_id = HashMap::new();
+        let mut scoped_evidence_by_id = HashMap::new();
         for (index, (entry, parsed)) in entries.into_iter().zip(canonical_queries).enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
                 QueryRecurrence::Repeated(RepeatedDemand::FixedIntervalAt {
@@ -651,14 +872,9 @@ impl BackendLocalPlanningInput {
                     )))
                 }
             };
-            if self.physical_inputs.scrape_interval_ms == 0
-                || !self
-                    .physical_inputs
-                    .scrape_interval_ms
-                    .is_multiple_of(1_000)
-            {
+            if self.physical_inputs.scrape_interval_ms == 0 {
                 return Err(CompileError::Snapshot(
-                    "scrape_interval_ms must be a positive whole number of seconds".into(),
+                    "scrape_interval_ms must be positive".into(),
                 ));
             }
             let accuracy = entry.requirements.accuracy.target();
@@ -686,6 +902,17 @@ impl BackendLocalPlanningInput {
             if let Some(evidence) = self.physical_inputs.topk_evidence.get(&query_string) {
                 topk_evidence_by_id.insert(query_id.clone(), evidence.clone());
             }
+            if let Some(evidence) = self.physical_inputs.accuracy_evidence.get(&query_string) {
+                evidence.validate(
+                    &query_id,
+                    &query_string,
+                    &data_workload,
+                    scoped_snapshot_id,
+                    self.environment.observed_at_unix_ms,
+                    self.environment.max_evidence_age_ms,
+                )?;
+                scoped_evidence_by_id.insert(query_id.clone(), evidence.clone());
+            }
             queries.push(QueryCompilationInput {
                 query_id,
                 query_string: query_string.clone(),
@@ -693,13 +920,23 @@ impl BackendLocalPlanningInput {
                 legacy_query_source: Source::TimeSeries {
                     metric: source_hint,
                 },
-                query_lookback_seconds: lookback_ms / 1_000,
+                query_lookback_ms: lookback_ms,
                 group_by_labels: metadata.group_by_labels,
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
                 window_realization_candidates: Vec::new(),
                 materialization_runtime_policy: RuntimeRulePolicy::default(),
             });
+        }
+        if self
+            .physical_inputs
+            .accuracy_evidence
+            .keys()
+            .any(|query| !queries.iter().any(|entry| &entry.query_string == query))
+        {
+            return Err(CompileError::Snapshot(
+                "accuracy evidence names a query absent from this workload".into(),
+            ));
         }
         let mut exact_costs_by_id = HashMap::new();
         for (index, entry) in workload.entries().enumerate() {
@@ -722,13 +959,95 @@ impl BackendLocalPlanningInput {
                 exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
             }
         }
-        let planner_selection_trace = select_logical_roots_with_trace(
+        let mut candidate_roots = Vec::new();
+        let mut planner_selection_trace = logical_roots_and_candidates(
             &mut queries,
             canonical_roots.clone(),
             &topk_evidence_by_id,
+            &scoped_evidence_by_id,
             &exact_costs_by_id,
             self.physical_inputs.erp.as_ref(),
+            self.environment.observed_at_unix_ms,
+            Some(&mut candidate_roots),
         )?;
+        // Resolve physical row identity before asking Planner for snapshot heap
+        // candidates. Keep canonical query semantics and exact candidates intact.
+        for (index, (query, root)) in queries.iter().zip(&canonical_roots).enumerate() {
+            let Ok(typed) =
+                asap_physical_operators::physical_planner::promql_rows::with_series_identity(root)
+            else {
+                continue;
+            };
+            let evidence = QueryEvidence {
+                topk: topk_evidence_by_id.get(&query.query_id),
+                scoped: scoped_evidence_by_id.get(&query.query_id),
+                now_ms: self.environment.observed_at_unix_ms,
+            };
+            let strategy =
+                asap_aware_mapping::SketchAlgorithmStrategy::new_with_planning_inputs_and_evidence(
+                    &asap_aware_mapping::cost_model::DefaultCostModel,
+                    &asap_aware_mapping::accuracy::DefaultAccuracyModel,
+                    &asap_aware_mapping::accuracy::EqualSplitAllocator,
+                    &evidence,
+                );
+            let typed = Rc::new(typed);
+            let mut proposed =
+                strategy.current_series_topk_candidates(&typed, &query.accuracy_target);
+            let direct = asap_aware_mapping::ReplacementStrategy::propose(
+                &strategy,
+                &asap_aware_mapping::TargetSubDAG::new(&typed),
+            );
+            proposed
+                .candidates
+                .extend(strategy.fixed_window_rate_candidates(&typed).candidates);
+            proposed.candidates.extend(
+                strategy
+                    .query_time_rate_aggregation_candidates(&typed)
+                    .candidates,
+            );
+            proposed.candidates.extend(direct.candidates);
+            proposed.rejected.extend(direct.rejected);
+            for candidate in proposed.candidates {
+                let asap_aware_mapping::Replacement::Summary(root) = candidate.replacement else {
+                    continue;
+                };
+                let root = asap_aware_mapping::replacement::finalize_query_candidate(root, &typed)
+                    .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+                let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
+                    .or_else(|_| asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(&root).map(|(_, program)| program));
+                if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&root) {
+                    planner_selection_trace.push(serde_json::json!({
+                        "stage":"planner.physical_candidate", "query_id":query.query_id,
+                        "logical_root_id":crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
+                        "rationale":candidate.rationale, "physical_candidate":serde_json::from_slice::<Value>(&physical.encode().map_err(|e| CompileError::Snapshot(e.to_string()))?).map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                        "guarantee":root.guarantee,
+                    }));
+                    candidate_roots.push(vec![(index, root)]);
+                    continue;
+                }
+                match compiled {
+                    Ok(program) => {
+                        planner_selection_trace.push(serde_json::json!({
+                            "stage": "planner.physical_candidate", "query_id": query.query_id,
+                            "logical_root_id": crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
+                            "rationale": candidate.rationale, "physical_dag": serde_json::from_slice::<Value>(&program.encode().map_err(|error| CompileError::Snapshot(error.to_string()))?).map_err(|error| CompileError::Snapshot(error.to_string()))?,
+                            "guarantee": root.guarantee,
+                        }));
+                        candidate_roots.push(vec![(index, root)]);
+                    }
+                    Err(error) => planner_selection_trace.push(serde_json::json!({
+                        "stage": "planner.physical_candidate", "query_id": query.query_id,
+                        "status": "unsupported", "reason": error.to_string(),
+                    })),
+                }
+            }
+            for rejected in proposed.rejected {
+                planner_selection_trace.push(serde_json::json!({
+                    "stage": "planner.physical_candidate", "query_id": query.query_id,
+                    "status": "rejected", "reason": rejected.error.to_string(),
+                }));
+            }
+        }
         for query in &mut queries {
             prepare_window_implementations(
                 query,
@@ -737,11 +1056,43 @@ impl BackendLocalPlanningInput {
                 self.physical_inputs.query_retention_margin_ms,
             )?;
         }
-        // Composable lowering defers unsafe leaves to query time individually; retain Planner siblings.
+        let mut planner_candidate_forests = Vec::new();
+        for roots in candidate_roots {
+            let mut forest = queries.clone();
+            let changed: BTreeSet<_> = roots.iter().map(|(index, _)| *index).collect();
+            for (index, root) in roots {
+                forest[index].selected_plan_root = root;
+            }
+            // Unchanged roots already have prepared windows in `queries`.
+            let preparation = changed.into_iter().try_for_each(|index| {
+                prepare_window_implementations(
+                    &mut forest[index],
+                    &self.physical_inputs.window_cost_model,
+                    self.environment.target,
+                    self.physical_inputs.query_retention_margin_ms,
+                )
+            });
+            if let Err(error) = preparation {
+                planner_selection_trace.push(serde_json::json!({
+                    "stage": "deployment.window_feasibility",
+                    "status": "rejected",
+                    "logical_root_ids": forest.iter().map(|query| crate::planner_selection::explained_root_id(
+                        &query.selected_plan_root, &query.accuracy_target)).collect::<Vec<_>>(),
+                    "reason": error.to_string(),
+                }));
+                continue;
+            }
+            planner_candidate_forests.push(forest);
+        }
+        // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PhysicalCompilationRequest {
-                planner_selection_trace,
+                planner_candidate_forests,
+                planner_selection_trace: planner_selection_trace.into(),
                 allow_mixed_summary_and_exact_execution: true,
+                require_backend_local_execution: self
+                    .physical_inputs
+                    .require_backend_local_execution,
                 enabled_materialization_keys: None,
                 query_workload: Some(workload),
                 data_workload: Some(data_workload),
@@ -1064,6 +1415,7 @@ impl DeploymentPlanCompiler {
         for (id, root) in planner_types::post_asap::share_common_summary_subtrees(roots) {
             request.queries[id].selected_plan_root = root;
         }
+        let population_operators = super::maintained_population::operators(&request)?;
         let mut compiled_materializations = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
         let mut plan_materializations = Vec::with_capacity(request.queries.len());
@@ -1100,15 +1452,22 @@ impl DeploymentPlanCompiler {
                 validate_evidence(&query.query_id, e, &environment)?;
             }
             let node = query.selected_plan_root.clone();
-            reject_uncertified_readouts(&query.query_id, &node)?;
-            let selected = collect_selected_materializations(
-                &node,
-                request.allow_mixed_summary_and_exact_execution,
-            )
-            .map_err(|reason| CompileError::Query {
-                query_id: query.query_id.clone(),
-                reason,
-            })?;
+            reject_uncertified_readouts(&query.query_id, &node, &query.accuracy_target)?;
+            let selected = if super::maintained_population::supported_node(&node) {
+                Vec::new()
+            } else {
+                collect_selected_materializations(
+                    &node,
+                    request.allow_mixed_summary_and_exact_execution,
+                )
+                .map_err(|reason| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                })?
+            };
+            if !selected.is_empty() {
+                reject_uncertified_readouts(&query.query_id, &node, &query.accuracy_target)?;
+            }
             let selected = selected
                 .into_iter()
                 .filter(|state| {
@@ -1156,16 +1515,14 @@ impl DeploymentPlanCompiler {
                                 .flatten()
                             });
                             // Masks enumerate counter/max choices only. Other selected
-                            // summaries remain required by this physical alternative.
+                            // summaries remain required by this physical candidate.
                             key.is_none_or(|key| policy.contains(&key))
                         })
                 })
                 .collect::<Vec<_>>();
             // An exact native fallback has no maintained state and must not
             // depend on evidence for unused window/state implementations.
-            if selected.is_empty()
-                && super::maintained_population::operator(&request, query)?.is_none()
-            {
+            if selected.is_empty() && population_operators[query_index].is_none() {
                 continue;
             }
             let executable = planner_types::post_asap::compile_executable_dag_with_node_ids(
@@ -1214,7 +1571,7 @@ impl DeploymentPlanCompiler {
                 for state in &selected {
                     if matches!(&state.node.expr, SummaryExpr::SummaryAgg {
                         reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
-                    } if keys.is_empty())
+                    } if keys.is_empty()) || asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).is_ok()
                     {
                         if let Some(sources) = immutable_materialization_sources(&state.node) {
                             canonical_nodes.insert(Rc::as_ptr(&state.node) as usize);
@@ -1225,10 +1582,13 @@ impl DeploymentPlanCompiler {
                 }
             }
             let cohort_nodes = windows::cohort_nodes(&selected);
+            let native_cohort = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).is_ok();
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let mut branch_query = query.clone();
-                branch_query.query_lookback_seconds =
-                    selected.window_secs.unwrap_or(query.query_lookback_seconds);
+                branch_query.query_lookback_ms = selected
+                    .window_secs
+                    .map(|seconds| seconds.saturating_mul(1_000))
+                    .unwrap_or(query.query_lookback_ms);
                 branch_query.group_by_labels = selected
                     .group_by
                     .clone()
@@ -1236,9 +1596,20 @@ impl DeploymentPlanCompiler {
                 branch_query
                     .window_realization_candidates
                     .retain(|candidate| {
-                        candidate.window_secs == branch_query.query_lookback_seconds
+                        candidate.window_secs.saturating_mul(1_000)
+                            == branch_query.query_lookback_ms
                             && if cohort_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
-                                windows::is_full_cohort(candidate)
+                                if native_cohort {
+                                    windows::is_complete_window(candidate)
+                                        && candidate.slide_secs.saturating_mul(1000)
+                                            == u64::from(
+                                                query
+                                                    .summary_lifecycle_inputs
+                                                    .evaluation_interval_ms,
+                                            )
+                                } else {
+                                    windows::is_full_cohort(candidate)
+                                }
                             } else {
                                 !candidate.cohort_only
                             }
@@ -1323,7 +1694,7 @@ impl DeploymentPlanCompiler {
                                 let cadence = u64::from(
                                     query.summary_lifecycle_inputs.evaluation_interval_ms,
                                 );
-                                let window = query.query_lookback_seconds.saturating_mul(1_000);
+                                let window = query.query_lookback_ms;
                                 a % cadence == b % cadence && a % window == b % window
                             }
                             _ => index == query_index,
@@ -1454,7 +1825,9 @@ impl DeploymentPlanCompiler {
                         query_id: query.query_id.clone(),
                         reason: error.to_string(),
                     })?;
-                    if runtime_materialization.window_size != runtime_materialization.slide_interval
+                    if !native_cohort
+                        && runtime_materialization.window_size
+                            != runtime_materialization.slide_interval
                     {
                         return Err(CompileError::Query { query_id: query.query_id.clone(),
                             reason: "immutable scalar composition runtime requires nonoverlapping windows".into() });
@@ -1745,7 +2118,7 @@ impl DeploymentPlanCompiler {
                     let window_ms = materialization.window_size.saturating_mul(1_000);
                     if materialization_family != *node_family
                         || window_ms == 0
-                        || source_window.unwrap_or(query.query_lookback_seconds).saturating_mul(1_000)
+                        || source_window.map(|seconds| seconds.saturating_mul(1_000)).unwrap_or(query.query_lookback_ms)
                             % window_ms != 0
                     {
                         return Err(crate::query_plan::QueryPlanError::Invalid(format!(
@@ -1768,7 +2141,7 @@ impl DeploymentPlanCompiler {
                     })
             };
             let instant = InstantExecution {
-                lookback_ms: query.query_lookback_seconds.saturating_mul(1_000),
+                lookback_ms: query.query_lookback_ms,
                 full_history: false,
                 cumulative_readout: true,
             };
@@ -1789,15 +2162,122 @@ impl DeploymentPlanCompiler {
                 } else {
                     false
                 };
-            let mut entry = if let Some(operator) =
-                super::maintained_population::operator(&request, query)?
-            {
+            let native_rate =
+                asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(
+                    &query.selected_plan_root,
+                )
+                .ok();
+            let native_rate = native_rate.or_else(|| {
+                let physical = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&query.selected_plan_root).ok()?;
+                fn heap(node: &Rc<SummaryNode>) -> Option<Rc<SummaryNode>> {
+                    match &node.expr {
+                        SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(..) | SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _), .. } => Some(node.clone()),
+                        SummaryExpr::ValueOperation { child, .. } => heap(child),
+                        SummaryExpr::SummaryEstimate { summary_input, .. } => heap(summary_input),
+                        _ => None,
+                    }
+                }
+                Some((heap(&query.selected_plan_root)?, physical.query))
+            });
+            let mut entry = if let Some((source, program)) = native_rate {
+                let native_state_binding = if let SummaryExpr::SummaryAgg {
+                    family:
+                        SummaryFamilyType::Sketch(..)
+                        | SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
+                    ..
+                } = &source.expr
+                {
+                    let SummaryExpr::SummaryAgg { family, .. } = &source.expr else {
+                        unreachable!()
+                    };
+                    Some(binding(&source, family)?)
+                } else {
+                    None
+                };
+                let mut entry = if let Some(binding) = native_state_binding {
+                    let root = crate::query_plan::QueryNodeId(0);
+                    if let Some(id) = executable_dags[query_index]
+                        .as_ref()
+                        .and_then(|compiled| compiled.node_ids.node_id(&source))
+                    {
+                        query_node_bindings.insert((query_index, id), root);
+                    }
+                    crate::query_plan::QueryPlanEntry {
+                        physical_dag: None,
+                        language: crate::query_plan::QueryLanguage::PromQl,
+                        query_id: query.query_id.clone(),
+                        canonical_query: canonical.clone(),
+                        fixed_evaluation: None,
+                        root,
+                        nodes: BTreeMap::from([(
+                            root,
+                            crate::query_plan::QueryPlanNode::ReadMaterialization { binding },
+                        )]),
+                        instant,
+                        fallback: FallbackPolicy::ExactBackend,
+                    }
+                } else {
+                    crate::query_plan::compile_bound_composable_mapped(
+                        query.query_id.clone(),
+                        canonical.clone(),
+                        &source,
+                        instant,
+                        FallbackPolicy::ExactBackend,
+                        binding,
+                        |node, query_node| {
+                            if let Some(id) = executable_dags[query_index]
+                                .as_ref()
+                                .and_then(|compiled| compiled.node_ids.node_id(node))
+                            {
+                                query_node_bindings.insert((query_index, id), query_node);
+                            }
+                        },
+                    )?
+                };
+                let root = crate::query_plan::QueryNodeId(
+                    entry.nodes.keys().map(|id| id.0).max().unwrap_or(0) + 1,
+                );
+                let sources = program
+                    .input_contracts()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>();
+                if sources.len() != 1 {
+                    return Err(CompileError::Snapshot(
+                        "Rate physical candidate requires one source binding".into(),
+                    ));
+                }
+                entry.nodes.insert(
+                    root,
+                    crate::query_plan::QueryPlanNode::Physical {
+                        inputs: vec![entry.root],
+                        source_nodes: sources,
+                        max_bytes: request
+                            .retained_summary_memory_budget_bytes
+                            .unwrap_or(64 * 1024 * 1024),
+                    },
+                );
+                entry.root = root;
+                entry.physical_dag = Some(
+                    serde_json::from_slice(
+                        &program
+                            .encode()
+                            .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                    )
+                    .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                );
+                entry.recover_vector_physical_dag()?;
+                if let Some(compiled) = &executable_dags[query_index] {
+                    query_node_bindings.insert((query_index, compiled.dag.root), root);
+                }
+                Ok(entry)
+            } else if let Some(operator) = population_operators[query_index].clone() {
                 let root = crate::query_plan::QueryNodeId(0);
                 let compiled = executable_dags[query_index]
                     .as_ref()
                     .expect("compiled Planner DAG");
                 query_node_bindings.insert((query_index, compiled.dag.root), root);
                 Ok(crate::query_plan::QueryPlanEntry {
+                    physical_dag: None,
                     language: crate::query_plan::QueryLanguage::PromQl,
                     query_id: query.query_id.clone(),
                     canonical_query: canonical.clone(),
@@ -1829,6 +2309,7 @@ impl DeploymentPlanCompiler {
                 // Keep native semantics instead of lowering an unbound summary.
                 let root = crate::query_plan::QueryNodeId(0);
                 Ok(crate::query_plan::QueryPlanEntry {
+                    physical_dag: None,
                     language: crate::query_plan::QueryLanguage::PromQl,
                     query_id: query.query_id.clone(),
                     canonical_query: canonical.clone(),
@@ -1888,6 +2369,10 @@ impl DeploymentPlanCompiler {
             if frontend == QueryFrontend::MetricsQl {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
+            super::maintained_population::install_native_topk(
+                &mut entry,
+                &query.selected_plan_root,
+            )?;
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
                 return Err(CompileError::Query {
@@ -1913,7 +2398,7 @@ impl DeploymentPlanCompiler {
                 .find(|entry| entry.query_id == query_id)
                 .expect("compiled query entry exists")
                 .root;
-            let installed = super::executable_binding::install_selected_dag(
+            let mut installed = super::executable_binding::install_selected_dag(
                 query_id.clone(),
                 &compiled.dag,
                 query_plan_sink,
@@ -1929,11 +2414,35 @@ impl DeploymentPlanCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
+            if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&request.queries[query_index].selected_plan_root) {
+                let program = physical.precompute.ok_or_else(|| CompileError::Snapshot("fixed-window candidate has no maintenance program".into()))?;
+                let sink = PostAsapNodeId(u32::try_from(program.roots()[0]).map_err(|_| CompileError::Snapshot("maintenance sink overflow".into()))?);
+                installed.native_programs.insert(sink, serde_json::from_slice(&program.encode().map_err(|e| CompileError::Snapshot(e.to_string()))?).map_err(|e| CompileError::Snapshot(e.to_string()))?);
+            }
             query_plan
                 .selected_dags
                 .insert(query_id.clone(), installed.document.clone());
             installed_dags.insert(query_id, installed);
         }
+        let maintenance_lookbacks = materializations
+            .iter()
+            .filter_map(|target| {
+                target
+                    .derived_input
+                    .as_ref()
+                    .map(|input| (input, target.stored_window_ms()))
+            })
+            .flat_map(|(input, window)| input.inputs.iter().map(move |source| (*source, window)))
+            .fold(
+                BTreeMap::<asap_types::sds::StoredOutputId, u64>::new(),
+                |mut windows, (source, window)| {
+                    windows
+                        .entry(source)
+                        .and_modify(|old| *old = (*old).max(window))
+                        .or_insert(window);
+                    windows
+                },
+            );
         for materialization in &mut materializations {
             let fingerprint = materialization.policy_fingerprint();
             let max_lookback_ms = query_plan
@@ -1942,6 +2451,7 @@ impl DeploymentPlanCompiler {
                 .flat_map(QueryPlanEntry::materialization_bindings)
                 .filter(|binding| binding.materialization.fingerprint() == fingerprint)
                 .filter_map(|binding| binding.readout_lookback_ms)
+                .chain(maintenance_lookbacks.get(&fingerprint.into()).copied())
                 .max();
             if let Some(lookback_ms) = max_lookback_ms {
                 materialization.num_aggregates_to_retain = Some(retained_state_count(
@@ -2075,6 +2585,20 @@ impl DeploymentPlanCompiler {
                     reason: error.to_string(),
                 })?;
         }
+        if request.require_backend_local_execution {
+            for entry in query_plan.entries.values() {
+                if entry.nodes.values().any(|node| matches!(node,
+                    crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                        | crate::query_plan::QueryPlanNode::Logical {
+                            operator: crate::query_plan::query_time::QueryTimeOperator::ExactSubquery { .. }
+                                | crate::query_plan::query_time::QueryTimeOperator::CandidateExactSubquery { .. }, .. })) {
+                    return Err(CompileError::Query {
+                        query_id: entry.query_id.clone(),
+                        reason: "external execution is unavailable in this deployment".into(),
+                    });
+                }
+            }
+        }
         query_plan.bind_catalog(&summary_catalog)?;
         let storage_routing = crate::emit::backend_wire::storage_routing_document(
             crate::emit::backend_wire::DEFAULT_TENANT,
@@ -2150,7 +2674,7 @@ pub fn select_logical_roots_for_queries(
     select_logical_roots_with_error_resource_profiles(queries, roots, evidence, exact_costs, None)
 }
 
-fn observed_population_matches_root(
+pub(crate) fn observed_population_matches_root(
     policy: &super::erp::ErpPlanningInput,
     root: &QueryExpr,
 ) -> bool {
@@ -2214,6 +2738,48 @@ pub fn select_logical_roots_with_trace(
     exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
     erp: Option<&super::erp::ErpPlanningInput>,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
+    select_logical_roots_with_scoped_evidence_and_trace(
+        queries,
+        roots,
+        evidence,
+        &HashMap::new(),
+        exact_costs,
+        erp,
+        0,
+    )
+}
+
+pub fn select_logical_roots_with_scoped_evidence_and_trace(
+    queries: &mut [QueryCompilationInput],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+    scoped_evidence: &HashMap<String, ScopedAccuracyEvidence>,
+    exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
+    erp: Option<&super::erp::ErpPlanningInput>,
+    now_ms: u64,
+) -> Result<Vec<serde_json::Value>, CompileError> {
+    logical_roots_and_candidates(
+        queries,
+        roots,
+        evidence,
+        scoped_evidence,
+        exact_costs,
+        erp,
+        now_ms,
+        None,
+    )
+}
+
+fn logical_roots_and_candidates(
+    queries: &mut [QueryCompilationInput],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+    scoped_evidence: &HashMap<String, ScopedAccuracyEvidence>,
+    exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
+    erp: Option<&super::erp::ErpPlanningInput>,
+    now_ms: u64,
+    mut candidates_out: Option<&mut Vec<Vec<(usize, Rc<SummaryNode>)>>>,
+) -> Result<Vec<serde_json::Value>, CompileError> {
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(
@@ -2226,6 +2792,7 @@ pub fn select_logical_roots_with_trace(
     for (index, root) in roots.into_iter().enumerate() {
         let accuracy = &queries[index].accuracy_target;
         let certificate_scope = (evidence.contains_key(&queries[index].query_id)
+            || scoped_evidence.contains_key(&queries[index].query_id)
             || exact_costs.contains_key(&queries[index].query_id))
         .then(|| queries[index].query_id.clone());
         if let Some((_, _, roots)) = cohorts
@@ -2279,6 +2846,7 @@ pub fn select_logical_roots_with_trace(
             model = model.with_erp(erp.clone());
         }
         let certificate = scope.as_ref().and_then(|id| evidence.get(id));
+        let scoped_certificate = scope.as_ref().and_then(|id| scoped_evidence.get(id));
         let accuracy_model = super::erp::ErpAccuracyModel {
             policy: erp,
             max_error: match accuracy {
@@ -2286,15 +2854,56 @@ pub fn select_logical_roots_with_trace(
                 AccuracyTarget::Exact => 0.0,
             },
         };
+        let mut candidate_assembly_rejections = Vec::new();
+        if let Some(output) = candidates_out.as_deref_mut() {
+            let inventory = crate::planner_selection::enumerate_workload_candidates(
+                roots.clone(),
+                accuracy.clone(),
+                &model,
+                &QueryEvidence {
+                    topk: certificate,
+                    scoped: scoped_certificate,
+                    now_ms,
+                },
+                &accuracy_model,
+            )
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+            candidate_assembly_rejections = inventory.rejected_assemblies;
+            let candidates = inventory.candidates;
+            // Retain every root's candidates without multiplying independent
+            // cohorts. Deployment evaluates each root substitution in the
+            // preferred workload context; this is not exhaustive joint search.
+            output.extend(candidates);
+        }
         let (selected, mut trace) =
             crate::planner_selection::select_workload_with_accuracy_model_and_trace(
                 roots,
                 accuracy,
                 &model,
-                &QueryEvidence(certificate),
+                &QueryEvidence {
+                    topk: certificate,
+                    scoped: scoped_certificate,
+                    now_ms,
+                },
                 &accuracy_model,
             )
             .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        trace["candidate_assembly_rejections"] = serde_json::json!(candidate_assembly_rejections);
+        if candidates_out.is_some() {
+            trace["computation_search_scope"] = serde_json::json!({
+                "inventory": "all_root_candidates",
+                "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
+                "joint_workload_search_exhaustive": false,
+            });
+        }
+        if let Some(evidence) = scoped_certificate {
+            trace["accuracy_evidence_scope"] = serde_json::json!({
+                "query_id": scope,
+                "source": evidence.source,
+                "data_snapshot_id": evidence.data_snapshot_id,
+                "observed_at_unix_ms": evidence.observed_at_unix_ms,
+            });
+        }
         trace["deployment_overrides"] = serde_json::json!([]);
         let selected_indices = selected.iter().map(|(index, _)| *index).collect::<Vec<_>>();
         for (index, node) in selected {
@@ -2474,7 +3083,11 @@ pub fn select_post_asap(
         expr,
         &CollectorFixtureModel(model),
         &DefaultAccuracyModel,
-        &QueryEvidence(evidence),
+        &QueryEvidence {
+            topk: evidence,
+            scoped: None,
+            now_ms: 0,
+        },
     )
 }
 
@@ -2634,10 +3247,9 @@ pub(super) fn derived_window_cost(
 /// example, `a[1m] offset 1h` selects `(t - 61m, t - 60m]`.
 fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<u64, CompileError> {
     fn duration_ms(duration: std::time::Duration) -> Result<u64, CompileError> {
-        if duration.subsec_nanos() != 0 {
+        if !duration.subsec_nanos().is_multiple_of(1_000_000) {
             return Err(CompileError::Snapshot(
-                "PromQL ranges must be a whole number of seconds in the backend-local profile"
-                    .into(),
+                "PromQL ranges must have millisecond precision".into(),
             ));
         }
         u64::try_from(duration.as_millis())
@@ -2666,17 +3278,10 @@ fn query_history_window_ms(expr: &QueryExpr, scrape_interval_ms: u64) -> Result<
                 duration_ms(*range)?,
                 visit(child, scrape_interval_ms, true)?,
             ),
-            QueryExpr::TimeShift { shift, child } => {
-                if !shift.offset_ms.unsigned_abs().is_multiple_of(1_000) {
-                    return Err(CompileError::Snapshot(
-                        "PromQL offsets must be a whole number of seconds in the backend-local profile".into(),
-                    ));
-                }
-                add(
-                    shift.offset_ms.max(0) as u64,
-                    visit(child, scrape_interval_ms, in_range)?,
-                )
-            }
+            QueryExpr::TimeShift { shift, child } => add(
+                shift.offset_ms.max(0) as u64,
+                visit(child, scrape_interval_ms, in_range)?,
+            ),
             QueryExpr::PromqlScalarBridge(child)
             | QueryExpr::PromqlVectorFromScalar(child)
             | QueryExpr::PromqlScalarFromVector(child)
@@ -2822,7 +3427,7 @@ pub(super) fn validate_window_implementations(
             && evidence.cpu_cost >= 0.0
             && evidence.weighted_cost.is_finite()
             && evidence.weighted_cost >= 0.0
-            && candidate.window_secs == query.query_lookback_seconds
+            && candidate.window_secs.saturating_mul(1_000) == query.query_lookback_ms
             && candidate
                 .layout
                 .validate(candidate.window_secs, candidate.slide_secs)
@@ -2885,8 +3490,8 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
     )
 }
 
-pub(super) fn estimated_state_bytes(
-    aggregation: &asap_types::AggregationType,
+pub(crate) fn estimated_state_bytes(
+    aggregation_type: &asap_types::AggregationType,
     parameters: &HashMap<String, Value>,
 ) -> u128 {
     use asap_types::AggregationType as A;
@@ -2897,7 +3502,7 @@ pub(super) fn estimated_state_bytes(
             .find_map(|name| parameters.get(*name).and_then(Value::as_u64))
             .unwrap_or(fallback) as u128
     };
-    match aggregation {
+    match aggregation_type {
         A::CountMinSketch | A::CountSketch => {
             parameter(&["width", "w", "col_num", "col"], 1)
                 * parameter(&["depth", "d", "row_num", "row"], 1)
@@ -2929,7 +3534,7 @@ pub(super) fn estimated_state_bytes(
     }
 }
 
-fn retained_partition_count(
+pub(crate) fn retained_partition_count(
     materialization: &asap_types::PrecomputeMaterialization,
     input_cardinality: Option<u64>,
 ) -> u128 {
@@ -2944,6 +3549,11 @@ fn retained_partition_count(
             A::Increase | A::Rate | A::Min | A::Max
         )
         || !materialization.grouping_labels.names().is_empty()
+        || (materialization.derived_input.is_some()
+            && matches!(
+                materialization.aggregation_type,
+                A::CountMinSketchWithHeap | A::CountSketchWithHeap | A::Sum
+            ))
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
     } else {
@@ -3034,8 +3644,8 @@ fn select_lifecycle(
                             raw_materialization_input_contract(node)
                                 .ok()
                                 .and_then(|(_, window, _)| window)
-                                .unwrap_or(query.query_lookback_seconds)
-                                .saturating_mul(1_000),
+                                .map(|seconds| seconds.saturating_mul(1_000))
+                                .unwrap_or(query.query_lookback_ms),
                         )),
                         as_of: None,
                     },
@@ -3124,12 +3734,12 @@ fn select_lifecycle(
         lifecycle_cost: plan.deployments[0]
             .alternatives
             .iter()
-            .find(|alternative| {
-                alternative.rejection.is_none()
-                    && alternative.summary_maintenance_lifecycle
+            .find(|candidate| {
+                candidate.rejection.is_none()
+                    && candidate.summary_maintenance_lifecycle
                         == guarantee.summary_maintenance_lifecycle
             })
-            .and_then(|alternative| alternative.total_cost)
+            .and_then(|candidate| candidate.total_cost)
             .ok_or_else(|| CompileError::Lifecycle {
                 query_id: query.query_id.clone(),
                 reason: "missing selected lifecycle cost".into(),
@@ -3262,7 +3872,7 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
     let SummaryExpr::SummaryAgg {
         child,
         input,
-        family: SummaryFamilyType::Sketch(..),
+        family: SummaryFamilyType::Sketch(..) | SummaryFamilyType::ExactAggregate(ExactKind::Sum, _),
         ..
     } = &node.expr
     else {
@@ -3271,6 +3881,37 @@ fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<Summar
         // because Planner made the exact accumulator boundary explicit.
         return None;
     };
+    if matches!(&node.expr, SummaryExpr::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. }
+        if matches!(kind.algorithm(), SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
+        || matches!(
+            &node.expr,
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, _),
+                ..
+            }
+        )
+    {
+        if let SummaryExpr::ValueOperation {
+            child: source,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            timing: ExecutionTiming::IngestionTime,
+        } = &child.expr
+        {
+            if matches!(&source.expr, SummaryExpr::SummaryAgg { family: SummaryFamilyType::ExactAggregate(ExactKind::Rate, _), reduction: planner_types::pre_asap::Reduction::PerEntity, child, .. } if matches!(child.expr, SummaryExpr::KeepPreAsap(_)))
+            {
+                return Some(vec![source.clone()]);
+            }
+        }
+    }
+    if matches!(
+        &node.expr,
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, _),
+            ..
+        }
+    ) {
+        return None;
+    }
     if input.item.is_some()
         || !matches!(
             input.weight,
@@ -3350,7 +3991,11 @@ fn validate_executable_subdag(node: &Rc<SummaryNode>) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_uncertified_readouts(query_id: &str, root: &Rc<SummaryNode>) -> Result<(), CompileError> {
+fn reject_uncertified_readouts(
+    query_id: &str,
+    root: &Rc<SummaryNode>,
+    accuracy: &AccuracyTarget,
+) -> Result<(), CompileError> {
     let dag = planner_types::post_asap::compile_executable_dag(root).map_err(|error| {
         CompileError::Query {
             query_id: query_id.into(),
@@ -3372,6 +4017,25 @@ fn reject_uncertified_readouts(query_id: &str, root: &Rc<SummaryNode>) -> Result
             });
         }
     }
+    // Leaf guarantees do not certify a composition (for example, division of
+    // two approximate quantiles). Admission checks the complete query result.
+    if dag.nodes.iter().any(|node| {
+        matches!(
+            node.payload,
+            planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
+        )
+    }) && root.guarantee.as_ref().is_none_or(|guarantee| {
+        !asap_aware_mapping::accuracy::AccuracyModel::satisfies(
+            &asap_aware_mapping::DefaultAccuracyModel,
+            guarantee,
+            accuracy,
+        )
+    }) {
+        return Err(CompileError::Query {
+            query_id: query_id.into(),
+            reason: "selected query result has no certified accuracy guarantee satisfying the requested accuracy".into(),
+        });
+    }
     Ok(())
 }
 
@@ -3385,7 +4049,9 @@ fn physical_aggregation(
         aggregation_id,
         metric_name: selected.metric.clone(),
         family: selected.family.clone(),
-        window_secs: selected.window_secs.unwrap_or(query.query_lookback_seconds),
+        window_secs: selected
+            .window_secs
+            .unwrap_or(query.query_lookback_ms.div_ceil(1_000)),
         spatial_filter: selected.spatial_filter.clone(),
         grouping: selected
             .group_by
@@ -3423,6 +4089,22 @@ fn scoped_materialization(
     let SummaryExpr::SummaryAgg { reduction, .. } = &node.expr else {
         anyhow::bail!("materialization lacks SummaryAgg partition contract");
     };
+    if immutable_materialization_sources(node).is_some_and(|sources| {
+        sources.iter().any(|source| {
+            matches!(
+                &source.expr,
+                SummaryExpr::SummaryAgg {
+                    family: SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Rate,
+                        _
+                    ),
+                    ..
+                }
+            )
+        })
+    }) {
+        config.grouping_labels = asap_types::KeyByLabelNames { labels: Vec::new() }.into();
+    }
     config.partitioning = Some(match reduction {
         planner_types::pre_asap::Reduction::PerEntity => {
             asap_types::sds::PopulationPartitioning::PerEntity
@@ -3575,6 +4257,7 @@ fn collect_selected_materializations(
         node: &Rc<SummaryNode>,
         readout: Option<&SketchQuery>,
         composable: bool,
+        native_maintenance: bool,
         inherited_grouping: Option<Vec<String>>,
         selected: &mut Vec<SelectedMaterialization>,
     ) -> Result<(), String> {
@@ -3608,9 +4291,26 @@ fn collect_selected_materializations(
         } else {
             None
         };
-        if let Some(source) = immutable_materialization_sources(node) {
+        // A nested legacy Sum is a query reduction unless Planner supplied a
+        // complete native maintenance graph for this selected root.
+        let immutable_sources = if !native_maintenance
+            && matches!(
+                &node.expr,
+                SummaryExpr::SummaryAgg {
+                    family: SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Sum,
+                        _
+                    ),
+                    ..
+                }
+            ) {
+            None
+        } else {
+            immutable_materialization_sources(node)
+        };
+        if let Some(source) = &immutable_sources {
             for source in source {
-                walk(&source, None, composable, None, selected)?;
+                walk(source, None, composable, native_maintenance, None, selected)?;
             }
         }
         match &node.expr {
@@ -3621,24 +4321,73 @@ fn collect_selected_materializations(
                 pruning: Some(_),
                 ..
             } => {
-                walk(candidates, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    candidates,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
                 // Explicit external authoritative values do not need duplicate local state.
                 if !composable {
-                    walk(values, readout, composable, grouping.clone(), selected)?;
+                    walk(
+                        values,
+                        readout,
+                        composable,
+                        native_maintenance,
+                        grouping.clone(),
+                        selected,
+                    )?;
                 }
             }
             SummaryExpr::ValueOperation { child, .. } => {
-                walk(child, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    child,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::RelationalJoin { left, right, .. } => {
-                walk(left, readout, composable, grouping.clone(), selected)?;
-                walk(right, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    left,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
+                walk(
+                    right,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::BinaryOp { lhs, rhs, .. }
                 if composable || crate::query_plan::exact_value_executable(node) =>
             {
-                walk(lhs, readout, composable, grouping.clone(), selected)?;
-                walk(rhs, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    lhs,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
+                walk(
+                    rhs,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::SummaryAgg {
                 child,
@@ -3646,15 +4395,23 @@ fn collect_selected_materializations(
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
                 ..
             } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                && immutable_sources.is_none()
                 && ((composable
                     && crate::query_plan::exact_accumulator_value_source(child).is_some())
                     || crate::query_plan::exact_value_executable(node)) =>
             {
-                walk(child, readout, composable, grouping.clone(), selected)?;
+                walk(
+                    child,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::SummaryAgg { child, .. }
                 if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
-                    && immutable_materialization_sources(node).is_none() => {}
+                    && immutable_sources.is_none() => {}
             SummaryExpr::SummaryAgg {
                 family:
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
@@ -3667,12 +4424,20 @@ fn collect_selected_materializations(
                 summary_input,
                 Some(query),
                 composable,
+                native_maintenance,
                 grouping.clone(),
                 selected,
             )?,
             SummaryExpr::SummaryMerge { children, .. } => {
                 for child in children {
-                    walk(child, readout, composable, grouping.clone(), selected)?;
+                    walk(
+                        child,
+                        readout,
+                        composable,
+                        native_maintenance,
+                        grouping.clone(),
+                        selected,
+                    )?;
                 }
             }
             SummaryExpr::SummaryAgg {
@@ -3769,7 +4534,18 @@ fn collect_selected_materializations(
     }
 
     let mut selected = Vec::new();
-    walk(node, None, composable, None, &mut selected)?;
+    let physical_source =
+        asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(node)
+            .ok()
+            .map(|(source, _)| source);
+    walk(
+        physical_source.as_ref().unwrap_or(node),
+        None,
+        composable,
+        asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(node).is_ok(),
+        None,
+        &mut selected,
+    )?;
     if composable {
         selected
             .retain(|state| !has_unsafe_raw_entity_leaf(node, &[Rc::clone(&state.node)], false));
@@ -3780,7 +4556,7 @@ fn collect_selected_materializations(
     Ok(selected)
 }
 
-pub(super) fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
+pub(crate) fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
         P::UnivMon {
@@ -3879,6 +4655,7 @@ pub(crate) mod tests {
             "quantile by (job) (0.99, a)",
             "topk by (job) (1, a)",
             "topk by (job) (5, a)",
+            "count by (job) (a)",
         ];
         snapshot.query_workload.repeating_queries = Some(
             queries
@@ -4455,9 +5232,10 @@ pub(crate) mod tests {
         );
     }
 
-    // Capability normalization precedes candidate enumeration, avoiding duplicate exact quotes.
+    // A larger computation inventory must retain both maintained and native
+    // execution; its cardinality is not the correctness contract.
     #[test]
-    fn counter_only_snapshot_has_distinct_local_and_native_cost_alternatives() {
+    fn counter_only_snapshot_has_distinct_local_and_native_cost_candidates() {
         let mut snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -4465,13 +5243,28 @@ pub(crate) mod tests {
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         entry.query = Query("rate(m[1m])".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
-        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
-        assert_eq!(
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let candidates =
             super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
-                .unwrap()
-                .len(),
-            3
+                .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
+                .count(),
+            1
         );
+        let plans = candidates
+            .into_iter()
+            .map(|candidate| DeploymentPlanCompiler.compile_promql(candidate, environment.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(plans
+            .iter()
+            .any(|plan| !plan.precompute_plan.materializations.is_empty()));
+        assert!(plans
+            .iter()
+            .any(|plan| plan.precompute_plan.materializations.is_empty()));
     }
 
     // Count and value rankings must configure different state update contracts.
@@ -4750,9 +5543,11 @@ pub(crate) mod tests {
             evidence_by_query.insert(query_id.to_string(), evidence);
         }
         Ok(PhysicalCompilationRequest {
-            planner_selection_trace: Vec::new(),
+            planner_candidate_forests: Vec::new(),
+            planner_selection_trace: Default::default(),
             canonical_roots: Vec::new(),
             allow_mixed_summary_and_exact_execution: false,
+            require_backend_local_execution: false,
             enabled_materialization_keys: None,
             query_workload: None,
             data_workload: None,
@@ -4761,7 +5556,7 @@ pub(crate) mod tests {
                 query_string: promql.into(),
                 selected_plan_root: post_asap,
                 legacy_query_source: Source::TimeSeries { metric: "m".into() },
-                query_lookback_seconds: 60,
+                query_lookback_ms: 60_000,
                 group_by_labels: vec![],
                 accuracy_target: accuracy,
                 summary_lifecycle_inputs: lifecycle,
@@ -5012,6 +5807,183 @@ pub(crate) mod tests {
         workload.allow_mixed_summary_and_exact_execution = true;
         let result = DeploymentPlanCompiler.compile_metricsql(workload, deployment);
         assert!(result.unwrap().precompute_plan.materializations.is_empty());
+    }
+
+    /// Accuracy facts must belong to the same query, workload, snapshot and
+    /// evidence window before they enter Planner.
+    #[test]
+    fn scoped_accuracy_evidence_rejects_wrong_or_stale_facts() {
+        let snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let evidence = ScopedAccuracyEvidence {
+            query_string: "quantile_over_time(0.9,m[1m])".into(),
+            data_snapshot_id: "snapshot-a".into(),
+            data_workload: snapshot.data_workload.clone(),
+            source: "enforced-source-contract".into(),
+            observed_at_unix_ms: 9_000,
+            valid_for_ms: 2_000,
+            quantile_operand_domains: vec![],
+            values_non_negative: Some(true),
+            input_row_count: Some(10),
+            hydra_shared_grid_collision_bound: None,
+            hydra_shared_grid_failure_probability: None,
+            topk_max_distinct_items: None,
+            topk_selected_lower_bound: None,
+            topk_excluded_upper_bound: None,
+            topk_interval_failure_probability: None,
+        };
+        let validate = |evidence: &ScopedAccuracyEvidence, query: &str, snapshot_id: &str, now| {
+            evidence.validate(
+                "q",
+                query,
+                &snapshot.data_workload,
+                Some(snapshot_id),
+                now,
+                2_000,
+            )
+        };
+        assert!(validate(&evidence, &evidence.query_string, "snapshot-a", 10_000).is_ok());
+        assert!(validate(&evidence, "another query", "snapshot-a", 10_000).is_err());
+        assert!(validate(&evidence, &evidence.query_string, "snapshot-b", 10_000).is_err());
+        assert!(validate(&evidence, &evidence.query_string, "snapshot-a", 12_000).is_err());
+        let mut invalid = evidence.clone();
+        invalid.hydra_shared_grid_failure_probability = Some(1.5);
+        assert!(validate(&invalid, &invalid.query_string, "snapshot-a", 10_000).is_err());
+        let mut partial_topk = evidence.clone();
+        partial_topk.topk_selected_lower_bound = Some(10.0);
+        assert!(validate(
+            &partial_topk,
+            &partial_topk.query_string,
+            "snapshot-a",
+            10_000
+        )
+        .is_err());
+        let mut valid_topk = partial_topk;
+        valid_topk.topk_excluded_upper_bound = Some(8.0);
+        valid_topk.topk_interval_failure_probability = Some(0.01);
+        assert!(validate(&valid_topk, &valid_topk.query_string, "snapshot-a", 10_000).is_ok());
+        let stats = QueryEvidence {
+            topk: None,
+            scoped: Some(&valid_topk),
+            now_ms: 10_000,
+        }
+        .propagation_stats(
+            &CompositionOperator::TopKSelection,
+            &SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Count,
+                planner_types::post_asap::ExactParams::Count,
+            ),
+            None,
+        );
+        assert_eq!(stats.topk_selected_lower_bound, Some(10.0));
+        assert_eq!(stats.topk_excluded_upper_bound, Some(8.0));
+    }
+
+    /// Quantile domain proof applies only to the operand named by its AST,
+    /// even when both operands read the same metric.
+    #[test]
+    fn scoped_quantile_domain_matches_one_exact_operand() {
+        let snapshot: BackendLocalPlanningInput = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let accuracy = AccuracyTarget::EpsilonDelta {
+            epsilon: 0.05,
+            delta: 0.01,
+        };
+        let root = crate::query_parser::parse_query_expr_canonical(
+            "quantile_over_time(0.9,m[5m]) / quantile_over_time(0.5,m[5m])",
+            accuracy.clone(),
+        )
+        .unwrap();
+        let QueryExpr::BinaryOp { lhs, rhs, .. } = &root else {
+            panic!("expected ratio expression")
+        };
+        let scoped = ScopedAccuracyEvidence {
+            query_string: "quantile_over_time(0.9,m[5m]) / quantile_over_time(0.5,m[5m])".into(),
+            data_snapshot_id: "snapshot-a".into(),
+            data_workload: snapshot.data_workload,
+            source: "enforced-source-contract".into(),
+            observed_at_unix_ms: 9_000,
+            valid_for_ms: 2_000,
+            quantile_operand_domains: vec![QuantileOperandDomainEvidence {
+                operand: serde_json::to_value(lhs.as_ref()).unwrap(),
+                lower: 1.0,
+                upper: 100.0,
+                max_samples: 10_000,
+                contract: "source-schema-v1".into(),
+            }],
+            values_non_negative: None,
+            input_row_count: None,
+            hydra_shared_grid_collision_bound: None,
+            hydra_shared_grid_failure_probability: None,
+            topk_max_distinct_items: None,
+            topk_selected_lower_bound: None,
+            topk_excluded_upper_bound: None,
+            topk_interval_failure_probability: None,
+        };
+        let provider = QueryEvidence {
+            topk: None,
+            scoped: Some(&scoped),
+            now_ms: 10_000,
+        };
+        assert!(provider.quantile_input_domain(lhs).is_some());
+        assert!(provider.quantile_input_domain(rhs).is_none());
+        let inspect = |provider: &dyn AccuracyEvidenceProvider| {
+            let (_, trace) =
+                crate::planner_selection::select_workload_with_accuracy_model_and_trace(
+                    vec![(0, Rc::new(root.clone()))],
+                    accuracy.clone(),
+                    &ControlPlaneCostModel::new(accuracy.clone()),
+                    provider,
+                    &DefaultAccuracyModel,
+                )
+                .unwrap();
+            trace
+        };
+        let unknown = inspect(&provider);
+        assert!(unknown["groups"].as_array().unwrap().iter().any(|group| {
+            group["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| {
+                    candidate["accuracy_status"] == "unknown" && candidate["selected"] == false
+                })
+        }));
+        let mut complete = scoped.clone();
+        complete
+            .quantile_operand_domains
+            .push(QuantileOperandDomainEvidence {
+                operand: serde_json::to_value(rhs.as_ref()).unwrap(),
+                lower: 1.0,
+                upper: 100.0,
+                max_samples: 10_000,
+                contract: "source-schema-v1".into(),
+            });
+        let complete_provider = QueryEvidence {
+            topk: None,
+            scoped: Some(&complete),
+            now_ms: 10_000,
+        };
+        assert!(complete_provider.quantile_input_domain(rhs).is_some());
+        let complete_trace = inspect(&complete_provider);
+        assert!(complete_trace["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| {
+                group["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|candidate| {
+                        candidate["accuracy_status"] == "known"
+                            && candidate["replacement_kind"] == "summary"
+                    })
+            }));
     }
 
     #[test]
@@ -5959,49 +6931,26 @@ pub(crate) mod tests {
             interval: RepetitionInterval(45_000),
             evaluation_phase: planner_types::workload::TimestampMs(0),
         };
-        let mut right = snapshot.clone();
-        right.query_workload.repeating_queries.as_mut().unwrap()[0].query =
-            Query("sum_over_time(n[1m])".into());
-        let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
-        let (right, _) = right.into_physical_compilation_request().unwrap();
-        let left = request.queries[0].selected_plan_root.clone();
-        let right = right.queries[0].selected_plan_root.clone();
-        request.queries[0].selected_plan_root = Rc::new(SummaryNode {
-            expr: SummaryExpr::BinaryOp {
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-                lhs: left.clone(),
-                rhs: right,
-                operator: planner_types::post_asap::BinaryOperator {
-                    checked_relative_division: false,
-                    checked_finite_division: false,
-                    kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
-                        planner_types::pre_asap::ArithmeticOpKind::Add,
-                    ),
-                    vector_match: None,
-                },
-            },
-            schema: left.schema.clone(),
-            guarantee: None,
-        });
-        let text = "quantile(0.9, sum_over_time(m[1m])) + sum_over_time(n[1m])";
-        request.queries[0].query_string = text.into();
-        request
+        // Keep both outputs independent: composing a quantile with a sum would
+        // require an additional accuracy proof unrelated to cadence selection.
+        let mut raw_entry = entry.clone();
+        raw_entry.query = Query("sum_over_time(n[1m])".into());
+        snapshot
             .query_workload
-            .as_mut()
-            .unwrap()
             .repeating_queries
             .as_mut()
-            .unwrap()[0]
-            .query = Query(text.into());
-        prepare_window_implementations(&mut request.queries[0], &model, env.target, 0).unwrap();
-        request.queries[0]
-            .window_realization_candidates
-            .retain(|candidate| {
+            .unwrap()
+            .push(raw_entry);
+        let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
+        for query in &mut request.queries {
+            prepare_window_implementations(query, &model, env.target, 0).unwrap();
+            query.window_realization_candidates.retain(|candidate| {
                 matches!(
                     candidate.layout,
                     asap_types::WindowMaterializationLayout::Pane { .. }
                 )
             });
+        }
         let plan = DeploymentPlanCompiler.compile_promql(request, env).unwrap();
         assert!(plan
             .precompute_plan
@@ -6179,7 +7128,8 @@ pub(crate) mod tests {
             .unwrap()
             .0
             .queries[0]
-            .query_lookback_seconds
+            .query_lookback_ms
+            / 1_000
     }
 
     fn set_data_ingestion_interval(
@@ -6204,7 +7154,7 @@ pub(crate) mod tests {
         set_data_ingestion_interval(&mut snapshot, Some(1_000));
 
         let (request, _) = snapshot.into_physical_compilation_request().unwrap();
-        assert_eq!(request.queries[0].query_lookback_seconds, 1);
+        assert_eq!(request.queries[0].query_lookback_ms, 1_000);
     }
 
     // Snapshot lowering must use the environment clock for cadence freshness.
@@ -6244,7 +7194,7 @@ pub(crate) mod tests {
             request.data_workload.unwrap().data_ingestion_interval.value,
             Some(DurationMs(5_000))
         );
-        assert_eq!(request.queries[0].query_lookback_seconds, 5);
+        assert_eq!(request.queries[0].query_lookback_ms, 5_000);
     }
 
     // An explicitly invalid interval must not be replaced by the migration value.
@@ -6279,29 +7229,48 @@ pub(crate) mod tests {
         assert_eq!(derived_query_window_secs("sum_over_time(a[1s])"), 1);
     }
 
-    // The seconds-based backend must fail explicitly instead of shrinking history.
+    /// Fractional ranges, subqueries and offsets preserve their exact history.
     #[test]
-    fn derived_history_rejects_fractional_seconds() {
-        for query in [
-            "sum_over_time(a[1500ms])",
-            "sum_over_time(a[500ms])",
-            "sum_over_time(a[1500ms] offset 500ms)",
-            "sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))",
-            "avg_over_time((sum(a))[1500ms:])",
-            "sum(a offset 500ms)",
+    fn derived_history_preserves_milliseconds() {
+        for (query, expected) in [
+            ("sum_over_time(a[1500ms])", 1500),
+            ("sum_over_time(a[500ms])", 500),
+            ("sum_over_time(a[1500ms] offset 500ms)", 2000),
+            ("sum_over_time(a[1s]) + sum(sum_over_time(b[500ms]))", 1000),
+            ("avg_over_time((sum(a))[1500ms:])", 6500),
+            ("sum(a offset 500ms)", 5500),
         ] {
             let mut snapshot = planning_snapshot();
             snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
                 Query(query.into());
-            let error = snapshot
-                .into_physical_compilation_request()
-                .expect_err(query)
-                .to_string();
-            assert!(
-                error.contains("whole number of seconds"),
-                "{query}: {error}"
-            );
+            let (request, _) = snapshot.into_physical_compilation_request().expect(query);
+            assert_eq!(request.queries[0].query_lookback_ms, expected, "{query}");
         }
+    }
+
+    /// A real 100 ms source stays at 100 ms through lowering and query publication.
+    #[test]
+    fn hundred_millisecond_source_compiles_without_rounding() {
+        let mut snapshot = planning_snapshot();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            Query("sum(data)".into());
+        snapshot.physical_inputs.scrape_interval_ms = 100;
+        set_data_ingestion_interval(&mut snapshot, Some(100));
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        assert_eq!(request.queries[0].query_lookback_ms, 100);
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        assert_eq!(
+            plan.query_plan
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .instant
+                .lookback_ms,
+            100
+        );
     }
 
     #[test]
@@ -6425,9 +7394,9 @@ pub(crate) mod tests {
     }
 
     // A tumbling shape pairs only with `Pane` in the validator's
-    // framework/layout table, so there is no alternative to price against it.
+    // framework/layout table, so there is no candidate to price against it.
     #[test]
-    fn tumbling_shapes_have_no_layout_alternative_to_rank() {
+    fn tumbling_shapes_have_no_layout_candidate_to_rank() {
         let cost = planning_snapshot().physical_inputs.window_cost_model.cost;
         let expr = crate::query_parser::parse_query_expr_canonical(
             "quantile_over_time(0.5, data[5m])",
@@ -6462,7 +7431,7 @@ pub(crate) mod tests {
             (60_000, 90_000),
         ] {
             let mut query = request.queries[0].clone();
-            query.query_lookback_seconds = lookback_ms / 1_000;
+            query.query_lookback_ms = lookback_ms;
             let expr = crate::query_parser::parse_query_expr_canonical(
                 &format!("quantile_over_time(0.5, data[{}s])", lookback_ms / 1_000),
                 AccuracyTarget::Exact,
@@ -6862,7 +7831,8 @@ pub(crate) mod tests {
             request =
                 super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
                     .unwrap()
-                    .pop()
+                    .into_iter()
+                    .find(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
                     .unwrap();
             let bundle = DeploymentPlanCompiler
                 .compile_promql(request, environment)
@@ -7333,6 +8303,7 @@ pub(crate) mod tests {
             query_workload,
             data_workload,
             physical_inputs: BackendLocalPhysicalInputs {
+                require_backend_local_execution: false,
                 lifecycle_costs: template.summary_lifecycle_inputs.costs,
                 evidence_observed_at_unix_ms: 9_500,
                 evidence_valid_for_ms: 60_000,
@@ -7346,6 +8317,8 @@ pub(crate) mod tests {
                 query_retention_margin_ms: 0,
                 retained_summary_memory_budget_bytes: DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
                 topk_evidence: HashMap::new(),
+                data_snapshot_id: None,
+                accuracy_evidence: HashMap::new(),
                 exact_composition_costs: HashMap::new(),
                 erp: None,
             },
@@ -7468,7 +8441,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn checked_in_per_entity_snapshot_preserves_native_alternative() {
+    fn checked_in_per_entity_snapshot_preserves_native_candidate() {
         let source = include_str!("../../../docs/examples/asapquery-planning-snapshot.json");
         let snapshot: BackendLocalPlanningInput =
             serde_json::from_str(source).expect("strict canonical workload fixture");
@@ -7535,8 +8508,9 @@ pub(crate) mod tests {
         let native =
             crate::physical::workload_cost::enumerate_exact_and_materialized_candidates(request)
                 .unwrap()
-                .pop()
-                .unwrap();
+                .into_iter()
+                .find(|candidate| !candidate.allow_mixed_summary_and_exact_execution)
+                .expect("native candidate retained");
         let plan = DeploymentPlanCompiler
             .compile_promql(native, environment)
             .expect("native demo compiles");
@@ -7782,9 +8756,9 @@ pub(crate) mod tests {
         let mut second = request("q40", "sum(sum_over_time(m[40s]))")
             .queries
             .remove(0);
-        workload.queries[0].query_lookback_seconds = 20;
+        workload.queries[0].query_lookback_ms = 20_000;
         workload.queries[0].window_realization_candidates[0].window_secs = 20;
-        second.query_lookback_seconds = 40;
+        second.query_lookback_ms = 40_000;
         second.summary_lifecycle_inputs.evaluation_interval_ms = 20_000;
         second.window_realization_candidates[0].window_secs = 40;
         workload.queries.push(second);

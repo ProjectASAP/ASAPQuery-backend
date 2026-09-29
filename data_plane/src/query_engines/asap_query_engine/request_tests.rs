@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 fn external_entry() -> QueryPlanEntry {
     QueryPlanEntry {
+        physical_dag: None,
         language: QueryLanguage::PromQl,
         query_id: "m".into(),
         canonical_query: "m".into(),
