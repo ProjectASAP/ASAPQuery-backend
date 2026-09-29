@@ -5,7 +5,7 @@ use planner_types::{
     post_asap::BinaryOperator,
     pre_asap::{AggIntent, ArithmeticOpKind, BinaryOpKind, ColumnRef, CompareOpKind, GroupKeys},
 };
-use residual::{Aggregation, BinaryOperation, Grouping, ResidualQueryOperator as Operation};
+use query_time::{Aggregation, BinaryOperation, Grouping, QueryTimeOperator as Operation};
 
 fn invalid(error: impl std::fmt::Display) -> QueryPlanError {
     QueryPlanError::Invalid(error.to_string())
@@ -132,7 +132,7 @@ pub fn compile(
                     Some(physical::compile_limit(*n, *offset, &grouping(groups)).map_err(invalid)?)
                 }
                 Operation::Temporal { operation } => {
-                    use residual::TemporalOperation as T;
+                    use query_time::TemporalOperation as T;
                     let intent = match operation {
                         T::Rate => AggIntent::Rate,
                         T::Increase => AggIntent::Increase,

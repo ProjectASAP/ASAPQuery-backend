@@ -8,7 +8,9 @@ use crate::storage_engines::types::KeyByLabelValues;
 use asap_physical_operators::dag as physical;
 use asap_types::query_plan::query_time::QueryTimeOperator;
 #[cfg(test)]
-use asap_types::query_plan::query_time::{Aggregation, BinaryOperation, Grouping, TemporalOperation};
+use asap_types::query_plan::query_time::{
+    Aggregation, BinaryOperation, Grouping, TemporalOperation,
+};
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use futures::{FutureExt, StreamExt};
 use std::cell::RefCell;

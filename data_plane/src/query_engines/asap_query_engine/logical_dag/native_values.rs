@@ -336,10 +336,10 @@ mod tests {
             execute_installed, PreparedLeaf, PreparedLeaves, Value as ProtocolValue,
         };
         use asap_types::query_plan::{
-            residual::ResidualQueryOperator, FallbackPolicy, InstantExecution, QueryPlanNode,
+            query_time::QueryTimeOperator, FallbackPolicy, InstantExecution, QueryPlanNode,
         };
         let query = "topk by (job) (1, sum without(instance) (left_metric) / sum without(instance) (right_metric))";
-        let mut entry = control_plane::query_plan::residual::compile_logical(
+        let mut entry = control_plane::query_plan::query_time::compile_logical(
             "compiled-values".into(),
             query.into(),
             InstantExecution {
@@ -356,7 +356,7 @@ mod tests {
             node,
             QueryPlanNode::PhysicalFragment { .. }
                 | QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Scan { .. },
+                    operator: QueryTimeOperator::Scan { .. },
                     ..
                 }
         )));
@@ -364,7 +364,7 @@ mod tests {
             let mut leaves = PreparedLeaves::new();
             for (id, node) in &entry.nodes {
                 if let QueryPlanNode::Logical {
-                    operator: ResidualQueryOperator::Scan { metric, .. },
+                    operator: QueryTimeOperator::Scan { metric, .. },
                     ..
                 } = node
                 {

@@ -1091,7 +1091,7 @@ mod tests {
             .all(|entry| entry.nodes.values().any(|node| matches!(
                 node,
                 crate::query_plan::QueryPlanNode::Logical {
-                    operator: crate::query_plan::residual::ResidualQueryOperator::CurrentSeries {
+                    operator: crate::query_plan::query_time::QueryTimeOperator::CurrentSeries {
                         readout: asap_types::query_plan::current_series::SeriesReadout::Count,
                         ..
                     },
