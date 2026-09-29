@@ -696,12 +696,11 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
             ) {
                 return Some(false);
             }
-            let dag = planner_types::post_asap::compile_executable_dag(&std::rc::Rc::new(
-                summary.clone(),
-            ))
-            .ok()?;
+            let dag =
+                planner_types::post_asap::compile_post_asap_dag(&std::rc::Rc::new(summary.clone()))
+                    .ok()?;
             if dag.nodes.iter().any(|node| matches!(&node.payload,
-                planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. } if kind.algorithm() != &self.1)) {
+                planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { family: SummaryFamilyType::Sketch(kind, _), .. } if kind.algorithm() != &self.1)) {
                 return Some(false);
             }
             self.0.summary_support_evidence(summary)

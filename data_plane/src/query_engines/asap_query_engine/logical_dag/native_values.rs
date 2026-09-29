@@ -137,14 +137,14 @@ pub(super) fn relation(
         compile_node, CompiledPhysicalDag, InputContract,
     };
     use planner_types::post_asap::{
-        ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState, PostAsapNodeId,
+        ExecutionDataState, PostAsapDagNode, PostAsapNodeId, PostAsapOperatorPayload,
     };
-    let node = ExecutableDagNode {
+    let node = PostAsapDagNode {
         id: PostAsapNodeId(2),
         output_state: ExecutionDataState::QUERY_ROWS,
         output_schema: (*output_schema).clone(),
         guarantee: None,
-        payload: ExecutableOperatorPayload::RelationalJoin {
+        payload: PostAsapOperatorPayload::RelationalJoin {
             join_kind: planner_types::pre_asap::JoinKind::Semi,
             pred: predicate,
             pruning: completeness,

@@ -16,7 +16,7 @@ use asap_aware_mapping::{
     SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
 };
 use planner_types::post_asap::{
-    CompositionOperator, EvaluationSchedule, ExecutableDagCompilation, OutputRepresentation,
+    CompositionOperator, EvaluationSchedule, OutputRepresentation, PostAsapDagCompilation,
     PostAsapNodeId, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
     SummaryMaintenanceLifecycle, SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
 };
@@ -1475,7 +1475,7 @@ impl DeploymentPlanCompiler {
         // materializations, then consumed by QueryPlan lowering. The key is
         // the planner DAG node identity across the workload; serving never scans
         // downstream components to rediscover this decision.
-        let mut executable_dags = vec![None::<ExecutableDagCompilation>; request.queries.len()];
+        let mut executable_dags = vec![None::<PostAsapDagCompilation>; request.queries.len()];
         let mut node_bindings =
             BTreeMap::<(usize, PostAsapNodeId), asap_types::PolicyFingerprint>::new();
         let mut query_node_bindings =
@@ -1575,7 +1575,7 @@ impl DeploymentPlanCompiler {
             if selected.is_empty() && population_operators[query_index].is_none() {
                 continue;
             }
-            let executable = planner_types::post_asap::compile_executable_dag_with_node_ids(
+            let executable = planner_types::post_asap::compile_post_asap_dag_with_node_ids(
                 &query.selected_plan_root,
             )
             .map_err(|error| CompileError::Query {
@@ -1894,14 +1894,15 @@ impl DeploymentPlanCompiler {
                         .node_ids
                         .node_id(child)
                         .expect("selected input node");
-                    let document = asap_types::executable_plan::OwnedPostAsapDag::from_executable(
-                        query.query_id.clone(),
-                        &compiled.dag,
-                    )
-                    .map_err(|reason| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason,
-                    })?;
+                    let document =
+                        asap_types::executable_plan::OwnedPostAsapDag::from_post_asap_dag(
+                            query.query_id.clone(),
+                            &compiled.dag,
+                        )
+                        .map_err(|reason| CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason,
+                        })?;
                     runtime_materialization.derived_input = Some(
                         asap_types::derived_input::DerivedInputIdentity::from_dag(
                             &document, input_node, &frontiers,
@@ -4081,7 +4082,7 @@ struct SelectedMaterialization {
 }
 
 fn validate_executable_subdag(node: &Rc<SummaryNode>) -> Result<(), String> {
-    let executable = planner_types::post_asap::compile_executable_dag(node)
+    let executable = planner_types::post_asap::compile_post_asap_dag(node)
         .map_err(|error| format!("invalid executable subDAG: {error}"))?;
     if let Some(edge) = executable.edges.iter().find(|edge| {
         edge.grouping == planner_types::post_asap::GroupingEdgeCompatibility::Incompatible
@@ -4099,7 +4100,7 @@ fn reject_uncertified_readouts(
     root: &Rc<SummaryNode>,
     accuracy: &AccuracyTarget,
 ) -> Result<(), CompileError> {
-    let dag = planner_types::post_asap::compile_executable_dag(root).map_err(|error| {
+    let dag = planner_types::post_asap::compile_post_asap_dag(root).map_err(|error| {
         CompileError::Query {
             query_id: query_id.into(),
             reason: format!("invalid executable subDAG: {error}"),
@@ -4108,7 +4109,7 @@ fn reject_uncertified_readouts(
     for node in &dag.nodes {
         if matches!(
             node.payload,
-            planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
+            planner_types::post_asap::PostAsapOperatorPayload::SummaryEstimate { .. }
         ) && node
             .guarantee
             .as_ref()
@@ -4125,7 +4126,7 @@ fn reject_uncertified_readouts(
     if dag.nodes.iter().any(|node| {
         matches!(
             node.payload,
-            planner_types::post_asap::ExecutableOperatorPayload::SummaryEstimate { .. }
+            planner_types::post_asap::PostAsapOperatorPayload::SummaryEstimate { .. }
         )
     }) && root.guarantee.as_ref().is_none_or(|guarantee| {
         !asap_aware_mapping::accuracy::AccuracyModel::satisfies(
@@ -4883,7 +4884,7 @@ pub(crate) mod tests {
             std::slice::from_ref(&root),
         );
         let candidate = rule.candidate(&root).unwrap();
-        planner_types::post_asap::compile_executable_dag(&candidate).unwrap();
+        planner_types::post_asap::compile_post_asap_dag(&candidate).unwrap();
         assert!(!super::super::maintained_population::supported_node(
             &candidate
         ));
@@ -5185,17 +5186,16 @@ pub(crate) mod tests {
             .find(|node| {
                 matches!(
                     node.payload,
-                    planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg { .. }
+                    planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { .. }
                 )
             })
             .unwrap();
-        if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
-            reduction, ..
-        } = &mut node.payload
+        if let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { reduction, .. } =
+            &mut node.payload
         {
             *reduction = planner_types::pre_asap::Reduction::by(vec![]);
         }
-        installed.document = asap_types::executable_plan::OwnedPostAsapDag::from_executable(
+        installed.document = asap_types::executable_plan::OwnedPostAsapDag::from_post_asap_dag(
             installed.document.query_id.clone(),
             &dag,
         )
@@ -7118,11 +7118,11 @@ pub(crate) mod tests {
             }],
             time_index: None,
         };
-        let dag = ExecutableDag {
+        let dag = PostAsapDag {
             nodes: (1..=5)
-                .map(|id| ExecutableDagNode {
+                .map(|id| PostAsapDagNode {
                     id: PostAsapNodeId(id),
-                    payload: ExecutableOperatorPayload::SummaryMerge,
+                    payload: PostAsapOperatorPayload::SummaryMerge,
                     output_state: ExecutionDataState::INGESTION_SUMMARY,
                     output_schema: schema.clone(),
                     guarantee: None,
@@ -7130,7 +7130,7 @@ pub(crate) mod tests {
                 .collect(),
             edges: [(1, 2), (2, 3), (2, 4), (3, 5), (4, 5)]
                 .into_iter()
-                .map(|(a, b)| ExecutableDagEdge {
+                .map(|(a, b)| PostAsapDagEdge {
                     producer: PostAsapNodeId(a),
                     consumer: PostAsapNodeId(b),
                     role: EdgeRole::Input,
@@ -7143,7 +7143,7 @@ pub(crate) mod tests {
             root: PostAsapNodeId(5),
         };
         let mut installed = InstalledPostAsapDag {
-            document: OwnedPostAsapDag::from_executable("shared".into(), &dag).unwrap(),
+            document: OwnedPostAsapDag::from_post_asap_dag("shared".into(), &dag).unwrap(),
             native_programs: BTreeMap::new(),
             binding: BackendExecutableBinding {
                 nodes: (1..=5)

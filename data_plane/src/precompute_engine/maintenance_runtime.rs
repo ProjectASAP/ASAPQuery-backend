@@ -5,7 +5,7 @@ use crate::storage_engines::types::{
     AggregateCore, InstalledPrecomputePlanHandle, PrecomputedOutput,
 };
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
-use planner_types::post_asap::{ExecutableDagNode, ExecutableOperatorPayload, PostAsapNodeId};
+use planner_types::post_asap::{PostAsapDagNode, PostAsapNodeId, PostAsapOperatorPayload};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -48,7 +48,7 @@ impl MaintenanceInputs<'_> {
 fn validate_maintenance_grouping(
     target: &asap_types::PrecomputeMaterialization,
     source: &asap_types::PrecomputeMaterialization,
-    node: &ExecutableDagNode,
+    node: &PostAsapDagNode,
     singleton_population_complete: bool,
 ) -> Result<(), MaintenanceError> {
     if target.grouping_labels == source.grouping_labels
@@ -61,7 +61,7 @@ fn validate_maintenance_grouping(
         && target.partitioning == Some(asap_types::sds::PopulationPartitioning::Grouped)
         && source.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
         && target.stored_window_ms() == source.stored_window_ms()
-        && matches!(&node.payload, ExecutableOperatorPayload::SummaryAgg {
+        && matches!(&node.payload, PostAsapOperatorPayload::SummaryAgg {
             reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
         } if keys.is_empty())
     {
@@ -142,7 +142,7 @@ fn prepare_frozen_maintenance_sink(
     sink: PostAsapNodeId,
     inputs: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],
     output_window: (u64, u64),
-) -> Result<(planner_types::post_asap::ExecutableDag, PublicationKey), MaintenanceError> {
+) -> Result<(planner_types::post_asap::PostAsapDag, PublicationKey), MaintenanceError> {
     installed.validate()?;
     let target = match installed.binding.node(sink) {
         Some(BackendNodeBinding::Materialization { stored_output }) => *stored_output,
@@ -223,7 +223,7 @@ fn execute_prepared_frozen_sink(
     configs: &[asap_types::PrecomputeMaterialization],
     sink: PostAsapNodeId,
     inputs: MaintenanceInputs<'_>,
-    dag: &planner_types::post_asap::ExecutableDag,
+    dag: &planner_types::post_asap::PostAsapDag,
     key: PublicationKey,
 ) -> Result<(SummaryState, Population), MaintenanceError> {
     let _ = (configs, dag);
@@ -1376,7 +1376,7 @@ impl PrecomputeDagSink {
 }
 
 fn depends_on_any(
-    dag: &planner_types::post_asap::ExecutableDag,
+    dag: &planner_types::post_asap::PostAsapDag,
     sink: PostAsapNodeId,
     sources: &BTreeSet<PostAsapNodeId>,
 ) -> bool {
@@ -1384,14 +1384,14 @@ fn depends_on_any(
 }
 
 fn dependencies(
-    dag: &planner_types::post_asap::ExecutableDag,
+    dag: &planner_types::post_asap::PostAsapDag,
     sink: PostAsapNodeId,
 ) -> BTreeSet<PostAsapNodeId> {
     dependencies_until(dag, sink, &BTreeSet::new())
 }
 
 fn dependencies_until(
-    dag: &planner_types::post_asap::ExecutableDag,
+    dag: &planner_types::post_asap::PostAsapDag,
     sink: PostAsapNodeId,
     frontier: &BTreeSet<PostAsapNodeId>,
 ) -> BTreeSet<PostAsapNodeId> {
@@ -1562,7 +1562,7 @@ mod tests {
     use super::*;
     use asap_physical_operators::summary_kernels::SumAccumulator;
     use planner_types::post_asap::{
-        EdgeRole, ExecutableDag, ExecutableDagEdge, GroupingEdgeCompatibility, SummarySchema,
+        EdgeRole, GroupingEdgeCompatibility, PostAsapDag, PostAsapDagEdge, SummarySchema,
         WindowEdgeCompatibility,
     };
 
@@ -1593,9 +1593,9 @@ mod tests {
     }
 
     fn maintenance_only(
-        mut dag: ExecutableDag,
+        mut dag: PostAsapDag,
         mut binding: BackendExecutableBinding,
-    ) -> (ExecutableDag, BackendExecutableBinding) {
+    ) -> (PostAsapDag, BackendExecutableBinding) {
         let retained = dag
             .nodes
             .iter()
@@ -1689,10 +1689,10 @@ mod tests {
 
     // Ingestion adapters must execute native operators in the parent's scope.
 
-    fn node(id: u32) -> ExecutableDagNode {
-        ExecutableDagNode {
+    fn node(id: u32) -> PostAsapDagNode {
+        PostAsapDagNode {
             id: PostAsapNodeId(id),
-            payload: ExecutableOperatorPayload::SummaryMerge,
+            payload: PostAsapOperatorPayload::SummaryMerge,
             output_state: planner_types::post_asap::ExecutionDataState::INGESTION_SUMMARY,
             output_schema: SummarySchema {
                 fields: vec![],
@@ -1702,8 +1702,8 @@ mod tests {
         }
     }
 
-    fn edge(producer: u32, consumer: u32) -> ExecutableDagEdge {
-        ExecutableDagEdge {
+    fn edge(producer: u32, consumer: u32) -> PostAsapDagEdge {
+        PostAsapDagEdge {
             producer: PostAsapNodeId(producer),
             consumer: PostAsapNodeId(consumer),
             role: EdgeRole::Input,
@@ -1784,7 +1784,7 @@ mod tests {
             precompute_sinks: vec![PostAsapNodeId(3)],
         };
         let mut read = node(2);
-        read.payload = ExecutableOperatorPayload::Value {
+        read.payload = PostAsapOperatorPayload::Value {
             operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
         };
         read.output_schema.fields = vec![SummaryField {
@@ -1793,7 +1793,7 @@ mod tests {
             nullable: false,
         }];
         let mut aggregate = node(3);
-        aggregate.payload = ExecutableOperatorPayload::SummaryAgg {
+        aggregate.payload = PostAsapOperatorPayload::SummaryAgg {
             family: target_family,
             input: SummaryUpdate {
                 item: None,
@@ -1825,7 +1825,7 @@ mod tests {
         second_edge.data_state = read.output_state;
         let mut query_edge = edge(3, 4);
         query_edge.intermediate_schema = aggregate.output_schema.clone();
-        let dag = ExecutableDag {
+        let dag = PostAsapDag {
             nodes: vec![source_node, read, aggregate, query],
             edges: vec![first_edge, second_edge, query_edge],
             root: PostAsapNodeId(4),
@@ -1856,7 +1856,7 @@ mod tests {
         };
         use asap_types::executable_plan::{InstalledPostAsapDag, OwnedPostAsapDag};
         let mut document =
-            OwnedPostAsapDag::from_executable("immutable-chain".into(), &dag).unwrap();
+            OwnedPostAsapDag::from_post_asap_dag("immutable-chain".into(), &dag).unwrap();
         let mut durable_configs = configs.to_vec();
         durable_configs[1].derived_input = Some(
             asap_types::derived_input::DerivedInputIdentity::from_dag(
@@ -2168,7 +2168,7 @@ mod tests {
     }
 
     fn exercise_two_source_completed_sink(
-        template: &ExecutableDag,
+        template: &PostAsapDag,
         configs: &[asap_types::PrecomputeMaterialization],
         binding: &BackendExecutableBinding,
         matching_windows: bool,
@@ -2200,7 +2200,7 @@ mod tests {
         second_node.id = PostAsapNodeId(5);
         let mut merge = second_node.clone();
         merge.id = PostAsapNodeId(6);
-        merge.payload = ExecutableOperatorPayload::SummaryMerge;
+        merge.payload = PostAsapOperatorPayload::SummaryMerge;
         dag.nodes.extend([second_node, merge]);
         let original = dag
             .edges
@@ -2217,7 +2217,7 @@ mod tests {
             edge.consumer = PostAsapNodeId(consumer);
             dag.edges.push(edge);
         }
-        if let ExecutableOperatorPayload::SummaryAgg { input, .. } = &mut dag
+        if let PostAsapOperatorPayload::SummaryAgg { input, .. } = &mut dag
             .nodes
             .iter_mut()
             .find(|node| node.id == PostAsapNodeId(3))
@@ -2229,7 +2229,7 @@ mod tests {
             );
         }
         let mut document =
-            OwnedPostAsapDag::from_executable("two-source-fixture".into(), &dag).unwrap();
+            OwnedPostAsapDag::from_post_asap_dag("two-source-fixture".into(), &dag).unwrap();
         let mut target = configs[1].clone();
         if complete_groups {
             target.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
@@ -2745,7 +2745,7 @@ mod tests {
             .into();
         let mut query = node(2);
         query.output_state = planner_types::post_asap::ExecutionDataState::QUERY_ROWS;
-        let dag = ExecutableDag {
+        let dag = PostAsapDag {
             nodes: vec![node(0), node(1), query],
             edges: vec![edge(0, 1), edge(1, 2)],
             root: PostAsapNodeId(2),
@@ -2782,7 +2782,7 @@ mod tests {
                 native_programs: BTreeMap::new(),
                 document: {
                     let mut document =
-                        OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap();
+                        OwnedPostAsapDag::from_post_asap_dag("retry".into(), &dag).unwrap();
                     document.schema_version =
                         asap_types::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION;
                     document

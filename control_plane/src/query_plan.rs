@@ -145,9 +145,9 @@ fn compile_native_fragment(
     query_inputs: &[QueryNodeId],
 ) -> Result<QueryPlanNode, QueryPlanError> {
     use asap_physical_operators::physical_planner::{compile, InputContract};
-    use planner_types::post_asap::{compile_executable_dag, EdgeRole};
+    use planner_types::post_asap::{compile_post_asap_dag, EdgeRole};
     let invalid = |e: String| QueryPlanError::Invalid(e);
-    let dag = compile_executable_dag(root).map_err(|e| invalid(e.to_string()))?;
+    let dag = compile_post_asap_dag(root).map_err(|e| invalid(e.to_string()))?;
     let mut edges = dag
         .edges
         .iter()
@@ -235,9 +235,9 @@ where
     fn lower_relation(&mut self, root: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {
         use asap_physical_operators::physical_planner::{compile, InputContract};
         use planner_types::post_asap::{
-            compile_executable_dag_with_node_ids, ExecutableOperatorPayload as Payload,
+            compile_post_asap_dag_with_node_ids, PostAsapOperatorPayload as Payload,
         };
-        let compilation = compile_executable_dag_with_node_ids(root)
+        let compilation = compile_post_asap_dag_with_node_ids(root)
             .map_err(|e| QueryPlanError::Invalid(e.to_string()))?;
         let mut pending = vec![compilation.dag.root];
         let mut visited = std::collections::BTreeSet::new();
@@ -1500,23 +1500,38 @@ mod tests {
                             std::sync::Arc::new(schema.clone()),
                             std::sync::Arc::new(schema.clone()),
                         ];
-                        let node = planner_types::post_asap::ExecutableDagNode {
-                id: planner_types::post_asap::PostAsapNodeId(2),
-                payload: planner_types::post_asap::ExecutableOperatorPayload::RelationalJoin { join_kind: planner_types::pre_asap::JoinKind::Semi, pred: serde_json::from_value(serde_json::to_value(planner_types::pre_asap::Predicate(
-                            std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Compare {
-                                left: std::rc::Rc::new(planner_types::pre_asap::QueryExpr::Column(
-                                    0,
-                                )),
-                                op: planner_types::pre_asap::CompareOpKind::Eq,
-                                right: std::rc::Rc::new(
-                                    planner_types::pre_asap::QueryExpr::Column(1),
-                                ),
-                            }),
-                        ))
-                        .unwrap()).unwrap(), pruning: None },
-                output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
-                output_schema: schema, guarantee: None,
-            };
+                        let node = planner_types::post_asap::PostAsapDagNode {
+                            id: planner_types::post_asap::PostAsapNodeId(2),
+                            payload:
+                                planner_types::post_asap::PostAsapOperatorPayload::RelationalJoin {
+                                    join_kind: planner_types::pre_asap::JoinKind::Semi,
+                                    pred: serde_json::from_value(
+                                        serde_json::to_value(planner_types::pre_asap::Predicate(
+                                            std::rc::Rc::new(
+                                                planner_types::pre_asap::QueryExpr::Compare {
+                                                    left: std::rc::Rc::new(
+                                                        planner_types::pre_asap::QueryExpr::Column(
+                                                            0,
+                                                        ),
+                                                    ),
+                                                    op: planner_types::pre_asap::CompareOpKind::Eq,
+                                                    right: std::rc::Rc::new(
+                                                        planner_types::pre_asap::QueryExpr::Column(
+                                                            1,
+                                                        ),
+                                                    ),
+                                                },
+                                            ),
+                                        ))
+                                        .unwrap(),
+                                    )
+                                    .unwrap(),
+                                    pruning: None,
+                                },
+                            output_state: planner_types::post_asap::ExecutionDataState::QUERY_ROWS,
+                            output_schema: schema,
+                            guarantee: None,
+                        };
                         let operator = asap_physical_operators::physical_planner::compile_node(
                             &node, &schemas,
                         )
