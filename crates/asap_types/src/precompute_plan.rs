@@ -593,6 +593,33 @@ impl PrecomputePlan {
                         .native_program(*sink)
                         .map_err(PrecomputePlanError::CatalogContract)?
                         .ok_or_else(invalid)?;
+                    for root in native.roots() {
+                        let root = planner_types::post_asap::PostAsapNodeId(
+                            u32::try_from(*root).map_err(|_| invalid())?,
+                        );
+                        let Some(crate::executable_plan::BackendNodeBinding::Materialization {
+                            stored_output,
+                        }) = installed.binding.node(root)
+                        else {
+                            return Err(invalid());
+                        };
+                        let other = self
+                            .materializations
+                            .iter()
+                            .find(|c| c.policy_fingerprint() == stored_output.fingerprint())
+                            .ok_or_else(invalid)?;
+                        if other.stored_window_ms() != config.stored_window_ms()
+                            || other.slide_interval != config.slide_interval
+                            || other.pane_origin_ms != config.pane_origin_ms
+                            || other.population_key_encoding != config.population_key_encoding
+                            || other.derived_input.as_ref().map(|d| &d.inputs)
+                                != Some(&derived.inputs)
+                            || (native.roots().len() > 1
+                                && config.population_key_encoding.is_legacy())
+                        {
+                            return Err(invalid());
+                        }
+                    }
                     let native = native.output_contract(u64::from(sink.0))
                         .map_err(|e| PrecomputePlanError::CatalogContract(e.to_string()))
                         .map(|contract| !asap_physical_operators::physical_planner::precompute::is_population_schema(&contract.schema))?

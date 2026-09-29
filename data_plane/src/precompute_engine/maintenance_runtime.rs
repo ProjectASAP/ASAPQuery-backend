@@ -241,7 +241,9 @@ fn execute_prepared_frozen_sink(
         ),
         asap_physical_operators::runtime::Limits::default().max_bytes,
         key.plan_version,
-    )?;
+    )?
+    .remove(&u64::from(sink.0))
+    .ok_or("native precompute output missing")?;
     let mut populations =
         super::native_precompute::population_states(&batch, u64::try_from(key.window_end_ms)?)?;
     if populations.len() != 1 {
@@ -658,9 +660,7 @@ fn execute_finite_source_cohort(
     Ok(())
 }
 
-/// Evaluate every raw population before one global immutable publication.
-/// Canonical source identities are mandatory; legacy plans retain their
-/// existing singleton path and cannot silently reinterpret old resolver keys.
+/// Evaluate a retained graph once per complete input window and publish all roots.
 fn execute_finite_complete_populations(
     store: &crate::storage_engines::sketch_db::index::SketchStore,
     resolver: &crate::drivers::ingest::series_resolver::SeriesIdResolver,
@@ -694,42 +694,14 @@ fn execute_finite_complete_populations(
         .collect::<Result<Vec<_>, _>>()?;
     asap_types::precompute_plan::validated_source_window_cohort(config, &sources)
         .map_err(|error| error.to_string())?;
-    let native_program = installed.native_program(sink)?.filter(|program| {
-        program
-            .output_contract(u64::from(sink.0))
-            .is_ok_and(|contract| {
-                !asap_physical_operators::physical_planner::precompute::is_population_schema(
-                    &contract.schema,
-                )
-            })
-    });
+    let program = installed
+        .native_program(sink)?
+        .ok_or("installed precompute output lacks its Planner physical graph")?;
     if std::iter::once(config)
         .chain(sources.iter().copied())
-        .any(|config| {
-            config.population_key_encoding != asap_types::PopulationKeyEncoding::CanonicalLabelsV1
-                || (native_program.is_none()
-                    && config.slide_interval.checked_mul(1000) != Some(config.stored_window_ms()))
-        })
+        .any(|c| c.population_key_encoding != asap_types::PopulationKeyEncoding::CanonicalLabelsV1)
     {
-        return Err(
-            "complete population execution requires canonical windows supported by the bound program".into(),
-        );
-    }
-    let dag = installed.document.decode()?;
-    let target_node = dag
-        .nodes
-        .iter()
-        .find(|node| node.id == sink)
-        .ok_or("complete target node is absent")?;
-    if native_program.is_none() {
-        asap_types::precompute_plan::validate_maintenance_reduction(config, target_node)?;
-    }
-    if native_program.is_none()
-        && !matches!(&target_node.payload, ExecutableOperatorPayload::SummaryAgg {
-        reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
-    } if keys.is_empty())
-    {
-        return Err("complete population execution currently requires one global reduction".into());
+        return Err("complete population execution requires canonical population bindings".into());
     }
     let mut common_windows: Option<BTreeSet<(u64, u64)>> = None;
     let mut common_groups: Option<BTreeSet<Population>> = None;
@@ -780,87 +752,81 @@ fn execute_finite_complete_populations(
     for window in common_windows.unwrap_or_default() {
         let cohort =
             store.read_complete_raw_maintenance_cohort(generation, &derived.inputs, window)?;
-        if let Some(program) = &native_program {
-            let max_bytes = asap_physical_operators::runtime::Limits::default().max_bytes;
-            let batch = super::native_precompute::execute(
-                installed,
-                program,
-                cohort.inputs(),
-                window,
-                max_bytes,
-                0,
-            )
-            .map_err(|e| e.to_string())?;
-            let mut output = crate::storage_engines::types::PrecomputedOutput::new(
-                window.0,
-                window.1,
-                None,
-                target.fingerprint(),
-            );
-            output.population_labels = Some(Population::new());
-            output.catalog_generation = Some(Arc::clone(generation));
-            store.publish_native_summary_output(resolver, config, &output, batch, max_bytes)?;
-            continue;
-        }
-        let (dag, key) = prepare_frozen_maintenance_sink(
+        let max_bytes = asap_physical_operators::runtime::Limits::default().max_bytes;
+        let outputs = super::native_precompute::execute(
             installed,
-            &plan.materializations,
-            sink,
+            &program,
             cohort.inputs(),
             window,
+            max_bytes,
+            0,
         )?;
-        let digest: [u8; 32] = key
-            .input_lineage
-            .as_slice()
-            .try_into()
-            .map_err(|_| "complete maintenance digest is invalid")?;
-        let output_group = Population::new();
-        let attrs = crate::drivers::ingest::population_attrs_fingerprint(
-            config.population_key_encoding,
-            &[],
-        )?;
-        let target_sid =
-            store.resolve_output_storage_handle(resolver, target, &attrs, Some(generation))?;
-        if store
-            .completed_maintenance_coordinates(target, generation)?
-            .get(&target_sid)
-            .and_then(|groups| groups.get(&output_group))
-            .is_some_and(|windows| windows.contains(&window))
-        {
-            continue;
+        for (root, batch) in outputs {
+            let root = PostAsapNodeId(u32::try_from(root)?);
+            let Some(BackendNodeBinding::Materialization {
+                stored_output: target,
+            }) = installed.binding.node(root)
+            else {
+                return Err("physical output lacks its storage binding".into());
+            };
+            let config = plan
+                .materializations
+                .iter()
+                .find(|c| c.policy_fingerprint() == target.fingerprint())
+                .ok_or("physical output configuration missing")?;
+            let mut output = PrecomputedOutput::new(window.0, window.1, None, target.fingerprint());
+            output.catalog_generation = Some(Arc::clone(generation));
+            if !asap_physical_operators::physical_planner::precompute::is_population_schema(
+                batch.schema(),
+            ) {
+                output.population_labels = Some(Population::new());
+                store.publish_native_summary_output(resolver, config, &output, batch, max_bytes)?;
+                continue;
+            }
+            let derived = config
+                .derived_input
+                .as_ref()
+                .ok_or("physical output input identity missing")?;
+            let digest = frozen_cohort_lineage(cohort.inputs(), derived)?;
+            for (group, state) in super::native_precompute::population_states(&batch, window.1)? {
+                let pairs = group
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect::<Vec<_>>();
+                let attrs = crate::drivers::ingest::population_attrs_fingerprint(
+                    config.population_key_encoding,
+                    &pairs,
+                )?;
+                let target_sid = store.resolve_output_storage_handle(
+                    resolver,
+                    *target,
+                    &attrs,
+                    Some(generation),
+                )?;
+                if store
+                    .completed_maintenance_coordinates(*target, generation)?
+                    .get(&target_sid)
+                    .and_then(|groups| groups.get(&group))
+                    .is_some_and(|windows| windows.contains(&window))
+                {
+                    continue;
+                }
+                if store.recover_complete_raw_maintenance_output(
+                    target_sid, config, &cohort, digest, window,
+                )? {
+                    continue;
+                }
+                output.population_labels = Some(group);
+                store.publish_complete_raw_maintenance_output(
+                    target_sid,
+                    config,
+                    &output,
+                    state.as_ref(),
+                    &cohort,
+                    digest,
+                )?;
+            }
         }
-        if store
-            .recover_complete_raw_maintenance_output(target_sid, config, &cohort, digest, window)?
-        {
-            continue;
-        }
-        let (state, computed_group) = execute_prepared_frozen_sink(
-            installed,
-            &plan.materializations,
-            sink,
-            MaintenanceInputs::Complete(&cohort),
-            &dag,
-            key,
-        )?;
-        if computed_group != output_group {
-            return Err("computed complete population differs from the bound global output".into());
-        }
-        let mut output = crate::storage_engines::types::PrecomputedOutput::new(
-            window.0,
-            window.1,
-            Some(crate::storage_engines::types::KeyByLabelValues { labels: Vec::new() }),
-            target.fingerprint(),
-        );
-        output.population_labels = Some(computed_group);
-        output.catalog_generation = Some(Arc::clone(generation));
-        store.publish_complete_raw_maintenance_output(
-            target_sid,
-            config,
-            &output,
-            state.as_ref(),
-            &cohort,
-            digest,
-        )?;
     }
     Ok(())
 }
@@ -883,7 +849,11 @@ pub(crate) fn execute_finite_maintenance(
         return Err("finite maintenance catalog generation changed".into());
     }
     for installed in plan.executable_dags.values() {
+        let mut executed = BTreeSet::new();
         for sink in &installed.binding.precompute_sinks {
+            if executed.contains(sink) {
+                continue;
+            }
             let Some(BackendNodeBinding::Materialization {
                 stored_output: target,
             }) = installed.binding.node(*sink)
@@ -909,6 +879,11 @@ pub(crate) fn execute_finite_maintenance(
                     *sink,
                     &active_generation,
                 )?;
+                if let Some(program) = installed.native_program(*sink)? {
+                    for root in program.roots() {
+                        executed.insert(PostAsapNodeId(u32::try_from(*root)?));
+                    }
+                }
                 continue;
             }
             if derived.inputs.len() > 1 {
@@ -2903,7 +2878,11 @@ pub(crate) fn execute_revision_outputs(
     for installed in plan.precompute_plan.executable_dags.values() {
         let mut result: BTreeMap<asap_types::sds::StoredOutputId, Vec<RevisionRecord>> =
             BTreeMap::new();
+        let mut executed = BTreeSet::new();
         for sink in &installed.binding.precompute_sinks {
+            if executed.contains(sink) {
+                continue;
+            }
             let Some(BackendNodeBinding::Materialization {
                 stored_output: target,
             }) = installed.binding.node(*sink)
@@ -2919,7 +2898,19 @@ pub(crate) fn execute_revision_outputs(
             let Some(derived) = &config.derived_input else {
                 continue;
             };
-            result.entry(*target).or_default();
+            let program = installed
+                .native_program(*sink)?
+                .ok_or("installed revision producer lacks its Planner physical graph")?;
+            for root in program.roots() {
+                let root = PostAsapNodeId(u32::try_from(*root)?);
+                executed.insert(root);
+                let Some(BackendNodeBinding::Materialization { stored_output }) =
+                    installed.binding.node(root)
+                else {
+                    return Err("physical output storage binding missing".into());
+                };
+                result.entry(*stored_output).or_default();
+            }
             let inputs: Vec<_> = raw
                 .iter()
                 .filter(|r| derived.inputs.contains(&r.definition))
@@ -2974,10 +2965,23 @@ pub(crate) fn execute_revision_outputs(
                 {
                     continue;
                 }
-                if let Some(program) = installed.native_program(*sink)? {
-                    let batch = super::native_precompute::execute(
-                        installed, &program, &selected, window, limit, revision,
-                    )?;
+                let outputs = super::native_precompute::execute(
+                    installed, &program, &selected, window, limit, revision,
+                )?;
+                for (root, batch) in outputs {
+                    let root = PostAsapNodeId(u32::try_from(root)?);
+                    let Some(BackendNodeBinding::Materialization {
+                        stored_output: target,
+                    }) = installed.binding.node(root)
+                    else {
+                        return Err("physical output storage binding missing".into());
+                    };
+                    let config = plan
+                        .precompute_plan
+                        .materializations
+                        .iter()
+                        .find(|c| c.policy_fingerprint() == target.fingerprint())
+                        .ok_or("physical output configuration missing")?;
                     if asap_physical_operators::physical_planner::precompute::is_population_schema(
                         batch.schema(),
                     ) {
@@ -3018,7 +3022,6 @@ pub(crate) fn execute_revision_outputs(
                     });
                     continue;
                 }
-                return Err("installed revision producer lacks its Planner physical graph".into());
             }
         }
         for (output, records) in result {

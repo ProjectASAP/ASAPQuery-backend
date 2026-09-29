@@ -21,7 +21,7 @@ pub(super) fn execute(
     window: (u64, u64),
     max_bytes: usize,
     revision: u64,
-) -> Result<Batch, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<BTreeMap<u64, Batch>, Box<dyn std::error::Error + Send + Sync>> {
     let mut sources = BTreeMap::new();
     let mut input_bytes = 0usize;
     for (id, contract) in program.input_contracts() {
@@ -144,24 +144,38 @@ pub(super) fn execute(
     )?;
     // Source buffers and retained publication output share the operator budget.
     let _inputs = context.reserve(input_bytes)?;
-    let mut retained = context.reserve(0)?;
-    let schema = program.output_contract(program.roots()[0])?.schema;
-    let mut stream = graph.execute(program.roots(), context)?.remove(0);
+    // Drain all roots together: a bounded shared producer can otherwise block
+    // while the first root waits for an unpolled sibling to consume its queue.
+    let streams = graph.execute(program.roots(), context.clone())?;
     block_on(async {
-        let mut rows = Vec::new();
-        let mut bytes = 0usize;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            bytes = bytes
-                .checked_add(batch.bytes())
-                .ok_or("native output size overflow")?;
-            if bytes > max_bytes {
-                return Err(asap_physical_operators::Error::MemoryLimit.into());
-            }
-            retained.resize(bytes)?;
-            rows.extend(batch.rows().iter().cloned());
-        }
-        Batch::try_new(schema, rows).map_err(Into::into)
+        let outputs =
+            futures::future::try_join_all(program.roots().iter().copied().zip(streams).map(
+                |(root, mut stream)| {
+                    let context = context.clone();
+                    async move {
+                        let schema = program.output_contract(root)?.schema;
+                        let mut retained = context.reserve(0)?;
+                        let mut rows = Vec::new();
+                        let mut bytes = 0usize;
+                        while let Some(batch) = stream.next().await {
+                            let batch = batch?;
+                            bytes = bytes
+                                .checked_add(batch.bytes())
+                                .ok_or(asap_physical_operators::Error::MemoryLimit)?;
+                            retained.resize(bytes)?;
+                            rows.extend(batch.rows().iter().cloned());
+                        }
+                        let batch = Batch::try_new(schema, rows)?;
+                        Ok::<_, asap_physical_operators::Error>((root, batch, retained))
+                    }
+                },
+            ))
+            .await?;
+        // Keep every root's reservation until all roots have finished.
+        Ok(outputs
+            .into_iter()
+            .map(|(id, batch, _)| (id, batch))
+            .collect())
     })
 }
 
@@ -204,4 +218,113 @@ pub(super) fn population_states(
         }
     }
     Ok(result.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asap_physical_operators::{physical_planner::InputContract, plan::PhysicalOperator};
+    use asap_types::executable_plan::{BackendExecutableBinding, OwnedPostAsapDag};
+
+    // Both persisted roots must receive the same producer result, while a later
+    // revision gets fresh state. A failed run must return no partial outputs.
+    #[test]
+    fn shared_outputs_use_one_producer_and_isolate_revisions() {
+        use planner_types::post_asap::{ExactKind, ExactParams};
+        let family = SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum);
+        let schema =
+            asap_physical_operators::physical_planner::precompute::population_schema(family);
+        let merge = Operator::summary_merge(schema.clone(), 2, vec![0]).unwrap();
+        let output = merge.output_schema();
+        let limit = || Operator::limit(output.clone(), 1, 0, vec![]).unwrap();
+        let program = CompiledPhysicalDag::from_operators(
+            BTreeMap::from([(1, InputContract::bounded(schema))]),
+            BTreeMap::from([
+                (2, (vec![1], merge)),
+                (3, (vec![2], limit())),
+                (4, (vec![2], limit())),
+            ]),
+            vec![3, 4],
+        )
+        .unwrap();
+        let program = CompiledPhysicalDag::decode(&program.encode().unwrap()).unwrap();
+        let definition = asap_types::sds::StoredOutputId(1);
+        let installed = InstalledPostAsapDag {
+            document: OwnedPostAsapDag {
+                schema_version: asap_types::executable_plan::MAINTENANCE_DAG_SCHEMA_VERSION,
+                query_id: "shared".into(),
+                nodes: vec![],
+                edges: vec![],
+                root: PostAsapNodeId(4),
+            },
+            binding: BackendExecutableBinding {
+                nodes: BTreeMap::from([(
+                    PostAsapNodeId(1),
+                    BackendNodeBinding::Materialization {
+                        stored_output: definition,
+                    },
+                )]),
+                query_sink: PostAsapNodeId(4),
+                query_plan_sink: asap_types::executable_plan::QueryNodeId(4),
+                precompute_sinks: vec![PostAsapNodeId(3), PostAsapNodeId(4)],
+            },
+            native_programs: BTreeMap::new(),
+        };
+        let generation = Arc::new(asap_types::sds::CatalogGeneration {
+            schema_version: 6,
+            plan_id: 1,
+            plan_version: 1,
+            snapshot_sha256: "0".repeat(64),
+        });
+        let state = |value| {
+            let mut sum = asap_physical_operators::summary_kernels::SumAccumulator::new();
+            sum.update(value);
+            Arc::new(sum) as Arc<dyn crate::storage_engines::types::AggregateCore>
+        };
+        for (revision, value) in [(1, 2.0), (2, 7.0)] {
+            let inputs = [
+                crate::storage_engines::sketch_db::index::FrozenExactWindows {
+                    stored_output_reference: asap_types::sds::StoredOutputReference {
+                        stored_output_id: definition,
+                        definition_id: serde_json::from_value(serde_json::json!(format!(
+                            "sds-v1:{}",
+                            "0".repeat(64)
+                        )))
+                        .unwrap(),
+                    },
+                    storage_handle: 1,
+                    definition,
+                    generation: generation.clone(),
+                    group: BTreeMap::new(),
+                    windows: BTreeMap::from([
+                        ((0, 1000), state(value)),
+                        ((1000, 2000), state(3.0)),
+                    ]),
+                    singleton_population_complete: true,
+                },
+            ];
+            let outputs =
+                execute(&installed, &program, &inputs, (0, 2000), 1 << 20, revision).unwrap();
+            assert_eq!(outputs.keys().copied().collect::<Vec<_>>(), vec![3, 4]);
+            let state_at = |root| match &outputs[&root].rows()[0][1] {
+                Value::Summary { state, .. } => state,
+                _ => panic!("expected retained summary state"),
+            };
+            assert!(
+                Arc::ptr_eq(state_at(3), state_at(4)),
+                "shared merge must execute once, not once per output"
+            );
+            assert_eq!(
+                state_at(3)
+                    .query_statistic(asap_types::Statistic::Sum, &None, &Default::default(),)
+                    .unwrap(),
+                value + 3.0
+            );
+            let error = execute(&installed, &program, &inputs, (0, 2000), 1, revision).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<asap_physical_operators::Error>(),
+                Some(asap_physical_operators::Error::MemoryLimit)
+            ));
+        }
+    }
 }
