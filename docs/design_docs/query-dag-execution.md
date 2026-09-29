@@ -7,23 +7,33 @@ precomputation and query execution.
 
 ```mermaid
 flowchart LR
-    IR["Post-ASAP IR"] --> Compile["Physical Planner"]
-    Compile --> DAG["CompiledPhysicalDag"]
-    DAG --> PreBind["Precomputation bindings"] --> PreRun["Precomputation"]
-    PreRun --> Store["SummaryStore"]
-    DAG --> QueryBind["Query bindings"] --> QueryRun["Query execution"]
-    Store --> QueryBind
-    QueryRun --> Result["Query result"]
+    L["Logical Post-ASAP DAG"] -->|Candidate generation| M["Summary Maintenance Lifecycle"]
+    M -->|Physical Plan Compiler| P["Physical DAG candidates"]
+    P -->|Backend selection and Deployment Plan Compiler| D["Deployment Plan / DAG"]
+    D --> Pre["PrecomputePlan"]
+    D --> Query["QueryPlan"]
+    Pre --> Runtime["Shared physical operators and DAG runtime"]
+    Query --> Runtime
 ```
 
-The key separation is:
+This follows [Planner #462's architecture](https://github.com/ProjectASAP/ASAPPlanner/blob/feat/shared-physical-operators/docs/design_docs/physical-planning-and-deployment.md):
 
-- ASAPPlanner defines computation: physical operators, DAG compilation, and DAG execution.
-- Backend defines deployment: where inputs come from, which revisions and windows
-  are valid, how summaries are stored, and how results are exposed through SQL or PromQL.
+| Layer | Responsibility |
+| --- | --- |
+| Logical Post-ASAP DAG | Computation semantics |
+| Summary Maintenance Lifecycle | Build, retention, reuse, and window strategy |
+| Physical DAG(s) | Supported physical candidates, executable operators, and typed boundaries |
+| Deployment Plan / DAG | Selected candidate, concrete bindings, and operational lifecycle |
 
-The same `CompiledPhysicalDag` representation is reusable across precomputation
-and query execution. The selected plan may contain different DAGs for these phases.
+ASAPPlanner owns the first three layers. Backend selects a feasible physical
+candidate using deployment statistics, resource limits and costs, then binds it
+into `PrecomputePlan` and `QueryPlan`. It preserves the candidate's operators,
+dependencies, sharing and materialization frontier.
+
+The lifecycle is a planning contract, not another computation IR. “Maintenance”
+here names Planner's lifecycle concept; input reception is ingestion and execution
+before a request is precomputation. Executing a bound Physical DAG introduces
+neither an **Execution DAG** abstraction nor another planning layer.
 
 ## 2. Ownership
 
@@ -67,27 +77,28 @@ for the broader architecture and DataFusion comparison.
 ## 3. Compilation and execution
 
 ```text
-post-ASAP IR
-     │ physical_planner
-     ▼
-CompiledPhysicalDag
-     │ bind deployment inputs
-     ▼
-Executable DAG instance
-     │ shared DAG runtime
-     ▼
-outputs
+Planner: Logical Post-ASAP DAG + lifecycle candidate
+                    ↓ Physical Plan Compiler
+         supported Physical DAG candidates
+                    ↓ Backend selection and Deployment Plan Compiler
+         Deployment Plan / DAG (PrecomputePlan + QueryPlan)
+                    ↓ execute bound Physical DAGs through shared runtime
+         stored outputs / query results
 ```
 
 ### 3.1 Compile
 
-ASAPPlanner compiles the selected post-ASAP computation and physical contracts
-into a `CompiledPhysicalDag`. Compilation resolves operator semantics but does
-not require live storage readers.
+ASAPPlanner compiles semantically legal computation and lifecycle candidates
+into supported Physical DAG candidates with typed input/output boundaries.
+Compilation does not require live storage readers. `CompiledPhysicalDag` is a
+Rust implementation type for physical compilation, not a separate architectural
+layer or an intermediate Execution DAG.
 
 ### 3.2 Bind
 
-Backend binds deployment inputs to the compiled DAG. Conceptually:
+Backend checks candidate feasibility and costs, selects a physical candidate,
+and binds its inputs in the Deployment Plan / DAG. At request time, those binding
+rules resolve concrete eligible records and readers. Conceptually:
 
 ```text
 Summary-state input → eligible SummaryStore records
@@ -100,7 +111,8 @@ revisions, and coverage. They do not repeat operator lowering.
 
 ### 3.3 Execute
 
-The shared runtime executes the instantiated DAG.
+The shared runtime executes the bound Physical DAG. Execution does not lower
+operators again or make new placement decisions.
 
 ```mermaid
 flowchart LR
@@ -147,7 +159,7 @@ An installed query brings together these contracts:
 ```text
 Installed query
   ├── QueryPlanEntry: nodes, dependencies and root
-  ├── Planner-compiled physical computation
+  ├── selected Query Physical DAG
   ├── deployment bindings and source references
   ├── window contract
   └── catalog generation
@@ -292,8 +304,11 @@ operator combination has been tested.
 This design establishes the common execution path:
 
 ```text
-post-ASAP IR → CompiledPhysicalDag → deployment binding
-            → shared DAG runtime → query/precomputation output
+Logical Post-ASAP DAG + Summary Maintenance Lifecycle
+    → Physical DAG candidates
+    → Deployment Plan / DAG
+    → execute bound Physical DAGs
+    → query/precomputation output
 ```
 
 Local raw Scan and universal support for every Planner aggregate or extension
