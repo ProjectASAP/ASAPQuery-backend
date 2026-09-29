@@ -795,6 +795,17 @@ pub fn select_candidates(
             }
         }
     }
+    tracing::debug!(target: "asap_runtime_debug", stage = "deployment.candidate_inventory",
+        candidate_count = candidate_evaluations.len(),
+        search_coverage = ?materialization_search_coverage,
+        "bounded candidate evaluation completed; absence is not a cost rejection");
+    for candidate in &candidate_evaluations {
+        tracing::debug!(target: "asap_runtime_debug", stage = "deployment.candidate_evaluation",
+            candidate_id = ?candidate.candidate_id,
+            physical_candidate_id = ?candidate.physical_candidate_id,
+            status = ?candidate.status, total_cost = candidate.total_cost,
+            reason = ?candidate.unavailable_reason, "candidate evaluated");
+    }
     let selected = asap_physical_operators::physical_planner::select_candidate(
         priced_candidates,
         |(cost, _, manifest, _, _)| {
@@ -817,6 +828,11 @@ pub fn select_candidates(
     })?;
     let (_, mut plan, selected_manifest, component_costs, best_index) = selected.candidate;
     candidate_evaluations[best_index].status = CandidateEvaluationStatus::Selected;
+    tracing::debug!(target: "asap_runtime_debug", stage = "deployment.candidate_selected",
+        plan_id = plan.envelope.plan_id, plan_version = plan.envelope.plan_version,
+        candidate_id = ?candidate_evaluations[best_index].candidate_id,
+        total_cost = candidate_evaluations[best_index].total_cost,
+        "lowest quoted cost selected within the admitted inventory");
     plan.cost_comparison = Some(CandidatePlanSelectionReport {
         planner_selection_trace,
         materialization_search_coverage,

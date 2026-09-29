@@ -141,6 +141,9 @@ impl AggregateCore for NativeSummaryOutput {
 impl SketchStore {
     /// Publish a finalized native result only after the complete raw input
     /// cohort is durable. Existing publication fences prevent duplicate commits.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "sds.publish_native", start_ms = output.start_timestamp,
+            end_ms = output.end_timestamp, max_bytes), err)]
     pub fn publish_native_summary_output(
         &self,
         resolver: &SeriesIdResolver,
@@ -219,6 +222,10 @@ impl SketchStore {
 
     /// Resolve the installed output/group prefix without minting a new handle,
     /// then read exactly the requested immutable window and validate its format.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "sds.read_native", plan_version = address.plan_version,
+            start_ms = address.window.start_ms, end_ms = address.window.end_ms,
+            max_bytes), err)]
     pub fn read_native_summary_output(
         &self,
         resolver: &SeriesIdResolver,
@@ -262,6 +269,8 @@ impl SketchStore {
 
     /// A complete native batch is stored atomically under one global address.
     /// Logical grouping remains in the batch; reads never allocate a resolver ID.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "sds.read_bound_native", plan_version = address.plan_version, stored_output_id = ?reference.stored_output_id, start_ms = address.window.start_ms, end_ms = address.window.end_ms, max_bytes), err)]
     pub fn read_bound_native_summary(
         &self,
         address: &asap_types::sds::StoredSummaryKey,

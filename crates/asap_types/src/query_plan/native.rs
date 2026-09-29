@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 impl QueryPlanEntry {
     /// Invoke during plan compilation, after external/storage boundaries are fixed.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "physical.compile_install", query_id = %self.query_id), err)]
     pub fn compile_relational_physical_dag(&mut self) -> Result<(), QueryPlanError> {
         let Some(expected) = self.relation_output_schema()? else {
             self.physical_dag = None;
@@ -159,6 +161,8 @@ impl QueryPlanEntry {
     }
 
     /// Validate persisted computation and boundary schemas without logical lowering.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "physical.recover_validate", query_id = %self.query_id), err)]
     pub fn recover_relational_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
         let invalid = |message: String| QueryPlanError::Invalid(message);
         let value = self
@@ -265,6 +269,8 @@ impl QueryPlanEntry {
 
     /// Recover an installed population readout; the source binds the complete
     /// maintained vector, while the physical program owns ranking and limiting.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "physical.recover_validate", query_id = %self.query_id, input_kind = "current_series_snapshot"), err)]
     pub fn recover_population_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
         let invalid = |message: &str| QueryPlanError::Invalid(message.into());
         let population = self
@@ -340,6 +346,8 @@ impl QueryPlanEntry {
 
     /// Validate bound counter vectors or stored aggregate batches against the
     /// retained physical program; recovery never lowers logical operators.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "physical.recover_validate", query_id = %self.query_id, input_kind = "bound_native_input"), err)]
     pub fn recover_vector_physical_dag(&self) -> Result<CompiledPhysicalDag, QueryPlanError> {
         let invalid = |message: &str| QueryPlanError::Invalid(message.into());
         let (inputs, source_nodes, max_bytes) = self

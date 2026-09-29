@@ -14,6 +14,8 @@ use planner_types::{
     pre_asap::DataType,
 };
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(stage = "physical.maintenance.execute", query_id = %installed.document.query_id, window_start_ms = window.0, window_end_ms = window.1, max_bytes, input_populations = inputs.len()), err)]
 pub(super) fn execute(
     installed: &InstalledPostAsapDag,
     program: &CompiledPhysicalDag,

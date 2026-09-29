@@ -532,11 +532,15 @@ pub fn gos_policy_from_accuracy_budget(
     })
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(plan_id = envelope.plan_id, plan_version = envelope.plan_version,
+        producer_count = precompute.producers.len()))]
 pub fn build_transmission_plan(
     envelope: PlanEnvelope,
     precompute: &PrecomputePlan,
     runtime_policies: &BTreeMap<asap_types::PolicyFingerprint, RuntimeRulePolicy>,
 ) -> Result<TransmissionPlan, TransmissionPlanError> {
+    tracing::debug!(target: "asap_runtime_debug", "transmission plan construction started");
     if envelope != precompute.envelope {
         return Err(TransmissionPlanError::EnvelopeMismatch);
     }
@@ -1000,6 +1004,9 @@ impl BackendLocalPlanningInput {
                 let asap_aware_mapping::Replacement::Summary(root) = candidate.replacement else {
                     continue;
                 };
+                let _physical = tracing::debug_span!(target: "asap_runtime_debug", "physical_candidate_compile",
+                    stage = "planner.physical_candidate", query_id = %query.query_id,
+                    input_kind = "bound_promql_vector").entered();
                 let root = asap_aware_mapping::replacement::finalize_query_candidate(root, &typed)
                     .map_err(|error| CompileError::Snapshot(error.to_string()))?;
                 let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
@@ -1310,12 +1317,16 @@ impl DeploymentPlanCompiler {
         self.compile_for_frontend(request, environment, QueryFrontend::MetricsQl)
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(frontend = ?frontend, plan_version = environment.plan_version,
+            query_count = request.queries.len()))]
     pub fn compile_for_frontend(
         &self,
         mut request: PhysicalCompilationRequest,
         environment: PhysicalDeploymentContext,
         frontend: QueryFrontend,
     ) -> Result<CompiledPhysicalPlan, CompileError> {
+        tracing::debug!(target: "asap_runtime_debug", stage = "deployment.bind", "backend deployment compiler entered");
         environment
             .dataset_identity
             .validate()
@@ -2730,6 +2741,8 @@ pub fn select_logical_roots_with_error_resource_profiles(
     select_logical_roots_with_trace(queries, roots, evidence, exact_costs, erp).map(|_| ())
 }
 
+#[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+    fields(query_count = queries.len(), root_count = roots.len()))]
 pub fn select_logical_roots_with_trace(
     queries: &mut [QueryCompilationInput],
     roots: Vec<Rc<QueryExpr>>,
@@ -2779,6 +2792,7 @@ fn logical_roots_and_candidates(
     now_ms: u64,
     mut candidates_out: Option<&mut Vec<Vec<(usize, Rc<SummaryNode>)>>>,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
+    tracing::debug!(target: "asap_runtime_debug", stage = "planner.select", "Planner selection entered");
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(

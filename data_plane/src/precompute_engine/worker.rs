@@ -335,8 +335,11 @@ impl Worker {
                 } => {
                     let sample_count = samples.len();
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_group",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         sid,
                         policy_fp = %policy_fp,
                         group = %group_key,
@@ -346,12 +349,13 @@ impl Worker {
                     if let Err(e) = self.process_group_samples(sid, policy_fp, &group_key, samples)
                     {
                         processing_error = Some(e.to_string());
-                        warn!(
-                            "Worker {} error processing sid={} (policy_fp={}, group={}): {}",
-                            self.id, sid, policy_fp, group_key, e
-                        );
+                        warn!(worker_id = self.id, sid, policy_fp = %policy_fp,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker group processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete"
                     );
@@ -362,17 +366,24 @@ impl Worker {
                     ingest_received_at,
                 } => {
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_raw",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         series = %series_key,
                         sample_count = samples.len(),
                     )
                     .entered();
                     if let Err(e) = self.process_samples_raw(&series_key, samples) {
                         processing_error = Some(e.to_string());
-                        warn!("Worker {} raw error for {}: {}", self.id, series_key, e);
+                        warn!(worker_id = self.id, series = %series_key,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker raw processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete (raw)"
                     );
@@ -386,8 +397,11 @@ impl Worker {
                     ingest_received_at,
                 } => {
                     let _span = debug_span!(
+                        target: "asap_runtime_debug",
                         "worker_process_accumulator",
                         worker_id = self.id,
+                        plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                        plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
                         sid,
                         policy_fp = %policy_fp,
                         group = %group_key,
@@ -403,12 +417,13 @@ impl Worker {
                         accumulator,
                     ) {
                         processing_error = Some(e.to_string());
-                        warn!(
-                            "Worker {} accumulator input error for sid={} (policy_fp={}, group={}): {}",
-                            self.id, sid, policy_fp, group_key, e
-                        );
+                        warn!(worker_id = self.id, sid, policy_fp = %policy_fp,
+                            plan_id = ?self.current_catalog_generation.as_ref().map(|g| g.plan_id),
+                            plan_version = ?self.current_catalog_generation.as_ref().map(|g| g.plan_version),
+                            error = %e, "worker accumulator processing failed");
                     }
                     debug!(
+                        target: "asap_runtime_debug",
                         e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
                         "e2e: ingest->worker complete (accumulator)"
                     );
@@ -528,6 +543,8 @@ impl Worker {
     /// `PrecomputeMaterialization` fingerprint used to resolve the bucket's
     /// config on first sight; `group_key` is held on the resulting
     /// `GroupState` for emit-time label rendering.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sid, policy_fp = %policy_fp, sample_count = samples.len()))]
     pub fn process_group_samples(
         &mut self,
         sid: u64,
@@ -535,6 +552,7 @@ impl Worker {
         group_key: &Arc<GroupKey>,
         samples: Vec<(String, i64, f64)>, // (series_key, timestamp_ms, value)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker group processing started");
         let input_revision = self.current_input_revision.clone();
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
@@ -552,6 +570,8 @@ impl Worker {
             return Ok(());
         }
         let state = self.group_states.get_mut(&sid).unwrap();
+        tracing::debug!(target: "asap_runtime_debug", worker_id = self.id, policy_fp = %policy_fp,
+            "precompute update route resolved");
         #[cfg(not(test))]
         if state.program.is_none() {
             return Err("raw precompute requires an installed post-ASAP DAG producer".into());
@@ -851,6 +871,8 @@ impl Worker {
     ///
     /// `policy_fp` / `group_key` carry the same semantics as on
     /// `process_group_samples` — policy lookup + emit-time label rendering.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sid, policy_fp = %policy_fp, timestamp_ms))]
     pub fn process_accumulator_input(
         &mut self,
         sid: u64,
@@ -859,6 +881,7 @@ impl Worker {
         timestamp_ms: i64,
         incoming: Box<dyn AggregateCore>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker accumulator processing started");
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
         let late_data_policy = self.late_data_policy;
@@ -877,6 +900,10 @@ impl Worker {
         let state = self.group_states.get_mut(&sid).unwrap();
 
         let previous_event_time = state.max_event_time_ms;
+        debug!(target: "asap_runtime_debug", aggregation_type = ?state.config.aggregation_type,
+            window_secs = state.config.window_size, slide_secs = state.config.slide_interval,
+            layout = ?state.config.window_layout,
+            "worker accumulator maintenance configuration selected");
         let current_event_time = if timestamp_ms > previous_event_time {
             timestamp_ms
         } else {
@@ -1021,11 +1048,14 @@ impl Worker {
     }
 
     /// Raw fast-path: emit each sample as a standalone `SumAccumulator`.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, sample_count = samples.len()))]
     pub fn process_samples_raw(
         &self,
         series_key: &str,
         samples: Vec<(i64, f64)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker raw processing started");
         let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> =
             Vec::with_capacity(samples.len());
 
@@ -1097,7 +1127,10 @@ impl Worker {
         }
     }
 
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(worker_id = self.id, group_count = self.group_states.len()))]
     fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(target: "asap_runtime_debug", "worker flush started");
         if self.pass_raw_samples {
             return Ok(());
         }

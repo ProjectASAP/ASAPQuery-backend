@@ -237,6 +237,11 @@ impl QueryExecutionContext<'_> {
     /// Resolve exactly one compiler-bound materialization. This is the formal
     /// QueryPlan path: the validated stored output resolves to its definition's
     /// generation-scoped SID index. Metadata checks never broaden that set.
+    #[tracing::instrument(level = "debug", target = "asap_runtime_debug", skip_all,
+        fields(stage = "sds.bound_read",
+            stored_output_id = binding.stored_output_reference.stored_output_id.as_u64(),
+            definition_id = ?binding.stored_output_reference.definition_id,
+            window_start_ms = self.t0_ms, window_end_ms = self.t1_ms), err(Debug, level = "debug"))]
     pub fn read_bound_materialization(
         &self,
         binding: &asap_types::query_plan::MaterializationBinding,
@@ -275,6 +280,9 @@ impl QueryExecutionContext<'_> {
             ));
         }
 
+        tracing::debug!(target: "asap_runtime_debug", stage = "sds.validate_binding",
+            plan_id = catalog.plan_id, plan_version = catalog.plan_version,
+            "installed output and semantic identity validated");
         let inventory_revision = self.index.summary_update_revision();
         let query_range = asap_types::sds::HalfOpenTimeRange {
             start_ms: i64::try_from(self.t0_ms).map_err(|_| {
@@ -342,6 +350,8 @@ impl QueryExecutionContext<'_> {
             .storage_handles_for_output(&binding.stored_output_reference);
         sids.sort_unstable();
         sids.dedup();
+        tracing::debug!(target: "asap_runtime_debug", stage = "sds.locate_records",
+            storage_handle_count = sids.len(), "bound output lookup completed");
         let mut matched_metadata = 0usize;
         let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> = BTreeMap::new();
         let mut source_order = BTreeMap::new();
@@ -545,6 +555,9 @@ impl QueryExecutionContext<'_> {
                 "summary input changed during read",
             ));
         }
+        tracing::debug!(target: "asap_runtime_debug", stage = "sds.validate_records",
+            group_count = result.len(),
+            "state format, applicable coverage and stable revision checks completed");
         Ok(result)
     }
 
