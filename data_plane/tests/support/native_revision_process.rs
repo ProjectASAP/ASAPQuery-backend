@@ -76,10 +76,12 @@ async fn run_native_ensemble(family: Option<&str>, cadence_ms: u64, phase_ms: u6
         .into_physical_compilation_request()
         .unwrap();
     let preferred = |plan: &control_plane::physical::compiler::CompiledPhysicalPlan| {
+        // Raw outputs also carry Planner programs; the ensemble needs a derived one.
         plan.precompute_plan.executable_dags.values().any(|dag| {
-            dag.native_programs
-                .values()
-                .any(|program| family.is_none_or(|family| program.to_string().contains(family)))
+            dag.native_programs.iter().any(|(sink, program)| {
+                !dag.reads_raw_samples(*sink)
+                    && family.is_none_or(|family| program.to_string().contains(family))
+            })
         }) && plan.query_plan.entries.values().all(|entry| {
             !entry.nodes.values().any(|node| {
                 matches!(

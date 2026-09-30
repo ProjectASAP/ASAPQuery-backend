@@ -215,6 +215,10 @@ pub fn manifest(
                 .iter()
                 .find(|m| m.policy_fingerprint() == stored_output.fingerprint())
                 .ok_or_else(|| invalid("native maintenance config is absent"))?;
+            // Raw ingest programs are priced by their stored state components.
+            if config.derived_input.is_none() {
+                continue;
+            }
             add(
                 format!("maintenance:{}", stored_output.0),
                 json!({"physical_program":program,"stored_output":stored_output,"window_ms":config.stored_window_ms(),"interval_ms":config.slide_interval.saturating_mul(1000)}),

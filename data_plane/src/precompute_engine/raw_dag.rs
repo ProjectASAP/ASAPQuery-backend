@@ -1,6 +1,15 @@
 //! Bind raw ingestion to a selected Planner producer and its raw dependency edge.
-use crate::storage_engines::types::KeyByLabelValues;
+//! The backend supplies one typed sample batch per pane; the Planner-compiled
+//! precompute graph owns every update, grouping and item computation.
+use crate::storage_engines::types::{AggregateCore, KeyByLabelValues};
+use asap_physical_operators::{
+    operators::Operator,
+    physical_planner::{precompute, CompiledPhysicalDag, Source as PhysicalSource},
+    runtime::{Limits, RunContext, Scope},
+    values::{Batch, Value},
+};
 use asap_summary_state::factory::{create_planner_accumulator, AccumulatorUpdater};
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::{executable_plan::BackendNodeBinding, PrecomputeMaterialization};
 use planner_types::post_asap::{
     EdgeRole, GroupingStrategy, PostAsapNodeId, PostAsapOperatorPayload, SummaryFamilyType,
@@ -19,6 +28,10 @@ pub struct RawDagProgram {
     pub grouping: GroupingStrategy,
     pub reduction: planner_types::pre_asap::Reduction,
     projected_column: Option<String>,
+    /// Planner's encoded precompute graph from the raw sample boundary to this
+    /// output. Decoded graphs are not `Send`, so each execution decodes it.
+    program: std::sync::Arc<[u8]>,
+    source: u64,
 }
 
 impl RawDagProgram {
@@ -164,7 +177,21 @@ impl RawDagProgram {
                 if !update_matches {
                     return Err("DAG update differs from stored summary identity".into());
                 }
+                let compiled = installed
+                    .native_program(node.id)?
+                    .ok_or("raw materialization lacks its Planner precompute graph")?;
+                let [(source, contract)] = compiled.input_contracts().collect::<Vec<_>>()[..]
+                else {
+                    return Err("raw precompute graph must read one raw sample input".into());
+                };
+                if contract.schema != precompute::raw_sample_schema()
+                    || source != u64::from(edge.producer.0)
+                {
+                    return Err("raw precompute graph does not read the bound raw source".into());
+                }
                 let program = Self {
+                    source,
+                    program: compiled.encode().map_err(|e| e.to_string())?.into(),
                     node: node.id,
                     family: family.clone(),
                     input: input.clone(),
@@ -193,6 +220,83 @@ impl RawDagProgram {
             }
         }
         selected.ok_or_else(|| "raw materialization has no selected post-ASAP DAG producer".into())
+    }
+
+    /// Execute the Planner graph over one pane's samples as one typed batch.
+    /// Returns `None` when the graph admits no population from them.
+    pub fn build<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+        pane: (i64, i64),
+        max_bytes: usize,
+    ) -> Result<Option<Box<dyn AggregateCore>>, String> {
+        use futures::StreamExt;
+        let samples = pane_batch(samples);
+        // Stored heap readout decodes only the backend heap kernel, not
+        // Planner's weighted frequency state, so heaps stay on that kernel.
+        if matches!(&self.family, SummaryFamilyType::Sketch(kind, _) if matches!(
+            kind.algorithm(),
+            planner_types::post_asap::SketchAlgorithm::CmsWithHeap
+                | planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap
+        )) {
+            let mut updater = self.updater()?;
+            for (series, time, value) in samples {
+                self.apply(&mut *updater, series, value, time)?;
+            }
+            return Ok(Some(updater.take_accumulator()));
+        }
+        let schema = precompute::raw_sample_schema();
+        let rows = samples
+            .into_iter()
+            .map(|(series, time, value)| {
+                precompute::raw_sample_row(&series_labels(series), time, value)
+            })
+            .collect();
+        let batch = Batch::try_new(schema.clone(), rows).map_err(|e| e.to_string())?;
+        let sources = std::collections::BTreeMap::from([(
+            self.source,
+            Box::new(Operator::source(schema, vec![batch]).map_err(|e| e.to_string())?)
+                as PhysicalSource<'_>,
+        )]);
+        let program = decoded(&self.program)?;
+        let graph = program.instantiate(sources).map_err(|e| e.to_string())?;
+        let context = RunContext::new(
+            Scope::Ingestion {
+                window_start_ms: pane.0,
+                window_end_ms: pane.1,
+                revision: 0,
+            },
+            Limits {
+                max_bytes,
+                ..Limits::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let rows = futures::executor::block_on(async {
+            let mut stream = graph.execute(program.roots(), context)?.pop().ok_or(
+                asap_physical_operators::Error::Invalid("missing output".into()),
+            )?;
+            let mut rows = Vec::new();
+            while let Some(batch) = stream.next().await {
+                rows.extend(batch?.rows().iter().cloned());
+            }
+            Ok::<_, asap_physical_operators::Error>(rows)
+        })
+        .map_err(|e| e.to_string())?;
+        // The router assigns one population per group, so one pane yields
+        // at most one state.
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => match row.as_slice() {
+                [_, _, Value::Summary { state, .. }] => {
+                    asap_summary_state::physical::from_physical(state.as_ref())
+                        .map(Some)
+                        .map_err(|e| e.to_string())
+                }
+                _ => Err("raw precompute output is not a population state".into()),
+            },
+            _ => Err("one routed group produced several populations".into()),
+        }
     }
 
     pub fn updater(&self) -> Result<Box<dyn AccumulatorUpdater>, String> {
@@ -288,4 +392,60 @@ impl RawDagProgram {
         }
         Ok(())
     }
+}
+
+/// The complete label set of a canonical series key, including `__name__`.
+pub(crate) fn series_labels(series: &str) -> std::collections::BTreeMap<String, String> {
+    let mut labels: std::collections::BTreeMap<_, _> =
+        super::worker::parse_labels_from_series_key(series)
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_owned(),
+                    super::worker::decode_label_value(v).into_owned(),
+                )
+            })
+            .collect();
+    let metric = series.split('{').next().unwrap_or_default();
+    if !metric.is_empty() {
+        labels.insert("__name__".into(), metric.to_owned());
+    }
+    labels
+}
+
+/// A pane's samples as ingestion delivers them to Planner: in timestamp
+/// order (stable for equal times), with one sample per series and timestamp;
+/// a repeated `(series, timestamp)` is the same sample, so the first is kept.
+fn pane_batch<'a>(
+    samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+) -> Vec<(&'a str, i64, f64)> {
+    let mut samples = samples.into_iter().collect::<Vec<_>>();
+    samples.sort_by_key(|(_, time, _)| *time);
+    let mut seen = std::collections::HashSet::new();
+    samples.retain(|(series, time, _)| seen.insert((*series, *time)));
+    samples
+}
+
+/// Decoded graphs are not `Send`, so each thread decodes an installed graph
+/// once. Holding the encoded bytes keeps their address from being reused.
+fn decoded(encoded: &std::sync::Arc<[u8]>) -> Result<std::rc::Rc<CompiledPhysicalDag>, String> {
+    type Cache =
+        std::collections::HashMap<usize, (std::sync::Arc<[u8]>, std::rc::Rc<CompiledPhysicalDag>)>;
+    thread_local! {
+        static DECODED: std::cell::RefCell<Cache> = Default::default();
+    }
+    DECODED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = encoded.as_ptr() as usize;
+        if let Some((_, program)) = cache.get(&key) {
+            return Ok(program.clone());
+        }
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        let program =
+            std::rc::Rc::new(CompiledPhysicalDag::decode(encoded).map_err(|e| e.to_string())?);
+        cache.insert(key, (encoded.clone(), program.clone()));
+        Ok(program)
+    })
 }
