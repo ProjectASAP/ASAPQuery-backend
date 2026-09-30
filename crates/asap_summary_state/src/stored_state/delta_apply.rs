@@ -212,12 +212,19 @@ fn decode_full(
             use crate::summary_kernels::weighted_frequency::FrequencyAlgorithm;
             let kernel = asap_sketchlib::WeightedFrequency::from_bytes(bytes)
                 .map_err(|e| format!("deserialize weighted frequency: {e:?}"))?;
-            let expected = match kind {
-                DeltaSketchKind::CmsWithHeap { .. } => FrequencyAlgorithm::Cms,
-                _ => FrequencyAlgorithm::CountSketch,
+            let (expected, rows, cols) = match kind {
+                DeltaSketchKind::CmsWithHeap { rows, cols, .. } => {
+                    (FrequencyAlgorithm::Cms, *rows, *cols)
+                }
+                DeltaSketchKind::CountSketchWithHeap { rows, cols, .. } => {
+                    (FrequencyAlgorithm::CountSketch, *rows, *cols)
+                }
+                _ => unreachable!("matched heap kinds"),
             };
-            if kernel.algorithm() != expected {
-                return Err("weighted frequency algorithm differs from installed catalog".into());
+            // The catalog's heap size is not carried here; matrix shape is.
+            let (width, depth, _) = kernel.shape();
+            if kernel.algorithm() != expected || (width, depth) != (cols, rows) {
+                return Err("weighted frequency shape differs from installed catalog".into());
             }
             Ok(SummaryState::WeightedFrequency(
                 rmp_serde::from_slice(&rmp_serde::to_vec(&kernel).map_err(|e| e.to_string())?)
@@ -229,7 +236,8 @@ fn decode_full(
 }
 
 /// Render a ranked heap item as the legacy heap key: item parts joined by
-/// `;`, with a canonical label-set identity shown as its series key.
+/// `;`, with a canonical series identity (it names `__name__`) shown as its
+/// series key.
 fn heap_item_key(items: &[asap_physical_operators::values::Value]) -> String {
     use asap_physical_operators::values::Value;
     items
@@ -237,9 +245,12 @@ fn heap_item_key(items: &[asap_physical_operators::values::Value]) -> String {
         .map(|item| match item {
             Value::Utf8(text) => {
                 asap_physical_operators::physical_planner::promql_rows::decode_series_identity(text)
+                    .ok()
+                    .filter(|labels| labels.contains_key("__name__"))
                     .map(|labels| series_key(&labels))
-                    .unwrap_or_else(|_| text.to_string())
+                    .unwrap_or_else(|| text.to_string())
             }
+            Value::Null => String::new(),
             Value::Float64(value) => value.to_string(),
             Value::Int64(value) => value.to_string(),
             Value::Bool(value) => value.to_string(),
@@ -848,7 +859,7 @@ mod tests {
     //! got wrong — fails the build.
     use super::*;
 
-    // A stored Planner heap window decodes for its catalog family only, merges
+    // A stored Planner heap window decodes only for its catalog family and shape, merges
     // with another window, and ranks items under their series keys.
     #[test]
     fn weighted_frequency_frames_rank_items_by_series_key() {
@@ -894,6 +905,12 @@ mod tests {
             heap_size: 8,
         };
         assert!(cumulative_summary_state(&[(1000, &first)], other).is_err());
+        let narrower = DeltaSketchKind::CmsWithHeap {
+            rows: 3,
+            cols: 32,
+            heap_size: 8,
+        };
+        assert!(cumulative_summary_state(&[(1000, &first)], narrower).is_err());
     }
     use asap_sketchlib::HllVariant;
 

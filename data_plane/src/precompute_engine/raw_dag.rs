@@ -192,6 +192,22 @@ impl RawDagProgram {
                 {
                     return Err("raw precompute graph does not read the bound raw source".into());
                 }
+                // Stored heap readout renders identity items as whole series
+                // keys; one that omits labels would not name its series.
+                fn partial_identity(expr: &SummaryInputExpr) -> bool {
+                    match expr {
+                        SummaryInputExpr::EntityIdentity(
+                            planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
+                        ) => !excluding.is_empty(),
+                        SummaryInputExpr::Tuple(items) => items.iter().any(partial_identity),
+                        _ => false,
+                    }
+                }
+                if input.item.as_ref().is_some_and(partial_identity) {
+                    return Err(
+                        "raw heap items that exclude identity labels are not readable".into(),
+                    );
+                }
                 let program = Self {
                     source,
                     program: compiled.encode().map_err(|e| e.to_string())?.into(),
@@ -261,8 +277,38 @@ impl RawDagProgram {
         self.execute(samples, bounds, max_bytes).map(|_| ())
     }
 
-    /// The family's empty state, for a pane known to have no samples.
+    /// The family's empty state, for a pane known to have no samples. Heaps
+    /// are Planner weighted-frequency states, as `build` produces.
     pub fn empty_state(&self) -> Result<Box<dyn AggregateCore>, String> {
+        use asap_summary_state::summary_kernels::weighted_frequency::{
+            FrequencyAlgorithm, PhysicalWeightedFrequency, WeightedFrequency,
+        };
+        use planner_types::post_asap::SketchParams;
+        if let SummaryFamilyType::Sketch(kind, _) = &self.family {
+            let heap = match kind.params() {
+                SketchParams::CmsWithHeap {
+                    width,
+                    depth,
+                    heap_size,
+                } => Some((FrequencyAlgorithm::Cms, width, depth, heap_size)),
+                SketchParams::CountSketchWithHeap {
+                    width,
+                    depth,
+                    heap_size,
+                } => Some((FrequencyAlgorithm::CountSketch, width, depth, heap_size)),
+                _ => None,
+            };
+            if let Some((algorithm, width, depth, heap_size)) = heap {
+                let state = PhysicalWeightedFrequency::new(
+                    algorithm,
+                    *width as usize,
+                    *depth as usize,
+                    *heap_size as usize,
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok(Box::new(WeightedFrequency(state)));
+            }
+        }
         Ok(
             create_planner_accumulator(&self.family, &self.input, &self.grouping)?
                 .take_accumulator(),
@@ -370,4 +416,42 @@ fn decoded(encoded: &std::sync::Arc<[u8]>) -> Result<std::rc::Rc<CompiledPhysica
         cache.insert(key, (encoded.clone(), program.clone()));
         Ok(program)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A heap output's empty state is the Planner heap state that `build`
+    // produces, so it binds as a physical input and stores as a heap frame.
+    #[test]
+    fn heap_empty_state_is_a_planner_heap_frame() {
+        use planner_types::post_asap::{SketchAlgorithm, SketchKind, SketchParams};
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(
+                SketchAlgorithm::CmsWithHeap,
+                SketchParams::CmsWithHeap {
+                    width: 64,
+                    depth: 3,
+                    heap_size: 8,
+                },
+            ),
+            GroupingStrategy::PerSubpopulationInstance,
+        );
+        let program = RawDagProgram {
+            node: PostAsapNodeId(1),
+            family,
+            input: SummaryUpdate::column(ColumnRef::SampleValue),
+            grouping: GroupingStrategy::PerSubpopulationInstance,
+            reduction: planner_types::pre_asap::Reduction::PerEntity,
+            program: std::sync::Arc::from(Vec::new()),
+            source: 0,
+        };
+        let empty = program.empty_state().unwrap();
+        assert!(asap_summary_state::physical::to_physical(empty.as_ref()).is_ok());
+        assert_eq!(
+            asap_summary_state::stored_state::SketchEncoding::full_frame_for(empty.as_ref()),
+            asap_summary_state::stored_state::SketchEncoding::WeightedFrequencyV1
+        );
+    }
 }

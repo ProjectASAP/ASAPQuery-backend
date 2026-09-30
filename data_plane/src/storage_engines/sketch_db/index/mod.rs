@@ -1915,10 +1915,7 @@ impl SketchStore {
                             let Some(s) = payload.as_sketch() else {
                                 continue;
                             };
-                            if !matches!(
-                                s.encoding,
-                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                            ) {
+                            if !s.encoding.is_full() {
                                 continue;
                             }
                             let w_end = win.1 as i64;
@@ -2128,13 +2125,7 @@ impl SketchStore {
                     })
                     .unwrap_or(false);
                 let has_base_before = samples.iter().any(|(w_end, frames)| {
-                    *w_end < start_unix_ms as i64
-                        && frames.iter().any(|s| {
-                            matches!(
-                                s.encoding,
-                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                            )
-                        })
+                    *w_end < start_unix_ms as i64 && frames.iter().any(|s| s.encoding.is_full())
                 });
                 earliest_is_delta && !has_base_before
             })
@@ -2161,10 +2152,7 @@ impl SketchStore {
                     continue;
                 };
                 let encoding = tag_to_encoding(entry.encoding_tag);
-                if !matches!(
-                    encoding,
-                    SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                ) {
+                if !encoding.is_full() {
                     continue;
                 }
                 let label_map = Self::rebuild_label_map(&keys, &entry.label);
@@ -3411,14 +3399,7 @@ impl SketchStore {
                 window,
                 SketchSampleState {
                     bytes: accumulator.serialize_to_bytes(),
-                    // Planner heap states are not legacy msgpack heap frames.
-                    encoding: if accumulator.as_any().is::<
-                        asap_summary_state::summary_kernels::weighted_frequency::WeightedFrequency,
-                    >() {
-                        SketchEncoding::WeightedFrequencyV1
-                    } else {
-                        SketchEncoding::MsgpackFull
-                    },
+                    encoding: SketchEncoding::full_frame_for(accumulator),
                 },
             ),
             AggKind::ExactAgg { .. } => self.append_precompute_with_binding(
@@ -6936,7 +6917,7 @@ impl SketchStore {
                         (record.start_ms, record.end_ms),
                         SketchSampleState {
                             bytes: state.serialize_to_bytes(),
-                            encoding: SketchEncoding::MsgpackFull,
+                            encoding: SketchEncoding::full_frame_for(state.as_ref()),
                         },
                     ),
                     AggKind::ExactAgg { .. } => view.append_precompute_with_binding(
