@@ -1596,13 +1596,15 @@ fn build_pane(
     pane: (i64, i64),
 ) -> Result<Option<Box<dyn AggregateCore>>, String> {
     if let Some(program) = program {
-        return program.build(
-            samples
-                .iter()
-                .map(|(series, time, value)| (series.as_ref(), *time, *value)),
-            pane,
-            asap_physical_operators::runtime::Limits::default().max_bytes,
-        );
+        return program
+            .build(
+                samples
+                    .iter()
+                    .map(|(series, time, value)| (series.as_ref(), *time, *value)),
+                pane,
+                asap_physical_operators::runtime::Limits::default().max_bytes,
+            )
+            .map_err(|e| e.to_string());
     }
     #[cfg(test)]
     {
@@ -5032,7 +5034,8 @@ mod dag_execution_tests {
         }
     }
 
-    // Revision admission checks samples with the installed Planner graph.
+    // Revision admission checks samples with the installed Planner graph, and
+    // keeps a Planner memory limit distinguishable from invalid input.
     #[test]
     fn admission_validates_with_the_planner_graph() {
         let plan = plan("sum_over_time(asap_demo_gauge[5s])");
@@ -5045,9 +5048,21 @@ mod dag_execution_tests {
         assert!(program
             .validate([(series, 1000, 1.0), (series, 2000, 2.0)], 1 << 20)
             .is_ok());
-        assert!(program
+        let rejected = program
             .validate([(series, 1000, f64::INFINITY)], 1 << 20)
-            .is_err());
+            .unwrap_err();
+        assert!(!matches!(
+            rejected.downcast_ref::<asap_physical_operators::Error>(),
+            Some(asap_physical_operators::Error::MemoryLimit)
+        ));
+        // A resource limit stays typed, so admission does not report it as bad input.
+        let limited = program
+            .validate((0..64).map(|t| (series, t * 10, 1.0)), 1)
+            .unwrap_err();
+        assert!(matches!(
+            limited.downcast_ref::<asap_physical_operators::Error>(),
+            Some(asap_physical_operators::Error::MemoryLimit)
+        ));
     }
 
     // A raw output installs only with its Planner-compiled precompute graph.

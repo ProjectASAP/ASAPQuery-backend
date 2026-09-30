@@ -18,6 +18,10 @@ use planner_types::post_asap::{
 use planner_types::pre_asap::{ColumnRef, QueryExpr, Source};
 use std::collections::HashMap;
 
+/// Planner execution errors keep their type (e.g. `MemoryLimit`); setup and
+/// binding failures are messages.
+pub type BuildError = Box<dyn std::error::Error + Send + Sync>;
+
 /// A validated executable projection; semantics come from the installed node.
 /// The retained node ID makes failures attributable to the selected DAG.
 #[derive(Debug, Clone)]
@@ -197,6 +201,9 @@ impl RawDagProgram {
                     grouping: grouping.clone(),
                     reduction: reduction.clone(),
                 };
+                if program.heap() {
+                    program.validate_heap_update()?;
+                }
                 if let Some(old) = &selected {
                     if old.family != program.family
                         || old.input != program.input
@@ -233,7 +240,7 @@ impl RawDagProgram {
         samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
         pane: (i64, i64),
         max_bytes: usize,
-    ) -> Result<Option<Box<dyn AggregateCore>>, String> {
+    ) -> Result<Option<Box<dyn AggregateCore>>, BuildError> {
         let samples = pane_batch(samples);
         if self.heap() {
             let mut updater = self.heap_updater()?;
@@ -247,11 +254,9 @@ impl RawDagProgram {
         match self.execute(samples, pane, max_bytes)?.as_slice() {
             [] => Ok(None),
             [row] => match row.as_slice() {
-                [_, _, Value::Summary { state, .. }] => {
-                    asap_summary_state::physical::from_physical(state.as_ref())
-                        .map(Some)
-                        .map_err(|e| e.to_string())
-                }
+                [_, _, Value::Summary { state, .. }] => Ok(Some(
+                    asap_summary_state::physical::from_physical(state.as_ref())?,
+                )),
                 _ => Err("raw precompute output is not a population state".into()),
             },
             _ => Err("one routed group produced several populations".into()),
@@ -263,7 +268,7 @@ impl RawDagProgram {
         &self,
         samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
         max_bytes: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), BuildError> {
         let samples = pane_batch(samples);
         if self.heap() {
             let updater = self.heap_updater()?;
@@ -293,7 +298,7 @@ impl RawDagProgram {
         samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
         pane: (i64, i64),
         max_bytes: usize,
-    ) -> Result<Vec<Vec<Value>>, String> {
+    ) -> Result<Vec<Vec<Value>>, BuildError> {
         use futures::StreamExt;
         let schema = precompute::raw_sample_schema();
         let rows = samples
@@ -322,7 +327,7 @@ impl RawDagProgram {
             },
         )
         .map_err(|e| e.to_string())?;
-        futures::executor::block_on(async {
+        Ok(futures::executor::block_on(async {
             let mut stream = graph.execute(program.roots(), context)?.pop().ok_or(
                 asap_physical_operators::Error::Invalid("missing output".into()),
             )?;
@@ -331,8 +336,31 @@ impl RawDagProgram {
                 rows.extend(batch?.rows().iter().cloned());
             }
             Ok::<_, asap_physical_operators::Error>(rows)
-        })
-        .map_err(|e| e.to_string())
+        })?)
+    }
+
+    /// Heaps still use the kernel interpreter, so install only updates it evaluates.
+    fn validate_heap_update(&self) -> Result<(), String> {
+        if !matches!(
+            &self.input.weight,
+            SummaryInputExpr::Column(ColumnRef::SampleValue) | SummaryInputExpr::Constant(_)
+        ) {
+            return Err("raw heap weight expression is unsupported".into());
+        }
+        fn item(expr: &SummaryInputExpr) -> bool {
+            match expr {
+                SummaryInputExpr::Column(ColumnRef::Named(_) | ColumnRef::SampleValue) => true,
+                SummaryInputExpr::Tuple(items) => items.iter().all(item),
+                SummaryInputExpr::EntityIdentity(
+                    planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
+                ) => excluding.is_empty(),
+                _ => false,
+            }
+        }
+        if !self.input.item.as_ref().is_some_and(item) {
+            return Err("raw heap item expression is unsupported".into());
+        }
+        self.heap_updater().map(|_| ())
     }
 
     fn heap_updater(&self) -> Result<Box<dyn AccumulatorUpdater>, String> {

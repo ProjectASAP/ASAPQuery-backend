@@ -1736,7 +1736,7 @@ impl PrometheusRemoteWriteReceiver {
         now_ms: u64,
     ) -> Result<u64, crate::precompute_engine::revisions::RevisionError> {
         use crate::precompute_engine::revisions::{encode_state, InputSample, RevisionRecord};
-        use crate::precompute_engine::{raw_dag::RawDagProgram, window_manager::WindowManager};
+        use crate::precompute_engine::window_manager::WindowManager;
         use asap_types::sds::StoredOutputId;
         let (plan, store) = runtime.installed()?;
         let generation = plan
@@ -1825,15 +1825,21 @@ impl PrometheusRemoteWriteReceiver {
             }
             for config in plan.precompute_plan.materializations.iter().filter(|c| c.derived_input.is_none()) {
                 let filter = compile_spatial_filter(&config.spatial_filter_normalized)?;
-                let program = RawDagProgram::from_plan(&plan.precompute_plan, config)?;
+                let program = plan.installed_precompute_plan.raw_programs.get(&config.policy_fp_u64()).ok_or("revision raw program missing")?;
                 let mut matching = samples.iter().filter_map(|sample| {
                     let labels = sample.labels.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
                     (sample.metric == config.metric && filter.matches(&labels)).then_some(())?;
                     Some((sample.series.as_str(), sample.timestamp_ms, sample.value?))
                 }).collect::<Vec<_>>();
                 matching.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-                // Reject the whole request when the Planner graph cannot admit it.
-                program.validate(matching, runtime.policy.max_checkpoint_bytes).map_err(|_| crate::precompute_engine::revisions::AdmissionRejected("sample is outside the bound summary kernel's input domain"))?;
+                // Reject the whole request when the Planner graph cannot admit its
+                // values; resource and setup failures are not input errors.
+                if let Err(error) = program.validate(matching, runtime.policy.max_checkpoint_bytes) {
+                    return Err(match error.downcast_ref::<asap_physical_operators::Error>() {
+                        Some(asap_physical_operators::Error::MemoryLimit) | None => error,
+                        Some(_) => crate::precompute_engine::revisions::AdmissionRejected("sample is outside the bound summary kernel's input domain").into(),
+                    });
+                }
             }
             Ok(())
         }, |inputs, revision, captured_at_ms, admitted, publish| {
@@ -1855,19 +1861,18 @@ impl PrometheusRemoteWriteReceiver {
                 let WorkerMessage::GroupSamples { sid, policy_fp, group_key, mut samples, .. } = message else { return Err("revision routing returned non-sample input".into()); };
                 let config = plan.precompute_plan.materializations.iter().find(|c| c.policy_fingerprint() == policy_fp).ok_or("revision raw configuration missing")?;
                 if committed.contains_key(&policy_fp.0) { continue; }
-                let program = RawDagProgram::from_plan(&plan.precompute_plan, config)?;
+                let program = plan.installed_precompute_plan.raw_programs.get(&config.policy_fp_u64()).ok_or("revision raw program missing")?;
                 let manager = WindowManager::with_layout(config.window_size, config.slide_interval, config.pane_origin_ms, &config.window_layout);
                 // Each stored window's admitted samples, built by the Planner graph below.
-                let mut windows: BTreeMap<(u64,u64), Vec<(String,i64,f64)>> = BTreeMap::new();
-                let mut buffered = 0usize;
+                // Overlapping windows share each sample's series key.
+                let mut windows: BTreeMap<(u64,u64), Vec<(Arc<str>,i64,f64)>> = BTreeMap::new();
                 samples.sort_by(|a,b| (&a.0,a.1).cmp(&(&b.0,b.1)));
                 for (series,time,value) in samples {
+                    let series: Arc<str> = Arc::from(series);
                     for start in manager.stored_bucket_starts(time) {
                         let (start,end) = manager.stored_bucket_bounds(start);
                         if start < 0 || end < 0 || end as u64 > captured_at_ms || (start as u64) < captured_at_ms.saturating_sub(retain.saturating_sub(max_window)) { continue; }
-                        buffered = buffered.saturating_add(series.len() + std::mem::size_of::<(String,i64,f64)>());
-                        if buffered > runtime.policy.max_checkpoint_bytes { return Err(Box::new(asap_physical_operators::Error::MemoryLimit)); }
-                        windows.entry((start as u64,end as u64)).or_default().push((series.clone(), time, value));
+                        windows.entry((start as u64,end as u64)).or_default().push((Arc::clone(&series), time, value));
                     }
                 }
                 // This captured revision contains every accepted local input.
@@ -1896,14 +1901,13 @@ impl PrometheusRemoteWriteReceiver {
                 for (window, samples) in windows {
                     let state = if samples.is_empty() {
                         // A known-empty counter pane of this captured revision.
-                        Some(program.empty_state()?)
+                        program.empty_state()?
                     } else {
                         let bounds = (i64::try_from(window.0)?, i64::try_from(window.1)?);
-                        program.build(samples.iter().map(|(s,t,v)|(s.as_str(),*t,*v)), bounds, runtime.policy.max_checkpoint_bytes)?
+                        program.build(samples.iter().map(|(s,t,v)|(s.as_ref(),*t,*v)), bounds, runtime.policy.max_checkpoint_bytes)?
+                            .ok_or("revision window admitted no population")?
                     };
-                    if let Some(state) = state {
-                        states.insert(window, Arc::from(state));
-                    }
+                    states.insert(window, Arc::from(state));
                 }
                 for ((start,end),state) in &states {
                     records.get_mut(&policy_fp.into()).unwrap().push(RevisionRecord { reference: reference.clone(), group: group.clone(), start_ms:*start, end_ms:*end, payload:encode_state(Arc::clone(state),program.family.clone())? });

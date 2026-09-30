@@ -173,11 +173,13 @@ pub fn build_dag_accumulator(
         i64::try_from(window.0).map_err(|_| "backfill window start overflow")?,
         i64::try_from(window.1).map_err(|_| "backfill window end overflow")?,
     );
-    program.build(
-        samples
-            .iter()
-            .map(|sample| (sample.labels.as_str(), sample.timestamp_ms, sample.value)),
-        window,
-        asap_physical_operators::runtime::Limits::default().max_bytes,
-    )
+    program
+        .build(
+            samples
+                .iter()
+                .map(|sample| (sample.labels.as_str(), sample.timestamp_ms, sample.value)),
+            window,
+            asap_physical_operators::runtime::Limits::default().max_bytes,
+        )
+        .map_err(|e| e.to_string())
 }
