@@ -670,17 +670,27 @@ mod workload_tests {
         assert!(saw_unknown);
     }
 
-    // JSON must not alias NaN and infinity through its null representation.
+    // Explicit nonfinite encodings retain distinct stable explanation identities.
     #[test]
-    fn explain_nonfinite_identity_is_unavailable() {
+    fn explain_nonfinite_identities_are_distinct_and_stable() {
+        let mut identities = std::collections::BTreeSet::new();
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let root = QueryExpr::Literal(planner_types::pre_asap::ScalarValue::Float64(value));
-            assert!(replacement_identity(
+            let identity = replacement_identity(
                 &root,
                 &Replacement::Rewrite(Rc::new(root.clone())),
-                &AccuracyTarget::Exact
+                &AccuracyTarget::Exact,
             )
-            .is_none());
+            .unwrap();
+            assert_eq!(
+                Some(identity.clone()),
+                replacement_identity(
+                    &root,
+                    &Replacement::Rewrite(Rc::new(root.clone())),
+                    &AccuracyTarget::Exact
+                )
+            );
+            assert!(identities.insert(identity));
         }
     }
 
