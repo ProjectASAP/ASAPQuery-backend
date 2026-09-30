@@ -116,7 +116,7 @@ fn decisions(queries: &[&str]) -> Vec<Value> {
 #[test]
 fn shared_state_is_priced_once_with_all_reads() {
     let [alone] = decisions(&["sum_over_time(m[1m])"]).try_into().unwrap();
-    let [shared] = decisions(&["sum_over_time(m[1m])", "sum_over_time(m[1m]) * 2"])
+    let [shared] = decisions(&["sum_over_time(m[1m])", "sort(sum_over_time(m[1m]))"])
         .try_into()
         .unwrap();
     assert_eq!(shared["query_ids"].as_array().unwrap().len(), 2);

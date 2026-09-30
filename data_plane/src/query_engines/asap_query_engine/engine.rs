@@ -388,14 +388,13 @@ impl ASAPQueryEngine {
         )?;
         // Native installed DAGs require no remote request preparation. Avoid
         // constructing evaluation-grid maps for this common deployment path.
-        // Subqueries and raw scans still take the checked preparation path.
+        // Raw scans still take the checked preparation path.
         if entry.nodes.values().all(|node| match node {
             asap_types::query_plan::QueryPlanNode::ExternalExact { .. } => false,
             asap_types::query_plan::QueryPlanNode::Logical { operator, .. } => !matches!(
                 operator,
                 asap_types::query_plan::query_time::QueryTimeOperator::ExactSubquery { .. }
                     | asap_types::query_plan::query_time::QueryTimeOperator::CandidateExactSubquery { .. }
-                    | asap_types::query_plan::query_time::QueryTimeOperator::Subquery { .. }
                     | asap_types::query_plan::query_time::QueryTimeOperator::Scan { .. }
             ),
             _ => true,
@@ -2885,6 +2884,7 @@ mod range_stitch_tests {
 
     #[tokio::test]
     async fn active_metricsql_entry_reaches_the_shared_dag_executor() {
+        use asap_types::physical_plan_codec::PhysicalPlanCodec;
         use asap_types::query_plan::{
             FallbackPolicy, InstantExecution, QueryLanguage, QueryNodeId, QueryPlanEntry,
             QueryPlanNode,
@@ -2906,18 +2906,21 @@ mod range_stitch_tests {
                 query_id: "vm-scalar".into(),
                 canonical_query: identity.clone(),
                 fixed_evaluation: None,
-                root: QueryNodeId(2),
-                nodes: std::collections::BTreeMap::from([
-                    (QueryNodeId(0), QueryPlanNode::Scalar { value: 1.0 }),
-                    (QueryNodeId(1), QueryPlanNode::Scalar { value: 2.0 }),
-                    (
-                        QueryNodeId(2),
-                        QueryPlanNode::Binary {
-                            inputs: [QueryNodeId(0), QueryNodeId(1)],
-                            operator: planner_types::pre_asap::ArithmeticOpKind::Add,
-                        },
-                    ),
-                ]),
+                root: QueryNodeId(0),
+                nodes: std::collections::BTreeMap::from([(
+                    QueryNodeId(0),
+                    QueryPlanNode::PhysicalFragment {
+                        inputs: vec![],
+                        dag: asap_physical_operators::physical_planner::promql_values::compile_scalar(
+                            3.0,
+                        )
+                        .unwrap()
+                        .encode()
+                        .unwrap(),
+                        row_input: None,
+                        pruning: None,
+                    },
+                )]),
                 instant: InstantExecution {
                     lookback_ms: 1,
                     full_history: false,
@@ -2926,12 +2929,6 @@ mod range_stitch_tests {
                 fallback: FallbackPolicy::ExactBackend,
             },
         );
-        let key =
-            asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity);
-        control_plane::query_plan::physical_values::compile(
-            plan.query_plan.entries.get_mut(&key).unwrap(),
-        )
-        .unwrap();
         let mut active = crate::drivers::query::servers::http::validate_and_build_runtime_plan(
             crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 summary_catalog: plan.summary_catalog,

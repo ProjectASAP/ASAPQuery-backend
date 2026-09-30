@@ -16,7 +16,7 @@ fn miss(message: impl Into<String>) -> EngineError {
     EngineError::capability_miss("exact_subquery", message.into())
 }
 
-/// Traverse only the installed graph, including epoch-aligned nested subquery grids.
+/// Traverse only the installed graph.
 #[derive(Debug, Clone)]
 enum ExactLeaf {
     Legacy(QueryTimeOperator),
@@ -55,35 +55,6 @@ fn leaves(
                 QueryTimeOperator::ExactSubquery { .. }
                 | QueryTimeOperator::CandidateExactSubquery { .. } => {
                     result.insert((id, at), ExactLeaf::Legacy(operator.clone()));
-                }
-                QueryTimeOperator::Subquery {
-                    range_ms,
-                    step_ms,
-                    offset_ms,
-                } => {
-                    let step = i64::try_from(*step_ms).map_err(|_| miss("step overflow"))?;
-                    let range = i64::try_from(*range_ms).map_err(|_| miss("range overflow"))?;
-                    if step <= 0 || range / step > 100_000 {
-                        return Err(miss("invalid subquery grid"));
-                    }
-                    let end = at
-                        .checked_sub(*offset_ms)
-                        .ok_or_else(|| miss("offset overflow"))?;
-                    let start = end
-                        .checked_sub(range)
-                        .ok_or_else(|| miss("range overflow"))?;
-                    let mut t = start
-                        .div_euclid(step)
-                        .checked_add(1)
-                        .and_then(|n| n.checked_mul(step))
-                        .ok_or_else(|| miss("grid overflow"))?;
-                    let input = *inputs
-                        .first()
-                        .ok_or_else(|| miss("missing subquery input"))?;
-                    while t <= end {
-                        pending.push((input, t));
-                        t = t.checked_add(step).ok_or_else(|| miss("grid overflow"))?;
-                    }
                 }
                 _ => pending.extend(inputs.iter().map(|input| (*input, at))),
             },
@@ -734,21 +705,7 @@ mod tests {
             QueryPlanNode::PhysicalFragment { inputs: [QueryNodeId(0), QueryNodeId(1)].to_vec(), dag: compiled.encode().unwrap(), row_input: Some(0), pruning: (Some(CandidateCompleteness::BestEffort { guarantee: None })).map(|completeness| asap_types::query_plan::PruningInputContract { candidate_input: 1, keys: vec![(0,0)], completeness }) }
         }
         });
-        entry.nodes.insert(
-            QueryNodeId(3),
-            QueryPlanNode::Logical {
-                operator: QueryTimeOperator::Limit {
-                    offset: 0,
-                    n: 2,
-                    grouping: asap_types::query_plan::query_time::Grouping {
-                        labels: vec![],
-                        without: false,
-                    },
-                },
-                inputs: vec![QueryNodeId(2)],
-            },
-        );
-        entry.root = QueryNodeId(3);
+        entry.root = QueryNodeId(2);
         let dependencies = external_dependencies(&entry, &[1_000]).unwrap();
         assert_eq!(dependencies, vec![(QueryNodeId(0), QueryNodeId(1), 1_000)]);
         let prepared = prepare_external(
@@ -852,10 +809,31 @@ mod tests {
         ));
         server.abort();
     }
+    /// Planner's label-map division, the computation over a prepared exact leaf.
+    fn planner_division() -> Vec<u8> {
+        use planner_types::{
+            post_asap::BinaryOperator,
+            pre_asap::{ArithmeticOpKind, BinaryOpKind},
+        };
+        asap_physical_operators::physical_planner::promql_values::compile_binary(
+            &BinaryOperator {
+                kind: BinaryOpKind::Arithmetic(ArithmeticOpKind::Div),
+                vector_match: None,
+                checked_relative_division: false,
+                checked_finite_division: false,
+            },
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn exact_leaf_calls_prometheus_and_combines_with_prepared_summary() {
         // A successful exact branch remains an intermediate, not a whole-root fallback.
-        use asap_types::query_plan::query_time::BinaryOperation;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -874,12 +852,11 @@ mod tests {
         let mut entry = entry(BTreeMap::from([
             (
                 QueryNodeId(0),
-                QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::Binary {
-                        operation: BinaryOperation::Div,
-                        return_bool: false,
-                    },
+                QueryPlanNode::PhysicalFragment {
                     inputs: vec![QueryNodeId(1), QueryNodeId(2)],
+                    dag: planner_division(),
+                    row_input: None,
+                    pruning: None,
                 },
             ),
             (
@@ -894,7 +871,6 @@ mod tests {
                 },
             ),
         ]));
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
         let leaves = prepare(
             &entry,
             &[1000],
@@ -970,9 +946,7 @@ mod tests {
         };
         use crate::storage_engines::types::Measurement;
         use asap_summary_state::summary_kernels::IncreaseAccumulator;
-        use asap_types::query_plan::{
-            query_time::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
-        };
+        use asap_types::query_plan::{ExactReadout, MaterializationBinding, PhysicalGrouping};
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1012,12 +986,11 @@ mod tests {
         let entry = entry(BTreeMap::from([
             (
                 QueryNodeId(0),
-                QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::Binary {
-                        operation: BinaryOperation::Div,
-                        return_bool: false,
-                    },
+                QueryPlanNode::PhysicalFragment {
                     inputs: vec![QueryNodeId(1), QueryNodeId(2)],
+                    dag: planner_division(),
+                    row_input: None,
+                    pruning: None,
                 },
             ),
             (

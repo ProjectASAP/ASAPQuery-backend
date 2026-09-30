@@ -362,11 +362,11 @@ fn incompatible_evidence_preserves_deployment_behavior() {
     }
 }
 
-/// Binary operations over these approximate sketch values retain explicit
-/// fallback even though the warm tier now supports exact additive binaries.
+/// Binary operations over these approximate sketch values have no accuracy
+/// guarantee, so the backend refuses to compute them and the query runs exactly.
 #[test]
 fn binary_summary_has_explicit_warm_tier_fallback() {
-    use control_plane::query_plan::{FallbackPolicy, InstantExecution, QueryPlanNode};
+    use control_plane::query_plan::{FallbackPolicy, InstantExecution, QueryPlanError};
     use planner_types::{post_asap::BinaryOperator, pre_asap::BinaryOpKind};
     let child = bound(&model());
     let root = std::rc::Rc::new(SummaryNode {
@@ -384,7 +384,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
         schema: child.schema.clone(),
         guarantee: None,
     });
-    let plan = control_plane::query_plan::compile_bound_mapped(
+    let error = control_plane::query_plan::compile_bound_mapped(
         "test".into(),
         "left / right".into(),
         &root,
@@ -397,9 +397,9 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
         |_, _| panic!("unsupported binary plan must not bind a materialization"),
         |_, _| {},
     )
-    .unwrap();
+    .unwrap_err();
     assert!(
-        matches!(&plan.nodes[&plan.root], QueryPlanNode::ExactFallback { reason } if !reason.is_empty())
+        matches!(error, QueryPlanError::UnsupportedNode(_)),
+        "{error}"
     );
-    assert!(plan.materialization_bindings().is_empty());
 }

@@ -201,31 +201,11 @@ pub(super) fn place(
                 .and_then(|root| raw_query_time_program(root).ok())
         })
         .collect();
-    // A leaf the query-time lowering can externalize reads Prometheus directly.
-    let externalizable = |state: &SummaryNode, query: usize| {
-        raw_bindable
-            && (crate::query_plan::query_time::selected_counter_materialization(
-                &queries[query].query_string,
-                state,
-            )
-            .ok()
-            .flatten()
-            .is_some()
-                || crate::query_plan::query_time::selected_range_max_materialization(
-                    &queries[query].query_string,
-                    state,
-                )
-                .ok()
-                .flatten()
-                .is_some())
-    };
     let horizon = first.summary_lifecycle_inputs.horizon_seconds;
     let mut ephemeral = vec![false; states.len()];
     let mut decisions = Vec::new();
     for (state_index, (state, consumers)) in states.iter().enumerate() {
-        let bindable = consumers
-            .iter()
-            .all(|&query| raw_programs[query].is_some() || externalizable(state, query));
+        let bindable = consumers.iter().all(|&query| raw_programs[query].is_some());
         let lead = &queries[consumers[0]].summary_lifecycle_inputs;
         let interval = consumers
             .iter()
@@ -283,8 +263,7 @@ pub(super) fn place(
         let mut changed = false;
         for (query, owned) in query_states.iter().enumerate() {
             let realizable = owned.iter().all(|state| {
-                index_of(state).is_some_and(|i| ephemeral[i])
-                    && (raw_programs[query].is_some() || externalizable(state, query))
+                index_of(state).is_some_and(|i| ephemeral[i]) && raw_programs[query].is_some()
             });
             if realizable {
                 continue;

@@ -1360,7 +1360,7 @@ mod tests {
                 .store_per_byte_second = store;
             let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
             q.query = planner_types::workload::Query(
-                "max_over_time(a[1m]) + max_over_time(b[1m])".into(),
+                "sum(max_over_time(a[1m])) + sum(max_over_time(b[1m]))".into(),
             );
             q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
                 crate::types::AccuracyTarget::Exact,

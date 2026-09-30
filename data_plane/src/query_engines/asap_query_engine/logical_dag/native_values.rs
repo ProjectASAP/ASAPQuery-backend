@@ -330,102 +330,9 @@ mod tests {
         Error,
     };
 
-    // An installed computation binds complete label maps; ranking and division are native.
-    #[test]
-    fn compiled_vector_composition_preserves_grouping_and_runs_independently() {
-        use super::super::{
-            execute_installed, PreparedLeaf, PreparedLeaves, Value as ProtocolValue,
-        };
-        use asap_types::query_plan::{
-            query_time::QueryTimeOperator, FallbackPolicy, InstantExecution, QueryPlanNode,
-        };
-        let query = "topk by (job) (1, sum without(instance) (left_metric) / sum without(instance) (right_metric))";
-        let mut entry = control_plane::query_plan::query_time::compile_logical(
-            "compiled-values".into(),
-            query.into(),
-            InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::Reject,
-        )
-        .unwrap();
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
-        entry.validate(&Default::default()).unwrap();
-        assert!(entry.nodes.values().all(|node| matches!(
-            node,
-            QueryPlanNode::PhysicalFragment { .. }
-                | QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::Scan { .. },
-                    ..
-                }
-        )));
-        for scale in [1., 2.] {
-            let mut leaves = PreparedLeaves::new();
-            for (id, node) in &entry.nodes {
-                if let QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::Scan { metric, .. },
-                    ..
-                } = node
-                {
-                    let left = metric.as_deref() == Some("left_metric");
-                    let values = [
-                        ("api", "a", if left { 4. * scale } else { 2. }),
-                        ("api", "b", if left { 2. * scale } else { 1. }),
-                        ("worker", "c", if left { 8. * scale } else { 2. }),
-                    ];
-                    leaves.insert(
-                        (*id, 1000),
-                        PreparedLeaf {
-                            value: ProtocolValue::Vector(
-                                values
-                                    .into_iter()
-                                    .map(|(job, instance, value)| {
-                                        (
-                                            Labels::from([
-                                                ("__name__".into(), metric.clone().unwrap()),
-                                                ("job".into(), job.into()),
-                                                ("instance".into(), instance.into()),
-                                            ]),
-                                            value,
-                                        )
-                                    })
-                                    .collect(),
-                            ),
-                            remote: true,
-                            remote_evaluations: 1,
-                            remote_rpcs: 1,
-                        },
-                    );
-                }
-            }
-            let (result, _) = execute_installed(&entry, &leaves, 1000, |_, _| {
-                panic!("all inputs were bound")
-            })
-            .unwrap();
-            let crate::query_engines::query_result::QueryResult::Vector(result) = result else {
-                panic!("expected vector")
-            };
-            let actual = result
-                .values
-                .into_iter()
-                .map(|point| (point.labels.labels[0].clone(), point.value))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            assert_eq!(
-                actual,
-                std::collections::BTreeMap::from([
-                    ("api".into(), 2. * scale),
-                    ("worker".into(), 4. * scale)
-                ])
-            );
-        }
-    }
-
     // An available label is bound by Backend; Planner evaluates its predicate.
     #[test]
     fn planner_filter_compiles_and_executes_bound_labels() {
-        use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryPlanNode};
         use planner_types::{
             post_asap::{
                 execution_data_state::lift_plain, ExecutionTiming, SummaryExpr, SummaryNode,
@@ -470,24 +377,24 @@ mod tests {
                 timing: ExecutionTiming::QueryTime,
             },
         });
-        let entry = control_plane::query_plan::compile_bound_mapped(
-            "filter".into(),
-            query.into(),
-            &root,
-            InstantExecution {
-                lookback_ms: 0,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::Reject,
-            |_, _| panic!("filter requires no materialization"),
-            |_, _| {},
+        // The pre-ASAP selector is the fragment's bound input, as an exact
+        // engine result would be.
+        let dag = planner_types::post_asap::compile_post_asap_dag(&root).unwrap();
+        let source = dag.nodes.iter().find(|node| node.id != dag.root).unwrap();
+        let program = asap_physical_operators::physical_planner::compile(
+            &dag,
+            [(
+                u64::from(source.id.0),
+                InputContract::bounded(std::sync::Arc::new(source.output_schema.clone())),
+            )]
+            .into(),
+            &[u64::from(dag.root.0)],
         )
         .unwrap();
-        let QueryPlanNode::PhysicalFragment { dag, row_input, .. } = &entry.nodes[&entry.root]
-        else {
-            panic!("filter was rejected: {:?}", entry.nodes)
-        };
+        let row_input = program
+            .row_source(program.roots()[0])
+            .and_then(|id| program.input_contracts().position(|(input, _)| input == id));
+        let dag = program.encode().unwrap();
         let values = vec![
             (
                 [
@@ -501,7 +408,7 @@ mod tests {
         ];
         let expected = values[0].clone();
         assert_eq!(
-            physical(dag, vec![values], *row_input, 42, context(1 << 20)).unwrap(),
+            physical(&dag, vec![values], row_input, 42, context(1 << 20)).unwrap(),
             vec![expected]
         );
     }

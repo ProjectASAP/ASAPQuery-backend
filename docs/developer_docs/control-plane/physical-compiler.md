@@ -224,6 +224,15 @@ family or operator on that path is unsupported, the query entry is emitted as
 `ExactFallback`; the compiler does not provision otherwise-unused warm state
 for a query that cannot be executed end to end.
 
+The backend lowers only stored-state readouts itself: `ReadMaterialization`,
+`ExactReadout`, `SummaryEstimate` and `SummaryMerge`. Computation over their
+decoded values is one `PhysicalFragment` per query-time region, compiled by
+`asap_physical_operators::physical_planner::compile` with the readouts as input
+contracts. Before binding, `preserve_uncompiled_computation_roots` checks that
+compilation; a root Planner cannot compile, or one whose region reads a raw
+PromQL selector, keeps no state and forwards the whole query as
+`ExactFallback`.
+
 Graph traversal is separate from node definitions and store semantics.
 Activation validates roots, edges, bindings, reachability, and cycles.
 The shared physical DAG runtime creates one producer per reachable node and

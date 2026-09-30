@@ -1,9 +1,12 @@
 //! Control-plane lowering from Planner IR to the shared installed query DAG.
 //! Serving consumes asap_types::query_plan; compilation stays in this component.
+//!
+//! The backend lowers only stored-state readouts itself. Query-time
+//! computation over their decoded values is one Planner-compiled physical DAG
+//! per maximal computation region.
 use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 mod clickhouse_exact;
-pub mod physical_values;
 pub mod query_time;
 
 pub use asap_types::query_plan::*;
@@ -37,7 +40,6 @@ where
         nodes: BTreeMap::new(),
         seen: BTreeMap::new(),
         bind: &mut bind,
-        logical_source: None,
         preserve_relational: false,
         lowered: Some(&mut lowered),
     };
@@ -78,7 +80,6 @@ where
         nodes: BTreeMap::new(),
         seen: BTreeMap::new(),
         bind: &mut bind,
-        logical_source: None,
         preserve_relational: true,
         lowered: Some(&mut lowered),
     };
@@ -96,123 +97,207 @@ where
     })
 }
 
-/// Compile a composable query while exposing the stable mapping from
-/// Planner semantic nodes to installed query nodes. The control-plane
-/// physical compiler uses this to persist backend placement without
-/// relying on pointer values or reconstructing query shape later.
-pub fn compile_bound_composable_mapped<F, G>(
-    query_id: String,
-    canonical_query: String,
-    root: &Rc<SummaryNode>,
-    instant: InstantExecution,
-    fallback: FallbackPolicy,
-    mut bind: F,
-    mut lowered: G,
-) -> Result<QueryPlanEntry, QueryPlanError>
-where
-    F: FnMut(
-        &Rc<SummaryNode>,
-        &SummaryFamilyType,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
-    G: FnMut(&Rc<SummaryNode>, QueryNodeId),
-{
-    let mut compiler = DagCompiler {
-        next_id: 0,
-        nodes: BTreeMap::new(),
-        seen: BTreeMap::new(),
-        bind: &mut bind,
-        logical_source: Some(canonical_query.clone()),
-        preserve_relational: false,
-        lowered: Some(&mut lowered),
-    };
-    let root = compiler.lower(root)?;
-    let mut entry = QueryPlanEntry {
-        physical_dag: None,
-        language: QueryLanguage::PromQl,
-        query_id,
-        canonical_query,
-        fixed_evaluation: None,
-        root,
-        nodes: compiler.nodes,
-        instant,
-        fallback,
-    };
-    query_time::finalize_query_time_nodes(&mut entry)?;
-    Ok(entry)
+/// Query-time computation over stored readouts, compiled once by Planner.
+pub(crate) struct QueryComputation {
+    pub(crate) physical: asap_physical_operators::physical_planner::CompiledPhysicalDag,
+    /// Readout feeding each physical input contract, keyed by contract ID.
+    frontier: BTreeMap<u64, Rc<SummaryNode>>,
+    computed: Vec<Rc<SummaryNode>>,
+    pruning: Option<PruningInputContract>,
 }
 
-fn compile_native_fragment(
-    root: &Rc<SummaryNode>,
-    query_inputs: &[QueryNodeId],
-) -> Result<QueryPlanNode, QueryPlanError> {
-    use asap_physical_operators::physical_planner::{compile, InputContract};
-    use planner_types::post_asap::{compile_post_asap_dag, EdgeRole};
-    let invalid = |e: String| QueryPlanError::Invalid(e);
-    let dag = compile_post_asap_dag(root).map_err(|e| invalid(e.to_string()))?;
-    let mut edges = dag
-        .edges
-        .iter()
-        .filter(|e| e.consumer == dag.root)
-        .collect::<Vec<_>>();
-    edges.sort_by_key(|e| match e.role {
-        EdgeRole::Left => 0,
-        EdgeRole::Input => 1,
-        EdgeRole::Right => 2,
-    });
-    if edges.len() != query_inputs.len() {
-        return Err(invalid("physical frontier arity mismatch".into()));
+/// Is this node decoded from stored state by the backend, rather than
+/// computed over values? An exact aggregate over values is a query-time
+/// reduction; a sketch over values is a derived stored output.
+fn stored_readout(node: &SummaryNode) -> bool {
+    match &node.expr {
+        SummaryExpr::ValueOperation {
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            ..
+        } => exact_accumulator_value_source(node)
+            .is_some_and(|source| !std::ptr::eq(source, node) && stored_readout(source)),
+        SummaryExpr::SummaryEstimate { .. }
+        | SummaryExpr::SummaryMerge { .. }
+        | SummaryExpr::SummaryJoin { .. }
+        | SummaryExpr::SummarySubtract { .. }
+        | SummaryExpr::SummaryDelete { .. } => true,
+        SummaryExpr::SummaryAgg { child, family, .. } => {
+            matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                || !matches!(family, SummaryFamilyType::ExactAggregate(..))
+        }
+        _ => false,
     }
-    let bindings = edges
-        .iter()
-        .zip(query_inputs)
-        .map(|(edge, &id)| (u64::from(edge.producer.0), id))
-        .collect::<BTreeMap<_, _>>();
-    let contracts = edges
-        .iter()
-        .map(|edge| {
-            (
-                u64::from(edge.producer.0),
-                InputContract::bounded(std::sync::Arc::new(edge.intermediate_schema.clone())),
-            )
-        })
-        .collect();
-    let physical =
-        compile(&dag, contracts, &[u64::from(dag.root.0)]).map_err(|e| invalid(e.to_string()))?;
-    let row_input = physical
-        .row_source(physical.roots()[0])
-        .and_then(|source| physical.input_contracts().position(|(id, _)| id == source));
-    let pruning = if let SummaryExpr::RelationalJoin {
-        left,
-        right,
-        pred,
-        pruning: Some(completeness),
-        ..
-    } = &root.expr
-    {
-        Some(asap_types::query_plan::PruningInputContract {
-            candidate_input: physical
-                .input_contracts()
-                .position(|(id, _)| bindings[&id] == query_inputs[1])
-                .unwrap(),
-            keys: asap_physical_operators::physical_planner::equijoin_keys(
-                pred,
-                &left.schema,
-                &right.schema,
-            )
-            .map_err(|e| invalid(e.to_string()))?,
-            completeness: completeness.clone(),
-        })
-    } else {
-        None
+}
+
+/// Does lowering `node` start a query-time computation region?
+pub(crate) fn is_query_computation(node: &SummaryNode) -> bool {
+    !matches!(
+        node.expr,
+        SummaryExpr::KeepPreAsap(_)
+            | SummaryExpr::ValueOperation {
+                operation: planner_types::post_asap::ValueOperation::MaintainPopulation { .. }
+                    | planner_types::post_asap::ValueOperation::ReadPopulation { .. },
+                ..
+            }
+    ) && !stored_readout(node)
+}
+
+/// Compile the maximal query-time region rooted at `root`. Its inputs are the
+/// stored readouts below it; an exact PromQL selector inside the region has no
+/// stored input, so the region is unsupported and the query runs exactly.
+pub(crate) fn compile_query_computation(
+    root: &Rc<SummaryNode>,
+) -> Result<QueryComputation, QueryPlanError> {
+    use asap_physical_operators::physical_planner::{compile, promql_fallback, InputContract};
+    use planner_types::post_asap::{
+        compile_post_asap_dag_with_node_ids, EdgeRole, PostAsapOperatorPayload as Payload,
     };
-    Ok(QueryPlanNode::PhysicalFragment {
+    let unsupported = |message: String| QueryPlanError::UnsupportedNode(message);
+    let finalized = finalize_query_value(root);
+    let compilation = compile_post_asap_dag_with_node_ids(&finalized)
+        .map_err(|error| unsupported(error.to_string()))?;
+    let dag = &compilation.dag;
+    let mut pending = vec![dag.root];
+    let mut visited = std::collections::BTreeSet::new();
+    let mut contracts = BTreeMap::new();
+    let mut frontier = BTreeMap::new();
+    let mut computed = Vec::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let node = dag
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .ok_or_else(|| unsupported("missing Planner node".into()))?;
+        let semantic = compilation.node_ids.summary_node(id);
+        let readout = id != dag.root && semantic.is_some_and(|semantic| stored_readout(semantic));
+        if !readout {
+            if let Payload::Fallback { expression } = &node.payload {
+                if !promql_fallback::raw_series(expression)
+                    .map_err(|error| unsupported(error.to_string()))?
+                    .is_empty()
+                {
+                    return Err(unsupported(
+                        "query-time computation reads an exact PromQL selector".into(),
+                    ));
+                }
+            }
+            if let Some(SummaryNode {
+                expr: SummaryExpr::BinaryOp { .. },
+                guarantee,
+                ..
+            }) = semantic.map(Rc::as_ref)
+            {
+                // Planner certifies the combined value; without that, the
+                // backend must not publish the arithmetic result.
+                if guarantee.as_ref().is_none_or(|g| g.has_unknown()) {
+                    return Err(unsupported(
+                        "query-time arithmetic has no accuracy guarantee".into(),
+                    ));
+                }
+            }
+            computed.extend(semantic.cloned());
+            pending.extend(
+                dag.edges
+                    .iter()
+                    .filter(|edge| edge.consumer == id)
+                    .map(|edge| edge.producer),
+            );
+            continue;
+        }
+        let semantic = semantic.expect("readout has a semantic node");
+        if matches!(
+            semantic.expr,
+            SummaryExpr::SummaryJoin { .. }
+                | SummaryExpr::SummarySubtract { .. }
+                | SummaryExpr::SummaryDelete { .. }
+        ) || node
+            .output_schema
+            .fields
+            .iter()
+            .any(|field| !matches!(field.dtype, SummaryFamilyType::Plain(_)))
+        {
+            return Err(unsupported(
+                "query-time computation consumes state that has no decoded readout".into(),
+            ));
+        }
+        contracts.insert(
+            u64::from(id.0),
+            InputContract::bounded(std::sync::Arc::new(node.output_schema.clone())),
+        );
+        frontier.insert(u64::from(id.0), Rc::clone(semantic));
+    }
+    let physical = compile(dag, contracts, &[u64::from(dag.root.0)])
+        .map_err(|error| unsupported(error.to_string()))?;
+    let pruning = match &root.expr {
+        SummaryExpr::RelationalJoin {
+            left,
+            right,
+            pred,
+            pruning: Some(completeness),
+            ..
+        } => {
+            let candidates = dag
+                .edges
+                .iter()
+                .find(|edge| edge.consumer == dag.root && edge.role == EdgeRole::Right)
+                .map(|edge| u64::from(edge.producer.0))
+                .ok_or_else(|| unsupported("pruned join has no candidate input".into()))?;
+            Some(PruningInputContract {
+                candidate_input: physical
+                    .input_contracts()
+                    .position(|(id, _)| id == candidates)
+                    .ok_or_else(|| {
+                        unsupported("pruning candidates must be a stored readout".into())
+                    })?,
+                keys: asap_physical_operators::physical_planner::equijoin_keys(
+                    pred,
+                    &left.schema,
+                    &right.schema,
+                )
+                .map_err(|error| unsupported(error.to_string()))?,
+                completeness: completeness.clone(),
+            })
+        }
+        _ => None,
+    };
+    Ok(QueryComputation {
+        physical,
+        frontier,
+        computed,
         pruning,
-        row_input,
-        inputs: physical
-            .input_contracts()
-            .map(|(id, _)| bindings[&id])
-            .collect(),
-        dag: physical.encode().map_err(|e| invalid(e.to_string()))?,
+    })
+}
+
+/// A query-time exact aggregate yields accumulator state; its PromQL value is
+/// that state finalized, as Planner does for stored exact states.
+fn finalize_query_value(root: &Rc<SummaryNode>) -> Rc<SummaryNode> {
+    use planner_types::pre_asap::DataType;
+    if !matches!(
+        root.expr,
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(..),
+            ..
+        }
+    ) {
+        return Rc::clone(root);
+    }
+    let mut schema = root.schema.clone();
+    for field in &mut schema.fields {
+        if matches!(field.dtype, SummaryFamilyType::ExactAggregate(..)) {
+            field.dtype = SummaryFamilyType::Plain(DataType::Float64);
+        }
+    }
+    Rc::new(SummaryNode {
+        expr: SummaryExpr::ValueOperation {
+            child: Rc::clone(root),
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            timing: planner_types::post_asap::ExecutionTiming::QueryTime,
+        },
+        schema,
+        guarantee: root.guarantee.clone(),
     })
 }
 
@@ -221,7 +306,6 @@ struct DagCompiler<'a, F> {
     nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
     seen: BTreeMap<usize, QueryNodeId>,
     bind: &'a mut F,
-    logical_source: Option<String>,
     preserve_relational: bool,
     lowered: Option<&'a mut dyn FnMut(&Rc<SummaryNode>, QueryNodeId)>,
 }
@@ -324,48 +408,35 @@ where
         Ok(id)
     }
 
-    fn graft(
-        &mut self,
-        id: QueryNodeId,
-        root: QueryNodeId,
-        nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
-    ) -> Result<QueryNodeId, QueryPlanError> {
-        let mut remap = BTreeMap::new();
-        for local in nodes.keys() {
-            let global = if *local == root {
-                id
-            } else {
-                let next = QueryNodeId(self.next_id);
-                self.next_id += 1;
-                next
-            };
-            remap.insert(*local, global);
+    /// One Planner physical fragment for the region, bound to backend readouts.
+    fn lower_computation(&mut self, root: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {
+        let computation = compile_query_computation(root)?;
+        let mut inputs = Vec::new();
+        for (id, _) in computation.physical.input_contracts() {
+            inputs.push(self.lower(&computation.frontier[&id])?);
         }
-        for (local, mut physical) in nodes {
-            match &mut physical {
-                QueryPlanNode::Physical { inputs, .. }
-                | QueryPlanNode::PhysicalRelation { inputs, .. }
-                | QueryPlanNode::PhysicalFragment { inputs, .. }
-                | QueryPlanNode::Logical { inputs, .. }
-                | QueryPlanNode::SummaryMerge { inputs }
-                | QueryPlanNode::ExternalExact { inputs, .. } => {
-                    for input in inputs {
-                        *input = remap[input];
-                    }
-                }
-                QueryPlanNode::Binary { inputs, .. } => {
-                    for input in inputs {
-                        *input = remap[input];
-                    }
-                }
-                QueryPlanNode::SummaryEstimate { input, .. }
-                | QueryPlanNode::ExactReadout { input, .. }
-                | QueryPlanNode::ReduceSum { input, .. } => *input = remap[input],
-                QueryPlanNode::Scalar { .. }
-                | QueryPlanNode::ReadMaterialization { .. }
-                | QueryPlanNode::ExactFallback { .. } => {}
+        let physical = &computation.physical;
+        let row_input = physical
+            .row_source(physical.roots()[0])
+            .and_then(|source| physical.input_contracts().position(|(id, _)| id == source));
+        let id = QueryNodeId(self.next_id);
+        self.next_id += 1;
+        self.nodes.insert(
+            id,
+            QueryPlanNode::PhysicalFragment {
+                inputs,
+                dag: physical
+                    .encode()
+                    .map_err(|e| QueryPlanError::Invalid(e.to_string()))?,
+                row_input,
+                pruning: computation.pruning,
+            },
+        );
+        for semantic in std::iter::once(root).chain(&computation.computed) {
+            self.seen.insert(Rc::as_ptr(semantic) as usize, id);
+            if let Some(lowered) = &mut self.lowered {
+                lowered(semantic, id);
             }
-            self.nodes.insert(remap[&local], physical);
         }
         Ok(id)
     }
@@ -396,31 +467,12 @@ where
             }
             return Ok(child_id);
         }
+        if !self.preserve_relational && is_query_computation(node) {
+            return self.lower_computation(node);
+        }
         let id = QueryNodeId(self.next_id);
         self.next_id += 1;
         self.seen.insert(identity, id);
-        let query_time = match (&self.logical_source, &node.expr) {
-            (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
-                Some(query_time::query_time_nodes(original, expr)?)
-            }
-            (Some(original), SummaryExpr::SummaryAgg { child, .. })
-                if matches!(child.expr, SummaryExpr::KeepPreAsap(_))
-                    && !matches!(
-                        crate::physical::compiler::raw_materialization_input_contract(node),
-                        Ok((_, Some(_), _))
-                    ) =>
-            {
-                Some(query_time::selected_query_time_nodes(original, node)?)
-            }
-            _ => None,
-        };
-        if let Some((root, nodes)) = query_time {
-            let id = self.graft(id, root, nodes)?;
-            if let Some(lowered) = &mut self.lowered {
-                lowered(node, id);
-            }
-            return Ok(id);
-        }
 
         let physical = match &node.expr {
             SummaryExpr::RelationalJoin { .. } if self.preserve_relational => {
@@ -441,205 +493,12 @@ where
             {
                 return self.lower_relation(node);
             }
-            SummaryExpr::ValueOperation {
-                child,
-                operation:
-                    planner_types::post_asap::ValueOperation::Exact(
-                        planner_types::post_asap::ExactOperation::Aggregate {
-                            having: None, ..
-                        },
-                    ),
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } => {
-                let input = self.lower(child)?;
-                compile_native_fragment(node, &[input])?
-            }
-            SummaryExpr::ValueOperation {
-                child,
-                operation:
-                    planner_types::post_asap::ValueOperation::Limit { .. }
-                    | planner_types::post_asap::ValueOperation::Sort { .. }
-                    | planner_types::post_asap::ValueOperation::Filter { .. },
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } => {
-                let input = self.lower(child)?;
-                compile_native_fragment(node, &[input])?
-            }
             SummaryExpr::ValueOperation { .. } => QueryPlanNode::ExactFallback {
                 reason: "unsupported post-ASAP value operation".into(),
             },
-            SummaryExpr::RelationalJoin {
-                right: candidates,
-                left: values,
-                kind: planner_types::pre_asap::JoinKind::Semi,
-                pruning,
-                ..
-            } => {
-                let candidate_input = self.lower(candidates)?;
-                let value_input = if let Some(original) =
-                    self.logical_source.as_ref().filter(|_| pruning.is_some())
-                {
-                    let exact_expression =
-                        query_time::selected_native_expression(original, values)?;
-                    let value_id = QueryNodeId(self.next_id);
-                    self.next_id += 1;
-                    self.nodes.insert(
-                        value_id,
-                        QueryPlanNode::ExternalExact {
-                            request: ExternalExactRequest {
-                                language: QueryLanguage::PromQl,
-                                expression: exact_expression.to_string(),
-                                output: ExternalExactOutput::InstantVector,
-                                parameters: BTreeMap::new(),
-                                start_parameter: None,
-                                end_parameter: None,
-                                // The external source provides values; the Planner DAG owns matching.
-                                input_contracts: vec![],
-                            },
-                            inputs: vec![],
-                        },
-                    );
-                    value_id
-                } else {
-                    self.lower(values)?
-                };
-                compile_native_fragment(node, &[value_input, candidate_input])?
-            }
             SummaryExpr::RelationalJoin { .. } => QueryPlanNode::ExactFallback {
                 reason: "unsupported join in vector adapter".into(),
             },
-            SummaryExpr::BinaryOp {
-                lhs,
-                rhs,
-                operator,
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } if matches!(
-                operator.kind,
-                planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
-            ) && operator.vector_match.is_none()
-                && !operator.checked_relative_division
-                && !operator.checked_finite_division
-                && node.guarantee.as_ref().is_some_and(|g| !g.has_unknown())
-                && [lhs, rhs].iter().all(|operand| {
-                    matches!(
-                        operand.expr,
-                        SummaryExpr::SummaryEstimate {
-                            query: planner_types::post_asap::SketchQuery::Quantile { .. },
-                            ..
-                        }
-                    )
-                }) =>
-            {
-                let planner_types::pre_asap::BinaryOpKind::Arithmetic(kind) = &operator.kind else {
-                    unreachable!()
-                };
-                QueryPlanNode::Binary {
-                    inputs: [self.lower(lhs)?, self.lower(rhs)?],
-                    operator: kind.clone(),
-                }
-            }
-            SummaryExpr::BinaryOp {
-                lhs,
-                rhs,
-                operator,
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } if self.logical_source.is_some()
-                || operator.checked_relative_division
-                || operator.checked_finite_division =>
-            {
-                let operator = query_time::binary_operator(operator)?;
-                QueryPlanNode::Logical {
-                    operator,
-                    inputs: vec![self.lower(lhs)?, self.lower(rhs)?],
-                }
-            }
-
-            SummaryExpr::SummaryAgg {
-                family: SummaryFamilyType::ExactAggregate(kind, _),
-                child,
-                reduction,
-                ..
-            } if self.logical_source.is_some()
-                && !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) =>
-            {
-                if !matches!(
-                    kind,
-                    planner_types::post_asap::ExactKind::Sum
-                        | planner_types::post_asap::ExactKind::Count
-                ) {
-                    let operator = query_time::selected_aggregate_operator(
-                        self.logical_source.as_deref().unwrap(),
-                        node,
-                    )?;
-                    let input = self.lower(child)?;
-                    self.nodes.insert(
-                        id,
-                        QueryPlanNode::Logical {
-                            operator,
-                            inputs: vec![input],
-                        },
-                    );
-                    return Ok(id);
-                }
-                let operation = match kind {
-                    planner_types::post_asap::ExactKind::Sum => query_time::Aggregation::Sum,
-                    planner_types::post_asap::ExactKind::Count => query_time::Aggregation::Count,
-                    _ => {
-                        return Err(QueryPlanError::Invalid(
-                            "unsupported aggregation over selected summary values".into(),
-                        ))
-                    }
-                };
-                let keys = reduction.group_keys().ok_or_else(|| {
-                    QueryPlanError::Invalid(
-                        "per-entity summary reduction requires a temporal operator".into(),
-                    )
-                })?;
-                let labels = keys
-                    .keys()
-                    .iter()
-                    .map(|&column| {
-                        child
-                            .schema
-                            .fields
-                            .get(column)
-                            .map(|field| field.name.clone())
-                            .ok_or_else(|| {
-                                QueryPlanError::Invalid("unresolved logical grouping column".into())
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                QueryPlanNode::Logical {
-                    operator: query_time::QueryTimeOperator::Aggregate {
-                        operation,
-                        grouping: query_time::Grouping {
-                            labels,
-                            without: keys.is_without(),
-                        },
-                    },
-                    inputs: vec![self.lower(child)?],
-                }
-            }
-            SummaryExpr::BinaryOp {
-                lhs,
-                rhs,
-                operator,
-                timing: planner_types::post_asap::ExecutionTiming::QueryTime,
-            } if exact_value_executable(node) => {
-                let planner_types::pre_asap::BinaryOpKind::Arithmetic(operator) = &operator.kind
-                else {
-                    unreachable!()
-                };
-                QueryPlanNode::Binary {
-                    inputs: [self.lower(lhs)?, self.lower(rhs)?],
-                    operator: operator.clone(),
-                }
-            }
-            SummaryExpr::KeepPreAsap(expr) if scalar_literal(expr).is_some() => {
-                QueryPlanNode::Scalar {
-                    value: scalar_literal(expr).unwrap(),
-                }
-            }
             SummaryExpr::KeepPreAsap(expr) if self.preserve_relational => {
                 let mut expression =
                     clickhouse_exact::render(expr).map_err(QueryPlanError::UnsupportedNode)?;
@@ -676,20 +535,6 @@ where
                         input_contracts: Vec::new(),
                     },
                     inputs: Vec::new(),
-                }
-            }
-            SummaryExpr::SummaryAgg {
-                family:
-                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
-                child,
-                reduction,
-                ..
-            } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
-                && exact_value_executable(node) =>
-            {
-                QueryPlanNode::ReduceSum {
-                    input: self.lower(child)?,
-                    grouping: physical_grouping(reduction, child)?,
                 }
             }
             SummaryExpr::SummaryAgg {
@@ -743,17 +588,10 @@ where
                 ..
             } => match family {
                 SummaryFamilyType::ExactAggregate(..) | SummaryFamilyType::Sketch(..) => {
-                    let mut binding = match (self.bind)(node, family) {
-                        Ok(binding) => binding,
-                        Err(error) => {
-                            if let Some(original) = &self.logical_source {
-                                let (root, nodes) =
-                                    query_time::selected_query_time_nodes(original, node)?;
-                                return self.graft(id, root, nodes);
-                            }
-                            return Err(error);
-                        }
-                    };
+                    // A selected state without a deployed binding leaves the
+                    // query to the exact engine.
+                    let mut binding = (self.bind)(node, family)
+                        .map_err(|error| QueryPlanError::UnsupportedNode(error.to_string()))?;
                     binding.output_grouping = physical_grouping(reduction, child)?;
                     if let Some(readout) = exact_readout(family) {
                         let existing = self.nodes.iter().find_map(|(id, node)| {
@@ -812,6 +650,28 @@ where
         }
         Ok(id)
     }
+}
+
+/// Parameters of each `kind` operator inside a physical fragment, for tests.
+#[cfg(test)]
+pub(crate) fn operator_parameters(node: &QueryPlanNode, kind: &str) -> Vec<serde_json::Value> {
+    let QueryPlanNode::PhysicalFragment { dag, .. } = node else {
+        return vec![];
+    };
+    asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag).unwrap();
+    let document: serde_json::Value = serde_json::from_slice(dag).unwrap();
+    document["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|node| {
+            node.get("Operator")?
+                .get("operator")?
+                .get("kind")?
+                .get(kind)
+                .cloned()
+        })
+        .collect()
 }
 
 fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
@@ -1175,9 +1035,11 @@ mod catalog_binding_tests {
 mod tests {
     use super::*;
 
+    // Planner's guarded average divides two per-series readouts; until
+    // Planner matches per-series rows, lowering refuses it instead of
+    // computing it in the backend.
     #[test]
-    fn guarded_division_retains_checks_in_both_query_compilers() {
-        // Both compilers retain the finite/relative guard supplied by Planner.
+    fn per_series_guarded_division_is_not_lowered_locally() {
         let query = "avg_over_time(m[5m])";
         let canonical = crate::query_parser::parse_query_expr_canonical(
             query,
@@ -1189,77 +1051,88 @@ mod tests {
             panic!("expected the Planner's average rewrite");
         };
         assert!(operator.checked_finite_division);
-        for relative in [false, true] {
-            let mut guarded = root.as_ref().clone();
-            let SummaryExpr::BinaryOp { operator, .. } = &mut guarded.expr else {
-                unreachable!();
-            };
-            operator.checked_finite_division = !relative;
-            operator.checked_relative_division = relative;
-            let guarded = Rc::new(guarded);
-            for composable in [false, true] {
-                let instant = InstantExecution {
-                    lookback_ms: 300_000,
-                    full_history: false,
-                    cumulative_readout: false,
-                };
-                let bind = |_: &Rc<SummaryNode>, _: &SummaryFamilyType| {
-                    Ok(MaterializationBinding {
-                        full_window_slide_ms: None,
-                        materialization: PolicyFingerprint(7).into(),
-                        stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
-                            PolicyFingerprint(7).into(),
-                        ),
-                        output_grouping: PhysicalGrouping::PerEntity,
-                        window_ms: 300_000,
-                        pane_origin_ms: Some(0),
-                        readout_lookback_ms: Some(300_000),
-                        item_labels: Vec::new(),
-                    })
-                };
-                let entry = if composable {
-                    compile_bound_composable_mapped(
-                        "guarded".into(),
-                        query.into(),
-                        &guarded,
-                        instant,
-                        FallbackPolicy::ExactBackend,
-                        bind,
-                        |_, _| {},
-                    )
-                } else {
-                    compile_bound_mapped(
-                        "guarded".into(),
-                        query.into(),
-                        &guarded,
-                        instant,
-                        FallbackPolicy::ExactBackend,
-                        bind,
-                        |_, _| {},
-                    )
+        let error = compile_bound_mapped(
+            "guarded".into(),
+            query.into(),
+            &root,
+            InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            FallbackPolicy::ExactBackend,
+            |_: &Rc<SummaryNode>, _: &SummaryFamilyType| {
+                Ok(MaterializationBinding {
+                    full_window_slide_ms: None,
+                    materialization: PolicyFingerprint(7).into(),
+                    stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
+                        PolicyFingerprint(7).into(),
+                    ),
+                    output_grouping: PhysicalGrouping::PerEntity,
+                    window_ms: 300_000,
+                    pane_origin_ms: Some(0),
+                    readout_lookback_ms: Some(300_000),
+                    item_labels: Vec::new(),
+                })
+            },
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, QueryPlanError::UnsupportedNode(_)),
+            "{error}"
+        );
+    }
+
+    // Every o11y corpus query compiles as backend readouts under Planner
+    // fragments, or forwards whole; no backend value operator remains.
+    #[test]
+    fn o11y_corpus_computes_only_through_planner_fragments() {
+        use crate::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/o11y_queries.json")).unwrap();
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let template = fixture["query_workload"]["repeating_queries"][0].clone();
+        let queries = corpus["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["query"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        fixture["query_workload"]["repeating_queries"] = queries
+            .iter()
+            .map(|query| {
+                let mut entry = template.clone();
+                entry["query"] = (*query).into();
+                entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
+                entry
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(fixture).unwrap();
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        assert_eq!(plan.query_plan.entries.len(), queries.len());
+        let mut fragments = 0;
+        for entry in plan.query_plan.entries.values() {
+            for node in entry.nodes.values() {
+                match node {
+                    QueryPlanNode::PhysicalFragment { .. } => fragments += 1,
+                    QueryPlanNode::ReadMaterialization { .. }
+                    | QueryPlanNode::ExactReadout { .. }
+                    | QueryPlanNode::SummaryEstimate { .. }
+                    | QueryPlanNode::SummaryMerge { .. } => {}
+                    QueryPlanNode::ExactFallback { .. } => assert_eq!(entry.nodes.len(), 1),
+                    other => panic!("{}: unexpected {other:?}", entry.canonical_query),
                 }
-                .unwrap();
-                let QueryPlanNode::Logical {
-                    operator: query_time::QueryTimeOperator::Binary { operation, .. },
-                    ..
-                } = &entry.nodes[&entry.root]
-                else {
-                    panic!(
-                        "expected guarded division (composable={composable}): {:?}",
-                        entry.nodes
-                    );
-                };
-                assert_eq!(
-                    *operation,
-                    if relative {
-                        query_time::BinaryOperation::CheckedDiv
-                    } else {
-                        query_time::BinaryOperation::FiniteDiv
-                    }
-                );
-                assert!(!entry.materialization_bindings().is_empty());
             }
         }
+        assert!(fragments > 0);
     }
 
     #[test]
