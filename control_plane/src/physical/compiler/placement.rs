@@ -43,14 +43,16 @@ impl Placement {
     }
 }
 
-/// Lifecycle prices of one state. Retention charges the state's estimated
-/// bytes for every retained pane at the summary-store price.
-struct StateCosts {
-    inputs: SummaryMaintenanceLifecycleCostInputs,
-    capabilities: SummaryMaintenanceCapabilities,
+/// Backend lifecycle prices for any summary state. Retention charges the
+/// state's estimated bytes for every retained pane at the summary-store price;
+/// an unknown size under a positive price leaves retention unpriced.
+struct LifecycleCosts<'a> {
+    costs: &'a LifecycleUnitCosts,
+    evaluation_interval_ms: u32,
+    delete: bool,
 }
 
-impl CostModel for StateCosts {
+impl CostModel for LifecycleCosts<'_> {
     fn rank_candidates(
         &self,
         _intent: &AggIntent,
@@ -61,53 +63,67 @@ impl CostModel for StateCosts {
 
     fn summary_maintenance_lifecycle_cost_inputs(
         &self,
-        _summary: &SummaryNode,
+        summary: &SummaryNode,
     ) -> SummaryMaintenanceLifecycleCostInputs {
-        self.inputs.clone()
+        let costs = self.costs;
+        let panes = selected_input_contract(summary)
+            .ok()
+            .and_then(|(_, window, _)| window)
+            .map_or(1.0, |seconds| {
+                (seconds.saturating_mul(1_000) as f64
+                    / f64::from(self.evaluation_interval_ms.max(1)))
+                .ceil()
+                .max(1.0)
+            });
+        let store = match &summary.expr {
+            SummaryExpr::SummaryAgg { family, .. } if costs.store_per_byte_second > 0.0 => {
+                crate::physical::post_asap::cost_model::analytical_state_bytes(family)
+                    .map(|bytes| bytes * panes * costs.store_per_byte_second)
+            }
+            _ => Some(0.0),
+        };
+        SummaryMaintenanceLifecycleCostInputs {
+            build_cost: Some(Cost(costs.build)),
+            maintenance_cost_per_update: Some(Cost(costs.maintenance_per_update)),
+            summary_read_cost: Some(Cost(costs.read)),
+            retention_cost_rate: store.map(|store| CostRate(costs.retention_per_second + store)),
+            retirement_cost: Some(Cost(costs.retirement)),
+        }
     }
 
     fn summary_maintenance_capabilities(
         &self,
         _summary: &SummaryNode,
     ) -> SummaryMaintenanceCapabilities {
-        self.capabilities
+        SummaryMaintenanceCapabilities {
+            incremental_update: true,
+            merge: true,
+            delete: self.delete,
+        }
     }
 }
 
-fn state_costs(
-    state: &SummaryNode,
-    costs: &LifecycleUnitCosts,
-    evaluation_interval_ms: u32,
-    delete: bool,
-) -> StateCosts {
-    let panes = selected_input_contract(state)
-        .ok()
-        .and_then(|(_, window, _)| window)
-        .map_or(1.0, |seconds| {
-            (seconds.saturating_mul(1_000) as f64 / f64::from(evaluation_interval_ms.max(1)))
-                .ceil()
-                .max(1.0)
-        });
-    let store = match &state.expr {
-        SummaryExpr::SummaryAgg { family, .. } if costs.store_per_byte_second > 0.0 => {
-            crate::physical::post_asap::cost_model::analytical_state_bytes(family)
-                .map(|bytes| bytes * panes * costs.store_per_byte_second)
-        }
-        _ => Some(0.0),
-    };
-    StateCosts {
-        inputs: SummaryMaintenanceLifecycleCostInputs {
-            build_cost: Some(Cost(costs.build)),
-            maintenance_cost_per_update: Some(Cost(costs.maintenance_per_update)),
-            summary_read_cost: Some(Cost(costs.read)),
-            retention_cost_rate: store.map(|store| CostRate(costs.retention_per_second + store)),
-            retirement_cost: Some(Cost(costs.retirement)),
-        },
-        capabilities: SummaryMaintenanceCapabilities {
-            incremental_update: true,
-            merge: true,
-            delete,
-        },
+/// Selectable total cost of `lifecycle` for `summary`, if Planner listed it.
+fn alternative_cost(
+    deployment: &asap_aware_mapping::SummaryMaintenanceDeployment,
+    lifecycle: &SummaryMaintenanceLifecycle,
+) -> Option<Cost> {
+    deployment
+        .alternatives
+        .iter()
+        .find(|alternative| {
+            alternative.rejection.is_none()
+                && &alternative.summary_maintenance_lifecycle == lifecycle
+        })
+        .and_then(|alternative| alternative.total_cost)
+}
+
+/// Unknown cost never makes a lifecycle win.
+fn rebuild_is_cheaper(retained: Option<Cost>, rebuilt: Option<Cost>) -> bool {
+    match (retained, rebuilt) {
+        (Some(retained), Some(rebuilt)) => rebuilt.0 < retained.0,
+        (None, Some(_)) => true,
+        _ => false,
     }
 }
 
@@ -207,12 +223,11 @@ pub(super) fn place(
             })
             .min()
             .unwrap_or(lead.evaluation_interval_ms);
-        let model = state_costs(
-            state,
-            &lead.costs,
-            interval,
-            environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite,
-        );
+        let model = LifecycleCosts {
+            costs: &lead.costs,
+            evaluation_interval_ms: interval,
+            delete: environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+        };
         let Ok(candidates) = enumerate_summary_maintenance_lifecycles(
             Rc::clone(state),
             WorkloadDemand::new_with_data(workload, data, consumers),
@@ -235,25 +250,12 @@ pub(super) fn place(
         else {
             continue;
         };
-        let cost = |lifecycle: &SummaryMaintenanceLifecycle| {
-            deployment
-                .alternatives
-                .iter()
-                .find(|alternative| {
-                    alternative.rejection.is_none()
-                        && &alternative.summary_maintenance_lifecycle == lifecycle
-                })
-                .and_then(|alternative| alternative.total_cost)
-        };
-        let retained = cost(&SummaryMaintenanceLifecycle::ContinuouslyMaintained);
-        let rebuilt = cost(&SummaryMaintenanceLifecycle::Ephemeral);
-        // An unpriced retained state stays retained unless rebuilding is priced:
-        // unknown cost never makes a lifecycle win.
-        ephemeral[state_index] = match (retained, rebuilt) {
-            (Some(retained), Some(rebuilt)) => rebuilt.0 < retained.0,
-            (None, Some(_)) => true,
-            _ => false,
-        };
+        let retained = alternative_cost(
+            deployment,
+            &SummaryMaintenanceLifecycle::ContinuouslyMaintained,
+        );
+        let rebuilt = alternative_cost(deployment, &SummaryMaintenanceLifecycle::Ephemeral);
+        ephemeral[state_index] = rebuild_is_cheaper(retained, rebuilt);
         decisions.push((state_index, bindable, retained, rebuilt));
     }
     // A query rebuilds either all of its states or none: raw query-time inputs
