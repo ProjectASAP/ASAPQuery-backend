@@ -1780,36 +1780,7 @@ impl DeploymentPlanCompiler {
                 .retained_physical()?
                 .is_some_and(|candidate| candidate.precompute.is_some());
             for (ordinal, selected) in selected.into_iter().enumerate() {
-                let mut branch_query = query.clone();
-                branch_query.query_lookback_ms = selected
-                    .window_secs
-                    .map(|seconds| seconds.saturating_mul(1_000))
-                    .unwrap_or(query.query_lookback_ms);
-                branch_query.group_by_labels = selected
-                    .group_by
-                    .clone()
-                    .unwrap_or_else(|| query.group_by_labels.clone());
-                branch_query
-                    .window_realization_candidates
-                    .retain(|candidate| {
-                        candidate.window_secs.saturating_mul(1_000)
-                            == branch_query.query_lookback_ms
-                            && if cohort_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
-                                if native_cohort {
-                                    windows::is_complete_window(candidate)
-                                        && candidate.slide_secs.saturating_mul(1000)
-                                            == u64::from(
-                                                query
-                                                    .summary_lifecycle_inputs
-                                                    .evaluation_interval_ms,
-                                            )
-                                } else {
-                                    windows::is_full_cohort(candidate)
-                                }
-                            } else {
-                                !candidate.cohort_only
-                            }
-                    });
+                let branch_query = state_query(query, &selected, &cohort_nodes, native_cohort);
                 let query = &branch_query;
                 let lifecycle_costs = SummaryMaintenanceLifecycleCostInputs {
                     build_cost: Some(Cost(query.summary_lifecycle_inputs.costs.build)),
@@ -3883,6 +3854,42 @@ struct PlannerPhysicalSelection {
     expected_reads: f64,
     expected_updates: f64,
     lifecycle_cost: f64,
+}
+
+/// `query` as the consumer of `state` alone: its window, grouping, and the
+/// window implementations that can install it.
+fn state_query(
+    query: &QueryCompilationInput,
+    state: &SelectedMaterialization,
+    cohort_nodes: &BTreeSet<usize>,
+    native_cohort: bool,
+) -> QueryCompilationInput {
+    let mut branch = query.clone();
+    branch.query_lookback_ms = state
+        .window_secs
+        .map(|seconds| seconds.saturating_mul(1_000))
+        .unwrap_or(query.query_lookback_ms);
+    branch.group_by_labels = state
+        .group_by
+        .clone()
+        .unwrap_or_else(|| query.group_by_labels.clone());
+    let lookback_ms = branch.query_lookback_ms;
+    let cohort = cohort_nodes.contains(&(Rc::as_ptr(&state.node) as usize));
+    branch.window_realization_candidates.retain(|candidate| {
+        candidate.window_secs.saturating_mul(1_000) == lookback_ms
+            && if cohort {
+                if native_cohort {
+                    windows::is_complete_window(candidate)
+                        && candidate.slide_secs.saturating_mul(1000)
+                            == u64::from(query.summary_lifecycle_inputs.evaluation_interval_ms)
+                } else {
+                    windows::is_full_cohort(candidate)
+                }
+            } else {
+                !candidate.cohort_only
+            }
+    });
+    branch
 }
 
 fn select_lifecycle(

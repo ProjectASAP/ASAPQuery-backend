@@ -3,8 +3,9 @@
 //!
 //! Planner enumerates each state's lifecycle alternatives; this backend prices
 //! them with its own unit costs and picks the cheapest for the whole workload.
-//! A `ContinuouslyMaintained` state is precomputed at ingestion. An `Ephemeral`
-//! state is rebuilt for each query from raw data read from Prometheus at query
+//! A `ContinuouslyMaintained` state is precomputed at ingestion into the window
+//! layout the compiler installs for it. An `Ephemeral` state is never built:
+//! its queries run an exact program over raw data read from Prometheus at query
 //! time, so it is offered only when that raw source is bindable.
 use super::*;
 use asap_aware_mapping::{enumerate_summary_maintenance_lifecycles, CostModel};
@@ -46,16 +47,18 @@ impl Placement {
 /// Backend lifecycle prices for any summary state. Retention charges the
 /// state's estimated bytes for every retained pane and partition at the
 /// summary-store price; an unknown size under a positive price leaves
-/// retention unpriced. Panes are estimated from the evaluation interval
-/// because the window layout is chosen only for retained state.
-struct LifecycleCosts<'a> {
-    costs: &'a LifecycleUnitCosts,
+/// retention unpriced.
+struct LifecycleCosts {
+    costs: LifecycleUnitCosts,
+    /// States the installed window layout retains. Without one, panes are
+    /// estimated as the state's window over `evaluation_interval_ms`.
+    retained_states: Option<u64>,
     evaluation_interval_ms: u32,
     input_cardinality: Option<u64>,
     delete: bool,
 }
 
-impl CostModel for LifecycleCosts<'_> {
+impl CostModel for LifecycleCosts {
     fn rank_candidates(
         &self,
         _intent: &AggIntent,
@@ -68,16 +71,21 @@ impl CostModel for LifecycleCosts<'_> {
         &self,
         summary: &SummaryNode,
     ) -> SummaryMaintenanceLifecycleCostInputs {
-        let costs = self.costs;
-        let panes = selected_input_contract(summary)
-            .ok()
-            .and_then(|(_, window, _)| window)
-            .map_or(1.0, |seconds| {
-                (seconds.saturating_mul(1_000) as f64
-                    / f64::from(self.evaluation_interval_ms.max(1)))
-                .ceil()
-                .max(1.0)
-            });
+        let costs = &self.costs;
+        let panes = self.retained_states.map_or_else(
+            || {
+                selected_input_contract(summary)
+                    .ok()
+                    .and_then(|(_, window, _)| window)
+                    .map_or(1.0, |seconds| {
+                        (seconds.saturating_mul(1_000) as f64
+                            / f64::from(self.evaluation_interval_ms.max(1)))
+                        .ceil()
+                        .max(1.0)
+                    })
+            },
+            |states| states as f64,
+        );
         let store = match &summary.expr {
             SummaryExpr::SummaryAgg {
                 family, reduction, ..
@@ -117,6 +125,70 @@ impl CostModel for LifecycleCosts<'_> {
             delete: self.delete,
         }
     }
+}
+
+/// The window implementation compilation installs for `state` when `query`
+/// retains it, with the number of states that layout keeps in the store for
+/// the state's own window. A derived state reading a longer window over it
+/// retains more, so this is a lower bound there.
+fn installed_window(
+    query: &QueryCompilationInput,
+    state: &SelectedMaterialization,
+    query_states: &[SelectedMaterialization],
+    environment: &PhysicalDeploymentContext,
+    retention_margin_ms: u64,
+) -> Option<(WindowRealizationCandidate, u64)> {
+    let native_cohort = query
+        .retained_physical()
+        .ok()?
+        .is_some_and(|candidate| candidate.precompute.is_some());
+    let branch = state_query(
+        query,
+        state,
+        &super::windows::cohort_nodes(query_states),
+        native_cohort,
+    );
+    let model = ControlPlaneCostModel::new(branch.accuracy_target.clone())
+        .with_window_implementation_costs(
+            validate_window_implementations(&branch, environment).ok()?,
+        );
+    let (id, framework, _) = model.cheapest_window_implementation()?;
+    let window = branch
+        .window_realization_candidates
+        .iter()
+        .find(|candidate| {
+            id.as_ref() == Some(&candidate.realization_id) && &candidate.framework == framework
+        })?
+        .clone();
+    let retained = retained_state_count(
+        branch.query_lookback_ms,
+        retention_margin_ms,
+        window.slide_secs.saturating_mul(1_000),
+        &window.layout,
+    );
+    Some((window, retained))
+}
+
+/// A state's index, raw bindability, retained and rebuilt costs, and
+/// retained store states.
+type Decision = (usize, bool, Option<Cost>, Option<Cost>, Option<u64>);
+
+/// One installed copy of a retained state and the consumers reading it.
+struct Install<'a> {
+    /// Window, slide, layout, evaluation cadence, and phase modulo cadence and
+    /// window; `None` when no installable window or phase is known.
+    layout: Option<(
+        u64,
+        u64,
+        asap_types::WindowMaterializationLayout,
+        u64,
+        u64,
+        u64,
+    )>,
+    costs: &'a LifecycleUnitCosts,
+    retained_states: Option<u64>,
+    evaluation_interval_ms: u32,
+    consumers: Vec<usize>,
 }
 
 /// Selectable total cost of `lifecycle` for `summary`, if Planner listed it.
@@ -168,6 +240,8 @@ pub(super) fn place(
         && environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite;
     let mut states: Vec<(Rc<SummaryNode>, Vec<usize>)> = Vec::new();
     let mut query_states = vec![Vec::new(); queries.len()];
+    let mut selected_states: Vec<Vec<SelectedMaterialization>> =
+        (0..queries.len()).map(|_| Vec::new()).collect();
     for (index, query) in queries.iter().enumerate() {
         if super::super::maintained_population::supported_node(&query.selected_plan_root) {
             continue;
@@ -176,7 +250,7 @@ pub(super) fn place(
         else {
             continue;
         };
-        for state in selected {
+        for state in &selected {
             if query_states[index]
                 .iter()
                 .any(|known: &Rc<SummaryNode>| Rc::ptr_eq(known, &state.node))
@@ -189,9 +263,10 @@ pub(super) fn place(
                 .find(|(known, _)| Rc::ptr_eq(known, &state.node))
             {
                 Some((_, consumers)) => consumers.push(index),
-                None => states.push((state.node, vec![index])),
+                None => states.push((Rc::clone(&state.node), vec![index])),
             }
         }
+        selected_states[index] = selected;
     }
     let raw_programs: Vec<Option<RawQueryTimeProgram>> = (0..queries.len())
         .map(|index| {
@@ -201,91 +276,208 @@ pub(super) fn place(
                 .and_then(|root| raw_query_time_program(root).ok())
         })
         .collect();
-    let horizon = first.summary_lifecycle_inputs.horizon_seconds;
-    let mut ephemeral = vec![false; states.len()];
-    let mut decisions = Vec::new();
-    for (state_index, (state, consumers)) in states.iter().enumerate() {
-        let bindable = consumers.iter().all(|&query| raw_programs[query].is_some());
-        let lead = &queries[consumers[0]].summary_lifecycle_inputs;
-        let interval = consumers
-            .iter()
-            .map(|&query| {
-                queries[query]
-                    .summary_lifecycle_inputs
-                    .evaluation_interval_ms
-            })
-            .min()
-            .unwrap_or(lead.evaluation_interval_ms);
-        let model = LifecycleCosts {
-            costs: &lead.costs,
-            evaluation_interval_ms: interval,
-            input_cardinality: data
-                .input_cardinality
-                .value_at(environment.observed_at_unix_ms)
-                .copied(),
+    let horizon = Some(Horizon(first.summary_lifecycle_inputs.horizon_seconds));
+    let now = environment.observed_at_unix_ms;
+    let update_rate = data.ingestion_rate.value_at(now).map(|rate| rate.0);
+    let model =
+        |costs: LifecycleUnitCosts, retained_states, evaluation_interval_ms| LifecycleCosts {
+            costs,
+            retained_states,
+            evaluation_interval_ms,
+            input_cardinality: data.input_cardinality.value_at(now).copied(),
             delete: environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite,
         };
-        let Ok(candidates) = enumerate_summary_maintenance_lifecycles(
+    // Planner's alternative `lifecycle` for `state`, priced for `consumers`.
+    let price = |state: &Rc<SummaryNode>,
+                 consumers: &[usize],
+                 lifecycle: SummaryMaintenanceLifecycle,
+                 model: &LifecycleCosts| {
+        let candidates = enumerate_summary_maintenance_lifecycles(
             Rc::clone(state),
             WorkloadDemand::new_with_data(workload, data, consumers),
-            environment.observed_at_unix_ms,
-            Some(Horizon(horizon)),
+            now,
+            horizon,
             SummaryMaintenanceLifecycleCapabilities {
-                supports_ephemeral: bindable,
+                supports_ephemeral: lifecycle == SummaryMaintenanceLifecycle::Ephemeral,
                 supports_prepared: false,
                 supports_shared: false,
-                supports_continuously_maintained: true,
+                supports_continuously_maintained: lifecycle
+                    == SummaryMaintenanceLifecycle::ContinuouslyMaintained,
             },
-            &model,
-        ) else {
-            continue;
-        };
-        let Some(deployment) = candidates
+            model,
+        )
+        .ok()?;
+        let deployment = candidates
             .deployments()
             .iter()
-            .find(|deployment| Rc::ptr_eq(&deployment.summary, state))
-        else {
-            continue;
+            .find(|deployment| Rc::ptr_eq(&deployment.summary, state))?;
+        alternative_cost(deployment, &lifecycle)
+    };
+    let phases: Vec<Option<u64>> = workload
+        .entries()
+        .map(|entry| match entry.recurrence {
+            QueryRecurrence::Repeated(RepeatedDemand::FixedIntervalAt {
+                evaluation_phase, ..
+            }) => Some(evaluation_phase.0),
+            _ => None,
+        })
+        .collect();
+    let mut decisions: Vec<Decision> = Vec::new();
+    for (state_index, (state, consumers)) in states.iter().enumerate() {
+        let bindable = consumers.iter().all(|&query| raw_programs[query].is_some());
+        // Consumers share one installed state only when compilation groups
+        // them: the same window layout and cadence, and the same evaluation
+        // phase within both cadence and window. Any other consumer installs its own.
+        let mut installs: Vec<Install> = Vec::new();
+        for &query in consumers {
+            let lifecycle = &queries[query].summary_lifecycle_inputs;
+            let installed = selected_states[query]
+                .iter()
+                .find(|selected| Rc::ptr_eq(&selected.node, state))
+                .and_then(|selected| {
+                    installed_window(
+                        &queries[query],
+                        selected,
+                        &selected_states[query],
+                        environment,
+                        request.query_retention_margin_ms,
+                    )
+                });
+            let layout = installed
+                .as_ref()
+                .zip(phases[query])
+                .map(|((window, _), phase)| {
+                    let cadence_ms = u64::from(lifecycle.evaluation_interval_ms).max(1);
+                    let window_ms = window.window_secs.saturating_mul(1_000).max(1);
+                    (
+                        window.window_secs,
+                        window.slide_secs,
+                        window.layout.clone(),
+                        cadence_ms,
+                        phase % cadence_ms,
+                        phase % window_ms,
+                    )
+                });
+            match installs
+                .iter_mut()
+                .find(|install| layout.is_some() && install.layout == layout)
+            {
+                Some(install) => install.consumers.push(query),
+                None => installs.push(Install {
+                    layout,
+                    costs: &lifecycle.costs,
+                    retained_states: installed.map(|(_, retained)| retained),
+                    evaluation_interval_ms: lifecycle.evaluation_interval_ms,
+                    consumers: vec![query],
+                }),
+            }
+        }
+        let retained = installs
+            .iter()
+            .map(|install| {
+                price(
+                    state,
+                    &install.consumers,
+                    SummaryMaintenanceLifecycle::ContinuouslyMaintained,
+                    &model(
+                        install.costs.clone(),
+                        install.retained_states,
+                        install.evaluation_interval_ms,
+                    ),
+                )
+                .map(|cost| cost.0)
+            })
+            .sum::<Option<f64>>()
+            .map(Cost);
+        // Each consumer runs its raw program once per evaluation. Per state the
+        // program builds, finalizes and retires a transient accumulator, as
+        // Planner's per-read rebuild charges; it also folds every sample its
+        // Scans cover, at the per-update cost maintenance pays for the same
+        // source rate. The query's states share that fold.
+        let rebuilt = if bindable {
+            consumers
+                .iter()
+                .map(|&query| {
+                    let raw = raw_programs[query].as_ref()?;
+                    let scanned_seconds = raw
+                        .scans
+                        .iter()
+                        .map(|(_, scan)| match scan {
+                            QueryTimeOperator::Scan {
+                                range_ms: Some(range_ms),
+                                ..
+                            } => Some(*range_ms as f64 / 1_000.0),
+                            _ => None,
+                        })
+                        .sum::<Option<f64>>()?;
+                    let lifecycle = &queries[query].summary_lifecycle_inputs;
+                    let fold =
+                        update_rate? * scanned_seconds * lifecycle.costs.maintenance_per_update;
+                    let costs = LifecycleUnitCosts {
+                        build: lifecycle.costs.build + fold / query_states[query].len() as f64,
+                        ..lifecycle.costs.clone()
+                    };
+                    price(
+                        state,
+                        std::slice::from_ref(&query),
+                        SummaryMaintenanceLifecycle::Ephemeral,
+                        &model(costs, None, lifecycle.evaluation_interval_ms),
+                    )
+                    .map(|cost| cost.0)
+                })
+                .sum::<Option<f64>>()
+                .map(Cost)
+        } else {
+            None
         };
-        let retained = alternative_cost(
-            deployment,
-            &SummaryMaintenanceLifecycle::ContinuouslyMaintained,
-        );
-        let rebuilt = alternative_cost(deployment, &SummaryMaintenanceLifecycle::Ephemeral);
-        ephemeral[state_index] = rebuild_is_cheaper(retained, rebuilt);
-        decisions.push((state_index, bindable, retained, rebuilt));
+        let retained_states = installs
+            .iter()
+            .map(|install| install.retained_states)
+            .sum::<Option<u64>>();
+        decisions.push((state_index, bindable, retained, rebuilt, retained_states));
     }
     // A query rebuilds either all of its states or none: raw query-time inputs
-    // and exact subtrees share no snapshot with installed state. Retaining is
-    // always realizable, so a query that keeps any state keeps all of them.
+    // and exact subtrees share no snapshot with installed state. States linked
+    // through a query therefore move together, and only when the raw programs
+    // of all their queries cost less than retaining all of them.
     let index_of = |state: &Rc<SummaryNode>| states.iter().position(|(s, _)| Rc::ptr_eq(s, state));
-    loop {
-        let mut changed = false;
-        for (query, owned) in query_states.iter().enumerate() {
-            let realizable = owned.iter().all(|state| {
-                index_of(state).is_some_and(|i| ephemeral[i]) && raw_programs[query].is_some()
-            });
-            if realizable {
-                continue;
+    let mut linked: Vec<usize> = (0..states.len()).collect();
+    for owned in &query_states {
+        let members: Vec<usize> = owned.iter().filter_map(index_of).collect();
+        if let Some(&first) = members.first() {
+            for member in members {
+                let (from, to) = (linked[member], linked[first]);
+                linked
+                    .iter_mut()
+                    .filter(|l| **l == from)
+                    .for_each(|l| *l = to);
             }
-            for state in owned {
-                if let Some(i) = index_of(state).filter(|&i| ephemeral[i]) {
-                    ephemeral[i] = false;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
         }
     }
-    for (state_index, bindable, retained, rebuilt) in decisions {
+    let total = |group: usize, cost: fn(&Decision) -> Option<Cost>| {
+        decisions
+            .iter()
+            .filter(|decision| linked[decision.0] == group)
+            .map(|decision| cost(decision).map(|cost| cost.0))
+            .sum::<Option<f64>>()
+            .map(Cost)
+    };
+    let ephemeral: Vec<bool> = (0..states.len())
+        .map(|state| {
+            rebuild_is_cheaper(
+                total(linked[state], |decision| decision.2),
+                total(linked[state], |decision| decision.3),
+            )
+        })
+        .collect();
+    for (state_index, bindable, retained, rebuilt, retained_states) in decisions {
         let (state, consumers) = &states[state_index];
         placement.trace.push(json!({
             "stage": "deployment.lifecycle_placement",
             "query_ids": consumers.iter().map(|&q| &queries[q].query_id).collect::<Vec<_>>(),
             "logical_root_id": crate::planner_selection::explained_root_id(state, &queries[consumers[0]].accuracy_target),
             "ephemeral_bindable": bindable,
+            "retained_states": retained_states,
             "continuously_maintained_cost": retained.map(|cost| cost.0),
             "ephemeral_cost": rebuilt.map(|cost| cost.0),
             "selected": if ephemeral[state_index] { "ephemeral" } else { "continuously_maintained" },
@@ -499,8 +691,11 @@ pub(super) fn time_native_candidate(
         })
     };
     let lifecycle = &query.summary_lifecycle_inputs;
+    // Windows are prepared from the timed root, so the installed layout is not
+    // known while its timing is being chosen.
     let model = LifecycleCosts {
-        costs: &lifecycle.costs,
+        costs: lifecycle.costs.clone(),
+        retained_states: None,
         evaluation_interval_ms: lifecycle.evaluation_interval_ms,
         input_cardinality: data
             .input_cardinality

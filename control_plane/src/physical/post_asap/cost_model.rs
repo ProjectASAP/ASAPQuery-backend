@@ -397,6 +397,28 @@ impl ControlPlaneCostModel {
         self
     }
 
+    /// The window implementation every complete candidate of this model
+    /// installs, whatever lifecycles its summary states take.
+    pub(crate) fn cheapest_window_implementation(
+        &self,
+    ) -> Option<&(Option<String>, SummaryWindowFramework, Cost)> {
+        self.window_framework_costs
+            .iter()
+            // GOS/error propagation is introduced by the later adaptation
+            // slice. Until then, do not claim an approximate exponential
+            // histogram window is exact.
+            .filter(|(_, framework, _)| {
+                !matches!(framework, SummaryWindowFramework::ExponentialHistogram)
+            })
+            .filter(|(_, _, cost)| cost.0.is_finite() && cost.0 >= 0.0)
+            .min_by(|left, right| {
+                left.2
+                     .0
+                    .total_cmp(&right.2 .0)
+                    .then_with(|| left.0.cmp(&right.0))
+            })
+    }
+
     pub fn with_summary_maintenance(
         mut self,
         lifecycle_costs: SummaryMaintenanceLifecycleCostInputs,
@@ -626,21 +648,7 @@ impl CostModel for ControlPlaneCostModel {
             .iter()
             .map(|deployment| deployment.selected_cost.0)
             .sum();
-        self.window_framework_costs
-            .iter()
-            // GOS/error propagation is introduced by the later adaptation
-            // slice. Until then, do not claim an approximate exponential
-            // histogram window is exact.
-            .filter(|(_, framework, _)| {
-                !matches!(framework, SummaryWindowFramework::ExponentialHistogram)
-            })
-            .filter(|(_, _, cost)| cost.0.is_finite() && cost.0 >= 0.0)
-            .min_by(|left, right| {
-                left.2
-                     .0
-                    .total_cmp(&right.2 .0)
-                    .then_with(|| left.0.cmp(&right.0))
-            })
+        self.cheapest_window_implementation()
             .map(
                 |(id, framework, physical_cost)| CompleteSummaryCandidateEstimate {
                     physical_plan_id: id.clone(),
