@@ -235,6 +235,19 @@ PromQL selector, keeps no state and forwards the whole query as
 whether PromQL drops `__name__` from its result, since Planner keeps it in the
 series identity.
 
+Planner matches per-series rows in query-time arithmetic (`avg_over_time` as
+sum/count, `rate(a) / rate(b)`, `rate(x) * 2`) only by the series identity
+column. When a selected computation fails to compile for lack of that identity,
+the workload is selected again over roots typed with it
+(`promql_rows::with_series_identity`) and added as one more candidate forest;
+deployment pricing chooses among all forests. Every query is retyped so shared
+states keep one semantic definition. A root that cannot be retyped keeps its
+canonical states, so the typed forest is rejected if such a root shares a state
+with a retyped one. Rejections and the typed selection's trace entries (tagged
+`"reselection": "series_identity"`) are kept in the selection trace. The
+adapter fills the identity column from each readout series' labels and decodes
+result labels from it.
+
 Graph traversal is separate from node definitions and store semantics.
 Activation validates roots, edges, bindings, reachability, and cycles.
 The shared physical DAG runtime creates one producer per reachable node and

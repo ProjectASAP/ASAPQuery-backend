@@ -1084,6 +1084,19 @@ mod tests {
         }
     }
 
+    /// `without` aggregations plan on the workload-cost fixture without a
+    /// Planner panic.
+    #[test]
+    fn without_aggregations_plan_on_the_workload_cost_fixture() {
+        for query in ["sum without (pod) (m)", "quantile without (pod) (0.5, m)"] {
+            let mut input = fixture();
+            input.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+                planner_types::workload::Query(query.into());
+            let plan = with_unit_quotes(input).compile_promql().unwrap();
+            plan.query_plan.lookup(query).unwrap();
+        }
+    }
+
     /// Instant counts select current membership, never accumulated observations.
     #[test]
     fn local_grouped_count_has_a_bindable_candidate() {
