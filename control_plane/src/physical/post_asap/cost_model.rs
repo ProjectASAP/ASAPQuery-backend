@@ -42,7 +42,7 @@ pub struct CandidateCostEstimate {
     pub erp_record_ids: Vec<String>,
 }
 
-fn analytical_state_bytes(family: &SummaryFamilyType) -> Option<f64> {
+pub(crate) fn analytical_state_bytes(family: &SummaryFamilyType) -> Option<f64> {
     use asap_types::AggregationType as A;
     use planner_types::post_asap::ExactKind;
     let (aggregation, params) = match family {

@@ -4,9 +4,8 @@
 //! Planner owns semantic legality. A manifest describes the exact physical
 //! demand to price; provider quotes and candidate evaluations are separate.
 
-mod materialization_candidates;
 mod status;
-pub use status::{CandidateEvaluationStatus, CandidateSearchScope};
+pub use status::CandidateEvaluationStatus;
 
 #[cfg(test)]
 use super::compiler::DeploymentPlanCompiler;
@@ -98,23 +97,10 @@ pub struct CandidatePlanEvaluation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MaterializationSearchCoverage {
-    #[serde(rename = "eligible_leaves")]
-    pub eligible_materialization_count: usize,
-    #[serde(rename = "enumerated_local_masks")]
-    pub enumerated_candidate_key_sets: usize,
-    pub exhaustive: bool,
-    #[serde(rename = "scope")]
-    pub search_scope: CandidateSearchScope,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CandidatePlanSelectionReport {
     #[serde(default)]
     #[serde(rename = "logical_selection")]
     pub planner_selection_trace: std::sync::Arc<Vec<Value>>,
-    #[serde(default)]
-    pub materialization_search_coverage: Option<MaterializationSearchCoverage>,
     pub data_snapshot_id: String,
     pub model_version: String,
     pub selected_plan_id: u64,
@@ -294,16 +280,20 @@ pub fn manifest(
                 let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: population.metric.clone() }, "location": "backend", "ingest": plan.precompute_plan.ingest});
                 add(format!("source:{source}"), source, "horizon", 1.0);
             }
-            if matches!(
-                node,
-                crate::query_plan::QueryPlanNode::Logical {
-                    operator: crate::query_plan::query_time::QueryTimeOperator::Scan { .. },
-                    ..
-                }
-            ) {
-                return Err(invalid(
-                    "generic backend raw scans are outside the ASAP/Prometheus execution contract",
-                ));
+            if let crate::query_plan::QueryPlanNode::Logical {
+                operator: crate::query_plan::query_time::QueryTimeOperator::Scan { metric, .. },
+                ..
+            } = node
+            {
+                // Only a native program reads raw series, from Prometheus at
+                // query time; its per-evaluation read is the query node below.
+                let (Some(metric), Some(_)) = (metric, &entry.physical_dag) else {
+                    return Err(invalid(
+                        "generic backend raw scans are outside the ASAP/Prometheus execution contract",
+                    ));
+                };
+                let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: metric.clone() }, "location": "exact_backend"});
+                add(format!("source:{source}"), source, "horizon", 1.0);
             }
             if let crate::query_plan::QueryPlanNode::Logical {
                 operator:
@@ -545,7 +535,6 @@ fn candidate_description<'a>(
                 &(
                     &logical_root_ids,
                     candidate.allow_mixed_summary_and_exact_execution,
-                    &candidate.enabled_materialization_keys,
                 ),
             )
         }),
@@ -706,23 +695,6 @@ fn select_candidates(
             "candidate inventory must contain 1..=4096 candidates",
         ));
     }
-    let candidate_key_sets: BTreeSet<_> = candidates
-        .iter()
-        .filter(|c| c.allow_mixed_summary_and_exact_execution)
-        .filter_map(|c| c.enabled_materialization_keys.clone())
-        .collect();
-    let eligible_keys: BTreeSet<_> = candidate_key_sets
-        .iter()
-        .flat_map(|p| p.iter().cloned())
-        .collect();
-    let materialization_search_coverage =
-        (!candidate_key_sets.is_empty()).then(|| MaterializationSearchCoverage {
-            eligible_materialization_count: eligible_keys.len(),
-            enumerated_candidate_key_sets: candidate_key_sets.len(),
-            exhaustive: eligible_keys.len() < usize::BITS as usize
-                && candidate_key_sets.len() == (1usize << eligible_keys.len()),
-            search_scope: CandidateSearchScope::PlannerAuthorizedMaterializations,
-        });
     let planner_selection_trace = candidates[0].planner_selection_trace.clone();
     let mut comparison_workload = None;
     let mut candidate_evaluations = Vec::new();
@@ -793,7 +765,6 @@ fn select_candidates(
     candidate_evaluations[best_index].status = CandidateEvaluationStatus::Selected;
     plan.cost_comparison = Some(CandidatePlanSelectionReport {
         planner_selection_trace,
-        materialization_search_coverage,
         data_snapshot_id: evidence.data_snapshot_id.clone(),
         model_version: evidence.model_version.clone(),
         selected_plan_id: plan.envelope.plan_id,
@@ -823,8 +794,6 @@ pub fn enumerate_exact_and_materialized_candidates(
             if !candidates.iter().any(|existing| {
                 existing.allow_mixed_summary_and_exact_execution
                     == candidate.allow_mixed_summary_and_exact_execution
-                    && existing.enabled_materialization_keys
-                        == candidate.enabled_materialization_keys
                     && existing
                         .queries
                         .iter()
@@ -893,7 +862,6 @@ fn enumerate_frontier_candidates(
                 }
                 if maintained_roots.iter().all(Option::is_some) {
                     candidate.allow_mixed_summary_and_exact_execution = false;
-                    candidate.enabled_materialization_keys = None;
                 }
                 Some(candidate)
             })
@@ -902,8 +870,6 @@ fn enumerate_frontier_candidates(
             if !candidates.iter().any(|existing| {
                 existing.allow_mixed_summary_and_exact_execution
                     == candidate.allow_mixed_summary_and_exact_execution
-                    && existing.enabled_materialization_keys
-                        == candidate.enabled_materialization_keys
                     && existing
                         .queries
                         .iter()
@@ -934,12 +900,14 @@ fn enumerate_frontier_candidates(
     Ok(candidates)
 }
 
+/// The Planner-selected candidate and the whole-workload native exact
+/// alternative. Placement within a candidate is a lifecycle decision made
+/// during compilation, so no per-state variants are enumerated here.
 fn materialization_candidates(
     request: PhysicalCompilationRequest,
 ) -> Result<Vec<PhysicalCompilationRequest>, CompileError> {
     let mut exact = request.clone();
     exact.allow_mixed_summary_and_exact_execution = false;
-    exact.enabled_materialization_keys = None;
     for (index, query) in exact.queries.iter_mut().enumerate() {
         let parsed = if let Some(root) = request.canonical_roots.get(index) {
             root.as_ref().clone()
@@ -962,42 +930,7 @@ fn materialization_candidates(
     {
         Ok(vec![request])
     } else {
-        if !request.allow_mixed_summary_and_exact_execution
-            || request.enabled_materialization_keys.is_some()
-        {
-            return Ok(vec![request, exact]);
-        }
-        let mut keys = BTreeSet::new();
-        for query in &request.queries {
-            match crate::query_plan::query_time::eligible_materialization_keys(
-                &query.query_string,
-                &query.selected_plan_root,
-            ) {
-                Ok(found) => keys.extend(found),
-                // A failed local projection must not make the native candidate
-                // disappear. Compile/select_lowest_cost_candidate retains its concrete unavailability.
-                Err(_) => return Ok(vec![request, exact]),
-            }
-        }
-        if keys.is_empty() {
-            return Ok(vec![request, exact]);
-        }
-        let inventory = materialization_candidates::enumerate(keys);
-        debug_assert_eq!(
-            inventory.exhaustive,
-            inventory.eligible_materialization_count <= 4
-        );
-        let mut candidate_requests: Vec<_> = inventory
-            .candidate_key_sets
-            .into_iter()
-            .map(|enabled_keys| {
-                let mut candidate = request.clone();
-                candidate.enabled_materialization_keys = Some(enabled_keys);
-                candidate
-            })
-            .collect();
-        candidate_requests.push(exact);
-        Ok(candidate_requests)
+        Ok(vec![request, exact])
     }
 }
 
@@ -1425,59 +1358,37 @@ mod tests {
         );
     }
 
+    /// One query keeps all of its states or rebuilds all of them at query
+    /// time, so a binary never mixes installed state with exact subtrees.
     #[test]
-    fn materialization_masks_reject_mixed_snapshots_before_costing() {
-        let mut snapshot = fixture();
-        let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
-        q.query =
-            planner_types::workload::Query("max_over_time(a[1m]) + max_over_time(b[1m])".into());
-        q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
-            crate::types::AccuracyTarget::Exact,
-        );
-        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        let candidates = enumerate_frontier_candidates(request).unwrap();
-        assert_eq!(
-            candidates.len(),
-            5,
-            "four proposed candidate key sets plus native"
-        );
-        let mut identities = BTreeSet::new();
-        let mut rejected = 0;
-        for candidate in &candidates[..4] {
-            let enabled = candidate
-                .enabled_materialization_keys
-                .as_ref()
-                .unwrap()
-                .len();
-            let result =
-                DeploymentPlanCompiler.compile_promql(candidate.clone(), environment.clone());
-            if enabled == 1 {
-                let Err(error) = result else {
-                    panic!("mixed snapshots must fail binding");
-                };
-                assert!(
-                    error.to_string().contains("common snapshot proof"),
-                    "{error}"
-                );
-                rejected += 1;
-                continue;
-            }
-            let plan = result.unwrap();
-            assert!(identities.insert(plan.envelope.plan_id));
-            let cost = manifest(&plan, &candidate.queries).unwrap();
+    fn placement_never_mixes_installed_and_query_time_operands() {
+        for (store, materialized) in [(0.0, 2), (1.0, 0)] {
+            let mut snapshot = fixture();
+            snapshot
+                .physical_inputs
+                .lifecycle_costs
+                .store_per_byte_second = store;
+            let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+            q.query = planner_types::workload::Query(
+                "max_over_time(a[1m]) + max_over_time(b[1m])".into(),
+            );
+            q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
+                crate::types::AccuracyTarget::Exact,
+            );
+            let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+            let candidates = enumerate_frontier_candidates(request).unwrap();
+            assert_eq!(candidates.len(), 2, "selected candidate plus native");
+            let plan = DeploymentPlanCompiler
+                .compile_promql(candidates[0].clone(), environment)
+                .unwrap();
+            assert_eq!(plan.precompute_plan.materializations.len(), materialized);
+            let cost = manifest(&plan, &candidates[0].queries).unwrap();
             assert_eq!(
                 cost.components
                     .keys()
                     .filter(|k| k.starts_with("state:backend:"))
                     .count(),
-                enabled * 4
-            );
-            assert_eq!(
-                cost.components
-                    .keys()
-                    .filter(|k| k.starts_with("raw-state:"))
-                    .count(),
-                0
+                materialized * 4
             );
             assert_eq!(
                 cost.components
@@ -1486,25 +1397,10 @@ mod tests {
                         && v.implementation.get("location").and_then(Value::as_str)
                             == Some("exact_backend"))
                     .count(),
-                2 - enabled
+                2 - materialized
             );
-            assert!(!plan
-                .query_plan
-                .entries
-                .values()
-                .any(|entry| entry.nodes.values().any(|node| matches!(
-                    node,
-                    crate::query_plan::QueryPlanNode::ExactFallback { .. }
-                ))));
+            assert!(!candidates[1].allow_mixed_summary_and_exact_execution);
         }
-        assert_eq!(rejected, 2);
-        assert_eq!(identities.len(), 2);
-        assert!(
-            !candidates
-                .last()
-                .unwrap()
-                .allow_mixed_summary_and_exact_execution
-        );
     }
 
     fn quoted() -> (

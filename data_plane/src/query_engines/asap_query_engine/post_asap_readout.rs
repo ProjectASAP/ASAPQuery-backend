@@ -1856,6 +1856,9 @@ mod tests {
                     entry["demand"]["fixed_interval_at"] = serde_json::json!({
                         "interval": evaluation_secs * 1_000, "evaluation_phase": phase_ms
                     });
+                    // Window schedules belong to retained state; without a
+                    // query-time raw source sparse reads cannot move it to query time.
+                    snapshot["implementation"]["require_backend_local_execution"] = true.into();
                     let snapshot: BackendLocalPlanningInput =
                         serde_json::from_value(snapshot).unwrap();
                     let (mut request, env) = snapshot.into_physical_compilation_request().unwrap();
