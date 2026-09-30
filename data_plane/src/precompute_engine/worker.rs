@@ -9,9 +9,9 @@ use crate::storage_engines::types::{
 };
 #[cfg(test)]
 use crate::tests::accumulator_fixture::create_fixture_accumulator;
+use asap_physical_operators::factory::AccumulatorUpdater;
 use asap_summary_state::codec::KeyCodec;
-use asap_summary_state::factory::AccumulatorUpdater;
-use asap_summary_state::summary_kernels::sum::SumAccumulator;
+use asap_summary_state::StoredState;
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 use asap_types::SampleUpdateRule;
@@ -1016,7 +1016,7 @@ impl Worker {
         Ok(())
     }
 
-    /// Raw fast-path: emit each sample as a standalone `SumAccumulator`.
+    /// Raw fast-path: emit each sample as a standalone exact Sum state.
     pub fn process_samples_raw(
         &self,
         series_key: &str,
@@ -1031,7 +1031,10 @@ impl Worker {
             let output =
                 PrecomputedOutput::new(ts as u64, ts as u64, None, PolicyFingerprint::UNSET);
             let _ = self.raw_mode_aggregation_id;
-            let accumulator = SumAccumulator::with_sum(val);
+            let accumulator = asap_summary_state::stored_state::codec::exact_value(
+                planner_types::post_asap::ExactKind::Sum,
+                val,
+            );
             emit_batch.push((output, Box::new(accumulator)));
         }
 
@@ -1759,8 +1762,14 @@ mod tests {
         let mut output = PrecomputedOutput::new(0, 1000, None, PolicyFingerprint(1));
         output.input_revision = Some(revision);
         let merged = coalesce_admitted_outputs(vec![
-            (output.clone(), Box::new(SumAccumulator::with_sum(2.0))),
-            (output, Box::new(SumAccumulator::with_sum(3.0))),
+            (
+                output.clone(),
+                Box::new(crate::tests::accumulator_fixture::sum_state(2.0)),
+            ),
+            (
+                output,
+                Box::new(crate::tests::accumulator_fixture::sum_state(3.0)),
+            ),
         ])
         .unwrap();
         assert_eq!(merged.len(), 1);
@@ -1768,7 +1777,8 @@ mod tests {
             merged[0]
                 .1
                 .as_any()
-                .downcast_ref::<SumAccumulator>()
+                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
                 .unwrap()
                 .sum,
             5.0
@@ -1888,10 +1898,9 @@ mod tests {
     use crate::precompute_engine::config::LateDataPolicy;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::InstalledPrecomputePlan;
+    use asap_physical_operators::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
+    use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
     use asap_sketchlib::KllSketch;
-    use asap_summary_state::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
-    use asap_summary_state::summary_kernels::keyed_sum_count::KeyedSumCountAccumulator;
-    use asap_summary_state::summary_kernels::sum::SumAccumulator;
     use asap_types::enums::WindowKind;
     use asap_types::sds::StoredOutputId;
     use asap_types::AggregationType;
@@ -2063,7 +2072,8 @@ mod tests {
             captured[0]
                 .1
                 .as_any()
-                .downcast_ref::<SumAccumulator>()
+                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
                 .unwrap()
                 .sum,
             0.0
@@ -2093,8 +2103,9 @@ mod tests {
             assert!(output.policy_fp.is_unset());
             let sum_acc = acc
                 .as_any()
-                .downcast_ref::<SumAccumulator>()
-                .expect("should be SumAccumulator");
+                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
+                .expect("should be an exact Sum");
             assert!(
                 (sum_acc.sum - val).abs() < 1e-10,
                 "sum should equal sample value"
@@ -2176,8 +2187,9 @@ mod tests {
 
         let sum_acc = acc
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("should be SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("should be an exact Sum");
         assert!(
             (sum_acc.sum - 6.0).abs() < 1e-10,
             "sum should be 1+2+3=6, got {}",
@@ -2247,8 +2259,9 @@ mod tests {
 
         let sum_acc = acc
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("should be SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("should be an exact Sum");
         assert!(
             (sum_acc.sum - 30.0).abs() < 1e-10,
             "sum should be 10+20=30, got {} (both series merged)",
@@ -2324,7 +2337,11 @@ mod tests {
 
         let mut sums_by_key: HashMap<String, f64> = HashMap::new();
         for (output, acc) in &captured {
-            let sum_acc = acc.as_any().downcast_ref::<SumAccumulator>().unwrap();
+            let sum_acc = acc
+                .as_any()
+                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
+                .unwrap();
             let key = output.key.as_ref().unwrap().labels.join(";");
             sums_by_key.insert(key, sum_acc.sum);
         }
@@ -2469,8 +2486,9 @@ mod tests {
         for (_output, acc) in &captured {
             let sum_acc = acc
                 .as_any()
-                .downcast_ref::<SumAccumulator>()
-                .expect("should be SumAccumulator");
+                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
+                .expect("should be an exact Sum");
             assert!(
                 (sum_acc.sum - 42.0).abs() < 1e-10,
                 "pane should have sum=42, got {}",
@@ -2531,7 +2549,8 @@ mod tests {
             assert_eq!(
                 accumulator
                     .as_any()
-                    .downcast_ref::<SumAccumulator>()
+                    .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
                     .unwrap()
                     .sum,
                 42.0
@@ -2600,24 +2619,21 @@ mod tests {
         let (_output, acc) = &captured[0];
         let ms_acc = acc
             .as_any()
-            .downcast_ref::<KeyedSumCountAccumulator>()
-            .expect("should be KeyedSumCountAccumulator");
-
-        // The KeyedSumCountAccumulator should have two internal keys: "A" and "B"
-        assert_eq!(ms_acc.sums.len(), 2, "two host keys inside one accumulator");
-
-        let mut found_a = false;
-        let mut found_b = false;
-        for (key, &sum) in &ms_acc.sums {
-            if key.labels == vec!["A".to_string()] {
-                assert!((sum - 10.0).abs() < 1e-10);
-                found_a = true;
-            }
-            if key.labels == vec!["B".to_string()] {
-                assert!((sum - 20.0).abs() < 1e-10);
-                found_b = true;
-            }
-        }
+            .downcast_ref::<ExactAccumulator>()
+            .expect("should be a keyed exact Sum");
+        assert!(ms_acc.is_keyed(), "both host keys inside one accumulator");
+        let sum = |host: &str| {
+            ms_acc
+                .readout(
+                    asap_types::Statistic::Sum,
+                    None,
+                    Some(&KeyByLabelValues::new_with_labels(vec![host.into()])),
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let found_a = (sum("A") - 10.0).abs() < 1e-10;
+        let found_b = (sum("B") - 20.0).abs() < 1e-10;
         assert!(found_a, "expected key A inside accumulator");
         assert!(found_b, "expected key B inside accumulator");
     }
@@ -2762,8 +2778,9 @@ mod tests {
 
         let sum_acc = acc
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("should be SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("should be an exact Sum");
         assert!(
             (sum_acc.sum - 55.0).abs() < 1e-10,
             "late sample sum should be 55.0, got {}",
@@ -2955,8 +2972,9 @@ mod tests {
         let sum = group_b
             .1
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("must emit SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("must emit an exact Sum");
         assert_eq!(sum.sum, 6.0, "group B's second sample must not be late");
     }
 
@@ -3007,8 +3025,9 @@ mod tests {
         let sum = emitted[0]
             .1
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("must emit SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("must emit an exact Sum");
         assert_eq!(sum.sum, 3.0, "flush must not manufacture event time");
     }
 
@@ -3185,8 +3204,8 @@ mod tests {
     // OTLP ingest dispatch builds via `decode_modified_otlp_sketch_bytes`.
     // -----------------------------------------------------------------------
 
+    use asap_physical_operators::summary_kernels::DDSketchAccumulator;
     use asap_sketchlib::DdSketch;
-    use asap_summary_state::summary_kernels::DDSketchAccumulator;
 
     /// Build a fresh DDSketch holding `vals` so each test has a real,
     /// non-empty sketch to push through `process_accumulator_input`.
@@ -3198,10 +3217,7 @@ mod tests {
             // positive-only is the realistic shape.
             s.update(*v);
         }
-        DDSketchAccumulator {
-            inner: s,
-            sample_p: 1.0,
-        }
+        DDSketchAccumulator { inner: s }
     }
 
     /// Pinning test: a single-group, single-window sketch ingest must
@@ -3635,8 +3651,9 @@ mod tests {
         let sum = captured[0]
             .1
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("must emit SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("must emit an exact Sum");
         assert!((sum.sum - expected_sum).abs() < 1e-9);
     }
 
@@ -3685,8 +3702,9 @@ mod tests {
         let initial = captured.pop().expect("deadline output").1;
         let sum = initial
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("must emit SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("must emit an exact Sum");
         assert_eq!(sum.sum, 28.0);
 
         // Continuing input for the already-closed event-time window becomes a
@@ -3708,8 +3726,9 @@ mod tests {
             .expect("deadline output and correction must merge");
         let merged_sum = merged
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("merged output must remain SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("merged output must remain an exact Sum");
         assert_eq!(merged_sum.sum, 36.0);
     }
 
@@ -3950,7 +3969,6 @@ mod tests {
     // A pooled Sum is correct only for an explicit cross-entity reduction.
     #[test]
     fn pooled_sum_does_not_preserve_per_entity_output_rows() {
-        use asap_summary_state::summary_kernels::SumAccumulator;
         let config = make_agg_config(
             1,
             "gauge",
@@ -3987,7 +4005,8 @@ mod tests {
             captured[0]
                 .1
                 .as_any()
-                .downcast_ref::<SumAccumulator>()
+                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
                 .unwrap()
                 .sum,
             240.0
@@ -4004,7 +4023,6 @@ mod tests {
     // The physical compiler rejects raw counter producers until series state is preserved.
     #[test]
     fn pooled_counter_samples_lose_independent_same_timestamp_reset() {
-        use asap_summary_state::summary_kernels::IncreaseAccumulator;
         let config = make_agg_config(
             1,
             "requests_total",
@@ -4037,15 +4055,18 @@ mod tests {
             .unwrap();
         worker.force_close_all().unwrap();
         let captured = sink.drain();
-        let accumulator = captured[0]
+        let total_increase = captured[0]
             .1
             .as_any()
-            .downcast_ref::<IncreaseAccumulator>()
+            .downcast_ref::<ExactAccumulator>()
+            .unwrap()
+            .readout(asap_types::Statistic::Increase, None, None)
+            .unwrap()
             .unwrap();
-        assert_eq!(accumulator.total_increase, 10.0);
+        assert_eq!(total_increase, 10.0);
         let independent_increases = (110.0 - 100.0) + 5.0;
         assert_eq!(independent_increases, 15.0);
-        assert_ne!(accumulator.total_increase, independent_increases);
+        assert_ne!(total_increase, independent_increases);
     }
 
     // Acknowledgement proves FIFO input processing and trailing-window publication.
@@ -4089,7 +4110,8 @@ mod tests {
             outputs[0]
                 .1
                 .as_any()
-                .downcast_ref::<SumAccumulator>()
+                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+                .map(crate::tests::accumulator_fixture::sum_view)
                 .unwrap()
                 .sum,
             5.0
@@ -4278,8 +4300,9 @@ mod tests {
         assert_eq!(output.end_timestamp, 10_000);
         let sum_acc = acc
             .as_any()
-            .downcast_ref::<SumAccumulator>()
-            .expect("should be SumAccumulator");
+            .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
+            .map(crate::tests::accumulator_fixture::sum_view)
+            .expect("should be an exact Sum");
         assert!(
             (sum_acc.sum - 5.0).abs() < 1e-10,
             "5 samples of 1.0 → sum 5, got {}",
@@ -4368,7 +4391,7 @@ mod dag_execution_tests {
     use super::*;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::InstalledPrecomputePlan;
-    use asap_summary_state::summary_kernels::exact::ExactAccumulator;
+    use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
     use asap_types::query_plan::ExactReadout;
 
     fn plan(query: &str) -> control_plane::physical::compiler::CompiledPhysicalPlan {
@@ -4578,9 +4601,10 @@ mod dag_execution_tests {
                         state.get_accumulator_type().planner_exact_family(),
                         Some(readout.planner_family())
                     );
-                    let restored =
-                        ExactAccumulator::deserialize_from_bytes(&state.serialize_to_bytes())
-                            .unwrap();
+                    let restored = asap_summary_state::stored_state::codec::decode_exact(
+                        &state.serialize_to_bytes(),
+                    )
+                    .unwrap();
                     states.insert(
                         output.end_timestamp as i64,
                         Arc::new(restored) as Arc<dyn AggregateCore>,
@@ -4774,7 +4798,7 @@ mod dag_execution_tests {
                                     end as u64,
                                 ))
                                 .or_insert_with(|| {
-                                    asap_summary_state::factory::create_planner_accumulator(
+                                    asap_physical_operators::factory::create_planner_accumulator(
                                         &program.family,
                                         &program.input,
                                         &program.grouping,
@@ -5024,12 +5048,13 @@ mod dag_execution_tests {
         assert!(!corrections.is_empty(), "late sample must be forwarded");
         for (_, state) in corrections {
             let exact =
-                ExactAccumulator::deserialize_from_bytes(&state.serialize_to_bytes()).unwrap();
+                asap_summary_state::stored_state::codec::decode_exact(&state.serialize_to_bytes())
+                    .unwrap();
             assert_eq!(
                 exact
-                    .query_statistic(asap_types::Statistic::Sum, &None, &Default::default())
+                    .readout(asap_types::Statistic::Sum, None, None)
                     .unwrap(),
-                7.0
+                Some(7.0)
             );
         }
     }

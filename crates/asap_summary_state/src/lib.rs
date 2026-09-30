@@ -1,19 +1,16 @@
-//! Backend-owned summary state: the kernels that ingest and the sketch store
-//! keep, their stored byte formats, and conversion to Planner physical states.
+//! Backend-owned summary storage: stored byte formats of Planner kernel
+//! states, edge wire decoding, delta reconstruction and readout binding.
 //!
-//! Planner's `asap-physical-operators` keeps only in-memory computation state.
-//! Storage formats, delta reconstruction and the legacy per-statistic kernels
-//! are deployment concerns and live here.
-
-pub mod summary_kernels;
-pub use summary_kernels::{factory, traits};
-pub use traits::*;
+//! Planner's `asap-physical-operators` owns summary computation (update,
+//! merge, estimate). The store keeps those kernel states directly; this crate
+//! only encodes, decodes and reads them.
 
 mod aggregation_type;
 pub use aggregation_type::AggregationType;
 
 pub mod codec;
-pub mod physical;
 pub mod stored_state;
+pub mod univmon;
 
-pub use asap_physical_operators::{KeyByLabelValues, Measurement, Statistic};
+pub use asap_physical_operators::{AggregateCore, KeyByLabelValues, Measurement, Statistic};
+pub use stored_state::codec::StoredState;

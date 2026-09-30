@@ -1052,15 +1052,10 @@ mod tests {
         let groups = [1, 2]
             .into_iter()
             .map(|samples| {
-                let mut state = asap_summary_state::summary_kernels::IncreaseAccumulator::new(
-                    Measurement::new(10.0),
-                    10_000,
-                    Measurement::new(10.0),
-                    10_000,
+                let state = crate::tests::accumulator_fixture::counter_state(
+                    planner_types::post_asap::ExactKind::Rate,
+                    &[(10_000, 10.0), (20_000, 20.0)][..samples],
                 );
-                if samples == 2 {
-                    state.update(Measurement::new(20.0), 20_000);
-                }
                 (
                     BTreeMap::from([("instance".into(), samples.to_string())]),
                     GroupState::ExactAgg {
@@ -1126,11 +1121,9 @@ mod tests {
             policy_fp: policy,
         });
         for (start, time, value) in [(20_000, 25_000, 10.), (40_000, 45_000, 20.)] {
-            let state = asap_summary_state::summary_kernels::IncreaseAccumulator::new(
-                Measurement::new(value),
-                time,
-                Measurement::new(value),
-                time,
+            let state = crate::tests::accumulator_fixture::counter_state(
+                planner_types::post_asap::ExactKind::Rate,
+                &[(time, value)],
             );
             idx.append_precompute(7, BTreeMap::new(), (start, start + 10_000), Box::new(state));
         }
@@ -1197,7 +1190,7 @@ mod tests {
                 sid,
                 BTreeMap::from([("instance".into(), instance.into())]),
                 (0, 1_000),
-                Box::new(asap_summary_state::summary_kernels::SumAccumulator::with_sum(1.)),
+                Box::new(crate::tests::accumulator_fixture::sum_state(1.)),
             );
         }
         let binding = asap_types::query_plan::MaterializationBinding {
@@ -1769,7 +1762,7 @@ mod tests {
             1,
             BTreeMap::new(),
             (1_000, 2_000),
-            Box::new(asap_summary_state::summary_kernels::SumAccumulator::with_sum(42.0)),
+            Box::new(crate::tests::accumulator_fixture::sum_state(42.0)),
         );
         let config =
             test_plan::materialization("bytes_total", "Sum", serde_json::json!({}), &[], 1000);
@@ -1869,9 +1862,7 @@ mod tests {
                             7,
                             BTreeMap::new(),
                             bounds,
-                            Box::new(
-                                asap_summary_state::summary_kernels::SumAccumulator::with_sum(sum),
-                            ),
+                            Box::new(crate::tests::accumulator_fixture::sum_state(sum)),
                         );
                     }
                     let entry = plan.query_plan.entries.values().next().unwrap();
@@ -1938,11 +1929,9 @@ mod tests {
                 7,
                 BTreeMap::new(),
                 (pane * 60_000, (pane + 1) * 60_000),
-                Box::new(
-                    asap_summary_state::summary_kernels::SumAccumulator::with_sum(
-                        (pane + 1) as f64,
-                    ),
-                ),
+                Box::new(crate::tests::accumulator_fixture::sum_state(
+                    (pane + 1) as f64,
+                )),
             );
         }
         let entry = plan.query_plan.entries.values().next().unwrap();
@@ -2013,11 +2002,9 @@ mod tests {
                 7,
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
-                Box::new(
-                    asap_summary_state::summary_kernels::SumAccumulator::with_sum(
-                        (pane + 1) as f64,
-                    ),
-                ),
+                Box::new(crate::tests::accumulator_fixture::sum_state(
+                    (pane + 1) as f64,
+                )),
             );
         }
 
@@ -2082,7 +2069,7 @@ mod tests {
                 7,
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
-                Box::new(asap_summary_state::summary_kernels::SumAccumulator::with_sum(1.0)),
+                Box::new(crate::tests::accumulator_fixture::sum_state(1.0)),
             );
         }
         assert!(
@@ -2111,16 +2098,15 @@ mod tests {
             expires_at_ms: None,
             policy_fp: policy,
         });
-        use crate::storage_engines::types::Measurement;
-        let mut accumulator = asap_summary_state::summary_kernels::IncreaseAccumulator::new(
-            Measurement::new(10.0),
-            10_000,
-            Measurement::new(10.0),
-            10_000,
+        let accumulator = crate::tests::accumulator_fixture::counter_state(
+            planner_types::post_asap::ExactKind::Rate,
+            &[
+                (10_000, 10.0),
+                (20_000, 20.0),
+                (30_000, 3.0),
+                (50_000, 13.0),
+            ],
         );
-        accumulator.update(Measurement::new(20.0), 20_000);
-        accumulator.update(Measurement::new(3.0), 30_000);
-        accumulator.update(Measurement::new(13.0), 50_000);
         idx.append_precompute(7, BTreeMap::new(), (0, 60_000), Box::new(accumulator));
 
         let entry = asap_types::query_plan::QueryPlanEntry {

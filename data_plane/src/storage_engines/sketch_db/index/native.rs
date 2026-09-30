@@ -4,13 +4,12 @@ use super::*;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use asap_physical_operators::values::{Batch, Schema, Value};
 use asap_summary_state::{
-    stored_state::native::{decode_batch, encode_batch},
-    AggregateCore, SerializableToSink,
+    stored_state::native::{decode_batch, encode_batch, NativeSummaryOutput, NATIVE_OUTPUT_TYPE},
+    AggregateCore, StoredState,
 };
 #[cfg(test)]
 use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
-const NATIVE_OUTPUT_TYPE: &str = "NativePhysicalOutputV1";
 const NATIVE_OUTPUT_TAG: u8 = persistence::part::encoding_tag::NATIVE_BATCH_V1;
 
 /// Preserve execution failures across the storage boundary; missing state remains
@@ -30,134 +29,6 @@ impl From<String> for NativeReadError {
 impl From<&'static str> for NativeReadError {
     fn from(message: &'static str) -> Self {
         Self::Unavailable(message.into())
-    }
-}
-
-#[derive(Clone)]
-struct NativeSummaryOutput {
-    batch: Batch,
-    bytes: Vec<u8>,
-    kind: AggregationType,
-}
-impl NativeSummaryOutput {
-    fn new(batch: Batch, max_bytes: usize) -> Result<Self, String> {
-        let families = batch
-            .schema()
-            .fields
-            .iter()
-            .filter_map(|field| {
-                (!matches!(
-                    field.dtype,
-                    planner_types::post_asap::SummaryFamilyType::Plain(_)
-                ))
-                .then_some(&field.dtype)
-            })
-            .collect::<Vec<_>>();
-        let [family] = families.as_slice() else {
-            return Err("native stored batch requires one summary column".into());
-        };
-        use planner_types::post_asap::{SketchAlgorithm, SummaryFamilyType};
-        let schema_kind = match family {
-            SummaryFamilyType::Sketch(sketch, _) => match sketch.algorithm() {
-                SketchAlgorithm::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
-                SketchAlgorithm::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
-                _ => None,
-            },
-            SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _) => {
-                Some(AggregationType::Sum)
-            }
-            _ => None,
-        };
-        let mut kind = schema_kind;
-        for row in batch.rows() {
-            let states = row
-                .iter()
-                .filter_map(|value| match value {
-                    Value::Summary { state, .. } => Some(state),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let [state] = states.as_slice() else {
-                return Err("native stored row requires one summary state".into());
-            };
-            let row_kind = asap_summary_state::physical::aggregation_type(state.as_ref())
-                .map_err(|error| error.to_string())?;
-            if kind.is_some_and(|kind| kind != row_kind) {
-                return Err("native stored rows have different summary families".into());
-            }
-            kind = Some(row_kind);
-        }
-        let kind = kind.ok_or("empty native batch has no supported summary family")?;
-        let bytes = encode_batch(&batch).map_err(|error| error.to_string())?;
-        if bytes.len() > max_bytes || batch.bytes() > max_bytes {
-            return Err("native summary exceeds publication/read budget".into());
-        }
-        Ok(Self { batch, bytes, kind })
-    }
-    fn validate_group(&self, group: &BTreeMap<String, String>) -> Result<(), String> {
-        for (key, value) in group {
-            let column = self
-                .batch
-                .schema()
-                .fields
-                .iter()
-                .position(|field| &field.name == key)
-                .ok_or("native output is missing its stored group key")?;
-            if self
-                .batch
-                .rows()
-                .iter()
-                .any(|row| !matches!(&row[column], Value::Utf8(actual) if actual.as_ref() == value))
-            {
-                return Err("native output group differs from stored address".into());
-            }
-        }
-        Ok(())
-    }
-}
-impl SerializableToSink for NativeSummaryOutput {
-    fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.bytes.clone()
-    }
-    fn serialize_to_json(&self) -> serde_json::Value {
-        serde_json::json!({"format": NATIVE_OUTPUT_TYPE, "bytes": self.bytes})
-    }
-}
-impl AggregateCore for NativeSummaryOutput {
-    fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
-        Box::new(self.clone())
-    }
-    fn type_name(&self) -> &'static str {
-        NATIVE_OUTPUT_TYPE
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn get_accumulator_type(&self) -> AggregationType {
-        self.kind
-    }
-    fn get_keys(&self) -> Option<Vec<crate::storage_engines::types::KeyByLabelValues>> {
-        None
-    }
-    fn approx_memory_bytes(&self) -> usize {
-        self.bytes.len() + self.batch.bytes()
-    }
-    fn merge_with(
-        &self,
-        _: &dyn AggregateCore,
-    ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error + Send + Sync>> {
-        Err("native output snapshots require an explicit physical merge operator".into())
-    }
-    fn query_statistic(
-        &self,
-        _: asap_types::Statistic,
-        _: &Option<crate::storage_engines::types::KeyByLabelValues>,
-        _: &HashMap<String, String>,
-    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        Err("native output readout requires the installed physical DAG".into())
     }
 }
 
@@ -188,7 +59,7 @@ impl SketchStore {
         let state = NativeSummaryOutput::new(batch, max_bytes)?;
         let family = config.accumulator_spec().map_err(|e| e.to_string())?.family;
         if state
-            .batch
+            .batch()
             .schema()
             .fields
             .iter()
@@ -202,7 +73,7 @@ impl SketchStore {
         {
             return Err("native output schema differs from installed definition".into());
         }
-        for value in state.batch.rows().iter().flatten() {
+        for value in state.batch().rows().iter().flatten() {
             if let Value::Summary { family: actual, .. } = value {
                 if actual != &family {
                     return Err("native output family differs from installed definition".into());
@@ -385,7 +256,7 @@ impl SketchStore {
             .as_any()
             .downcast_ref::<NativeSummaryOutput>()
             .ok_or("native output decoder mismatch")?;
-        Ok(state.batch.clone())
+        Ok(state.batch().clone())
     }
 }
 
@@ -541,8 +412,8 @@ mod tests {
             let mut output = PrecomputedOutput::new(0, 60_000, None, source.policy_fingerprint());
             output.population_labels = Some(group);
             output.catalog_generation = Some(generation.clone());
-            let mut state = asap_summary_state::summary_kernels::SumAccumulator::new();
-            state.update(value);
+            let mut state = crate::tests::accumulator_fixture::sum_state(0.0);
+            state.update(None, value, 0);
             store
                 .publish_admitted_summary_update(
                     &generation,
@@ -571,11 +442,9 @@ mod tests {
             .iter()
             .flat_map(|input| input.windows.values())
             .map(|state| {
-                vec![Value::Float64(
-                    state
-                        .query_statistic(asap_types::Statistic::Sum, &None, &HashMap::new())
-                        .unwrap(),
-                )]
+                vec![Value::Float64(crate::tests::accumulator_fixture::sum_of(
+                    state.as_ref(),
+                ))]
             })
             .collect();
         let raw_schema = Arc::new(SummarySchema {

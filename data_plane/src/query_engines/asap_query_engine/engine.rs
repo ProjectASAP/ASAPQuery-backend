@@ -919,37 +919,6 @@ impl ASAPQueryEngine {
         })
     }
 
-    #[cfg(test)]
-    fn query_precompute_for_statistic(
-        &self,
-        precompute: &dyn AggregateCore,
-        statistic: &Statistic,
-        key: &Option<KeyByLabelValues>,
-        query_kwargs: &HashMap<String, String>,
-    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        // Phase 1b of the sketch DB design
-        // (docs/design_docs/summary-storage.md):
-        // for single-subpopulation queries on additive statistics
-        // (Count / Sum / Min / Max), serve from the typed aux
-        // columns without deserialising the sketch payload.
-        //
-        // Keyed queries (`key.is_some()`) still need the full
-        // `query_statistic` path — aux is per-accumulator, not
-        // per-subpopulation key.
-        //
-        // `try_answer` returns `None` when the statistic isn't
-        // covered by aux (Quantile / Cardinality / TopK / Increase /
-        // Rate) or when the accumulator doesn't track the requested
-        // aux field; both cases fall through to the existing path
-        // so the query result is semantically identical.
-        if key.is_none() {
-            if let Some(value) = precompute.aux_stats().try_answer(*statistic) {
-                return Ok(value);
-            }
-        }
-        precompute.query_statistic(*statistic, key, query_kwargs)
-    }
-
     /// Modern warm-tier path for `/api/v1/query_range` — the range-
     /// query equivalent of the `QueryEngine::execute(&str)` trait
     /// surface. Used by the HTTP server as a fallback when the legacy
@@ -1599,188 +1568,6 @@ mod sketch_query_tests {
     // }
 }
 
-// Typed auxiliary statistics must answer covered queries without invoking
-// the accumulator query method; uncovered statistics use that method.
-#[cfg(test)]
-mod aux_pushdown_tests {
-    use super::*;
-    use crate::storage_engines::types::AggregationType;
-    use asap_summary_state::summary_kernels::{
-        max::MaxAccumulator, min::MinAccumulator, sum::SumAccumulator,
-    };
-    use asap_types::Statistic;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    /// Accumulator that records how many times `query_statistic`
-    /// was invoked. Used to verify the aux fast path skips it.
-    struct SpyAccumulator {
-        inner_sum: f64,
-        query_calls: Arc<AtomicUsize>,
-    }
-
-    impl crate::storage_engines::types::SerializableToSink for SpyAccumulator {
-        fn serialize_to_bytes(&self) -> Vec<u8> {
-            Vec::new()
-        }
-        fn serialize_to_json(&self) -> serde_json::Value {
-            serde_json::Value::Null
-        }
-    }
-
-    impl AggregateCore for SpyAccumulator {
-        fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
-            Box::new(SpyAccumulator {
-                inner_sum: self.inner_sum,
-                query_calls: self.query_calls.clone(),
-            })
-        }
-        fn type_name(&self) -> &'static str {
-            "SpyAccumulator"
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
-        fn merge_with(
-            &self,
-            _other: &dyn AggregateCore,
-        ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error + Send + Sync>> {
-            unimplemented!()
-        }
-        fn get_accumulator_type(&self) -> AggregationType {
-            AggregationType::Sum
-        }
-        fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
-            None
-        }
-        fn query_statistic(
-            &self,
-            _statistic: Statistic,
-            _key: &Option<KeyByLabelValues>,
-            _query_kwargs: &HashMap<String, String>,
-        ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-            self.query_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(-1.0) // sentinel: fast path should not return this
-        }
-        fn aux_stats(&self) -> crate::storage_engines::types::AuxStats {
-            crate::storage_engines::types::AuxStats {
-                sum: Some(self.inner_sum),
-                ..crate::storage_engines::types::AuxStats::empty()
-            }
-        }
-    }
-
-    fn make_engine() -> ASAPQueryEngine {
-        use crate::storage_engines::types::{
-            CleanupPolicy, InstalledPrecomputePlan, InstalledPrecomputePlanHandle,
-        };
-
-        let sc = Arc::new(InstalledPrecomputePlan::new(HashMap::new()));
-        let hr = InstalledPrecomputePlanHandle::from_arc(sc.clone());
-        let _ = sc;
-        ASAPQueryEngine::new(60)
-    }
-
-    #[test]
-    fn aux_covered_stat_skips_query_statistic() {
-        let engine = make_engine();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let spy = SpyAccumulator {
-            inner_sum: 42.0,
-            query_calls: calls.clone(),
-        };
-        let result = engine
-            .query_precompute_for_statistic(&spy, &Statistic::Sum, &None, &HashMap::new())
-            .expect("query ok");
-        assert_eq!(result, 42.0, "aux fast path should return aux value");
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            0,
-            "query_statistic should NOT be called when aux covers the stat"
-        );
-    }
-
-    #[test]
-    fn aux_uncovered_stat_falls_through_to_query_statistic() {
-        let engine = make_engine();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let spy = SpyAccumulator {
-            inner_sum: 42.0,
-            query_calls: calls.clone(),
-        };
-        // Quantile is not covered by aux → must fall through.
-        let result = engine
-            .query_precompute_for_statistic(&spy, &Statistic::Quantile, &None, &HashMap::new())
-            .expect("query ok");
-        assert_eq!(
-            result, -1.0,
-            "should have returned query_statistic's sentinel"
-        );
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            1,
-            "query_statistic should be called exactly once when aux misses"
-        );
-    }
-
-    #[test]
-    fn keyed_queries_always_use_query_statistic() {
-        let engine = make_engine();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let spy = SpyAccumulator {
-            inner_sum: 42.0,
-            query_calls: calls.clone(),
-        };
-        let key = Some(KeyByLabelValues::new());
-        // Even for Sum (which aux covers), a keyed query must bypass aux
-        // — aux is per-accumulator, not per-subpopulation key.
-        let result = engine
-            .query_precompute_for_statistic(&spy, &Statistic::Sum, &key, &HashMap::new())
-            .expect("query ok");
-        assert_eq!(result, -1.0);
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            1,
-            "keyed queries must skip aux fast path"
-        );
-    }
-
-    #[test]
-    fn real_sum_accumulator_uses_aux_fast_path() {
-        // End-to-end: a real SumAccumulator goes through the fast path
-        // and returns its sum without ever hitting query_statistic.
-        let engine = make_engine();
-        let acc = SumAccumulator::with_sum(7.5);
-        let result = engine
-            .query_precompute_for_statistic(&acc, &Statistic::Sum, &None, &HashMap::new())
-            .expect("query ok");
-        assert_eq!(result, 7.5);
-    }
-
-    #[test]
-    fn real_min_max_accumulator_uses_aux_fast_path() {
-        let engine = make_engine();
-        let min_acc = MinAccumulator::with_value(3.0);
-        let max_acc = MaxAccumulator::with_value(99.0);
-        assert_eq!(
-            engine
-                .query_precompute_for_statistic(&min_acc, &Statistic::Min, &None, &HashMap::new())
-                .unwrap(),
-            3.0
-        );
-        assert_eq!(
-            engine
-                .query_precompute_for_statistic(&max_acc, &Statistic::Max, &None, &HashMap::new())
-                .unwrap(),
-            99.0
-        );
-    }
-}
-
 // ── build_query_execution_context_promql_for_agg_id (forced-agg) tests ──
 
 // ===========================================================================
@@ -1824,7 +1611,6 @@ mod asap_tier_classify_tests {
     async fn execute_sum_by_zone_dispatches_to_exact_agg_reducer() {
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
-        use asap_summary_state::summary_kernels::sum::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         // Mirror the acceptance-test setup: four ExactAgg(Sum) sids, one
@@ -1862,7 +1648,7 @@ mod asap_tier_classify_tests {
                 sid,
                 lm,
                 (window_start, window_end),
-                Box::new(SumAccumulator::with_sum(value)),
+                Box::new(crate::tests::accumulator_fixture::sum_state(value)),
             );
         }
 
@@ -2478,7 +2264,6 @@ mod asap_tier_classify_tests {
     async fn execute_instant_sum_accumulates_all_windows_not_last() {
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
-        use asap_summary_state::summary_kernels::sum::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = 600_000_u64;
@@ -2512,7 +2297,7 @@ mod asap_tier_classify_tests {
                     sid,
                     lm,
                     (ws, we),
-                    Box::new(SumAccumulator::with_sum(*per_window)),
+                    Box::new(crate::tests::accumulator_fixture::sum_state(*per_window)),
                 );
             }
         }

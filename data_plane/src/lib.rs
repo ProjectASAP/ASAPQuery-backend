@@ -37,13 +37,8 @@ pub mod utils;
 
 // Re-export commonly used types to avoid glob import conflicts
 pub use storage_engines::types::{
-    AggregateCore, KeyByLabelValues, Measurement, MergeableAccumulator,
-    MultipleSubpopulationAggregate, PrecomputeMaterialization, PrecomputedOutput,
-    SerializableToSink, SingleSubpopulationAggregate,
-};
-
-pub use asap_summary_state::summary_kernels::{
-    IncreaseAccumulator, KeyedSumCountAccumulator, MaxAccumulator, MinAccumulator, SumAccumulator,
+    AggregateCore, KeyByLabelValues, Measurement, PrecomputeMaterialization, PrecomputedOutput,
+    StoredState,
 };
 
 pub use storage_engines::StoreResult;

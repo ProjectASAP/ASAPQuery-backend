@@ -35,18 +35,10 @@ fn ddsketch_bare_state_is_rejected_and_envelope_supports_query_readout() {
     let bare = prost::Message::encode_to_vec(&state);
     assert!(asap_sketch_codec::reconstruct_ddsketch(&bare).is_err());
     let (decoded, _) = asap_sketch_codec::reconstruct_ddsketch(&envelope).unwrap();
-    let accumulator = asap_summary_state::summary_kernels::DDSketchAccumulator {
-        inner: decoded,
-        sample_p: 1.0,
-    };
+    let accumulator =
+        asap_physical_operators::summary_kernels::DDSketchAccumulator { inner: decoded };
     let median = accumulator
-        .query_statistic(
-            asap_types::Statistic::Quantile,
-            &None,
-            &[("quantile".to_string(), "0.5".to_string())]
-                .into_iter()
-                .collect(),
-        )
+        .estimate(&planner_types::post_asap::SketchQuery::Quantile { q: 0.5 })
         .unwrap();
     assert!((median - 50.0).abs() / 50.0 < 0.05);
 }
@@ -62,7 +54,9 @@ fn kll_envelope_keeps_level_layout_for_backend_readout() {
     assert_eq!(state.k, 200);
     assert_eq!(state.items.len(), 50);
     let snapshot_bytes = bytes;
-    let accumulator = asap_summary_state::summary_kernels::DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&snapshot_bytes).unwrap();
+    let accumulator = asap_physical_operators::summary_kernels::DatasketchesKLLAccumulator {
+        inner: asap_summary_state::stored_state::decoders::kll_from_proto(&snapshot_bytes).unwrap(),
+    };
     assert!(accumulator.get_quantile(0.5).is_finite());
 }
 

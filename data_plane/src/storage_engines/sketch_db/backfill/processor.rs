@@ -414,6 +414,7 @@ mod tests {
     use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
     use crate::storage_engines::sketch_db::backfill::BackfillSource;
     use crate::storage_engines::types::InstalledPrecomputePlan;
+    use asap_summary_state::StoredState;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
@@ -985,7 +986,7 @@ mod tests {
             ),
             cfg.policy_fingerprint(),
         );
-        let acc = asap_summary_state::summary_kernels::sum::SumAccumulator::with_sum(1.0);
+        let acc = crate::tests::accumulator_fixture::sum_state(1.0);
         let live_sid = store
             .ingest_precompute_for_agg_config(
                 |_metric, attrs, _kind| {

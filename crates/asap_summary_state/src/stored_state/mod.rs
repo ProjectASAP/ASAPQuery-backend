@@ -1,4 +1,5 @@
 //! Portable stored-summary payloads and reconstruction, independent of storage engines.
+pub mod codec;
 pub mod decoders;
 pub mod delta_apply;
 pub mod native;
@@ -35,10 +36,8 @@ impl SketchEncoding {
 
     /// Encoding of a stored sketch state written as one complete window.
     pub fn full_frame_for(state: &dyn crate::AggregateCore) -> Self {
-        if state
-            .as_any()
-            .is::<crate::summary_kernels::weighted_frequency::WeightedFrequency>()
-        {
+        use asap_physical_operators::summary_kernels::weighted_frequency::WeightedFrequency;
+        if state.as_any().is::<WeightedFrequency>() {
             Self::WeightedFrequencyV1
         } else {
             Self::MsgpackFull

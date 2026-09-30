@@ -1,5 +1,6 @@
 //! Planner-declared readouts over reconstructed summary states.
 use super::delta_apply::SummaryState;
+use asap_physical_operators::AggregateCore;
 use planner_types::{post_asap::SketchQuery, pre_asap::ColumnRef};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -8,20 +9,9 @@ pub enum Error {
 }
 pub fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, Error> {
     if let SummaryState::UnivMon(state) = rs {
-        use crate::AggregateCore;
-        let statistic = match query {
-            SketchQuery::Cardinality => crate::Statistic::Cardinality,
-            SketchQuery::FrequencyL2 => crate::Statistic::FrequencyL2,
-            SketchQuery::FrequencyEntropy => crate::Statistic::FrequencyEntropy,
-            SketchQuery::PointCount {
-                key: ColumnRef::SampleValue,
-                value: None,
-            } => crate::Statistic::Count,
-            _ => return Err(Error::Unsupported("unsupported UnivMon readout")),
-        };
         return state
-            .query_statistic(statistic, &None, &Default::default())
-            .map_err(|_| Error::Unsupported("UnivMon readout failed"));
+            .estimate(query)
+            .map_err(|_| Error::Unsupported("unsupported UnivMon readout"));
     }
     if matches!(rs, SummaryState::WeightedFrequency(_)) {
         return Err(Error::Unsupported(
@@ -35,9 +25,17 @@ pub fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64,
         SketchQuery::Quantile { q } => match rs {
             // Typed PromQL/continuous-percentile readout uses interpolation;
             // portable DDS `quantile` deliberately retains lower-rank parity.
-            SummaryState::Dd(sketch) => sketch.quantile_interpolated(*q).ok_or(Error::Unsupported(
-                "DDS interpolated quantile is unavailable",
-            )),
+            SummaryState::Dd(sketch) => {
+                sketch
+                    .inner
+                    .quantile_interpolated(*q)
+                    .ok_or(Error::Unsupported(
+                        "DDS interpolated quantile is unavailable",
+                    ))
+            }
+            SummaryState::Kll(sketch) => sketch
+                .estimate(query)
+                .map_err(|_| Error::Unsupported("KLL quantile must be in [0, 1]")),
             _ => Ok(rs.quantile(*q)),
         },
         SketchQuery::Cardinality => Ok(rs.cardinality()),
@@ -100,110 +98,68 @@ pub fn topk_ranked(
     Ok(items)
 }
 
-/// Merge already selected exact panes and finalize using the shared accumulator contract.
+type Parameters = std::collections::HashMap<String, String>;
+
+/// Merge already selected exact panes and read one population; an absent
+/// population (empty MIN/MAX, counter with too few samples) is an error.
 pub fn exact_readout(
-    states: impl IntoIterator<Item = std::sync::Arc<dyn crate::AggregateCore>>,
+    states: impl IntoIterator<Item = std::sync::Arc<dyn AggregateCore>>,
     statistic: crate::Statistic,
     key: &Option<crate::KeyByLabelValues>,
-    parameters: &std::collections::HashMap<String, String>,
+    parameters: &Parameters,
 ) -> Result<f64, String> {
-    let merged = merge_exact_states(states)?;
-    merged
-        .query_statistic(statistic, key, parameters)
-        .map_err(|e| e.to_string())
-}
-
-fn merge_exact_states(
-    states: impl IntoIterator<Item = std::sync::Arc<dyn crate::AggregateCore>>,
-) -> Result<Box<dyn crate::AggregateCore>, String> {
-    let mut states = states.into_iter();
-    let first = states
-        .next()
-        .ok_or_else(|| "empty exact state input".to_string())?;
-    if let Some(first) = first
-        .as_any()
-        .downcast_ref::<crate::summary_kernels::exact::ExactAccumulator>()
-    {
-        let mut merged = first.clone();
-        for state in states {
-            let other = state
-                .as_any()
-                .downcast_ref::<crate::summary_kernels::exact::ExactAccumulator>()
-                .ok_or_else(|| "merge requires Planner exact state".to_string())?;
-            merged
-                .merge_from(other)
-                .map_err(|error| error.to_string())?;
-        }
-        return Ok(Box::new(merged));
-    }
-    let mut merged = first.clone_boxed_core();
-    for state in states {
-        merged = merged
-            .merge_with(state.as_ref())
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(merged)
+    exact_readout_optional(states, statistic, key, parameters)?
+        .ok_or_else(|| "empty exact population".to_string())
 }
 
 /// PromQL counter readouts omit a series with fewer than two samples. Other
 /// state/type/range failures remain errors rather than empty results.
 pub fn insufficient_counter_samples(
-    state: &dyn crate::AggregateCore,
+    state: &dyn AggregateCore,
     statistic: crate::Statistic,
 ) -> bool {
-    matches!(
-        statistic,
-        crate::Statistic::Rate | crate::Statistic::Increase
-    ) && (state
-        .as_any()
-        .downcast_ref::<crate::summary_kernels::IncreaseAccumulator>()
-        .is_some_and(|state| {
-            state.sample_count < 2 || state.last_seen_timestamp == state.starting_timestamp
-        })
-        || state
-            .as_any()
-            .downcast_ref::<crate::summary_kernels::exact::ExactAccumulator>()
-            .is_some_and(|state| state.insufficient_counter_samples(statistic, &None)))
+    asap_physical_operators::readout::insufficient_counter_samples(state, statistic)
 }
 
+/// Merge already selected exact panes with Planner's exact readout. `None`
+/// means a counter population with too few samples is absent; an empty
+/// MIN/MAX population is an error so the query can fall back.
 pub fn exact_readout_optional(
-    states: impl IntoIterator<Item = std::sync::Arc<dyn crate::AggregateCore>>,
+    states: impl IntoIterator<Item = std::sync::Arc<dyn AggregateCore>>,
     statistic: crate::Statistic,
     key: &Option<crate::KeyByLabelValues>,
-    parameters: &std::collections::HashMap<String, String>,
+    parameters: &Parameters,
 ) -> Result<Option<f64>, String> {
-    let merged = merge_exact_states(states)?;
-    let counter = key.as_ref().and_then(|key| {
-        merged
-            .as_any()
-            .downcast_ref::<crate::summary_kernels::KeyedCounterState>()
-            .and_then(|state| state.increases.get(key))
-    });
-    let exact_insufficient = merged
-        .as_any()
-        .downcast_ref::<crate::summary_kernels::exact::ExactAccumulator>()
-        .is_some_and(|state| state.insufficient_counter_samples(statistic, key));
-    if exact_insufficient
-        || insufficient_counter_samples(merged.as_ref(), statistic)
-        || counter.is_some_and(|counter| insufficient_counter_samples(counter, statistic))
-    {
-        return Ok(None);
+    let range = super::codec::range_ms(parameters).map_err(|error| error.to_string())?;
+    let value =
+        asap_physical_operators::readout::exact_readout(states, statistic, range, key.as_ref())?;
+    if value.is_none() && matches!(statistic, crate::Statistic::Min | crate::Statistic::Max) {
+        return Err("empty exact population".into());
     }
-    merged
-        .query_statistic(statistic, key, parameters)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    Ok(value)
 }
 
 #[cfg(test)]
 mod counter_tests {
     use super::*;
-    use crate::{summary_kernels::IncreaseAccumulator, AggregateCore, Measurement, Statistic};
+    use crate::{KeyByLabelValues, Statistic};
+    use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
+    use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
     use std::sync::Arc;
 
+    fn counter(kind: ExactKind, params: ExactParams, keyed: bool) -> ExactAccumulator {
+        ExactAccumulator::new(SummaryFamilyType::ExactAggregate(kind, params), keyed).unwrap()
+    }
+    fn range(start: &str, end: &str) -> Parameters {
+        Parameters::from([
+            ("range_start_ms".into(), start.into()),
+            ("range_end_ms".into(), end.into()),
+        ])
+    }
+
+    // A counter population with a single sample is absent, keyed or not.
     #[test]
     fn planner_counter_population_omits_insufficient_samples() {
-        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
         for (kind, params, statistic) in [
             (ExactKind::Rate, ExactParams::Rate, Statistic::Rate),
             (
@@ -213,13 +169,8 @@ mod counter_tests {
             ),
         ] {
             for keyed in [false, true] {
-                let mut state = crate::summary_kernels::exact::ExactAccumulator::new(
-                    SummaryFamilyType::ExactAggregate(kind.clone(), params.clone()),
-                    keyed,
-                )
-                .unwrap();
-                let key = keyed
-                    .then(|| crate::KeyByLabelValues::new_with_labels(vec!["checkout".into()]));
+                let mut state = counter(kind.clone(), params.clone(), keyed);
+                let key = keyed.then(|| KeyByLabelValues::new_with_labels(vec!["checkout".into()]));
                 state.update(key.as_ref(), 10., 10_000);
                 assert_eq!(
                     exact_readout_optional(
@@ -235,78 +186,45 @@ mod counter_tests {
         }
     }
 
+    // Repeated or single samples are absent; unknown keys, inverted ranges
+    // and empty input remain errors.
     #[test]
     fn sparse_counter_is_absent_but_invalid_ranges_still_fail() {
-        let mut state =
-            IncreaseAccumulator::new(Measurement::new(10.), 10_000, Measurement::new(10.), 10_000);
-        let parameters = std::collections::HashMap::from([
-            ("range_start_ms".into(), "0".into()),
-            ("range_end_ms".into(), "60000".into()),
-        ]);
-        assert_eq!(
+        let label = KeyByLabelValues::new_with_labels(vec!["checkout".into()]);
+        let mut keyed = counter(ExactKind::Rate, ExactParams::Rate, true);
+        keyed.update(Some(&label), 10., 10_000);
+        keyed.update(Some(&label), 10., 10_000);
+        let read = |state: &ExactAccumulator, key: Option<KeyByLabelValues>, p: &Parameters| {
             exact_readout_optional(
                 [Arc::new(state.clone()) as Arc<dyn AggregateCore>],
                 Statistic::Rate,
-                &None,
-                &parameters
+                &key,
+                p,
             )
-            .unwrap(),
-            None
-        );
-        let mut repeated = state.clone();
-        repeated.update(Measurement::new(10.), 10_000);
-        assert_eq!(
-            exact_readout_optional(
-                [Arc::new(repeated) as Arc<dyn AggregateCore>],
-                Statistic::Rate,
-                &None,
-                &parameters
-            )
-            .unwrap(),
-            None
-        );
-        let mut keyed = crate::summary_kernels::KeyedCounterState::new();
-        let label = crate::KeyByLabelValues::new_with_labels(vec!["checkout".into()]);
-        keyed.update(label.clone(), state.clone());
-        assert_eq!(
-            exact_readout_optional(
-                [Arc::new(keyed.clone()) as Arc<dyn AggregateCore>],
-                Statistic::Rate,
-                &Some(label),
-                &parameters
-            )
-            .unwrap(),
-            None
-        );
-        assert!(exact_readout_optional(
-            [Arc::new(keyed) as Arc<dyn AggregateCore>],
-            Statistic::Rate,
-            &Some(crate::KeyByLabelValues::new_with_labels(vec![
-                "missing".into()
-            ])),
-            &parameters
-        )
-        .is_err());
-        state.update(Measurement::new(20.), 20_000);
-        assert!(exact_readout_optional(
-            [Arc::new(state.clone()) as Arc<dyn AggregateCore>],
-            Statistic::Rate,
-            &None,
-            &parameters
-        )
-        .unwrap()
-        .is_some());
-        let invalid = std::collections::HashMap::from([
-            ("range_start_ms".into(), "60000".into()),
-            ("range_end_ms".into(), "0".into()),
-        ]);
-        assert!(exact_readout_optional(
-            [Arc::new(state) as Arc<dyn AggregateCore>],
-            Statistic::Rate,
-            &None,
-            &invalid
-        )
-        .is_err());
-        assert!(exact_readout_optional([], Statistic::Rate, &None, &parameters).is_err());
+        };
+        let window = range("0", "60000");
+        assert_eq!(read(&keyed, Some(label.clone()), &window).unwrap(), None);
+        let mut repeated = counter(ExactKind::Rate, ExactParams::Rate, false);
+        repeated.update(None, 10., 10_000);
+        repeated.update(None, 10., 10_000);
+        assert_eq!(read(&repeated, None, &window).unwrap(), None);
+        let missing = KeyByLabelValues::new_with_labels(vec!["missing".into()]);
+        assert!(read(&keyed, Some(missing), &window).is_err());
+        keyed.update(Some(&label), 20., 20_000);
+        assert!(read(&keyed, Some(label.clone()), &window)
+            .unwrap()
+            .is_some());
+        assert!(read(&keyed, Some(label), &range("60000", "0")).is_err());
+        assert!(exact_readout_optional([], Statistic::Rate, &None, &window).is_err());
+    }
+
+    // An empty MIN population is an error, not an absent series.
+    #[test]
+    fn empty_extremum_population_is_an_error() {
+        let empty = counter(ExactKind::Min, ExactParams::Min, false);
+        let states = || [Arc::new(empty.clone()) as Arc<dyn AggregateCore>];
+        let none = Parameters::new();
+        assert!(exact_readout_optional(states(), Statistic::Min, &None, &none).is_err());
+        assert!(exact_readout(states(), Statistic::Min, &None, &none).is_err());
     }
 }

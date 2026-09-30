@@ -944,8 +944,6 @@ mod tests {
             data::AggKind,
             index::{Capability, SummarySeriesMetadata},
         };
-        use crate::storage_engines::types::Measurement;
-        use asap_summary_state::summary_kernels::IncreaseAccumulator;
         use asap_types::query_plan::{ExactReadout, MaterializationBinding, PhysicalGrouping};
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
@@ -971,9 +969,10 @@ mod tests {
             expires_at_ms: None,
             policy_fp: MATERIALIZATION,
         });
-        let mut denominator =
-            IncreaseAccumulator::new(Measurement::new(100.0), 0, Measurement::new(100.0), 0);
-        denominator.update(Measurement::new(400.0), AT as i64);
+        let denominator = crate::tests::accumulator_fixture::counter_state(
+            planner_types::post_asap::ExactKind::Rate,
+            &[(0, 100.0), (AT as i64, 400.0)],
+        );
         store.append_precompute(
             41,
             BTreeMap::from([("job".into(), "user-service".into())]),

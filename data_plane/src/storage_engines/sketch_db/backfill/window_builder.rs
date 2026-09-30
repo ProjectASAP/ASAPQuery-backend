@@ -11,7 +11,7 @@ use crate::storage_engines::types::AggregateCore;
 #[cfg(test)]
 use crate::tests::accumulator_fixture::create_fixture_accumulator;
 #[cfg(test)]
-use asap_summary_state::factory::AccumulatorUpdater;
+use asap_physical_operators::factory::AccumulatorUpdater;
 #[cfg(test)]
 use asap_types::aggregation_config::PrecomputeMaterialization;
 
@@ -86,7 +86,7 @@ mod tests {
     // Replay must preserve each series and rank by the selected update mode.
     #[test]
     fn backfilled_topk_preserves_series_and_weight_mode() {
-        use asap_summary_state::summary_kernels::{
+        use asap_physical_operators::summary_kernels::{
             CountMinSketchWithHeapAccumulator, CountSketchWithHeapAccumulator,
         };
         for kind in [
@@ -145,19 +145,15 @@ mod tests {
             raw("m{svc=\"a\"}", 30, 3.0),
         ];
         let acc = build_backfilled_accumulator(&config, &samples);
-        // SumAccumulator's AuxStats exposes the sum.
-        let aux = acc.aux_stats();
-        assert_eq!(aux.sum, Some(6.0));
+        assert_eq!(crate::tests::accumulator_fixture::sum_of(acc.as_ref()), 6.0);
     }
 
     #[test]
     fn empty_samples_produce_empty_accumulator() {
         let config = sum_config();
         let acc = build_backfilled_accumulator(&config, &[]);
-        let aux = acc.aux_stats();
-        // A fresh SumAccumulator has sum = Some(0.0) per its AuxStats
-        // implementation (identity element).
-        assert!(aux.sum == Some(0.0) || aux.sum.is_none());
+        // An empty exact Sum is the additive identity.
+        assert_eq!(crate::tests::accumulator_fixture::sum_of(acc.as_ref()), 0.0);
     }
 }
 

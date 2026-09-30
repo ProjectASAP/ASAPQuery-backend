@@ -367,8 +367,8 @@ mod tests {
     async fn delta_path_reconstitutes_cumulative_state() {
         use crate::drivers::ingest::otel::apply_modified_otlp_delta_bytes;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_physical_operators::summary_kernels::DDSketchAccumulator;
         use asap_sketchlib::DdSketch;
-        use asap_summary_state::summary_kernels::DDSketchAccumulator;
         use planner_types::post_asap::SketchAlgorithm;
         use prost::Message;
 
@@ -382,7 +382,6 @@ mod tests {
         let series_key = "__name__=latency_ms,inst=a";
         let base = DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
-            sample_p: 1.0,
         };
         state.sketch_snapshots.insert(
             series_key.to_string(),
@@ -472,8 +471,6 @@ mod tests {
     /// survive; a stale entry from far in the past must be swept.
     #[tokio::test]
     async fn stale_snapshot_entry_is_evicted_by_sweep() {
-        use asap_summary_state::summary_kernels::SumAccumulator;
-
         let (state, drain) = setup_state(7, "evict_metric").await;
 
         // Pin a deterministic lag of 100ns so the test doesn't depend on
@@ -489,14 +486,14 @@ mod tests {
         state.sketch_snapshots.insert(
             "stale".to_string(),
             SnapshotCacheEntry {
-                core: Box::new(SumAccumulator::with_sum(1.0)),
+                core: Box::new(crate::tests::accumulator_fixture::sum_state(1.0)),
                 window_start: 10,
             },
         );
         state.sketch_snapshots.insert(
             "fresh".to_string(),
             SnapshotCacheEntry {
-                core: Box::new(SumAccumulator::with_sum(2.0)),
+                core: Box::new(crate::tests::accumulator_fixture::sum_state(2.0)),
                 window_start: 1000,
             },
         );
@@ -524,7 +521,7 @@ mod tests {
         state.sketch_snapshots.insert(
             "ancient".to_string(),
             SnapshotCacheEntry {
-                core: Box::new(SumAccumulator::with_sum(3.0)),
+                core: Box::new(crate::tests::accumulator_fixture::sum_state(3.0)),
                 window_start: 1,
             },
         );

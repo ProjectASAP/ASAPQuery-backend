@@ -452,10 +452,7 @@ pub(crate) fn encode_state(
 ) -> Result<Vec<u8>, RevisionError> {
     Ok(native::encode_batch(&Batch::try_new(
         state_schema(family.clone()),
-        vec![vec![Value::Summary {
-            family,
-            state: asap_summary_state::physical::to_physical(state.as_ref())?,
-        }]],
+        vec![vec![Value::Summary { family, state }]],
     )?)?)
 }
 
@@ -467,9 +464,10 @@ pub(crate) fn decode_state(
     let batch = native::decode_batch(&record.payload, state_schema(family), record.payload.len())?;
     match batch.rows() {
         [row] => match row.as_slice() {
-            [Value::Summary { state, .. }] => Ok(Arc::from(
-                asap_summary_state::physical::from_physical(state.as_ref())?,
-            )),
+            [Value::Summary { state, .. }] => {
+                asap_summary_state::stored_state::codec::check_storable(state.as_ref())?;
+                Ok(Arc::clone(state))
+            }
             _ => Err("revision record must contain exactly one typed summary".into()),
         },
         _ => Err("revision record must contain exactly one row".into()),

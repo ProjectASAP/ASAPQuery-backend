@@ -73,7 +73,7 @@ pub(super) fn execute(
                         ),
                         Value::Summary {
                             family: family.clone(),
-                            state: asap_summary_state::physical::to_physical(state.as_ref())?,
+                            state: Arc::clone(state),
                         },
                     ]);
                 }
@@ -93,8 +93,7 @@ pub(super) fn execute(
                         _,
                     ) => Ok(Value::Summary {
                         family: field.dtype.clone(),
-                        state: asap_summary_state::physical::to_physical(state.as_ref())
-                            .map_err(|e| e.to_string())?,
+                        state: Arc::clone(state),
                     }),
                     SummaryFamilyType::Plain(DataType::Timestamp) => Ok(Value::Timestamp(
                         i64::try_from(window.1).map_err(|_| "native window overflow")?,
@@ -216,8 +215,8 @@ pub(super) fn population_states(
                 return Err("duplicate population label".into());
             }
         }
-        let state = asap_summary_state::physical::from_physical(state.as_ref())?;
-        if result.insert(group, Arc::from(state)).is_some() {
+        asap_summary_state::stored_state::codec::check_storable(state.as_ref())?;
+        if result.insert(group, Arc::clone(state)).is_some() {
             return Err("repeated precompute output population".into());
         }
     }
@@ -297,8 +296,8 @@ mod tests {
             snapshot_sha256: "0".repeat(64),
         });
         let state = |value| {
-            let mut sum = asap_summary_state::summary_kernels::SumAccumulator::new();
-            sum.update(value);
+            let mut sum = crate::tests::accumulator_fixture::sum_state(0.0);
+            sum.update(None, value, 0);
             Arc::new(sum) as Arc<dyn crate::storage_engines::types::AggregateCore>
         };
         for (revision, value) in [(1, 2.0), (2, 7.0)] {
@@ -335,10 +334,7 @@ mod tests {
                 "shared merge must execute once, not once per output"
             );
             assert_eq!(
-                asap_summary_state::physical::from_physical(state_at(3).as_ref())
-                    .unwrap()
-                    .query_statistic(asap_types::Statistic::Sum, &None, &Default::default(),)
-                    .unwrap(),
+                crate::tests::accumulator_fixture::sum_of(state_at(3).as_ref()),
                 value + 3.0
             );
             let error = execute(&installed, &program, &inputs, (0, 2000), 1, revision).unwrap_err();

@@ -194,7 +194,6 @@ pub fn warn_if_retention_inverted(
 mod tests {
     use super::*;
     use crate::storage_engines::types::{AggregationType, InstalledPrecomputePlan};
-    use asap_summary_state::summary_kernels::SumAccumulator;
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::KeyByLabelNames;
@@ -258,7 +257,7 @@ mod tests {
     ) -> u64 {
         use crate::drivers::ingest::series_resolver::SeriesIdResolver;
         use std::sync::Arc;
-        let acc = SumAccumulator::with_sum(1.0);
+        let acc = crate::tests::accumulator_fixture::sum_state(1.0);
         let output = crate::storage_engines::types::PrecomputedOutput::new(
             ts,
             ts + 1000,

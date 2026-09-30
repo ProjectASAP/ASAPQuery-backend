@@ -524,7 +524,10 @@ impl std::fmt::Debug for AggPayload {
             AggPayload::Sketch(s) => f.debug_tuple("Sketch").field(s).finish(),
             AggPayload::ExactAgg(p) => f
                 .debug_struct("ExactAgg")
-                .field("type_name", &p.type_name())
+                .field(
+                    "type_name",
+                    &asap_summary_state::StoredState::type_name(p.as_ref()),
+                )
                 .finish(),
         }
     }
