@@ -38,6 +38,9 @@ mod current_series_process;
 #[path = "support/issue_701_702_process.rs"]
 mod issue_701_702_process;
 
+#[path = "support/lifecycle_placement_process.rs"]
+mod lifecycle_placement_process;
+
 // Test-only quotes preserve the fixture's local candidate without a production bypass.
 fn quote_snapshot_for_test(
     snapshot: control_plane::physical::compiler::BackendLocalPlanningInput,
