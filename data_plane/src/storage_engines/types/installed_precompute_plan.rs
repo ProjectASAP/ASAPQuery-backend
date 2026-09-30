@@ -49,10 +49,11 @@ impl InstalledPrecomputePlan {
     /// Production construction always validates the executable DAG and bindings.
     pub fn from_precompute_plan(plan: asap_types::precompute_plan::PrecomputePlan) -> Result<Self> {
         let materializations = plan.runtime_materializations()?;
+        let lookup = plan.lookup().map_err(anyhow::Error::msg)?;
         let outputs = materializations
             .into_values()
             .map(|config| {
-                let family = plan
+                let family = lookup
                     .state_family(config.stored_output_id)
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("stored output has no state schema"))?;
@@ -62,7 +63,8 @@ impl InstalledPrecomputePlan {
         let population_filters = outputs
             .iter()
             .map(|(config, _)| {
-                plan.population_filter(config)
+                lookup
+                    .population_filter(config)
                     .map(|filter| (config.stored_output_id, filter))
                     .map_err(anyhow::Error::msg)
             })
@@ -71,7 +73,7 @@ impl InstalledPrecomputePlan {
         for (config, _) in &outputs {
             use planner_types::post_asap::{PostAsapOperatorPayload, SummaryInputExpr};
             use planner_types::pre_asap::ColumnRef;
-            let Some((node, _)) = plan
+            let Some((node, _)) = lookup
                 .summary_producer(config.stored_output_id)
                 .map_err(anyhow::Error::msg)?
             else {
@@ -107,6 +109,7 @@ impl InstalledPrecomputePlan {
                     .map_err(anyhow::Error::msg)?;
             programs.insert(config.policy_fp_u64(), std::sync::Arc::new(program));
         }
+        drop(lookup);
         let mut view = Self::derived_view(outputs);
         view.population_filters = population_filters;
         view.item_labels = item_labels;

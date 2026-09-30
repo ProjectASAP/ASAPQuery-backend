@@ -121,6 +121,130 @@ pub struct PrecomputePlan {
     pub executable_dags: BTreeMap<String, crate::executable_plan::InstalledPostAsapDag>,
 }
 
+/// Temporary decoded indexes for a complete plan validation/installation pass.
+/// Keeping this separate from the wire plan preserves its Send/Sync contract.
+pub struct PrecomputePlanLookup<'a> {
+    families: HashMap<crate::sds::StoredOutputId, &'a SummaryFamilyType>,
+    dags: Vec<(
+        &'a crate::executable_plan::InstalledPostAsapDag,
+        planner_types::post_asap::PostAsapDag,
+    )>,
+}
+
+impl PrecomputePlanLookup<'_> {
+    pub fn state_family(&self, output: crate::sds::StoredOutputId) -> Option<&SummaryFamilyType> {
+        self.families.get(&output).copied()
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn summary_producer(
+        &self,
+        output: crate::sds::StoredOutputId,
+    ) -> Result<
+        Option<(
+            planner_types::post_asap::PostAsapDagNode,
+            Option<planner_types::pre_asap::QueryExpr>,
+        )>,
+        String,
+    > {
+        use planner_types::post_asap::PostAsapOperatorPayload;
+        let mut selected: Option<(
+            planner_types::post_asap::PostAsapDagNode,
+            Option<planner_types::pre_asap::QueryExpr>,
+        )> = None;
+        for (installed, dag) in &self.dags {
+            let Some(node) = installed.binding.nodes.iter().find_map(|(node, binding)| {
+                matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { stored_output } if *stored_output == output).then_some(*node)
+            }) else {
+                continue;
+            };
+            let producer = dag
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == node)
+                .ok_or("bound materialization node is absent from its DAG")?;
+            if !matches!(producer.payload, PostAsapOperatorPayload::SummaryAgg { .. }) {
+                continue;
+            }
+            let inputs: Vec<_> = dag.edges.iter().filter(|e| e.consumer == node).collect();
+            let source = match inputs.as_slice() {
+                [edge] => dag
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.id == edge.producer)
+                    .and_then(|source| match &source.payload {
+                        PostAsapOperatorPayload::Fallback { expression } => {
+                            Some(expression.clone())
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            if let Some((first, first_source)) = &selected {
+                // Shared outputs may be read by scans that project different
+                // columns; what must agree is the update and its population.
+                let population =
+                    |node: &planner_types::post_asap::PostAsapDagNode,
+                     source: &Option<planner_types::pre_asap::QueryExpr>| {
+                        let PostAsapOperatorPayload::SummaryAgg { family, .. } = &node.payload
+                        else {
+                            return None;
+                        };
+                        source.as_ref().map(|expression| {
+                            raw_time_series_input_contract(
+                                expression,
+                                matches!(family, SummaryFamilyType::ExactAggregate(..)),
+                            )
+                            .map(|(metric, _, filter)| {
+                                (metric, crate::utils::normalize_spatial_filter(&filter))
+                            })
+                        })
+                    };
+                if first.payload != producer.payload
+                    || population(first, first_source) != population(producer, &source)
+                {
+                    return Err(format!(
+                        "stored output {} is produced by DAGs that disagree on its computation",
+                        output.as_u64()
+                    ));
+                }
+            } else {
+                selected = Some((producer.clone(), source));
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Canonical population predicate of `config`'s input: the typed table
+    /// population, or the label filter of its Planner DAG time-series scan.
+    pub fn population_filter(
+        &self,
+        config: &crate::PrecomputeMaterialization,
+    ) -> Result<String, String> {
+        let table = config.table_population_canonical()?;
+        if config.table_name.is_some() || config.derived_input.is_some() {
+            return Ok(table);
+        }
+        let expression = match self.summary_producer(config.stored_output_id)? {
+            Some((_, Some(expression))) => expression,
+            // A bound raw output whose input cannot be read must not be
+            // treated as unfiltered.
+            Some((_, None)) => {
+                return Err("raw output's Planner producer does not read a source scan".into())
+            }
+            // Only plans without a Planner DAG for this output (imported or
+            // fixture outputs) have no predicate to read.
+            None => return Ok(String::new()),
+        };
+        let family = self.state_family(config.stored_output_id);
+        let (_, _, filter) = raw_time_series_input_contract(
+            &expression,
+            matches!(family, Some(SummaryFamilyType::ExactAggregate(..))),
+        )?;
+        Ok(crate::utils::normalize_spatial_filter(&filter))
+    }
+}
+
 /// Serde mirror of [`PrecomputePlan`]; the compiler checks it stays in sync.
 #[derive(Deserialize)]
 #[serde(remote = "PrecomputePlan")]
@@ -141,11 +265,11 @@ impl<'de> Deserialize<'de> for PrecomputePlan {
     /// version rather than with its first unrecognized field.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        let value = serde_json::Value::deserialize(deserializer)?;
+        let value = serde_yaml::Value::deserialize(deserializer)?;
         let compat = value
             .get("envelope")
             .and_then(|envelope| envelope.get("backend_compat"))
-            .and_then(serde_json::Value::as_str);
+            .and_then(serde_yaml::Value::as_str);
         if compat != Some(BACKEND_COMPAT) {
             return Err(D::Error::custom(format!(
                 "unsupported installed precompute plan schema {}: this backend requires \
@@ -153,7 +277,15 @@ impl<'de> Deserialize<'de> for PrecomputePlan {
                 compat.unwrap_or("<missing>")
             )));
         }
-        PrecomputePlanDef::deserialize(value).map_err(D::Error::custom)
+        // Preserve YAML enum tags and numeric mapping keys. JSON uses string
+        // keys for numeric node IDs, so its buffered form needs JSON's key decoder.
+        PrecomputePlanDef::deserialize(value.clone())
+            .map_err(|error| error.to_string())
+            .or_else(|_| {
+                let json = serde_json::to_value(value).map_err(|error| error.to_string())?;
+                PrecomputePlanDef::deserialize(json).map_err(|error| error.to_string())
+            })
+            .map_err(D::Error::custom)
     }
 }
 
@@ -471,11 +603,24 @@ impl PrecomputePlan {
             .map(|schema| &schema.family)
     }
 
-    /// The Planner SummaryAgg node that produces `output`, with the source
-    /// expression feeding it when that input is a raw source. `None` when no
-    /// installed DAG produces the output with a SummaryAgg. Every DAG that
-    /// produces the output must agree on both, or the plan is rejected: the
-    /// runtime routes, filters and catalogs the output once.
+    /// Decode each Planner DAG once for a validation or installation pass.
+    /// The lookup stays local because Planner payloads contain process-local `Rc`s.
+    pub fn lookup(&self) -> Result<PrecomputePlanLookup<'_>, String> {
+        Ok(PrecomputePlanLookup {
+            families: self
+                .schemas
+                .iter()
+                .map(|schema| (schema.materialization, &schema.family))
+                .collect(),
+            dags: self
+                .executable_dags
+                .values()
+                .map(|installed| installed.document.decode().map(|dag| (installed, dag)))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// The authoritative producer and raw input of one stored output.
     #[allow(clippy::type_complexity)]
     pub fn summary_producer(
         &self,
@@ -487,102 +632,15 @@ impl PrecomputePlan {
         )>,
         String,
     > {
-        use planner_types::post_asap::PostAsapOperatorPayload;
-        let mut selected: Option<(
-            planner_types::post_asap::PostAsapDagNode,
-            Option<planner_types::pre_asap::QueryExpr>,
-        )> = None;
-        for installed in self.executable_dags.values() {
-            let Some(node) = installed.binding.nodes.iter().find_map(|(node, binding)| {
-                matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { stored_output } if *stored_output == output).then_some(*node)
-            }) else {
-                continue;
-            };
-            let dag = installed.document.decode()?;
-            let producer = dag
-                .nodes
-                .iter()
-                .find(|candidate| candidate.id == node)
-                .ok_or("bound materialization node is absent from its DAG")?;
-            if !matches!(producer.payload, PostAsapOperatorPayload::SummaryAgg { .. }) {
-                continue;
-            }
-            let inputs: Vec<_> = dag.edges.iter().filter(|e| e.consumer == node).collect();
-            let source = match inputs.as_slice() {
-                [edge] => dag
-                    .nodes
-                    .iter()
-                    .find(|candidate| candidate.id == edge.producer)
-                    .and_then(|source| match &source.payload {
-                        PostAsapOperatorPayload::Fallback { expression } => {
-                            Some(expression.clone())
-                        }
-                        _ => None,
-                    }),
-                _ => None,
-            };
-            if let Some((first, first_source)) = &selected {
-                // Shared outputs may be read by scans that project different
-                // columns; what must agree is the update and its population.
-                let population =
-                    |node: &planner_types::post_asap::PostAsapDagNode,
-                     source: &Option<planner_types::pre_asap::QueryExpr>| {
-                        let PostAsapOperatorPayload::SummaryAgg { family, .. } = &node.payload
-                        else {
-                            return None;
-                        };
-                        source.as_ref().map(|expression| {
-                            raw_time_series_input_contract(
-                                expression,
-                                matches!(family, SummaryFamilyType::ExactAggregate(..)),
-                            )
-                            .map(|(metric, _, filter)| {
-                                (metric, crate::utils::normalize_spatial_filter(&filter))
-                            })
-                        })
-                    };
-                if first.payload != producer.payload
-                    || population(first, first_source) != population(producer, &source)
-                {
-                    return Err(format!(
-                        "stored output {} is produced by DAGs that disagree on its computation",
-                        output.as_u64()
-                    ));
-                }
-            } else {
-                selected = Some((producer.clone(), source));
-            }
-        }
-        Ok(selected)
+        self.lookup()?.summary_producer(output)
     }
 
-    /// Canonical population predicate of `config`'s input: the typed table
-    /// population, or the label filter of its Planner DAG time-series scan.
+    /// Canonical input predicate of one output.
     pub fn population_filter(
         &self,
         config: &crate::PrecomputeMaterialization,
     ) -> Result<String, String> {
-        let table = config.table_population_canonical()?;
-        if config.table_name.is_some() || config.derived_input.is_some() {
-            return Ok(table);
-        }
-        let expression = match self.summary_producer(config.stored_output_id)? {
-            Some((_, Some(expression))) => expression,
-            // A bound raw output whose input cannot be read must not be
-            // treated as unfiltered.
-            Some((_, None)) => {
-                return Err("raw output's Planner producer does not read a source scan".into())
-            }
-            // Only plans without a Planner DAG for this output (imported or
-            // fixture outputs) have no predicate to read.
-            None => return Ok(String::new()),
-        };
-        let family = self.state_family(config.stored_output_id);
-        let (_, _, filter) = raw_time_series_input_contract(
-            &expression,
-            matches!(family, Some(SummaryFamilyType::ExactAggregate(..))),
-        )?;
-        Ok(crate::utils::normalize_spatial_filter(&filter))
+        self.lookup()?.population_filter(config)
     }
 
     pub fn runtime_materializations(
@@ -675,6 +733,9 @@ impl PrecomputePlan {
         if !valid_ingest {
             return Err(PrecomputePlanError::UnsupportedIngestEndpoint);
         }
+        let lookup = self
+            .lookup()
+            .map_err(PrecomputePlanError::CatalogContract)?;
         let canonical_cohort_members: BTreeSet<_> = self
             .materializations
             .iter()
@@ -685,12 +746,6 @@ impl PrecomputePlan {
                     .chain(input.inputs.iter().copied())
             })
             .collect();
-        // Decode each DAG at most once; errors still surface only where used.
-        let dags = self
-            .executable_dags
-            .values()
-            .map(|installed| (installed, std::cell::OnceCell::new()))
-            .collect::<Vec<_>>();
         for config in &self.materializations {
             if !config.population_key_encoding.is_legacy()
                 && (self.ingest.protocol != IngestProtocol::PrometheusRemoteWriteV1
@@ -741,11 +796,7 @@ impl PrecomputePlan {
             }
             validated_source_window_cohort(config, &sources)?;
             let mut matched = false;
-            for (installed, dag) in &dags {
-                let dag = dag
-                    .get_or_init(|| installed.document.decode())
-                    .as_ref()
-                    .map_err(|error| PrecomputePlanError::CatalogContract(error.clone()))?;
+            for (installed, dag) in &lookup.dags {
                 for sink in &installed.binding.precompute_sinks {
                     if !matches!(installed.binding.node(*sink),
                         Some(crate::executable_plan::BackendNodeBinding::Materialization { stored_output })
@@ -794,7 +845,7 @@ impl PrecomputePlan {
                         .map(|contract| !asap_physical_operators::physical_planner::precompute::is_population_schema(&contract.schema))?
                         .then_some(native);
                     let exact = |config: &crate::PrecomputeMaterialization, kinds: &[ExactKind]| {
-                        matches!(self.state_family(config.stored_output_id),
+                        matches!(lookup.state_family(config.stored_output_id),
                             Some(SummaryFamilyType::ExactAggregate(kind, _)) if kinds.contains(kind))
                     };
                     let source_kinds: &[ExactKind] = if native.is_some() {
@@ -812,7 +863,7 @@ impl PrecomputePlan {
                         validate_maintenance_reduction(config, target_node)
                             .map_err(PrecomputePlanError::CatalogContract)?;
                     } else if !exact(config, &[ExactKind::Sum])
-                        && !matches!(self.state_family(config.stored_output_id),
+                        && !matches!(lookup.state_family(config.stored_output_id),
                             Some(SummaryFamilyType::Sketch(kind, _)) if matches!(kind.algorithm(),
                                 SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
                     {
@@ -911,7 +962,7 @@ impl PrecomputePlan {
                 return Err(invalid());
             }
         }
-        for (query_id, installed) in &self.executable_dags {
+        for ((query_id, _), (installed, dag)) in self.executable_dags.iter().zip(&lookup.dags) {
             if query_id != &installed.document.query_id {
                 return Err(PrecomputePlanError::CatalogContract(
                     "post-ASAP DAG map key differs from document query ID".into(),
@@ -919,10 +970,6 @@ impl PrecomputePlan {
             }
             installed
                 .validate()
-                .map_err(PrecomputePlanError::CatalogContract)?;
-            let dag = installed
-                .document
-                .decode()
                 .map_err(PrecomputePlanError::CatalogContract)?;
             for node in &dag.nodes {
                 let Some(crate::executable_plan::BackendNodeBinding::Materialization {
@@ -946,7 +993,7 @@ impl PrecomputePlan {
                     ..
                 } = &node.payload
                 {
-                    if self.state_family(config.stored_output_id) != Some(family) {
+                    if lookup.state_family(config.stored_output_id) != Some(family) {
                         return Err(PrecomputePlanError::CatalogContract(
                             "stored output schema family differs from its Planner producer".into(),
                         ));
@@ -1095,7 +1142,7 @@ impl PrecomputePlan {
             // read every series of its metric.
             if raw
                 && !self.executable_dags.is_empty()
-                && self
+                && lookup
                     .summary_producer(schema.materialization)
                     .map_err(invalid_computation)?
                     .is_none()
@@ -1104,7 +1151,8 @@ impl PrecomputePlan {
                     "raw output has no Planner producer".into(),
                 ));
             }
-            self.population_filter(materialization)
+            lookup
+                .population_filter(materialization)
                 .map_err(invalid_computation)?;
             let source = materialization.table_name.as_ref().map_or_else(
                 || Source::TimeSeries {
@@ -1542,6 +1590,21 @@ mod source_window_cohort_tests {
             assert_ne!(source.policy_fingerprint(), changed.policy_fingerprint());
             assert!(validated_source_window_cohort(&target, &[&changed]).is_err());
         }
+    }
+
+    // YAML transport preserves tagged Planner families and numeric DAG node keys.
+    #[test]
+    fn installed_plan_yaml_round_trip_preserves_typed_fields() {
+        let mut config = full_window();
+        config.slide_interval = config.window_size;
+        config.window_type = crate::WindowKind::Tumbling;
+        let plan = PrecomputePlan::build_backend_local(envelope(1), vec![(config, sum())]).unwrap();
+        let yaml = serde_yaml::to_string(&plan).unwrap();
+        let decoded: PrecomputePlan = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(plan).unwrap()
+        );
     }
 
     // A plan compiled for the v1 schema, which duplicated computation fields

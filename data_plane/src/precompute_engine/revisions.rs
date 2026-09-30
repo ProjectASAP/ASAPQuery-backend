@@ -637,7 +637,7 @@ impl RevisionRuntime {
                     {
                         decode_state(
                             record,
-                            plan.precompute_plan
+                            plan.installed_precompute_plan
                                 .state_family(config.stored_output_id)
                                 .ok_or("recovered revision has no state schema")?,
                         )?;
